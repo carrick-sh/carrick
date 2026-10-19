@@ -1296,15 +1296,15 @@ mod tests {
         let mut ignored_action = LinuxSigaction::empty();
         ignored_action.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
         leader
-            .shared
-            .sighand()
-            .install_action(ignored, ignored_action);
+            .signal_authority()
+            .install_action(ignored, ignored_action)
+            .expect("install action");
         let mut caught_action = LinuxSigaction::empty();
         caught_action.sa_handler = 0x3000;
         leader
-            .shared
-            .sighand()
-            .install_action(caught, caught_action);
+            .signal_authority()
+            .install_action(caught, caught_action)
+            .expect("install action");
         let caller_signal_state = super::super::objects::ThreadSignalState::new(
             SigSet::EMPTY.with(4),
             SigSet::EMPTY.with(5),

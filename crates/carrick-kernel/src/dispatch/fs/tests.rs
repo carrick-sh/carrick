@@ -7147,7 +7147,9 @@ fn tee_in_memory_destination_reader_closed_epipe_and_sigpipe() {
     ign.sa_handler = carrick_abi::LINUX_SIG_IGN;
     let sigpipe =
         crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGPIPE).unwrap();
-    ctx.shared().sighand().install_action(sigpipe, ign);
+    ctx.signal_authority()
+        .install_action(sigpipe, ign)
+        .expect("install action");
     ctx.thread()
         .update_signal_state(|s| s.replace_pending_entries(&[]));
 

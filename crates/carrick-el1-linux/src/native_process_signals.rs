@@ -81,7 +81,9 @@ impl<T> NativeProcessSignals<T> {
             })),
         }
     }
-    /// Future rt_sigaction adapters update this authority after wire validation.
+    /// rt_sigaction's exchange (decoded by `carrick_signal_core::sigaction`)
+    /// installs here and applies the table's pending discard in the same
+    /// sighand admission.
     pub fn install_action(
         &self,
         key: TaskKey,
@@ -92,12 +94,12 @@ impl<T> NativeProcessSignals<T> {
             return Err(SignalActionError::Stale);
         }
         let mut resources = self.resources.lock();
-        let old = resources
+        let installed = resources
             .actions
             .install(signal, action)
             .map_err(SignalActionError::Action)?;
-        if action.disposition == Disposition::Ignore {
-            let selected = SignalSet::EMPTY.with(signal);
+        let selected = installed.discard;
+        if !selected.is_empty() {
             resources.inbox.pending_mut().discard(selected);
             let SignalResources {
                 thread_pending,
@@ -111,7 +113,7 @@ impl<T> NativeProcessSignals<T> {
             }
             thread_pending.retain(|(_, pending)| !pending.is_empty());
         }
-        Ok(old)
+        Ok(installed.previous)
     }
     pub fn forced_action(&self, signal: Signal, blocked: SigBlockMask) -> Action {
         let mut resources = self.resources.lock();
@@ -414,6 +416,39 @@ mod tests {
             Some((usr1, Some(43))),
             "blocked ignored signals remain waitable"
         );
+    }
+
+    /// signal(7)/sigaction(2): SIG_DFL whose default action is ignore also
+    /// discards the pending signal; a caught handler keeps it. Red before the
+    /// discard moved into `ActionTable::install`: the ring discarded only on
+    /// SIG_IGN.
+    #[test]
+    fn installing_default_for_default_ignored_signal_discards_pending() {
+        let task = key(43, 13);
+        let signals = NativeProcessSignals::<u32>::fresh_root(task);
+        let record = carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+            incarnation: 3,
+        };
+        let urg = Signal::from_number(23).unwrap();
+        let term = Signal::from_number(15).unwrap();
+        signals.enqueue(task, urg, None).unwrap();
+        signals.enqueue_thread(record, urg, None);
+        signals.enqueue_thread(record, term, None);
+        signals
+            .install_action(task, urg, Action::default())
+            .unwrap();
+        signals
+            .install_action(
+                task,
+                term,
+                Action {
+                    disposition: Disposition::Handler(HandlerAddress(0x4000)),
+                    ..Action::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(signals.pending_set(record), SignalSet::EMPTY.with(term));
     }
 
     #[test]

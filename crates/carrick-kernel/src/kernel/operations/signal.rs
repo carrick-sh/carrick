@@ -1365,8 +1365,12 @@ mod tests {
         // is about process-vs-thread queue ownership, not init immunity.
         let mut caught = carrick_abi::LinuxSigaction::empty();
         caught.sa_handler = 0x4000;
-        root.shared().sighand().install_action(sigusr1, caught);
-        root.shared().sighand().install_action(sigusr2, caught);
+        root.signal_authority()
+            .install_action(sigusr1, caught)
+            .expect("install action");
+        root.signal_authority()
+            .install_action(sigusr2, caught)
+            .expect("install action");
         let process_ticket = match kernel.authorize_signal_target_exact(
             &root,
             root.task().key(),
@@ -1597,14 +1601,18 @@ mod tests {
         }
         let mut caught = carrick_abi::LinuxSigaction::empty();
         caught.sa_handler = 0x4000;
-        init.shared().sighand().install_action(sigterm, caught);
+        init.signal_authority()
+            .install_action(sigterm, caught)
+            .expect("install action");
         assert_eq!(
             kernel.authorize_signal_target(&sender, init_id, None, Some(sigterm)),
             SignalTargetAuthorization::Allowed,
             "guest init may receive a signal for which it installed a handler",
         );
         let sigtstp = LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGTSTP).expect("SIGTSTP");
-        init.shared().sighand().install_action(sigtstp, caught);
+        init.signal_authority()
+            .install_action(sigtstp, caught)
+            .expect("install action");
         assert_eq!(
             kernel.authorize_signal_target(&sender, init_id, None, Some(sigtstp)),
             SignalTargetAuthorization::Allowed,

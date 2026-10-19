@@ -1820,6 +1820,14 @@ impl Task {
         } else {
             SigSet::EMPTY
         };
+        self.discard_pending_signals(signals);
+    }
+
+    /// Remove `signals` from the shared process queue and every live thread
+    /// queue of this task, while the caller holds
+    /// [`Self::lock_signal_generation`]. Job-control cancellation and the
+    /// sigaction(2) ignore discard share this one transition.
+    pub(in crate::kernel) fn discard_pending_signals(&self, signals: SigSet) {
         if signals.is_empty() {
             return;
         }

@@ -427,7 +427,10 @@ fn host_slot_signal_is_reserved_and_cancelled_into_exact_kernel_ownership() {
     context.signal_authority().set_blocked(persistent);
     let mut action = carrick_abi::LinuxSigaction::empty();
     action.sa_handler = 0x3330;
-    context.signal_authority().install_action(signal, action);
+    context
+        .signal_authority()
+        .install_action(signal, action)
+        .expect("install action");
     let continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::WaitOnFds {
             fds: WaitFds::empty(),
@@ -468,7 +471,10 @@ fn realtime_host_slot_import_preserves_fifo_multiplicity_and_exact_cancellation_
     for signal in [rt_a, rt_b] {
         let mut action = carrick_abi::LinuxSigaction::empty();
         action.sa_handler = 0x9000 + signal.raw() as u64;
-        context.signal_authority().install_action(signal, action);
+        context
+            .signal_authority()
+            .install_action(signal, action)
+            .expect("install action");
     }
     let first =
         crate::linux_abi::LinuxSiginfo::kill(32, crate::linux_abi::LINUX_SI_TKILL, 101, 201);

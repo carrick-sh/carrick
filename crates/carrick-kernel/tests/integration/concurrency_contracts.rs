@@ -233,7 +233,10 @@ fn shared_dispatcher_routes_sibling_thread_signals() {
     let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(10).unwrap();
     let mut action = carrick_kernel::linux_abi::LinuxSigaction::empty();
     action.sa_handler = 0x4000;
-    context.shared().sighand().install_action(signal, action);
+    context
+        .signal_authority()
+        .install_action(signal, action)
+        .expect("install action");
 
     let routed = dispatcher
         .dispatch_threaded(

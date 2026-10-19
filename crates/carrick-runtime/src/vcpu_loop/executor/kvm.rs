@@ -1721,7 +1721,10 @@ mod tests {
         let signal = LinuxSignal::for_signal_number(10).expect("SIGUSR1");
         let mut action = carrick_abi::LinuxSigaction::empty();
         action.sa_handler = 0x1234;
-        context.signal_authority().install_action(signal, action);
+        context
+            .signal_authority()
+            .install_action(signal, action)
+            .expect("install action");
         context
             .signal_authority()
             .enqueue_thread_standard(signal, None);
@@ -1811,7 +1814,10 @@ mod tests {
         let signal = LinuxSignal::for_signal_number(10).expect("SIGUSR1");
         let mut action = carrick_abi::LinuxSigaction::empty();
         action.sa_handler = 0x1234;
-        context.signal_authority().install_action(signal, action);
+        context
+            .signal_authority()
+            .install_action(signal, action)
+            .expect("install action");
         context
             .signal_authority()
             .enqueue_thread_standard(signal, None);

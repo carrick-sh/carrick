@@ -2224,13 +2224,15 @@ mod tests {
         let usr1 = LinuxSignal::for_signal_number(10).unwrap();
         let rt = LinuxSignal::for_signal_number(34).unwrap();
         let authority = context.signal_authority();
-        authority.install_action(
-            usr1,
-            LinuxSigaction {
-                sa_handler: 0x1234,
-                ..LinuxSigaction::empty()
-            },
-        );
+        authority
+            .install_action(
+                usr1,
+                LinuxSigaction {
+                    sa_handler: 0x1234,
+                    ..LinuxSigaction::empty()
+                },
+            )
+            .expect("install action");
         authority.set_blocked(SigSet::EMPTY.with(10));
         authority.enqueue_task_standard(usr1, None);
         authority.enqueue_thread_realtime(rt, Some(LinuxSiginfo::rt_queue(34, 7, 8, 9)));

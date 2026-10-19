@@ -2220,10 +2220,9 @@ mod tests {
         let (kernel, root) = bootstrap(19_630);
         let mut ign_action = carrick_abi::LinuxSigaction::empty();
         ign_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
-        root.task()
-            .shared()
-            .sighand()
-            .install_action(crate::kernel::ids::LinuxSignal::SIGCHLD, ign_action);
+        root.signal_authority()
+            .install_action(crate::kernel::ids::LinuxSignal::SIGCHLD, ign_action)
+            .expect("install action");
 
         let plan = ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan");
         let child = kernel
@@ -2253,10 +2252,9 @@ mod tests {
         let (kernel, root) = bootstrap(19_640);
         let mut ign_action = carrick_abi::LinuxSigaction::empty();
         ign_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
-        root.task()
-            .shared()
-            .sighand()
-            .install_action(crate::kernel::ids::LinuxSignal::SIGCHLD, ign_action);
+        root.signal_authority()
+            .install_action(crate::kernel::ids::LinuxSignal::SIGCHLD, ign_action)
+            .expect("install action");
 
         let wake_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let wake_count_cb = Arc::clone(&wake_count);

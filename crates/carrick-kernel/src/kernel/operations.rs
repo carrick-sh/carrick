@@ -2102,12 +2102,14 @@ pub(super) mod tests {
         let caught = LinuxSignal::for_signal_number(3).expect("caught signal");
         let mut ignored_action = LinuxSigaction::empty();
         ignored_action.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
-        root.shared
-            .sighand()
-            .install_action(ignored, ignored_action);
+        root.signal_authority()
+            .install_action(ignored, ignored_action)
+            .expect("install action");
         let mut caught_action = LinuxSigaction::empty();
         caught_action.sa_handler = 0x3000;
-        root.shared.sighand().install_action(caught, caught_action);
+        root.signal_authority()
+            .install_action(caught, caught_action)
+            .expect("install action");
         let parent_signals =
             ThreadSignalState::new(SigSet::EMPTY.with(4), SigSet::EMPTY.with(5), true, 2);
         root.thread.replace_signal_state(parent_signals.clone());

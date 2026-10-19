@@ -56,7 +56,10 @@ pub fn install_guest_signal_handler(context: &carrick_kernel::kernel::KernelCont
         carrick_kernel::kernel::LinuxSignal::for_signal_number(signal).expect("valid test signal");
     let mut action = LinuxSigaction::empty();
     action.sa_handler = 0x4000;
-    context.shared().sighand().install_action(signal, action);
+    context
+        .signal_authority()
+        .install_action(signal, action)
+        .expect("install action");
 }
 pub use carrick_test_support::{gzip_tar, gzip_tar_with_links, gzip_tar_with_modes};
 pub use zerocopy::{FromBytes, IntoBytes};

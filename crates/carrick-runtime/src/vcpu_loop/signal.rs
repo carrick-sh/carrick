@@ -2250,8 +2250,12 @@ mod tests {
         restart.sa_flags = carrick_abi::LINUX_SA_RESTART;
         let mut no_restart = carrick_abi::LinuxSigaction::empty();
         no_restart.sa_handler = 0x2220;
-        authority.install_action(first, restart);
-        authority.install_action(second, no_restart);
+        authority
+            .install_action(first, restart)
+            .expect("install action");
+        authority
+            .install_action(second, no_restart)
+            .expect("install action");
         authority.enqueue_thread_standard(first, None);
         let dequeued = authority
             .take_lowest_in(carrick_abi::SigSet::EMPTY.with(10))
@@ -2374,7 +2378,9 @@ mod tests {
         );
         let mut ignored = carrick_abi::LinuxSigaction::empty();
         ignored.sa_handler = carrick_abi::LINUX_SIG_IGN;
-        authority.install_action(signal, ignored);
+        authority
+            .install_action(signal, ignored)
+            .expect("install action");
 
         let action = deliver_reserved_signal_with_restart(
             &mut NoopTrap::default(),
@@ -2508,7 +2514,10 @@ mod tests {
         let mut caught = carrick_abi::LinuxSigaction::empty();
         caught.sa_handler = 0x7000;
         caught.sa_flags = carrick_abi::LINUX_SA_SIGINFO;
-        context.signal_authority().install_action(signal, caught);
+        context
+            .signal_authority()
+            .install_action(signal, caught)
+            .expect("install action");
         let mut trap = NoopTrap::default();
         assert!(matches!(
             inject_fault_signal(
@@ -2555,7 +2564,10 @@ mod tests {
             .set_blocked(carrick_abi::SigSet::EMPTY);
         let mut ignored = carrick_abi::LinuxSigaction::empty();
         ignored.sa_handler = carrick_abi::LINUX_SIG_IGN;
-        context.signal_authority().install_action(signal, ignored);
+        context
+            .signal_authority()
+            .install_action(signal, ignored)
+            .expect("install action");
         assert!(matches!(
             inject_fault_signal(
                 &mut NoopTrap::default(),
@@ -2697,7 +2709,10 @@ mod tests {
             .expect("SIGUSR1");
             let mut action = carrick_abi::LinuxSigaction::empty();
             action.sa_handler = 0x1234;
-            context.signal_authority().install_action(signal, action);
+            context
+                .signal_authority()
+                .install_action(signal, action)
+                .expect("install action");
             dispatcher.mark_signal_pending(&context, tid, crate::linux_abi::LINUX_SIGUSR1);
             let mut trap = NoopTrap::default();
             let delivered = deliver_pending_signal_with_restart(

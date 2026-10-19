@@ -3413,7 +3413,9 @@ fn signal_restart_is_derived_from_captured_kernel_action_not_event_input() {
     action.sa_handler = 0x1234;
     action.sa_flags = carrick_abi::LINUX_SA_RESTART;
     let authority = context.signal_authority();
-    authority.install_action(signal, action);
+    authority
+        .install_action(signal, action)
+        .expect("install action");
     authority.enqueue_thread_standard(signal, None);
     let continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::WaitOnFds {
@@ -3452,10 +3454,14 @@ fn reserved_signal_keeps_exact_action_when_opposite_restart_signal_arrives_befor
     restart.sa_flags = carrick_abi::LINUX_SA_RESTART;
     let mut no_restart = carrick_abi::LinuxSigaction::empty();
     no_restart.sa_handler = 0x2220;
-    context.signal_authority().install_action(first, restart);
     context
         .signal_authority()
-        .install_action(second, no_restart);
+        .install_action(first, restart)
+        .expect("install action");
+    context
+        .signal_authority()
+        .install_action(second, no_restart)
+        .expect("install action");
     context
         .signal_authority()
         .enqueue_thread_standard(first, None);
@@ -3499,8 +3505,12 @@ fn ignored_lower_signal_does_not_hide_next_exact_deliverable_reservation() {
     let mut caught_action = carrick_abi::LinuxSigaction::empty();
     caught_action.sa_handler = 0x4440;
     let authority = context.signal_authority();
-    authority.install_action(ignored, ignore_action);
-    authority.install_action(caught, caught_action);
+    authority
+        .install_action(ignored, ignore_action)
+        .expect("install action");
+    authority
+        .install_action(caught, caught_action)
+        .expect("install action");
     authority.enqueue_thread_standard(ignored, None);
     authority.enqueue_thread_standard(caught, None);
     let continuation = BlockedContinuation::from_dispatch_outcome(
@@ -3527,7 +3537,9 @@ fn kernel_signal_reservation_is_atomic_across_two_waiters_and_two_instances() {
         let signal = crate::kernel::LinuxSignal::for_signal_number(signum).expect("signal");
         let mut action = carrick_abi::LinuxSigaction::empty();
         action.sa_handler = 0x5000 + signum as u64;
-        authority.install_action(signal, action);
+        authority
+            .install_action(signal, action)
+            .expect("install action");
         authority.enqueue_thread_standard(signal, None);
     }
     let barrier = Arc::new(Barrier::new(3));
@@ -3574,7 +3586,9 @@ fn kernel_signal_reservation_linearizes_disposition_and_mask_changes() {
         let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
         let mut initial = carrick_abi::LinuxSigaction::empty();
         initial.sa_handler = initial_handler;
-        authority.install_action(signal, initial);
+        authority
+            .install_action(signal, initial)
+            .expect("install action");
         authority.enqueue_thread_standard(signal, None);
         let barrier = Arc::new(Barrier::new(3));
         let reserve_authority = authority.clone();
@@ -3589,7 +3603,9 @@ fn kernel_signal_reservation_linearizes_disposition_and_mask_changes() {
             action_barrier.wait();
             let mut replacement = carrick_abi::LinuxSigaction::empty();
             replacement.sa_handler = replacement_handler;
-            action_authority.install_action(signal, replacement);
+            action_authority
+                .install_action(signal, replacement)
+                .expect("install action");
         });
         barrier.wait();
         changer.join().expect("action changer");
@@ -3609,7 +3625,9 @@ fn kernel_signal_reservation_linearizes_disposition_and_mask_changes() {
     let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
     let mut action = carrick_abi::LinuxSigaction::empty();
     action.sa_handler = 0x8000;
-    authority.install_action(signal, action);
+    authority
+        .install_action(signal, action)
+        .expect("install action");
     authority.enqueue_thread_standard(signal, None);
     let barrier = Arc::new(Barrier::new(3));
     let reserve_authority = authority.clone();
@@ -3646,7 +3664,10 @@ fn partial_blocking_write_never_restarts_after_caught_sa_restart_signal() {
     let mut action = carrick_abi::LinuxSigaction::empty();
     action.sa_handler = 0x1234;
     action.sa_flags = carrick_abi::LINUX_SA_RESTART;
-    context.signal_authority().install_action(signal, action);
+    context
+        .signal_authority()
+        .install_action(signal, action)
+        .expect("install action");
     context
         .signal_authority()
         .enqueue_thread_standard(signal, None);
@@ -3758,7 +3779,10 @@ fn signal_readiness_honors_replace_additive_ignore_and_live_restart_action() {
     let chld = crate::kernel::LinuxSignal::for_signal_number(17).expect("SIGCHLD");
     let mut ignored = carrick_abi::LinuxSigaction::empty();
     ignored.sa_handler = carrick_abi::LINUX_SIG_IGN;
-    context.signal_authority().install_action(chld, ignored);
+    context
+        .signal_authority()
+        .install_action(chld, ignored)
+        .expect("install action");
     context
         .signal_authority()
         .enqueue_thread_standard(chld, None);

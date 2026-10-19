@@ -1742,7 +1742,10 @@ mod ipc_tests {
         let signal =
             carrick_kernel::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGPIPE)
                 .unwrap();
-        context.shared().sighand().install_action(signal, ign);
+        context
+            .signal_authority()
+            .install_action(signal, ign)
+            .expect("install action");
         ipc_complete(&dispatcher, &context, tid, epipe, true);
         assert!(!sigpipe_pending(&context), "SIG_IGN suppresses SIGPIPE");
     }

@@ -24,10 +24,10 @@ Docker-blessed; the error-order lines (err_*) in particular need the oracle.
 """
 
 [bindings]
+vm_free = "carrick-signal-core::sigaction::tests::{codec_round_trips_named_flags_and_strips_unblockable_mask,errors_follow_the_one_fixed_order,unwritable_oldact_faults_after_the_install_commits,signum_is_the_low_c_int}; carrick-kernel::dispatch::signal::tests::{rt_sigaction_ignore_discards_process_and_every_thread_pending,rt_sigaction_host_lane_uses_the_shared_error_order,rt_sigaction_exec_resets_caught_keeps_ignored_and_pending}; carrick-el1-linux::native_process_signals::tests::installing_ignore_discards_process_and_thread_pending; carrick-el1-linux::native_process_signals::tests::installing_default_for_default_ignored_signal_discards_pending"
 embed = "probe:sigignpending"
 docker = "probe:sigignpending"
 
 [bindings.unresolved]
-vm_free = "The shared-core move and its host-lane dispatcher tests land in the next layer of this stack."
 docker = "Predicted Linux lines are committed; the Docker bless (gnu and musl) is pending."
 embed_structural = "Signed probe run pending (no HVF in this lane)."

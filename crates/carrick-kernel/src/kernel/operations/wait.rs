@@ -664,10 +664,9 @@ mod tests {
         let (kernel, root) = bootstrap(500);
         let mut ign_action = carrick_abi::LinuxSigaction::empty();
         ign_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
-        root.task
-            .shared()
-            .sighand()
-            .install_action(LinuxSignal::SIGCHLD, ign_action);
+        root.signal_authority()
+            .install_action(LinuxSignal::SIGCHLD, ign_action)
+            .expect("install action");
 
         let child = kernel
             .fork_task(
@@ -708,10 +707,9 @@ mod tests {
         let (kernel, root) = bootstrap(600);
         let mut nocldwait_action = carrick_abi::LinuxSigaction::empty();
         nocldwait_action.sa_flags = carrick_abi::LINUX_SA_NOCLDWAIT;
-        root.task
-            .shared()
-            .sighand()
-            .install_action(LinuxSignal::SIGCHLD, nocldwait_action);
+        root.signal_authority()
+            .install_action(LinuxSignal::SIGCHLD, nocldwait_action)
+            .expect("install action");
 
         let child = kernel
             .fork_task(
@@ -741,10 +739,9 @@ mod tests {
         let (kernel, root) = bootstrap(700);
         let mut ign_action = carrick_abi::LinuxSigaction::empty();
         ign_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
-        root.task
-            .shared()
-            .sighand()
-            .install_action(LinuxSignal::SIGCHLD, ign_action);
+        root.signal_authority()
+            .install_action(LinuxSignal::SIGCHLD, ign_action)
+            .expect("install action");
 
         let plan = ClonePlan::from_flags(LinuxCloneFlags::empty())
             .expect("fork plan")
@@ -791,10 +788,9 @@ mod tests {
         let (kernel, root) = bootstrap(850);
         let mut ign_action = carrick_abi::LinuxSigaction::empty();
         ign_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
-        root.task
-            .shared()
-            .sighand()
-            .install_action(LinuxSignal::SIGCHLD, ign_action);
+        root.signal_authority()
+            .install_action(LinuxSignal::SIGCHLD, ign_action)
+            .expect("install action");
 
         let child1 = kernel
             .fork_task(
@@ -827,10 +823,9 @@ mod tests {
 
         // Reset SIGCHLD to default for ordinary zombie reaping test
         let dfl_action = carrick_abi::LinuxSigaction::empty();
-        root.task
-            .shared()
-            .sighand()
-            .install_action(LinuxSignal::SIGCHLD, dfl_action);
+        root.signal_authority()
+            .install_action(LinuxSignal::SIGCHLD, dfl_action)
+            .expect("install action");
 
         let child2 = kernel
             .fork_task(
@@ -874,10 +869,9 @@ mod tests {
         let (kernel, root) = bootstrap(900);
         let mut ign_action = carrick_abi::LinuxSigaction::empty();
         ign_action.sa_handler = carrick_abi::LINUX_SIG_IGN;
-        root.task
-            .shared()
-            .sighand()
-            .install_action(LinuxSignal::SIGCHLD, ign_action);
+        root.signal_authority()
+            .install_action(LinuxSignal::SIGCHLD, ign_action)
+            .expect("install action");
 
         let child = kernel
             .fork_task(

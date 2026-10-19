@@ -3853,7 +3853,9 @@ pub(crate) mod tests {
                 .expect("SIGUSR1");
                 let mut action = carrick_abi::LinuxSigaction::empty();
                 action.sa_handler = 0x4000;
-                root.signal_authority().install_action(signal, action);
+                root.signal_authority()
+                    .install_action(signal, action)
+                    .expect("install action");
                 let ticket = match root.kernel().authorize_signal_target_exact(
                     &root,
                     root.task().key(),

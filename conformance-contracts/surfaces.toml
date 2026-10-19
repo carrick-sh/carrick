@@ -984,7 +984,7 @@ contracts = ["x86.carrier.cli-run"]
 # Linux pending-signal policy and its unchanged VM-free owner contracts.
 [[surfaces]]
 path = "crates/carrick-personality-linux/src/signal.rs"
-contracts = ["kernel.el1.signal-delivery-owner"]
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.signal.disposition-authority"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/tests/signal_policy_contract.rs"
@@ -1018,7 +1018,7 @@ contracts = ["kernel.el1.thread-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_process_signals.rs"
-contracts = ["kernel.el1.thread-lifecycle", "kernel.el1.signal-delivery-owner"]
+contracts = ["kernel.el1.thread-lifecycle", "kernel.el1.signal-delivery-owner", "kernel.signal.disposition-authority"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_process_entry.rs"
@@ -1599,3 +1599,19 @@ contracts = ["kernel.mm.invalidation-domain"]
 [[surfaces]]
 path = "crates/carrick-core/src/mm/retirement/invalidation/loom_models.rs"
 contracts = ["kernel.mm.invalidation-domain"]
+
+[[surfaces]]
+path = "crates/carrick-signal-core/src/sigaction.rs"
+contracts = ["kernel.signal.disposition-authority"]
+
+[[surfaces]]
+path = "crates/carrick-signal-core/src/policy.rs"
+contracts = ["kernel.signal.disposition-authority"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/objects/signal.rs"
+contracts = ["kernel.signal.disposition-authority"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/signal.rs"
+contracts = ["kernel.signal.disposition-authority"]

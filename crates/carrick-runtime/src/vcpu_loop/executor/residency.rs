@@ -609,7 +609,9 @@ mod tests {
             } else {
                 0
             };
-            authority.install_action(signal, action);
+            authority
+                .install_action(signal, action)
+                .expect("install action");
             authority.enqueue_thread_standard(signal, None);
             let dequeued = authority
                 .take_lowest_in(carrick_abi::SigSet::EMPTY.with(10))

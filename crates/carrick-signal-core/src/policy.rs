@@ -3,9 +3,9 @@
 //! Semantic authority: <https://man7.org/linux/man-pages/man7/signal.7.html>,
 //! sigaction(2), sigprocmask(2), sigsuspend(2), wait(2), clone(2), fork(2)
 //! and execve(2). Numbering is Linux asm-generic, as used by AArch64.
-//! `carrick-abi` owns wire layouts; this core owns semantic domains and named
-//! policy flags. The adapter translates the wire flags without duplicating ABI
-//! records or importing host facilities.
+//! `carrick-syscall-abi` owns wire layouts; this core owns semantic domains,
+//! named policy flags and (in [`crate::sigaction`]) the one rt_sigaction wire
+//! decoder every lane calls. It imports no host facilities.
 //!
 //! The consuming EL1 owner serializes action lookup/reset, pending dequeue and
 //! mask publication in one transaction. No graph, lock or scheduler is created
@@ -153,9 +153,33 @@ pub struct Action {
     pub restorer: Option<RestorerAddress>,
 }
 
+impl Action {
+    /// Whether installing this action discards `signal` from every pending
+    /// set it occupies, blocked or not. POSIX (signal(7) and sigaction(2)):
+    /// setting SIG_IGN, or SIG_DFL where the default action is to ignore,
+    /// discards the pending signal. A caught handler leaves it pending.
+    pub fn discards_pending(self, signal: Signal) -> bool {
+        match self.disposition {
+            Disposition::Ignore => true,
+            Disposition::Default => default_delivery(signal) == Delivery::Ignore,
+            Disposition::Handler(_) => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionError {
     Uncatchable,
+}
+
+/// The result of one install: the previous action and the signals the owner
+/// must remove from its process and thread pending sets in the same
+/// admission. The table cannot see pending state; the set is the obligation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "the owner must apply the pending discard"]
+pub struct Installation {
+    pub previous: Action,
+    pub discard: SignalSet,
 }
 
 /// One sighand's actions. Missing entries are SIG_DFL. BTreeMap keys have a
@@ -170,16 +194,52 @@ impl ActionTable {
         self.actions.get(&signal).copied().unwrap_or_default()
     }
 
-    /// Return the old action, or reject any installation on SIGKILL/SIGSTOP.
-    pub fn install(&mut self, signal: Signal, action: Action) -> Result<Action, ActionError> {
+    /// The stored entry: `None` is an action never installed (implicit
+    /// SIG_DFL), distinct from an explicit SIG_DFL with retained metadata.
+    pub fn entry(&self, signal: Signal) -> Option<Action> {
+        self.actions.get(&signal).copied()
+    }
+
+    /// Stored entries in signal order.
+    pub fn entries(&self) -> impl Iterator<Item = (Signal, Action)> + '_ {
+        self.actions
+            .iter()
+            .map(|(&signal, &action)| (signal, action))
+    }
+
+    /// Build a table from stored entries, refusing SIGKILL/SIGSTOP exactly as
+    /// [`Self::install`] does. Rebuilding pending state is not implied.
+    pub fn from_entries(
+        entries: impl IntoIterator<Item = (Signal, Action)>,
+    ) -> Result<Self, ActionError> {
+        let mut actions = BTreeMap::new();
+        for (signal, action) in entries {
+            if signal.uncatchable() {
+                return Err(ActionError::Uncatchable);
+            }
+            actions.insert(signal, action);
+        }
+        Ok(Self { actions })
+    }
+
+    /// Install `action`, rejecting SIGKILL/SIGSTOP. The returned
+    /// [`Installation`] names the pending discard the owner must apply.
+    pub fn install(&mut self, signal: Signal, action: Action) -> Result<Installation, ActionError> {
         if signal.uncatchable() {
             return Err(ActionError::Uncatchable);
         }
-        Ok(self.actions.insert(signal, action).unwrap_or_default())
+        let previous = self.actions.insert(signal, action).unwrap_or_default();
+        let discard = if action.discards_pending(signal) {
+            SignalSet::EMPTY.with(signal)
+        } else {
+            SignalSet::EMPTY
+        };
+        Ok(Installation { previous, discard })
     }
 
-    /// Exec makes a private table: caught handlers reset and ignored actions
-    /// stay ignored. Reset default metadata as the existing kernel Sighand does.
+    /// execve(2): caught handlers reset to SIG_DFL (their entries are
+    /// removed) and ignored actions stay ignored with their stored metadata.
+    /// The pending set and the signal mask are the owner's, preserved.
     pub fn clone_for_exec(&self) -> Self {
         Self {
             actions: self

@@ -271,6 +271,7 @@ lint-domains-source:
     python3 scripts/migrate/check-dispatch-lock-authority.py --self-test
     python3 scripts/migrate/check-serial-host-tests.py --self-test
     python3 scripts/migrate/check-pipe-core-boundary.py --self-test
+    python3 scripts/migrate/check-signal-core-boundary.py --self-test
     python3 scripts/migrate/check-address-domains.py --self-test
     # Discovery and structural rules run their negative fixture suites
     # before their production checks. Keep the list named
@@ -300,6 +301,7 @@ lint-domains-source:
     cargo run --locked -p carrick-xtask -- authority-debt --source-only
     python3 scripts/migrate/check-serial-host-tests.py
     python3 scripts/migrate/check-pipe-core-boundary.py
+    python3 scripts/migrate/check-signal-core-boundary.py
 
 
 

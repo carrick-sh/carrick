@@ -2045,88 +2045,25 @@ impl<'a> SignalView<'a> {
         }
 
         /// rt_sigaction(signum, new_action, old_action, sigset_size): configure handler.
+        /// Decoding, validation and error order are `carrick_signal_core::sigaction`'s;
+        /// this lane supplies guest memory, the Kernel sighand and host mirroring.
         fn rt_sigaction(this, cx, signum: Signal, new_action: GuestPtr, old_action: GuestPtr, sigset_size: u64) {
-            let signum = signum.0;
-            let new_action = new_action.0;
-            let old_action = old_action.0;
-            let memory = &mut *cx.memory;
-            if sigset_size != LINUX_RT_SIGSET_SIZE {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            if !(1..=64).contains(&signum) {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            let new_sa = if new_action != 0 {
-                let bytes =
-                    match memory.read_bytes(new_action, core::mem::size_of::<LinuxSigaction>()) {
-                        Ok(bytes) => bytes,
-                        Err(_) => {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        }
-                    };
-                if signum == LINUX_SIGKILL || signum == LINUX_SIGSTOP {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                match LinuxSigaction::ref_from_bytes(&bytes) {
-                    Ok(sa) => {
-                        let w = |o: usize| {
-                            bytes
-                                .get(o..o + 8)
-                                .and_then(|s| s.try_into().ok())
-                                .map(u64::from_le_bytes)
-                                .unwrap_or(0)
-                        };
-                        crate::probes::sigaction_read(signum, w(0), w(8), w(16), w(24));
-                        Some(*sa)
-                    }
-                    Err(_) => {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                }
-            } else {
-                None
+            let mut port = HostSigactionPort {
+                signum: signum.0,
+                dispatcher: this,
+                kernel: cx.kernel,
+                memory: &mut *cx.memory,
             };
-            if old_action != 0 {
-                let prev = Self::signal_action_static(cx.kernel, signum);
-                if write_kernel_struct_raw(memory, old_action, &prev).is_err() {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
+            let args = carrick_signal_core::sigaction::SigactionArgs::from_registers([
+                signum.0 as u64,
+                new_action.0,
+                old_action.0,
+                sigset_size,
+            ]);
+            match carrick_signal_core::sigaction::rt_sigaction(args, &mut port) {
+                Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
-            if let Some(sa) = new_sa {
-                Self::install_signal_action(cx.kernel, signum, sa);
-                let h = sa.sa_handler;
-                let real_handler =
-                    h != crate::linux_abi::LINUX_SIG_DFL && h != crate::linux_abi::LINUX_SIG_IGN;
-                if real_handler {
-                    this.cross.host_signal().ensure_host_handler(signum);
-                    this.request_signal_pump();
-                } else if h == crate::linux_abi::LINUX_SIG_IGN {
-                    // Mirror SIG_IGN to the host disposition so a CROSS-PROCESS
-                    // kill from a sibling guest process is dropped instead of
-                    // host-default-terminating us (test_interprocess_signal:
-                    // SIGUSR2=SIG_IGN + child kill → parent died -12; probe
-                    // xprocsigign). Excludes faults/carrick-managed signals.
-                    this.cross.host_signal().set_host_ignore(signum);
-                } else {
-                    // h == SIG_DFL: the guest reset the disposition to default.
-                    // Clear any host SIG_IGN / routed handler that was mirrored
-                    // earlier and possibly INHERITED across fork, so the host no
-                    // longer swallows the signal. This is what makes Ctrl-Z work:
-                    // a job-control shell sets SIGTSTP=SIG_IGN for itself, then
-                    // each forked child resets SIGTSTP to SIG_DFL before exec; the
-                    // pty's ^Z (host SIGTSTP) must then actually stop the job
-                    // instead of being discarded by the inherited host SIG_IGN.
-                    this.cross.host_signal().set_host_default(signum);
-                }
-                // pid-1 protection (§5.4): if WE are the ns-init, publish whether
-                // we now handle this signal so the kill path knows not to drop a
-                // handled signal (and to drop an unhandled default-lethal one).
-                // A non-init member's handler table is irrelevant to this.
-                if crate::namespace::pid::self_ns_pid() == crate::namespace::pid::NS_INIT_PID {
-                    crate::namespace::pid::set_init_handler(signum, real_handler);
-                }
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         /// rt_sigprocmask(how, new_set, old_set, sigset_size): configure blocked mask.
@@ -2627,6 +2564,90 @@ impl<'a> SignalView<'a> {
     }
 }
 
+/// The host dispatcher's guest memory, Kernel sighand and host-disposition
+/// mirror behind the one shared rt_sigaction decoder.
+struct HostSigactionPort<'v, 'a, 'k, 'm, M: CurrentMmMemory> {
+    signum: i32,
+    dispatcher: &'v SignalView<'a>,
+    kernel: &'k crate::kernel::KernelContext,
+    memory: &'m mut M,
+}
+
+impl<M: CurrentMmMemory> carrick_signal_core::sigaction::SigactionPort
+    for HostSigactionPort<'_, '_, '_, '_, M>
+{
+    fn read_action(&mut self, act: u64) -> Option<LinuxSigaction> {
+        let bytes = self
+            .memory
+            .read_bytes(act, core::mem::size_of::<LinuxSigaction>())
+            .ok()?;
+        let action = LinuxSigaction::read_from_bytes(&bytes).ok()?;
+        crate::probes::sigaction_read(
+            self.signum,
+            action.sa_handler,
+            action.sa_flags,
+            action.sa_restorer,
+            action.sa_mask[0],
+        );
+        Some(action)
+    }
+
+    fn exchange(
+        &mut self,
+        signal: carrick_signal_core::policy::Signal,
+        new: Option<carrick_signal_core::policy::Action>,
+    ) -> Result<carrick_signal_core::policy::Action, LinuxErrno> {
+        let signum = signal.number();
+        let kernel_signal =
+            crate::kernel::LinuxSignal::for_signal_number(signum).map_err(|_| LINUX_EINVAL)?;
+        let Some(action) = new else {
+            return Ok(carrick_signal_core::sigaction::decode_action(
+                self.kernel.shared().sighand().action(kernel_signal),
+            ));
+        };
+        let previous = self
+            .kernel
+            .signal_authority()
+            .install_action(
+                kernel_signal,
+                carrick_signal_core::sigaction::encode_action(action),
+            )
+            .map_err(|_| LINUX_EINVAL)?;
+        let host = self.dispatcher.cross.host_signal();
+        let real_handler = matches!(
+            action.disposition,
+            carrick_signal_core::policy::Disposition::Handler(_)
+        );
+        match action.disposition {
+            carrick_signal_core::policy::Disposition::Handler(_) => {
+                host.ensure_host_handler(signum);
+                self.dispatcher.request_signal_pump();
+            }
+            // Mirror SIG_IGN to the host disposition so a CROSS-PROCESS kill
+            // from a sibling guest process is dropped instead of
+            // host-default-terminating us (test_interprocess_signal; probe
+            // xprocsigign). Excludes faults/carrick-managed signals.
+            carrick_signal_core::policy::Disposition::Ignore => host.set_host_ignore(signum),
+            // SIG_DFL: clear any host SIG_IGN / routed handler mirrored earlier
+            // and possibly INHERITED across fork, so the host no longer
+            // swallows the signal (Ctrl-Z: a job-control shell ignores SIGTSTP,
+            // each forked child resets it to SIG_DFL before exec).
+            carrick_signal_core::policy::Disposition::Default => host.set_host_default(signum),
+        }
+        // pid-1 protection (5.4): if WE are the ns-init, publish whether we now
+        // handle this signal so the kill path knows not to drop a handled
+        // signal (and to drop an unhandled default-lethal one).
+        if crate::namespace::pid::self_ns_pid() == crate::namespace::pid::NS_INIT_PID {
+            crate::namespace::pid::set_init_handler(signum, real_handler);
+        }
+        Ok(carrick_signal_core::sigaction::decode_action(previous))
+    }
+
+    fn write_action(&mut self, oldact: u64, old: LinuxSigaction) -> bool {
+        write_kernel_struct_raw(self.memory, oldact, &old).is_ok()
+    }
+}
+
 macro_rules! forward_signal_handlers {
     ($( $handler:ident ),* $(,)?) => {
         impl SyscallDispatcher {
@@ -2727,7 +2748,16 @@ impl SyscallDispatcher {
                     "invalid signal reached Kernel Sighand install"
                 );
             });
-        context.shared().sighand().install_action(signal, action);
+        if context
+            .signal_authority()
+            .install_action(signal, action)
+            .is_err()
+        {
+            carrick_fatal!(
+                "dispatch::signal_disposition",
+                "SIGKILL/SIGSTOP action reached Kernel Sighand install"
+            );
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -3834,15 +3864,17 @@ mod tests {
             .unwrap();
         let usr2 =
             crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGUSR2).unwrap();
-        root.shared().sighand().install_action(
-            usr2,
-            LinuxSigaction {
-                sa_handler: 0x1234_0000,
-                sa_flags: 0,
-                sa_restorer: 0,
-                sa_mask: [0],
-            },
-        );
+        root.signal_authority()
+            .install_action(
+                usr2,
+                LinuxSigaction {
+                    sa_handler: 0x1234_0000,
+                    sa_flags: 0,
+                    sa_restorer: 0,
+                    sa_mask: [0],
+                },
+            )
+            .expect("install action");
 
         let target = hvpatch_process_signal_target(&peer, sibling_tid.raw())
             .expect("the peer resolves the sibling tid");
@@ -4051,7 +4083,8 @@ mod tests {
         let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("signal");
         let action = LinuxSigaction {
             sa_handler: 0x1234_0000,
-            sa_flags: crate::linux_abi::LINUX_SA_SIGINFO,
+            // The restorer is retained only with SA_RESTORER (sigaction(2)).
+            sa_flags: crate::linux_abi::LINUX_SA_SIGINFO | carrick_abi::LINUX_SA_RESTORER,
             sa_restorer: 0x5678_0000,
             sa_mask: [0x55],
         };
@@ -5977,6 +6010,359 @@ mod tests {
         fn linux_to_host_signum(&self, _: i32) -> i32 {
             panic!("unexpected host signal operation in sigsuspend fixture")
         }
+    }
+
+    /// The host-disposition mirror is the only host effect rt_sigaction has;
+    /// record it so the fixture never changes the test process's dispositions.
+    #[derive(Debug, Default)]
+    struct HostDispositionRecorder(parking_lot::Mutex<Vec<(&'static str, i32)>>);
+    #[allow(clippy::panic)]
+    impl carrick_hal::HostSignalBridge for HostDispositionRecorder {
+        fn has_unblocked_pending_for(&self, _: i32, _: SigBlockMask) -> bool {
+            false
+        }
+        fn take_pending_for(&self, _: i32) -> i32 {
+            panic!("unexpected host signal operation in rt_sigaction fixture")
+        }
+        fn take_pending_in_for(&self, _: i32, _: SigSet) -> i32 {
+            panic!("unexpected host signal operation in rt_sigaction fixture")
+        }
+        fn publish_pending_for(&self, _: i32, _: i32) {
+            panic!("unexpected host signal operation in rt_sigaction fixture")
+        }
+        fn publish_process_signal(&self, _: i32) {
+            panic!("unexpected host signal operation in rt_sigaction fixture")
+        }
+        fn last_sender_for(&self, _: i32) -> i32 {
+            panic!("unexpected host signal operation in rt_sigaction fixture")
+        }
+        fn raise_for_self(&self, _: i32) {
+            panic!("unexpected host signal operation in rt_sigaction fixture")
+        }
+        fn wake_all_waiters(&self) {
+            panic!("unexpected host signal operation in rt_sigaction fixture")
+        }
+        fn ensure_host_handler(&self, signum: i32) {
+            self.0.lock().push(("ensure_host_handler", signum));
+        }
+        fn set_host_ignore(&self, signum: i32) {
+            self.0.lock().push(("set_host_ignore", signum));
+        }
+        fn set_host_default(&self, signum: i32) {
+            self.0.lock().push(("set_host_default", signum));
+        }
+        fn reset_routed_handlers_after_execve(&self, ignored: SigSet) {
+            self.0
+                .lock()
+                .push(("reset_routed_handlers_after_execve", ignored.raw() as i32));
+        }
+        fn xsig_enqueue(&self, _: i32, _: i32, _: i32, _: i32, _: u32, _: i64, _: i32) -> bool {
+            panic!("unexpected host signal operation in rt_sigaction fixture")
+        }
+        fn xsig_nudge(&self, _: i32) {
+            panic!("unexpected host signal operation in rt_sigaction fixture")
+        }
+        fn xsig_drain_for_self(&self) -> Vec<(i32, i32, i32, u32, i64, i32)> {
+            panic!("unexpected host signal operation in rt_sigaction fixture")
+        }
+        fn host_to_linux_signum(&self, _: i32) -> i32 {
+            panic!("unexpected host signal operation in rt_sigaction fixture")
+        }
+        fn linux_to_host_signum(&self, _: i32) -> i32 {
+            panic!("unexpected host signal operation in rt_sigaction fixture")
+        }
+    }
+
+    const SIGACTION_ACT: u64 = 0x1000;
+    const SIGACTION_OLD: u64 = 0x1100;
+    const SIGACTION_SET: u64 = 0x1200;
+
+    fn sigaction_fixture() -> (SyscallDispatcher, Arc<HostDispositionRecorder>) {
+        let recorder = Arc::new(HostDispositionRecorder::default());
+        let dispatcher = SyscallDispatcher::with_bridges(super::super::CarrierBridges {
+            host_signal: recorder.clone(),
+            timers: Arc::new(carrick_hal::NullGuestTimerBridge::default()),
+        });
+        (dispatcher, recorder)
+    }
+
+    /// rt_sigaction through the real dispatcher table, with `act` (when
+    /// given) written at `SIGACTION_ACT` first.
+    fn dispatch_sigaction(
+        dispatcher: &mut SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut crate::dispatch::LinearMemory,
+        signum: i32,
+        act: Option<LinuxSigaction>,
+        oldact: u64,
+    ) -> DispatchOutcome {
+        let act_ptr = act.map_or(0, |action| {
+            memory
+                .write_bytes(SIGACTION_ACT, zerocopy::IntoBytes::as_bytes(&action))
+                .expect("write act");
+            SIGACTION_ACT
+        });
+        let reporter = crate::compat::CompatReporter::default();
+        dispatcher
+            .dispatch(
+                context,
+                SyscallRequest::new(
+                    nr::RT_SIGACTION.raw(),
+                    SyscallArgs([signum as u64, act_ptr, oldact, LINUX_RT_SIGSET_SIZE, 0, 0]),
+                ),
+                memory,
+                &reporter,
+            )
+            .expect("rt_sigaction dispatch")
+    }
+
+    fn dispatch_sigpending(
+        dispatcher: &mut SyscallDispatcher,
+        context: &crate::kernel::KernelContext,
+        memory: &mut crate::dispatch::LinearMemory,
+    ) -> u64 {
+        let reporter = crate::compat::CompatReporter::default();
+        let outcome = dispatcher
+            .dispatch(
+                context,
+                SyscallRequest::new(
+                    nr::RT_SIGPENDING.raw(),
+                    SyscallArgs([SIGACTION_SET, LINUX_RT_SIGSET_SIZE, 0, 0, 0, 0]),
+                ),
+                memory,
+                &reporter,
+            )
+            .expect("rt_sigpending dispatch");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        u64::from_le_bytes(
+            memory
+                .read_bytes(SIGACTION_SET, 8)
+                .expect("read pending")
+                .try_into()
+                .expect("pending word"),
+        )
+    }
+
+    fn sigaction_with_handler(handler: u64) -> LinuxSigaction {
+        let mut action = LinuxSigaction::empty();
+        action.sa_handler = handler;
+        action
+    }
+
+    /// sigaction(2)/signal(7): SIG_IGN (or SIG_DFL whose default is ignore)
+    /// discards the pending signal, blocked or not, from the process queue
+    /// and from every thread's queue; a caught handler leaves it pending.
+    /// Red before the host install moved onto `ActionTable`: the host
+    /// `Sighand::install_action` was a plain map insert.
+    #[test]
+    fn rt_sigaction_ignore_discards_process_and_every_thread_pending() {
+        let (mut dispatcher, recorder) = sigaction_fixture();
+        let root = dispatcher.capture_one_task_context().expect("root");
+        let sibling_tid = dispatcher
+            .register_one_task_thread(&root, crate::thread::ThreadId::synthetic_for_tests(8_688))
+            .expect("sibling");
+        let sibling = root
+            .kernel()
+            .context(root.task().key().id, sibling_tid)
+            .expect("sibling context");
+        let signal = |number| crate::kernel::LinuxSignal::for_signal_number(number).unwrap();
+        let (usr1, urg, term) = (signal(10), signal(23), signal(15));
+        let blocked = SigSet::EMPTY.with(10).with(23).with(15);
+        for context in [&root, &sibling] {
+            dispatcher.restore_signal_mask(context, context.thread().registry_id(), blocked);
+            let authority = context.signal_authority();
+            authority.enqueue_thread_standard(usr1, None);
+            authority.enqueue_thread_standard(term, None);
+        }
+        root.signal_authority().enqueue_task_standard(usr1, None);
+        root.signal_authority().enqueue_task_standard(urg, None);
+        let mut memory = crate::dispatch::LinearMemory::new(SIGACTION_ACT, vec![0; 0x400]);
+        assert_eq!(
+            dispatch_sigpending(&mut dispatcher, &root, &mut memory),
+            blocked.raw()
+        );
+
+        let ignore = sigaction_with_handler(crate::linux_abi::LINUX_SIG_IGN);
+        let outcome = dispatch_sigaction(&mut dispatcher, &root, &mut memory, 10, Some(ignore), 0);
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        // SIG_DFL on SIGURG (default ignore) discards; a handler for SIGTERM
+        // does not.
+        let default = sigaction_with_handler(crate::linux_abi::LINUX_SIG_DFL);
+        let outcome = dispatch_sigaction(&mut dispatcher, &root, &mut memory, 23, Some(default), 0);
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        let caught = sigaction_with_handler(0x4000);
+        let outcome = dispatch_sigaction(&mut dispatcher, &root, &mut memory, 15, Some(caught), 0);
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+
+        let only_term = SigSet::EMPTY.with(15);
+        assert_eq!(root.signal_authority().thread_pending(), only_term);
+        assert_eq!(sibling.signal_authority().thread_pending(), only_term);
+        assert!(root.signal_authority().task_pending().is_empty());
+        assert_eq!(
+            dispatch_sigpending(&mut dispatcher, &sibling, &mut memory),
+            only_term.raw()
+        );
+        assert_eq!(
+            *recorder.0.lock(),
+            [
+                ("set_host_ignore", 10),
+                ("set_host_default", 23),
+                ("ensure_host_handler", 15)
+            ]
+        );
+
+        // A later generation of an ignored, blocked signal is retained again:
+        // the discard is an install-time transition, not a generation filter.
+        root.signal_authority().enqueue_task_standard(usr1, None);
+        assert_eq!(
+            root.signal_authority().task_pending(),
+            SigSet::EMPTY.with(10)
+        );
+    }
+
+    /// One decoder, one error order (`carrick_signal_core::sigaction`): the
+    /// host lane gives the ring's answers.
+    #[test]
+    fn rt_sigaction_host_lane_uses_the_shared_error_order() {
+        let (mut dispatcher, _recorder) = sigaction_fixture();
+        let root = dispatcher.capture_one_task_context().expect("root");
+        let mut memory = crate::dispatch::LinearMemory::new(SIGACTION_ACT, vec![0; 0x400]);
+        let reporter = crate::compat::CompatReporter::default();
+        let mut call = |args: [u64; 4], memory: &mut crate::dispatch::LinearMemory| {
+            dispatcher
+                .dispatch(
+                    &root,
+                    SyscallRequest::new(
+                        nr::RT_SIGACTION.raw(),
+                        SyscallArgs([args[0], args[1], args[2], args[3], 0, 0]),
+                    ),
+                    memory,
+                    &reporter,
+                )
+                .expect("rt_sigaction dispatch")
+        };
+        let unmapped = 0x10_0000;
+        assert_eq!(
+            call([10, SIGACTION_ACT, 0, 4], &mut memory),
+            DispatchOutcome::errno(LINUX_EINVAL)
+        );
+        for signum in [0, 9, 19, 65] {
+            assert_eq!(
+                call([signum, unmapped, 0, LINUX_RT_SIGSET_SIZE], &mut memory),
+                DispatchOutcome::errno(LINUX_EFAULT),
+                "{signum}"
+            );
+        }
+        memory
+            .write_bytes(
+                SIGACTION_ACT,
+                zerocopy::IntoBytes::as_bytes(&sigaction_with_handler(0x4000)),
+            )
+            .unwrap();
+        for signum in [9, 19, 0, 65] {
+            assert_eq!(
+                call(
+                    [signum, SIGACTION_ACT, 0, LINUX_RT_SIGSET_SIZE],
+                    &mut memory
+                ),
+                DispatchOutcome::errno(LINUX_EINVAL),
+                "{signum}"
+            );
+        }
+        // An unwritable oldact faults after the install commits.
+        assert_eq!(
+            call(
+                [12, SIGACTION_ACT, unmapped, LINUX_RT_SIGSET_SIZE],
+                &mut memory
+            ),
+            DispatchOutcome::errno(LINUX_EFAULT)
+        );
+        let signal = crate::kernel::LinuxSignal::for_signal_number(12).unwrap();
+        let installed = root.shared().sighand().action(signal).sa_handler;
+        assert_eq!(installed, 0x4000);
+        // The stored record reads back with SIGKILL/SIGSTOP stripped from sa_mask.
+        let mut full_mask = sigaction_with_handler(0x5000);
+        full_mask.sa_mask = [u64::MAX];
+        let outcome = dispatch_sigaction(
+            &mut dispatcher,
+            &root,
+            &mut memory,
+            12,
+            Some(full_mask),
+            SIGACTION_OLD,
+        );
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        let outcome =
+            dispatch_sigaction(&mut dispatcher, &root, &mut memory, 12, None, SIGACTION_OLD);
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        let old = LinuxSigaction::read_from_bytes(
+            &memory
+                .read_bytes(SIGACTION_OLD, size_of::<LinuxSigaction>())
+                .unwrap(),
+        )
+        .unwrap();
+        let mask = old.sa_mask[0];
+        assert_eq!(mask, !((1 << 8) | (1 << 18)));
+    }
+
+    /// execve(2)/signal(7) through the real dispatcher and Kernel exec:
+    /// caught handlers reset to SIG_DFL, ignored actions stay ignored with
+    /// their flags, and the pending set and mask are preserved.
+    #[test]
+    fn rt_sigaction_exec_resets_caught_keeps_ignored_and_pending() {
+        let (mut dispatcher, _recorder) = sigaction_fixture();
+        let root = dispatcher.capture_one_task_context().expect("root");
+        let mut memory = crate::dispatch::LinearMemory::new(SIGACTION_ACT, vec![0; 0x400]);
+        let mut caught = sigaction_with_handler(0x4000);
+        caught.sa_flags = carrick_abi::LINUX_SA_SIGINFO;
+        let mut ignored = sigaction_with_handler(crate::linux_abi::LINUX_SIG_IGN);
+        ignored.sa_flags = carrick_abi::LINUX_SA_RESTART;
+        for (signum, action) in [(10, caught), (12, ignored)] {
+            let outcome =
+                dispatch_sigaction(&mut dispatcher, &root, &mut memory, signum, Some(action), 0);
+            assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        }
+        let blocked = SigSet::EMPTY.with(10);
+        dispatcher.restore_signal_mask(&root, root.thread().registry_id(), blocked);
+        root.signal_authority().enqueue_task_standard(
+            crate::kernel::LinuxSignal::for_signal_number(10).unwrap(),
+            None,
+        );
+
+        let prepared = dispatcher
+            .prepare_one_task_kernel_exec(&root)
+            .expect("prepare exec");
+        let exec = dispatcher
+            .commit_one_task_kernel_exec(prepared)
+            .expect("commit exec");
+        dispatcher.reset_signal_handlers_on_execve(&exec);
+
+        let read_old = |dispatcher: &mut SyscallDispatcher,
+                        memory: &mut crate::dispatch::LinearMemory,
+                        signum| {
+            let outcome =
+                dispatch_sigaction(dispatcher, &exec, memory, signum, None, SIGACTION_OLD);
+            assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+            LinuxSigaction::read_from_bytes(
+                &memory
+                    .read_bytes(SIGACTION_OLD, size_of::<LinuxSigaction>())
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            read_old(&mut dispatcher, &mut memory, 10),
+            LinuxSigaction::empty()
+        );
+        assert_eq!(read_old(&mut dispatcher, &mut memory, 12), ignored);
+        assert_eq!(
+            dispatch_sigpending(&mut dispatcher, &exec, &mut memory),
+            blocked.raw()
+        );
+        assert_eq!(
+            dispatcher.signal_mask_for(&exec, exec.thread().registry_id()),
+            blocked
+        );
     }
 
     #[test]

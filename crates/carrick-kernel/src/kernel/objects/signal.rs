@@ -14,6 +14,10 @@ use parking_lot::Mutex;
 use carrick_abi::{LinuxSigaction, LinuxSigaltstack, LinuxSiginfo, SigSet, WaitSigMask};
 use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::CurrentMmMemory;
+use carrick_signal_core::policy::{
+    ActionError, ActionTable, Disposition, Installation, Signal as PolicySignal,
+};
+use carrick_signal_core::sigaction::{decode_action, encode_action};
 
 use crate::kernel::ids::{LinuxSignal, LinuxTid, SighandId};
 use crate::kernel::operations::KernelOperationError;
@@ -27,21 +31,51 @@ pub enum SignalDisposition {
     Caught,
 }
 
-/// Complete Linux signal-action authority shared according to
-/// `CLONE_SIGHAND`. An absent entry is `SIG_DFL`; stored records retain every
-/// guest-visible field needed for delivery and `rt_sigaction` round trips.
+/// Storage adapter for one Linux signal-action table shared according to
+/// `CLONE_SIGHAND`. The semantics (catchability, the SIG_IGN/default-ignore
+/// pending discard, exec inheritance and the wire codec) belong to
+/// [`carrick_signal_core::policy::ActionTable`] and
+/// [`carrick_signal_core::sigaction`]; this type adds only the lock, the
+/// revision and the `LinuxSigaction` view its host consumers read. Installs go
+/// through [`SignalAuthority::install_action`], which applies the discard.
 #[derive(Debug)]
 pub struct Sighand {
     id: SighandId,
-    actions: Mutex<BTreeMap<LinuxSignal, LinuxSigaction>>,
+    actions: Mutex<ActionTable>,
     revision: ObjectRevision,
+}
+
+/// Every kernel `LinuxSignal` is a policy signal (both are 1..=64).
+fn policy_signal(signal: LinuxSignal) -> PolicySignal {
+    PolicySignal::from_number(signal.raw()).unwrap_or_else(|| {
+        carrick_fatal!(
+            "kernel::sighand",
+            "LinuxSignal outside the policy signal range"
+        )
+    })
+}
+
+fn kernel_signal(signal: PolicySignal) -> LinuxSignal {
+    LinuxSignal::for_signal_number(signal.number()).unwrap_or_else(|_| {
+        carrick_fatal!(
+            "kernel::sighand",
+            "policy signal outside the LinuxSignal range"
+        )
+    })
+}
+
+fn encoded_entries(table: &ActionTable) -> Vec<(LinuxSignal, LinuxSigaction)> {
+    table
+        .entries()
+        .map(|(signal, action)| (kernel_signal(signal), encode_action(action)))
+        .collect()
 }
 
 impl Sighand {
     pub fn new(id: SighandId) -> Self {
         Self {
             id,
-            actions: Mutex::new(BTreeMap::new()),
+            actions: Mutex::new(ActionTable::default()),
             revision: ObjectRevision::new(),
         }
     }
@@ -55,17 +89,9 @@ impl Sighand {
     }
 
     pub(crate) fn for_exec(id: SighandId, caller: &Self) -> Self {
-        let actions = caller
-            .actions
-            .lock()
-            .iter()
-            .filter_map(|(signal, action)| {
-                (action.sa_handler == crate::linux_abi::LINUX_SIG_IGN).then_some((*signal, *action))
-            })
-            .collect();
         Self {
             id,
-            actions: Mutex::new(actions),
+            actions: Mutex::new(caller.actions.lock().clone_for_exec()),
             revision: ObjectRevision::new(),
         }
     }
@@ -74,43 +100,61 @@ impl Sighand {
         self.id
     }
 
-    /// Install one complete Linux action. Explicit `SIG_DFL` records retain
-    /// their flags, mask, and restorer for exact `rt_sigaction` round trips.
-    pub fn install_action(&self, signal: LinuxSignal, action: LinuxSigaction) {
+    /// Install one decoded action and return the table's [`Installation`].
+    /// Only [`SignalAuthority::install_action`] calls this, so the pending
+    /// discard it names is applied under the task's signal-generation lock.
+    fn install(
+        &self,
+        signal: LinuxSignal,
+        action: LinuxSigaction,
+    ) -> Result<Installation, ActionError> {
+        let action = decode_action(action);
         let mut actions = self.actions.lock();
-        if actions.insert(signal, action) != Some(action) {
+        let before = actions.entry(policy_signal(signal));
+        let installed = actions.install(policy_signal(signal), action)?;
+        if before != Some(action) {
             self.revision.publish();
         }
+        Ok(installed)
     }
 
     pub fn action(&self, signal: LinuxSignal) -> LinuxSigaction {
-        self.action_entry(signal)
-            .unwrap_or_else(LinuxSigaction::empty)
+        encode_action(self.actions.lock().action(policy_signal(signal)))
     }
 
     fn action_with_revision(&self, signal: LinuxSignal) -> (u64, LinuxSigaction) {
         let actions = self.actions.lock();
-        let action = actions
-            .get(&signal)
-            .copied()
-            .unwrap_or_else(LinuxSigaction::empty);
-        (self.revision.load(), action)
+        (
+            self.revision.load(),
+            encode_action(actions.action(policy_signal(signal))),
+        )
     }
 
     pub fn action_entry(&self, signal: LinuxSignal) -> Option<LinuxSigaction> {
-        self.actions.lock().get(&signal).copied()
+        self.actions
+            .lock()
+            .entry(policy_signal(signal))
+            .map(encode_action)
     }
 
     pub fn actions(&self) -> Vec<(LinuxSignal, LinuxSigaction)> {
-        self.actions
-            .lock()
-            .iter()
-            .map(|(signal, action)| (*signal, *action))
-            .collect()
+        encoded_entries(&self.actions.lock())
     }
 
+    /// Replace the whole table with another sighand's entries (a bootstrap
+    /// copy, not an install: no pending set exists yet to discard from).
     pub fn replace_actions(&self, replacement: Vec<(LinuxSignal, LinuxSigaction)>) {
-        let replacement = replacement.into_iter().collect::<BTreeMap<_, _>>();
+        let replacement = ActionTable::from_entries(
+            replacement
+                .into_iter()
+                .map(|(signal, action)| (policy_signal(signal), decode_action(action))),
+        )
+        .unwrap_or_else(|_| {
+            carrick_fatal!(
+                "kernel::sighand",
+                "replacement sighand carried a SIGKILL/SIGSTOP action"
+            )
+        });
         let mut actions = self.actions.lock();
         if *actions != replacement {
             *actions = replacement;
@@ -119,19 +163,23 @@ impl Sighand {
     }
 
     pub fn disposition(&self, signal: LinuxSignal) -> SignalDisposition {
-        match self.action(signal).sa_handler {
-            crate::linux_abi::LINUX_SIG_DFL => SignalDisposition::Default,
-            crate::linux_abi::LINUX_SIG_IGN => SignalDisposition::Ignore,
-            _ => SignalDisposition::Caught,
+        match self
+            .actions
+            .lock()
+            .action(policy_signal(signal))
+            .disposition
+        {
+            Disposition::Default => SignalDisposition::Default,
+            Disposition::Ignore => SignalDisposition::Ignore,
+            Disposition::Handler(_) => SignalDisposition::Caught,
         }
     }
 
     /// Whether terminating children with exit signal `SIGCHLD` should be auto-reaped
     /// rather than transformed into zombies (POSIX.1-2001 `SIG_IGN` or `SA_NOCLDWAIT`).
     pub fn autoreaps_children(&self) -> bool {
-        let action = self.action(LinuxSignal::SIGCHLD);
-        action.sa_handler == carrick_abi::LINUX_SIG_IGN
-            || (action.sa_flags & carrick_abi::LINUX_SA_NOCLDWAIT != 0)
+        let action = self.actions.lock().action(PolicySignal::CHLD);
+        action.disposition == Disposition::Ignore || action.flags.no_child_wait
     }
 
     pub(in crate::kernel) fn snapshot_until(
@@ -139,13 +187,7 @@ impl Sighand {
         deadline: std::time::Instant,
     ) -> Option<(u64, Vec<(LinuxSignal, LinuxSigaction)>)> {
         let actions = self.actions.try_lock_until(deadline)?;
-        Some((
-            self.revision.load(),
-            actions
-                .iter()
-                .map(|(signal, action)| (*signal, *action))
-                .collect(),
-        ))
+        Some((self.revision.load(), encoded_entries(&actions)))
     }
 
     pub(in crate::kernel) fn revision(&self) -> u64 {
@@ -1158,8 +1200,23 @@ impl SignalAuthority {
         self.sighand.action_with_revision(signal)
     }
 
-    pub fn install_action(&self, signal: LinuxSignal, action: LinuxSigaction) {
-        self.sighand.install_action(signal, action);
+    /// The one host install: store the decoded action in the shared table
+    /// and, under this task's signal-generation lock, discard what the table
+    /// names (SIG_IGN, or SIG_DFL whose default is ignore) from the task's
+    /// process-directed queue and every one of its threads' queues, blocked
+    /// or not (sigaction(2), signal(7)). Returns the previous action.
+    pub fn install_action(
+        &self,
+        signal: LinuxSignal,
+        action: LinuxSigaction,
+    ) -> Result<LinuxSigaction, ActionError> {
+        let _generation = self.task.lock_signal_generation();
+        let installed = self.sighand.install(signal, action)?;
+        let discard = SigSet::from_raw(installed.discard.bits());
+        if !discard.is_empty() {
+            self.task.discard_pending_signals(discard);
+        }
+        Ok(encode_action(installed.previous))
     }
 
     pub fn blocked(&self) -> SigSet {
@@ -1423,13 +1480,9 @@ impl SignalAuthority {
                 .difference(effective_mask);
             let signum = candidates.lowest_signum()?;
             let signal = LinuxSignal::for_signal_number(signum).ok()?;
-            let action = actions
-                .get(&signal)
-                .copied()
-                .unwrap_or_else(LinuxSigaction::empty);
-            let ignored = action.sa_handler == crate::linux_abi::LINUX_SIG_IGN
-                || action.sa_handler == crate::linux_abi::LINUX_SIG_DFL
-                    && is_default_ignore_signal(signum);
+            let policy_action = actions.action(policy_signal(signal));
+            let action = encode_action(policy_action);
+            let ignored = policy_action.discards_pending(policy_signal(signal));
             let thread_has = thread.pending().contains(signum);
             let dequeue = if thread_has {
                 let mut pending = thread.take_lowest_in(SigSet::EMPTY.with(signum))?;
@@ -1813,14 +1866,16 @@ mod tests {
         ignored_action.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
         ignored_action.sa_flags = 0x4000_0000;
         ignored_action.sa_mask = [0x55];
+        // Canonical records: every named flag, SA_RESTORER with its address,
+        // and a mask without SIGKILL/SIGSTOP round-trip exactly.
         let caught_action = LinuxSigaction {
             sa_handler: 0x1234_5000,
-            sa_flags: 0x0800_0004,
+            sa_flags: 0x0800_0004 | carrick_abi::LINUX_SA_RESTORER,
             sa_restorer: 0x7777_0000,
             sa_mask: [0xaa],
         };
-        source.install_action(ignored, ignored_action);
-        source.install_action(caught, caught_action);
+        let _ = source.install(ignored, ignored_action).expect("install");
+        let _ = source.install(caught, caught_action).expect("install");
 
         let copied = Sighand::for_fork_copy(ids.sighand_id().expect("copy sighand"), &source);
         assert_eq!(copied.action(ignored), ignored_action);

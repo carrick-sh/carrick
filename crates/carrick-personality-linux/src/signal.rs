@@ -484,10 +484,51 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
     }
 }
 
+/// The ring's guest memory and process sighand behind the one shared
+/// rt_sigaction decoder. `unserved` records an absent process owner, which
+/// leaves the call to the caller exactly as before the decoder moved.
+struct RingSigactionPort<'n, 'a> {
+    native: &'n mut dyn SignalNative<'a>,
+    unserved: bool,
+}
+
+impl carrick_signal_core::sigaction::SigactionPort for RingSigactionPort<'_, '_> {
+    fn read_action(&mut self, act: u64) -> Option<crate::abi::signal::LinuxSigaction> {
+        use zerocopy::FromBytes;
+        let mut bytes = [0u8; core::mem::size_of::<crate::abi::signal::LinuxSigaction>()];
+        if !self
+            .native
+            .copy_in(&mut bytes, carrick_guest_arch::UserVa::new(act))
+        {
+            return None;
+        }
+        crate::abi::signal::LinuxSigaction::read_from_bytes(&bytes).ok()
+    }
+
+    fn exchange(
+        &mut self,
+        signal: Signal,
+        new: Option<carrick_signal_core::policy::Action>,
+    ) -> Result<carrick_signal_core::policy::Action, carrick_syscall_abi::LinuxErrno> {
+        let Some(signals) = self.native.process_signals() else {
+            self.unserved = true;
+            return Err(crate::abi::signal::LINUX_EINVAL);
+        };
+        signals.rt_sigaction(signal, new)
+    }
+
+    fn write_action(&mut self, oldact: u64, old: crate::abi::signal::LinuxSigaction) -> bool {
+        self.native.copy_out(
+            carrick_guest_arch::UserVa::new(oldact),
+            zerocopy::IntoBytes::as_bytes(&old),
+        )
+    }
+}
+
 pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<SignalOutcome> {
     use crate::abi::signal::{
         LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_ESRCH, LINUX_SI_TKILL, LINUX_SI_USER,
-        LinuxSigaction, LinuxSiginfo, RT_SIGSET_SIZE,
+        LinuxSiginfo, RT_SIGSET_SIZE,
     };
     use zerocopy::{FromBytes, IntoBytes};
     let args = native.arguments();
@@ -499,110 +540,24 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
     };
     match call {
         SignalCall::RtSigaction => {
-            let [signum, act_ptr, oldact_ptr, size, _, _] = args;
-            if size != RT_SIGSET_SIZE {
-                return returned(LINUX_EINVAL.guest_retval(), false);
-            }
-            let Some(signum) = Signal::from_number(signum as i32) else {
-                return returned(LINUX_EINVAL.guest_retval(), false);
+            let [signum, act, oldact, sigsetsize, _, _] = args;
+            let mut port = RingSigactionPort {
+                native: &mut *native,
+                unserved: false,
             };
-            if act_ptr != 0 && signum.uncatchable() {
-                return returned(LINUX_EINVAL.guest_retval(), false);
+            let result = carrick_signal_core::sigaction::rt_sigaction(
+                carrick_signal_core::sigaction::SigactionArgs::from_registers([
+                    signum, act, oldact, sigsetsize,
+                ]),
+                &mut port,
+            );
+            if port.unserved {
+                return None;
             }
-            let new_action = if act_ptr != 0 {
-                let mut bytes = [0u8; core::mem::size_of::<LinuxSigaction>()];
-                if !native.copy_in(&mut bytes, carrick_guest_arch::UserVa::new(act_ptr)) {
-                    return returned(LINUX_EFAULT.guest_retval(), false);
-                }
-                let Ok(newact) = LinuxSigaction::ref_from_bytes(&bytes) else {
-                    return returned(LINUX_EFAULT.guest_retval(), false);
-                };
-                let disposition = match newact.sa_handler {
-                    0 => carrick_signal_core::policy::Disposition::Default,
-                    1 => carrick_signal_core::policy::Disposition::Ignore,
-                    addr => carrick_signal_core::policy::Disposition::Handler(
-                        carrick_signal_core::policy::HandlerAddress(addr),
-                    ),
-                };
-                let flags = carrick_signal_core::policy::ActionFlags {
-                    on_stack: newact.sa_flags & carrick_syscall_abi::LINUX_SA_ONSTACK != 0,
-                    reset_hand: newact.sa_flags & carrick_syscall_abi::LINUX_SA_RESETHAND != 0,
-                    nodefer: newact.sa_flags & carrick_syscall_abi::LINUX_SA_NODEFER != 0,
-                    restart: newact.sa_flags & carrick_syscall_abi::LINUX_SA_RESTART != 0,
-                    siginfo: newact.sa_flags & carrick_syscall_abi::LINUX_SA_SIGINFO != 0,
-                    no_child_wait: newact.sa_flags & carrick_syscall_abi::LINUX_SA_NOCLDWAIT != 0,
-                    no_child_stop: newact.sa_flags & carrick_syscall_abi::LINUX_SA_NOCLDSTOP != 0,
-                };
-                let restorer = if newact.sa_flags & carrick_syscall_abi::LINUX_SA_RESTORER != 0 {
-                    Some(carrick_signal_core::policy::RestorerAddress(
-                        newact.sa_restorer,
-                    ))
-                } else {
-                    None
-                };
-                let mask = carrick_signal_core::SignalSet::from_bits(newact.sa_mask[0])
-                    .without(carrick_signal_core::policy::Signal::KILL)
-                    .without(carrick_signal_core::policy::Signal::STOP);
-                Some(carrick_signal_core::policy::Action {
-                    disposition,
-                    flags,
-                    mask,
-                    restorer,
-                })
-            } else {
-                None
-            };
-            // The owner exchanges old/new under one sighand admission.
-            let current = {
-                let signals = native.process_signals()?;
-                match signals.rt_sigaction(signum, new_action) {
-                    Ok(action) => action,
-                    Err(error) => {
-                        return returned(error.guest_retval(), false);
-                    }
-                }
-            };
-            if oldact_ptr != 0 {
-                let mut oldact = LinuxSigaction::empty();
-                oldact.sa_handler = match current.disposition {
-                    carrick_signal_core::policy::Disposition::Default => 0,
-                    carrick_signal_core::policy::Disposition::Ignore => 1,
-                    carrick_signal_core::policy::Disposition::Handler(addr) => addr.0,
-                };
-                let mut flags = 0u64;
-                if current.flags.on_stack {
-                    flags |= carrick_syscall_abi::LINUX_SA_ONSTACK;
-                }
-                if current.flags.siginfo {
-                    flags |= carrick_syscall_abi::LINUX_SA_SIGINFO; // SA_SIGINFO
-                }
-                if current.flags.nodefer {
-                    flags |= carrick_syscall_abi::LINUX_SA_NODEFER; // SA_NODEFER
-                }
-                if current.flags.reset_hand {
-                    flags |= carrick_syscall_abi::LINUX_SA_RESETHAND; // SA_RESETHAND
-                }
-                if current.flags.restart {
-                    flags |= carrick_syscall_abi::LINUX_SA_RESTART; // SA_RESTART
-                }
-                if current.flags.no_child_stop {
-                    flags |= carrick_syscall_abi::LINUX_SA_NOCLDSTOP; // SA_NOCLDSTOP
-                }
-                if current.flags.no_child_wait {
-                    flags |= carrick_syscall_abi::LINUX_SA_NOCLDWAIT; // SA_NOCLDWAIT
-                }
-                if let Some(restorer) = current.restorer {
-                    flags |= carrick_syscall_abi::LINUX_SA_RESTORER; // SA_RESTORER
-                    oldact.sa_restorer = restorer.0;
-                }
-                oldact.sa_flags = flags;
-                oldact.sa_mask = [current.mask.bits()];
-                let bytes = IntoBytes::as_bytes(&oldact);
-                if !native.copy_out(carrick_guest_arch::UserVa::new(oldact_ptr), bytes) {
-                    return returned(LINUX_EFAULT.guest_retval(), false);
-                }
+            match result {
+                Ok(()) => returned(0, false),
+                Err(error) => returned(error.guest_retval(), false),
             }
-            returned(0, false)
         }
         SignalCall::RtSigpending => {
             let [set_ptr, size, _, _, _, _] = args;

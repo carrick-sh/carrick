@@ -76,7 +76,7 @@ fn actions_default_ignore_handler_and_uncatchable_signals() {
         disposition: Disposition::Ignore,
         ..Action::default()
     };
-    actions.install(sig(10), ignored).unwrap();
+    let _ = actions.install(sig(10), ignored).unwrap();
     assert_eq!(
         actions.prepare_delivery(sig(10), &mut MaskState::default()),
         Delivery::Ignore
@@ -106,7 +106,7 @@ fn handler_entry_resets_action_and_composes_mask_without_losing_siginfo() {
         },
         &[12, 9, 19],
     );
-    actions.install(sig(10), action).unwrap();
+    let _ = actions.install(sig(10), action).unwrap();
     let mut masks = MaskState::new(mask(&[2]));
     let Delivery::Handler(delivery) = actions.prepare_delivery(sig(10), &mut masks) else {
         unreachable!()
@@ -138,7 +138,7 @@ fn handler_entry_resets_action_and_composes_mask_without_losing_siginfo() {
         } else {
             &[12][..]
         };
-        actions
+        let _ = actions
             .install(
                 sig(10),
                 caught(
@@ -190,7 +190,7 @@ fn masks_and_temporary_masks_replace_restore_and_reject_nested_waits() {
 
     state.begin_temporary(mask(&[12])).unwrap();
     let mut actions = ActionTable::default();
-    actions
+    let _ = actions
         .install(sig(10), caught(ActionFlags::default(), &[2]))
         .unwrap();
     let Delivery::Handler(delivery) = actions.prepare_delivery(sig(10), &mut state) else {
@@ -355,10 +355,10 @@ fn fork_and_exec_reset_actions_pending_and_masks_in_their_own_domains() {
         mask: set(&[12]),
         ..handler
     };
-    actions.install(sig(10), handler).unwrap();
-    actions.install(sig(12), ignored).unwrap();
+    let _ = actions.install(sig(10), handler).unwrap();
+    let _ = actions.install(sig(12), ignored).unwrap();
     let mut copied = actions.clone();
-    copied.install(sig(10), Action::default()).unwrap();
+    let _ = copied.install(sig(10), Action::default()).unwrap();
     assert_eq!(actions.action(sig(10)), handler);
     let exec = actions.clone_for_exec();
     assert_eq!(exec.action(sig(10)), Action::default());
@@ -401,7 +401,7 @@ fn clone_sighand_shares_actions_but_never_masks_or_pending_at_1_8_32_targets() {
             unreachable!()
         };
         let action = caught(ActionFlags::default(), &[]);
-        tables
+        let _ = tables
             .get_mut(&parent_key)
             .unwrap()
             .install(sig(10), action)
@@ -705,7 +705,7 @@ fn aarch64_and_x86_64_use_one_signal_policy_and_explicit_return_policy() {
             Ok(RestorerAddress(0x8000))
         );
         let mut table = ActionTable::default();
-        table.install(sig(10), registered).unwrap();
+        let _ = table.install(sig(10), registered).unwrap();
         let mut masks = MaskState::default();
         assert!(matches!(
             table.prepare_delivery(sig(10), &mut masks),
@@ -752,10 +752,10 @@ fn ignored_signal_preserves_temporary_wait_and_nested_handlers_restore_masks() {
     );
     assert_eq!(masks.effective(), mask(&[10]));
     assert!(masks.end_temporary());
-    table
+    let _ = table
         .install(sig(10), caught(ActionFlags::default(), &[2]))
         .unwrap();
-    table
+    let _ = table
         .install(sig(3), caught(ActionFlags::default(), &[4]))
         .unwrap();
     let Delivery::Handler(outer) = table.prepare_delivery(sig(10), &mut masks) else {

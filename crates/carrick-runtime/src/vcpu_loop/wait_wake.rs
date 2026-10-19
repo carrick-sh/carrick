@@ -1818,7 +1818,10 @@ mod tests {
         let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(chld).expect("SIGCHLD");
         let mut caught = carrick_abi::LinuxSigaction::empty();
         caught.sa_handler = 0x4000;
-        post_exec.shared().sighand().install_action(signal, caught);
+        post_exec
+            .signal_authority()
+            .install_action(signal, caught)
+            .expect("install action");
 
         assert_eq!(pre_exec.task().key(), post_exec.task().key());
         assert_ne!(pre_exec.revision(), post_exec.revision());

@@ -1,8 +1,9 @@
 //! Host-free signal storage and Linux signal policy transitions.
 //!
 //! Storage slots are numbered 1 through 64. [`policy`] supplies typed Linux
-//! asm-generic semantics; synchronization, ABI conversion, transport and guest
-//! handler frames belong to the consuming owner. [`timer`] takes an injected
+//! asm-generic semantics and [`sigaction`] the one rt_sigaction argument
+//! decoder; synchronization, transport and guest handler frames belong to the
+//! consuming owner. [`timer`] takes an injected
 //! clock; it never reads a host clock or schedules a host wait.
 #![no_std]
 
@@ -12,6 +13,7 @@ extern crate std;
 
 pub mod fasync;
 pub mod policy;
+pub mod sigaction;
 pub mod timer;
 pub mod wait;
 
