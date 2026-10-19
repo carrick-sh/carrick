@@ -485,8 +485,23 @@ fn member_host_identity(
         // it makes a genuine host retirement receipt impossible to satisfy.
         pool_host_identity(page, entry)
     } else {
-        Ok(carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding))
+        Ok(adopted_host_identity(control, binding))
     }
+}
+
+/// The exact receipt host retirement publishes for an entry-less member:
+/// its control slot's birth identity (process generation), which is fixed
+/// for the thread. The execution binding's generation versions each CPU
+/// snapshot and advances on every rehome, so it can never be the expected
+/// receipt (#641). A member with no published birth identity falls back
+/// to its binding.
+fn adopted_host_identity(
+    control: &ThreadControlSlot,
+    binding: ExecutionBinding,
+) -> carrick_core::terminal::HostThreadRetirementReceipt {
+    control.host_birth_identity().unwrap_or_else(|| {
+        carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding)
+    })
 }
 
 pub struct NativeResources<'a, M, C: ProcessContext> {
@@ -578,6 +593,8 @@ enum OutstandingExitReceipt<'a> {
     Adopted {
         binding: ExecutionBinding,
         control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
+        /// [`adopted_host_identity`]: stable across rehomes.
+        expected_host: carrick_core::terminal::HostThreadRetirementReceipt,
     },
     HostBorn {
         identity: carrick_core::terminal::HostThreadRetirementReceipt,
@@ -631,11 +648,13 @@ impl PendingExit<'_> {
                     member: control.control(),
                     expected_host: *expected_host,
                 }),
-                OutstandingExitReceipt::Adopted { binding, control } => {
+                OutstandingExitReceipt::Adopted {
+                    control,
+                    expected_host,
+                    ..
+                } => {
                     host.push(carrick_core::terminal::HostMemberObservation::Adopted {
-                        binding: carrick_core::terminal::HostThreadRetirementReceipt::from_binding(
-                            *binding,
-                        ),
+                        binding: *expected_host,
                         member: control.control(),
                     });
                 }
@@ -939,10 +958,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             probe: None,
         };
         for identity in members.host() {
-            if let Some((_, control, record)) = adopted.iter().find(|(binding, _, _)| {
-                *identity
-                    == carrick_core::terminal::HostThreadRetirementReceipt::from_binding(*binding)
-            }) {
+            if let Some((_, control, record)) = adopted
+                .iter()
+                .find(|(binding, control, _)| *identity == adopted_host_identity(control, *binding))
+            {
                 if control.host_retirement().is_some()
                     || control.entry().is_some_and(|entry| {
                         carrick_el1_abi::Lifecycle::expected_exit_receipt(
@@ -1227,11 +1246,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         if let Some(pending) = graph.pending_exit.get_mut(&process) {
             let old_binding = old_key.binding();
             if pending.outstanding.iter().any(|receipt| {
-                matches!(receipt, OutstandingExitReceipt::Adopted { binding, control: expected }
+                matches!(receipt, OutstandingExitReceipt::Adopted { binding, control: expected, .. }
                     if *binding == old_binding && core::ptr::eq(expected.control(), control))
             }) && !pending.members.rehome_host(
-                carrick_core::terminal::HostThreadRetirementReceipt::from_binding(old_binding),
-                carrick_core::terminal::HostThreadRetirementReceipt::from_binding(key.binding()),
+                adopted_host_identity(control, old_binding),
+                adopted_host_identity(control, key.binding()),
             ) {
                 return Err(NativeProcessError::Stale);
             }
@@ -1248,11 +1267,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 if let OutstandingExitReceipt::Adopted {
                     binding,
                     control: expected,
+                    expected_host,
                 } = receipt
                     && *binding == old_binding
                     && core::ptr::eq(expected.control(), control)
                 {
                     *binding = key.binding();
+                    *expected_host = adopted_host_identity(control, key.binding());
                 }
             }
         }
@@ -3962,6 +3983,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     outstanding.push(OutstandingExitReceipt::Adopted {
                         binding: *binding,
                         control: retain_member_control(control)?,
+                        expected_host: adopted_host_identity(control, *binding),
                     });
                 }
                 for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
@@ -3989,11 +4011,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .iter()
                     .filter_map(|receipt| match receipt {
                         OutstandingExitReceipt::Pool { .. } => None,
-                        OutstandingExitReceipt::Adopted { binding, .. } => Some(
-                            carrick_core::terminal::HostThreadRetirementReceipt::from_binding(
-                                *binding,
-                            ),
-                        ),
+                        OutstandingExitReceipt::Adopted { expected_host, .. } => {
+                            Some(*expected_host)
+                        }
                         OutstandingExitReceipt::HostBorn { identity, .. } => Some(*identity),
                     })
                     .collect();
