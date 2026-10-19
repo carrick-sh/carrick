@@ -31,7 +31,7 @@ impl owner::ReservationGeometry for X86Cpl0ReservationGeometry {
     const ZONE_OFFSET: usize = carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize;
     const REGION_BASE: u64 = carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE;
     const BOOTSTRAP_BASE: u64 = carrick_el1_abi::X86_CPL0_BOOTSTRAP_METADATA_BASE;
-    const BOOTSTRAP_SIZE: u64 = carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE;
+    const BOOTSTRAP_SIZE: u64 = carrick_el1_abi::X86_CPL0_BOOTSTRAP_METADATA_SIZE;
     fn authorizes_identity_write(address: u64, len: u64) -> bool {
         CarrickIdentityWriteRange::authorizes(address, len)
     }

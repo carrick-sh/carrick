@@ -333,12 +333,15 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   add + 3M remove watches, one host seek). Need live request/completion
   closure; counts ≠ critical path; keep uninstrumented A/B and native-I/O
   controls. `--profile hvpatch-inotify09-population` fits only that case.
-- **Bad ELR far outside EL1 text, or "guest executed at EL1" at pool
-  shutdown = ring stack overflow**, not a wild jump: the 16 KiB per-CPU EL1
-  stack has no guard page, and by-value records on the exit chain
-  (`publish_exit` alone 0x2190) overwrote a neighbour CPU's stack (#338). No
-  large by-value locals or return values on EL1/CPL0 paths — box or borrow;
-  frame-budget gate plus guard pages: #369.
+- **Ring stack overflow** once overwrote a neighbour CPU's stack (#338:
+  by-value records on the exit chain, `publish_exit` alone 0x2190). Each
+  16 KiB EL1 stack (and each CPL0 stack) now sits above an unmapped guard
+  (#369): an overflow faults on it, and the EL1 fault vector reports through
+  `hvc #3` without pushing into the guard (FAR names the guard).
+  The image builds run `carrick-ring-audit`, which fails on an oversized
+  frame or entry chain; reviewed recursion and indirect-call bounds live in
+  its `policy.rs`. No large by-value locals or return values on EL1/CPL0
+  paths — box or borrow.
 - **Verify diagnoses empirically** — "race/coherence/Heisenbug" labels and
   memory notes are hypotheses; read real values, and check how you read them.
 

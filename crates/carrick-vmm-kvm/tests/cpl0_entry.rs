@@ -157,7 +157,7 @@ fn production_cpl0_boot_retains_separate_supervisor_and_initial_extents() {
             carrier.retained_bytes(),
             0xc0_0000
                 + metadata_bytes
-                + carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE as usize
+                + carrick_el1_abi::X86_CPL0_BOOTSTRAP_METADATA_SIZE as usize
                 + carrick_el1_abi::EL1_REGION_SIZE as usize
                 + initial_bytes
         );

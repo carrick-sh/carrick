@@ -1797,13 +1797,13 @@ pub(crate) fn abi_stack_ptr<T>(
         return None;
     }
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
-    let start =
-        carrick_el1_abi::EL1_STACKS_BASE + u64::from(slot.raw()) * carrick_el1_abi::EL1_STACK_SIZE;
+    let start = carrick_el1_abi::stack_slot_usable_base(slot.raw() as usize);
+    let top = carrick_el1_abi::stack_slot_top(slot.raw() as usize);
     let end = address
         .raw()
         .checked_add(core::mem::size_of::<T>() as u64)?;
     if address.raw() < start
-        || end > start + carrick_el1_abi::EL1_STACK_SIZE
+        || end > top
         || !address
             .raw()
             .is_multiple_of(core::mem::align_of::<T>() as u64)
@@ -1967,7 +1967,7 @@ mod tests {
         task.mm.key.store(5, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         assert!(task.root_generation().is_none());
-        let address = carrick_el1_abi::EL1_STACKS_BASE + 3 * carrick_el1_abi::EL1_STACK_SIZE;
+        let address = carrick_el1_abi::stack_slot_usable_base(3);
         let mut diagnostic = carrick_el1_abi::NativeForkDiagnostic::new();
         write!(&mut diagnostic, "Census: Core").unwrap();
         // SAFETY: aligned complete stack record in this exclusively owned ABI region.
@@ -2061,9 +2061,7 @@ mod tests {
         let custody = crate::trap::CarrierVmCustody::new();
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
-        let address = carrick_guest_arch::KernelVa::new(
-            carrick_el1_abi::EL1_STACKS_BASE + 3 * carrick_el1_abi::EL1_STACK_SIZE,
-        );
+        let address = carrick_guest_arch::KernelVa::new(carrick_el1_abi::stack_slot_usable_base(3));
         let offset = (address.raw() - carrick_el1_abi::EL1_REGION_BASE) as usize;
         // SAFETY: retained ABI storage is aligned; this fixture exclusively owns this stack.
         unsafe {

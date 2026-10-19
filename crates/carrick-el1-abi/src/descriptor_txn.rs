@@ -240,7 +240,7 @@ pub fn descriptor_drain_frame_offset(slot: usize) -> Option<u64> {
     if slot >= EL1_STACK_SLOTS as usize {
         return None;
     }
-    let top = crate::EL1_STACKS_OFFSET + (slot as u64 + 1) * crate::EL1_STACK_SIZE;
+    let top = crate::stack_slot_top(slot) - crate::EL1_REGION_BASE;
     Some((top - 0x120 - 0x200) & !0xF)
 }
 
@@ -256,8 +256,8 @@ pub fn descriptor_drain_frame_offset_below(slot: usize, suspended_sp: Option<u64
     let Some(sp) = suspended_sp else {
         return Some(fixed);
     };
-    let base = crate::EL1_STACKS_OFFSET + slot as u64 * crate::EL1_STACK_SIZE;
-    let top = base + crate::EL1_STACK_SIZE;
+    let base = crate::stack_slot_usable_base(slot) - crate::EL1_REGION_BASE;
+    let top = crate::stack_slot_top(slot) - crate::EL1_REGION_BASE;
     let sp = sp.checked_sub(crate::EL1_REGION_BASE)?;
     if sp <= base || sp > top {
         return None;
@@ -310,8 +310,8 @@ mod tests {
     fn drain_frame_lies_below_a_suspended_el1_stack() {
         let frame = core::mem::size_of::<crate::TrapFrame>() as u64;
         for slot in [0, 1, EL1_STACK_SLOTS as usize - 1] {
-            let base = crate::EL1_STACKS_OFFSET + slot as u64 * crate::EL1_STACK_SIZE;
-            let top = base + crate::EL1_STACK_SIZE;
+            let base = crate::stack_slot_usable_base(slot) - crate::EL1_REGION_BASE;
+            let top = crate::stack_slot_top(slot) - crate::EL1_REGION_BASE;
             let fixed = descriptor_drain_frame_offset(slot).unwrap();
             // Not suspended: the fixed placement.
             assert_eq!(descriptor_drain_frame_offset_below(slot, None), Some(fixed));

@@ -23,9 +23,9 @@ use carrick_el1::memory::reservations::{
 use carrick_el1_abi::GuestMmuPublication;
 use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
-    BlockedMask, Counters, CurrentTask, EL1_BOOTSTRAP_METADATA_SIZE, El1TaskId, ThreadControlSlot,
-    ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE, X86_CPL0_DYNAMIC_METADATA_BASE,
-    X86_CPL0_REGION_BASE,
+    BlockedMask, Counters, CurrentTask, El1TaskId, ThreadControlSlot, ThreadLifecyclePage,
+    X86_CPL0_BOOTSTRAP_METADATA_BASE, X86_CPL0_BOOTSTRAP_METADATA_SIZE,
+    X86_CPL0_DYNAMIC_METADATA_BASE, X86_CPL0_REGION_BASE,
 };
 use carrick_el1_abi::{ReservationMm, ReservationRange};
 use carrick_guest_arch::FrameGpa;
@@ -1460,7 +1460,7 @@ impl KernelStackSnapshot {
                 .ok_or_else(|| fail("CPL0 RSP beyond stack"))?,
         )
         .map_err(|_| fail("CPL0 stack length overflow"))?;
-        if len == 0 || len > 0x1_0000 {
+        if len == 0 || len > carrick_el1_abi::X86_CPL0_KERNEL_STACK_SIZE as usize {
             return Err(fail("CPL0 RSP outside private stack"));
         }
         let offset = usize::try_from(rsp - base).map_err(|_| fail("CPL0 stack offset overflow"))?;
@@ -1603,14 +1603,17 @@ impl ProductionCpuLease {
             let end = custody
                 .binding(slot)
                 .kernel_stack
-                .checked_add(16)
+                .checked_add(carrick_el1_abi::X86_CPL0_KERNEL_STACK_TOP_RESERVE)
                 .ok_or_else(|| fail("CPL0 stack top overflow"))?;
             let base = end
-                .checked_sub(0x1_0000)
+                .checked_sub(carrick_el1_abi::X86_CPL0_KERNEL_STACK_SIZE)
                 .ok_or_else(|| fail("CPL0 stack base underflow"))?;
             let source = custody
                 .ram
-                .host_ptr(base - DIRECT_VA, 0x1_0000)
+                .host_ptr(
+                    base - DIRECT_VA,
+                    carrick_el1_abi::X86_CPL0_KERNEL_STACK_SIZE as usize,
+                )
                 .ok_or_else(|| fail("CPL0 stack backing absent"))?;
             // SAFETY: this exact task and CPU are stopped, and the backing
             // spans the verified private stack.
@@ -1634,14 +1637,17 @@ impl ProductionCpuLease {
             let end = custody
                 .binding(slot)
                 .kernel_stack
-                .checked_add(16)
+                .checked_add(carrick_el1_abi::X86_CPL0_KERNEL_STACK_TOP_RESERVE)
                 .ok_or_else(|| fail("CPL0 stack top overflow"))?;
             let base = end
-                .checked_sub(0x1_0000)
+                .checked_sub(carrick_el1_abi::X86_CPL0_KERNEL_STACK_SIZE)
                 .ok_or_else(|| fail("CPL0 stack base underflow"))?;
             let destination = custody
                 .ram
-                .host_ptr(base - DIRECT_VA, 0x1_0000)
+                .host_ptr(
+                    base - DIRECT_VA,
+                    carrick_el1_abi::X86_CPL0_KERNEL_STACK_SIZE as usize,
+                )
                 .ok_or_else(|| fail("CPL0 stack backing absent"))?;
             // SAFETY: the exact task is loaded but stopped, and the snapshot
             // authenticates the physical stack before copying.
@@ -4318,7 +4324,7 @@ impl Cpl0Carrier {
         }
         ram.add_window(
             ALLOCATOR_GPA,
-            EL1_BOOTSTRAP_METADATA_SIZE as usize,
+            X86_CPL0_BOOTSTRAP_METADATA_SIZE as usize,
             WindowKind::Private,
         )
         .map_err(|e| fail(e.to_string()))?;
@@ -4410,7 +4416,7 @@ impl Cpl0Carrier {
         maps.push(Pml4MapSpec {
             va: X86_CPL0_BOOTSTRAP_METADATA_BASE,
             gpa: ALLOCATOR_GPA,
-            len: EL1_BOOTSTRAP_METADATA_SIZE,
+            len: X86_CPL0_BOOTSTRAP_METADATA_SIZE,
             user: false,
             write: true,
             exec: false,
@@ -4488,15 +4494,22 @@ impl Cpl0Carrier {
                 0
             })
             .ok_or_else(|| fail("fixture private copy table capacity"))?;
-        let tables = pml4_tables(&maps, LAYOUT.pml4_base, table_capacity)
-            .map_err(|e| fail(format!("CPL0 tables: {e:?}")))?;
+        // Every CPU's kernel stack guard stays unmapped in the direct window
+        // the stacks run on (#369), whatever bootstrap map would cover it.
+        let guards: Vec<(u64, u64)> = carrick_el1_abi::x86_cpl0_kernel_stack_guards().collect();
+        let tables = pml4_tables(
+            &carrick_mem::pml4::punch_holes(&maps, &guards),
+            LAYOUT.pml4_base,
+            table_capacity,
+        )
+        .map_err(|e| fail(format!("CPL0 tables: {e:?}")))?;
         ram.write_gpa(LAYOUT.pml4_base, &tables)
             .map_err(|e| fail(e.to_string()))?;
         if interrupts {
             let last = maps.last_mut().ok_or_else(|| fail("progress data map"))?;
             *last = crate::carrier_interrupts::data_map(1);
             let second = pml4_tables(
-                &maps,
+                &carrick_mem::pml4::punch_holes(&maps, &guards),
                 crate::carrier_interrupts::SECOND_ROOT,
                 table_capacity,
             )
@@ -4668,7 +4681,8 @@ impl Cpl0Carrier {
                     .ok_or_else(|| fail("CPU binding backing"))?
                     .cast::<CpuBinding>();
                 binding.write(CpuBinding {
-                    kernel_stack: DIRECT_VA + 0xe1_0000 + index as u64 * 0x1_0000 - 16,
+                    kernel_stack: DIRECT_VA + carrick_el1_abi::x86_cpl0_kernel_stack_end_gpa(index)
+                        - carrick_el1_abi::X86_CPL0_KERNEL_STACK_TOP_RESERVE,
                     user_stack: 0,
                     self_address: METADATA_VA + BINDING_OFFSET + offset,
                     task_address: METADATA_VA + TASK_OFFSET + offset,
@@ -6077,11 +6091,11 @@ fn checked_readiness_region(base: u64, offset: u64, length: usize, extent: u64) 
 }
 
 fn checked_stack_end(kernel_stack: u64) -> Option<u64> {
-    kernel_stack.checked_add(16)
+    kernel_stack.checked_add(carrick_el1_abi::X86_CPL0_KERNEL_STACK_TOP_RESERVE)
 }
 
 fn checked_private_stack_frame_gpa(stack_end: u64, address: u64, length: usize) -> Option<u64> {
-    let stack_start = stack_end.checked_sub(0x1_0000)?;
+    let stack_start = stack_end.checked_sub(carrick_el1_abi::X86_CPL0_KERNEL_STACK_SIZE)?;
     let length = u64::try_from(length).ok()?;
     if address & 7 != 0 || address < stack_start || address.checked_add(length)? > stack_end {
         return None;
@@ -6143,9 +6157,9 @@ impl ForwardVenue<'_> {
             .checked_mul(size_of::<carrick_el1_abi::HostReadinessEntry>())
             .ok_or_else(|| fail("host readiness batch length overflow"))?;
         let region = if let Some(offset) = address.checked_sub(X86_CPL0_BOOTSTRAP_METADATA_BASE)
-            && offset < EL1_BOOTSTRAP_METADATA_SIZE
+            && offset < X86_CPL0_BOOTSTRAP_METADATA_SIZE
         {
-            Some((ALLOCATOR_GPA, offset, EL1_BOOTSTRAP_METADATA_SIZE))
+            Some((ALLOCATOR_GPA, offset, X86_CPL0_BOOTSTRAP_METADATA_SIZE))
         } else if let Some(offset) = address.checked_sub(X86_CPL0_REGION_BASE)
             && offset < carrick_el1_abi::EL1_REGION_SIZE
         {

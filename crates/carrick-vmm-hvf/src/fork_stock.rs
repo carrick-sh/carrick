@@ -416,7 +416,7 @@ mod tests {
                 .unwrap();
         }
         let request = test_request(exec, 302, 4, 1);
-        let address = KernelVa::new(carrick_el1_abi::EL1_STACKS_BASE);
+        let address = KernelVa::new(carrick_el1_abi::stack_slot_usable_base(0));
         let offset = (address.raw() - carrick_el1_abi::EL1_REGION_BASE) as usize;
         // SAFETY: aligned complete loan record on this CPU's retained fixture stack.
         let record = unsafe { region_ptr.add(offset).cast::<ForkStockExchange>() };
@@ -630,7 +630,7 @@ mod tests {
 
         let mut request = test_request(exec, 302, 4, 1);
         request.operation.carrier = custody.transfer_carrier;
-        let address = KernelVa::new(carrick_el1_abi::EL1_STACKS_BASE);
+        let address = KernelVa::new(carrick_el1_abi::stack_slot_usable_base(0));
         let offset = (address.raw() - carrick_el1_abi::EL1_REGION_BASE) as usize;
         // SAFETY: aligned complete loan record on this CPU's retained fixture stack.
         let record = unsafe { region_ptr.add(offset).cast::<ForkStockExchange>() };
