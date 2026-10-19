@@ -68,13 +68,18 @@ fn owned(owner: &str, count: u64) -> AuthorityDebtCeilings {
     policy.counters[0].owner = owner.into();
     policy
 }
-fn moved(from: &str, to: &str) -> MoveMap {
-    MoveMap::new(&[DebtMove {
+fn entry(from: &str, to: &str) -> [DebtMove; 1] {
+    [DebtMove {
         from: from.into(),
         to: to.into(),
         issue: 673,
-    }])
-    .unwrap()
+    }]
+}
+fn moved(from: &str, to: &str) -> MoveMap {
+    MoveMap::new(&entry(from, to), &[]).unwrap()
+}
+fn inherited(from: &str, to: &str) -> MoveMap {
+    MoveMap::new(&entry(from, to), &entry(from, to)).unwrap()
 }
 #[test]
 fn a_reviewed_owner_move_transfers_its_ceiling() {
@@ -149,6 +154,36 @@ fn moves_refuse_existing_destinations_stale_entries_and_masked_growth() {
             .ratchet(&owned("carrick_kernel::poll", 3), &moves)
             .is_err(),
         "a split whose source grows fails"
+    );
+}
+#[test]
+fn inherited_moves_are_no_ops_and_cannot_launder() {
+    let landed = owned("carrick_kernel::readiness", 3);
+    let map = inherited("carrick_kernel::poll", "carrick_kernel::readiness");
+    assert!(
+        owned("carrick_kernel::readiness", 3)
+            .ratchet(&landed, &map)
+            .is_ok(),
+        "an inherited stale entry passes"
+    );
+    assert!(
+        owned("carrick_kernel::readiness", 4)
+            .ratchet(&landed, &map)
+            .unwrap_err()
+            .to_string()
+            .contains("increase"),
+        "an inherited entry admits nothing: the destination follows the normal rule"
+    );
+    assert!(
+        owned("carrick_kernel::readiness", 3)
+            .ratchet(
+                &landed,
+                &moved("carrick_kernel::poll", "carrick_kernel::readiness")
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("stale"),
+        "a newly added stale entry fails"
     );
 }
 #[test]

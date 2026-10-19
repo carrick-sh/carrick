@@ -437,7 +437,8 @@ fn check_policy(root: &Path, base: Option<&str>) -> Result<(), String> {
     let sites = discover(root)?;
     validate(&sites, &allowed)?;
     if let Some(base) = base {
-        let moves = crate::debt_moves::DebtMoves::load(root)?.terminal_custody()?;
+        let moves = crate::debt_moves::DebtMoves::load(root)?
+            .terminal_custody(&crate::debt_moves::DebtMoves::load_at(root, base)?)?;
         ratchet(&allowed, &base_counts(root, base)?, &moves)
             .map_err(|error| format!("{error}; current sites: {sites:?}"))?;
         println!("terminal custody PR-base ratchet passed ({base})");
@@ -717,12 +718,13 @@ mod tests {
     #[test]
     fn reviewed_crate_moves_transfer_the_cohort_total() {
         use crate::debt_moves::DebtMove;
-        let moves = MoveMap::new(&[DebtMove {
+        let entries = [DebtMove {
             from: "lane".into(),
             to: "lane-linux".into(),
             issue: 673,
-        }])
-        .unwrap();
+        }];
+        let moves = MoveMap::new(&entries, &[]).unwrap();
+        let inherited = MoveMap::new(&entries, &entries).unwrap();
         let base = BTreeMap::from([("lane".to_owned(), 28)]);
         let split = BTreeMap::from([("lane".to_owned(), 6), ("lane-linux".to_owned(), 22)]);
         assert!(
@@ -774,6 +776,15 @@ mod tests {
         assert!(
             ratchet(&masked, &wide, &moves).is_err(),
             "growth in the destination is not masked by a shrink elsewhere"
+        );
+        // (c) After landing, the inherited entry admits nothing: the halves
+        // follow the ordinary per-crate rule and cannot trade debt.
+        let landed = BTreeMap::from([("lane".to_owned(), 6), ("lane-linux".to_owned(), 22)]);
+        assert!(ratchet(&landed, &landed, &inherited).is_ok());
+        let traded = BTreeMap::from([("lane".to_owned(), 5), ("lane-linux".to_owned(), 23)]);
+        assert!(
+            ratchet(&traded, &landed, &inherited).is_err(),
+            "an inherited entry cannot launder destination growth"
         );
     }
 

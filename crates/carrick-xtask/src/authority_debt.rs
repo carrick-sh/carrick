@@ -689,7 +689,7 @@ pub fn run(root: &Path, args: &AuthorityDebtArgs) -> Result<(), DebtError> {
     policy.validate()?;
     if let Some(base) = &base {
         let moves = DebtMoves::load(&root)
-            .and_then(|moves| moves.authority_debt())
+            .and_then(|moves| moves.authority_debt(&DebtMoves::load_at(&root, base)?))
             .map_err(DebtError::Policy)?;
         policy.ratchet(&base_policy(&root, base)?, &moves)?;
     } else {

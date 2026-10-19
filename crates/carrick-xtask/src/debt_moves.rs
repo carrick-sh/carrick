@@ -5,8 +5,11 @@
 //! removed cohort plus a new one. An entry here admits exactly that change
 //! and nothing else:
 //! - it applies only while its source exists in the PR base and its
-//!   destination does not; any other entry is stale and fails, so the file
-//!   returns to empty once the move lands (delete-at-zero);
+//!   destination does not. An entry this change adds (absent from the base
+//!   revision's own move file) that does not apply is stale and fails; an
+//!   entry inherited from the base's file that no longer applies is a no-op
+//!   that settles nothing, so landed moves cannot be reused and a follow-up
+//!   change empties the file (delete-at-zero);
 //! - the source key is compared on its own (head ≤ base), and the new
 //!   destination key is admitted only up to what the source gave up
 //!   (`base(source) − head(source)`), so a split cannot pool its halves and a
@@ -36,12 +39,21 @@ pub struct DebtMoves {
     pub terminal_custody: Vec<DebtMove>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Move {
+    from: String,
+    to: String,
+    /// Listed identically in the base revision's move file.
+    inherited: bool,
+}
+
 /// A validated one-to-one list of moves.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MoveMap(Vec<(String, String)>);
+pub struct MoveMap(Vec<Move>);
 
 impl MoveMap {
-    pub fn new(moves: &[DebtMove]) -> Result<Self, String> {
+    /// `moves` is the head's list; `inherited` is the base revision's list.
+    pub fn new(moves: &[DebtMove], inherited: &[DebtMove]) -> Result<Self, String> {
         let mut sources = BTreeSet::new();
         let mut destinations = BTreeSet::new();
         for entry in moves {
@@ -61,7 +73,13 @@ impl MoveMap {
         Ok(Self(
             moves
                 .iter()
-                .map(|entry| (entry.from.clone(), entry.to.clone()))
+                .map(|entry| Move {
+                    from: entry.from.clone(),
+                    to: entry.to.clone(),
+                    inherited: inherited
+                        .iter()
+                        .any(|old| old.from == entry.from && old.to == entry.to),
+                })
                 .collect(),
         ))
     }
@@ -79,18 +97,27 @@ impl MoveMap {
         rename: impl Fn(&K, &str) -> K,
     ) -> Result<BTreeSet<K>, String> {
         let mut settled = BTreeSet::new();
-        for (from, to) in &self.0 {
-            if base.keys().any(|key| name(key) == to) {
-                return Err(format!(
-                    "stale debt move {from} -> {to}: the destination already exists in the base; \
-                     delete landed moves"
-                ));
-            }
+        for Move {
+            from,
+            to,
+            inherited,
+        } in &self.0
+        {
+            let destination_exists = base.keys().any(|key| name(key) == to);
             let sources: Vec<_> = base.keys().filter(|key| name(key) == from).collect();
-            if sources.is_empty() {
-                return Err(format!(
-                    "stale debt move {from} -> {to}: the source does not exist in the base"
-                ));
+            if destination_exists || sources.is_empty() {
+                if *inherited {
+                    // Landed before this change: it admits nothing now.
+                    continue;
+                }
+                return Err(if destination_exists {
+                    format!(
+                        "stale debt move {from} -> {to}: the destination already exists in the \
+                         base; a new move must name a new destination"
+                    )
+                } else {
+                    format!("stale debt move {from} -> {to}: the source does not exist in the base")
+                });
             }
             for source in sources {
                 let destination = rename(source, to);
@@ -136,12 +163,38 @@ impl DebtMoves {
         Ok(moves)
     }
 
-    pub fn authority_debt(&self) -> Result<MoveMap, String> {
-        MoveMap::new(&self.authority_debt)
+    /// The moves file at `base`, the revision the ratchet compares against;
+    /// absent there, it lists no moves.
+    pub fn load_at(root: &Path, base: &str) -> Result<Self, String> {
+        let listed =
+            crate::command::run_checked("git", ["ls-tree", base, "--", MOVES_PATH], Some(root))
+                .map_err(|error| error.to_string())?;
+        if listed.stdout.trim().is_empty() {
+            return Ok(Self {
+                schema: 1,
+                ..Self::default()
+            });
+        }
+        let source = crate::command::run_checked(
+            "git",
+            ["show", &format!("{base}:{MOVES_PATH}")],
+            Some(root),
+        )
+        .map_err(|error| error.to_string())?;
+        let moves: Self = serde_json::from_str(&source.stdout)
+            .map_err(|error| format!("{base}:{MOVES_PATH}: {error}"))?;
+        if moves.schema != 1 {
+            return Err(format!("unknown debt move schema {}", moves.schema));
+        }
+        Ok(moves)
     }
 
-    pub fn terminal_custody(&self) -> Result<MoveMap, String> {
-        MoveMap::new(&self.terminal_custody)
+    pub fn authority_debt(&self, base: &Self) -> Result<MoveMap, String> {
+        MoveMap::new(&self.authority_debt, &base.authority_debt)
+    }
+
+    pub fn terminal_custody(&self, base: &Self) -> Result<MoveMap, String> {
+        MoveMap::new(&self.terminal_custody, &base.terminal_custody)
     }
 }
 
@@ -173,15 +226,15 @@ mod tests {
 
     #[test]
     fn duplicate_self_and_chained_moves_are_refused() {
-        assert!(MoveMap::new(&[entry("a", "a")]).is_err());
-        assert!(MoveMap::new(&[entry("a", "b"), entry("a", "c")]).is_err());
-        assert!(MoveMap::new(&[entry("a", "c"), entry("b", "c")]).is_err());
-        assert!(MoveMap::new(&[entry("a", "b"), entry("b", "c")]).is_err());
+        assert!(MoveMap::new(&[entry("a", "a")], &[]).is_err());
+        assert!(MoveMap::new(&[entry("a", "b"), entry("a", "c")], &[]).is_err());
+        assert!(MoveMap::new(&[entry("a", "c"), entry("b", "c")], &[]).is_err());
+        assert!(MoveMap::new(&[entry("a", "b"), entry("b", "c")], &[]).is_err());
     }
 
     #[test]
     fn a_split_is_bounded_by_what_the_source_gave_up() {
-        let map = MoveMap::new(&[entry("lane", "lane-linux")]).unwrap();
+        let map = MoveMap::new(&[entry("lane", "lane-linux")], &[]).unwrap();
         assert!(settle(&map, &[("lane", 28)], &[("lane", 6), ("lane-linux", 22)]).is_ok());
         assert!(settle(&map, &[("lane", 28)], &[("lane-linux", 28)]).is_ok());
         // The source grows while the destination shrinks to keep the total.
@@ -190,8 +243,30 @@ mod tests {
     }
 
     #[test]
+    fn an_inherited_entry_that_no_longer_applies_is_a_no_op() {
+        let inherited = [entry("a", "b")];
+        let map = MoveMap::new(&inherited, &inherited).unwrap();
+        // (a) After landing, the base names the destination: no error.
+        assert_eq!(
+            map.settle(
+                &counts(&[("b", 3)]),
+                &counts(&[("b", 3)]),
+                |k| k.as_str(),
+                |_, n| n.to_owned()
+            ),
+            Ok(BTreeSet::new()),
+            "an inherited stale entry settles nothing and passes"
+        );
+        // (b) The same entry newly added by this change is stale.
+        let added = MoveMap::new(&inherited, &[]).unwrap();
+        assert!(settle(&added, &[("b", 3)], &[("b", 3)]).is_err());
+        // An inherited entry that still applies keeps its bound.
+        assert!(settle(&map, &[("a", 3)], &[("b", 4)]).is_err());
+    }
+
+    #[test]
     fn an_existing_destination_or_a_landed_move_is_stale() {
-        let map = MoveMap::new(&[entry("a", "b")]).unwrap();
+        let map = MoveMap::new(&[entry("a", "b")], &[]).unwrap();
         // Moving into an existing cohort would hide its new debt.
         assert!(settle(&map, &[("a", 3), ("b", 2)], &[("b", 5)]).is_err());
         // After landing the base names the destination: the entry is stale.
