@@ -30,6 +30,12 @@ path = "src/fixture.rs"
 test = false
 bench = false
 
+[features]
+# The ring stack audit's red fixture: an oversized frame on a fixture entry
+# chain that `cargo xtask frame-budget --red-fixture` requires the audit to
+# reject. Never enabled by an image build that ships.
+frame-budget-red-fixture = []
+
 [lints]
 workspace = true
 

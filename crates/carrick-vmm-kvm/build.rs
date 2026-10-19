@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=cpl0_inputs.rs");
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
     let target_dir = out.join("cpl0-target");
-    let status = Command::new(cargo)
+    let status = Command::new(&cargo)
         .args([
             "build",
             "--locked",
@@ -67,6 +67,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &image,
         )?;
         println!("cargo:rustc-env={variable}={}", image.display());
+    }
+    // The ring stack audit (#369) over exactly the images embedded above.
+    println!("cargo:rerun-if-changed=../carrick-ring-audit/src");
+    let objdump = carrick_ring_audit::toolchain::llvm_objdump(std::path::Path::new(&cargo))?;
+    let mut failures = String::new();
+    for bin in ["carrick-x86-cpl0", "carrick-x86-cpl0-fixture"] {
+        let report = carrick_ring_audit::audit_image_with(
+            &objdump,
+            &out.join(bin),
+            // Under `cargo clippy` the nested build is `clippy-driver`'s, too.
+            if cfg!(clippy) {
+                |arch| carrick_ring_audit::policy::for_build(arch, true)
+            } else {
+                |arch| carrick_ring_audit::policy::for_build(arch, false)
+            },
+        )?;
+        for line in carrick_ring_audit::summary(&report).lines() {
+            println!("cargo:warning={bin}: {line}");
+        }
+        for violation in &report.violations {
+            failures.push_str(&format!("{bin}: {violation}\n"));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!("CPL0 ring stack audit failed:\n{failures}").into());
     }
     Ok(())
 }

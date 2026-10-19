@@ -94,6 +94,9 @@ NON_PRODUCT_CRATES = frozenset(
         "carrick-conformance",
         "carrick-coordinator",
         "carrick-investigation",
+        # Build-time ring image audit: a build-dependency of the image
+        # crates and a dependency of xtask, never linked into a product.
+        "carrick-ring-audit",
         "carrick-test-support",
         "carrick-xtask",
     }

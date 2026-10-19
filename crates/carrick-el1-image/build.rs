@@ -1,155 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-pub(crate) fn get_sysroot(cargo: &Path) -> Result<String, String> {
-    // Cargo supplies its executable path. Query that toolchain's sibling
-    // rustc, independently of PATH and any census compiler wrappers.
-    let cargo_bin = cargo
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| format!("Cargo path {cargo:?} has no compiler directory"))?;
-    let mut command = Command::new(cargo_bin.join("rustc"));
-    let output = command
-        .args(["--print", "sysroot"])
-        .output()
-        .map_err(|error| format!("failed to query compiler sysroot ({command:?}): {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "compiler sysroot query ({command:?}) failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let sysroot = String::from_utf8(output.stdout)
-        .map_err(|error| format!("sysroot is not valid UTF-8: {error}"))?;
-    let sysroot = sysroot.trim();
-    if sysroot.is_empty() {
-        return Err(format!(
-            "compiler sysroot query ({command:?}) returned an empty path"
-        ));
-    }
-    Ok(sysroot.to_owned())
-}
-
-fn find_sysroot_tool(tool: &str, sysroot: &str, host: &str) -> PathBuf {
-    let sysroot_path = Path::new(sysroot)
-        .join("lib/rustlib")
-        .join(host)
-        .join("bin")
-        .join(tool);
-    if sysroot_path.exists() {
-        return sysroot_path;
-    }
-
-    if Command::new(tool).arg("--version").output().is_ok() {
-        return PathBuf::from(tool);
-    }
-
-    panic!(
-        "{tool} not found in sysroot ({sysroot_path:?}) or on PATH.\n\
-         Install the llvm-tools component with:\n    rustup component add llvm-tools-preview"
-    );
-}
-
-/// Pin the frames that actually retain stack across owner entry and exit.
-/// Tail-call wrappers do not stand in for their callee's budget.
-fn check_process_exit_frames(disassembly: &str) {
-    let budgets = [
-        // Runtime table construction must stay in-place on the heap, never
-        // materialize the pending-fork array on a 16 KiB EL1 stack.
-        ("::PendingForkStorage::initialize::", 0x100, true),
-        ("::dispatch::dispatch_syscall::", 0x600, true),
-        ("::aarch64_process::admit_entry_runtime::", 0x1200, true),
-        ("::exit_with_status::", 0x600, true),
-        ("::finish_exit::", 0x800, true),
-        ("::aarch64_process::resume_selected::", 0xa00, true),
-        ("::resume_checkpoint::", 0x400, true),
-        // The ARM codec is dormant until #323 routes rt_sigreturn in-ring.
-        // Once linked, its frame must fit below the budget; #323 makes this
-        // symbol required as part of the atomic signal-owner cutover.
-        ("Aarch64Backend$GT$::restore_signal_frame::", 0x1300, false),
-    ];
-    for (symbol, ceiling, required) in budgets {
-        let mut found = false;
-        for body in disassembly.split(">:\n") {
-            if !body
-                .lines()
-                .last()
-                .is_some_and(|line| line.contains(symbol))
-            {
-                continue;
-            }
-            // The next segment begins with this function's instructions.
-            let start = disassembly.find(body).unwrap() + body.len() + 3;
-            let mut frame = 0;
-            let mut aligned = false;
-            for line in disassembly[start..].lines().take(20) {
-                // A short tail-call wrapper may end before twenty instructions.
-                // Do not charge the next symbol's frame to this function.
-                if line.ends_with(">:") {
-                    break;
-                }
-                let Some((_, instruction)) = line.split_once(':') else {
-                    continue;
-                };
-                let instruction = instruction.trim();
-                if instruction.starts_with("stp") && instruction.contains("[sp, #-0x") {
-                    let hex = instruction
-                        .split("#-0x")
-                        .nth(1)
-                        .unwrap()
-                        .split(']')
-                        .next()
-                        .unwrap();
-                    frame += usize::from_str_radix(hex, 16).unwrap();
-                }
-                // LLVM stack probing computes the final aligned SP in x9;
-                // count that target once, rather than counting the probe loop.
-                if instruction.starts_with("sub") {
-                    let operands = instruction
-                        .split_whitespace()
-                        .skip(1)
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if operands.starts_with("x9, sp,") {
-                        aligned = true;
-                    }
-                    let counted = if aligned {
-                        operands.starts_with("x9, sp,") || operands.starts_with("x9, x9,")
-                    } else {
-                        operands.starts_with("sp, sp,")
-                    };
-                    if counted {
-                        let hex = operands
-                            .split("#0x")
-                            .nth(1)
-                            .expect("immediate frame allocation")
-                            .split([',', ' '])
-                            .next()
-                            .unwrap();
-                        let amount = usize::from_str_radix(hex, 16).unwrap();
-                        frame += if operands.contains("lsl #12") {
-                            amount << 12
-                        } else {
-                            amount
-                        };
-                    }
-                }
-            }
-            if aligned {
-                frame += 63;
-            }
-            assert!(
-                frame > 0 && frame <= ceiling,
-                "EL1 exit frame {symbol}: {frame:#x} exceeds {ceiling:#x}"
-            );
-            found = true;
-        }
-        if required {
-            assert!(found, "missing EL1 exit frame {symbol}");
-        }
-    }
-}
+pub(crate) use carrick_ring_audit::toolchain::{find_sysroot_tool, get_sysroot};
 
 /// The CEL1 header stores this same linker expression. The end symbol includes
 /// trailing .bss and alignment that are absent from the flat file.
@@ -170,6 +22,27 @@ pub(crate) fn loaded_image_size(symbols: &str) -> Result<u64, String> {
         .ok_or_else(|| "invalid EL1 loaded image extent".to_owned())
 }
 
+/// The ring stack audit (#338, #369) over this exact image: every frame,
+/// the #338 exit-frame pins, and each entry chain's worst case.
+fn check_ring_stack(disassembly: &str) {
+    use carrick_ring_audit::frames::{Arch, Image, audit};
+    let image = Image::parse(Arch::Aarch64, disassembly, None)
+        .unwrap_or_else(|error| panic!("EL1 ring stack audit cannot parse the image: {error}"));
+    // Under `cargo clippy` the nested build is `clippy-driver`'s, too.
+    let policy = carrick_ring_audit::policy::for_build(Arch::Aarch64, cfg!(clippy));
+    let report = audit(&image, policy);
+    for line in carrick_ring_audit::summary(&report).lines() {
+        println!("cargo:warning={line}");
+    }
+    if !report.passed() {
+        let mut failure = String::new();
+        for violation in &report.violations {
+            failure.push_str(&format!("{violation}\n"));
+        }
+        panic!("EL1 ring stack audit failed:\n{failure}");
+    }
+}
+
 fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) -> u64 {
     let output = Command::new(llvm_objdump)
         .arg("-d")
@@ -187,7 +60,7 @@ fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) -> u64 {
     }
     let stdout = String::from_utf8(output.stdout).expect("disassembly not valid utf-8");
 
-    check_process_exit_frames(&stdout);
+    check_ring_stack(&stdout);
 
     // The in-guest thread switch saves and restores the guest's FP/SIMD
     // state in exactly these two audited routines (`carrick-el1`
@@ -324,6 +197,9 @@ fn main() {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let host = std::env::var("HOST").expect("HOST not set");
     let sysroot = get_sysroot(Path::new(&cargo)).unwrap_or_else(|error| panic!("{error}"));
+    let tool = |name: &str| {
+        find_sysroot_tool(name, &sysroot, &host).unwrap_or_else(|error| panic!("{error}"))
+    };
 
     // Verify that the aarch64-unknown-none-softfloat target is installed
     let target_dir = Path::new(&sysroot).join("lib/rustlib/aarch64-unknown-none-softfloat");
@@ -338,8 +214,8 @@ fn main() {
         );
     }
 
-    let rust_objcopy = find_sysroot_tool("rust-objcopy", &sysroot, &host);
-    let llvm_objdump = find_sysroot_tool("llvm-objdump", &sysroot, &host);
+    let rust_objcopy = tool("rust-objcopy");
+    let llvm_objdump = tool("llvm-objdump");
 
     let el1_target_dir = Path::new(&out_dir).join("el1-target");
 
@@ -427,4 +303,6 @@ fn main() {
     println!("cargo:rerun-if-changed=../carrick-personality-api/Cargo.toml");
     println!("cargo:rerun-if-changed=../carrick-personality-linux/src");
     println!("cargo:rerun-if-changed=../carrick-personality-linux/Cargo.toml");
+    // The audit and its policy are part of what this build enforces.
+    println!("cargo:rerun-if-changed=../carrick-ring-audit/src");
 }

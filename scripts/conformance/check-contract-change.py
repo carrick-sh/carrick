@@ -19,6 +19,7 @@ NON_GUEST_CRATES = {
     "crates/carrick-investigation",
     "crates/carrick-test-support",
     "crates/carrick-observability",
+    "crates/carrick-ring-audit",
     "crates/carrick-xtask",
 }
 

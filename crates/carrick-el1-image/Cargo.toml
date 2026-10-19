@@ -10,6 +10,7 @@ carrick-el1-abi = { path = "../carrick-el1-abi" }
 
 [build-dependencies]
 carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-ring-audit = { path = "../carrick-ring-audit" }
 
 [features]
 default = []

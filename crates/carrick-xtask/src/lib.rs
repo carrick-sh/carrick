@@ -15,6 +15,7 @@ pub mod command;
 pub mod commit_trailers;
 pub mod debt_moves;
 pub mod fixtures;
+pub mod frame_budget;
 pub mod guest_image;
 pub mod host_lease;
 pub mod host_load;

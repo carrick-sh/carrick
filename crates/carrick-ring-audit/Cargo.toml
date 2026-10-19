@@ -1,0 +1,13 @@
+[package]
+name = "carrick-ring-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build-time audits of the freestanding ring images: toolchain discovery and the ring stack frame budget."
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-el1-abi = { path = "../carrick-el1-abi" }
