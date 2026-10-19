@@ -471,16 +471,16 @@ pub fn capture_zombie(
     let (children_user_us, children_system_us) = task.children_cpu_us();
     let credentials = task.process_credentials();
     let internal_pid = u32::try_from(task.key().id.raw()).unwrap_or_else(|_| {
-        <carrick_el1::personality::process_owner::GuestRegistryFailure as
-            carrick_el1::personality::process_owner::GuestProcessFailure>::fail_process(
-                carrick_el1::personality::process_owner::GuestProcessInvariant::NamespaceInternalIdentityOutOfRange(task.key()),
+        <carrick_el1_linux::process_owner::GuestRegistryFailure as
+            carrick_el1_linux::process_owner::GuestProcessFailure>::fail_process(
+                carrick_el1_linux::process_owner::GuestProcessInvariant::NamespaceInternalIdentityOutOfRange(task.key()),
             );
     });
     let namespace_pid = match task.pid_ns_region() {
         Some(region) => region.host_to_ns(internal_pid).unwrap_or_else(|| {
-            <carrick_el1::personality::process_owner::GuestRegistryFailure as
-                carrick_el1::personality::process_owner::GuestProcessFailure>::fail_process(
-                    carrick_el1::personality::process_owner::GuestProcessInvariant::NamespaceVisibleIdentityLost(task.key()),
+            <carrick_el1_linux::process_owner::GuestRegistryFailure as
+                carrick_el1_linux::process_owner::GuestProcessFailure>::fail_process(
+                    carrick_el1_linux::process_owner::GuestProcessInvariant::NamespaceVisibleIdentityLost(task.key()),
                 );
         }),
         None => internal_pid,

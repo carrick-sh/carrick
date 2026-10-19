@@ -2699,8 +2699,8 @@ impl Drop for Cpl0HostCustody {
             .as_ref()
             .is_some_and(|fault| fault.load(Ordering::Acquire))
         {
-            carrick_el1::personality::dispatch::invalid_completion(
-                carrick_el1::personality::dispatch::NativeInvariant::PhysicalCustody(
+            carrick_el1_linux::dispatch::invalid_completion(
+                carrick_el1_linux::dispatch::NativeInvariant::PhysicalCustody(
                     "unexposed physical inventory rollback failed",
                 ),
             );
@@ -7388,7 +7388,7 @@ mod cpl0_layout_tests {
 
     #[test]
     fn file_region_host_mutation_refused_while_cpu_running() {
-        use carrick_el1::personality::file_table::admit_host_fd;
+        use carrick_el1_linux::file_table::admit_host_fd;
         use std::os::fd::AsRawFd;
         let inventory = Arc::new(FrameInventoryAuthority::new())
             .physical_projection(Arc::new(ObjectIdRegistry::new()));

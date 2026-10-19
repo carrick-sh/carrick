@@ -158,7 +158,7 @@ fn wrong_region_notification_venue_is_rejected() {
 
 #[test]
 fn delayed_old_root_admission_cannot_demote_reused_notification_word() {
-    use carrick_el1::personality::mm_portal::test_support::ROOT;
+    use carrick_el1_linux::mm_portal::test_support::ROOT;
     use carrick_sched_core::spaces::notification::SpaceReleaseVenue;
     use core::cell::{Cell, RefCell};
     let region = Region::new();
@@ -287,10 +287,10 @@ fn delayed_old_root_admission_cannot_demote_reused_notification_word() {
 
 mod fixture {
     use super::*;
-    pub struct Region(carrick_el1::personality::mm_portal::test_support::Region);
+    pub struct Region(carrick_el1_linux::mm_portal::test_support::Region);
     impl Region {
         pub fn new() -> Self {
-            Self(carrick_el1::personality::mm_portal::test_support::Region::new())
+            Self(carrick_el1_linux::mm_portal::test_support::Region::new())
         }
         pub fn table(&self) -> &SharedReservations {
             // SAFETY: unit and production owners use the same repr(C) store,
@@ -308,7 +308,7 @@ mod fixture {
         pages: usize,
         unrelated: usize,
     ) -> ReservationMm {
-        carrick_el1::personality::mm_portal::test_support::admit_notified(
+        carrick_el1_linux::mm_portal::test_support::admit_notified(
             &region.0, mm, root, pages, unrelated,
         )
     }

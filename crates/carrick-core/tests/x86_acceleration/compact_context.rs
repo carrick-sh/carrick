@@ -8,7 +8,7 @@ use carrick_el1::memory::reservations::{
     LinuxReservationLayout, NoRootWait, X86Cpl0ReservationGeometry, X86Cpl0Reservations,
     X86Cpl0RootReleaseVenue,
 };
-use carrick_el1::personality::mm_portal::test_support::{IPA, NoPin, Region, Tables, VA};
+use carrick_el1_linux::mm_portal::test_support::{IPA, NoPin, Region, Tables, VA};
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_mmu_core::x86::descriptor_txn::{COW, MAY_WRITE, NX, PRESENT, PRIVATE, USER, WRITE};
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
@@ -163,9 +163,7 @@ fn compact_parked_context_owner_clones_two_roots_and_selects_exact_cow_supply() 
     }
     .with_zone(zone)
     .unwrap();
-    fn accepts_native_fork<
-        T: carrick_el1::personality::mm_portal::NativeForkPortal<NoPin, X86Mmu>,
-    >(
+    fn accepts_native_fork<T: carrick_el1_linux::mm_portal::NativeForkPortal<NoPin, X86Mmu>>(
         _: &T,
     ) {
     }
@@ -399,7 +397,7 @@ fn compact_native_portal_prepares_and_publishes_initial_private_ranges() {
         fn publish_barrier(&self) {}
         fn invalidate_range(&self, _: u64, _: u64) {}
     }
-    use carrick_el1::personality::mm_portal::NativeForkPortal;
+    use carrick_el1_linux::mm_portal::NativeForkPortal;
     let words = Words([&parent, &child, &supply]);
     let scratch = portal.census_fork(request, &words, 0).unwrap();
     let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();

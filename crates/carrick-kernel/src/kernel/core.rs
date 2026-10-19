@@ -3082,7 +3082,7 @@ pub(super) type RegistryState = carrick_sched_core::process::registry::ProcessRe
     super::thread_retirement::RetiredThreads,
     Arc<ProcessGroup>,
     Arc<Session>,
-    carrick_el1::personality::process_owner::GuestRegistryFailure,
+    carrick_el1_linux::process_owner::GuestRegistryFailure,
 >;
 
 fn fail_container_root(

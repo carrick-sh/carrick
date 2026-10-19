@@ -10,11 +10,11 @@ fn x4_linux_common_entry() {
 
 #[test]
 fn unmigrated_family_completes_once_through_linux_owner() {
-    use carrick_el1::personality::{dispatch, sched};
     use carrick_el1_abi::{
         Counters, CurrentTask, DELEGATED_FLAG_READABLE, DELEGATED_STATE_GUEST, DelegatedFile,
         DelegatedOpenFile, FdMapSlot, InotifyNameCache, TrapFrame,
     };
+    use carrick_el1_linux::{dispatch, sched};
     use core::sync::atomic::Ordering;
     for scale in [1, 2, 8] {
         let counters = Counters::default();
@@ -69,7 +69,7 @@ fn unmigrated_family_completes_once_through_linux_owner() {
 // This family fixture has no zone. Reaching a CPU hook would violate the
 // absence of a native scheduling venue, rather than model a second scheduler.
 struct NoCpu;
-impl carrick_el1::personality::sched::ThreadCpu for NoCpu {
+impl carrick_el1_linux::sched::ThreadCpu for NoCpu {
     fn save(
         &mut self,
         _: &carrick_el1_abi::TrapFrame,

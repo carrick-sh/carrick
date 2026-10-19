@@ -71,6 +71,7 @@ carrick-abi = { path = "../carrick-abi" }
 carrick-syscall-abi = { path = "../carrick-syscall-abi" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-el1 = { path = "../carrick-el1" }
+carrick-el1-linux = { path = "../carrick-el1-linux" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-core = { path = "../carrick-core" }
 carrick-core-abi = { path = "../carrick-core-abi" }
@@ -160,6 +161,7 @@ mach2.workspace = true
 wait-timeout = "0.2.1"
 loom = "=0.7.2"
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
+carrick-el1-linux = { path = "../carrick-el1-linux", features = ["host-test"] }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 # Self dev-dependency: enables `test-support` on this crate's own lib when it
 # is built for an integration test (`tests/`), which sees no `cfg(test)`.

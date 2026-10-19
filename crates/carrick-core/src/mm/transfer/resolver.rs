@@ -109,8 +109,7 @@ mod tests {
             }
         }
         let mut cow = CountingCow(0);
-        let tables =
-            carrick_el1::personality::mm_portal::test_support::Tables::new(0x10000, 0x40000, 1);
+        let tables = carrick_el1_linux::mm_portal::test_support::Tables::new(0x10000, 0x40000, 1);
         let maintenance = carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
         let handle = unsafe {
             carrick_core_abi::El1MmHandle::from_admitted_owner(

@@ -13,8 +13,8 @@ use carrick_el1::isa::x86::context::native::{
     OBSERVE_SHARED_PREPARED_FAULT,
 };
 use carrick_el1::isa::x86::context::scheduler::XsaveArea;
-use carrick_el1::personality::{sched, thread_setup::GuestLifecycleVenue};
 use carrick_el1_abi::{Counters, CurrentTask};
+use carrick_el1_linux::{sched, thread_setup::GuestLifecycleVenue};
 use carrick_guest_arch::{EntryArch, NativeReturnWord, UserVa};
 use carrick_personality_linux::crossing::{HostCrossingSet, evaluate_host_crossing};
 use carrick_personality_linux::dispatch::CompletionRoute;
@@ -232,7 +232,7 @@ fn fixture_handled(
                 task,
                 counters,
                 call.args,
-                carrick_el1::personality::native_run_failure::complete_native_run_failure,
+                carrick_el1_linux::native_run_failure::complete_native_run_failure,
             )
         }) else {
             fatal_error(frame);
@@ -892,8 +892,8 @@ impl Personality for FixturePersonality {
             FixtureCall::ObserveSharedCowFault => {
                 use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
                 use carrick_el1::fault::{GrantMailboxes, dispatch_x86_fault_with_prepared};
-                use carrick_el1::personality::cow_resolver::X86CowResolver;
                 use carrick_el1_abi::{Action, FrameGrantResidencyIdentity};
+                use carrick_el1_linux::cow_resolver::X86CowResolver;
                 use carrick_guest_arch::{
                     Access, EditBacking, EditOperation, EditPermissions, FaultInfo, FrameGpa,
                     GuestLen, UserVa,
@@ -1126,8 +1126,8 @@ impl Personality for FixturePersonality {
                         file_table,
                         files: &files,
                     };
-                    let route =
-                        match production_boundary(carrick_el1::dispatch_syscall_with_lifecycle(
+                    let route = match production_boundary(
+                        carrick_el1_linux::dispatch::dispatch_syscall_with_lifecycle(
                             &mut native,
                             counters,
                             core::slice::from_ref(task),
@@ -1137,19 +1137,24 @@ impl Personality for FixturePersonality {
                             &[],
                             files.names(),
                             None::<
-                                carrick_el1::Zone<'_, sched::HardwareCpu, sched::HardwareUserWord>,
+                                carrick_el1_linux::dispatch::Zone<
+                                    '_,
+                                    sched::HardwareCpu,
+                                    sched::HardwareUserWord,
+                                >,
                             >,
                             None,
                             Some(&GuestLifecycleVenue),
                             None,
                             cache_lookup,
-                        )) {
-                            ProductionBoundary::Continue => CompletionRoute::Served,
-                            ProductionBoundary::Work => CompletionRoute::WithWork,
-                            ProductionBoundary::Forward => CompletionRoute::Forward,
-                            ProductionBoundary::HostCustody => CompletionRoute::HostCustody,
-                            ProductionBoundary::Invalid => CompletionRoute::InvalidCompletion,
-                        };
+                        ),
+                    ) {
+                        ProductionBoundary::Continue => CompletionRoute::Served,
+                        ProductionBoundary::Work => CompletionRoute::WithWork,
+                        ProductionBoundary::Forward => CompletionRoute::Forward,
+                        ProductionBoundary::HostCustody => CompletionRoute::HostCustody,
+                        ProductionBoundary::Invalid => CompletionRoute::InvalidCompletion,
+                    };
                     match route {
                         CompletionRoute::Served => {}
                         CompletionRoute::WithWork => notify_work(frame),
@@ -1244,8 +1249,8 @@ impl Personality for FixturePersonality {
     fn handle_page_fault(frame: &mut PageFaultStack, fpstate: &XsaveArea) -> u64 {
         use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
         use carrick_el1::fault::{GrantMailboxes, dispatch_x86_fault_with_prepared};
-        use carrick_el1::personality::cow_resolver::X86CowResolver;
         use carrick_el1_abi::Action;
+        use carrick_el1_linux::cow_resolver::X86CowResolver;
 
         let prep = match prepare_user_page_fault(frame) {
             Ok(p) => p,

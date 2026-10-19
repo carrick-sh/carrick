@@ -1,12 +1,12 @@
 //! Dispatch-policy assertions moved with the single Linux owner.
 use super::NoCpu;
-use carrick_el1::personality::{
-    dispatch::{El1PendingFamilies, Zone, dispatch_syscall_with_regions},
-    inotify, sched,
-};
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
     DelegatedOpenFile, FdMapSlot, InotifyNameCache, TrapFrame,
+};
+use carrick_el1_linux::{
+    dispatch::{El1PendingFamilies, Zone, dispatch_syscall_with_regions},
+    inotify, sched,
 };
 use core::sync::atomic::Ordering;
 

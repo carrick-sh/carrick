@@ -14307,10 +14307,10 @@ fn transfer_import_refuses_competing_pending_journal() {
 
 fn exercise_retained_import(journal_case: u8) {
     use carrick_aarch64::user_transfer::TransferCustody;
-    use carrick_el1::personality::mm_portal::test_support::{Region, VA, admit, nodes};
     use carrick_el1_abi::{
         PortalRetainedData, PortalTransferIntent, ReservationProtection, ReservationRange,
     };
+    use carrick_el1_linux::mm_portal::test_support::{Region, VA, admit, nodes};
     let _external = ExternalAliasStateRestore::capture();
     let _stub = ScopedStage2MapTestStub::enable();
     let transport = Arc::new(CarrierForeignMmTransport::new());
@@ -14691,7 +14691,7 @@ fn exercise_retained_import(journal_case: u8) {
     );
     // Actual selected source bytes survive source owner/directory destruction.
     let view = nodes(&region);
-    let portal = carrick_el1::personality::mm_portal::MmPortal::new(
+    let portal = carrick_el1_linux::mm_portal::MmPortal::new(
         target.carrier(),
         region.table(),
         &zone.spaces,
@@ -14700,7 +14700,7 @@ fn exercise_retained_import(journal_case: u8) {
     let transfer = portal
         .begin(
             portal.admitted_handle(mm, 0).unwrap(),
-            carrick_el1::personality::mm_portal::GuestVa::new(VA),
+            carrick_el1_linux::mm_portal::GuestVa::new(VA),
             4,
             PortalTransferIntent::UserRead,
             0,
@@ -14720,15 +14720,15 @@ fn exercise_retained_import(journal_case: u8) {
         )
     }
     .unwrap();
-    let chunk = carrick_el1::personality::mm_portal::test_support::selected(
+    let chunk = carrick_el1_linux::mm_portal::test_support::selected(
         portal
             .select(
                 &transfer,
                 &words,
-                carrick_el1::personality::mm_portal::SelectionVenues {
+                carrick_el1_linux::mm_portal::SelectionVenues {
                     prepared: &mut carrick_el1::fault::NoopPreparedResolver,
                     cow: &mut carrick_el1::fault::NoopCowResolver,
-                    residency: &carrick_el1::personality::mm_portal::test_support::residency(),
+                    residency: &carrick_el1_linux::mm_portal::test_support::residency(),
                     slot: 0,
                 },
             )
