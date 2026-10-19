@@ -21,7 +21,7 @@
 //! `gpa == SENTINEL_GPA` → `Syscall`, `FAULT_SENTINEL_GPA` → `EL0Fault`,
 //! `MAINT_SENTINEL_GPA` → `MaintenanceDone`, and `KVM_RUN` EINTR → `Kicked`.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
@@ -36,7 +36,7 @@ use carrick_hal::{
 use carrick_mem::memory::AddressSpace;
 
 use crate::guest_setup::{
-    BroughtUp, FAULT_SENTINEL_GPA, GuestRam, MAINT_SENTINEL_GPA, SENTINEL_GPA, WindowDesc,
+    BroughtUp, FAULT_SENTINEL_GPA, GuestRam, GuestRamKvmExt, MAINT_SENTINEL_GPA, SENTINEL_GPA,
     bring_up as ram_bring_up, populate_vdso_vvar, program_sysregs,
 };
 use crate::kvm::{KvmVcpu, KvmVm, SharedVmHandle, VcpuLiveTicket};
