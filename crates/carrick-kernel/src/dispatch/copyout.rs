@@ -88,11 +88,12 @@ pub(crate) fn bounded_capacity(memory: &impl CurrentMmMemory, requested: usize) 
 /// serves the dependency and redispatches the saved syscall.
 #[derive(Debug, Eq, PartialEq)]
 #[must_use = "a refused copyout must be returned before any side effect"]
-pub(crate) struct CopyoutRefusal(DispatchOutcome);
+/// Boxed: a refusal is the rare path, and the outcome is large.
+pub(crate) struct CopyoutRefusal(Box<DispatchOutcome>);
 
 impl CopyoutRefusal {
     pub(crate) fn into_outcome(self) -> DispatchOutcome {
-        self.0
+        *self.0
     }
 }
 
@@ -188,7 +189,7 @@ pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
             // `owner_prepare_refusal` has recorded the fault probe; the
             // commit reports EFAULT at Linux's point.
             outcome if outcome == DispatchOutcome::errno(LINUX_EFAULT) => Ok(faulted),
-            outcome => Err(CopyoutRefusal(outcome)),
+            outcome => Err(CopyoutRefusal(Box::new(outcome))),
         },
     }
 }
@@ -491,10 +492,9 @@ mod tests {
     #[test]
     fn owner_fault_surfaces_at_commit_like_legacy() {
         let mut memory = OwnerRefusingMemory::new(BASE, 0x1000, 0);
-        let prepared = UserOut::<LinuxTimespec>::new(BASE + 0x2000)
-            .prepare(&mut memory)
-            .ok()
-            .expect("an invalid pointer is not a retryable refusal");
+        let Ok(prepared) = UserOut::<LinuxTimespec>::new(BASE + 0x2000).prepare(&mut memory) else {
+            panic!("an invalid pointer is not a retryable refusal");
+        };
         assert_eq!(
             prepared.commit(&LinuxTimespec::new(1, 1)),
             Err(CopyoutFault)
