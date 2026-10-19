@@ -1325,8 +1325,9 @@ crate-internal `ExtentTable` authentication via the sealed `PlacementGpa` trait
 and refusing MMIO holes (default xAPIC `0xfee0_0000..0xfee0_1000`) and
 out-of-span extents. `ExtentTable::remove`, `ExtentTable::replace`,
 `ExtentTable::remove_root_generation`, and `ExtentTable::replace_root_generation`
-require TLB shootdowns across supplied `SoftTlb`s, `ExtentTable::set_root_generation`
-refuses re-registering an existing root without a flush, and
+publish a domain-wide invalidation that every seated soft vCPU owes
+(`softmmu.x86.physical-retirement`, below), `ExtentTable::set_root_generation`
+refuses re-registering an existing root or a root still pending retirement, and
 `ExtentTable::expected_generation` refuses unregistered roots (`None`, no
 fallback generation). `SoftTlb` provides three 1024-entry direct-mapped planes
 (`read`, `write`, `exec`) with 16-byte `SoftTlbEntry { tag, addend }` records
@@ -1346,7 +1347,8 @@ unchanged (restarting the walk on a material change and counting every failed
 CAS against `MAX_AD_CAS_RETRIES`, with typed `AdCasRetryExhausted` counted in
 `SoftWalkerStats`), non-canonical `#GP(0)`/`#SS(0)` and MMIO outcomes, leaf
 extent authentication over `[leaf_base, +leaf.size)`, and frame-keyed code-page
-write shootdowns across per-CPU `SoftTlb`s.
+write invalidation across explicitly supplied `SoftTlb`s (cross-vCPU code-page
+publication is #684, slice 3 of #681).
 
 VM-free bindings in `crates/carrick-softmmu/tests/softmmu_contract.rs` cover
 all permission, CR-gating (including `Execute` -> `Read` SMAP isolation), and
@@ -1358,8 +1360,45 @@ concurrent `P`-clear walk restart, and bounded `AdCasRetryExhausted` at
 software-available bits `9..=11`), cross-page split accesses, MMIO hole exclusion,
 production `AuthenticatedDescriptorWords` `LinearPlacement`-backed atomic access
 (rejecting disagreeing raw-PA mappings, retired table frames, and unregistered
-roots), `ExtentTable` `remove` / `replace` / `remove_root_generation` TLB
-shootdowns, frame-keyed code-page alias invalidation across CPUs, a two-thread
+roots), `ExtentTable` `remove` / `replace` / `remove_root_generation`
+retirements served by both seated CPUs at block entry, frame-keyed code-page
+alias invalidation across supplied TLBs, a two-thread
 `invlpg` + `mov cr3` shootdown test, a concurrent PTE writer
 snapshot-consistency race witness, and structural budget bounds across
 `{1, 16, 256}` extents and `{2, 3, 4}` page-table levels.
+
+## Software vCPU physical retirement (`softmmu.x86.physical-retirement`, #681 slice 2, #607)
+
+Surface: `carrick-softmmu::retirement` (`SoftVcpuSeat`, `PendingRetirement`,
+`SoftRequester`), the `ExtentTable` retirement edits, and the soft CPU's block
+entry and host-side guest access in `carrick-softcpu-x86`. Authority: Intel SDM
+Vol. 3 §4.10.4 and AMD APM Vol. 2 §5.5: a processor may keep using a cached
+translation until it is invalidated, so software invalidates on every
+processor that may hold it before the frames are reused.
+
+The venue runs on the neutral invalidation domain
+(`kernel.mm.invalidation-domain`); it replaces PR #678's bespoke coordinator.
+`ExtentTable` owns one `ServedTable<64>` through an owning `SoftDomainHandle`
+(a soft vCPU outlives any borrow of its inventory). Each soft vCPU holds a
+`SoftVcpuSeat`; its cache is its `SoftTlb`. Physical retirement is keyed by the
+frame, not by one address space, so it is a domain-wide request
+(`stage_domain`): every seated member owes it. The kick is the member's exit
+flag, the safe point is block entry (own-line `has_debt` loads), and the local
+invalidation is `SoftTlb::flush_all` for Unmap or `flush_write_plane` for
+RevokeWrite. A running CPU serves only at block entry, never inside a block, so
+in-block pointers stay usable until the block ends; a parked CPU is never
+waited on and serves when it re-enters; host-side guest access on a parked CPU
+enters for the whole access. Retired extent bases, owner generations, roots and
+root generations wait in a `ReclaimQueue` that only the exact
+`DomainCompletion` drains. `OwnerGeneration` is NonZero with a refusing
+successor, the code-page generation refuses on exhaustion, and an exhausted
+domain counter makes the inventory terminal. `carrick-softmmu` is `no_std` with
+only `alloc`: there is no lock to take.
+
+The red-first witness is the #607 shape: a running peer holding a translation
+of a retired extent kept serving `Some(stale_host_address)` on main, because
+the retiring thread could flush only the TLBs it could borrow. Structural
+budgets, measured at 2, 16 and 64 seated members: zero shared RMWs or stores
+per debt-free block entry, one owed raise per seated member per retirement,
+and at most one kick per running member (none for a parked one). Signed and
+Docker layers wait for the soft carrier.

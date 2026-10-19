@@ -15,7 +15,14 @@ use crate::domains::{
     SoftTranslationError, Stage1Gpa, TranslatedLeaf, X86Page4K,
 };
 use crate::placement::{HostVa, LinearPlacement, PlacementError, X86HostPage4K};
+use crate::retirement::{
+    CommitRefused, PendingRetirement, SoftDomainHandle, SoftRequester, SoftSeatError, SoftVcpuSeat,
+    commit_domain,
+};
 use crate::tlb::SoftTlb;
+use carrick_core::mm::retirement::invalidation::{
+    DomainCompletion, GenerationExhausted, InvalidationKind, ReclaimQueue,
+};
 
 /// Committed physical extent record used to authenticate `(Stage1Gpa, len, OwnerGeneration) -> AuthenticatedGpa`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,16 +59,60 @@ impl ExtentRecord {
     }
 }
 
-/// Physical extent inventory and frame-keyed code-page tracker authenticating
-/// `(Stage1Gpa, len, OwnerGeneration) -> AuthenticatedGpa`.
+/// One identity a retirement took out of use. It stays refused for reuse
+/// until the retirement's [`DomainCompletion`] releases it through
+/// [`ExtentTable::reclaim`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetiredIdentity {
+    ExtentBase(FrameGpa),
+    ExtentGeneration(OwnerGeneration),
+    Root(RootGpa),
+    RootGeneration(OwnerGeneration),
+}
+
+/// Why an [`ExtentTable`] edit was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtentEditError {
+    /// Nothing changed: the record is malformed or overlaps, a retired
+    /// identity it names is still pending, or the table is terminal.
+    Refused,
+    /// Nothing changed: the requester is a member of another inventory.
+    ForeignRequester,
+    /// The edit is in place but its invalidation could not be requested: the
+    /// domain's generation counter is exhausted. The table is now terminal
+    /// and refuses every later edit; the caller must stop its CPUs.
+    Exhausted,
+}
+
+/// A retired value and the invalidation every soft vCPU owes for it.
+#[derive(Debug)]
+pub struct Retirement<T> {
+    pub retired: T,
+    pub pending: PendingRetirement,
+}
+
+/// Physical extent inventory and frame-keyed code-page tracker
+/// authenticating `(Stage1Gpa, len, OwnerGeneration) -> AuthenticatedGpa`.
+///
+/// It owns the invalidation domain of every soft vCPU translating through
+/// it: extent and root-generation retirement is a domain-wide request
+/// (`crate::retirement`), and the retired identities wait in a
+/// [`ReclaimQueue`] until the request completes.
 #[derive(Debug)]
 pub struct ExtentTable {
     by_base: BTreeMap<u64, ExtentRecord>,
     root_generations: BTreeMap<u64, OwnerGeneration>,
     code_pages: BTreeMap<u64, (bool, u64)>,
     extents_visited: AtomicU64,
+    domain: SoftDomainHandle,
+    reclaim: ReclaimQueue<RetiredIdentity>,
+    terminal: bool,
 }
 
+/// A clone is a second inventory over the same soft vCPUs: it shares the
+/// invalidation domain, so a retirement in either copy reaches every CPU,
+/// and copies the records. Retired identities still pending stay refused in
+/// the copy that retired them; the clone starts with none pending.
 impl Clone for ExtentTable {
     fn clone(&self) -> Self {
         Self {
@@ -69,61 +120,160 @@ impl Clone for ExtentTable {
             root_generations: self.root_generations.clone(),
             code_pages: self.code_pages.clone(),
             extents_visited: AtomicU64::new(self.extents_visited.load(Ordering::Relaxed)),
+            domain: self.domain.clone(),
+            reclaim: ReclaimQueue::new(),
+            terminal: self.terminal,
         }
-    }
-}
-
-impl Default for ExtentTable {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
 impl ExtentTable {
-    /// Create an empty extent table with no registered roots.
-    pub const fn new() -> Self {
-        Self {
+    /// Create an empty extent table with no registered roots and a fresh
+    /// invalidation domain.
+    pub fn new() -> Result<Self, GenerationExhausted> {
+        Ok(Self {
             by_base: BTreeMap::new(),
             root_generations: BTreeMap::new(),
             code_pages: BTreeMap::new(),
             extents_visited: AtomicU64::new(0),
+            domain: SoftDomainHandle::new()?,
+            reclaim: ReclaimQueue::new(),
+            terminal: false,
+        })
+    }
+
+    /// Seat a soft vCPU whose translation cache is `tlb` in this
+    /// inventory's domain. The claim flushes `tlb` before adopting the
+    /// member, and the CPU starts parked.
+    pub fn register_vcpu(&self, tlb: &mut SoftTlb) -> Result<SoftVcpuSeat, SoftSeatError> {
+        SoftVcpuSeat::claim(&self.domain, tlb)
+    }
+
+    /// Whether `seat` is a member of this inventory's domain.
+    pub fn is_member(&self, seat: &SoftVcpuSeat) -> bool {
+        seat.belongs_to(&self.domain)
+    }
+
+    /// Kicks issued by this domain's retirements so far.
+    pub fn retirement_kicks(&self) -> u64 {
+        self.domain.kicks()
+    }
+
+    /// Retired identities still waiting for their completion.
+    pub fn pending_identities(&self) -> usize {
+        self.reclaim.len()
+    }
+
+    /// Release the identities a completed retirement took out of use.
+    /// Returns how many became reusable.
+    pub fn reclaim(&mut self, completion: &DomainCompletion) -> usize {
+        self.reclaim.drain_ready(completion).len()
+    }
+
+    fn is_pending(&self, identity: RetiredIdentity) -> bool {
+        self.reclaim.iter().any(|pending| *pending == identity)
+    }
+
+    fn admit_edit(&self, requester: Option<&SoftRequester<'_>>) -> Result<(), ExtentEditError> {
+        if self.terminal {
+            return Err(ExtentEditError::Refused);
+        }
+        if requester.is_some_and(|requester| !requester.seat.belongs_to(&self.domain)) {
+            return Err(ExtentEditError::ForeignRequester);
+        }
+        Ok(())
+    }
+
+    /// Publish the domain-wide invalidation for an edit already in place and
+    /// queue its retired identities.
+    fn retire(
+        &mut self,
+        identities: [RetiredIdentity; 2],
+        requester: Option<SoftRequester<'_>>,
+    ) -> Result<PendingRetirement, ExtentEditError> {
+        match commit_domain(&self.domain, InvalidationKind::Unmap, requester) {
+            Ok(pending) => {
+                for identity in identities {
+                    self.reclaim.push(pending.reclaim_tag(), identity);
+                }
+                Ok(pending)
+            }
+            // The edit is in place and cannot be invalidated: terminal.
+            Err(CommitRefused::Exhausted | CommitRefused::ForeignRequester) => {
+                self.terminal = true;
+                Err(ExtentEditError::Exhausted)
+            }
         }
     }
-    /// Register the expected [`OwnerGeneration`] for walks under an unregistered `root` (`false` if already registered).
+
+    /// Register the expected [`OwnerGeneration`] for walks under an
+    /// unregistered `root` (`false` if already registered, or if the root or
+    /// generation is still pending retirement).
     pub fn set_root_generation(&mut self, root: RootGpa, generation: OwnerGeneration) -> bool {
-        if self.root_generations.contains_key(&root.address().raw()) {
+        if self.terminal
+            || self.root_generations.contains_key(&root.address().raw())
+            || self.is_pending(RetiredIdentity::Root(root))
+            || self.is_pending(RetiredIdentity::RootGeneration(generation))
+        {
             return false;
         }
         self.root_generations
             .insert(root.address().raw(), generation);
         true
     }
-    /// Replace (or set) `root`'s [`OwnerGeneration`] and flush all supplied [`SoftTlb`]s.
+    /// Replace (or set) `root`'s [`OwnerGeneration`]. Replacing a live
+    /// generation retires it: every soft vCPU owes the returned invalidation.
     pub fn replace_root_generation(
         &mut self,
         root: RootGpa,
         generation: OwnerGeneration,
-        tlbs: &mut [&mut SoftTlb],
-    ) -> Option<OwnerGeneration> {
-        let prev = self
-            .root_generations
-            .insert(root.address().raw(), generation);
-        for tlb in tlbs {
-            tlb.flush_all();
+        requester: Option<SoftRequester<'_>>,
+    ) -> Result<Option<Retirement<OwnerGeneration>>, ExtentEditError> {
+        self.admit_edit(requester.as_ref())?;
+        if self.is_pending(RetiredIdentity::Root(root))
+            || self.is_pending(RetiredIdentity::RootGeneration(generation))
+        {
+            return Err(ExtentEditError::Refused);
         }
-        prev
+        let Some(previous) = self
+            .root_generations
+            .insert(root.address().raw(), generation)
+        else {
+            return Ok(None);
+        };
+        let pending = self.retire(
+            [
+                RetiredIdentity::Root(root),
+                RetiredIdentity::RootGeneration(previous),
+            ],
+            requester,
+        )?;
+        Ok(Some(Retirement {
+            retired: previous,
+            pending,
+        }))
     }
-    /// Remove `root`'s generation registration and flush all supplied [`SoftTlb`]s.
+    /// Remove `root`'s generation registration, retiring it.
     pub fn remove_root_generation(
         &mut self,
         root: RootGpa,
-        tlbs: &mut [&mut SoftTlb],
-    ) -> Option<OwnerGeneration> {
-        let removed = self.root_generations.remove(&root.address().raw());
-        for tlb in tlbs {
-            tlb.flush_all();
-        }
-        removed
+        requester: Option<SoftRequester<'_>>,
+    ) -> Result<Option<Retirement<OwnerGeneration>>, ExtentEditError> {
+        self.admit_edit(requester.as_ref())?;
+        let Some(removed) = self.root_generations.remove(&root.address().raw()) else {
+            return Ok(None);
+        };
+        let pending = self.retire(
+            [
+                RetiredIdentity::Root(root),
+                RetiredIdentity::RootGeneration(removed),
+            ],
+            requester,
+        )?;
+        Ok(Some(Retirement {
+            retired: removed,
+            pending,
+        }))
     }
     /// Return the registered [`OwnerGeneration`] for `root` (`None` if `root` is unregistered).
     pub fn expected_generation(&self, root: RootGpa) -> Option<OwnerGeneration> {
@@ -174,38 +324,74 @@ impl ExtentTable {
         }
     }
 
-    /// Install a new, non-overlapping extent (`false` if unaligned, empty, or overlapping any existing extent).
+    fn extent_pending(&self, record: ExtentRecord) -> bool {
+        self.is_pending(RetiredIdentity::ExtentBase(record.base))
+            || self.is_pending(RetiredIdentity::ExtentGeneration(record.generation))
+    }
+
+    /// Install a new, non-overlapping extent (`false` if unaligned, empty,
+    /// overlapping any existing extent, or naming a base or generation that
+    /// is still pending retirement).
     pub fn install(&mut self, record: ExtentRecord) -> bool {
-        if !self.validate_non_overlapping(record, false) {
+        if self.terminal
+            || !self.validate_non_overlapping(record, false)
+            || self.extent_pending(record)
+        {
             return false;
         }
         self.by_base.insert(record.base.raw(), record);
         true
     }
-    /// Replace (or install) an extent at `record.base` and flush all supplied [`SoftTlb`]s.
-    pub fn replace(&mut self, record: ExtentRecord, tlbs: &mut [&mut SoftTlb]) -> bool {
-        if !self.validate_non_overlapping(record, true) {
-            return false;
+    /// Replace (or install) an extent at `record.base`. Replacing a live
+    /// extent retires it: every soft vCPU owes the returned invalidation.
+    pub fn replace(
+        &mut self,
+        record: ExtentRecord,
+        requester: Option<SoftRequester<'_>>,
+    ) -> Result<Option<Retirement<ExtentRecord>>, ExtentEditError> {
+        self.admit_edit(requester.as_ref())?;
+        if !self.validate_non_overlapping(record, true) || self.extent_pending(record) {
+            return Err(ExtentEditError::Refused);
         }
-        let base = record.base.raw();
-        if let Some(old) = self.by_base.insert(base, record) {
-            self.clear_code_pages_in_span(old.base.raw(), old.end_gpa());
-        }
-        for tlb in tlbs {
-            tlb.flush_all();
-        }
-        true
+        let Some(old) = self.by_base.insert(record.base.raw(), record) else {
+            return Ok(None);
+        };
+        self.clear_code_pages_in_span(old.base.raw(), old.end_gpa());
+        let pending = self.retire(
+            [
+                RetiredIdentity::ExtentBase(old.base),
+                RetiredIdentity::ExtentGeneration(old.generation),
+            ],
+            requester,
+        )?;
+        Ok(Some(Retirement {
+            retired: old,
+            pending,
+        }))
     }
-    /// Retire the extent starting at `base` and flush all supplied [`SoftTlb`]s.
-    pub fn remove(&mut self, base: FrameGpa, tlbs: &mut [&mut SoftTlb]) -> Option<ExtentRecord> {
-        let removed = self.by_base.remove(&base.raw());
-        if let Some(old) = removed {
-            self.clear_code_pages_in_span(old.base.raw(), old.end_gpa());
-        }
-        for tlb in tlbs {
-            tlb.flush_all();
-        }
-        removed
+    /// Retire the extent starting at `base`: every soft vCPU owes the
+    /// returned invalidation before its base or generation is reusable.
+    pub fn remove(
+        &mut self,
+        base: FrameGpa,
+        requester: Option<SoftRequester<'_>>,
+    ) -> Result<Option<Retirement<ExtentRecord>>, ExtentEditError> {
+        self.admit_edit(requester.as_ref())?;
+        let Some(old) = self.by_base.remove(&base.raw()) else {
+            return Ok(None);
+        };
+        self.clear_code_pages_in_span(old.base.raw(), old.end_gpa());
+        let pending = self.retire(
+            [
+                RetiredIdentity::ExtentBase(old.base),
+                RetiredIdentity::ExtentGeneration(old.generation),
+            ],
+            requester,
+        )?;
+        Ok(Some(Retirement {
+            retired: old,
+            pending,
+        }))
     }
     /// Look up the single predecessor extent covering `[gpa, gpa + len_bytes)`.
     pub fn lookup_span(&self, gpa: u64, len_bytes: u64) -> Option<ExtentRecord> {
@@ -289,20 +475,25 @@ impl ExtentTable {
             .get(&frame_gpa.raw())
             .map_or(0, |&(_, generation)| generation)
     }
-    /// Bump `frame_gpa`'s code generation on guest write and flush `write` planes across `peer_tlbs`.
+    /// Bump `frame_gpa`'s code generation on guest write and flush `write`
+    /// planes across `peer_tlbs`. `None` once the frame's generation is
+    /// exhausted: the bump is refused (never saturated, which would let a
+    /// stale translated block match a rewritten page) and nothing changes.
     pub fn on_code_page_write(
         &mut self,
         frame_gpa: AuthenticatedGpa,
         peer_tlbs: &mut [&mut SoftTlb],
-    ) -> u64 {
-        let entry = self.code_pages.entry(frame_gpa.raw()).or_insert((true, 0));
-        entry.0 = true;
-        entry.1 = entry.1.saturating_add(1);
-        let code_gen = entry.1;
+    ) -> Option<u64> {
+        let current = self
+            .code_pages
+            .get(&frame_gpa.raw())
+            .map_or(0, |&(_, generation)| generation);
+        let code_gen = current.checked_add(1)?;
+        self.code_pages.insert(frame_gpa.raw(), (true, code_gen));
         for tlb in peer_tlbs {
             tlb.flush_write_plane();
         }
-        code_gen
+        Some(code_gen)
     }
 }
 
@@ -669,7 +860,10 @@ impl SoftWalker {
                 self.stats.tlb_fills += 1;
                 if was_code_page {
                     tlb.flush_write_plane();
-                    let _ = memory.extents_mut().on_code_page_write(frame_gpa, &mut []);
+                    memory
+                        .extents_mut()
+                        .on_code_page_write(frame_gpa, &mut [])
+                        .ok_or(SoftTranslationError::CodeGenerationExhausted { va, frame_gpa })?;
                     invalidated_code_page = true;
                     self.stats.code_page_invalidations += 1;
                 } else {
@@ -793,5 +987,22 @@ impl SoftWalker {
             second_host_addr,
             second_len,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    #[test]
+    fn code_generation_refuses_exhaustion_instead_of_saturating() {
+        let mut table = ExtentTable::new().expect("fresh domain");
+        let frame = AuthenticatedGpa::from_authenticated_raw(0x5000);
+        assert_eq!(table.mark_code_page(frame, &mut []), 1);
+        assert_eq!(table.on_code_page_write(frame, &mut []), Some(2));
+        table.code_pages.insert(frame.raw(), (true, u64::MAX));
+        assert_eq!(table.on_code_page_write(frame, &mut []), None);
+        assert_eq!(table.code_generation(frame), u64::MAX, "nothing changed");
     }
 }

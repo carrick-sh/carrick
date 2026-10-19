@@ -12,9 +12,9 @@ use crate::cflow::compute_effective_va;
 use crate::decode::gpr_index;
 use crate::emit::{EmitError, JitStage};
 use crate::mmu::{
-    Cpl, CpuAccessMode, FrameGpa, RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK,
-    SOFT_TLB_PAGE_SIZE, SoftAccessKind, SoftMmuMemory, SoftPageFault, SoftTlb, SoftWalker,
-    is_canonical_va, translate_va,
+    Cpl, CpuAccessMode, ExtentTable, FrameGpa, RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK,
+    SOFT_TLB_PAGE_SIZE, SoftAccessKind, SoftMmuMemory, SoftPageFault, SoftSeatError, SoftTlb,
+    SoftTlbStats, SoftVcpuSeat, SoftWalker, is_canonical_va, translate_va,
 };
 
 /// Monomorphized translation callback for active [`SoftMmuMemory`] during block execution.
@@ -215,7 +215,9 @@ pub struct SoftCpuContext {
     bounce_active: u64,
     bounce_buf: [u8; 64],
     pub fxsave: FxsaveArea,
-    pub tlb: SoftTlb,
+    /// This CPU's translation cache. Private so it is only ever served
+    /// through `seat` (one cache per member of the inventory's domain).
+    pub(crate) tlb: SoftTlb,
     pub walker: SoftWalker,
     pub cpl: u8,
     pub pkru: u32,
@@ -237,6 +239,8 @@ pub struct SoftCpuContext {
     virt_rsp_spill: u64,
     pub x87_code_selector: u16,
     pub x87_data_selector: u16,
+    /// Membership in the physical inventory's invalidation domain.
+    pub(crate) seat: SoftVcpuSeat,
 }
 
 const _: () = {
@@ -257,15 +261,12 @@ const _: () = {
     assert!(offset_of!(SoftCpuContext, tlb) == CTX_TLB_READ_OFF);
 };
 
-impl Default for SoftCpuContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SoftCpuContext {
-    #[must_use]
-    pub fn new() -> Self {
+    /// A context seated in `extents`' invalidation domain. Its TLB starts
+    /// empty and the CPU starts parked.
+    pub fn new(extents: &ExtentTable) -> Result<Self, SoftSeatError> {
+        let mut tlb = SoftTlb::new();
+        let seat = extents.register_vcpu(&mut tlb)?;
         let gw = gateway_trampolines().ok();
         let mut ctx = Self {
             gpr: [0; 16],
@@ -289,7 +290,7 @@ impl SoftCpuContext {
             bounce_active: 0,
             bounce_buf: [0; 64],
             fxsave: FxsaveArea::default(),
-            tlb: SoftTlb::new(),
+            tlb,
             walker: SoftWalker::new(),
             cpl: 3,
             pkru: 0,
@@ -313,9 +314,45 @@ impl SoftCpuContext {
             virt_rsp_spill: 0,
             x87_code_selector: 0,
             x87_data_selector: 0,
+            seat,
         };
         ctx.sync_tlb_tag_bits();
-        ctx
+        Ok(ctx)
+    }
+
+    #[must_use]
+    pub const fn tlb_stats(&self) -> SoftTlbStats {
+        self.tlb.stats()
+    }
+
+    /// `mov cr3`-style local flush of this CPU's whole TLB.
+    pub fn flush_tlb(&mut self) {
+        self.tlb.flush_all();
+    }
+
+    pub fn reset_tlb_stats(&mut self) {
+        self.tlb.reset_stats();
+    }
+
+    /// This CPU's membership in its inventory's invalidation domain.
+    pub fn seat(&self) -> &SoftVcpuSeat {
+        &self.seat
+    }
+
+    /// Admit a host-side guest access (see [`SoftVcpuSeat::admit`]).
+    pub fn admit_host_access(&mut self) -> crate::mmu::LookupAdmission {
+        self.seat.admit(&mut self.tlb)
+    }
+
+    /// End a host-side guest access admitted by [`Self::admit_host_access`].
+    pub fn release_host_access(&mut self, admission: crate::mmu::LookupAdmission) {
+        self.seat.release(admission);
+    }
+
+    /// This CPU as the requester of a retirement it issues itself: served
+    /// inline, never kicked, so it cannot wait on its own safe point.
+    pub fn requester(&mut self) -> crate::mmu::SoftRequester<'_> {
+        crate::mmu::SoftRequester::new(&mut self.seat, &mut self.tlb)
     }
 
     pub(crate) fn prepare_block(
@@ -1665,12 +1702,17 @@ fn build_gateway() -> Result<GatewayTrampolines, JitStage> {
 mod tests {
     use super::*;
     use crate::JitCodeBuffer;
+
+    fn test_extents() -> ExtentTable {
+        ExtentTable::new().expect("fresh invalidation domain")
+    }
+
     #[test]
     fn gateway_returns_with_host_df_and_fp_controls_restored() {
         // Capture DF in a native wrapper immediately after the translated exit,
         // then restore host DF/FP controls before Rust even on the broken gateway.
         use crate::cpu::JitCodeBuffer;
-        let mut ctx = SoftCpuContext::new();
+        let mut ctx = SoftCpuContext::new(&test_extents()).unwrap();
         let mut block_jit = JitCodeBuffer::new(4096).unwrap();
         // std; jmp [r15 + exit trampoline] exercises the gateway's host return.
         let mut code = vec![0xfd, 0x41, 0xff, 0xa7];
@@ -1740,16 +1782,16 @@ mod tests {
         let placement = unsafe {
             LinearPlacement::new(host_base as usize, 6 * 4096, MmioHoles::empty()).unwrap()
         };
-        let mut extents = ExtentTable::new();
-        let generation = OwnerGeneration::new(1);
+        let mut extents = test_extents();
+        let generation = OwnerGeneration::FIRST;
         assert!(extents.install(ExtentRecord::new(FrameGpa::new(0), 6 * 4096, generation)));
         extents.set_root_generation(RootGpa::page_aligned(FrameGpa::new(0)).unwrap(), generation);
+        let mut ctx = SoftCpuContext::new(&extents).unwrap();
         let mut memory = Memory(placement, extents);
         // SAFETY: the 16 bytes span the last eight bytes of frame 4 and the first eight of frame 5.
         unsafe {
             std::ptr::write_bytes(host_base.add(0x4ff8), 0x55, 16);
         }
-        let mut ctx = SoftCpuContext::new();
         ctx.bounce_buf.fill(0xcc);
         ctx.active_mem_ptr = Some(NonNull::from(&mut memory).cast());
         ctx.active_translate_fn = Some(translate_for_mem::<Memory>);
@@ -1792,7 +1834,7 @@ mod tests {
             let addr = jit.publish(&[0xc3]).unwrap();
             assert_eq!(permissions(addr), "r-xp");
         }
-        let ctx = SoftCpuContext::new();
+        let ctx = SoftCpuContext::new(&test_extents()).unwrap();
         for addr in [
             ctx.slow_path_fn,
             ctx.bounce_commit_fn,
@@ -1835,7 +1877,7 @@ mod tests {
 
     #[test]
     fn fp_leaf_allocation_is_once_across_repeated_blocks() {
-        let mut cpu = crate::SoftCpu::new().unwrap();
+        let mut cpu = crate::SoftCpu::new(&test_extents()).unwrap();
         let planned = fp_block();
         crate::cpu::JIT_ALLOCATIONS.with(|count| count.set(0));
         for _ in 0..3 {
@@ -1845,7 +1887,7 @@ mod tests {
     }
 
     fn fp_host_failure(publish: bool) {
-        let mut cpu = crate::SoftCpu::new().unwrap();
+        let mut cpu = crate::SoftCpu::new(&test_extents()).unwrap();
         let planned = fp_block();
         crate::cpu::FAIL_SMALL_JIT.with(|fault| fault.set(Some(publish)));
         let result = cpu.execute_planned_block(&planned, &mut NoMemory);
@@ -1883,7 +1925,7 @@ mod tests {
         TEST_GATEWAY.with(|slot| *slot.borrow_mut() = Some(OnceLock::new()));
         let _reset = Reset;
         crate::cpu::FAIL_SMALL_JIT.with(|fault| fault.set(Some(publish)));
-        let mut cpu = crate::SoftCpu::new().unwrap();
+        let mut cpu = crate::SoftCpu::new(&test_extents()).unwrap();
         let allocations = crate::cpu::JIT_ALLOCATIONS.with(|count| count.get());
         let planned = fp_block();
         cpu.context_mut().rip = planned.start;

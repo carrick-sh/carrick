@@ -142,10 +142,16 @@ pub enum WorkMetric {
     /// member's steady-state safe-point check while it owes nothing. The
     /// check runs on every trap and syscall return, so it must stay zero.
     InvalidationSteadyStateRmws,
+    /// Members one invalidation request counted (raised `owed` on). A
+    /// physical retirement counts every seated member once: O(members).
+    InvalidationMembersCounted,
+    /// Kicks one invalidation request delivered. At most one per counted
+    /// member that was running; none for a stopped member.
+    InvalidationKicks,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 56;
+    pub const COUNT: usize = 58;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -203,6 +209,8 @@ impl WorkMetric {
         Self::LifecycleEntryVisits,
         Self::DescriptorLoadsPerMiss,
         Self::InvalidationSteadyStateRmws,
+        Self::InvalidationMembersCounted,
+        Self::InvalidationKicks,
     ];
 }
 

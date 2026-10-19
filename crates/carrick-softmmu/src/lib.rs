@@ -27,12 +27,19 @@
 
 #![no_std]
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod domains;
 pub mod placement;
+pub mod retirement;
 pub mod tlb;
 pub mod walker;
 
+/// The neutral invalidation types a softmmu caller handles directly.
+pub use carrick_core::mm::retirement::invalidation::{
+    DomainCompletion, GenerationExhausted, InvalidationGeneration,
+};
 pub use domains::{
     ACCESSED, ADDRESS, Access, AuthenticatedGpa, COW, Cpl, CpuAccessMode, DEFAULT_MAX_PHY_ADDR,
     DIRTY, DescriptorRefusal, FaultClass, FrameGpa, GuestVa, HUGE, HardwareFaultClass,
@@ -48,12 +55,17 @@ pub use placement::{
     HostVa, LAPIC_MMIO_BASE_GPA, LAPIC_MMIO_SIZE_BYTES, LinearPlacement, MAX_MMIO_HOLES, MmioHole,
     MmioHoles, PlacementError, PlacementGpa, X86HostPage4K,
 };
+pub use retirement::{
+    LookupAdmission, PendingRetirement, SOFT_VCPU_MEMBERS, SoftDomainHandle, SoftRequester,
+    SoftSeatError, SoftVcpuSeat,
+};
 pub use tlb::{
     SOFT_TLB_BITS, SOFT_TLB_ENTRIES, SOFT_TLB_INDEX_MASK, SoftTlb, SoftTlbEntry, SoftTlbPlane,
     SoftTlbStats, TLB_TAG_AC_BIT, TLB_TAG_CPL3_BIT, TLB_TAG_INVALID, TLB_TAG_MODE_MASK,
     TLB_TAG_NXE_OFF_BIT, TLB_TAG_SMAP_OFF_BIT, TLB_TAG_SMEP_OFF_BIT, TLB_TAG_WP_OFF_BIT,
 };
 pub use walker::{
-    AccessOutcome, AuthenticatedDescriptorWords, ExtentRecord, ExtentTable, ResolvedAccess,
-    ResolvedSpan, SoftMmuMemory, SoftWalker, SoftWalkerStats, WalkOutcome,
+    AccessOutcome, AuthenticatedDescriptorWords, ExtentEditError, ExtentRecord, ExtentTable,
+    ResolvedAccess, ResolvedSpan, RetiredIdentity, Retirement, SoftMmuMemory, SoftWalker,
+    SoftWalkerStats, WalkOutcome,
 };

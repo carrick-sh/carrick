@@ -1,0 +1,77 @@
+schema_version = 1
+id = "softmmu.x86.physical-retirement"
+title = "Software vCPU physical retirement reaches every soft TLB through the neutral invalidation domain"
+guest_surfaces = ["vmm:soft", "mm:softmmu", "tlb:soft-tlb", "kernel:frame-inventory"]
+semantic_authority = [
+  "Intel SDM Vol. 3 §4.10.4 (Invalidation of TLBs and Paging-Structure Caches): a processor may keep using a cached translation until it is invalidated; software must invalidate on every logical processor that may hold the translation before the paging structures or frames are reused (TLB shootdown)",
+  "AMD64 Architecture Programmer's Manual Vol. 2 §5.5 (Translation-Lookaside Buffer): TLB entries are not coherent with page-table or ownership changes; system software invalidates them on each processor before reusing the physical memory",
+  "man 2 munmap: references to pages in the unmapped range are invalid after the call returns, on every thread of the process",
+]
+fixture = "carrick-softmmu::retirement::tests"
+scale_points = [2, 16, 64]
+rationale = """
+Slice 2 of #681 (#607): the softmmu physical-retirement venue on the neutral
+invalidation domain (`carrick_core::mm::retirement::invalidation`). It replaces
+PR #678's bespoke coordinator; no mutex, condition variable, pending-shootdown
+token or pointer-identity authority remains, and `carrick-softmmu` stays
+`#![no_std]` with only `alloc`, so it has no lock to take.
+
+`ExtentTable` owns one domain (`ServedTable<64>` behind an owning
+`SoftDomainHandle`). Every soft vCPU is a member holding a `SoftVcpuSeat`;
+its cache is its `SoftTlb`. Extent and root-generation retirement is keyed by
+physical ownership, so it is a domain-wide request (`stage_domain`): every
+seated member owes it whatever root it runs. The kick is the member's exit
+flag; the safe point is block entry; the local invalidation is
+`SoftTlb::flush_all` (Unmap) or `flush_write_plane` (RevokeWrite, #684). A
+running member serves only at block entry, never inside a block, so a pointer
+translated inside a block stays usable until the block ends: no request it
+owes can complete before its next safe point. A parked member is never waited
+on and serves when it re-enters; host-side guest access on a parked member
+(`translate_va`, `read_guest_bytes`, `write_guest_bytes`) enters for the whole
+access. Retired extent bases, owner generations, roots and root generations
+wait in a `ReclaimQueue` and are refused for reuse until the exact
+`DomainCompletion` releases them. `OwnerGeneration` is NonZero with a refusing
+successor; the code-page generation refuses on exhaustion instead of
+saturating; an exhausted domain counter makes the inventory terminal.
+
+Witnesses: the #607 red-first two-thread stale-addend case (on main the peer
+TLB was flushed only if the retiring thread could borrow it; omitted, the peer
+probe returned `Some(stale_host_address)`), a parked peer that is never kicked
+and resynchronizes before use, host admission of a parked peer, retirement
+issued from inside a running peer (served inline, never kicked, no
+self-deadlock), identity refusal until completion, a foreign requester refused
+before any edit, and a concurrent Running/Parked transition race against 400
+retirements. The x86 soft CPU carries the integration witnesses (a peer that
+really hits through `step_block`, host-side `translate_va` after completion).
+"""
+
+[bindings]
+vm_free = "carrick-softmmu::retirement::tests::{running_peer_cannot_use_stale_addend_after_retirement_completes,parked_peer_resynchronizes_at_block_entry_and_is_never_kicked,host_admission_of_a_parked_peer_serves_before_its_probe,retirement_from_inside_a_running_peer_serves_itself_without_deadlock,pending_extent_identities_are_refused_until_their_completion,pending_root_and_generation_are_refused_until_their_completion,a_seat_of_another_inventory_is_refused_before_any_edit,owner_generation_refuses_exhaustion,concurrent_running_parked_transitions_never_outlive_a_completion,retirement_is_linear_in_peers_and_block_entry_is_rmw_free (evaluates the structural budgets at 2, 16 and 64 seated members)}; carrick-softmmu::walker::tests::code_generation_refuses_exhaustion_instead_of_saturating; carrick-softcpu-x86::softcpu_level0::{running_peer_that_hits_through_step_block_misses_after_retirement,host_translate_va_after_completion_misses_on_a_parked_cpu,retirement_issued_by_a_running_cpu_completes_without_waiting_on_itself} (x86_64 host lane); carrick-core::mm::retirement::invalidation::tests::{domain_request_counts_every_seated_member_whatever_its_context,owning_handle_seat_moves_to_its_own_thread_and_serves_requests,reclaim_iter_lists_outstanding_objects_until_their_exact_release}; carrick-core::mm::retirement::invalidation::loom_models::loom_models_claim_races_domain_request_counts_or_flushes (just test-loom)"
+
+[bindings.unresolved]
+embed_structural = "Software vCPU carrier integration (`carrick-vmm-soft`) lands in later slices of #578; the soft CPU is proved by the VM-free x86_64 lane."
+signed = "No HVF execution: the software MMU and soft CPU are hypervisor-free; the signed binding arrives with the soft carrier."
+docker = "Architectural TLB-invalidation contract (Intel SDM §4.10.4, AMD APM §5.5). Guest-visible munmap/mprotect parity on multi-threaded workloads lands with the soft carrier."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "invalidation_steady_state_rmws"
+value = 0
+layers = ["vm-free"]
+rationale = "A debt-free block entry of a running soft vCPU performs exactly owed[2] + served[2] own-line loads and zero shared read-modify-writes or stores on any member word, measured on the production `block_entry` over an instrumented served word at 2, 16 and 64 seated members (the metric counts RMWs plus stores). No coordinator lock exists to acquire."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "invalidation_members_counted"
+base = 0
+per_unit = 1
+layers = ["vm-free"]
+rationale = "One physical retirement counts each of n seated soft vCPUs exactly once (raises its owed word once), running or parked, at n = 2, 16, 64."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "invalidation_kicks"
+base = 0
+per_unit = 1
+layers = ["vm-free"]
+rationale = "One physical retirement kicks at most one running peer once and never a parked peer: with n/2 running and n/2 parked members it delivers exactly n/2 kicks."
