@@ -611,6 +611,10 @@ _test-unit-kernel *ARGS:
     else
         : # This selection is already in the portable workspace group.
     fi
+    # The signed-witness control (#695) has VM-free tests of its own; they
+    # need the feature the product never selects, and share the handback
+    # publisher, so they run serially on every host.
+    env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test -p carrick-kernel --lib --features deferred-capture-test-control {{ARGS}} deferred_capture_control
 
 [private]
 _test-unit-runtime *ARGS:
