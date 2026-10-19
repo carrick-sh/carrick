@@ -248,6 +248,37 @@ impl PipeRecord {
             writers: 1,
         }
     }
+
+    pub fn capacity(&self) -> usize {
+        (self.capacity_pages * self.page_size) as usize
+    }
+
+    /// FIONREAD count, independent of which endpoint is observed.
+    pub fn unread_bytes(&self) -> usize {
+        self.unread as usize
+    }
+
+    pub fn references(&self, end: End) -> usize {
+        match end {
+            End::Reader => self.readers as usize,
+            End::Writer => self.writers as usize,
+        }
+    }
+
+    pub fn readiness(&self, end: End) -> Readiness {
+        match end {
+            End::Reader => Readiness {
+                readable: self.unread != 0,
+                hup: self.writers == 0,
+                ..Readiness::default()
+            },
+            End::Writer => Readiness {
+                writable: self.used < self.capacity_pages,
+                err: self.readers == 0,
+                ..Readiness::default()
+            },
+        }
+    }
 }
 
 impl<'a> Pipe<'a, PipeRecord> {
@@ -394,17 +425,14 @@ impl<R: BorrowMut<PipeRecord>, V: RevisionStorage> Pipe<'_, R, V> {
         self.st().page_size as usize
     }
     pub fn capacity(&self) -> usize {
-        (self.st().capacity_pages * self.st().page_size) as usize
+        self.st().capacity()
     }
     /// FIONREAD returns this same count on BOTH ends, including after closure.
     pub fn unread_bytes(&self) -> usize {
-        self.st().unread as usize
+        self.st().unread_bytes()
     }
     pub fn references(&self, end: End) -> usize {
-        match end {
-            End::Reader => self.st().readers as usize,
-            End::Writer => self.st().writers as usize,
-        }
+        self.st().references(end)
     }
     /// Whether ring storage for the current capacity is attached. An
     /// unbacked pipe holds no byte; its first write needs storage.
@@ -555,20 +583,7 @@ impl<R: BorrowMut<PipeRecord>, V: RevisionStorage> Pipe<'_, R, V> {
     }
 
     pub fn readiness(&self, end: End) -> Readiness {
-        let s = self.st();
-        match end {
-            End::Reader => Readiness {
-                readable: s.unread != 0,
-                hup: s.writers == 0,
-                ..Readiness::default()
-            },
-            // A full ring can accept a tail merge but is not POLLOUT-ready.
-            End::Writer => Readiness {
-                writable: s.used < s.capacity_pages,
-                err: s.readers == 0,
-                ..Readiness::default()
-            },
-        }
+        self.st().readiness(end)
     }
 
     pub fn readiness_snapshot(&self, end: End) -> Result<ReadinessSnapshot, Error> {
