@@ -148,6 +148,41 @@ fn words<W: ServedWord>(member: &ResidencyMember<W>) -> &MemberWords<W> {
     unsafe { member.words() }
 }
 
+/// How a seat, a stage or a pending request reaches its table.
+///
+/// A borrow (`&ServedTable`) serves members that live inside the table's
+/// scope. A member that must outlive any borrow scope (a software vCPU
+/// thread whose table is owned by a shared physical inventory) uses an
+/// owning handle instead, so its seat is held without a self-referential
+/// borrow. Requests from either handle reach the same member words.
+///
+/// # Safety
+/// Every call to [`Self::table`], through this handle and every clone of it,
+/// returns the same table for as long as any of them lives. A seat names a
+/// member by index; a handle that changed tables would let one seat write
+/// another table's member words and mint a completion for it.
+pub unsafe trait TableHandle<const N: usize, W: ServedWord>: Clone {
+    fn table(&self) -> &ServedTable<N, W>;
+}
+
+// SAFETY: a shared reference always names the one table it borrows.
+unsafe impl<const N: usize, W: ServedWord> TableHandle<N, W> for &ServedTable<N, W> {
+    fn table(&self) -> &ServedTable<N, W> {
+        self
+    }
+}
+
+/// Which members one request counts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestTarget {
+    /// Members whose installed context is exactly this key, or changing.
+    Context(ContextKey),
+    /// Every seated member, whatever context it has installed. Used when the
+    /// edit is keyed by physical ownership rather than by one address space
+    /// (an extent or table frame retired from under every context at once).
+    Domain,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ContextKey {
     tag: u64,
@@ -179,12 +214,19 @@ pub enum SeatError<E> {
 /// `running` and `served` words. Not cloneable; dropping it stops the member
 /// and releases the seat.
 #[derive(Debug)]
-pub struct MemberSeat<'t, const N: usize, W: ServedWord = AtomicU64> {
-    table: &'t ServedTable<N, W>,
+pub struct MemberSeat<H, const N: usize, W: ServedWord = AtomicU64>
+where
+    H: TableHandle<N, W>,
+{
+    handle: H,
     index: usize,
+    word: PhantomData<fn() -> W>,
 }
 
-impl<'t, const N: usize, W: ServedWord> MemberSeat<'t, N, W> {
+impl<H, const N: usize, W: ServedWord> MemberSeat<H, N, W>
+where
+    H: TableHandle<N, W>,
+{
     /// Claim member `cpu` for the venue's cache. The member's `served`
     /// watermark describes the previous holder's cache, not this one, so
     /// admission flushes this cache for every kind before adopting it: read
@@ -193,7 +235,7 @@ impl<'t, const N: usize, W: ServedWord> MemberSeat<'t, N, W> {
     /// it preceded its issue, so the flush covers it; later generations stay
     /// owed.
     pub fn claim<V: InvalidationVenue>(
-        table: &'t ServedTable<N, W>,
+        handle: H,
         cpu: CpuId,
         venue: &mut V,
     ) -> Result<Self, SeatError<V::Error>> {
@@ -201,13 +243,19 @@ impl<'t, const N: usize, W: ServedWord> MemberSeat<'t, N, W> {
         if index >= ServedTable::<N, W>::member_count() {
             return Err(SeatError::OutOfRange);
         }
-        words(&table.members()[index])
+        // Seat Dekker (domain requests): the claim before reading the issue
+        // counter; a domain request issues, fences, then reads `seat`.
+        words(&handle.table().members()[index])
             .seat
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| SeatError::Claimed)?;
-        let seat = Self { table, index };
+        let seat = Self {
+            handle,
+            index,
+            word: PhantomData,
+        };
         W::fence(Ordering::SeqCst);
-        let latest = table.counter().latest(Ordering::Acquire);
+        let latest = seat.handle.table().counter().latest(Ordering::Acquire);
         for kind in InvalidationKind::ALL {
             // On error the seat drops: the member stops and is released.
             venue
@@ -230,8 +278,20 @@ impl<'t, const N: usize, W: ServedWord> MemberSeat<'t, N, W> {
         CpuId::new(self.index as u32)
     }
 
-    fn words(&self) -> &'t MemberWords<W> {
-        words(&self.table.members()[self.index])
+    fn words(&self) -> &MemberWords<W> {
+        words(&self.handle.table().members()[self.index])
+    }
+
+    /// The handle this seat was claimed through.
+    pub fn handle(&self) -> &H {
+        &self.handle
+    }
+
+    /// Whether this member is admitted to execution (between
+    /// [`Self::enter`] and [`Self::stop`]). Own-line load; the seat holder
+    /// is the only writer of `running`.
+    pub fn is_running(&self) -> bool {
+        self.words().running.load(Ordering::Relaxed) != 0
     }
 
     /// Publish `context` as this member's installed context, then serve
@@ -259,7 +319,7 @@ impl<'t, const N: usize, W: ServedWord> MemberSeat<'t, N, W> {
             .store(revision.wrapping_add(2), Ordering::Release);
         // Install Dekker: publication before reading the issue counter.
         W::fence(Ordering::SeqCst);
-        let latest = self.table.counter().latest(Ordering::Acquire);
+        let latest = self.handle.table().counter().latest(Ordering::Acquire);
         if let Some(latest) = latest {
             for kind in InvalidationKind::ALL {
                 if words.served[kind.index()].load(Ordering::Relaxed) < latest.value().get() {
@@ -312,7 +372,10 @@ impl<'t, const N: usize, W: ServedWord> MemberSeat<'t, N, W> {
     }
 }
 
-impl<const N: usize, W: ServedWord> Drop for MemberSeat<'_, N, W> {
+impl<H, const N: usize, W: ServedWord> Drop for MemberSeat<H, N, W>
+where
+    H: TableHandle<N, W>,
+{
     fn drop(&mut self) {
         let words = self.words();
         words.running.store(0, Ordering::Release);
@@ -323,23 +386,55 @@ impl<const N: usize, W: ServedWord> Drop for MemberSeat<'_, N, W> {
 /// Stage an invalidation of `context` inside a page-table transaction's
 /// prepare step. Staging has no global effect; [`StagedInvalidation::commit`]
 /// is the only route to a request and dropping the stage is rollback.
-pub fn stage<'t, const N: usize, W: ServedWord, T: ResidencyTag>(
-    table: &'t ServedTable<N, W>,
+pub fn stage<H, const N: usize, W: ServedWord, T: ResidencyTag>(
+    table: H,
     context: AddressContext<T>,
     kind: InvalidationKind,
-) -> StagedInvalidation<'t, N, W, T> {
+) -> StagedInvalidation<H, N, W, T>
+where
+    H: TableHandle<N, W>,
+{
     // The counted mask is one bit per member: N <= 64 is a compile-time fact.
     let _members = ServedTable::<N, W>::member_count();
     StagedInvalidation {
-        table,
-        key: ContextKey::of(context),
+        handle: table,
+        target: RequestTarget::Context(ContextKey::of(context)),
         kind,
         tag: PhantomData,
+        word: PhantomData,
+    }
+}
+
+/// Stage an invalidation that every seated member owes, whatever context it
+/// has installed. For edits keyed by physical ownership (a retired extent or
+/// table frame) that no single [`AddressContext`] names. Same transaction
+/// rules as [`stage`].
+///
+/// A member claiming its seat concurrently is either counted (the request
+/// read its seat) or its claim flush covers the generation (the claim read
+/// the issue counter after the issue): the seat Dekker pair.
+pub fn stage_domain<H, const N: usize, W: ServedWord, T: ResidencyTag>(
+    table: H,
+    kind: InvalidationKind,
+) -> StagedInvalidation<H, N, W, T>
+where
+    H: TableHandle<N, W>,
+{
+    let _members = ServedTable::<N, W>::member_count();
+    StagedInvalidation {
+        handle: table,
+        target: RequestTarget::Domain,
+        kind,
+        tag: PhantomData,
+        word: PhantomData,
     }
 }
 
 #[derive(Debug)]
-pub enum CommitError<'t, const N: usize, W: ServedWord, E> {
+pub enum CommitError<H, const N: usize, W: ServedWord, E>
+where
+    H: TableHandle<N, W>,
+{
     /// No generation was issued; nothing was published. Exhaustion is
     /// terminal for the domain: the caller's translation edits are already
     /// in place and can no longer be invalidated through it, so the caller
@@ -352,7 +447,7 @@ pub enum CommitError<'t, const N: usize, W: ServedWord, E> {
     /// point; [`PendingInvalidation::wait`] retries it. Dropping `pending`
     /// loses only the completion proof, never the debt.
     Venue {
-        pending: PendingInvalidation<'t, N, W>,
+        pending: PendingInvalidation<H, N, W>,
         error: E,
     },
 }
@@ -360,14 +455,21 @@ pub enum CommitError<'t, const N: usize, W: ServedWord, E> {
 /// A prepared, unpublished invalidation. Not cloneable.
 #[must_use = "dropping a staged invalidation rolls it back"]
 #[derive(Debug)]
-pub struct StagedInvalidation<'t, const N: usize, W: ServedWord, T: ResidencyTag> {
-    table: &'t ServedTable<N, W>,
-    key: ContextKey,
+pub struct StagedInvalidation<H, const N: usize, W: ServedWord, T: ResidencyTag>
+where
+    H: TableHandle<N, W>,
+{
+    handle: H,
+    target: RequestTarget,
     kind: InvalidationKind,
     tag: PhantomData<T>,
+    word: PhantomData<fn() -> W>,
 }
 
-impl<'t, const N: usize, W: ServedWord, T: ResidencyTag> StagedInvalidation<'t, N, W, T> {
+impl<H, const N: usize, W: ServedWord, T: ResidencyTag> StagedInvalidation<H, N, W, T>
+where
+    H: TableHandle<N, W>,
+{
     /// Discard the stage. Equivalent to dropping it: nothing was published.
     pub fn rollback(self) {}
 
@@ -379,27 +481,31 @@ impl<'t, const N: usize, W: ServedWord, T: ResidencyTag> StagedInvalidation<'t, 
     /// only after reaching a safe point it is not at.
     pub fn commit<V: InvalidationVenue<Tag = T>>(
         self,
-        requester: Option<&mut MemberSeat<'t, N, W>>,
+        requester: Option<&mut MemberSeat<H, N, W>>,
         venue: &mut V,
-    ) -> Result<PendingInvalidation<'t, N, W>, CommitError<'t, N, W, V::Error>> {
+    ) -> Result<PendingInvalidation<H, N, W>, CommitError<H, N, W, V::Error>> {
         let _members = ServedTable::<N, W>::member_count();
+        let table = self.handle.table();
         if requester
             .as_ref()
-            .is_some_and(|seat| !core::ptr::eq(seat.table, self.table))
+            .is_some_and(|seat| !core::ptr::eq(seat.handle.table(), table))
         {
             return Err(CommitError::ForeignSeat);
         }
-        let generation = self
-            .table
+        let generation = table
             .counter()
             .issue()
             .map_err(|GenerationExhausted| CommitError::Exhausted)?;
-        // Install Dekker: issue before reading member contexts.
+        // Install (and seat) Dekker: issue before reading member contexts.
         W::fence(Ordering::SeqCst);
         let mut counted = 0u64;
-        for (index, member) in self.table.members().iter().enumerate() {
+        for (index, member) in table.members().iter().enumerate() {
             let words = words(member);
-            if matches_or_changing(words, self.key) {
+            let owes = match self.target {
+                RequestTarget::Context(key) => matches_or_changing(words, key),
+                RequestTarget::Domain => words.seat.load(Ordering::Acquire) != 0,
+            };
+            if owes {
                 words.owed[self.kind.index()].fetch_max(generation.value().get(), Ordering::AcqRel);
                 counted |= 1 << index;
             }
@@ -407,7 +513,7 @@ impl<'t, const N: usize, W: ServedWord, T: ResidencyTag> StagedInvalidation<'t, 
         // Entry Dekker: `owed` before reading `running`.
         W::fence(Ordering::SeqCst);
         let requester_index = requester.as_ref().map(|seat| seat.index);
-        for (index, member) in self.table.members().iter().enumerate() {
+        for (index, member) in table.members().iter().enumerate() {
             if counted & (1 << index) != 0
                 && Some(index) != requester_index
                 && words(member).running.load(Ordering::Relaxed) != 0
@@ -416,10 +522,11 @@ impl<'t, const N: usize, W: ServedWord, T: ResidencyTag> StagedInvalidation<'t, 
             }
         }
         let pending = PendingInvalidation {
-            table: self.table,
+            handle: self.handle,
             generation,
             kind: self.kind,
             counted,
+            word: PhantomData,
         };
         if let Some(seat) = requester
             && let Err(error) = seat.serve(venue)
@@ -452,23 +559,38 @@ fn matches_or_changing<W: ServedWord>(words: &MemberWords<W>, key: ContextKey) -
 /// Dropping it loses only the completion proof: the debt stays in `owed`.
 #[must_use = "a pending invalidation must complete before its reclaim is released"]
 #[derive(Debug)]
-pub struct PendingInvalidation<'t, const N: usize, W: ServedWord = AtomicU64> {
-    table: &'t ServedTable<N, W>,
+pub struct PendingInvalidation<H, const N: usize, W: ServedWord = AtomicU64>
+where
+    H: TableHandle<N, W>,
+{
+    handle: H,
     generation: InvalidationGeneration,
     kind: InvalidationKind,
     counted: u64,
+    word: PhantomData<fn() -> W>,
 }
 
-impl<'t, const N: usize, W: ServedWord> PendingInvalidation<'t, N, W> {
+impl<H, const N: usize, W: ServedWord> PendingInvalidation<H, N, W>
+where
+    H: TableHandle<N, W>,
+{
     pub fn generation(&self) -> InvalidationGeneration {
         self.generation
     }
     pub fn kind(&self) -> InvalidationKind {
         self.kind
     }
+    /// The handle of the table this request was published in.
+    pub fn handle(&self) -> &H {
+        &self.handle
+    }
     /// Whether this member was counted (owes this generation).
     pub fn counts(&self, cpu: CpuId) -> bool {
         u32::try_from(N).is_ok_and(|n| cpu.raw() < n) && self.counted & (1 << cpu.raw()) != 0
+    }
+    /// How many members owe this generation: the request's per-member work.
+    pub fn counted_members(&self) -> u32 {
+        self.counted.count_ones()
     }
 
     /// Tag an object whose reuse must wait for this request's completion.
@@ -483,7 +605,7 @@ impl<'t, const N: usize, W: ServedWord> PendingInvalidation<'t, N, W> {
     /// stopped with the debt recorded (it serves in [`MemberSeat::enter`]
     /// before any translation use). No fence is needed; see the module docs.
     pub fn try_complete(self) -> Result<DomainCompletion, Self> {
-        for (index, member) in self.table.members().iter().enumerate() {
+        for (index, member) in self.handle.table().members().iter().enumerate() {
             if self.counted & (1 << index) == 0 {
                 continue;
             }
@@ -508,7 +630,7 @@ impl<'t, const N: usize, W: ServedWord> PendingInvalidation<'t, N, W> {
     /// a venue error the request is handed back.
     pub fn wait<V: InvalidationVenue>(
         mut self,
-        mut requester: Option<&mut MemberSeat<'t, N, W>>,
+        mut requester: Option<&mut MemberSeat<H, N, W>>,
         venue: &mut V,
     ) -> Result<DomainCompletion, (Self, V::Error)> {
         loop {
@@ -596,6 +718,11 @@ impl<T> ReclaimQueue<T> {
     }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+    /// The objects still waiting, for owners that must refuse reuse of an
+    /// identity while its retirement is outstanding.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().map(|(_, item)| item)
     }
     /// Release every object tagged with exactly this completion's domain,
     /// generation and kind. A completion for one context's generation says
