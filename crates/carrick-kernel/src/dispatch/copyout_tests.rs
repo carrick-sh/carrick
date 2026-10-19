@@ -432,7 +432,7 @@ fn time_and_resource_records_wait_for_an_owner_refused_copyout() {
 fn getdents_with_huge_count<M: carrick_guest_mem::CurrentMmMemory>(memory: &mut M) -> usize {
     let mut dispatcher = SyscallDispatcher::new();
     let reporter = CompatReporter::default();
-    let mut call = |dispatcher: &mut SyscallDispatcher, memory: &mut M, number: u64, args| {
+    let call = |dispatcher: &mut SyscallDispatcher, memory: &mut M, number: u64, args| {
         let context = dispatcher.capture_one_task_context().unwrap();
         match dispatcher
             .dispatch(
