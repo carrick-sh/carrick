@@ -205,7 +205,7 @@ impl DeferredAnonymousState {
             .iter()
             .take_while(|backed| backed.start < range.end)
             .map(|backed| {
-                GuestVa(backed.start.max(range.start))..GuestVa(backed.end.min(range.end))
+                GuestVa::new(backed.start.max(range.start))..GuestVa::new(backed.end.min(range.end))
             })
             .collect()
     }
@@ -409,7 +409,7 @@ impl DeferredAnonymousState {
             }
             if p.start > cursor {
                 let gap_end = p.start.min(req_end);
-                materialized.push(GuestVa(cursor)..GuestVa(gap_end));
+                materialized.push(GuestVa::new(cursor)..GuestVa::new(gap_end));
             }
             cursor = cursor.max(p.end);
             if cursor >= req_end {
@@ -417,7 +417,7 @@ impl DeferredAnonymousState {
             }
         }
         if cursor < req_end {
-            materialized.push(GuestVa(cursor)..GuestVa(req_end));
+            materialized.push(GuestVa::new(cursor)..GuestVa::new(req_end));
         }
 
         materialized
@@ -443,12 +443,12 @@ impl DeferredAnonymousState {
             pristine: state
                 .pristine
                 .iter()
-                .map(|r| GuestVa(r.start)..GuestVa(r.end))
+                .map(|r| GuestVa::new(r.start)..GuestVa::new(r.end))
                 .collect(),
             zero_read_resident: state
                 .resident
                 .iter()
-                .map(|r| GuestVa(r.start)..GuestVa(r.end))
+                .map(|r| GuestVa::new(r.start)..GuestVa::new(r.end))
                 .collect(),
             private_file: self
                 .files
@@ -456,7 +456,7 @@ impl DeferredAnonymousState {
                 .views
                 .iter()
                 .map(|view| DeferredPrivateFileSnapshot {
-                    range: GuestVa(view.range.start)..GuestVa(view.range.end),
+                    range: GuestVa::new(view.range.start)..GuestVa::new(view.range.end),
                     file_offset: view.file_offset,
                     source: view.source,
                 })
@@ -531,7 +531,7 @@ pub struct DeferredPrivateFileTransition<'a> {
 
 impl DeferredPrivateFileTransition<'_> {
     pub fn start(&self) -> GuestVa {
-        GuestVa(self.view.range.start)
+        GuestVa::new(self.view.range.start)
     }
 
     pub fn len(&self) -> usize {
@@ -657,60 +657,60 @@ mod tests {
     #[test]
     fn adopted_pristine_never_covers_live_backing() {
         let state = DeferredAnonymousState::new();
-        let base = GuestVa(0x10_0000);
+        let base = GuestVa::new(0x10_0000);
         state.reserve_fresh(base, 4 * PAGE as usize).unwrap();
         state
-            .begin_pristine_materialization(GuestVa(base.raw() + PAGE), 2 * PAGE as usize)
+            .begin_pristine_materialization(GuestVa::new(base.raw() + PAGE), 2 * PAGE as usize)
             .unwrap()
             .expect("pristine span")
             .commit();
         state.adopt_pristine(base, 4 * PAGE as usize).unwrap();
         assert!(state.covers_pristine(base, PAGE as usize));
-        assert!(!state.covers_pristine(GuestVa(base.raw() + PAGE), PAGE as usize));
+        assert!(!state.covers_pristine(GuestVa::new(base.raw() + PAGE), PAGE as usize));
         assert_eq!(
             state.materialized_within(base, 4 * PAGE as usize),
-            vec![GuestVa(base.raw() + PAGE)..GuestVa(base.raw() + 3 * PAGE)]
+            vec![GuestVa::new(base.raw() + PAGE)..GuestVa::new(base.raw() + 3 * PAGE)]
         );
         // Retiring the backing releases it; a later attestation adopts it.
         state
-            .retire(GuestVa(base.raw() + PAGE), PAGE as usize)
+            .retire(GuestVa::new(base.raw() + PAGE), PAGE as usize)
             .unwrap();
         state.adopt_pristine(base, 4 * PAGE as usize).unwrap();
-        assert!(state.covers_pristine(GuestVa(base.raw() + PAGE), PAGE as usize));
-        assert!(!state.covers_pristine(GuestVa(base.raw() + 2 * PAGE), PAGE as usize));
+        assert!(state.covers_pristine(GuestVa::new(base.raw() + PAGE), PAGE as usize));
+        assert!(!state.covers_pristine(GuestVa::new(base.raw() + 2 * PAGE), PAGE as usize));
         assert!(state.materialized_within(base, PAGE as usize).is_empty());
     }
     use std::io::Write;
     #[test]
     fn pristine_validation_is_nonmutating_and_rejects_holes_and_overflow() {
         let state = DeferredAnonymousState::new();
-        state.reserve_fresh(GuestVa(0x1000), 0x3000).unwrap();
+        state.reserve_fresh(GuestVa::new(0x1000), 0x3000).unwrap();
         let before = state.snapshot();
-        assert!(state.covers_pristine(GuestVa(0x1fff), 2));
-        assert!(state.covers_pristine(GuestVa(0x1000), 0x3000));
-        assert!(!state.covers_pristine(GuestVa(0xfff), 2));
-        assert!(!state.covers_pristine(GuestVa(0x3fff), 2));
-        assert!(!state.covers_pristine(GuestVa(u64::MAX), 2));
-        assert!(!state.covers_pristine(GuestVa(0x1000), 0));
+        assert!(state.covers_pristine(GuestVa::new(0x1fff), 2));
+        assert!(state.covers_pristine(GuestVa::new(0x1000), 0x3000));
+        assert!(!state.covers_pristine(GuestVa::new(0xfff), 2));
+        assert!(!state.covers_pristine(GuestVa::new(0x3fff), 2));
+        assert!(!state.covers_pristine(GuestVa::new(u64::MAX), 2));
+        assert!(!state.covers_pristine(GuestVa::new(0x1000), 0));
         assert_eq!(state.snapshot(), before);
         state
-            .begin_materialization(GuestVa(0x2000), 4096)
+            .begin_materialization(GuestVa::new(0x2000), 4096)
             .unwrap()
             .commit();
-        assert!(!state.covers_pristine(GuestVa(0x1fff), 0x1002));
-        assert!(state.covers_pristine(GuestVa(0x3001), 2));
-        state.retire(GuestVa(0x3000), 4096).unwrap();
-        assert!(!state.covers_pristine(GuestVa(0x3001), 2));
+        assert!(!state.covers_pristine(GuestVa::new(0x1fff), 0x1002));
+        assert!(state.covers_pristine(GuestVa::new(0x3001), 2));
+        state.retire(GuestVa::new(0x3000), 4096).unwrap();
+        assert!(!state.covers_pristine(GuestVa::new(0x3001), 2));
         assert!(state.snapshot().zero_read_resident.is_empty());
     }
 
     #[test]
     fn a_rolled_back_pristine_materialization_restores_the_exact_snapshot() {
         let state = DeferredAnonymousState::new();
-        let base = GuestVa(0x40_0000);
+        let base = GuestVa::new(0x40_0000);
         state.reserve_fresh(base, 8 * PAGE as usize).unwrap();
         let before = state.snapshot();
-        let grant = GuestVa(0x40_0000 + 2 * PAGE);
+        let grant = GuestVa::new(0x40_0000 + 2 * PAGE);
         state
             .begin_pristine_materialization(grant, 4 * PAGE as usize)
             .unwrap()
@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn pristine_materialization_transition_refuses_a_materialized_hole_without_mutation() {
         let state = DeferredAnonymousState::new();
-        let base = GuestVa(0x40_0000);
+        let base = GuestVa::new(0x40_0000);
         state.reserve_fresh(base, 3 * PAGE as usize).unwrap();
 
         let untouched = state
@@ -734,11 +734,11 @@ mod tests {
         drop(untouched);
         assert_eq!(
             state.snapshot().pristine,
-            vec![base..GuestVa(base.raw() + 3 * PAGE)]
+            vec![base..GuestVa::new(base.raw() + 3 * PAGE)]
         );
 
         state
-            .begin_materialization(GuestVa(base.raw() + PAGE), PAGE as usize)
+            .begin_materialization(GuestVa::new(base.raw() + PAGE), PAGE as usize)
             .unwrap()
             .commit();
         let before = state.snapshot();
@@ -759,59 +759,59 @@ mod tests {
     #[test]
     fn exact_zero_reads_and_lifecycle() {
         let state = DeferredAnonymousState::new();
-        state.reserve_fresh(GuestVa(0x1000), 0x2000).unwrap();
-        state.reserve_fresh(GuestVa(0x3000), 0x1000).unwrap();
+        state.reserve_fresh(GuestVa::new(0x1000), 0x2000).unwrap();
+        state.reserve_fresh(GuestVa::new(0x3000), 0x1000).unwrap();
         assert_eq!(
             state.snapshot().pristine,
-            vec![GuestVa(0x1000)..GuestVa(0x4000)]
+            vec![GuestVa::new(0x1000)..GuestVa::new(0x4000)]
         );
         let mut bytes = [9; 4];
         assert!(
             state
-                .copy_pristine_zero(GuestVa(0x1ffc), &mut bytes)
+                .copy_pristine_zero(GuestVa::new(0x1ffc), &mut bytes)
                 .unwrap()
         );
         assert_eq!(bytes, [0; 4]);
         assert_eq!(
             state.snapshot().zero_read_resident,
-            vec![GuestVa(0x1000)..GuestVa(0x2000)]
+            vec![GuestVa::new(0x1000)..GuestVa::new(0x2000)]
         );
         assert!(
             state
-                .copy_pristine_zero(GuestVa(0x1ffe), &mut bytes)
+                .copy_pristine_zero(GuestVa::new(0x1ffe), &mut bytes)
                 .is_err()
         );
-        state.retire(GuestVa(0x2000), 0x1000).unwrap();
+        state.retire(GuestVa::new(0x2000), 0x1000).unwrap();
         bytes.fill(7);
         assert!(
             !state
-                .copy_pristine_zero(GuestVa(0x2000), &mut bytes)
+                .copy_pristine_zero(GuestVa::new(0x2000), &mut bytes)
                 .unwrap()
         );
         assert_eq!(bytes, [7; 4]);
-        state.reserve_fresh(GuestVa(0x1000), 0x1000).unwrap();
+        state.reserve_fresh(GuestVa::new(0x1000), 0x1000).unwrap();
         assert!(state.snapshot().zero_read_resident.is_empty());
-        assert!(state.reserve_fresh(GuestVa(u64::MAX - 4095), 4096).is_err());
-        assert!(state.retire(GuestVa(1), 4096).is_err());
-        assert!(state.retire(GuestVa(0), 0).is_err());
+        assert!(state.reserve_fresh(GuestVa::new(u64::MAX - 4095), 4096).is_err());
+        assert!(state.retire(GuestVa::new(1), 4096).is_err());
+        assert!(state.retire(GuestVa::new(0), 0).is_err());
     }
     #[test]
     fn transition_commit_failure_and_fork_isolation() {
         let state = DeferredAnonymousState::new();
-        state.reserve_fresh(GuestVa(0x1000), 0x3000).unwrap();
+        state.reserve_fresh(GuestVa::new(0x1000), 0x3000).unwrap();
         let child = state.fork_private();
         let before = state.snapshot();
-        drop(state.begin_materialization(GuestVa(0x2000), 4096).unwrap());
+        drop(state.begin_materialization(GuestVa::new(0x2000), 4096).unwrap());
         assert_eq!(state.snapshot(), before);
         state
-            .begin_materialization(GuestVa(0x2000), 4096)
+            .begin_materialization(GuestVa::new(0x2000), 4096)
             .unwrap()
             .commit();
         assert_eq!(
             state.snapshot().pristine,
             vec![
-                GuestVa(0x1000)..GuestVa(0x2000),
-                GuestVa(0x3000)..GuestVa(0x4000)
+                GuestVa::new(0x1000)..GuestVa::new(0x2000),
+                GuestVa::new(0x3000)..GuestVa::new(0x4000)
             ]
         );
         assert_eq!(child.snapshot(), before);
@@ -819,34 +819,34 @@ mod tests {
     #[test]
     fn zero_read_residency_has_an_independent_lifecycle() {
         let state = DeferredAnonymousState::new();
-        state.reserve_fresh(GuestVa(0x1000), 8192).unwrap();
+        state.reserve_fresh(GuestVa::new(0x1000), 8192).unwrap();
         assert!(
             state
-                .copy_pristine_zero(GuestVa(0x1000), &mut [1; 4])
+                .copy_pristine_zero(GuestVa::new(0x1000), &mut [1; 4])
                 .unwrap()
         );
         state
-            .begin_materialization(GuestVa(0x1000), 4096)
+            .begin_materialization(GuestVa::new(0x1000), 4096)
             .unwrap()
             .commit();
         assert_eq!(
             state.snapshot().zero_read_resident,
-            vec![GuestVa(0x1000)..GuestVa(0x2000)]
+            vec![GuestVa::new(0x1000)..GuestVa::new(0x2000)]
         );
         state
-            .clear_zero_read_residency(GuestVa(0x1000), 8192)
+            .clear_zero_read_residency(GuestVa::new(0x1000), 8192)
             .unwrap();
         assert!(state.snapshot().zero_read_resident.is_empty());
         assert_eq!(
             state.snapshot().pristine,
-            vec![GuestVa(0x2000)..GuestVa(0x3000)]
+            vec![GuestVa::new(0x2000)..GuestVa::new(0x3000)]
         );
         assert!(
             state
-                .copy_pristine_zero(GuestVa(0x2000), &mut [1; 4])
+                .copy_pristine_zero(GuestVa::new(0x2000), &mut [1; 4])
                 .unwrap()
         );
-        state.retire(GuestVa(0x2000), 4096).unwrap();
+        state.retire(GuestVa::new(0x2000), 4096).unwrap();
         assert!(state.snapshot().zero_read_resident.is_empty());
         assert!(state.snapshot().pristine.is_empty());
     }
@@ -854,8 +854,8 @@ mod tests {
     #[test]
     fn rolled_back_materializer_orders_before_zero_reader() {
         let state = std::sync::Arc::new(DeferredAnonymousState::new());
-        state.reserve_fresh(GuestVa(0x1000), 4096).unwrap();
-        let guard = state.begin_materialization(GuestVa(0x1000), 4096).unwrap();
+        state.reserve_fresh(GuestVa::new(0x1000), 4096).unwrap();
+        let guard = state.begin_materialization(GuestVa::new(0x1000), 4096).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let child = state.clone();
         let reader = std::thread::spawn(move || {
@@ -864,7 +864,7 @@ mod tests {
             let mut bytes = [5; 4];
             (
                 child
-                    .copy_pristine_zero(GuestVa(0x1000), &mut bytes)
+                    .copy_pristine_zero(GuestVa::new(0x1000), &mut bytes)
                     .unwrap(),
                 bytes,
             )
@@ -877,8 +877,8 @@ mod tests {
     #[test]
     fn committed_materializer_orders_before_reader() {
         let state = std::sync::Arc::new(DeferredAnonymousState::new());
-        state.reserve_fresh(GuestVa(0x1000), 4096).unwrap();
-        let guard = state.begin_materialization(GuestVa(0x1000), 4096).unwrap();
+        state.reserve_fresh(GuestVa::new(0x1000), 4096).unwrap();
+        let guard = state.begin_materialization(GuestVa::new(0x1000), 4096).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let child = state.clone();
         let reader = std::thread::spawn(move || {
@@ -887,7 +887,7 @@ mod tests {
             let mut bytes = [5; 4];
             (
                 child
-                    .copy_pristine_zero(GuestVa(0x1000), &mut bytes)
+                    .copy_pristine_zero(GuestVa::new(0x1000), &mut bytes)
                     .unwrap(),
                 bytes,
             )
@@ -921,7 +921,7 @@ mod tests {
         let state = DeferredAnonymousState::new();
         state
             .reserve_private_file(
-                GuestVa(0x1000),
+                GuestVa::new(0x1000),
                 0x3000,
                 file.as_fd(),
                 0,
@@ -935,22 +935,22 @@ mod tests {
         let mut copied = [0; 8];
         assert!(
             state
-                .copy_pristine_file(GuestVa(0x2000), &mut copied)
+                .copy_pristine_file(GuestVa::new(0x2000), &mut copied)
                 .unwrap()
         );
         assert_eq!(copied, [2; 8], "the mapping-owned dup survives guest close");
 
-        state.retire(GuestVa(0x2000), 0x1000).unwrap();
+        state.retire(GuestVa::new(0x2000), 0x1000).unwrap();
         assert_eq!(
             state.snapshot().private_file,
             vec![
                 DeferredPrivateFileSnapshot {
-                    range: GuestVa(0x1000)..GuestVa(0x2000),
+                    range: GuestVa::new(0x1000)..GuestVa::new(0x2000),
                     file_offset: 0,
                     source: crate::PrivateFileSource::ImmutableLower,
                 },
                 DeferredPrivateFileSnapshot {
-                    range: GuestVa(0x3000)..GuestVa(0x4000),
+                    range: GuestVa::new(0x3000)..GuestVa::new(0x4000),
                     file_offset: 0x2000,
                     source: crate::PrivateFileSource::ImmutableLower,
                 },
@@ -959,7 +959,7 @@ mod tests {
         assert_eq!(
             child.snapshot().private_file,
             vec![DeferredPrivateFileSnapshot {
-                range: GuestVa(0x1000)..GuestVa(0x4000),
+                range: GuestVa::new(0x1000)..GuestVa::new(0x4000),
                 file_offset: 0,
                 source: crate::PrivateFileSource::ImmutableLower,
             }],
@@ -967,38 +967,38 @@ mod tests {
         );
         let mut page = [0; 0x1000];
         child
-            .begin_private_file_materialization(GuestVa(0x2000))
+            .begin_private_file_materialization(GuestVa::new(0x2000))
             .map(|transition| {
                 assert_eq!(transition.len(), 0x3000);
                 assert!(!transition.is_empty());
                 transition
-                    .copy_pristine(GuestVa(0x2000), &mut page)
+                    .copy_pristine(GuestVa::new(0x2000), &mut page)
                     .unwrap();
             })
             .unwrap();
         assert_eq!(page, [2; 0x1000]);
         child
-            .begin_private_file_materialization(GuestVa(0x2000))
+            .begin_private_file_materialization(GuestVa::new(0x2000))
             .unwrap()
-            .commit_range(GuestVa(0x2000), 0x1000)
+            .commit_range(GuestVa::new(0x2000), 0x1000)
             .unwrap();
         assert_eq!(
             child.snapshot().private_file,
             vec![
                 DeferredPrivateFileSnapshot {
-                    range: GuestVa(0x1000)..GuestVa(0x2000),
+                    range: GuestVa::new(0x1000)..GuestVa::new(0x2000),
                     file_offset: 0,
                     source: crate::PrivateFileSource::ImmutableLower,
                 },
                 DeferredPrivateFileSnapshot {
-                    range: GuestVa(0x3000)..GuestVa(0x4000),
+                    range: GuestVa::new(0x3000)..GuestVa::new(0x4000),
                     file_offset: 0x2000,
                     source: crate::PrivateFileSource::ImmutableLower,
                 },
             ]
         );
         state
-            .begin_private_file_materialization(GuestVa(0x3000))
+            .begin_private_file_materialization(GuestVa::new(0x3000))
             .unwrap()
             .commit();
         assert_eq!(state.snapshot().private_file.len(), 1);
@@ -1007,7 +1007,7 @@ mod tests {
     #[test]
     fn materialized_subranges_enumerates_gaps_in_pristine_state() {
         let state = DeferredAnonymousState::new();
-        let base = GuestVa(0x1000_0000);
+        let base = GuestVa::new(0x1000_0000);
         let len = 64 * 1024 * 1024; // 64 MiB
         state.reserve_fresh(base, len).unwrap();
 
@@ -1017,11 +1017,11 @@ mod tests {
         // Touch first page (0x1000_0000), middle page (0x1200_0000), and last page (0x13ff_f000).
         state.begin_materialization(base, 0x1000).unwrap().commit();
         state
-            .begin_materialization(GuestVa(0x1200_0000), 0x1000)
+            .begin_materialization(GuestVa::new(0x1200_0000), 0x1000)
             .unwrap()
             .commit();
         state
-            .begin_materialization(GuestVa(0x13ff_f000), 0x1000)
+            .begin_materialization(GuestVa::new(0x13ff_f000), 0x1000)
             .unwrap()
             .commit();
 
@@ -1029,9 +1029,9 @@ mod tests {
         assert_eq!(
             subranges,
             vec![
-                GuestVa(0x1000_0000)..GuestVa(0x1000_1000),
-                GuestVa(0x1200_0000)..GuestVa(0x1200_1000),
-                GuestVa(0x13ff_f000)..GuestVa(0x1400_0000),
+                GuestVa::new(0x1000_0000)..GuestVa::new(0x1000_1000),
+                GuestVa::new(0x1200_0000)..GuestVa::new(0x1200_1000),
+                GuestVa::new(0x13ff_f000)..GuestVa::new(0x1400_0000),
             ]
         );
     }

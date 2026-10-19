@@ -1173,7 +1173,7 @@ impl BhyveVmm {
         // SAFETY: map_gpa proved the live PML4 window is mapped.
         unsafe { std::ptr::copy_nonoverlapping(host, tables.as_mut_ptr(), tables.len()) };
         let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
-        mgr.map_aliased(GuestVa(va & !0xFFF), Gpa(gpa), span as u64, true, true)
+        mgr.map_aliased(GuestVa::new(va & !0xFFF), Gpa::new(gpa), span as u64, true, true)
             .map_err(|_| {
                 RepointPrivateError::clean(MemoryError::OutOfBounds {
                     address: va,
@@ -1243,7 +1243,7 @@ impl BhyveVmm {
             // GUEST's own execution permission (W^X / NX) is set independently by
             // the `#PF` `demand_commit` path, which honours the reservation's exec.
             self.with_live_pml4(|mgr| {
-                mgr.map_aliased(GuestVa(page), Gpa(gpa), span as u64, true, true)
+                mgr.map_aliased(GuestVa::new(page), Gpa::new(gpa), span as u64, true, true)
                     .map_err(|_| MemoryError::OutOfBounds {
                         address: page,
                         length: span,
@@ -1510,8 +1510,8 @@ fn write_mirror_slot_key(slot: &FutexMirrorSlot, key: SharedFutexMirrorWireKey) 
 
 fn mirror_location(slot: &FutexMirrorSlot) -> SharedFutexLocation {
     SharedFutexLocation::Mirror {
-        word: HostVa(&slot.value as *const _ as usize),
-        waiter_count: HostVa(&slot.waiters as *const _ as usize),
+        word: HostVa::new(&slot.value as *const _ as usize),
+        waiter_count: HostVa::new(&slot.waiters as *const _ as usize),
         waiter_key: &slot.value as *const _ as usize,
     }
 }
@@ -1724,7 +1724,7 @@ impl X86Vmm for BhyveVmm {
                 // (W^X). A writable+exec reservation commits RWX (the common
                 // anon-arena case).
                 self.with_live_pml4(|mgr| {
-                    mgr.map_aliased(GuestVa(page), Gpa(gpa), 4096, writable, exec)
+                    mgr.map_aliased(GuestVa::new(page), Gpa::new(gpa), 4096, writable, exec)
                         .map_err(|_| MemoryError::OutOfBounds {
                             address: page,
                             length: 4096,
@@ -1900,7 +1900,7 @@ impl X86Vmm for BhyveVmm {
             let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
             // exec=true: a MAP_SHARED file/anon host alias maps executable (the
             // historical alias behaviour; shared-object text needs to execute).
-            mgr.map_aliased(GuestVa(va), Gpa(gpa), len, writable, true)
+            mgr.map_aliased(GuestVa::new(va), Gpa::new(gpa), len, writable, true)
                 .map_err(|_| {
                     TrapError::Hypervisor(format!(
                         "bhyve map_host_alias: map_aliased va=0x{va:x} gpa=0x{gpa:x} len=0x{len:x}"
@@ -2047,7 +2047,7 @@ impl X86Vmm for BhyveVmm {
         self.with_live_pml4(|mgr| {
             // exec=true: the caller's `protect_range`/`set_rw` re-applies the prot
             // (incl. NX); the leaf itself stays executable here.
-            mgr.map_aliased(GuestVa(base), Gpa(gpa), span as u64, writable, true)
+            mgr.map_aliased(GuestVa::new(base), Gpa::new(gpa), span as u64, writable, true)
                 .map_err(|_| MemoryError::OutOfBounds {
                     address: base,
                     length: span,
@@ -2540,8 +2540,8 @@ mod tests {
         initial[2 * PAGE..3 * PAGE].fill(0x33);
         engine
             .map_host_alias(
-                GuestVa(shared),
-                Gpa(0),
+                GuestVa::new(shared),
+                Gpa::new(0),
                 initial.len() as u64,
                 &initial,
                 HostAliasBacking::Anonymous {
@@ -2601,8 +2601,8 @@ mod tests {
         let shared_stale = vec![0x55; 2 * GRANULE];
         engine
             .map_host_alias(
-                GuestVa(source),
-                Gpa(0),
+                GuestVa::new(source),
+                Gpa::new(0),
                 (2 * GRANULE) as u64,
                 &shared_stale,
                 HostAliasBacking::Anonymous {

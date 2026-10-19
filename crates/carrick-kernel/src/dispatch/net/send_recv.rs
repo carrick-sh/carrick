@@ -675,7 +675,7 @@ impl<'a> NetView<'a> {
                         {
                             let copy_len = len.min(4096 - (buf_addr as usize & 4095));
                             let Some(range) = carrick_guest_mem::GuestWriteRange::new(
-                                carrick_guest_mem::GuestVa(buf_addr), copy_len,
+                                carrick_guest_mem::GuestVa::new(buf_addr), copy_len,
                             ) else {
                                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                             };
@@ -861,7 +861,7 @@ impl<'a> NetView<'a> {
             {
                 let chunk = len.min(4096 - (buf_addr as usize & 4095));
                 let Some(range) = carrick_guest_mem::GuestWriteRange::new(
-                    carrick_guest_mem::GuestVa(buf_addr), chunk,
+                    carrick_guest_mem::GuestVa::new(buf_addr), chunk,
                 ) else {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 };
@@ -941,9 +941,9 @@ impl<'a> NetView<'a> {
                 .collect();
             let outcome = this.blocking_io(fd, host_fd.get(), IoDir::Read, nonblocking, recv_to, || {
                 let host_write_ranges = [carrick_guest_mem::HostWriteRange {
-                    guest: carrick_guest_mem::GuestVa(buf_addr),
+                    guest: carrick_guest_mem::GuestVa::new(buf_addr),
                     len,
-                    host: carrick_guest_mem::HostVa(dst_ptr as usize),
+                    host: carrick_guest_mem::HostVa::new(dst_ptr as usize),
                 }];
                 let host_write = zero_copy.then(|| {
                     carrick_guest_mem::HostWriteGuard::new(memory, &host_write_ranges)

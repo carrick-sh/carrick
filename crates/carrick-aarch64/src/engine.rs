@@ -2893,12 +2893,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     fn syscall_buffer_ipa(&self, va: GuestVa, len: usize) -> Option<Gpa> {
         let raw = va.raw();
         if !carrick_mem::memory::needs_stage1_translation(raw, len as u64) {
-            return Some(Gpa(raw));
+            return Some(Gpa::new(raw));
         }
         self.page_tables
             .with_manager(|mgr| mgr.translate(raw))
             .flatten()
-            .map(Gpa)
+            .map(Gpa::new)
     }
 
     /// Enforce permission transitions served by guest EL1 on host-side syscall
@@ -3124,7 +3124,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let page_left = (0x1000 - (va & 0xfff)) as usize;
         let len = (total_len - offset).min(page_left);
         let ipa = self
-            .syscall_buffer_ipa(GuestVa(va), len)
+            .syscall_buffer_ipa(GuestVa::new(va), len)
             .ok_or(MemoryError::OutOfBounds {
                 address,
                 length: total_len,
@@ -3493,7 +3493,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         bytes: &[u8],
         intent: carrick_el1_abi::PortalTransferIntent,
     ) -> Result<(), MemoryError> {
-        let range = carrick_guest_mem::GuestWriteRange::new(GuestVa(address), bytes.len()).ok_or(
+        let range = carrick_guest_mem::GuestWriteRange::new(GuestVa::new(address), bytes.len()).ok_or(
             MemoryError::OutOfBounds {
                 address,
                 length: bytes.len(),
@@ -3807,7 +3807,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 Err(error) => {
                     let deferred = match self.vm.deferred_anonymous_state() {
                         Some(state) => state
-                            .copy_pristine_file(GuestVa(va), &mut out[copied..copied + chunk_len])
+                            .copy_pristine_file(GuestVa::new(va), &mut out[copied..copied + chunk_len])
                             .map_err(|error| {
                                 MemoryError::HostMap(format!(
                                     "read deferred private file backing: {error}"
@@ -3869,7 +3869,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             {
                 let deferred = match self.vm.deferred_anonymous_state() {
                     Some(state) => state
-                        .copy_pristine_file(GuestVa(va), &mut dst[copied..copied + chunk_len])
+                        .copy_pristine_file(GuestVa::new(va), &mut dst[copied..copied + chunk_len])
                         .map_err(|error| {
                             MemoryError::HostMap(format!(
                                 "read deferred private file backing: {error}"
@@ -4231,7 +4231,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // Publish fresh-zero provenance only after the old translation and this
         // MM's authoritative aliases have been retired. Fork peers are untouched.
         deferred
-            .reserve_fresh(carrick_guest_mem::GuestVa(address), len)
+            .reserve_fresh(carrick_guest_mem::GuestVa::new(address), len)
             .map_err(|error| {
                 RepointPrivateError::indeterminate(MemoryError::HostMap(error.to_string()))
             })?;
@@ -4393,7 +4393,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             .deferred_anonymous_state()
             .ok_or_else(|| MemoryError::HostMap("missing deferred mmap state".to_owned()))?;
         state
-            .reserve_private_file(GuestVa(va), len, host_fd, offset, source)
+            .reserve_private_file(GuestVa::new(va), len, host_fd, offset, source)
             .map_err(|error| {
                 MemoryError::HostMap(format!("defer private file backing: {error}"))
             })?;
@@ -6937,7 +6937,7 @@ fn fork_debug_va() -> Option<u64> {
 }
 
 fn shared_futex_backing_gpa(page_tables: &PageTableManager, guest_addr: u64) -> Option<Gpa> {
-    page_tables.translate(guest_addr).map(Gpa)
+    page_tables.translate(guest_addr).map(Gpa::new)
 }
 
 fn require_core_fpsimd_authority(enabled: bool) -> Result<(), TrapError> {
@@ -9109,7 +9109,7 @@ mod transfer_service_tests {
         fn carrier_maintenance_root(
             &self,
         ) -> Result<carrick_mem::memory::CarrierMaintenanceRoot, TrapError> {
-            Ok(carrick_mem::memory::CarrierMaintenanceRoot::new(Gpa(
+            Ok(carrick_mem::memory::CarrierMaintenanceRoot::new(Gpa::new(
                 carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
             )))
         }
@@ -9491,7 +9491,7 @@ mod transfer_service_tests {
             ttbr0: original,
             fail_restore: false,
         };
-        let root = carrick_mem::memory::CarrierMaintenanceRoot::new(Gpa(
+        let root = carrick_mem::memory::CarrierMaintenanceRoot::new(Gpa::new(
             carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
         ));
         let result: Result<(), TrapError> = with_maintenance_transfer_root(&mut cpu, root, |cpu| {
@@ -9501,7 +9501,7 @@ mod transfer_service_tests {
         });
         assert!(result.is_err());
         assert_eq!(cpu.ttbr0, original);
-        let wrong = carrick_mem::memory::CarrierMaintenanceRoot::new(Gpa(original));
+        let wrong = carrick_mem::memory::CarrierMaintenanceRoot::new(Gpa::new(original));
         let result: Result<(), TrapError> = with_maintenance_transfer_root(&mut cpu, wrong, |_| {
             panic!("unrecognized root must be refused before service effects")
         });

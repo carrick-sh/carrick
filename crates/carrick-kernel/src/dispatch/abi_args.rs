@@ -175,21 +175,21 @@ impl GuestPtr {
 
     #[inline]
     pub const fn to_va(self) -> GuestVa {
-        GuestVa(self.0)
+        GuestVa::new(self.0)
     }
 }
 
 impl From<GuestVa> for GuestPtr {
     #[inline]
     fn from(va: GuestVa) -> Self {
-        Self(va.0)
+        Self(va.raw())
     }
 }
 
 impl From<GuestPtr> for GuestVa {
     #[inline]
     fn from(ptr: GuestPtr) -> Self {
-        GuestVa(ptr.0)
+        GuestVa::new(ptr.0)
     }
 }
 
@@ -235,7 +235,7 @@ impl FromGuestArg for GuestPtr {
 }
 impl FromGuestArg for GuestVa {
     fn from_arg(raw: u64) -> Self {
-        GuestVa(raw)
+        GuestVa::new(raw)
     }
 }
 impl FromGuestArg for u64 {

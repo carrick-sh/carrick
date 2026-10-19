@@ -141,8 +141,8 @@ mod tests {
             write: true,
             exec: false,
         };
-        assert!(tx.stage_map(GuestVa(0x1000), test_frame(1), rw).is_ok());
-        assert!(tx.stage_unmap(GuestVa(0x2000), 0x1000).is_ok());
+        assert!(tx.stage_map(GuestVa::new(0x1000), test_frame(1), rw).is_ok());
+        assert!(tx.stage_unmap(GuestVa::new(0x2000), 0x1000).is_ok());
         assert_eq!(tx.staged_count(), 2);
         drop(tx);
     }
@@ -160,8 +160,8 @@ mod tests {
             write: false,
             exec: false,
         };
-        assert!(tx.stage_map(GuestVa(0x1000), test_frame(1), rw).is_ok());
-        assert!(tx.stage_protect(GuestVa(0x1000), 0x1000, r).is_ok());
+        assert!(tx.stage_map(GuestVa::new(0x1000), test_frame(1), rw).is_ok());
+        assert!(tx.stage_protect(GuestVa::new(0x1000), 0x1000, r).is_ok());
         assert_eq!(tx.commit().unwrap(), 2);
     }
 }

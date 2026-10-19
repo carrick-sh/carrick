@@ -91,7 +91,7 @@ impl carrick_hal::FrameCowAuthority for LiveForkReceiptAuthority {
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         assert_eq!(mapping, self.mapping);
         assert_eq!(frame, self.frame);
-        assert_eq!(gpa, carrick_guest_mem::Gpa(self.ipa));
+        assert_eq!(gpa, carrick_guest_mem::Gpa::new(self.ipa));
         assert_eq!(length.raw(), self.length);
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(true)

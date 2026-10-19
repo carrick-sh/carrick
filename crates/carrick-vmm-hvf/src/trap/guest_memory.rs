@@ -312,13 +312,13 @@ impl HvfVmState {
                     if let Some(state) = self.deferred_anonymous_state() {
                         let chunk = &mut dst[copied..copied + chunk_len];
                         if state
-                            .copy_pristine_zero(carrick_guest_mem::GuestVa(chunk_address), chunk)
+                            .copy_pristine_zero(carrick_guest_mem::GuestVa::new(chunk_address), chunk)
                             .map_err(|error| {
                                 MemoryError::HostMap(format!("anonymous zero read: {error}"))
                             })?
                             || state
                                 .copy_pristine_file(
-                                    carrick_guest_mem::GuestVa(chunk_address),
+                                    carrick_guest_mem::GuestVa::new(chunk_address),
                                     chunk,
                                 )
                                 .map_err(|error| {
@@ -930,7 +930,7 @@ impl HvfVmState {
                 let deferred = self.deferred_anonymous_state();
                 match resolve_missing_mapping_after_pristine_handoff(
                     deferred.as_deref(),
-                    carrick_guest_mem::GuestVa(chunk_address),
+                    carrick_guest_mem::GuestVa::new(chunk_address),
                     chunk_len,
                     || self.syscall_buffer_lookup_addr(chunk_address, chunk_len),
                     |published_lookup| self.mapping_for_range(published_lookup, chunk_len),
@@ -999,7 +999,7 @@ impl HvfVmState {
                 ),
                 self.mapping_for_range(lookup_address, chunk_len).is_some(),
                 self.deferred_anonymous_state().is_some_and(|state| state
-                    .covers_pristine(carrick_guest_mem::GuestVa(chunk_address), chunk_len)),
+                    .covers_pristine(carrick_guest_mem::GuestVa::new(chunk_address), chunk_len)),
             ),
         );
         if let Some(region) = self
@@ -1138,7 +1138,7 @@ mod tests {
         use std::sync::{Arc, mpsc};
 
         let state = Arc::new(carrick_guest_mem::DeferredAnonymousState::new());
-        let start = carrick_guest_mem::GuestVa(0x6001_0000_0000);
+        let start = carrick_guest_mem::GuestVa::new(0x6001_0000_0000);
         state.reserve_fresh(start, 4096).unwrap();
         let published_lookup = Arc::new(AtomicU64::new(0));
         let (held_tx, held_rx) = mpsc::channel();

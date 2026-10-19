@@ -77,7 +77,7 @@ impl MappingView {
         {
             return None;
         }
-        let word = carrick_guest_mem::HostVa(unsafe { self.host_addr.add(offset) } as usize);
+        let word = carrick_guest_mem::HostVa::new(unsafe { self.host_addr.add(offset) } as usize);
         if let Some(identity) = self.shared_key_base {
             let file_offset = self.shared_key_offset.checked_add(offset as u64)?;
             let waiter_key = shared_futex_waiter_key(identity, file_offset);

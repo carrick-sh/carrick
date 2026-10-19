@@ -597,7 +597,7 @@ pub(crate) fn settle_one(
         .mapping_is_live(
             split.new_extent.mapping,
             split.new_extent.frame,
-            carrick_guest_mem::Gpa(new_physical_ipa),
+            carrick_guest_mem::Gpa::new(new_physical_ipa),
             cow_length,
         )
         .ok()

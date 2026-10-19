@@ -385,7 +385,7 @@ fn publish_frame_grant_backing(
                 commit,
                 inventory_mapping.mapping,
                 inventory_mapping.frame,
-                carrick_guest_mem::Gpa(physical_ipa),
+                carrick_guest_mem::Gpa::new(physical_ipa),
                 physical_length,
             )
             .map(|applied| (challenge, applied))
@@ -1289,7 +1289,7 @@ pub(super) fn publish_replacing(
                     context.mm_key,
                     stage,
                     owner_rollback,
-                    (carrick_guest_mem::GuestVa(start), semantic),
+                    (carrick_guest_mem::GuestVa::new(start), semantic),
                 )?,
                 AliasAccess::User {
                     writable: true,
@@ -1382,11 +1382,11 @@ pub(super) fn publish_replacing(
                     );
                 Some(CarrierForeignCowReceipt {
                     snapshot,
-                    start: carrick_guest_mem::GuestVa(start),
+                    start: carrick_guest_mem::GuestVa::new(start),
                     len: semantic_len,
                     mapping: prepared.extent.mapping,
                     frame: prepared.extent.frame,
-                    physical_base: carrick_guest_mem::Gpa(physical_ipa),
+                    physical_base: carrick_guest_mem::Gpa::new(physical_ipa),
                     physical_len,
                     owner_generation: proof.owner_generation,
                     kernel_proof: proof.kernel_proof,
@@ -1663,7 +1663,7 @@ pub(super) fn publish_replacing(
             .authority
             .apply_foreign_cow(
                 commit,
-                carrick_guest_mem::GuestVa(start),
+                carrick_guest_mem::GuestVa::new(start),
                 std::num::NonZeroUsize::new(semantic_len).unwrap_or_else(|| {
                     carrick_fatal!(
                         "hvpatch::sparse_materialization_inventory",
@@ -1672,7 +1672,7 @@ pub(super) fn publish_replacing(
                 }),
                 inventory_mapping.mapping,
                 inventory_mapping.frame,
-                carrick_guest_mem::Gpa(physical_ipa),
+                carrick_guest_mem::Gpa::new(physical_ipa),
                 carrick_hal::FrameLength::from_mapping_extent(
                     std::num::NonZeroU64::new(physical_len).unwrap_or_else(|| {
                         carrick_fatal!(
@@ -1714,11 +1714,11 @@ pub(super) fn publish_replacing(
                 carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(receipt.revision());
             Some(CarrierForeignCowReceipt {
                 snapshot,
-                start: carrick_guest_mem::GuestVa(start),
+                start: carrick_guest_mem::GuestVa::new(start),
                 len: semantic_len,
                 mapping: inventory_mapping.mapping,
                 frame: inventory_mapping.frame,
-                physical_base: carrick_guest_mem::Gpa(physical_ipa),
+                physical_base: carrick_guest_mem::Gpa::new(physical_ipa),
                 physical_len,
                 owner_generation: generation,
                 kernel_proof,
@@ -1739,7 +1739,7 @@ pub(super) fn publish_replacing(
     match context.authority.mapping_is_live(
         inventory_mapping.mapping,
         inventory_mapping.frame,
-        carrick_guest_mem::Gpa(physical_ipa),
+        carrick_guest_mem::Gpa::new(physical_ipa),
         carrick_hal::FrameLength::from_mapping_extent(
             std::num::NonZeroU64::new(physical_len).unwrap_or_else(|| {
                 carrick_fatal!(
@@ -2844,7 +2844,7 @@ impl Drop for PendingTransferGrant {
                 .mapping_is_live(
                     expected.mapping,
                     expected.frame,
-                    carrick_guest_mem::Gpa(key.0),
+                    carrick_guest_mem::Gpa::new(key.0),
                     length,
                 )
                 .unwrap_or_else(|error| {

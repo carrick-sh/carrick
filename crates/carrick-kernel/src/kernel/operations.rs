@@ -1538,7 +1538,7 @@ pub(super) mod tests {
 
     fn test_binding() -> MmBinding {
         let asid = Asid::from_registry_allocation(NonZeroU16::new(7).expect("nonzero ASID"));
-        let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("aligned root");
+        let root = Stage1Root::for_aarch64_4k(Gpa::new(0x8000)).expect("aligned root");
         MmBinding::for_aarch64(asid, root)
     }
 

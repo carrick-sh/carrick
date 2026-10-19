@@ -594,7 +594,7 @@ impl InitialInventory {
                         frame,
                         mapping,
                         generation,
-                        gpa: carrick_guest_mem::Gpa(gpa.raw()),
+                        gpa: carrick_guest_mem::Gpa::new(gpa.raw()),
                         length,
                         permissions: MemPerms {
                             read: true,
@@ -690,7 +690,7 @@ impl InventoryTransaction for InitialInventory {
                     .mapping_is_live(
                         mapping,
                         frame,
-                        carrick_guest_mem::Gpa(gpa.raw()),
+                        carrick_guest_mem::Gpa::new(gpa.raw()),
                         self.length,
                     )
                     .map_err(|error| crate::carrier_memory::MemoryError(error.to_string()))?
@@ -6213,10 +6213,10 @@ impl ForwardVenue<'_> {
             .ok_or(MemoryError::OutOfBounds { address, length: 1 })?;
         if row.frame != FrameId::from_kernel_allocation(identity.frame_id)
             || row.generation != MappingGeneration::from_backend_counter(identity.owner_generation)
-            || page < row.gpa.0
+            || page < row.gpa.raw()
             || page.checked_add(4096).is_none_or(|end| {
                 row.gpa
-                    .0
+                    .raw()
                     .checked_add(row.length.raw())
                     .is_none_or(|limit| end > limit)
             })
@@ -6591,7 +6591,7 @@ mod initial_reply_tests {
                 frame,
                 mapping,
                 generation,
-                gpa: carrick_guest_mem::Gpa(0x2_0000_1000),
+                gpa: carrick_guest_mem::Gpa::new(0x2_0000_1000),
                 length: inventory.length,
                 permissions: MemPerms {
                     read: true,
@@ -6699,8 +6699,8 @@ mod initial_reply_tests {
         assert_eq!(inventory.frames.len(), 2);
         let rows = authority.snapshot().mappings;
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].gpa.0, grants[2].gpa);
-        assert_eq!(rows[1].gpa.0, grants[3].gpa);
+        assert_eq!(rows[0].gpa.raw(), grants[2].gpa);
+        assert_eq!(rows[1].gpa.raw(), grants[3].gpa);
     }
 
     #[test]

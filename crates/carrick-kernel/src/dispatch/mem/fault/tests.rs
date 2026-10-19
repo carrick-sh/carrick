@@ -58,8 +58,8 @@ fn growdown_metadata_is_trimmed_with_mapping_teardown() {
         split.vmas,
         vec![
             crate::kernel::VmaSummary {
-                start: GuestVa(start - page),
-                end: GuestVa(start + page),
+                start: GuestVa::new(start - page),
+                end: GuestVa::new(start + page),
                 access: crate::kernel::VmaAccess {
                     readable: true,
                     writable: true,
@@ -68,8 +68,8 @@ fn growdown_metadata_is_trimmed_with_mapping_teardown() {
                 },
             },
             crate::kernel::VmaSummary {
-                start: GuestVa(start + page * 2),
-                end: GuestVa(start + page * 4),
+                start: GuestVa::new(start + page * 2),
+                end: GuestVa::new(start + page * 4),
                 access: crate::kernel::VmaAccess {
                     readable: true,
                     writable: true,
@@ -95,8 +95,8 @@ fn growdown_metadata_is_trimmed_with_mapping_teardown() {
     assert_eq!(
         retired.vmas,
         vec![crate::kernel::VmaSummary {
-            start: GuestVa(start + page * 2),
-            end: GuestVa(start + page * 4),
+            start: GuestVa::new(start + page * 2),
+            end: GuestVa::new(start + page * 4),
             access: crate::kernel::VmaAccess {
                 readable: true,
                 writable: true,
@@ -506,7 +506,7 @@ fn first_touch_arming_answers_and_splits_exactly_like_a_scan() {
     let page = LINUX_PAGE_SIZE;
     let base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
     let range = |start: u64, end: u64| {
-        carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).expect("range")
+        carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)).expect("range")
     };
     let mut arming = FirstTouchArming::default();
     arming.arm(range(base, base + 4 * page), LinuxProtFlags::READ);
@@ -660,7 +660,7 @@ fn first_touch_arming_coalesces_adjacent_equal_protections() {
     let page = LINUX_PAGE_SIZE;
     let base = crate::memory::LINUX_HIGH_VA_THRESHOLD;
     let range = |start: u64, end: u64| {
-        carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).expect("range")
+        carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)).expect("range")
     };
     let mut arming = FirstTouchArming::default();
 

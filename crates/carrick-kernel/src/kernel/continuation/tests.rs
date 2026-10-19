@@ -189,7 +189,7 @@ fn await_event_timeout(
 fn direct_shared_word_location(word: &std::sync::atomic::AtomicU32) -> SharedFutexLocation {
     let address = word as *const std::sync::atomic::AtomicU32 as usize;
     SharedFutexLocation::Direct {
-        word: HostVa(address),
+        word: HostVa::new(address),
         waiter_key: address,
     }
 }
@@ -200,7 +200,7 @@ fn shared_queue_key(location: SharedFutexLocation) -> carrick_thread::thread::Fu
 
 fn synthetic_shared_queue_key(word: usize, waiter_key: usize) -> carrick_thread::thread::FutexKey {
     shared_queue_key(SharedFutexLocation::Direct {
-        word: HostVa(word),
+        word: HostVa::new(word),
         waiter_key,
     })
 }
@@ -694,7 +694,7 @@ fn outcome_for(
         ContinuationFamily::SharedFutexWait => DispatchOutcome::SharedFutexWait {
             target: SharedFutexTarget {
                 location: SharedFutexLocation::Direct {
-                    word: HostVa(0x3000),
+                    word: HostVa::new(0x3000),
                     waiter_key: 31,
                 },
                 waiter_key: 31,
@@ -710,7 +710,7 @@ fn outcome_for(
         ContinuationFamily::SharedFutexWaitv => DispatchOutcome::SharedFutexWaitv {
             target: SharedFutexTarget {
                 location: SharedFutexLocation::Direct {
-                    word: HostVa(0x4000),
+                    word: HostVa::new(0x4000),
                     waiter_key: 41,
                 },
                 waiter_key: 41,
@@ -726,7 +726,7 @@ fn outcome_for(
         },
         ContinuationFamily::WaitOnSharedWord => DispatchOutcome::WaitOnSharedWord {
             location: SharedFutexLocation::Direct {
-                word: HostVa(0x5000),
+                word: HostVa::new(0x5000),
                 waiter_key: 51,
             },
             waiter_key: 51,
@@ -2155,14 +2155,14 @@ fn select_and_sleep_guest_writes_revalidate_exact_mm_before_any_access() {
             ContinuationFamily::WaitOnFdsSelect,
             vec![
                 GuestOutputRange::new(
-                    GuestVa(0x7000),
+                    GuestVa::new(0x7000),
                     16,
                     context.shared().mm().id(),
                     context.shared().mm().id().raw(),
                 )
                 .unwrap(),
                 GuestOutputRange::new(
-                    GuestVa(0x7100),
+                    GuestVa::new(0x7100),
                     8,
                     context.shared().mm().id(),
                     context.shared().mm().id().raw(),
@@ -2174,7 +2174,7 @@ fn select_and_sleep_guest_writes_revalidate_exact_mm_before_any_access() {
             ContinuationFamily::WaitOnSleep,
             vec![
                 GuestOutputRange::new(
-                    GuestVa(0x9000),
+                    GuestVa::new(0x9000),
                     std::mem::size_of::<libc::timespec>(),
                     context.shared().mm().id(),
                     context.shared().mm().id().raw(),
@@ -2766,13 +2766,13 @@ fn two_live_shared_word_owners_do_not_consume_each_others_wake() {
     let hint_b = carrick_host::futex_key::shared_futex_waiter_key(identity_b, offset);
     assert_eq!(hint_a, hint_b, "force the legacy hash collision");
     let location_a = SharedFutexLocation::File {
-        word: HostVa((&word_a as *const std::sync::atomic::AtomicU32) as usize),
+        word: HostVa::new((&word_a as *const std::sync::atomic::AtomicU32) as usize),
         identity: identity_a,
         offset,
         waiter_key: hint_a,
     };
     let location_b = SharedFutexLocation::File {
-        word: HostVa((&word_b as *const std::sync::atomic::AtomicU32) as usize),
+        word: HostVa::new((&word_b as *const std::sync::atomic::AtomicU32) as usize),
         identity: identity_b,
         offset,
         waiter_key: hint_b,
@@ -2931,7 +2931,7 @@ fn two_kernels_with_the_same_file_word_do_not_share_wakes() {
     let service_b = CarrierWaitService::new(Arc::new(Scheduler::new(kernel_b)));
     let word = std::sync::atomic::AtomicU32::new(7);
     let location = SharedFutexLocation::File {
-        word: HostVa(std::ptr::from_ref(&word) as usize),
+        word: HostVa::new(std::ptr::from_ref(&word) as usize),
         identity: carrick_hal::SharedFutexFileIdentity {
             device: 42,
             inode: 73,
@@ -5321,7 +5321,7 @@ fn shared_word_lifetime_and_safety_through_cancellation_retirement() {
     let word_box = Box::new(std::sync::atomic::AtomicU32::new(42));
     let word_raw = Box::into_raw(word_box);
     let location = SharedFutexLocation::Direct {
-        word: HostVa(word_raw as usize),
+        word: HostVa::new(word_raw as usize),
         waiter_key: word_raw as usize,
     };
 

@@ -1027,10 +1027,10 @@ impl Cpl0HostCustody {
                                     != MappingGeneration::from_backend_counter(
                                         identity.owner_generation,
                                     )
-                                || edge.physical().raw() < row.gpa.0
+                                || edge.physical().raw() < row.gpa.raw()
                                 || edge.physical().raw().checked_add(4096).is_none_or(|end| {
                                     row.gpa
-                                        .0
+                                        .raw()
                                         .checked_add(row.length.raw())
                                         .is_none_or(|limit| end > limit)
                                 })

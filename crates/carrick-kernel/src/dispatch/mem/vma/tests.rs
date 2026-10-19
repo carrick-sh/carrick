@@ -63,15 +63,15 @@ fn vma_snapshot_projects_permissions_and_splits_kernel_hidden_coverage() {
     }]);
     locked_ranges_insert(
         &mut mem.secretmem_maps,
-        carrick_vfs::GuestMemoryRange::new(GuestVa(0x2000), GuestVa(0x3000)).expect("secret range"),
+        carrick_vfs::GuestMemoryRange::new(GuestVa::new(0x2000), GuestVa::new(0x3000)).expect("secret range"),
     );
 
     assert_eq!(
         project_vma_summaries(&mem),
         vec![
             crate::kernel::VmaSummary {
-                start: GuestVa(0x1000),
-                end: GuestVa(0x2000),
+                start: GuestVa::new(0x1000),
+                end: GuestVa::new(0x2000),
                 access: crate::kernel::VmaAccess {
                     readable: true,
                     writable: false,
@@ -80,8 +80,8 @@ fn vma_snapshot_projects_permissions_and_splits_kernel_hidden_coverage() {
                 },
             },
             crate::kernel::VmaSummary {
-                start: GuestVa(0x2000),
-                end: GuestVa(0x3000),
+                start: GuestVa::new(0x2000),
+                end: GuestVa::new(0x3000),
                 access: crate::kernel::VmaAccess {
                     readable: true,
                     writable: false,
@@ -90,8 +90,8 @@ fn vma_snapshot_projects_permissions_and_splits_kernel_hidden_coverage() {
                 },
             },
             crate::kernel::VmaSummary {
-                start: GuestVa(0x3000),
-                end: GuestVa(0x5000),
+                start: GuestVa::new(0x3000),
+                end: GuestVa::new(0x5000),
                 access: crate::kernel::VmaAccess {
                     readable: true,
                     writable: false,
@@ -142,8 +142,8 @@ fn vma_projection_preserves_adjacency_and_removes_unmapped_boot_ranges() {
     assert_eq!(
         after.vmas,
         vec![crate::kernel::VmaSummary {
-            start: GuestVa(0x2000),
-            end: GuestVa(0x3000),
+            start: GuestVa::new(0x2000),
+            end: GuestVa::new(0x3000),
             access: crate::kernel::VmaAccess {
                 readable: true,
                 writable: false,

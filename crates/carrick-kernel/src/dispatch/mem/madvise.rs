@@ -242,7 +242,7 @@ impl<'a> MemView<'a> {
         if let Some(regions) = &mem.address_space_regions {
             for region in regions {
                 if let Some(range) =
-                    carrick_vfs::GuestMemoryRange::new(GuestVa(region.start), GuestVa(region.end))
+                    carrick_vfs::GuestMemoryRange::new(GuestVa::new(region.start), GuestVa::new(region.end))
                 {
                     locked_ranges_insert(&mut ranges, range);
                 }
@@ -258,7 +258,7 @@ impl<'a> MemView<'a> {
                     .map(|row| (row.start, row.end)),
             )
         {
-            if let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) {
+            if let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)) {
                 locked_ranges_insert(&mut ranges, range);
             }
         }
@@ -775,7 +775,7 @@ impl<'a> MemView<'a> {
                             if ::std::env::var("CARRICK_MINCORE_EXACT").as_deref() != Ok("0")
                                 && cx
                                     .memory
-                                    .resident_pages(GuestVa(segment.start), 1, this.linux_page_size())
+                                    .resident_pages(GuestVa::new(segment.start), 1, this.linux_page_size())
                                     .is_none()
                                 && cx.memory.protect_range(segment.start, segment_len, 0).is_ok()
                             {

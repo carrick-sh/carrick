@@ -226,7 +226,7 @@ pub(in crate::dispatch) fn read_from_repeatable_owner_at(
             Err(_errno) if copied > 0 => break,
             Err(errno) => return Err(DispatchError::Errno(errno)),
         };
-        let range = GuestWriteRange::new(GuestVa(at), read_len)
+        let range = GuestWriteRange::new(GuestVa::new(at), read_len)
             .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
         let prepared = match memory.prepare_write(&[range]) {
             Ok(prepared) => prepared,

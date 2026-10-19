@@ -1878,7 +1878,7 @@ impl HvfTaskState {
             match authority.mapping_is_live(
                 receipt.child_mapping,
                 receipt.frame,
-                carrick_guest_mem::Gpa(receipt.ipa),
+                carrick_guest_mem::Gpa::new(receipt.ipa),
                 length,
             ) {
                 Ok(true) => {}
@@ -2157,7 +2157,7 @@ impl HvfTaskState {
         if carrier_initial_arena_retired().swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
-        let Some(mapping) = self.mappings.get(&GuestVa(crate::memory::LINUX_MMAP_BASE)) else {
+        let Some(mapping) = self.mappings.get(&GuestVa::new(crate::memory::LINUX_MMAP_BASE)) else {
             return Ok(());
         };
         if mapping.end
@@ -2179,7 +2179,7 @@ impl HvfTaskState {
             )));
         }
         self.mappings.remove_range(
-            GuestVa(crate::memory::LINUX_MMAP_BASE),
+            GuestVa::new(crate::memory::LINUX_MMAP_BASE),
             crate::memory::mmap_arena_size() as usize,
         );
         Ok(())
@@ -2413,7 +2413,7 @@ impl HvfVmState {
                 carrick_hal::ForeignMmId::from_kernel_allocation(mm),
                 CarrierForeignMmBinding {
                     asid: carrick_hal::ForeignAsid::from_kernel_allocation(asid),
-                    stage1_root: carrick_guest_mem::Gpa(stage1_root),
+                    stage1_root: carrick_guest_mem::Gpa::new(stage1_root),
                 },
                 &self.task.mm_access,
             );
@@ -5792,7 +5792,7 @@ impl HvpatchTaskRegistration {
             mm,
             CarrierForeignMmBinding {
                 asid,
-                stage1_root: carrick_guest_mem::Gpa(stage1_root),
+                stage1_root: carrick_guest_mem::Gpa::new(stage1_root),
             },
             &task.mm_access,
         ));

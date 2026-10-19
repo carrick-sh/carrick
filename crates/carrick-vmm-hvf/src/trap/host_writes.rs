@@ -311,7 +311,7 @@ impl HvfTaskState {
         // control mappings that outlive every access.
         Some(unsafe {
             HostRead::retained(
-                carrick_guest_mem::GuestVa(address),
+                carrick_guest_mem::GuestVa::new(address),
                 access.pointer,
                 len,
                 retention,

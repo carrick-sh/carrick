@@ -436,8 +436,8 @@ mod execve_tests {
         let payload = b"carrick alias payload".to_vec();
         engine
             .map_host_alias(
-                GuestVa(va),
-                Gpa(0),
+                GuestVa::new(va),
+                Gpa::new(0),
                 0x1000,
                 &payload,
                 HostAliasBacking::Anonymous {
@@ -476,8 +476,8 @@ mod execve_tests {
         let va = LINUX_HIGH_VA_THRESHOLD + 0x40_0000;
         engine
             .map_host_alias(
-                GuestVa(va),
-                Gpa(0),
+                GuestVa::new(va),
+                Gpa::new(0),
                 0x1000,
                 &[],
                 HostAliasBacking::File {
@@ -516,8 +516,8 @@ mod execve_tests {
         // 1 TiB + ~6.4 TiB: well past the 64 GiB arena.
         let va = LINUX_HIGH_VA_THRESHOLD + 0x10_0000_0000u64 * 100;
         let r = engine.map_host_alias(
-            GuestVa(va),
-            Gpa(0),
+            GuestVa::new(va),
+            Gpa::new(0),
             0x1000,
             &[1, 2, 3],
             HostAliasBacking::Anonymous {

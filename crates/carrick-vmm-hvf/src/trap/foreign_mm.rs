@@ -2077,12 +2077,12 @@ pub(crate) fn attest_foreign_identity_write_receipt(
     let (kernel_proof, owner_generation) = runtime
         .authority
         .attest_foreign_identity_write(
-            carrick_guest_mem::GuestVa(page_va),
+            carrick_guest_mem::GuestVa::new(page_va),
             semantic_len,
             requested.frame_inventory_revision.raw_for_probe(),
             mapping,
             frame,
-            carrick_guest_mem::Gpa(extent_key.0),
+            carrick_guest_mem::Gpa::new(extent_key.0),
             cow_length,
         )
         .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
@@ -2091,11 +2091,11 @@ pub(crate) fn attest_foreign_identity_write_receipt(
     }
     Ok(CarrierForeignCowReceipt {
         snapshot: requested.clone(),
-        start: carrick_guest_mem::GuestVa(page_va),
+        start: carrick_guest_mem::GuestVa::new(page_va),
         len: PAGE as usize,
         mapping,
         frame,
-        physical_base: carrick_guest_mem::Gpa(extent_key.0),
+        physical_base: carrick_guest_mem::Gpa::new(extent_key.0),
         physical_len: extent_key.1,
         owner_generation,
         kernel_proof,
@@ -2143,7 +2143,7 @@ pub(crate) fn materialize_foreign_pristine_write(
             .protections
             .legacy()
             .is_none_or(|protections| protections.range_write_denied(start, PAGE))
-        || !deferred.covers_pristine(carrick_guest_mem::GuestVa(start), PAGE)
+        || !deferred.covers_pristine(carrick_guest_mem::GuestVa::new(start), PAGE)
     {
         return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
     }
@@ -2157,7 +2157,7 @@ pub(crate) fn materialize_foreign_pristine_write(
     let mut stage1 =
         ForeignStage1Services::for_target(invalidator, &lease.state, requested, deadline)?;
     let transition = deferred
-        .begin_materialization(carrick_guest_mem::GuestVa(start), PAGE)
+        .begin_materialization(carrick_guest_mem::GuestVa::new(start), PAGE)
         .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
     let published = sparse_materialization::publish(
         &context,
@@ -2278,7 +2278,7 @@ pub(crate) fn materialize_foreign_private_file_write(
         .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
     let mut page = [0_u8; PAGE];
     transition
-        .copy_pristine(carrick_guest_mem::GuestVa(start), &mut page)
+        .copy_pristine(carrick_guest_mem::GuestVa::new(start), &mut page)
         .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
     let context = sparse_materialization::PublicationContext::for_foreign(
         lease.state.clone(),
@@ -2348,7 +2348,7 @@ pub(crate) fn materialize_foreign_private_file_write(
     }
     lease_guard.retained = receipt.snapshot.clone();
     transition
-        .commit_range(carrick_guest_mem::GuestVa(start), PAGE)
+        .commit_range(carrick_guest_mem::GuestVa::new(start), PAGE)
         .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
     Ok(receipt)
 }
@@ -3021,7 +3021,7 @@ pub(crate) fn perform_foreign_cow_transaction(
         .authority
         .apply_foreign_cow(
             commit,
-            carrick_guest_mem::GuestVa(span.va),
+            carrick_guest_mem::GuestVa::new(span.va),
             std::num::NonZeroUsize::new(span.len).unwrap_or_else(|| {
                 carrick_fatal!(
                     "hvpatch::cow_token",
@@ -3030,7 +3030,7 @@ pub(crate) fn perform_foreign_cow_transaction(
             }),
             split.new_extent.mapping,
             split.new_extent.frame,
-            carrick_guest_mem::Gpa(new_physical_ipa),
+            carrick_guest_mem::Gpa::new(new_physical_ipa),
             cow_length,
         ) {
         Ok(publication) => publication,
@@ -3381,7 +3381,7 @@ fn perform_foreign_guest_cow(
     let (kernel_proof, authenticated_owner_generation) = runtime
         .authority
         .attest_foreign_identity_write(
-            carrick_guest_mem::GuestVa(span.va),
+            carrick_guest_mem::GuestVa::new(span.va),
             std::num::NonZeroUsize::new(span.len).unwrap_or_else(|| {
                 carrick_fatal!(
                     "hvpatch::cow_token",
@@ -3391,7 +3391,7 @@ fn perform_foreign_guest_cow(
             apply_receipt.revision(),
             split.new_extent.mapping,
             split.new_extent.frame,
-            carrick_guest_mem::Gpa(new_physical_ipa),
+            carrick_guest_mem::Gpa::new(new_physical_ipa),
             cow_length,
         )
         .unwrap_or_else(|error| {
@@ -3616,7 +3616,7 @@ fn finish_foreign_cow_publication(
     match runtime.authority.mapping_is_live(
         split.new_extent.mapping,
         split.new_extent.frame,
-        carrick_guest_mem::Gpa(new_physical_ipa),
+        carrick_guest_mem::Gpa::new(new_physical_ipa),
         cow_length,
     ) {
         Ok(true) => {}
@@ -3699,11 +3699,11 @@ fn finish_foreign_cow_publication(
     }
     CarrierForeignCowReceipt {
         snapshot: committed,
-        start: carrick_guest_mem::GuestVa(span.va),
+        start: carrick_guest_mem::GuestVa::new(span.va),
         len: span.len,
         mapping: split.new_extent.mapping,
         frame: split.new_extent.frame,
-        physical_base: carrick_guest_mem::Gpa(new_physical_ipa),
+        physical_base: carrick_guest_mem::Gpa::new(new_physical_ipa),
         physical_len: CowArmedRanges::COMPOUND_SIZE,
         owner_generation: authenticated_owner_generation,
         kernel_proof,
@@ -4027,7 +4027,7 @@ impl CarrierForeignMmReadLease {
         let mut cursor = va.raw();
         let mut expected_physical = initial_physical;
         while cursor < va_end {
-            let current_va = carrick_guest_mem::GuestVa(cursor);
+            let current_va = carrick_guest_mem::GuestVa::new(cursor);
             let leaf_physical = foreign_stage1_translate(
                 &inner.backing,
                 requested.binding.stage1_root,
@@ -4163,7 +4163,7 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             if !live_snapshot_matches(authority, &requested, deadline)? {
                 return Err(carrick_hal::ForeignMmTransportError::Retry);
             }
-            let current_va = carrick_guest_mem::GuestVa(cursor);
+            let current_va = carrick_guest_mem::GuestVa::new(cursor);
             let ipa = match foreign_stage1_translate(
                 &inner.backing,
                 requested.binding.stage1_root,

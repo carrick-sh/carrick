@@ -410,7 +410,7 @@ mod tests {
         let prepared = PreparedWrite::prepare(
             service,
             &slots,
-            vec![GuestWriteRange::new(carrick_guest_mem::GuestVa(0x40000), 12288).unwrap()],
+            vec![GuestWriteRange::new(carrick_guest_mem::GuestVa::new(0x40000), 12288).unwrap()],
             pages(&state),
         )
         .unwrap();
@@ -445,7 +445,7 @@ mod tests {
                 fail: Some(2),
             },
             &slots,
-            vec![GuestWriteRange::new(carrick_guest_mem::GuestVa(0x40000), 12288).unwrap()],
+            vec![GuestWriteRange::new(carrick_guest_mem::GuestVa::new(0x40000), 12288).unwrap()],
             pages(&state),
         );
         assert!(matches!(result, Err(MemoryPrepareError::OwnerWait(_))));
@@ -472,7 +472,7 @@ mod tests {
                     fail: None,
                 },
                 &slots,
-                vec![GuestWriteRange::new(carrick_guest_mem::GuestVa(0x40000), 12288).unwrap()],
+                vec![GuestWriteRange::new(carrick_guest_mem::GuestVa::new(0x40000), 12288).unwrap()],
                 pages(&state),
             )
             .unwrap();

@@ -172,41 +172,8 @@ pub enum PrivateFileSource {
 /// `u64`s in mapping signatures like `map_aliased(va, gpa, len)` — a va↔gpa
 /// transposition is page-aligned on both sides, so alignment guards cannot
 /// catch it; only the type can.
-#[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Debug,
-    ::serde::Serialize,
-    ::serde::Deserialize,
-)]
-pub struct GuestVa(pub u64);
+pub use carrick_guest_arch::GuestVa;
 
-impl GuestVa {
-    /// The raw guest-virtual address value.
-    #[inline]
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
-
-impl From<u64> for GuestVa {
-    #[inline]
-    fn from(val: u64) -> Self {
-        GuestVa(val)
-    }
-}
-
-impl From<GuestVa> for u64 {
-    #[inline]
-    fn from(va: GuestVa) -> Self {
-        va.0
-    }
-}
 
 /// A contiguous range of guest virtual addresses `[start, start + len)`.
 #[derive(
@@ -229,9 +196,9 @@ pub struct GuestVaRange {
 impl GuestVaRange {
     #[inline]
     pub fn new(start: GuestVa, end: GuestVa) -> Option<Self> {
-        (start.0 < end.0).then_some(Self {
+        (start.raw() < end.raw()).then_some(Self {
             start,
-            len: end.0.saturating_sub(start.0) as usize,
+            len: end.raw().saturating_sub(start.raw()) as usize,
         })
     }
 
@@ -243,7 +210,7 @@ impl GuestVaRange {
     #[inline]
     pub const fn from_raw(start: u64, len: usize) -> Self {
         Self {
-            start: GuestVa(start),
+            start: GuestVa::new(start),
             len,
         }
     }
@@ -255,7 +222,7 @@ impl GuestVaRange {
 
     #[inline]
     pub const fn start_raw(self) -> u64 {
-        self.start.0
+        self.start.raw()
     }
 
     #[inline]
@@ -280,29 +247,29 @@ impl GuestVaRange {
 
     #[inline]
     pub const fn end_raw(self) -> u64 {
-        self.start.0.saturating_add(self.len as u64)
+        self.start.raw().saturating_add(self.len as u64)
     }
 
     #[inline]
     pub const fn end_va(self) -> GuestVa {
-        GuestVa(self.end_raw())
+        GuestVa::new(self.end_raw())
     }
 
     #[inline]
     pub fn overlap_bytes(self, start: u64, end: u64) -> u64 {
-        let lo = self.start.0.max(start);
+        let lo = self.start.raw().max(start);
         let hi = self.end_raw().min(end);
         hi.saturating_sub(lo)
     }
 
     #[inline]
     pub const fn contains_va(self, va: GuestVa) -> bool {
-        va.0 >= self.start.0 && va.0 < self.end_raw()
+        va.raw() >= self.start.raw() && va.raw() < self.end_raw()
     }
 
     #[inline]
     pub const fn contains_raw(self, va: u64) -> bool {
-        va >= self.start.0 && va < self.end_raw()
+        va >= self.start.raw() && va < self.end_raw()
     }
 
     #[inline]
@@ -314,40 +281,8 @@ impl GuestVaRange {
     }
 }
 
-/// A GUEST PHYSICAL address (stage-2 / memslot space; aarch64 calls it IPA).
-///
-/// Distinct from [`GuestVa`] and [`HostVa`] because the three were adjacent
-/// bare `u64`s in mapping signatures like `map_aliased(va, gpa, len)` — a
-/// va↔gpa transposition is page-aligned on both sides, so alignment guards
-/// cannot catch it; only the type can.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, ::serde::Serialize)]
-pub struct Gpa(pub u64);
+pub use carrick_guest_arch::{Gpa, HostVa};
 
-impl Gpa {
-    /// The raw guest-physical (IPA) address value.
-    #[inline]
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
-
-/// A HOST VIRTUAL address (a real pointer in carrick's own address space).
-///
-/// Distinct from [`GuestVa`] and [`Gpa`] because the translation chain
-/// (guest VA → GPA → host pointer, e.g. `shared_futex_location`) carried all
-/// three as adjacent bare integers — a swap is page-aligned and alignment
-/// guards cannot catch it; only the type can. Deref via `raw()` at the
-/// pointer boundary.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, ::serde::Serialize)]
-pub struct HostVa(pub usize);
-
-impl HostVa {
-    /// The raw host address value (cast to a pointer at the deref site).
-    #[inline]
-    pub const fn raw(self) -> usize {
-        self.0
-    }
-}
 
 /// Resolved native page profile for a run — how Linux page semantics map
 /// onto the host's page size on the native execution backend.

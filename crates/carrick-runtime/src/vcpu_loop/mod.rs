@@ -3465,7 +3465,7 @@ pub(crate) mod tests {
                     frame,
                     mapping,
                     generation,
-                    gpa: carrick_guest_mem::Gpa(0x4000),
+                    gpa: carrick_guest_mem::Gpa::new(0x4000),
                     length: carrick_hal::FrameLength::from_mapping_extent(
                         std::num::NonZeroU64::new(0x4000).unwrap(),
                     ),

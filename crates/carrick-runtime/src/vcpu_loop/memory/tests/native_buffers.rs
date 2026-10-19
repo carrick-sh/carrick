@@ -53,7 +53,7 @@ fn syscall_copyout_updates_carrier_not_private_elf_data() {
         .unwrap();
     assert!(matches!(outcome, DispatchOutcome::Returned { value: 0 }));
     let foreign = foreign_mm(&kernel, &root, &root_lease, fixture.child.task().key());
-    let read = foreign.read_range(GuestVa(TEST_VA), 16).unwrap().unwrap();
+    let read = foreign.read_range(GuestVa::new(TEST_VA), 16).unwrap().unwrap();
     let mut actual = [0; 16];
     carrick_kernel::kernel::MmAccessAuthority::new()
         .read_foreign(&foreign, read, &mut actual)
@@ -105,8 +105,8 @@ fn carrier_buffer_elf_control() {
     let physical_start = data_va & !(granule - 1);
     let physical_end = (data_end + granule - 1) & !(granule - 1);
     let shape = FixtureShape::with_data(
-        Gpa(0x9a00_e000_0000),
-        Gpa(0x9b00_e000_0000),
+        Gpa::new(0x9a00_e000_0000),
+        Gpa::new(0x9b00_e000_0000),
         physical_start,
         physical_end - physical_start,
     )
@@ -131,14 +131,14 @@ fn carrier_buffer_elf_control() {
         .unwrap();
     fixture
         .child
-        .copy_current_from(&execution, GuestVa(data_va), initial)
+        .copy_current_from(&execution, GuestVa::new(data_va), initial)
         .unwrap();
     // The physical compound includes a prefix before ELF data. Its presence in
     // stage-1 does not grant semantic access to the private code publication.
     assert!(
         fixture
             .child
-            .copy_current_into(&execution, GuestVa(image.base()), &mut [0; 4])
+            .copy_current_into(&execution, GuestVa::new(image.base()), &mut [0; 4])
             .is_err()
     );
     let authority = carrick_kernel::kernel::MmAccessAuthority::new();
@@ -148,7 +148,7 @@ fn carrier_buffer_elf_control() {
     let window_len = (0x1000 - data_va % 0x1000).min(data_end - data_va) as usize;
     let range = current
         .access_token()
-        .write_range(GuestVa(data_va), window_len)
+        .write_range(GuestVa::new(data_va), window_len)
         .unwrap()
         .unwrap();
     let mut prepared = authority
@@ -366,16 +366,16 @@ fn repeated_copyout_crosses_private_guest_pages() {
     let second = [0xa7; 8193];
     fixture
         .child
-        .copy_current_from(&execution, GuestVa(TEST_VA + 1), &first)
+        .copy_current_from(&execution, GuestVa::new(TEST_VA + 1), &first)
         .unwrap();
     fixture
         .child
-        .copy_current_from(&execution, GuestVa(TEST_VA + 1), &second)
+        .copy_current_from(&execution, GuestVa::new(TEST_VA + 1), &second)
         .unwrap();
     let mut actual = [0; 8193];
     fixture
         .child
-        .copy_current_into(&execution, GuestVa(TEST_VA + 1), &mut actual)
+        .copy_current_into(&execution, GuestVa::new(TEST_VA + 1), &mut actual)
         .unwrap();
     assert_eq!(actual, second);
     assert_eq!(original.prefix(), *b"same");
@@ -405,13 +405,13 @@ fn current_copies_reject_wrong_lease_and_invalid_ranges() {
     assert!(
         fixture
             .child
-            .copy_current_into(&wrong, GuestVa(TEST_VA), &mut [])
+            .copy_current_into(&wrong, GuestVa::new(TEST_VA), &mut [])
             .is_err()
     );
     assert!(
         fixture
             .child
-            .copy_current_from(&wrong, GuestVa(TEST_VA), &[])
+            .copy_current_from(&wrong, GuestVa::new(TEST_VA), &[])
             .is_err()
     );
     let mut memory = CarrierCopyMemory::new(&fixture.child, &execution).unwrap();
@@ -461,7 +461,7 @@ fn current_copies_honor_vma_read_write_and_executable_permissions() {
         let mut bytes = [0; 4];
         let read = fixture
             .child
-            .copy_current_into(&execution, GuestVa(TEST_VA), &mut bytes);
+            .copy_current_into(&execution, GuestVa::new(TEST_VA), &mut bytes);
         assert_eq!(read.is_ok(), mode != 0);
         if mode != 0 {
             assert_eq!(bytes, *b"same");
@@ -469,7 +469,7 @@ fn current_copies_honor_vma_read_write_and_executable_permissions() {
         assert!(
             fixture
                 .child
-                .copy_current_from(&execution, GuestVa(TEST_VA), b"oops")
+                .copy_current_from(&execution, GuestVa::new(TEST_VA), b"oops")
                 .is_err(),
             "mode {mode} permitted forbidden copy"
         );
@@ -499,7 +499,7 @@ fn current_copyout_rechecks_live_leaf_and_protection_tracker() {
         let execution = execution_lease(&fixture.child, id as u64);
         fixture
             .child
-            .copy_current_from(&execution, GuestVa(TEST_VA), b"live")
+            .copy_current_from(&execution, GuestVa::new(TEST_VA), b"live")
             .unwrap();
         let current = fixture.child.current_mm(&execution).unwrap();
         carrick_kernel::kernel::MmAccessAuthority::new()
@@ -514,7 +514,7 @@ fn current_copyout_rechecks_live_leaf_and_protection_tracker() {
         assert!(
             fixture
                 .child
-                .copy_current_from(&execution, GuestVa(TEST_VA), b"oops")
+                .copy_current_from(&execution, GuestVa::new(TEST_VA), b"oops")
                 .is_err(),
             "mode {mode} permitted forbidden copy"
         );
@@ -533,7 +533,7 @@ fn current_copies_cross_compounds_and_preserve_source() {
     use carrick_vmm_hvf::trap::foreign_cow_test_support::FixtureShape;
     let (kernel, root) = bootstrap(38_800);
     let shape =
-        FixtureShape::with_data(Gpa(0x9a01_4000_0000), Gpa(0x9b01_4000_0000), TEST_VA, 32768)
+        FixtureShape::with_data(Gpa::new(0x9a01_4000_0000), Gpa::new(0x9b01_4000_0000), TEST_VA, 32768)
             .unwrap();
     let fixture = production_cow_fixture_with_shape(
         &kernel,
@@ -548,16 +548,16 @@ fn current_copies_cross_compounds_and_preserve_source() {
     let bytes: Vec<u8> = (0..20001).map(|n| (n % 251) as u8).collect();
     fixture
         .child
-        .copy_current_from(&execution, GuestVa(TEST_VA + 17), &bytes)
+        .copy_current_from(&execution, GuestVa::new(TEST_VA + 17), &bytes)
         .unwrap();
     fixture
         .child
-        .copy_current_from(&execution, GuestVa(TEST_VA + 17), &bytes)
+        .copy_current_from(&execution, GuestVa::new(TEST_VA + 17), &bytes)
         .unwrap();
     let mut actual = vec![0; bytes.len()];
     fixture
         .child
-        .copy_current_into(&execution, GuestVa(TEST_VA + 17), &mut actual)
+        .copy_current_into(&execution, GuestVa::new(TEST_VA + 17), &mut actual)
         .unwrap();
     assert_eq!(actual, bytes);
     assert_eq!(original.prefix(), *b"same");
@@ -704,8 +704,8 @@ fn current_read_reuse_cost_contract() {
     for scale in [1u64, 8, 32, 128] {
         let (kernel, root) = bootstrap(39_000);
         let shape = FixtureShape::with_data(
-            Gpa(0x9a02_1000_0000),
-            Gpa(0x9b02_1000_0000),
+            Gpa::new(0x9a02_1000_0000),
+            Gpa::new(0x9b02_1000_0000),
             TEST_VA,
             scale * 16384,
         )
@@ -724,14 +724,14 @@ fn current_read_reuse_cost_contract() {
         for n in 0..scale {
             fixture
                 .child
-                .copy_current_from(&execution, GuestVa(TEST_VA + n * 16384), b"data")
+                .copy_current_from(&execution, GuestVa::new(TEST_VA + n * 16384), b"data")
                 .unwrap_or_else(|e| panic!("setup scale={scale} compound={n}: {e:?}"));
         }
         let mut cache = carrick_kernel::kernel::mm_access::CurrentReadCache::default();
         let mut bytes = [0; 256];
         fixture
             .child
-            .copy_current_into_cached(&execution, GuestVa(TEST_VA), &mut bytes, &mut cache)
+            .copy_current_into_cached(&execution, GuestVa::new(TEST_VA), &mut bytes, &mut cache)
             .unwrap();
         let snapshots_before = copy_work_for_test::snapshots();
         let pins_before = fixture.carrier.copy_owner_pins_for_test();
@@ -739,7 +739,7 @@ fn current_read_reuse_cost_contract() {
         for _ in 0..16 {
             fixture
                 .child
-                .copy_current_into_cached(&execution, GuestVa(TEST_VA), &mut bytes, &mut cache)
+                .copy_current_into_cached(&execution, GuestVa::new(TEST_VA), &mut bytes, &mut cache)
                 .unwrap();
             assert_eq!(bytes[..4], *b"data");
             assert!(bytes[4..].iter().all(|b| *b == 0));
@@ -816,11 +816,11 @@ fn current_read_window_rechecks_live_carrier_authorities() {
         let execution = execution_lease(&fixture.child, id as u64);
         fixture
             .child
-            .copy_current_from(&execution, GuestVa(TEST_VA), b"live")
+            .copy_current_from(&execution, GuestVa::new(TEST_VA), b"live")
             .unwrap();
         let window = fixture
             .child
-            .prepare_current_read_window(&execution, GuestVa(TEST_VA), 256)
+            .prepare_current_read_window(&execution, GuestVa::new(TEST_VA), 256)
             .unwrap();
         let current = fixture.child.current_mm(&execution).unwrap();
         carrick_kernel::kernel::MmAccessAuthority::new()
@@ -833,7 +833,7 @@ fn current_read_window_rechecks_live_carrier_authorities() {
             })
             .unwrap();
         let mut bytes = [0; 4];
-        let result = window.copy_into(&fixture.child, &execution, GuestVa(TEST_VA), &mut bytes);
+        let result = window.copy_into(&fixture.child, &execution, GuestVa::new(TEST_VA), &mut bytes);
         // Read-only leaves and write-only denial preserve readable input. A
         // distinct page-table authority with readable leaves is also valid.
         assert_eq!(
@@ -869,37 +869,37 @@ fn current_read_window_observes_changed_bytes_and_rejects_other_ranges_and_lease
     let execution = execution_lease(&fixture.child, 39401);
     fixture
         .child
-        .copy_current_from(&execution, GuestVa(TEST_VA), b"live")
+        .copy_current_from(&execution, GuestVa::new(TEST_VA), b"live")
         .unwrap();
     let window = fixture
         .child
-        .prepare_current_read_window(&execution, GuestVa(TEST_VA), 256)
+        .prepare_current_read_window(&execution, GuestVa::new(TEST_VA), 256)
         .unwrap();
     fixture
         .child
-        .copy_current_from(&execution, GuestVa(TEST_VA), b"next")
+        .copy_current_from(&execution, GuestVa::new(TEST_VA), b"next")
         .unwrap();
     let mut bytes = [0; 4];
     window
-        .copy_into(&fixture.child, &execution, GuestVa(TEST_VA), &mut bytes)
+        .copy_into(&fixture.child, &execution, GuestVa::new(TEST_VA), &mut bytes)
         .unwrap();
     assert_eq!(bytes, *b"next", "window must never cache bytes");
     for va in [TEST_VA - 1, TEST_VA + 253, u64::MAX - 1] {
         assert!(
             window
-                .copy_into(&fixture.child, &execution, GuestVa(va), &mut bytes)
+                .copy_into(&fixture.child, &execution, GuestVa::new(va), &mut bytes)
                 .is_err()
         );
     }
     let wrong = execution_lease(&root, 39400);
     assert!(
         window
-            .copy_into(&root, &wrong, GuestVa(TEST_VA), &mut bytes)
+            .copy_into(&root, &wrong, GuestVa::new(TEST_VA), &mut bytes)
             .is_err()
     );
     assert!(
         window
-            .copy_into(&fixture.child, &wrong, GuestVa(TEST_VA), &mut bytes)
+            .copy_into(&fixture.child, &wrong, GuestVa::new(TEST_VA), &mut bytes)
             .is_err()
     );
     root.thread().yield_from_executor(wrong).unwrap();
@@ -912,13 +912,13 @@ fn current_read_window_observes_changed_bytes_and_rejects_other_ranges_and_lease
     let next = fixture.child.thread().claim_runnable(executor_id).unwrap();
     assert!(
         window
-            .copy_into(&fixture.child, &next, GuestVa(TEST_VA), &mut bytes)
+            .copy_into(&fixture.child, &next, GuestVa::new(TEST_VA), &mut bytes)
             .is_err()
     );
     let mut cache = carrick_kernel::kernel::mm_access::CurrentReadCache::default();
     fixture
         .child
-        .copy_current_into_cached(&next, GuestVa(TEST_VA), &mut bytes, &mut cache)
+        .copy_current_into_cached(&next, GuestVa::new(TEST_VA), &mut bytes, &mut cache)
         .unwrap();
     assert_eq!(bytes, *b"next");
     fixture.child.thread().yield_from_executor(next).unwrap();
@@ -942,11 +942,11 @@ fn current_read_window_uses_live_leaf_after_guest_publication() {
     let execution = execution_lease(&fixture.child, 39_611);
     fixture
         .child
-        .copy_current_from(&execution, GuestVa(TEST_VA), b"live")
+        .copy_current_from(&execution, GuestVa::new(TEST_VA), b"live")
         .unwrap();
     let window = fixture
         .child
-        .prepare_current_read_window(&execution, GuestVa(TEST_VA), 256)
+        .prepare_current_read_window(&execution, GuestVa::new(TEST_VA), 256)
         .unwrap();
     let current = fixture.child.current_mm(&execution).unwrap();
     carrick_kernel::kernel::MmAccessAuthority::new()
@@ -959,10 +959,10 @@ fn current_read_window_uses_live_leaf_after_guest_publication() {
         })
         .unwrap();
     let mut bytes = [0; 4];
-    let cached = window.copy_into(&fixture.child, &execution, GuestVa(TEST_VA), &mut bytes);
+    let cached = window.copy_into(&fixture.child, &execution, GuestVa::new(TEST_VA), &mut bytes);
     let prepared = fixture
         .child
-        .prepare_current_read_window(&execution, GuestVa(TEST_VA), 256);
+        .prepare_current_read_window(&execution, GuestVa::new(TEST_VA), 256);
     drop(current);
     fixture
         .child
@@ -997,7 +997,7 @@ fn stage1_snapshot_observes_live_leaf_after_guest_publication() {
     let execution = execution_lease(&fixture.child, 39_621);
     fixture
         .child
-        .copy_current_from(&execution, GuestVa(TEST_VA), b"live")
+        .copy_current_from(&execution, GuestVa::new(TEST_VA), b"live")
         .unwrap();
     let current = fixture.child.current_mm(&execution).unwrap();
     let snapshot_translation = carrick_kernel::kernel::MmAccessAuthority::new()
@@ -1045,25 +1045,25 @@ fn current_read_window_rejects_vma_revocation_and_cow_replacement() {
     let execution = execution_lease(&fixture.child, 39501);
     let old = fixture
         .child
-        .prepare_current_read_window(&execution, GuestVa(TEST_VA), 256)
+        .prepare_current_read_window(&execution, GuestVa::new(TEST_VA), 256)
         .unwrap();
     fixture
         .child
-        .copy_current_from(&execution, GuestVa(TEST_VA), b"cow!")
+        .copy_current_from(&execution, GuestVa::new(TEST_VA), b"cow!")
         .unwrap();
     let mut bytes = [0; 4];
     assert!(
-        old.copy_into(&fixture.child, &execution, GuestVa(TEST_VA), &mut bytes)
+        old.copy_into(&fixture.child, &execution, GuestVa::new(TEST_VA), &mut bytes)
             .is_err()
     );
     let window = fixture
         .child
-        .prepare_current_read_window(&execution, GuestVa(TEST_VA), 256)
+        .prepare_current_read_window(&execution, GuestVa::new(TEST_VA), 256)
         .unwrap();
     let mut cache = carrick_kernel::kernel::mm_access::CurrentReadCache::default();
     fixture
         .child
-        .copy_current_into_cached(&execution, GuestVa(TEST_VA), &mut bytes, &mut cache)
+        .copy_current_into_cached(&execution, GuestVa::new(TEST_VA), &mut bytes, &mut cache)
         .unwrap();
     assert_eq!(bytes, *b"cow!");
     for readable in [false, true] {
@@ -1077,12 +1077,12 @@ fn current_read_window_rejects_vma_revocation_and_cow_replacement() {
             });
         assert!(
             window
-                .copy_into(&fixture.child, &execution, GuestVa(TEST_VA), &mut bytes)
+                .copy_into(&fixture.child, &execution, GuestVa::new(TEST_VA), &mut bytes)
                 .is_err()
         );
         let result = fixture.child.copy_current_into_cached(
             &execution,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             &mut bytes,
             &mut cache,
         );
@@ -1092,7 +1092,7 @@ fn current_read_window_rejects_vma_revocation_and_cow_replacement() {
     let mut crossing = [0; 4097];
     fixture
         .child
-        .copy_current_into_cached(&execution, GuestVa(TEST_VA), &mut crossing, &mut cache)
+        .copy_current_into_cached(&execution, GuestVa::new(TEST_VA), &mut crossing, &mut cache)
         .unwrap();
     assert_eq!(&crossing[..4], b"cow!");
     assert!(crossing[4..].iter().all(|b| *b == 0));

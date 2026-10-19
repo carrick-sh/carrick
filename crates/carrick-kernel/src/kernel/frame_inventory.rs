@@ -1071,7 +1071,7 @@ fn apply_event(
             if reservation.mappings.binary_search(&mapping).is_err() {
                 return Err(FrameInventoryError::UnreservedMapping(mapping));
             }
-            if gpa.0.checked_add(length.raw()).is_none() {
+            if gpa.raw().checked_add(length.raw()).is_none() {
                 return Err(FrameInventoryError::ExtentOverflow { gpa, length });
             }
             if generation.raw() != 1 {
@@ -1730,7 +1730,7 @@ mod tests {
                 frame,
                 mapping,
                 generation: generation(1),
-                gpa: Gpa(gpa),
+                gpa: Gpa::new(gpa),
                 length: length(len),
                 permissions: perms(true),
             })
@@ -1839,7 +1839,7 @@ mod tests {
         let row = ExactMappingRow {
             mapping,
             frame,
-            gpa: Gpa(0x8000),
+            gpa: Gpa::new(0x8000),
             length: length(0x4000),
         };
         let (_, receipt) = fixture
@@ -1893,7 +1893,7 @@ mod tests {
         let wrong = ExactMappingRow {
             mapping,
             frame,
-            gpa: Gpa(0x20_4000),
+            gpa: Gpa::new(0x20_4000),
             length: length(0x4000),
         };
         assert!(matches!(
@@ -1985,7 +1985,7 @@ mod tests {
             fixture.mm1,
             first_mapping,
             first_frame,
-            Gpa(0x4000),
+            Gpa::new(0x4000),
             length(0x4000),
         ));
         let (sibling_mapping, sibling_frame) = sibling_pair.unwrap();
@@ -1993,7 +1993,7 @@ mod tests {
             fixture.mm2,
             sibling_mapping,
             sibling_frame,
-            Gpa(0x8000),
+            Gpa::new(0x8000),
             length(0x4000),
         ));
     }
@@ -2722,7 +2722,7 @@ mod tests {
                 frame,
                 mapping,
                 generation: generation(1),
-                gpa: Gpa(0x4000),
+                gpa: Gpa::new(0x4000),
                 length: length(0x4000),
                 permissions: perms(true),
             })
@@ -2767,7 +2767,7 @@ mod tests {
                     frame,
                     mapping,
                     generation: generation(1),
-                    gpa: Gpa(0x8000),
+                    gpa: Gpa::new(0x8000),
                     length: length(0x4000),
                     permissions: perms(true),
                 })
@@ -2824,7 +2824,7 @@ mod tests {
             snapshot
                 .mappings
                 .iter()
-                .map(|mapping| (mapping.gpa.0, mapping.length.raw()))
+                .map(|mapping| (mapping.gpa.raw(), mapping.length.raw()))
                 .collect::<Vec<_>>(),
             vec![(0x10000, 0x4000), (0x18000, 0x8000)]
         );
@@ -2927,7 +2927,7 @@ mod tests {
                     frame,
                     mapping,
                     generation: generation(1),
-                    gpa: Gpa(0x4000),
+                    gpa: Gpa::new(0x4000),
                     length: length(0x4000),
                     permissions: perms(true),
                 })
@@ -3251,7 +3251,7 @@ mod tests {
                     frame,
                     mapping,
                     generation: generation(1),
-                    gpa: Gpa(0x8000),
+                    gpa: Gpa::new(0x8000),
                     length: length(0x1000),
                     permissions: perms(true),
                 })
@@ -3408,56 +3408,56 @@ mod tests {
             (
                 mm1_private_mapping,
                 private_frame,
-                Gpa(0x2000),
+                Gpa::new(0x2000),
                 length(0x4000),
             ),
             // Valid shared extent for mm1
             (
                 mm1_shared_mapping,
                 shared_frame,
-                Gpa(0x1000),
+                Gpa::new(0x1000),
                 length(0x4000),
             ),
             // Sibling mm2's extent of the shared frame (not live in mm1)
             (
                 mm2_shared_mapping,
                 shared_frame,
-                Gpa(0x1000),
+                Gpa::new(0x1000),
                 length(0x4000),
             ),
             // vfork child mm3's extent of the shared frame (not live in mm1)
             (
                 mm3_shared_mapping,
                 shared_frame,
-                Gpa(0x1000),
+                Gpa::new(0x1000),
                 length(0x4000),
             ),
             // Sibling mm2's private extent (not live in mm1)
             (
                 mm2_sibling_mapping,
                 sibling_frame,
-                Gpa(0x3000),
+                Gpa::new(0x3000),
                 length(0x4000),
             ),
             // Mismatched frame
             (
                 mm1_private_mapping,
                 shared_frame,
-                Gpa(0x2000),
+                Gpa::new(0x2000),
                 length(0x4000),
             ),
             // Mismatched GPA
             (
                 mm1_private_mapping,
                 private_frame,
-                Gpa(0x9000),
+                Gpa::new(0x9000),
                 length(0x4000),
             ),
             // Mismatched length
             (
                 mm1_private_mapping,
                 private_frame,
-                Gpa(0x2000),
+                Gpa::new(0x2000),
                 length(0x8000),
             ),
         ];
@@ -3563,7 +3563,7 @@ mod physical_projection_tests {
                 frame,
                 mapping,
                 generation,
-                gpa: Gpa(0x1000),
+                gpa: Gpa::new(0x1000),
                 length: FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap()),
                 permissions: MemPerms {
                     read: true,
@@ -3627,7 +3627,7 @@ mod physical_projection_tests {
         let frame = reservation.claim_frame().unwrap();
         let mapping = reservation.claim_mapping().unwrap();
         let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
-        let gpa = Gpa(0x1000);
+        let gpa = Gpa::new(0x1000);
         let length = FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap());
         reservation
             .push(FrameInventoryEvent::PrepareMapping {
@@ -3713,7 +3713,7 @@ mod physical_projection_tests {
         let frame = reservation.claim_frame().unwrap();
         let mapping = reservation.claim_mapping().unwrap();
         let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
-        let gpa = Gpa(0x1000);
+        let gpa = Gpa::new(0x1000);
         let length = FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap());
         reservation
             .push(FrameInventoryEvent::PrepareMapping {
@@ -3785,7 +3785,7 @@ mod inventory_origin_tests {
                 frame,
                 mapping,
                 generation,
-                gpa: Gpa(0x1000),
+                gpa: Gpa::new(0x1000),
                 length: FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap()),
                 permissions: MemPerms {
                     read: true,

@@ -177,9 +177,9 @@ impl GuestAliasContext<'_> {
                 .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
                     mapping: extent.mapping,
                     frame: extent.frame,
-                    gpa: carrick_guest_mem::Gpa(key.0),
+                    gpa: carrick_guest_mem::Gpa::new(key.0),
                     length: length(key.1)?,
-                    owner_gpa: carrick_guest_mem::Gpa(extent.stage2_base),
+                    owner_gpa: carrick_guest_mem::Gpa::new(extent.stage2_base),
                     owner_length: length(extent.stage2_length)?,
                 })
                 .map_err(|e| Self::error(format!("authenticate alias backing: {e}")))?;

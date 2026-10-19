@@ -722,7 +722,7 @@ pub mod test_support {
         let asid = crate::kernel::Asid::from_registry_allocation(
             NonZeroU16::new(asid).expect("nonzero test ASID"),
         );
-        let root = crate::kernel::Stage1Root::for_aarch64_4k(Gpa(stage1_root))
+        let root = crate::kernel::Stage1Root::for_aarch64_4k(Gpa::new(stage1_root))
             .expect("aligned stage-1 root");
         crate::kernel::MmBinding::for_aarch64(asid, root)
     }

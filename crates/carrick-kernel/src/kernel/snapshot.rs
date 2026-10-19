@@ -2034,7 +2034,7 @@ mod tests {
     impl TestBackend {
         fn new(mode: BackendMode) -> Arc<Self> {
             let asid = Asid::from_registry_allocation(NonZeroU16::new(7).expect("ASID"));
-            let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("root");
+            let root = Stage1Root::for_aarch64_4k(Gpa::new(0x8000)).expect("root");
             Arc::new(Self {
                 binding: MmBinding::for_aarch64(asid, root),
                 revision: AtomicU64::new(1),
@@ -2068,8 +2068,8 @@ mod tests {
                     revision: self.revision(),
                     binding: self.binding,
                     vmas: vec![VmaSummary {
-                        start: GuestVa(0x2000),
-                        end: GuestVa(0x1000),
+                        start: GuestVa::new(0x2000),
+                        end: GuestVa::new(0x1000),
                         access: crate::kernel::VmaAccess {
                             readable: true,
                             writable: false,
@@ -2129,8 +2129,8 @@ mod tests {
                     vmas: if matches!(self.mode, BackendMode::IoUring) {
                         vec![
                             VmaSummary {
-                                start: GuestVa(0x1000),
-                                end: GuestVa(0x2000),
+                                start: GuestVa::new(0x1000),
+                                end: GuestVa::new(0x2000),
                                 access: crate::kernel::VmaAccess {
                                     readable: true,
                                     writable: true,
@@ -2139,8 +2139,8 @@ mod tests {
                                 },
                             },
                             VmaSummary {
-                                start: GuestVa(0x3000),
-                                end: GuestVa(0x4000),
+                                start: GuestVa::new(0x3000),
+                                end: GuestVa::new(0x4000),
                                 access: crate::kernel::VmaAccess {
                                     readable: true,
                                     writable: true,
@@ -2151,8 +2151,8 @@ mod tests {
                         ]
                     } else {
                         vec![VmaSummary {
-                            start: GuestVa(0x1000),
-                            end: GuestVa(0x2000),
+                            start: GuestVa::new(0x1000),
+                            end: GuestVa::new(0x2000),
                             access: crate::kernel::VmaAccess {
                                 readable: true,
                                 writable: true,
@@ -2446,7 +2446,7 @@ mod tests {
             generation: carrick_hal::MappingGeneration::from_backend_counter(
                 NonZeroU64::new(1).expect("generation"),
             ),
-            gpa: carrick_guest_mem::Gpa(raw * 0x1000),
+            gpa: carrick_guest_mem::Gpa::new(raw * 0x1000),
             length: carrick_hal::FrameLength::from_mapping_extent(
                 NonZeroU64::new(4096).expect("length"),
             ),

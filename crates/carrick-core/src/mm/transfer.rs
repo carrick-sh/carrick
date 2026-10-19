@@ -7,17 +7,8 @@ pub enum TransferError {
     Stale,
     Invalid,
 }
-/// Guest address, never a physical extent or a host pointer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GuestVa(u64);
-impl GuestVa {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
+pub use carrick_guest_arch::GuestVa;
+
 
 /// Owned request position. Suspension never discards already copied bytes.
 pub struct TransferContinuation {

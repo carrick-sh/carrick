@@ -7058,7 +7058,7 @@ mod tests {
                 frame,
                 mapping,
                 generation,
-                gpa: carrick_guest_mem::Gpa(0x8000),
+                gpa: carrick_guest_mem::Gpa::new(0x8000),
                 length: carrick_hal::FrameLength::from_mapping_extent(
                     NonZeroU64::new(0x4000).expect("length"),
                 ),

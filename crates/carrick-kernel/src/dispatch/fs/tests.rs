@@ -11122,9 +11122,9 @@ fn fcntl_f_created_query_semantics() {
 
 fn test_host_write_ranges() -> [carrick_guest_mem::HostWriteRange; 2] {
     [0x1000, 0x5000].map(|address| carrick_guest_mem::HostWriteRange {
-        guest: carrick_guest_mem::GuestVa(address),
+        guest: carrick_guest_mem::GuestVa::new(address),
         len: 0x1000,
-        host: carrick_guest_mem::HostVa(address as usize),
+        host: carrick_guest_mem::HostVa::new(address as usize),
     })
 }
 

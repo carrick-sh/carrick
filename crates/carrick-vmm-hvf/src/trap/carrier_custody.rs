@@ -2114,7 +2114,7 @@ mod carrier_vm_custody_tests {
                 assert!(
                     carrick_hal::FrameCowOwnerInventory::retain_current(
                         &inventory,
-                        carrick_guest_mem::Gpa(key.0),
+                        carrick_guest_mem::Gpa::new(key.0),
                         length,
                     )
                     .is_err(),

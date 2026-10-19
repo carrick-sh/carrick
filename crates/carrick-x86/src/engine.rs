@@ -318,9 +318,9 @@ impl<V: X86Vmm> X86EngineCore<V> {
     fn syscall_buffer_gpa(&self, address: GuestVa, len: usize) -> Option<Gpa> {
         let raw = address.raw();
         if !carrick_mem::memory::needs_stage1_translation(raw, len as u64) {
-            return Some(Gpa(raw));
+            return Some(Gpa::new(raw));
         }
-        self.vm.translate_va(raw).map(Gpa)
+        self.vm.translate_va(raw).map(Gpa::new)
     }
 
     /// Return one 4 KiB-bounded VA→GPA segment. A private overlay can repoint a
@@ -345,7 +345,7 @@ impl<V: X86Vmm> X86EngineCore<V> {
         let page_left = (0x1000 - (va & 0xfff)) as usize;
         let len = (total_len - offset).min(page_left);
         let gpa = self
-            .syscall_buffer_gpa(GuestVa(va), len)
+            .syscall_buffer_gpa(GuestVa::new(va), len)
             .ok_or(MemoryError::OutOfBounds {
                 address,
                 length: total_len,
@@ -479,7 +479,7 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         // registry is the point at which sibling dispatch can request a
         // cross-process futex key, so it must never lead the backing metadata.
         self.vm
-            .publish_mapping_sharing(GuestVa(address), len, sharing);
+            .publish_mapping_sharing(GuestVa::new(address), len, sharing);
         self.protections.set_mapping_sharing(address, len, sharing);
     }
 
@@ -492,7 +492,7 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         sharing: MappingSharing,
     ) {
         self.vm
-            .publish_mapping_sharing(GuestVa(address), len, sharing);
+            .publish_mapping_sharing(GuestVa::new(address), len, sharing);
         self.protections
             .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
     }
@@ -563,7 +563,7 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
         while off < length {
             let (va, gpa, page_len) = self.syscall_buffer_chunk(address, off, length)?;
             let addr = gpa.raw();
-            let run = host_run_len(&self.vm, GuestVa(va), gpa, page_len);
+            let run = host_run_len(&self.vm, GuestVa::new(va), gpa, page_len);
             if run == 0 {
                 // A reserved-but-uncommitted page (a lazily-zeroed anonymous
                 // mmap/brk page the guest never touched — e.g. a calloc/
@@ -579,7 +579,7 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
             }
             let host = self
                 .vm
-                .syscall_buffer_host_ptr(GuestVa(va), gpa, run)
+                .syscall_buffer_host_ptr(GuestVa::new(va), gpa, run)
                 .ok_or(MemoryError::OutOfBounds { address, length })?;
             // SAFETY: `host_run_len`/`host_ptr` proved [host, host+run) is within
             // a live window; the destination slice is disjoint.
@@ -650,15 +650,15 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
             // resolver.
             let _ = self
                 .vm
-                .syscall_buffer_host_ptr_mut(GuestVa(va), gpa, page_len);
-            let run = host_run_len(&self.vm, GuestVa(va), gpa, page_len);
+                .syscall_buffer_host_ptr_mut(GuestVa::new(va), gpa, page_len);
+            let run = host_run_len(&self.vm, GuestVa::new(va), gpa, page_len);
             if run == 0 {
                 trace_x86_efault("write", addr, length - off);
                 return Err(MemoryError::OutOfBounds { address, length });
             }
             let host = self
                 .vm
-                .syscall_buffer_host_ptr_mut(GuestVa(va), gpa, run)
+                .syscall_buffer_host_ptr_mut(GuestVa::new(va), gpa, run)
                 .ok_or(MemoryError::OutOfBounds { address, length })?;
             // SAFETY: `host_run_len`/`host_ptr_mut` proved [host, host+run) is
             // within a live window; the source slice is disjoint.
@@ -671,7 +671,7 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         // Guest mmap/mprotect must fail before a VMM touches backing or PML4.
         // The shared dispatcher also serves AArch64's wider address layout.
-        if carrick_mem::pml4::X86UserRange::checked(GuestVa(address), len as u64).is_err() {
+        if carrick_mem::pml4::X86UserRange::checked(GuestVa::new(address), len as u64).is_err() {
             return Err(MemoryError::OutOfBounds {
                 address,
                 length: len,
@@ -737,7 +737,7 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
             )))
         })?;
         self.vm
-            .publish_mapping_sharing(GuestVa(va), len, MappingSharing::Private);
+            .publish_mapping_sharing(GuestVa::new(va), len, MappingSharing::Private);
         self.protections
             .set_mapping_sharing(va, len, MappingSharing::Private);
         Ok(())
@@ -1876,7 +1876,7 @@ mod tests {
         fn shared_futex_location(&self, gpa: Gpa, len: usize) -> Option<SharedFutexLocation> {
             let word = self.host_ptr(gpa.raw(), len)?;
             Some(SharedFutexLocation::Direct {
-                word: carrick_guest_mem::HostVa(word as usize),
+                word: carrick_guest_mem::HostVa::new(word as usize),
                 waiter_key: word as usize,
             })
         }
@@ -2337,8 +2337,8 @@ mod tests {
             ));
             let error = engine
                 .map_host_alias(
-                    GuestVa(address),
-                    Gpa(0x10_0000),
+                    GuestVa::new(address),
+                    Gpa::new(0x10_0000),
                     len as u64,
                     &[],
                     HostAliasBacking::Anonymous {

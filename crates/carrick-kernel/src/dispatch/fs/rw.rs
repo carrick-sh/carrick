@@ -429,9 +429,9 @@ fn prepare_readv_targets(
             iov_len,
         });
         guest_ranges.push(carrick_guest_mem::HostWriteRange {
-            guest: carrick_guest_mem::GuestVa(iovec.iov_base),
+            guest: carrick_guest_mem::GuestVa::new(iovec.iov_base),
             len: iov_len,
-            host: carrick_guest_mem::HostVa(ptr as usize),
+            host: carrick_guest_mem::HostVa::new(ptr as usize),
         });
     }
     Ok(Some(PreparedReadvTargets {

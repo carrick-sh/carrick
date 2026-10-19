@@ -229,7 +229,7 @@ impl MetadataBacking {
     fn as_ptr(&self) -> *mut u8 {
         match self {
             Self::Allocated(mapping) => mapping.as_ptr(),
-            Self::Retained(owner) => owner.host_base().0 as *mut u8,
+            Self::Retained(owner) => owner.host_base().as_mut_ptr(),
         }
     }
     fn len(&self) -> usize {
@@ -253,7 +253,7 @@ struct GrantedSlotRecord {
 // SAFETY: each variant owns stable, synchronized storage for its entire lifetime.
 unsafe impl RetainedMetadataBacking for MetadataBacking {
     fn host_base(&self) -> carrick_guest_mem::HostVa {
-        carrick_guest_mem::HostVa(self.as_ptr() as usize)
+        carrick_guest_mem::HostVa::new(self.as_ptr() as usize)
     }
     fn mapped_len(&self) -> usize {
         self.len()
@@ -465,7 +465,7 @@ impl HostApertureState {
         map: impl FnOnce(crate::trap::CarrierStage2RecordSpec) -> i32,
     ) -> Result<MetadataExtent, MetadataResolutionError> {
         let len = backing.mapped_len();
-        let host = backing.host_base().0;
+        let host = backing.host_base().raw();
         if len == 0
             || len > EL1_DYNAMIC_METADATA_SIZE as usize
             || !len.is_multiple_of(16384)

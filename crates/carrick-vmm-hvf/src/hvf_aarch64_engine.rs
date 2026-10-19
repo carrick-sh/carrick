@@ -2624,7 +2624,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
                 mm,
                 crate::trap::CarrierForeignMmBinding {
                     asid,
-                    stage1_root: carrick_guest_mem::Gpa(token.ttbr0() & 0x0000_ffff_ffff_f000),
+                    stage1_root: carrick_guest_mem::Gpa::new(token.ttbr0() & 0x0000_ffff_ffff_f000),
                 },
                 &backing,
             )?;

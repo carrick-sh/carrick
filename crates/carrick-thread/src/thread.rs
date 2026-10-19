@@ -233,7 +233,7 @@ impl RegistryInner {
         Some(Arc::new(ChildTidClearState {
             id,
             tid,
-            address: carrick_guest_mem::GuestVa::from(address),
+            address: carrick_guest_mem::GuestVa::new(address),
             custody: AtomicU8::new(CLEAR_AVAILABLE),
         }))
     }

@@ -12,25 +12,8 @@ pub const LAPIC_MMIO_SIZE_BYTES: u64 = PAGE_SIZE_4K;
 /// Maximum number of disjoint MMIO holes tracked in a [`MmioHoles`] set.
 pub const MAX_MMIO_HOLES: usize = 8;
 
-/// Host virtual address within a [`LinearPlacement`] reservation (`host = gpa + K`).
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct HostVa(usize);
+pub use carrick_guest_arch::HostVa;
 
-impl HostVa {
-    pub const fn raw(self) -> usize {
-        self.0
-    }
-    pub const fn page_base(self) -> usize {
-        self.0 & !(PAGE_OFFSET_MASK_4K as usize)
-    }
-    pub const fn as_ptr<T>(self) -> *const T {
-        self.0 as *const T
-    }
-    pub const fn as_mut_ptr<T>(self) -> *mut T {
-        self.0 as *mut T
-    }
-}
 
 mod sealed {
     use crate::domains::AuthenticatedGpa;
@@ -294,7 +277,7 @@ impl LinearPlacement {
             .base_host_addr
             .checked_add(offset)
             .ok_or(PlacementError::AddressOverflow { gpa: raw })?;
-        Ok(HostVa(addr))
+        Ok(HostVa::new(addr))
     }
 
     /// Validate a contiguous `[frame_gpa, frame_gpa + len)` byte extent and return its starting [`HostVa`].

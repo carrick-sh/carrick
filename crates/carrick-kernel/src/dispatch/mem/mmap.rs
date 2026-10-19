@@ -510,8 +510,8 @@ impl<'a> MemView<'a> {
                 return Ok(DispatchOutcome::MapHostAlias {
                     success_retval: address as i64,
                     transaction,
-                    va: GuestVa(address),
-                    ipa: Gpa(ipa),
+                    va: GuestVa::new(address),
+                    ipa: Gpa::new(ipa),
                     len: length,
                     payload: Vec::new(),
                     backing: HostAliasBacking::File {
@@ -1024,7 +1024,7 @@ impl<'a> MemView<'a> {
                         + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
                     let locked_range = match locked_len {
                         Some(length) => match va.checked_add(length).and_then(|end| {
-                            carrick_vfs::GuestMemoryRange::new(GuestVa(va), GuestVa(end))
+                            carrick_vfs::GuestMemoryRange::new(GuestVa::new(va), GuestVa::new(end))
                         }) {
                             Some(range) => Some(range),
                             None => {
@@ -1091,7 +1091,7 @@ impl<'a> MemView<'a> {
                                     SharedFileAliasCommit {
                                         description,
                                         mapping,
-                                        extent_base: Gpa(ipa.saturating_sub(offset)),
+                                        extent_base: Gpa::new(ipa.saturating_sub(offset)),
                                         row_file_offset: offset,
                                     }
                                 }),
@@ -1101,8 +1101,8 @@ impl<'a> MemView<'a> {
                     return Ok(DispatchOutcome::MapHostAlias {
                         success_retval: va as i64,
                         transaction,
-                        va: GuestVa(va),
-                        ipa: Gpa(ipa),
+                        va: GuestVa::new(va),
+                        ipa: Gpa::new(ipa),
                         len: length,
                         payload: Vec::new(),
                         backing: HostAliasBacking::File {
@@ -1206,7 +1206,7 @@ impl<'a> MemView<'a> {
                     let protection = if prot_none {
                         memory.protect_range(addr, map_len_usize, 0)
                     } else if memory
-                        .resident_pages(GuestVa(addr), 1, this.linux_page_size())
+                        .resident_pages(GuestVa::new(addr), 1, this.linux_page_size())
                         .is_none()
                     {
                         // Backends without live host residency use a temporary
@@ -1498,7 +1498,7 @@ impl<'a> MemView<'a> {
                         .mem()
                         .lock()
                         .deferred_anonymous
-                        .reserve_fresh(GuestVa(address), length_usize)
+                        .reserve_fresh(GuestVa::new(address), length_usize)
                     {
                         mark_range_unmapped(memory, address, length_usize);
                         return Ok(request.refused_by(
@@ -1583,7 +1583,7 @@ impl<'a> MemView<'a> {
                 }
                 if defer_anonymous {
                     if let Err(error) = this.mem().lock().deferred_anonymous
-                        .reserve_fresh(GuestVa(address), length_usize)
+                        .reserve_fresh(GuestVa::new(address), length_usize)
                     {
                         mark_range_unmapped(memory, address, length_usize);
                         return Ok(request.refused_by(
@@ -1618,7 +1618,7 @@ impl<'a> MemView<'a> {
                     && in_arena
                     && ::std::env::var("CARRICK_MINCORE_EXACT").as_deref() != Ok("0")
                     && memory
-                        .resident_pages(GuestVa(address), 1, this.linux_page_size())
+                        .resident_pages(GuestVa::new(address), 1, this.linux_page_size())
                         .is_none()
                     && memory.protect_range(address, length_usize, 0).is_ok())
                 {
@@ -2007,7 +2007,7 @@ impl<'a> MemView<'a> {
                                 this.open_file(fd.0).map(|open| SharedFileAliasCommit {
                                     description: Arc::clone(&open.description),
                                     mapping: file_mapping_reference.clone(),
-                                    extent_base: Gpa(ipa.saturating_sub(offset)),
+                                    extent_base: Gpa::new(ipa.saturating_sub(offset)),
                                     row_file_offset: offset,
                                 })
                             } else {
@@ -2017,13 +2017,13 @@ impl<'a> MemView<'a> {
                     ))
                     .map_err(|_| DispatchError::Errno(linux_errno::ENOMEM))?;
                 if let Some(socket) = &packet_socket_desc {
-                    socket.set_mapped_va(GuestVa(address));
+                    socket.set_mapped_va(GuestVa::new(address));
                 }
                 return Ok(DispatchOutcome::MapHostAlias {
                     success_retval: address as i64,
                     transaction,
-                    va: GuestVa(address),
-                    ipa: Gpa(ipa),
+                    va: GuestVa::new(address),
+                    ipa: Gpa::new(ipa),
                     len: length,
                     payload: bytes,
                     backing: HostAliasBacking::Anonymous {
@@ -2226,7 +2226,7 @@ impl<'a> MemView<'a> {
                         .mem()
                         .lock()
                         .deferred_anonymous
-                        .retire(GuestVa(address), length_usize);
+                        .retire(GuestVa::new(address), length_usize);
                 }
                 mark_range_unmapped(memory, address, length_usize);
                 return Ok(request.refused_by(
@@ -2251,7 +2251,7 @@ impl<'a> MemView<'a> {
                             .mem()
                             .lock()
                             .deferred_anonymous
-                            .retire(GuestVa(address), length_usize);
+                            .retire(GuestVa::new(address), length_usize);
                     }
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("beyond-EOF SIGBUS protection could not be published"),
@@ -2320,7 +2320,7 @@ impl<'a> MemView<'a> {
                 },
             );
             if let Some(socket) = &packet_socket_desc {
-                socket.set_mapped_va(GuestVa(address));
+                socket.set_mapped_va(GuestVa::new(address));
             }
             this.mark_vma_dispatch(&mut host_alias_dispatch);
             Ok(DispatchOutcome::returned_u64(address)?)
@@ -2678,7 +2678,7 @@ impl<'a> MemView<'a> {
                             shared_file_alias: Some(SharedFileAliasCommit {
                                 description,
                                 mapping,
-                                extent_base: Gpa(ipa.saturating_sub(file_offset)),
+                                extent_base: Gpa::new(ipa.saturating_sub(file_offset)),
                                 row_file_offset: file_offset,
                             }),
                         })) {
@@ -2688,8 +2688,8 @@ impl<'a> MemView<'a> {
                     DispatchOutcome::MapHostAlias {
                         success_retval: va as i64,
                         transaction,
-                        va: GuestVa(va),
-                        ipa: Gpa(ipa),
+                        va: GuestVa::new(va),
+                        ipa: Gpa::new(ipa),
                         len: new_size,
                         payload: Vec::new(),
                         backing: HostAliasBacking::File {
@@ -2813,7 +2813,7 @@ impl<'a> MemView<'a> {
                 {
                     return fail(
                         SharedFileFixedMremapError::RepointSharedLeaf { source: err },
-                        Some(carrick_guest_mem::Gpa(
+                        Some(carrick_guest_mem::Gpa::new(
                             destination_leaf_ipa.saturating_sub(source_file_offset),
                         )),
                         Some(source_file_offset),
@@ -2854,15 +2854,15 @@ impl<'a> MemView<'a> {
                 );
 
                 let Some(dest_range) = carrick_vfs::GuestMemoryRange::new(
-                    GuestVa(va),
-                    GuestVa(va.saturating_add(new_size)),
+                    GuestVa::new(va),
+                    GuestVa::new(va.saturating_add(new_size)),
                 ) else {
                     return fail(
                         SharedFileFixedMremapError::InvalidDestinationRange {
                             va,
                             end: va.saturating_add(new_size),
                         },
-                        Some(carrick_guest_mem::Gpa(
+                        Some(carrick_guest_mem::Gpa::new(
                             destination_leaf_ipa.saturating_sub(source_file_offset),
                         )),
                         Some(source_file_offset),
@@ -2872,7 +2872,7 @@ impl<'a> MemView<'a> {
                     range: dest_range,
                     description: Arc::clone(&alias_entry.description),
                     mapping: alias_entry.mapping.clone(),
-                    extent_base: carrick_guest_mem::Gpa(
+                    extent_base: carrick_guest_mem::Gpa::new(
                         destination_leaf_ipa.saturating_sub(source_file_offset),
                     ),
                     row_file_offset: source_file_offset,
@@ -3867,8 +3867,8 @@ impl<'a> MemView<'a> {
                         // mprotect answers 0, not the address.
                         success_retval: 0,
                         transaction,
-                        va: GuestVa(address.0),
-                        ipa: Gpa(ipa),
+                        va: GuestVa::new(address.0),
+                        ipa: Gpa::new(ipa),
                         len: length,
                         payload: Vec::new(),
                         backing: HostAliasBacking::Anonymous {

@@ -246,7 +246,7 @@ fn poll_normalizes_every_negative_timeout_at_the_native_boundary() {
         let result = sys_poll(
             StandaloneHostFds,
             &mut guest,
-            carrick_guest_mem::GuestVa(0),
+            carrick_guest_mem::GuestVa::new(0),
             1,
             timeout,
             |fds, native_timeout| {
@@ -274,7 +274,7 @@ fn poll_invalid_descriptor_overrides_an_infinite_timeout() {
     let result = sys_poll(
         StandaloneHostFds,
         &mut guest,
-        carrick_guest_mem::GuestVa(0),
+        carrick_guest_mem::GuestVa::new(0),
         1,
         i32::MIN,
         |fds, timeout| {
@@ -347,7 +347,7 @@ fn poll_positive_wait_completes_when_a_producer_makes_the_fd_ready() {
     let result = sys_poll(
         StandaloneHostFds,
         &mut guest,
-        carrick_guest_mem::GuestVa(0),
+        carrick_guest_mem::GuestVa::new(0),
         1,
         5_000,
         |fds, timeout| {
@@ -380,7 +380,7 @@ fn poll_native_interruption_returns_linux_eintr_without_copyout_or_retry() {
     let result = sys_poll(
         StandaloneHostFds,
         &mut guest,
-        carrick_guest_mem::GuestVa(0),
+        carrick_guest_mem::GuestVa::new(0),
         1,
         5_000,
         |_, _| {
@@ -417,7 +417,7 @@ fn poll_rejects_nfds_above_the_limit_before_guest_access_or_native_wait() {
         let result = sys_poll(
             StandaloneHostFds,
             &mut guest,
-            carrick_guest_mem::GuestVa(0),
+            carrick_guest_mem::GuestVa::new(0),
             count,
             0,
             |_, _| panic!("invalid request must not reach the native wait"),

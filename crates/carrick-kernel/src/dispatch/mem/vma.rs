@@ -825,8 +825,8 @@ fn vma_summaries_of(
                 .iter()
                 .any(|secret| secret.start().raw() < end && start < secret.end().raw());
             summaries.push(crate::kernel::VmaSummary {
-                start: GuestVa(start),
-                end: GuestVa(end),
+                start: GuestVa::new(start),
+                end: GuestVa::new(end),
                 access: crate::kernel::VmaAccess {
                     readable: map.read,
                     writable: map.write,
@@ -849,7 +849,7 @@ pub(crate) fn committed_va_bytes(mem: &MemState) -> u64 {
     }
     project_vma_summaries(mem)
         .iter()
-        .map(|vma| vma.end.0.saturating_sub(vma.start.0))
+        .map(|vma| vma.end.raw().saturating_sub(vma.start.raw()))
         .sum()
 }
 
@@ -863,7 +863,7 @@ pub(crate) fn mapped_overlap_bytes(mem: &MemState, start: u64, len: u64) -> u64 
     }
     project_vma_summaries(mem)
         .iter()
-        .map(|vma| vma.end.0.min(end).saturating_sub(vma.start.0.max(start)))
+        .map(|vma| vma.end.raw().min(end).saturating_sub(vma.start.raw().max(start)))
         .sum()
 }
 

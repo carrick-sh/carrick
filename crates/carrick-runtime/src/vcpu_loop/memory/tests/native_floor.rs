@@ -35,7 +35,7 @@ fn carrier_checkpoint_component_cost() {
     let current = fixture.child.current_mm(&execution).unwrap();
     let range = current
         .access_token()
-        .write_range(GuestVa(TEST_VA), 4096)
+        .write_range(GuestVa::new(TEST_VA), 4096)
         .unwrap()
         .unwrap();
     let mut prepared = authority
@@ -273,7 +273,7 @@ fn native_data_demand_contract() {
     let current = fixture.child.current_mm(&execution).unwrap();
     let range = current
         .access_token()
-        .write_range(GuestVa(TEST_VA), 8)
+        .write_range(GuestVa::new(TEST_VA), 8)
         .unwrap()
         .unwrap();
     let mut prepared = authority

@@ -441,7 +441,7 @@ impl SharedBufferLease {
         if !offset.is_multiple_of(4) {
             return Err(SharedBufferError::Misaligned(offset));
         }
-        let word = HostVa(unsafe { self.inner.ptr.as_ptr().add(offset) } as usize);
+        let word = HostVa::new(unsafe { self.inner.ptr.as_ptr().add(offset) } as usize);
         let location = if let Some(identity) =
             carrick_host::futex_key::shared_file_key_base(self.inner.file.as_raw_fd())
         {

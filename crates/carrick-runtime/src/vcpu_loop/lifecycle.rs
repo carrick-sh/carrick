@@ -797,7 +797,7 @@ where
     if let ProcessChildBootstrap::GuestFork { child_settid, .. } = bootstrap {
         if let Some((address, tid)) = child_settid {
             return Ok(ProcessChildBootstrapReady::ChildTid {
-                address: carrick_guest_mem::GuestVa(address),
+                address: carrick_guest_mem::GuestVa::new(address),
                 tid,
             });
         }
@@ -868,7 +868,7 @@ pub(crate) fn bootstrap_hvpatch_process_child_tid(
     check_hvpatch_process_failpoint(task, HvpatchProcessFailpoint::ChildSettidBootstrap)?;
     let bytes = tid.to_le_bytes();
     if memory.user_memory_venue() == UserMemoryVenue::Owner {
-        let range = GuestWriteRange::new(GuestVa(address), bytes.len())
+        let range = GuestWriteRange::new(GuestVa::new(address), bytes.len())
             .ok_or_else(|| RuntimeError::Configuration("child TID range overflow".into()))?;
         match memory.prepare_write(&[range]) {
             Ok(write) => write.commit(&[&bytes]),

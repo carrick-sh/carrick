@@ -271,7 +271,7 @@ impl SyscallDispatcher {
         }
         let view = self.mem_view();
         let need = if brk {
-            mem::anonymous::HostMetadataNeed::Break(carrick_guest_mem::GuestVa(request.args.0[0]))
+            mem::anonymous::HostMetadataNeed::Break(carrick_guest_mem::GuestVa::new(request.args.0[0]))
         } else if number == MUNMAP {
             let [address, length, ..] = request.args.0;
             // A malformed range fails the syscall's own validation first.

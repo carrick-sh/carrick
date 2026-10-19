@@ -56,7 +56,7 @@ impl ForeignMmBinding {
     /// Boundary constructor for crates that intentionally depend only on HAL
     /// domain types rather than on `carrick-guest-mem` directly.
     pub const fn for_aarch64_root_raw(asid: ForeignAsid, stage1_root: u64) -> Self {
-        Self::for_aarch64(asid, Gpa(stage1_root))
+        Self::for_aarch64(asid, Gpa::new(stage1_root))
     }
 }
 
@@ -329,7 +329,7 @@ fn derive_ptrace_text_cow_span(
             let cow_start = range.start.raw().max(compound_start);
             let cow_end = range.end.raw().min(compound_end);
             let cow_len = usize::try_from(cow_end.checked_sub(cow_start)?).ok()?;
-            (cow_len != 0 && request_end <= cow_end).then_some((GuestVa(cow_start), cow_len))
+            (cow_len != 0 && request_end <= cow_end).then_some((GuestVa::new(cow_start), cow_len))
         })
         .find_map(|span| span)
 }
@@ -1030,7 +1030,7 @@ mod tests {
         fn binding(&self) -> ForeignMmBinding {
             ForeignMmBinding::for_aarch64(
                 ForeignAsid::from_kernel_allocation(NonZeroU16::new(13).unwrap()),
-                Gpa(0x1234_5000),
+                Gpa::new(0x1234_5000),
             )
         }
         fn backend_revision(&self) -> ForeignBackendRevision {
@@ -1067,7 +1067,7 @@ mod tests {
         fn authenticates(&self, snapshot: &dyn ForeignMmSnapshot) -> bool {
             snapshot.mm().raw_for_probe() == 11
                 && snapshot.binding().asid().raw_for_probe() == 13
-                && snapshot.binding().stage1_root() == Gpa(0x1234_5000)
+                && snapshot.binding().stage1_root() == Gpa::new(0x1234_5000)
                 && snapshot.backend_revision().raw_for_probe() == 17
                 && snapshot.vma_revision().raw_for_probe() == 19
                 && snapshot.frame_inventory_revision().raw_for_probe() == 23
@@ -1126,7 +1126,7 @@ mod tests {
                 frame_inventory_revision: snapshot.frame_inventory_revision(),
                 mapping: MappingId::from_kernel_allocation(NonZeroU64::new(31).unwrap()),
                 frame: crate::FrameId::from_kernel_allocation(NonZeroU64::new(37).unwrap()),
-                physical_base: Gpa(0x9000),
+                physical_base: Gpa::new(0x9000),
                 physical_len: 0x4000,
                 owner_generation: ForeignOwnerGeneration::from_backend_counter(
                     NonZeroU64::new(41).unwrap(),
@@ -1323,7 +1323,7 @@ mod tests {
             .read(
                 &Live,
                 snapshot.as_ref(),
-                GuestVa(0x4000),
+                GuestVa::new(0x4000),
                 &mut bytes,
                 deadline,
             )
@@ -1338,13 +1338,13 @@ mod tests {
             .break_cow(
                 &mut invalidator,
                 snapshot.as_ref(),
-                GuestVa(0x4000),
+                GuestVa::new(0x4000),
                 bytes.len(),
                 deadline,
             )
             .unwrap();
         assert_eq!(cow.mm(), snapshot.mm());
-        assert_eq!(cow.range_start(), GuestVa(0x4000));
+        assert_eq!(cow.range_start(), GuestVa::new(0x4000));
         assert_eq!(cow.range_len(), bytes.len());
         assert_eq!(cow.backend_revision(), snapshot.backend_revision());
         assert_eq!(cow.vma_revision(), snapshot.vma_revision());
@@ -1360,7 +1360,7 @@ mod tests {
             cow.frame(),
             crate::FrameId::from_kernel_allocation(NonZeroU64::new(37).unwrap())
         );
-        assert_eq!(cow.physical_base(), Gpa(0x9000));
+        assert_eq!(cow.physical_base(), Gpa::new(0x9000));
         assert_eq!(cow.physical_len(), 0x4000);
         assert_eq!(cow.owner_generation().raw_for_probe(), 41);
 
@@ -1369,13 +1369,13 @@ mod tests {
                 &Live,
                 snapshot.as_ref(),
                 cow.as_ref(),
-                GuestVa(0x4000),
+                GuestVa::new(0x4000),
                 b"target",
                 deadline,
             )
             .unwrap();
         assert_eq!(prepared.receipt().mm(), snapshot.mm());
-        assert_eq!(prepared.receipt().range_start(), GuestVa(0x4000));
+        assert_eq!(prepared.receipt().range_start(), GuestVa::new(0x4000));
         assert_eq!(prepared.receipt().range_len(), 6);
         assert_eq!(prepared.receipt().bytes_written(), 6);
         assert_eq!(

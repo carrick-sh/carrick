@@ -14,8 +14,10 @@ workspace = true
 [dependencies]
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-fatal.workspace = true
+carrick-guest-arch = { path = "../carrick-guest-arch", features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 parking_lot.workspace = true
 zerocopy.workspace = true
 libc.workspace = true
+

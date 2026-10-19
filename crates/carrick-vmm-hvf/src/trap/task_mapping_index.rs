@@ -41,7 +41,7 @@ impl MappingExtent {
                 if *length == 0 {
                     return false;
                 }
-                let va_start = start.0;
+                let va_start = start.raw();
                 let va_end = va_start.checked_add(*length);
                 match va_end {
                     Some(end) => region.start < end && region.end > va_start,
@@ -217,7 +217,7 @@ impl TaskMappingClassIndex {
                 self.by_class_start.range((class, lower)..=(class, upper))
             {
                 for &va_start in starts {
-                    out.push(GuestVa(va_start));
+                    out.push(GuestVa::new(va_start));
                 }
             }
         }
@@ -255,7 +255,7 @@ impl TaskMappingIndex {
     /// Publish one row into the live map and both ordered views. Every live
     /// insertion goes through here so the IPA view cannot drift.
     fn live_insert(&mut self, region: HvfMappedRegion) {
-        if let Some(previous) = self.live.remove(&GuestVa(region.start)) {
+        if let Some(previous) = self.live.remove(&GuestVa::new(region.start)) {
             // A same-start replacement: retire the row that left.
             self.forget_ipa_entry(&previous);
         }
@@ -266,7 +266,7 @@ impl TaskMappingIndex {
             region.physical_size as u64,
             region.start,
         );
-        self.live.insert(GuestVa(region.start), region);
+        self.live.insert(GuestVa::new(region.start), region);
     }
 
     /// Take one row out of the live map and both ordered views.
@@ -296,9 +296,9 @@ impl TaskMappingIndex {
         let mut prev: Option<(u64, u64)> = None;
         for (va, region) in &self.live {
             debug_assert_eq!(
-                va.0, region.start,
+                va.raw(), region.start,
                 "TaskMappingIndex key must be the row start: key=0x{:x} start=0x{:x}",
-                va.0, region.start
+                va.raw(), region.start
             );
             debug_assert!(
                 region.start < region.end,
@@ -396,7 +396,7 @@ impl TaskMappingIndex {
 
         let predecessor = self
             .live
-            .range(..GuestVa(region.start))
+            .range(..GuestVa::new(region.start))
             .next_back()
             .map(|(key, _)| *key)
             .filter(|key| {
@@ -411,7 +411,7 @@ impl TaskMappingIndex {
             region = left;
         }
 
-        let successor = GuestVa(region.end);
+        let successor = GuestVa::new(region.end);
         if self
             .live
             .get(&successor)
@@ -453,14 +453,14 @@ impl TaskMappingIndex {
     /// measures what actually accumulates.
     fn displace_overlapping(&mut self, start: u64, end: u64) {
         let mut displaced = Vec::new();
-        if let Some((&key, row)) = self.live.range(..GuestVa(start)).next_back()
+        if let Some((&key, row)) = self.live.range(..GuestVa::new(start)).next_back()
             && row.end > start
         {
             displaced.push(key);
         }
         displaced.extend(
             self.live
-                .range(GuestVa(start)..GuestVa(end))
+                .range(GuestVa::new(start)..GuestVa::new(end))
                 .map(|(key, _)| *key),
         );
         for key in displaced {
@@ -475,21 +475,21 @@ impl TaskMappingIndex {
     /// Used where the caller has already unmapped the extent and the rows
     /// describing it must not outlive that unmap.
     pub(crate) fn remove_range(&mut self, va: GuestVa, len: usize) {
-        let Some(end) = va.0.checked_add(len as u64) else {
+        let Some(end) = va.raw().checked_add(len as u64) else {
             return;
         };
         let mut doomed = Vec::new();
         if let Some((&key, row)) = self.live.range(..va).next_back()
-            && row.end > va.0
+            && row.end > va.raw()
         {
             doomed.push(key);
         }
-        doomed.extend(self.live.range(va..GuestVa(end)).map(|(key, _)| *key));
+        doomed.extend(self.live.range(va..GuestVa::new(end)).map(|(key, _)| *key));
         for key in doomed {
             self.live_remove(&key);
         }
         self.shadowed
-            .retain(|row| row.end <= va.0 || row.start >= end);
+            .retain(|row| row.end <= va.raw() || row.start >= end);
         self.assert_invariants();
     }
 
@@ -523,7 +523,7 @@ impl TaskMappingIndex {
                 && row.owner_generation != 0
                 && self
                     .live
-                    .range(..=GuestVa(row.start))
+                    .range(..=GuestVa::new(row.start))
                     .next_back()
                     .is_some_and(|(_, live)| {
                         live.start == row.start
@@ -589,7 +589,7 @@ impl TaskMappingIndex {
                     if *length == 0 {
                         continue;
                     }
-                    let va_start = start.0;
+                    let va_start = start.raw();
                     let va_end = va_start.checked_add(*length);
                     if let Some((&key, row)) = self.live.range(..start).next_back() {
                         if row.end > va_start {
@@ -598,7 +598,7 @@ impl TaskMappingIndex {
                     }
                     match va_end {
                         Some(end) => {
-                            for (&key, _) in self.live.range(*start..GuestVa(end)) {
+                            for (&key, _) in self.live.range(*start..GuestVa::new(end)) {
                                 candidate_keys.push(key);
                             }
                         }
@@ -744,8 +744,8 @@ impl TaskMappingIndex {
         va: GuestVa,
         length: u64,
     ) -> impl Iterator<Item = &HvfMappedRegion> {
-        let start = va.0;
-        let end = GuestVa(start.saturating_add(length.max(1)));
+        let start = va.raw();
+        let end = GuestVa::new(start.saturating_add(length.max(1)));
         self.live
             .range(..end)
             .rev()
@@ -836,7 +836,7 @@ impl TaskMappingIndex {
                 {
                     for &start in starts {
                         note_task_mapping_row_visited();
-                        if let Some(row) = self.live.get(&GuestVa(start)) {
+                        if let Some(row) = self.live.get(&GuestVa::new(start)) {
                             if row.ipa <= ipa && end <= row.ipa.saturating_add(row.size as u64) {
                                 candidates.push(row);
                             }
@@ -862,7 +862,7 @@ impl TaskMappingIndex {
     /// The row covering `[va, va + length)`, or `None`.
     pub(crate) fn mapping_for_range(&self, va: GuestVa, length: usize) -> Option<&HvfMappedRegion> {
         self.candidates_for_range(va, length as u64)
-            .find(|row| row.contains_range(va.0, length))
+            .find(|row| row.contains_range(va.raw(), length))
     }
 
     /// Split every dynamic-alias row across `[va, va + len)`.
@@ -875,14 +875,14 @@ impl TaskMappingIndex {
         };
         let mut affected: Vec<HvfMappedRegion> = Vec::new();
         let mut keys = Vec::new();
-        if let Some((&key, row)) = self.live.range(..GuestVa(va)).next_back()
+        if let Some((&key, row)) = self.live.range(..GuestVa::new(va)).next_back()
             && row.end > va
         {
             keys.push(key);
         }
         keys.extend(
             self.live
-                .range(GuestVa(va)..GuestVa(end))
+                .range(GuestVa::new(va)..GuestVa::new(end))
                 .map(|(key, _)| *key),
         );
         for key in keys {
@@ -1208,7 +1208,7 @@ mod task_mapping_index_tests {
         for page in [0, 1, PAGES / 2, PAGES - 1] {
             let offset = page * 0x1000;
             let found = index
-                .mapping_for_range(GuestVa(va_base + offset), 0x1000)
+                .mapping_for_range(GuestVa::new(va_base + offset), 0x1000)
                 .expect("every coalesced page must still resolve");
             assert_eq!(found.start, va_base);
         }
@@ -1337,7 +1337,7 @@ mod task_mapping_index_tests {
             "an unmap split must leave a sorted, non-overlapping table",
         );
         let tail = index
-            .mapping_for_range(GuestVa(va_base + 0x2000), 0x1000)
+            .mapping_for_range(GuestVa::new(va_base + 0x2000), 0x1000)
             .expect("the split tail must still resolve");
         assert_eq!(
             tail.ipa,
@@ -1346,7 +1346,7 @@ mod task_mapping_index_tests {
         );
         assert!(
             index
-                .mapping_for_range(GuestVa(va_base + 0x1000), 0x1000)
+                .mapping_for_range(GuestVa::new(va_base + 0x1000), 0x1000)
                 .is_none(),
             "the unmapped page must no longer resolve",
         );
@@ -1367,14 +1367,14 @@ mod task_mapping_index_tests {
 
         assert_eq!(index.len(), 2, "the shadowed row must not be dropped");
         let resolved = index
-            .mapping_for_range(GuestVa(va), 0x1000)
+            .mapping_for_range(GuestVa::new(va), 0x1000)
             .expect("the newest row resolves");
         assert_eq!(
             resolved.owner_generation, 2,
             "the newest publication must win the lookup",
         );
         let generations: Vec<u64> = index
-            .candidates_for_range(GuestVa(va), 0x1000)
+            .candidates_for_range(GuestVa::new(va), 0x1000)
             .map(|row| row.owner_generation)
             .collect();
         assert_eq!(
@@ -1432,13 +1432,13 @@ mod task_mapping_index_tests {
         );
         assert_eq!(
             index
-                .mapping_for_range(GuestVa(va), 0x1000)
+                .mapping_for_range(GuestVa::new(va), 0x1000)
                 .map(|row| row.owner_generation),
             Some(REPUBLICATIONS),
             "the newest incarnation still wins the lookup"
         );
         assert_eq!(
-            index.candidates_for_range(GuestVa(va), 0x1000).count() as u64,
+            index.candidates_for_range(GuestVa::new(va), 0x1000).count() as u64,
             REPUBLICATIONS,
             "and every retained incarnation is still offered, newest first"
         );
@@ -1457,7 +1457,7 @@ mod task_mapping_index_tests {
             0x9b03_b61000,
         ));
         let candidates: Vec<u64> = index
-            .candidates_for_range(GuestVa(compound_va), CowArmedRanges::COMPOUND_SIZE)
+            .candidates_for_range(GuestVa::new(compound_va), CowArmedRanges::COMPOUND_SIZE)
             .map(|row| row.start)
             .collect();
         assert_eq!(
@@ -1533,13 +1533,13 @@ mod task_mapping_index_tests {
         assert_eq!(index.len(), 2_000);
         let probe = 0x6000_0000 + 1_999 * 0x20_0000;
         assert_eq!(
-            index.candidates_for_range(GuestVa(probe), 0x1000).count(),
+            index.candidates_for_range(GuestVa::new(probe), 0x1000).count(),
             1,
             "an ordered probe must offer only the rows that overlap the query",
         );
         assert_eq!(
             index
-                .candidates_for_range(GuestVa(0x5000_0000), 0x1000)
+                .candidates_for_range(GuestVa::new(0x5000_0000), 0x1000)
                 .count(),
             0,
             "a query below every row must offer nothing",
@@ -1719,7 +1719,7 @@ mod task_mapping_index_tests {
         // Test 1: Remove one extent by VA in the middle of 4,096 rows.
         let target_idx = 2048_u64;
         let target_va = va_base + target_idx * 0x20_0000;
-        let extent_va = MappingExtent::Va(GuestVa(target_va), 0x1000);
+        let extent_va = MappingExtent::Va(GuestVa::new(target_va), 0x1000);
 
         let before_va = hot_path_rows_scanned(HotPathScan::TaskMappings);
         let removed = index.remove_rows_matching_in_ranges(&[extent_va], |_| true);
@@ -1787,7 +1787,7 @@ mod task_mapping_index_tests {
         let mut candidates = Vec::new();
         index.candidate_starts_overlapping(0x1000, 0x1000, &mut candidates);
         candidates.sort_unstable();
-        assert_eq!(candidates, vec![GuestVa(0x5000), GuestVa(0x6000)]);
+        assert_eq!(candidates, vec![GuestVa::new(0x5000), GuestVa::new(0x6000)]);
 
         index.remove(0x1000, 0x1000, 0x5000);
         assert_eq!(index.class_counts.get(&12), Some(&1));
@@ -1819,6 +1819,6 @@ mod task_mapping_index_tests {
         let mut candidates = Vec::new();
         index.candidate_starts_overlapping(target_ipa, 0x1000, &mut candidates);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0], GuestVa(0x6000_0000_0000 + 1024 * 0x20_0000));
+        assert_eq!(candidates[0], GuestVa::new(0x6000_0000_0000 + 1024 * 0x20_0000));
     }
 }

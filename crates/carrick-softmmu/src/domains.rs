@@ -1,6 +1,6 @@
 //! Typed address, privilege, and fault domains for the software MMU.
 
-pub use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
+pub use carrick_guest_arch::{FrameGpa, GuestVa, RootGpa, UserVa};
 pub use carrick_mmu_core::x86::descriptor_txn::{
     ACCESSED, ADDRESS, Access, COW, DEFAULT_MAX_PHY_ADDR, DIRTY, DescriptorRefusal, FaultClass,
     HUGE, HardwareFaultClass, HardwareWalkConfig, LeafSize, LiveDescriptorWords,
@@ -14,49 +14,6 @@ pub const PAGE_SIZE_4K: u64 = PAGE;
 pub const PAGE_OFFSET_MASK_4K: u64 = PAGE_SIZE_4K - 1;
 pub const PAGE_BASE_MASK_4K: u64 = !PAGE_OFFSET_MASK_4K;
 
-/// Guest linear virtual address (either lower-half user or upper-half CPL0 supervisor).
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GuestVa(u64);
-
-impl GuestVa {
-    pub const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-    pub const fn from_user_va(va: UserVa) -> Self {
-        Self(va.raw())
-    }
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-    pub const fn page_base(self) -> u64 {
-        self.0 & PAGE_BASE_MASK_4K
-    }
-    pub const fn page_offset(self) -> usize {
-        (self.0 & PAGE_OFFSET_MASK_4K) as usize
-    }
-    pub const fn crosses_page(self, len: usize) -> bool {
-        if len == 0 {
-            return false;
-        }
-        match self.page_offset().checked_add(len) {
-            Some(end) => end > (PAGE_SIZE_4K as usize),
-            None => true,
-        }
-    }
-    pub const fn checked_add(self, offset: u64) -> Option<Self> {
-        match self.0.checked_add(offset) {
-            Some(next) => Some(Self(next)),
-            None => None,
-        }
-    }
-    pub const fn is_canonical_48bit(self) -> bool {
-        ((self.0 as i64) << 16 >> 16) as u64 == self.0
-    }
-    pub const fn to_descriptor_va(self) -> UserVa {
-        UserVa::new(self.0)
-    }
-}
 
 /// Unauthenticated stage-1 output guest physical address produced by a page-table walk.
 #[repr(transparent)]
