@@ -27,7 +27,6 @@
 //! clock reads) may prepare immediately before committing.
 
 use carrick_abi::{KernelAbi, LINUX_EFAULT};
-use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::{
     CurrentMmMemory, GuestVa, GuestWriteRange, PreparedGuestWrite, UserMemoryVenue,
 };
@@ -151,6 +150,10 @@ pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
             venue: Venue::Legacy(memory),
         });
     }
+    let faulted = PreparedCopyout {
+        slots,
+        venue: Venue::Faulted,
+    };
     let total = slots
         .iter()
         .flatten()
@@ -158,20 +161,16 @@ pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
     if total.is_none_or(|total| total > COPYOUT_MAX_BYTES) {
         // Owner capacities are fixed records (checked at compile time),
         // carrick-sized values, or `bounded_capacity` results, so no guest
-        // length reaches this; a larger permit would be refused as a Limit
-        // after the source was chosen.
-        carrick_fatal!(
-            "dispatch::copyout",
-            "owner copyout exceeds one prepared permit: {total:?} bytes"
-        );
+        // length reaches this. A larger permit would be refused as a Limit,
+        // which the owner refusal path treats as fatal; report EFAULT at the
+        // commit instead and never abort the carrier.
+        debug_assert!(false, "owner copyout exceeds one permit: {total:?} bytes");
+        return Ok(faulted);
     }
-    let mut ranges = [GuestWriteRange::new(GuestVa::new(0), 0).unwrap_or_else(|| {
-        carrick_fatal!("dispatch::copyout", "empty write range is unrepresentable")
-    }); N];
-    let faulted = PreparedCopyout {
-        slots,
-        venue: Venue::Faulted,
+    let Some(empty) = GuestWriteRange::new(GuestVa::new(0), 0) else {
+        return Ok(faulted);
     };
+    let mut ranges = [empty; N];
     let mut count = 0;
     for slot in slots.iter().flatten() {
         let Some(range) = GuestWriteRange::new(GuestVa::new(slot.address), slot.capacity) else {
@@ -216,11 +215,14 @@ impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
                 continue;
             };
             if output.len() > capacity {
-                carrick_fatal!(
-                    "dispatch::copyout",
+                // A handler bug, never guest-sized: write nothing and report
+                // EFAULT rather than overrun the prepared range.
+                debug_assert!(
+                    false,
                     "copyout output of {} bytes exceeds its prepared {capacity}",
                     output.len()
                 );
+                return Err(CopyoutFault);
             }
         }
         match self.venue {
