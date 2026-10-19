@@ -464,7 +464,7 @@ fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
     use carrick_core_abi::{
         EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
-    use carrick_el1::personality::native_process_runtime::host_test_support::{
+    use carrick_el1_linux::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
     };
     use carrick_guest_mem::GuestMemory;
@@ -806,7 +806,7 @@ fn serial_host_empty_native_checkpoint_returns_one_forwarded_eintr() {
     use carrick_core_abi::{
         EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
-    use carrick_el1::personality::native_process_runtime::host_test_support::NativeSignalFixture;
+    use carrick_el1_linux::native_process_runtime::host_test_support::NativeSignalFixture;
 
     let fixture = NativeSignalFixture::new(
         ExecutionBinding {
@@ -842,7 +842,7 @@ fn serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint() {
     use carrick_core_abi::{
         EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
-    use carrick_el1::personality::native_process_runtime::host_test_support::{
+    use carrick_el1_linux::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
     };
     use carrick_guest_mem::GuestMemory;
@@ -942,7 +942,7 @@ fn serial_host_two_live_reads_share_one_process_signal_wake() {
     use carrick_core_abi::{
         EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
-    use carrick_el1::personality::native_process_runtime::host_test_support::{
+    use carrick_el1_linux::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
     };
     use carrick_guest_mem::GuestMemory;
