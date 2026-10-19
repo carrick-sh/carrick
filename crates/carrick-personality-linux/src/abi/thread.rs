@@ -411,6 +411,12 @@ pub struct ThreadControlSlot {
     retired_task: AtomicU64,
     retired_execution: AtomicU64,
     retired_thread: AtomicU64,
+    /// The host birth identity, written once when the host publishes the
+    /// birth and never by retirement: an exact-receipt check compares the
+    /// retirement receipt above against this, never the receipt with itself.
+    birth_task: AtomicU64,
+    birth_execution: AtomicU64,
+    birth_thread: AtomicU64,
 }
 
 impl ThreadControlSlot {
@@ -441,6 +447,9 @@ impl ThreadControlSlot {
             retired_task: AtomicU64::new(0),
             retired_execution: AtomicU64::new(0),
             retired_thread: AtomicU64::new(0),
+            birth_task: AtomicU64::new(0),
+            birth_execution: AtomicU64::new(0),
+            birth_thread: AtomicU64::new(0),
         }
     }
 
@@ -519,6 +528,9 @@ impl ThreadControlSlot {
         self.retired_thread.store(0, Ordering::Relaxed);
         self.retired_task.store(0, Ordering::Relaxed);
         self.retired_execution.store(0, Ordering::Relaxed);
+        self.birth_thread.store(0, Ordering::Relaxed);
+        self.birth_task.store(0, Ordering::Relaxed);
+        self.birth_execution.store(0, Ordering::Relaxed);
         self.zone_incarnation.store(0, Ordering::Relaxed);
         self.zone_seq.store(0, Ordering::Relaxed);
         self.pending.clear(PendingSignals(u64::MAX));
@@ -702,27 +714,28 @@ impl ThreadControlSlot {
         (self.robust_head.load(Ordering::Relaxed), len)
     }
 
-    /// Publish only after the host has retired the exact kernel thread and
-    /// withdrawn its runtime membership. The control lease stays pinned.
+    /// Publish the host birth identity once, before the thread can run.
+    /// Its storage is separate from the retirement receipt, which never
+    /// overwrites it.
     pub fn publish_host_birth_identity(&self, binding: carrick_core_abi::entry::ExecutionBinding) {
-        self.retired_task
-            .store(binding.task.raw(), Ordering::Relaxed);
-        self.retired_execution
+        self.birth_task.store(binding.task.raw(), Ordering::Relaxed);
+        self.birth_execution
             .store(binding.generation.raw(), Ordering::Relaxed);
-        self.retired_thread
+        self.birth_thread
             .store(binding.thread_generation.raw(), Ordering::Release);
     }
 
+    /// The exact identity host retirement must later publish as its receipt.
     pub fn host_birth_identity(
         &self,
     ) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
-        let thread = self.retired_thread.load(Ordering::Acquire);
+        let thread = self.birth_thread.load(Ordering::Acquire);
         carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
             carrick_core_abi::entry::EntryTaskKey::from_raw(
-                self.retired_task.load(Ordering::Relaxed),
+                self.birth_task.load(Ordering::Relaxed),
             ),
             carrick_core_abi::entry::EntryGeneration::from_raw(
-                self.retired_execution.load(Ordering::Relaxed),
+                self.birth_execution.load(Ordering::Relaxed),
             ),
             carrick_core_abi::entry::EntryThreadGeneration::from_raw(thread),
         )
@@ -1214,7 +1227,7 @@ impl LifecycleHatches {
             | (if self.sigmask { SERVING_SIGMASK } else { 0 })
     }
 }
-const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 128);
+const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 192);
 const _: () = assert!(core::mem::size_of::<PoolEntry>() == 80);
 
 /// Linux keeps the last thread's exit with the terminal runtime owner.
@@ -1796,7 +1809,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 37] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 40] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::offset_of!(PoolEntry, execution) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, terminal) as u64,
@@ -1834,6 +1847,9 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 37] = [
     ::core::mem::size_of::<HostBornMember>() as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, closing_verdict) as u64,
     ::core::mem::size_of::<ClosingVerdictRecord>() as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, birth_task) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, birth_execution) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, birth_thread) as u64,
 ];
 
 #[cfg(test)]
@@ -2678,7 +2694,7 @@ mod layout_manifest {
                 size_of::<ThreadControlSlot>(),
                 align_of::<ThreadControlSlot>()
             ),
-            (128, 64)
+            (192, 64)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |ThreadControlSlot {
@@ -2700,6 +2716,9 @@ mod layout_manifest {
                      retired_task: _,
                      retired_execution: _,
                      retired_thread: _,
+                     birth_task: _,
+                     birth_execution: _,
+                     birth_thread: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
@@ -2726,6 +2745,9 @@ mod layout_manifest {
         field!(ThreadControlSlot, retired_task, AtomicU64, 104, 8, 8);
         field!(ThreadControlSlot, retired_execution, AtomicU64, 112, 8, 8);
         field!(ThreadControlSlot, retired_thread, AtomicU64, 120, 8, 8);
+        field!(ThreadControlSlot, birth_task, AtomicU64, 128, 8, 8);
+        field!(ThreadControlSlot, birth_execution, AtomicU64, 136, 8, 8);
+        field!(ThreadControlSlot, birth_thread, AtomicU64, 144, 8, 8);
     }
 
     #[test]
