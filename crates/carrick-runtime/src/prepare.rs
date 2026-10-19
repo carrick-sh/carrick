@@ -301,9 +301,8 @@ pub fn try_run_prepared_kvm_pool_with_loaded_pre_entry_hook(
     feature = "kvm-pool-test-control",
     target_arch = "x86_64"
 ))]
-pub type KvmLoadedPreEntryHook = Arc<
-    dyn Fn(&std::sync::atomic::AtomicBool, &carrick_vmm_kvm::KvmKickHandle) + Send + Sync + 'static,
->;
+pub type KvmLoadedPreEntryHook =
+    crate::vcpu_loop::executor::cpl0::LoadedPreEntryHook<carrick_vmm_kvm::KvmKickHandle>;
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 fn run_prepared_kvm_pool_with_debug(

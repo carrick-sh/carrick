@@ -2316,11 +2316,16 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
 }
 
 impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionWorkerParts<M, Mem> {
+    /// Both CPUs take the root binding from `root_state` itself; callers
+    /// cannot supply a second, possibly different, root binding.
     pub fn new(
-        cpus: [CarrierCpu<M>; 2],
+        mut cpus: [CarrierCpu<M>; 2],
         custody: BootstrapCustody<Mem>,
         root_state: carrick_x86::arch_context::X86ArchContext,
     ) -> Self {
+        for cpu in &mut cpus {
+            cpu.bind_root(root_state.binding());
+        }
         Self {
             cpus,
             custody: custody.0,
