@@ -245,6 +245,8 @@ impl<V: ResidencyVenue, G: Copy + Eq> ResidencyRetirement<V, G> {
 }
 
 use core::sync::atomic::{AtomicU64, Ordering};
+/// Carrier-wide refusing retirement-nonce counter: root quarantine tickets
+/// and invalidation-domain nonces (`invalidation::issue_domain_nonce`).
 static NEXT_ROOT_RETIREMENT_NONCE: AtomicU64 = AtomicU64::new(1);
 
 /// Native geometry of one structural root extent; no ownership is conferred.
