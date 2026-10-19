@@ -1168,7 +1168,7 @@ impl FileAuthorityCore {
         let read_description = self.allocate_description();
         let write_description = self.allocate_description();
         let revision = self.publish_mutation();
-        self.streams.insert(pipe, PipeStreamState::new(capacity));
+        self.streams.insert(pipe, PipeStreamState::new(capacity)?);
         self.stream_revisions.insert(pipe, revision);
         for (description, end, access_mode) in [
             (read_description, PipeEnd::Reader, AccessMode::ReadOnly),
@@ -1231,13 +1231,14 @@ impl FileAuthorityCore {
         self.streams
             .get(&pipe)
             .ok_or(AuthorityError::NotPipe)?
-            .capacity();
+            .capacity()?;
         let mut prepared = self.streams.remove(&pipe).unwrap_or_else(|| {
             abort_fatal(AuthorityFatal::InvariantViolation(
                 "pipe capacity mutation lost its stream",
             ))
         });
         let result = prepared.set_capacity(capacity);
+        let capacity = prepared.capacity()?;
         self.streams.insert(pipe, prepared);
         result?;
         let revision = self.publish_mutation();

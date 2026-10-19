@@ -744,6 +744,7 @@ dependencies = [
  "carrick-mmu-core",
  "carrick-observability",
  "carrick-personality-linux",
+ "carrick-pipe-core",
  "carrick-portable",
  "carrick-sched-core",
  "carrick-signal-core",

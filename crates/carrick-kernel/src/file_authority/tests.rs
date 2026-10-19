@@ -1035,7 +1035,7 @@ fn direct_pipe_streams_preserve_shared_state_and_endpoint_lifetime() {
                 ceiling: NofileAllocationCeiling::from_captured_soft_limit(32),
                 descriptor_flags: DescriptorFlags::NONE,
                 status_flags: StatusFlags::from_linux_bits(0x800),
-                capacity: PipeCapacity::bounded(8).expect("capacity"),
+                capacity: PipeCapacity::bounded(8192).expect("capacity"),
             },
             ObjectGeneration::INITIAL,
         ) {
@@ -1053,7 +1053,7 @@ fn direct_pipe_streams_preserve_shared_state_and_endpoint_lifetime() {
                 Command::Read {
                     table,
                     fd: read_fd,
-                    maximum: ByteCount::bounded(8).expect("count"),
+                    maximum: ByteCount::bounded(8192).expect("count"),
                 },
                 ObjectGeneration::INITIAL,
             ),
@@ -1064,12 +1064,16 @@ fn direct_pipe_streams_preserve_shared_state_and_endpoint_lifetime() {
                 Command::Write {
                     table,
                     fd: write_fd,
-                    bytes: b"abcdefghij".to_vec(),
+                    bytes: {
+                        let mut bytes = vec![b'x'; 8194];
+                        bytes[..3].copy_from_slice(b"abc");
+                        bytes
+                    },
                 },
                 ObjectGeneration::INITIAL,
             ),
             Outcome::StreamWritten { pipe: actual, count, .. }
-                if actual == pipe && count.raw() == 8
+                if actual == pipe && count.raw() == 8192
         ));
         assert!(matches!(
             harness.send(
@@ -1098,7 +1102,7 @@ fn direct_pipe_streams_preserve_shared_state_and_endpoint_lifetime() {
                 Command::SetPipeCapacity {
                     table,
                     fd: read_fd,
-                    capacity: PipeCapacity::bounded(4).expect("capacity"),
+                    capacity: PipeCapacity::bounded(4096).expect("capacity"),
                 },
                 ObjectGeneration::INITIAL,
             ),
@@ -1137,6 +1141,77 @@ fn direct_pipe_streams_preserve_shared_state_and_endpoint_lifetime() {
             } if actual == write_description
         ));
     }
+}
+
+#[test]
+fn pipe_authority_uses_core_atomicity_and_capacity_rounding() {
+    let mut harness = Harness::new();
+    let table = harness.create_table();
+    let (pipe, read_fd, write_fd) = match harness.send(
+        Command::CreatePipeAndInstall {
+            table,
+            minimum: fd(3),
+            ceiling: NofileAllocationCeiling::from_captured_soft_limit(32),
+            descriptor_flags: DescriptorFlags::NONE,
+            status_flags: StatusFlags::from_linux_bits(0x800),
+            capacity: PipeCapacity::bounded(4096).expect("capacity"),
+        },
+        ObjectGeneration::INITIAL,
+    ) {
+        Outcome::PipeCreated {
+            pipe,
+            read_fd,
+            write_fd,
+            ..
+        } => (pipe, read_fd, write_fd),
+        other => panic!("unexpected pipe creation: {other:?}"),
+    };
+    assert!(matches!(
+        harness.send(
+            Command::Write {
+                table,
+                fd: write_fd,
+                bytes: vec![b'x'; 4095],
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::StreamWritten { pipe: actual, count, .. }
+            if actual == pipe && count.raw() == 4095
+    ));
+    assert_eq!(
+        harness.send(
+            Command::Write {
+                table,
+                fd: write_fd,
+                bytes: b"yz".to_vec(),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::Rejected(AuthorityError::WouldBlock)
+    );
+    assert!(matches!(
+        harness.send(
+            Command::Read {
+                table,
+                fd: read_fd,
+                maximum: ByteCount::bounded(4096).expect("count"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::StreamBytes { bytes, .. }
+            if bytes.len() == 4095 && bytes.iter().all(|byte| *byte == b'x')
+    ));
+    assert!(matches!(
+        harness.send(
+            Command::SetPipeCapacity {
+                table,
+                fd: read_fd,
+                capacity: PipeCapacity::bounded(4097).expect("capacity"),
+            },
+            ObjectGeneration::INITIAL,
+        ),
+        Outcome::PipeCapacitySet { capacity, .. } if capacity.raw() == 8192
+    ));
 }
 
 #[test]
@@ -2620,7 +2695,7 @@ fn pipe_authority_direction_and_stream_sharing_survives_fork_copy() {
             minimum: fd(3),
             ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
             status_flags: StatusFlags::from_linux_bits(0),
-            capacity: PipeCapacity::bounded(64).expect("capacity"),
+            capacity: PipeCapacity::bounded(4096).expect("capacity"),
         },
         ObjectGeneration::INITIAL,
     ) {
@@ -2734,7 +2809,7 @@ fn pipe_authority_direction_and_stream_sharing_survives_share_table_and_exec() {
             minimum: fd(3),
             ceiling: NofileAllocationCeiling::from_captured_soft_limit(16),
             status_flags: StatusFlags::from_linux_bits(0),
-            capacity: PipeCapacity::bounded(64).expect("capacity"),
+            capacity: PipeCapacity::bounded(4096).expect("capacity"),
         },
         ObjectGeneration::INITIAL,
     ) {
