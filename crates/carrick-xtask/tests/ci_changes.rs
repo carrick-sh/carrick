@@ -305,7 +305,7 @@ fn scripts_justfile_and_xtask_classify_as_full_heavy_macos_and_hardware() {
         "scripts/build-signed.sh",
         "scripts/entitlements.plist",
         "scripts/lib/post-link-sign.sh",
-        "scripts/ci/gcp-kvm-run.sh",
+        "scripts/ci/runner-once.sh",
         "justfile",
         "crates/carrick-xtask/src/accept.rs",
         "crates/carrick-xtask/src/ci_receipt.rs",
