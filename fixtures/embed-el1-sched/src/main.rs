@@ -43,6 +43,12 @@
 //!   genuinely host-served `read` that the host completes. With `pinned`
 //!   both threads share guest CPU 0, so a completed read queues behind the
 //!   thread that is about to block in the next host wait.
+//! - `sock-pingpong-stepper <iters>`: pinned `sock-pingpong` plus an
+//!   independent host-served actor pinned to the same guest CPU 0. It loops
+//!   a write and read on its own socketpair, so it never blocks and steps
+//!   its executor away from CPU 0's zone slot on every operation, whatever
+//!   the pingpong threads are doing. The main thread pins to CPU 0 and waits
+//!   on a host-served read until the actor runs; it prints `stepper ok`.
 //! - `pipe-compute <ms>` (EL1 plan 1d): two threads pinned to one guest CPU;
 //!   one completes the other's host-served pipe `read`, then computes: the
 //!   woken thread must still run within the window.
@@ -979,6 +985,44 @@ fn sock_pingpong(iters: usize, pinned: bool) -> i32 {
         percentile(&samples, 0.99) as f64 * ns
     );
     0
+}
+
+/// `sock_pingpong` beside an independent host-served actor on guest CPU 0
+/// (the deferred-capture witness, #695): every actor operation steps its
+/// executor away from CPU 0's slot, independent of the pingpong threads.
+fn sock_pingpong_stepper(iters: usize) -> i32 {
+    if pin(0) != 0 {
+        println!("sock-pingpong-stepper pin failed");
+        return 1;
+    }
+    let ready = socket_pair();
+    let loopback = socket_pair();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = std::sync::Arc::clone(&stop);
+    let stepper = std::thread::spawn(move || {
+        if pin(0) != 0 || write_byte(ready.1) != 1 {
+            return false;
+        }
+        while !stopped.load(Ordering::Acquire) {
+            if write_byte(loopback.0) != 1 || read_byte(loopback.1) != 1 {
+                return false;
+            }
+        }
+        true
+    });
+    // A host-served read: the actor is running once it returns.
+    if read_byte(ready.0) != 1 {
+        println!("sock-pingpong-stepper actor never started");
+        return 1;
+    }
+    let status = sock_pingpong(iters, true);
+    stop.store(true, Ordering::Release);
+    if !stepper.join().expect("stepper exits") {
+        println!("sock-pingpong-stepper actor failed");
+        return 1;
+    }
+    println!("stepper ok");
+    status
 }
 
 /// One direction of `epoll_pingpong`: an eventfd and the epoll that watches
@@ -3397,6 +3441,9 @@ fn main() {
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000),
             args.get(3).is_some_and(|mode| mode == "pinned"),
         ),
+        "sock-pingpong-stepper" => {
+            sock_pingpong_stepper(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000))
+        }
         "pipe-compute" => pipe_compute(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(300)),
         "two-process" => two_process(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000)),
         "mm-occupancy" => mm_occupancy(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200)),

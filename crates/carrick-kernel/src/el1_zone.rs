@@ -1841,6 +1841,62 @@ mod tests {
             assert!(batches.is_empty());
         }
 
+        /// #695 signed 20x at 8f932d032: holding a pingpong thread stalls its
+        /// partner. A step-away only on a slot the held record may not run on
+        /// releases nothing, and the hold expires. An independent actor
+        /// stepping away on the record's allowed CPU releases it.
+        #[test]
+        fn hold_needs_a_step_away_on_an_allowed_cpu() {
+            let zone: &'static ZoneTables = Box::leak(heap_zone());
+            let (allowed, other) = (SlotId::new(0), SlotId::new(1));
+            zone.drive(allowed, 7);
+            zone.drive(other, 8);
+            zone.publish_slot(allowed, 0, Some(0), 0);
+            zone.publish_slot(other, 0, Some(1), 0);
+            let place = || {
+                assert!(place_service(
+                    thread(),
+                    crate::kernel::objects::ExecutionGeneration::from_raw(9),
+                    0b1
+                ));
+            };
+            // Stall shape: only the partner's slot (another CPU) steps away.
+            let mut stalled = HoldOutcome::NotHeld;
+            let batches = captures(|| {
+                with_test_zone(zone, || {
+                    let hold = arm(Duration::from_secs(10));
+                    step_away_from_slot(other, 8);
+                    zone.step_back(other, 8);
+                    place();
+                    step_away_from_slot(other, 8);
+                    zone.step_back(other, 8);
+                    stalled = hold.finish();
+                });
+            });
+            assert!(
+                matches!(stalled, HoldOutcome::Expired { .. }),
+                "{stalled:?}"
+            );
+            assert!(batches.is_empty(), "{batches:?}");
+            // Fixed shape: an independent actor on the allowed CPU steps away.
+            let mut released = HoldOutcome::NotHeld;
+            let batches = captures(|| {
+                with_test_zone(zone, || {
+                    let hold = arm(Duration::from_secs(10));
+                    step_away_from_slot(other, 8);
+                    zone.step_back(other, 8);
+                    place();
+                    step_away_from_slot(allowed, 7);
+                    released = hold.finish();
+                });
+            });
+            let HoldOutcome::ReleasedAtStepAway { record, slot } = released else {
+                panic!("independent actor did not release the hold: {released:?}");
+            };
+            assert_eq!(slot, allowed);
+            assert_eq!(batches, [vec![record]]);
+        }
+
         #[test]
         fn unreleased_hold_expires_to_the_host_queue() {
             let zone: &'static ZoneTables = Box::leak(heap_zone());
