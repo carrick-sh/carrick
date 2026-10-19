@@ -9,19 +9,19 @@ use carrick_core::mm::transaction::{MmPortal, OwnerVenue};
 use carrick_el1::memory::reservations::{
     X86Cpl0ReservationGeometry, X86Cpl0Zone, shared_x86_cpl0_guest,
 };
-use carrick_el1::personality::mm_portal::production::GuestMetadataPin;
-use carrick_el1::personality::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
-use carrick_el1::personality::native_process_runtime::{
-    NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
-    NativeProcessRuntime, NativeProcessService,
-};
-use carrick_el1::personality::retired_spaces::{RetiredSpace, RetiredSpaces};
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, FORK_STOCK_PORT, ForkStockExchange, ForkStockLoan,
     ForkStockRequest, ForkStockSettlement, Lifecycle, MmPortalSlots, NATIVE_CHILD_RETIRE_PORT,
     NativeChildRetire, PortalForkCustody, PortalOperation, ReservationMm, ThreadControlSlot,
     ThreadLifecyclePage,
 };
+use carrick_el1_linux::mm_portal::production::GuestMetadataPin;
+use carrick_el1_linux::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
+use carrick_el1_linux::native_process_runtime::{
+    NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
+    NativeProcessRuntime, NativeProcessService,
+};
+use carrick_el1_linux::retired_spaces::{RetiredSpace, RetiredSpaces};
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, KernelVa, MmGeneration, RootGpa, UserVa,
 };
@@ -332,7 +332,7 @@ impl Service {
 /// stock port. True when the carrier accepted the abort.
 fn abort_loan(loan: &ForkStockLoan) -> bool {
     // SAFETY: the loan never published a birth; no reader remains.
-    unsafe { carrick_el1::personality::fork_loan::clear_lifecycle(loan) };
+    unsafe { carrick_el1_linux::fork_loan::clear_lifecycle(loan) };
     let mut settlement = carrick_el1_abi::ForkStockSettlement::abort(*loan);
     // SAFETY: the aborted loan is still exclusively owned across this
     // stopped crossing; the host authenticates its exact execution key.
@@ -359,7 +359,7 @@ fn return_loan(
     scrub: Option<&InitialWords>,
 ) -> Result<(), NativeProcessError> {
     if let Some(words) = scrub
-        && !carrick_el1::personality::fork_loan::scrub_tables(words, loan)
+        && !carrick_el1_linux::fork_loan::scrub_tables(words, loan)
     {
         return Err(NativeProcessError::Quarantined);
     }
@@ -473,7 +473,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             (operation, root.generation(), count, root.layout())
         };
         let request = ForkStockRequest {
-            binding: carrick_el1::personality::common_entry::execution_binding(self.task),
+            binding: carrick_el1_linux::common_entry::execution_binding(self.task),
             context: *parent,
             operation,
             parent_generation: generation,
@@ -624,7 +624,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             .find(mm.mm.raw().get())
             .unwrap_or_else(|| fatal());
         owner.spaces.close(index);
-        let binding = carrick_el1::personality::common_entry::execution_binding(self.task);
+        let binding = carrick_el1_linux::common_entry::execution_binding(self.task);
         let Some(mut retire) = NativeChildRetire::new(binding, mm) else {
             fatal();
         };
@@ -704,7 +704,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             carrick_el1::isa::x86::context::current_cpu_binding()
                 .ok_or(NativeProcessError::Stale)?,
         );
-        carrick_el1::personality::file_table::fork_fd_map(
+        carrick_el1_linux::file_table::fork_fd_map(
             files.fd_map(),
             files.opens(),
             parent_table,
@@ -717,7 +717,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         let binding =
             carrick_el1::isa::x86::context::current_cpu_binding().unwrap_or_else(|| fatal());
         let files = crate::linux_personality::file_tables(binding);
-        carrick_el1::personality::file_table::retire_fd_map(files.fd_map(), files.opens(), table);
+        carrick_el1_linux::file_table::retire_fd_map(files.fd_map(), files.opens(), table);
         self.task.linux.mark_pending_host_work();
     }
 }

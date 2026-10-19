@@ -9,6 +9,7 @@ carrick-abi = { path = "../carrick-abi" }
 carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-el1 = { path = "../carrick-el1" }
+carrick-el1-linux = { path = "../carrick-el1-linux" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }

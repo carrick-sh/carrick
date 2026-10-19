@@ -2,12 +2,12 @@
 extern crate std;
 
 use carrick_core::lifecycle::Lifecycle;
-use carrick_el1::personality::thread_setup::{LifecycleThread, LifecycleVenue};
-use carrick_el1::personality::{common_entry::execution_binding, dispatch, sched};
 use carrick_el1_abi::{
     Action, BlockedMask, Counters, CurrentTask, EntryRef, InotifyNameCache, LifecycleHatches,
     PendingSignals, ThreadControlSlot, ThreadLifecyclePage, TrapFrame,
 };
+use carrick_el1_linux::thread_setup::{LifecycleThread, LifecycleVenue};
+use carrick_el1_linux::{common_entry::execution_binding, dispatch, sched};
 use carrick_guest_arch::{GuestIsa, NativeReturnWord, UserVa};
 use carrick_personality_linux::dispatch::{FamilyCompletion, SyscallFrame};
 use carrick_personality_linux::entry::{

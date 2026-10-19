@@ -5,14 +5,14 @@
 use carrick_abi::{LINUX_SEGV_ACCERR, LINUX_SEGV_MAPERR, LINUX_SIGSEGV, LinuxErrno, LinuxSiginfo};
 use carrick_el1::isa::x86::context::native::{CpuBinding, NativeFrame, checked_scheduler_slot};
 use carrick_el1::isa::x86::context::scheduler::XsaveArea;
-use carrick_el1::personality::dispatch::GuestDispatchFrame;
-use carrick_el1::personality::lifecycle::LifecycleVenue;
-use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
-use carrick_el1::{PollSignalMask, PollTimeoutKind, dispatch_syscall_with_native};
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DelegatedOpenFile, FileTables, HostObjectBinding,
     HostObjectReleaseCrossing, HostObjectWriteCrossing, HostReadinessCrossing, fd_map_lookup,
 };
+use carrick_el1_linux::dispatch::GuestDispatchFrame;
+use carrick_el1_linux::dispatch::{PollSignalMask, PollTimeoutKind, dispatch_syscall_with_native};
+use carrick_el1_linux::lifecycle::LifecycleVenue;
+use carrick_el1_linux::thread_setup::GuestLifecycleVenue;
 use carrick_guest_arch::{LayoutBackend, NativeReturnWord, SlotId, UserVa};
 use carrick_personality_linux::crossing::{HostCrossingSet, evaluate_host_crossing};
 use carrick_personality_linux::dispatch::{CompletionRoute, SyscallFrame};
@@ -50,7 +50,7 @@ pub fn file_tables(binding: &CpuBinding) -> FileTables<'static> {
 pub fn admit_stdio_cached(binding: &CpuBinding, task: &CurrentTask, files: &FileTables<'_>) {
     let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
     if binding.stdio_table_admitted.load(Ordering::Acquire) != file_table {
-        carrick_el1::personality::file_table::admit_stdio(
+        carrick_el1_linux::file_table::admit_stdio(
             files.fd_map(),
             files.opens(),
             files.objects(),
@@ -267,7 +267,7 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
         &mut self,
         copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
     ) -> Result<carrick_personality_linux::signal::policy::SigBlockMask, LinuxErrno> {
-        let mut backend = carrick_el1::isa::x86::X86Backend;
+        let mut backend = carrick_el1_linux::x86_signal::LinuxX86Backend;
         carrick_personality_linux::signal::SignalBackend::restore_signal_frame(
             &mut backend,
             self.frame,
@@ -283,7 +283,7 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
         siginfo: Option<&[u8]>,
         copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
     ) -> Result<UserVa, LinuxErrno> {
-        let mut backend = carrick_el1::isa::x86::X86Backend;
+        let mut backend = carrick_el1_linux::x86_signal::LinuxX86Backend;
         carrick_personality_linux::signal::SignalBackend::setup_signal_frame(
             &mut backend,
             self.frame,
@@ -301,14 +301,14 @@ pub fn complete_run_failure(
     reason: carrick_core_abi::NativeRunFailureReason,
 ) -> ! {
     carrick_el1::isa::x86::complete_native_run_failure(
-        carrick_el1::personality::common_entry::execution_binding(task),
+        carrick_el1_linux::common_entry::execution_binding(task),
         reason,
     )
 }
 
 pub fn complete_root_exit(task: &CurrentTask, status: LinuxWaitStatus) -> ! {
     let exit = carrick_core_abi::NativeRootExit::new(
-        carrick_el1::personality::common_entry::execution_binding(task),
+        carrick_el1_linux::common_entry::execution_binding(task),
         status.terminal_status().unwrap_or_else(|_| fatal_boot()),
     )
     .unwrap_or_else(|| fatal_boot());
@@ -325,14 +325,13 @@ pub fn complete_root_exit(task: &CurrentTask, status: LinuxWaitStatus) -> ! {
 }
 
 struct X86SignalMachine {
-    backend: carrick_el1::isa::x86::X86Backend,
+    backend: carrick_el1_linux::x86_signal::LinuxX86Backend,
 }
 
-impl
-    carrick_el1::personality::signal_delivery::SignalMachine<carrick_sched_core::ParkedContextWords>
+impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::ParkedContextWords>
     for X86SignalMachine
 {
-    type Backend = carrick_el1::isa::x86::X86Backend;
+    type Backend = carrick_el1_linux::x86_signal::LinuxX86Backend;
 
     fn backend(&mut self) -> &mut Self::Backend {
         &mut self.backend
@@ -366,7 +365,7 @@ impl
 
 pub(crate) fn deliver_signal_on_syscall_return(
     task: &CurrentTask,
-    process: &mut carrick_el1::personality::native_process_runtime::NativeProcessEntry<
+    process: &mut carrick_el1_linux::native_process_runtime::NativeProcessEntry<
         '_,
         'static,
         native_process::Mm,
@@ -376,13 +375,13 @@ pub(crate) fn deliver_signal_on_syscall_return(
     frame: &mut NativeFrame,
     fpstate: &XsaveArea,
 ) -> Option<CompletionRoute> {
-    carrick_el1::personality::signal_delivery::deliver_signal_on_syscall_return(
+    carrick_el1_linux::signal_delivery::deliver_signal_on_syscall_return(
         task,
         process,
         frame,
         &fpstate.0,
         &mut X86SignalMachine {
-            backend: carrick_el1::isa::x86::X86Backend,
+            backend: carrick_el1_linux::x86_signal::LinuxX86Backend,
         },
     )
 }
@@ -599,7 +598,7 @@ pub fn handle_user_page_fault_prepared(
     // every prepared commit; InitialWords retains its mapped window.
     let mut prepared =
         unsafe { carrick_el1::fault::X86PreparedResolver::under_editor(prepared_mm, &words) };
-    let mut cow = carrick_el1::personality::cow_resolver::X86CowResolver {
+    let mut cow = carrick_el1_linux::cow_resolver::X86CowResolver {
         words: &words,
         pool: cow_pool,
         residency,
@@ -694,7 +693,7 @@ pub fn handle_user_page_fault_prepared(
                 fault.address,
             );
             let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
-            let mut cow = carrick_el1::personality::cow_resolver::X86CowResolver {
+            let mut cow = carrick_el1_linux::cow_resolver::X86CowResolver {
                 words: &words,
                 pool: cow_pool,
                 residency,
@@ -959,10 +958,10 @@ impl Personality for LinuxPersonality {
                 &[],
                 files.names(),
                 None::<
-                    carrick_el1::Zone<
+                    carrick_el1_linux::dispatch::Zone<
                         '_,
-                        carrick_el1::sched::HardwareCpu,
-                        carrick_el1::sched::HardwareUserWord,
+                        carrick_el1::substrate::sched::HardwareCpu,
+                        carrick_el1::substrate::sched::HardwareUserWord,
                     >,
                 >,
                 None,

@@ -58,6 +58,7 @@ carrick-abi = { path = "../carrick-abi" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-el1 = { path = "../carrick-el1" }
+carrick-el1-linux = { path = "../carrick-el1-linux" }
 carrick-inotify-core = { path = "../carrick-inotify-core" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-portable = { path = "../carrick-portable" }
@@ -109,6 +110,7 @@ loom = "=0.7.2"
 # Typed guest addresses for the fork-retirement witness over the inventory.
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
+carrick-el1-linux = { path = "../carrick-el1-linux", features = ["host-test"] }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 # Self dev-dependency: enables `test-support` on this crate's own lib when it
 # is built for an integration test (`tests/`), which sees no `cfg(test)`.

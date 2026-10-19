@@ -68,13 +68,14 @@ fn carrick_x86_cpl0_sources_and_build_config_are_inputs() {
         "code-model=kernel lives in .cargo/config.toml"
     );
     // The original target-filtered closure plus the conservative host-only
-    // carrick-el1 -> carrick-fatal edge.
+    // carrick-el1-linux -> carrick-fatal edge.
     let packages = [
         "carrick-abi",
         "carrick-core",
         "carrick-core-abi",
         "carrick-el1",
         "carrick-el1-abi",
+        "carrick-el1-linux",
         "carrick-fatal",
         "carrick-fd-core",
         "carrick-guest-arch",

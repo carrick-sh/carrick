@@ -642,7 +642,7 @@ pub(super) mod tests {
             pin: Option<RetainedUserData>,
             owners: Vec<Arc<GlobalFrameHostOwner>>,
         }
-        impl carrick_el1::personality::mm_portal::test_support::PhysicalTransferFixture for Physical {
+        impl carrick_el1_linux::mm_portal::test_support::PhysicalTransferFixture for Physical {
             fn carrier(&self) -> NonZeroU64 {
                 self.custody.carrier()
             }
@@ -693,7 +693,7 @@ pub(super) mod tests {
                 }));
             }
         }
-        carrick_el1::personality::mm_portal::test_support::native_owner_matrix(|| {
+        carrick_el1_linux::mm_portal::test_support::native_owner_matrix(|| {
             Box::new(Physical {
                 custody: UserTransferCustody::new(Arc::new(CarrierVmCustody::new_live_fixture())),
                 pin: None,

@@ -1815,7 +1815,9 @@ impl<M: carrick_guest_mem::CurrentMmMemory> HostUserCopy<'_, M> {
     }
 }
 
-impl<M: carrick_guest_mem::CurrentMmMemory> carrick_el1::file::UserCopy for HostUserCopy<'_, M> {
+impl<M: carrick_guest_mem::CurrentMmMemory> carrick_el1::substrate::file::UserCopy
+    for HostUserCopy<'_, M>
+{
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
         if src.is_empty() {
             return true;
@@ -1847,7 +1849,7 @@ struct HostPreparedRead {
     pending: Option<Vec<u8>>,
 }
 
-impl carrick_el1::file::UserCopy for HostPreparedRead {
+impl carrick_el1::substrate::file::UserCopy for HostPreparedRead {
     fn copy_out(&mut self, destination: u64, source: &[u8]) -> bool {
         if destination != self.destination || source.len() > self.capacity || self.pending.is_some()
         {
@@ -1938,7 +1940,7 @@ fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
             MAX_DELEGATED_INOTIFY,
         )
     };
-    let zone_file = carrick_el1::file::ZoneFile {
+    let zone_file = carrick_el1::substrate::file::ZoneFile {
         inode: file,
         open: record,
     };
@@ -2006,7 +2008,7 @@ fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
         }
         // SAFETY: the inode is locked and live; the cache pointer is its slot.
         let result = unsafe {
-            carrick_el1::serve_locked_file_op(
+            carrick_el1_linux::dispatch::serve_locked_file_op(
                 &zone_file,
                 inotify_table,
                 nr,
@@ -2054,7 +2056,7 @@ fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
 /// instance); it has nowhere else to send the operation.
 struct HostInstanceLock;
 
-impl carrick_el1::InstanceLockPolicy for HostInstanceLock {
+impl carrick_el1::substrate::file::InstanceLockPolicy for HostInstanceLock {
     fn acquire(&self, instance: &DelegatedInotify) -> bool {
         let start = std::time::Instant::now();
         while !instance.host_lock_bounded(64) {
@@ -2130,7 +2132,7 @@ pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
             MAX_DELEGATED_INOTIFY,
         )
     };
-    let zone_file = carrick_el1::file::ZoneFile {
+    let zone_file = carrick_el1::substrate::file::ZoneFile {
         inode: file,
         open: record,
     };
@@ -2140,7 +2142,7 @@ pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
     };
     // SAFETY: the inode is locked and live; the cache pointer is its slot.
     let result = unsafe {
-        carrick_el1::serve_locked_file_op(
+        carrick_el1_linux::dispatch::serve_locked_file_op(
             &zone_file,
             inotify_table,
             nr,
@@ -2711,7 +2713,7 @@ mod tests {
                             MAX_ZONE_OPEN_FILES,
                         )
                     };
-                    carrick_el1::personality::file_table::close_host_binding(
+                    carrick_el1_linux::file_table::close_host_binding(
                         fd_map_slots(address),
                         records,
                         child_table,
@@ -2785,7 +2787,7 @@ mod tests {
                         )
                     };
                     assert!(
-                        carrick_el1::personality::file_table::close_host_binding(
+                        carrick_el1_linux::file_table::close_host_binding(
                             fd_map_slots(address),
                             records,
                             child_table,
@@ -2812,9 +2814,7 @@ mod tests {
 
         #[test]
         fn file_seam_final_ring_release_has_one_terminal_handoff_at_each_population() {
-            use carrick_el1::personality::file_table::{
-                close_host_binding_observed, dup2_host_binding,
-            };
+            use carrick_el1_linux::file_table::{close_host_binding_observed, dup2_host_binding};
             for population in [1, 16, 512] {
                 let region = Region::new();
                 let scratch = tempfile::tempdir().unwrap();
@@ -2888,7 +2888,7 @@ mod tests {
 
         #[test]
         fn file_seam_failed_dup_rollback_publishes_terminal_host_work() {
-            use carrick_el1::personality::file_table::{
+            use carrick_el1_linux::file_table::{
                 RETAINED_HOOK, dup_host_binding, dup2_host_binding,
             };
             // Primitive rollback safety: borrowed host views are not ARM dup's
@@ -2956,12 +2956,11 @@ mod tests {
             let (_fs, open) = seam_open(scratch.path(), "/data", 3);
             let description = open.description.clone();
             open.closed.set(true);
-            *carrick_el1::personality::file_table::SNAPSHOT_HOOK.lock() =
-                Some(Box::new(move || {
-                    description.release_fd_ref();
-                }));
+            *carrick_el1_linux::file_table::SNAPSHOT_HOOK.lock() = Some(Box::new(move || {
+                description.release_fd_ref();
+            }));
             let address = get_el1_region_host_ptr();
-            carrick_el1::personality::aarch64_process_tests::with_native_file_fork(
+            carrick_el1_linux::aarch64_process_tests::with_native_file_fork(
                 fd_map_slots(address),
                 seam_table(&region),
                 table().raw(),
@@ -2976,7 +2975,7 @@ mod tests {
         }
 
         fn seam_fork(region: &Region, witness: impl FnOnce(&carrick_el1_abi::CurrentTask)) {
-            carrick_el1::personality::aarch64_process_tests::with_native_file_fork(
+            carrick_el1_linux::aarch64_process_tests::with_native_file_fork(
                 fd_map_slots(get_el1_region_host_ptr()),
                 seam_table(region),
                 table().raw(),
@@ -3001,10 +3000,10 @@ mod tests {
             let mut frame = carrick_el1_abi::TrapFrame::default();
             frame.x[8] = nr;
             frame.x[0] = fd as u64;
-            let action = carrick_el1::dispatch_syscall_with_regions::<
+            let action = carrick_el1_linux::dispatch::dispatch_syscall_with_regions::<
                 _,
-                carrick_el1::sched::FakeCpu,
-                carrick_el1::sched::HardwareUserWord,
+                carrick_el1::substrate::sched::FakeCpu,
+                carrick_el1::substrate::sched::HardwareUserWord,
             >(
                 &mut frame,
                 &carrick_el1_abi::Counters::default(),
@@ -3026,7 +3025,7 @@ mod tests {
             let scratch = tempfile::tempdir().unwrap();
             let (_fs, open) = seam_open(scratch.path(), "/data", 3);
             let address = get_el1_region_host_ptr();
-            carrick_el1::personality::aarch64_process_tests::with_native_file_fork(
+            carrick_el1_linux::aarch64_process_tests::with_native_file_fork(
                 fd_map_slots(address),
                 seam_table(&region),
                 table().raw(),
@@ -3093,7 +3092,7 @@ mod tests {
                 let (_fs, open) = seam_open(scratch.path(), "/data", 3);
                 let identity = open.description.el1_identity().unwrap();
                 let address = get_el1_region_host_ptr();
-                carrick_el1::personality::aarch64_process_tests::with_native_file_fork(
+                carrick_el1_linux::aarch64_process_tests::with_native_file_fork(
                     fd_map_slots(address),
                     seam_table(&region),
                     table().raw(),

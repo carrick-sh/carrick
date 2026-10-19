@@ -24,6 +24,7 @@ workspace = true
 [dev-dependencies]
 carrick-x86 = { path = "../carrick-x86" }
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
+carrick-el1-linux = { path = "../carrick-el1-linux", features = ["host-test"] }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 
 [package.metadata.carrick.test-lanes]

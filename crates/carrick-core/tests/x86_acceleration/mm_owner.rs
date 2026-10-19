@@ -5,8 +5,8 @@ use carrick_core_abi::{
     PortalTransferIntent as TransferIntent, ReservationProtection, ReservationRange,
 };
 use carrick_el1::memory::reservations::NativeReservationGeometry;
-use carrick_el1::personality::mm_portal::NativeOwnerVenue;
-use carrick_el1::personality::mm_portal::test_support::*;
+use carrick_el1_linux::mm_portal::NativeOwnerVenue;
+use carrick_el1_linux::mm_portal::test_support::*;
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_personality_linux::mm::LinuxReservationPolicy;
 use carrick_sched_core::AddressSpaces;

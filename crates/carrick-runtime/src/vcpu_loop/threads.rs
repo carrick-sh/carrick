@@ -1257,7 +1257,7 @@ pub(super) fn wake_removed_persistent_sibling_threads(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod child_tid_owner_tests {
     use super::*;
-    use carrick_el1::personality::mm_portal::{
+    use carrick_el1_linux::mm_portal::{
         GuestVa as OwnerVa, MmError, MmPortal, TransferIntent,
         test_support::{IPA, NoPin, ROOT, Region, Tables, VA, admit_notified, nodes, residency},
     };
@@ -1370,8 +1370,10 @@ mod child_tid_owner_tests {
             bytes: owner.raw().to_le_bytes(),
             waits: 0,
         };
-        let access =
-            carrick_el1::sched::object_wait::space_access(zone, carrick_sched_core::SlotId::new(1));
+        let access = carrick_el1::substrate::sched::object_wait::space_access(
+            zone,
+            carrick_sched_core::SlotId::new(1),
+        );
         let index = zone.spaces.find(mm.raw()).unwrap();
         access.raise(index);
         let clear = registry.claim_clear_child_tid(owner).unwrap();

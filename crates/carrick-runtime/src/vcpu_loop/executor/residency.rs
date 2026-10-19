@@ -263,7 +263,7 @@ mod tests {
         native.pc = 0x4004;
         native.x[0] = 7;
         native.x[8] = 94;
-        carrick_el1::personality::aarch64_process_tests::with_native_terminal_host_handback(
+        carrick_el1_linux::aarch64_process_tests::with_native_terminal_host_handback(
             native,
             |zone, record| {
                 let restored = materialize_zone_in(zone, &pending_read(), record).unwrap();

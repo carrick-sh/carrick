@@ -76,12 +76,10 @@ pub fn schedule(slot: SlotId) -> ! {
                     .resume_checkpoint()
                     .unwrap_or_else(|reason| complete_run_failure(current, reason))
                 {
-                    carrick_el1::personality::native_process_runtime::NativeResume::Returned(
-                        result,
-                    ) => words.set_syscall_return(result.raw() as u64),
-                    carrick_el1::personality::native_process_runtime::NativeResume::Left(
-                        root_exit,
-                    ) => {
+                    carrick_el1_linux::native_process_runtime::NativeResume::Returned(result) => {
+                        words.set_syscall_return(result.raw() as u64)
+                    }
+                    carrick_el1_linux::native_process_runtime::NativeResume::Left(root_exit) => {
                         if let Some(status) = root_exit {
                             publish_root_exit(current, status.to_termination_status());
                         }
@@ -89,12 +87,12 @@ pub fn schedule(slot: SlotId) -> ! {
                         leave_space(source);
                         continue;
                     }
-                    carrick_el1::personality::native_process_runtime::NativeResume::NoPending => {
+                    carrick_el1_linux::native_process_runtime::NativeResume::NoPending => {
                         if let Some(result) = selected.result {
                             words.set_syscall_return(result);
                         }
                     }
-                    carrick_el1::personality::native_process_runtime::NativeResume::Invalid => {
+                    carrick_el1_linux::native_process_runtime::NativeResume::Invalid => {
                         fatal_boot()
                     }
                 }

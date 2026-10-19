@@ -7107,7 +7107,7 @@ pub(crate) mod tests {
 
     #[test]
     fn owned_arm_process_return_is_observed_once() {
-        use carrick_el1::personality::lifecycle::{
+        use carrick_el1_linux::lifecycle::{
             LifecycleOutcome, LinuxWaitOptions, ProcessNative, ProcessWaitPid,
         };
         use carrick_guest_arch::UserVa;
@@ -7115,7 +7115,7 @@ pub(crate) mod tests {
         use std::sync::atomic::Ordering;
 
         struct NoCpu;
-        impl carrick_el1::sched::ThreadCpu for NoCpu {
+        impl carrick_el1::substrate::sched::ThreadCpu for NoCpu {
             fn save(
                 &mut self,
                 _: &carrick_el1_abi::TrapFrame,
@@ -7165,11 +7165,11 @@ pub(crate) mod tests {
             }
         }
         struct Venue;
-        impl carrick_el1::personality::lifecycle::LifecycleVenue for Venue {
+        impl carrick_el1_linux::lifecycle::LifecycleVenue for Venue {
             fn thread<'a>(
                 &'a self,
                 _: &'a carrick_el1_abi::CurrentTask,
-            ) -> Option<carrick_el1::personality::lifecycle::LifecycleThread<'a>> {
+            ) -> Option<carrick_el1_linux::lifecycle::LifecycleThread<'a>> {
                 None
             }
             fn born_slot(
@@ -7235,7 +7235,7 @@ pub(crate) mod tests {
             task.mm.thread_generation.store(13, Ordering::Relaxed);
             task.publish_visible_pid(1);
             let mut owner = Owner {
-                binding: carrick_el1::personality::common_entry::execution_binding(&task),
+                binding: carrick_el1_linux::common_entry::execution_binding(&task),
                 result: value,
                 calls: 0,
             };
@@ -7253,10 +7253,10 @@ pub(crate) mod tests {
                     context.retain_exact(),
                     kernel.dispatcher.observers().cloned(),
                 ));
-            let route = carrick_el1::dispatch_syscall_with_native::<
+            let route = carrick_el1_linux::dispatch::dispatch_syscall_with_native::<
                 _,
                 NoCpu,
-                carrick_el1::sched::HardwareUserWord,
+                carrick_el1::substrate::sched::HardwareUserWord,
                 _,
                 carrick_el1_abi::Aarch64ParkedContext,
             >(

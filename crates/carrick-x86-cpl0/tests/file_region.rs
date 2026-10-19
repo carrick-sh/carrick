@@ -2,10 +2,10 @@
 //! operations, not FileService or regular-file open acceptance.
 #![allow(clippy::expect_used)]
 
-use carrick_el1::personality::file_table::{
+use carrick_el1_abi::*;
+use carrick_el1_linux::file_table::{
     admit_host_fd, admit_stdio, close_host_binding, dup_host_binding, fork_fd_map, retire_fd_map,
 };
-use carrick_el1_abi::*;
 use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa};
 use carrick_test_support::TestEl1Region;
 use core::{num::NonZeroU64, ptr::NonNull, sync::atomic::Ordering};
