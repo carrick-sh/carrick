@@ -317,6 +317,8 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
             "-p",
             "carrick-host-linux",
             "-p",
+            "carrick-x86-cpl0-host",
+            "-p",
             "carrick-signal-linux",
             "-p",
             "carrick-spec",
@@ -2225,6 +2227,7 @@ mod tests {
             "carrick-signal-core",
             "carrick-kernel-example",
             "carrick-x86",
+            "carrick-x86-cpl0-host",
         ] {
             assert!(portable.args.windows(2).any(|pair| pair == ["-p", package]));
         }

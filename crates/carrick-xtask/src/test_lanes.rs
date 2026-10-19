@@ -21,6 +21,12 @@
 //! * `test-lanes check` fails when a declaration names a missing target or an
 //!   unknown lane, when a derived lane's recipe does not consume `test-lanes
 //!   args`, or when a named-lane target is absent from its gate recipe.
+//! * The same check fails when a crate whose library root is
+//!   `#![cfg(target_os = "linux")]` has its lib tests in no Linux gate. macOS
+//!   `just test` compiles such a crate empty, so it would pass there while
+//!   running none of the crate's tests. A Linux gate is the `test-kvm` recipe
+//!   (`-p <pkg>` and `--lib` on one line) or a `cargo test` step of
+//!   `accept --profile linux-portable` naming `-p <pkg>`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -469,6 +475,91 @@ pub fn coverage_errors(root: &Path, justfile: &str, targets: &[TestTarget]) -> V
     errors
 }
 
+/// Workspace packages whose library root is gated to Linux, with the source
+/// path of that root. Their lib tests exist only where a Linux gate runs them.
+pub fn linux_only_libs(metadata: &Value) -> Vec<(String, PathBuf)> {
+    let packages = metadata
+        .get("packages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut libs = Vec::new();
+    for package in packages {
+        let name = package.get("name").and_then(Value::as_str).unwrap_or("");
+        let lib = package
+            .get("targets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|target| {
+                target
+                    .get("kind")
+                    .and_then(Value::as_array)
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"))
+            });
+        let Some(src) = lib
+            .and_then(|lib| lib.get("src_path"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let src = PathBuf::from(src);
+        if crate_root_is_linux_only(&src) {
+            libs.push((name.to_owned(), src));
+        }
+    }
+    libs.sort();
+    libs
+}
+
+/// A crate-level `#![cfg(...)]` naming `target_os = "linux"`. Inner
+/// attributes are only legal at the head of the file, so any such line is one.
+fn crate_root_is_linux_only(src: &Path) -> bool {
+    std::fs::read_to_string(src).is_ok_and(|text| {
+        text.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("#![cfg(") && line.contains("target_os = \"linux\"")
+        })
+    })
+}
+
+/// Every Linux-only library in `libs` whose lib tests no Linux gate selects:
+/// neither the `test-kvm` recipe (`-p <pkg>` and `--lib` on one line) nor a
+/// `cargo test` step of `linux_portable` naming `-p <pkg>`.
+pub fn linux_lib_errors(
+    root: &Path,
+    justfile: &str,
+    libs: &[(String, PathBuf)],
+    linux_portable: &[crate::accept::StepSpec],
+) -> Vec<String> {
+    let kvm = recipe_text(root, justfile, "test-kvm").unwrap_or_default();
+    let mut errors = Vec::new();
+    for (package, src) in libs {
+        let in_kvm = kvm.lines().any(|line| {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            tokens
+                .windows(2)
+                .any(|w| w[0] == "-p" && w[1] == package.as_str())
+                && tokens.contains(&"--lib")
+        });
+        let in_portable = linux_portable.iter().any(|step| {
+            step.program == "cargo"
+                && step.args.first() == Some(&"test")
+                && step
+                    .args
+                    .windows(2)
+                    .any(|w| w[0] == "-p" && w[1] == package.as_str())
+        });
+        if !in_kvm && !in_portable {
+            errors.push(format!(
+                "{package}: library root {} is Linux-only, but neither `test-kvm` (`-p {package} --lib`) nor an `accept --profile linux-portable` cargo test step selects it; macOS `just test` compiles it empty",
+                src.display()
+            ));
+        }
+    }
+    errors
+}
+
 /// Contract bindings (`[bindings]` in `conformance-contracts/contracts/*.toml`)
 /// whose path names an integration test target (`<crate>::<target>::...`).
 /// Returns `(contract file, binding, target)` triples and parse errors.
@@ -607,6 +698,13 @@ pub fn run(
             let text = std::fs::read_to_string(&path)
                 .map_err(|source| TestLanesError::Io { path, source })?;
             errors.extend(coverage_errors(root, &text, &targets));
+            let linux_libs = linux_only_libs(&metadata);
+            errors.extend(linux_lib_errors(
+                root,
+                &text,
+                &linux_libs,
+                crate::accept::LINUX_PORTABLE_STEPS,
+            ));
             let (bound, binding_errors) = contract_test_bindings(root, &targets);
             errors.extend(binding_errors);
             for (contract, binding, target) in &bound {
@@ -630,10 +728,11 @@ pub fn run(
                 .collect();
             writeln!(
                 writer,
-                "test-lanes: {} test targets, all gated ({}); {} contract bindings name gated test targets",
+                "test-lanes: {} test targets, all gated ({}); {} contract bindings name gated test targets; {} Linux-only libs in a Linux gate",
                 targets.len(),
                 summary.join(" "),
-                bound.len()
+                bound.len(),
+                linux_libs.len()
             )
             .map_err(io)?;
             for target in targets.iter().filter(|target| target.lane == "manual") {
@@ -760,6 +859,40 @@ mod tests {
             lane_args(&targets, "integration", ""),
             Err(TestLanesError::NotDerived(_))
         ));
+    }
+
+    #[test]
+    fn linux_only_libs_need_a_linux_gate() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lib = |name: &str, head: &str| {
+            let src = temp_dir.path().join(format!("{name}.rs"));
+            std::fs::write(&src, format!("{head}\n//! doc\npub fn f() {{}}\n")).unwrap();
+            json!({
+                "name": name,
+                "features": {"default": []},
+                "targets": [{"name": name, "kind": ["lib"], "src_path": src.to_str().unwrap()}],
+            })
+        };
+        let metadata = json!({"packages": [
+            lib("kvm-only", "#![cfg(target_os = \"linux\")]"),
+            lib("portable-only", "#![cfg(target_os = \"linux\")]"),
+            lib("forgotten", "#![cfg(target_os = \"linux\")]"),
+            lib("everywhere", "#![forbid(unsafe_code)]"),
+        ]});
+        let libs = linux_only_libs(&metadata);
+        let names: Vec<&str> = libs.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["forgotten", "kvm-only", "portable-only"]);
+        let justfile = "test-kvm:\n    cargo test --locked -p kvm-only --lib\n    cargo test -p forgotten --test x\n";
+        let portable = [crate::accept::StepSpec {
+            name: "portable-tests",
+            program: "cargo",
+            args: &["test", "-p", "portable-only"],
+            env: &[],
+            log_name: "x.log",
+        }];
+        let errors = linux_lib_errors(Path::new("."), justfile, &libs, &portable);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("forgotten: "), "{errors:?}");
     }
 
     #[test]
