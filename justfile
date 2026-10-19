@@ -680,7 +680,7 @@ _test-unit-hvf *ARGS:
 
 # Every KVM-lane test target (`kvm` in `[package.metadata.carrick.test-lanes]`,
 # derived by `carrick-xtask test-lanes`), plus carrick-vmm-kvm's own lib/bin
-# tests. Linux x86_64 with a usable /dev/kvm only: the recipe refuses anywhere
+# tests and carrick-x86-cpl0-host's lib tests. Linux x86_64 with a usable /dev/kvm only: the recipe refuses anywhere
 # else, and exports CARRICK_REQUIRE_KVM=1 so a test that would skip on a
 # missing device or fixture fails instead. Run by `just accept --profile
 # kvm` and the KVM job in kernel-runtime.yml (merge queue); not by workers.
@@ -703,6 +703,10 @@ test-kvm *ARGS:
         --manifest-path crates/carrick-vmm-bhyve/fixtures/hello-x86_64/Cargo.toml \
         --target x86_64-unknown-linux-musl
     {{_admit}} {{_cargo}} test --locked -p carrick-vmm-kvm --lib --bins {{ARGS}}
+    # The x86 CPL0 host coordinator is Linux-only and its CPU/coordinator
+    # modules are x86_64-only, so its VM-free lib tests run here, not in macOS
+    # `just test` where the crate compiles empty (`test-lanes check` enforces it).
+    {{_admit}} {{_cargo}} test --locked -p carrick-x86-cpl0-host --lib {{ARGS}}
     selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane kvm --platform-features "{{_platform_features}}")"
     red=()
     while IFS= read -r selection; do
