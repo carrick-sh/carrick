@@ -1657,7 +1657,7 @@ impl HvfVmState {
                 frame,
                 mapping,
                 generation: Self::inventory_generation(1),
-                gpa: carrick_guest_mem::Gpa(gpa),
+                gpa: carrick_guest_mem::Gpa::new(gpa),
                 length: carrick_hal::FrameLength::from_mapping_extent(length),
                 permissions,
             })
@@ -2360,7 +2360,7 @@ impl HvfVmState {
                 frame,
                 mapping,
                 generation: Self::inventory_generation(1),
-                gpa: carrick_guest_mem::Gpa(gpa),
+                gpa: carrick_guest_mem::Gpa::new(gpa),
                 length: length_typed,
                 permissions,
             })
@@ -2523,7 +2523,7 @@ impl HvfVmState {
             candidate_extents.push((
                 extent.mapping,
                 extent.frame,
-                carrick_guest_mem::Gpa(gpa),
+                carrick_guest_mem::Gpa::new(gpa),
                 carrick_hal::FrameLength::from_mapping_extent(non_zero_len),
             ));
         }

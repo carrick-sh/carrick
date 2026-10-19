@@ -169,7 +169,7 @@ impl GuestPreparedBacking {
                     commit,
                     extent.mapping,
                     extent.frame,
-                    carrick_guest_mem::Gpa(stage.gpa),
+                    carrick_guest_mem::Gpa::new(stage.gpa),
                     length,
                 )
                 .map(|(receipt, generation)| (receipt, generation, None)),
@@ -180,7 +180,7 @@ impl GuestPreparedBacking {
                     len,
                     extent.mapping,
                     extent.frame,
-                    carrick_guest_mem::Gpa(stage.gpa),
+                    carrick_guest_mem::Gpa::new(stage.gpa),
                     length,
                 )
                 .map(|(receipt, proof, generation)| {
@@ -1045,7 +1045,7 @@ impl HvfVmState {
         }
         if let Some(state) = self.deferred_anonymous_state()
             && let Some(transition) =
-                state.begin_private_file_materialization(carrick_guest_mem::GuestVa(va))
+                state.begin_private_file_materialization(carrick_guest_mem::GuestVa::new(va))
         {
             let start = transition.start().raw();
             let materialized = self.materialize_private_file_backing(
@@ -1135,8 +1135,8 @@ impl HvfVmState {
                     // every publication site, and displaced rows are searched
                     // too.
                     let next_local = self.mappings.first_start_between(
-                        GuestVa(current),
-                        GuestVa(window_end),
+                        GuestVa::new(current),
+                        GuestVa::new(window_end),
                         |_| true,
                     );
                     let next_alias = alias_registry()
@@ -1165,7 +1165,7 @@ impl HvfVmState {
                         ) {
                         let lower_has_local = self
                             .mappings
-                            .any_lower_row_reaches(GuestVa(current), compound_start);
+                            .any_lower_row_reaches(GuestVa::new(current), compound_start);
                         if !lower_has_local {
                             compound_start
                         } else {
@@ -1222,7 +1222,7 @@ impl HvfVmState {
             // the materializer rechecks this shape before publication.
             let next_local =
                 self.mappings
-                    .first_start_between(GuestVa(current), GuestVa(end), |_| true);
+                    .first_start_between(GuestVa::new(current), GuestVa::new(end), |_| true);
             let next_alias = alias_registry()
                 .lock()
                 .first_matching_process_alias_start_between(
@@ -1492,7 +1492,7 @@ impl HvfVmState {
             return decline("frame grant lacks deferred provenance");
         };
         let transition = match deferred_state.begin_pristine_materialization(
-            carrick_guest_mem::GuestVa(request.semantic_base),
+            carrick_guest_mem::GuestVa::new(request.semantic_base),
             semantic_len,
         ) {
             Ok(Some(transition)) => transition,
@@ -1698,7 +1698,7 @@ impl HvfVmState {
                 TrapError::Hypervisor("EL1 frame-grant rollback has no deferred state".to_owned())
             })?;
             deferred
-                .restore_pristine(carrick_guest_mem::GuestVa(grant.semantic_base), len)
+                .restore_pristine(carrick_guest_mem::GuestVa::new(grant.semantic_base), len)
                 .map_err(|error| {
                     TrapError::Hypervisor(format!(
                         "restore EL1 frame-grant pristine span: {error:?}"
@@ -1720,7 +1720,7 @@ impl HvfVmState {
             TrapError::Hypervisor("EL1 frame-grant rollback has no deferred state".to_owned())
         })?;
         deferred
-            .restore_pristine(carrick_guest_mem::GuestVa(grant.semantic_base), len)
+            .restore_pristine(carrick_guest_mem::GuestVa::new(grant.semantic_base), len)
             .map_err(|error| {
                 TrapError::Hypervisor(format!("restore EL1 frame-grant pristine span: {error:?}"))
             })?;
@@ -1941,7 +1941,7 @@ impl HvfVmState {
             let custody = self.custody();
             let next_local =
                 self.mappings
-                    .first_start_between(GuestVa(start), GuestVa(end), |mapping| {
+                    .first_start_between(GuestVa::new(start), GuestVa::new(end), |mapping| {
                         global_frame_region_owner_matches_in(custody, mapping)
                     });
             let next_alias_candidates = alias_registry()
@@ -1978,7 +1978,7 @@ impl HvfVmState {
         let deferred_transition = deferred_state
             .as_ref()
             .map(|state| {
-                state.begin_materialization(carrick_guest_mem::GuestVa(start), semantic_len)
+                state.begin_materialization(carrick_guest_mem::GuestVa::new(start), semantic_len)
             })
             .transpose()
             .map_err(|error| {
@@ -2631,7 +2631,7 @@ impl HvfTaskState {
         match authority.mapping_is_live(
             inventory_mapping.mapping,
             inventory_mapping.frame,
-            carrick_guest_mem::Gpa(new_physical_ipa),
+            carrick_guest_mem::Gpa::new(new_physical_ipa),
             carrick_hal::FrameLength::from_mapping_extent(
                 std::num::NonZeroU64::new(CowArmedRanges::COMPOUND_SIZE).unwrap_or_else(|| {
                     carrick_fatal!(
@@ -3084,7 +3084,7 @@ impl HvfTaskState {
                     .mapping_is_live(
                         extent.mapping,
                         extent.frame,
-                        carrick_guest_mem::Gpa(key.0),
+                        carrick_guest_mem::Gpa::new(key.0),
                         length,
                     )
                     .ok()
@@ -3905,9 +3905,9 @@ impl HvfTaskState {
                     .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
                         mapping: extent.mapping,
                         frame: extent.frame,
-                        gpa: carrick_guest_mem::Gpa(new_physical_ipa),
+                        gpa: carrick_guest_mem::Gpa::new(new_physical_ipa),
                         length,
-                        owner_gpa: carrick_guest_mem::Gpa(extent.stage2_base),
+                        owner_gpa: carrick_guest_mem::Gpa::new(extent.stage2_base),
                         owner_length: carrick_hal::FrameLength::from_mapping_extent(
                             std::num::NonZeroU64::new(extent.stage2_length).ok_or_else(|| {
                                 TrapError::Hypervisor("zero COW physical extent".to_owned())
@@ -4426,7 +4426,7 @@ impl HvfTaskState {
         match authority.mapping_is_live(
             new_mapping,
             new_frame,
-            carrick_guest_mem::Gpa(new_physical_ipa),
+            carrick_guest_mem::Gpa::new(new_physical_ipa),
             cow_length,
         ) {
             Ok(true) => {}
@@ -6663,7 +6663,7 @@ impl HvfVmState {
     ) -> Option<MappingView> {
         let semantic_end = semantic_va.checked_add(u64::try_from(length).ok()?)?;
         mappings
-            .candidates_for_range(GuestVa(semantic_va), length as u64)
+            .candidates_for_range(GuestVa::new(semantic_va), length as u64)
             .find(|mapping| {
                 semantic_va >= mapping.start
                     && semantic_end <= mapping.end
@@ -7136,7 +7136,7 @@ impl HvfTaskState {
         }
         let mapping = self
             .mappings
-            .candidates_for_range(GuestVa(semantic_start), CowArmedRanges::COMPOUND_SIZE)
+            .candidates_for_range(GuestVa::new(semantic_start), CowArmedRanges::COMPOUND_SIZE)
             .find(|mapping| {
                 let physical_mapping_end = mapping
                     .physical_ipa
@@ -7458,7 +7458,7 @@ impl HvfTaskState {
         if let Some(ipa) = stage1_ipa {
             if let Some(mapping) = self
                 .mappings
-                .candidates_for_range(GuestVa(address), length as u64)
+                .candidates_for_range(GuestVa::new(address), length as u64)
                 .find(|mapping| {
                     ipa >= mapping.ipa
                         && ipa < mapping.ipa.saturating_add(mapping.size as u64)
@@ -7572,7 +7572,7 @@ impl HvfTaskState {
         };
         if let Some(mapping) = self
             .mappings
-            .candidates_for_range(GuestVa(address), length as u64)
+            .candidates_for_range(GuestVa::new(address), length as u64)
             .find(|mapping| {
                 mapping.contains_range(address, length)
                     && region_is_live(mapping)
@@ -8191,7 +8191,7 @@ pub(crate) fn live_ipa_mapping_row(
     // walk offers those rows in the same newest-first order the whole-table
     // reverse walk did (live rows by descending start, then displaced rows).
     mappings
-        .candidates_for_range(GuestVa(semantic_va), length)
+        .candidates_for_range(GuestVa::new(semantic_va), length)
         .find(|mapping| {
             let mapping_end = mapping.ipa.checked_add(mapping.size as u64);
             semantic_va >= mapping.start

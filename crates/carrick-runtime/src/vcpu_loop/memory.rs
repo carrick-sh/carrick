@@ -506,11 +506,11 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             owner_gpa,
             owner_length,
         } = request;
-        if gpa.0 < owner_gpa.0
+        if gpa.raw() < owner_gpa.raw()
             || gpa
-                .0
+                .raw()
                 .checked_add(length.raw())
-                .zip(owner_gpa.0.checked_add(owner_length.raw()))
+                .zip(owner_gpa.raw().checked_add(owner_length.raw()))
                 .is_none_or(|(end, owner_end)| end > owner_end)
         {
             return Err(Box::new(std::io::Error::other(
@@ -1144,7 +1144,7 @@ mod tests {
             );
         backend.bind_inventory(kernel, mm);
         backend.bind_vma_source(dispatch_mm);
-        let physical_base = Gpa(0xb000);
+        let physical_base = Gpa::new(0xb000);
         let physical_len = 0x4000;
         let (mapping, frame, inventory_revision) =
             publish_cow_mapping(kernel, mm, physical_base, physical_len);
@@ -1153,7 +1153,7 @@ mod tests {
         let proof = carrick_kernel::kernel::KernelForeignCowProof::new(
             Arc::clone(kernel),
             mm,
-            GuestVa(0x3000),
+            GuestVa::new(0x3000),
             std::num::NonZeroUsize::new(physical_len as usize).unwrap(),
             inventory_revision,
             mapping,
@@ -1203,7 +1203,7 @@ mod tests {
         caller_tid: ThreadId,
     ) -> RealProductionCowFixture {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::{FixtureShape, TEST_VA};
-        let shape = FixtureShape::new(Gpa(stage1_root), Gpa(data_ipa)).unwrap();
+        let shape = FixtureShape::new(Gpa::new(stage1_root), Gpa::new(data_ipa)).unwrap();
         production_cow_fixture_with_shape(
             kernel,
             parent,
@@ -1326,7 +1326,7 @@ mod tests {
         let execution = execution_lease(&root, 75);
         let child = production_composition_cow_fixture(&kernel, &root, 31_076);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
             carrick_kernel::kernel::MmAccessAuthority::new()
@@ -1343,7 +1343,7 @@ mod tests {
         let execution = execution_lease(&root, 77);
         let child = production_composition_cow_fixture(&kernel, &root, 31_078);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
             carrick_kernel::kernel::MmAccessAuthority::new()
@@ -1395,7 +1395,7 @@ mod tests {
         let mut execution = execution_lease(&fixture.child, 41101);
         let mut content = fixture
             .child
-            .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4)
+            .fetch_instruction_bytes(&execution, GuestVa::new(TEST_VA), 4)
             .unwrap()
             .prepare_tracked_content()
             .unwrap();
@@ -1502,7 +1502,7 @@ mod tests {
         }
         let mut fresh = fixture
             .child
-            .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4)
+            .fetch_instruction_bytes(&execution, GuestVa::new(TEST_VA), 4)
             .unwrap()
             .prepare_tracked_content()
             .unwrap();
@@ -1563,7 +1563,7 @@ mod tests {
         assert!(matches!(
             fixture
                 .child
-                .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4),
+                .fetch_instruction_bytes(&execution, GuestVa::new(TEST_VA), 4),
             Err(MmAccessError::ExecuteDenied { .. })
         ));
         fixture
@@ -1576,7 +1576,7 @@ mod tests {
             });
         let read = fixture
             .child
-            .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4)
+            .fetch_instruction_bytes(&execution, GuestVa::new(TEST_VA), 4)
             .expect("kernel-authorized execute-only fetch through production carrier");
         assert_eq!(read.bytes(), b"same");
         read.validate_mapping().unwrap();
@@ -1585,20 +1585,20 @@ mod tests {
         let current = fixture.child.current_mm(&execution).unwrap();
         use carrick_kernel::kernel::mm_access::MmAccessTarget;
         assert!(matches!(
-            current.access_token().read_range(GuestVa(TEST_VA), 4),
+            current.access_token().read_range(GuestVa::new(TEST_VA), 4),
             Err(MmAccessError::ReadDenied { .. })
         ));
         assert!(matches!(
             fixture
                 .child
-                .fetch_instruction_bytes(&execution, GuestVa(TEST_VA + OWNER_LEN - 2), 4),
+                .fetch_instruction_bytes(&execution, GuestVa::new(TEST_VA + OWNER_LEN - 2), 4),
             Err(MmAccessError::Unmapped { .. })
         ));
         let wrong = execution_lease(&root, 170);
         assert!(matches!(
             fixture
                 .child
-                .fetch_instruction_bytes(&wrong, GuestVa(TEST_VA), 4),
+                .fetch_instruction_bytes(&wrong, GuestVa::new(TEST_VA), 4),
             Err(MmAccessError::ExecutionAuthority(_))
         ));
         fixture
@@ -1616,7 +1616,7 @@ mod tests {
         assert!(matches!(
             fixture
                 .child
-                .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4),
+                .fetch_instruction_bytes(&execution, GuestVa::new(TEST_VA), 4),
             Err(MmAccessError::ExecuteDenied { .. })
         ));
     }
@@ -1695,7 +1695,7 @@ mod tests {
         let current = fixture.child.current_mm(&execution).unwrap();
         let range = current
             .access_token()
-            .write_range(GuestVa(TEST_VA), 8)
+            .write_range(GuestVa::new(TEST_VA), 8)
             .unwrap()
             .unwrap();
         let mut prepared = authority
@@ -1780,7 +1780,7 @@ mod tests {
                     foreign_mm(&kernel, &root, &root_execution, fixture.child.task().key());
                 let read = foreign
                     .access_token()
-                    .read_range(GuestVa(TEST_VA), 4)
+                    .read_range(GuestVa::new(TEST_VA), 4)
                     .unwrap()
                     .unwrap();
                 let mut actual = [0; 4];
@@ -1940,7 +1940,7 @@ mod tests {
             let current = fixture.child.current_mm(&leases[0]).unwrap();
             let range = current
                 .access_token()
-                .write_range(GuestVa(TEST_VA), 8)
+                .write_range(GuestVa::new(TEST_VA), 8)
                 .unwrap()
                 .unwrap();
             let result = authority.with_current_mutation(
@@ -2011,7 +2011,7 @@ mod tests {
         let current = fixture.child.current_mm(&execution).unwrap();
         let range = current
             .access_token()
-            .write_range(GuestVa(TEST_VA), 4)
+            .write_range(GuestVa::new(TEST_VA), 4)
             .unwrap()
             .unwrap();
         let mut prepared = authority
@@ -2046,7 +2046,7 @@ mod tests {
                     .unwrap();
                 {
                     let mut active = prepared.activate(&scope).unwrap();
-                    assert_eq!(active.start(), GuestVa(TEST_VA));
+                    assert_eq!(active.start(), GuestVa::new(TEST_VA));
                     assert_eq!(active.len(), 4);
                     // Bounded CPU access to the actual pinned carrier bytes, after mutation
                     // exclusion has ended. No syscall/dispatcher reentry or Rust aliases.
@@ -2074,7 +2074,7 @@ mod tests {
         );
         let captured = fixture
             .child
-            .fetch_instruction_bytes(&execution, GuestVa(TEST_VA), 4)
+            .fetch_instruction_bytes(&execution, GuestVa::new(TEST_VA), 4)
             .unwrap();
         captured.validate_tracked_content().unwrap();
         assert_eq!(
@@ -2102,7 +2102,7 @@ mod tests {
         let current = foreign_mm(&kernel, &root, &root_execution, fixture.child.task().key());
         let read = current
             .access_token()
-            .read_range(GuestVa(TEST_VA), 4)
+            .read_range(GuestVa::new(TEST_VA), 4)
             .unwrap()
             .unwrap();
         let mut bytes = [0; 4];
@@ -2173,7 +2173,7 @@ mod tests {
         let current = fixture.child.current_mm(&execution).unwrap();
         let range = current
             .access_token()
-            .write_range(GuestVa(TEST_VA), 4)
+            .write_range(GuestVa::new(TEST_VA), 4)
             .unwrap()
             .unwrap();
         let mut prepared = authority
@@ -2229,7 +2229,7 @@ mod tests {
                     .unwrap();
                 {
                     let mut active = prepared.activate(&scope).unwrap();
-                    assert_eq!(active.start(), GuestVa(TEST_VA));
+                    assert_eq!(active.start(), GuestVa::new(TEST_VA));
                     assert_eq!(active.len(), 4);
                     // Bounded CPU access to the actual pinned carrier bytes, after mutation
                     // exclusion has ended. No syscall/dispatcher reentry or Rust aliases.
@@ -2280,7 +2280,7 @@ mod tests {
         let current = foreign_mm(&kernel, &root, &root_execution, fixture.child.task().key());
         let read = current
             .access_token()
-            .read_range(GuestVa(TEST_VA), 4)
+            .read_range(GuestVa::new(TEST_VA), 4)
             .unwrap()
             .unwrap();
         let mut bytes = [0; 4];
@@ -2332,7 +2332,7 @@ mod tests {
             let current = fixture.child.current_mm(&execution).unwrap();
             let range = current
                 .access_token()
-                .write_range(GuestVa(TEST_VA), 8192)
+                .write_range(GuestVa::new(TEST_VA), 8192)
                 .unwrap()
                 .unwrap();
             let mut prepared = authority
@@ -2488,7 +2488,7 @@ mod tests {
         let current = fixture.child.current_mm(&execution).unwrap();
         let range = current
             .access_token()
-            .write_range(GuestVa(TEST_VA), 4)
+            .write_range(GuestVa::new(TEST_VA), 4)
             .unwrap()
             .unwrap();
         let mut prepared = authority
@@ -2647,7 +2647,7 @@ mod tests {
             let current = fixture.child.current_mm(&execution).unwrap();
             let range = current
                 .access_token()
-                .write_range(GuestVa(TEST_VA), 4096)
+                .write_range(GuestVa::new(TEST_VA), 4096)
                 .unwrap()
                 .unwrap();
             let mut prepared = authority
@@ -2740,7 +2740,7 @@ mod tests {
         use carrick_kernel::kernel::mm_access::MmAccessTarget;
         let range = current
             .access_token()
-            .write_range(GuestVa(TEST_VA), 4)
+            .write_range(GuestVa::new(TEST_VA), 4)
             .unwrap()
             .unwrap();
         let authority = carrick_kernel::kernel::MmAccessAuthority::new();
@@ -2762,7 +2762,7 @@ mod tests {
                         .child
                         .borrow_current_native_data(&execution, &mut cow)
                         .expect("authenticated resident native data span after production COW");
-                    assert_eq!(data.start(), GuestVa(TEST_VA));
+                    assert_eq!(data.start(), GuestVa::new(TEST_VA));
                     assert_eq!(data.len(), 4);
                     // This bounded native CPU operation qualifies the data grant only.
                     // It does not publish translated code or call the syscall dispatcher.
@@ -2782,7 +2782,7 @@ mod tests {
         let current = foreign_mm(&kernel, &root, &wrong, fixture.child.task().key());
         let read = current
             .access_token()
-            .read_range(GuestVa(TEST_VA), 4)
+            .read_range(GuestVa::new(TEST_VA), 4)
             .unwrap()
             .unwrap();
         let mut bytes = [0; 4];
@@ -2810,7 +2810,7 @@ mod tests {
             let current = fixture.child.current_mm(&execution).unwrap();
             let range = current
                 .access_token()
-                .write_range(GuestVa(TEST_VA), 4)
+                .write_range(GuestVa::new(TEST_VA), 4)
                 .unwrap()
                 .unwrap();
             let authority = carrick_kernel::kernel::MmAccessAuthority::new();
@@ -2879,7 +2879,7 @@ mod tests {
             let current = fixture.child.current_mm(&execution).unwrap();
             let range = current
                 .access_token()
-                .write_range(GuestVa(TEST_VA + 4092), 8)
+                .write_range(GuestVa::new(TEST_VA + 4092), 8)
                 .unwrap()
                 .unwrap();
             let authority = carrick_kernel::kernel::MmAccessAuthority::new();
@@ -2950,7 +2950,7 @@ mod tests {
                 let current = fixture.child.current_mm(execution).unwrap();
                 let range = current
                     .access_token()
-                    .write_range(GuestVa(TEST_VA), 4)
+                    .write_range(GuestVa::new(TEST_VA), 4)
                     .unwrap()
                     .unwrap();
                 authority
@@ -3001,7 +3001,7 @@ mod tests {
         let current = a.child.current_mm(&ae).unwrap();
         let range = current
             .access_token()
-            .write_range(GuestVa(TEST_VA), 4)
+            .write_range(GuestVa::new(TEST_VA), 4)
             .unwrap()
             .unwrap();
         authority
@@ -3039,7 +3039,7 @@ mod tests {
             ThreadId::synthetic_for_tests(31_079),
         );
         let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
-        let range = foreign.write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
+        let range = foreign.write_range(GuestVa::new(TEST_VA), 4).unwrap().unwrap();
 
         let write = with_foreign_mutation(&foreign, |mutation| {
             let mut cow = carrick_kernel::kernel::MmAccessAuthority::new()
@@ -3054,7 +3054,7 @@ mod tests {
         assert_eq!(write.bytes_written(), 4);
         assert_eq!(
             fixture.stage1.binding().stage1_root.gpa(),
-            Gpa(0x9a00_3000_0000)
+            Gpa::new(0x9a00_3000_0000)
         );
         assert_ne!(fixture.dispatch_mm.vma_revision().raw(), 0);
         let _keep_carrier_live = &fixture.carrier;
@@ -3105,7 +3105,7 @@ mod tests {
                             mutation,
                             &foreign,
                             &access,
-                            GuestVa(TEST_VA),
+                            GuestVa::new(TEST_VA),
                             b"edit",
                         )
                 })
@@ -3181,7 +3181,7 @@ mod tests {
                             mutation,
                             &foreign,
                             &access,
-                            GuestVa(TEST_VA),
+                            GuestVa::new(TEST_VA),
                             b"edit",
                         )
                 })
@@ -3267,7 +3267,7 @@ mod tests {
             "the caller owns the sole vCPU"
         );
         let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
-        let range = foreign.write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
+        let range = foreign.write_range(GuestVa::new(TEST_VA), 4).unwrap().unwrap();
 
         with_foreign_mutation(&foreign, |mutation| {
             carrick_kernel::kernel::MmAccessAuthority::new()
@@ -3414,7 +3414,7 @@ mod tests {
         });
         ready_rx.recv().expect("active target is in guest");
         let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
-        let range = foreign.write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
+        let range = foreign.write_range(GuestVa::new(TEST_VA), 4).unwrap().unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
             carrick_kernel::kernel::MmAccessAuthority::new()
@@ -3495,7 +3495,7 @@ mod tests {
             &shared.shared().mm()
         ));
         let foreign = foreign_mm(&kernel, &root, &execution, shared.task().key());
-        let range = foreign.write_range(GuestVa(TEST_VA), 4).unwrap().unwrap();
+        let range = foreign.write_range(GuestVa::new(TEST_VA), 4).unwrap().unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
             carrick_kernel::kernel::MmAccessAuthority::new()
@@ -3519,7 +3519,7 @@ mod tests {
                 Ok(MmRelation::Foreign(foreign)) => {
                     assert_eq!(foreign.mm_id(), expected_mm, "race selected the wrong MM");
                     let range = foreign
-                        .write_range(GuestVa(TEST_VA), 4)
+                        .write_range(GuestVa::new(TEST_VA), 4)
                         .expect("race target range validation")
                         .expect("race target has writable production VMA");
                     let result = carrick_kernel::kernel::MmAccessAuthority::new()
@@ -3632,7 +3632,7 @@ mod tests {
         let (child, _backend, _owner, _bytes, _counters) =
             cow_fixture(&kernel, &root, 31_083, MockCowFault::None);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
         let wrong_mm =
             MmId::from_registry_allocation(NonZeroU64::new(foreign.mm_id().raw() + 1).unwrap());
         with_mm_mutation(wrong_mm, |mutation| {
@@ -3647,7 +3647,7 @@ mod tests {
             cow_fixture(&kernel, &root, 31_084, MockCowFault::None);
         let other_foreign = foreign_mm(&kernel, &root, &execution, other.task().key());
         let other_range = other_foreign
-            .write_range(GuestVa(0x3000), 4)
+            .write_range(GuestVa::new(0x3000), 4)
             .unwrap()
             .unwrap();
         with_foreign_mutation(&foreign, |mutation| {
@@ -3665,7 +3665,7 @@ mod tests {
             let (target, _backend, _owner, _bytes, _counters) =
                 cow_fixture(&kernel, &root, 31_085 + fault as i32, fault);
             let target = foreign_mm(&kernel, &root, &execution, target.task().key());
-            let target_range = target.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+            let target_range = target.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
             with_foreign_mutation(&target, |mutation| {
                 assert!(matches!(
                     carrick_kernel::kernel::MmAccessAuthority::new().break_foreign_cow(
@@ -3691,7 +3691,7 @@ mod tests {
         let mapping = reservation.claim_mapping().unwrap();
         let generation =
             carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::new(1).unwrap());
-        let gpa = Gpa(0xd000);
+        let gpa = Gpa::new(0xd000);
         let length =
             carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(0x4000).unwrap());
         reservation
@@ -3731,7 +3731,7 @@ mod tests {
         let (receipt, proof, authenticated_owner) = authority
             .apply_foreign_cow(
                 reservation.commit(()),
-                GuestVa(0x3000),
+                GuestVa::new(0x3000),
                 std::num::NonZeroUsize::new(0x4000).unwrap(),
                 mapping,
                 frame,
@@ -3751,7 +3751,7 @@ mod tests {
             proof.authenticates(
                 &kernel,
                 mm,
-                GuestVa(0x3000),
+                GuestVa::new(0x3000),
                 0x4000,
                 receipt.revision(),
                 mapping,
@@ -3766,7 +3766,7 @@ mod tests {
             !proof.authenticates(
                 &kernel,
                 mm,
-                GuestVa(0x3000),
+                GuestVa::new(0x3000),
                 0x4000,
                 receipt.revision(),
                 mapping,
@@ -3852,7 +3852,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut next = 0x1_0000_0000_u64;
                 while !stop.load(Ordering::Acquire) {
-                    let (reservation, ..) = stage_grant_row(&kernel, Gpa(next));
+                    let (reservation, ..) = stage_grant_row(&kernel, Gpa::new(next));
                     kernel
                         .frame_inventory()
                         .apply(mm, reservation.commit(()))
@@ -3863,7 +3863,7 @@ mod tests {
         };
         let mut refused = 0_u64;
         for index in 0..GRANTS {
-            let gpa = Gpa(0x10_0000 + index * 0x4000);
+            let gpa = Gpa::new(0x10_0000 + index * 0x4000);
             let (reservation, mapping, frame, length) = stage_grant_row(&kernel, gpa);
             match authority.apply_frame_grant(reservation.commit(()), mapping, frame, gpa, length) {
                 Ok((receipt, generation)) => {
@@ -3895,7 +3895,7 @@ mod tests {
         let mapping = reservation.claim_mapping().unwrap();
         let generation =
             carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::new(1).unwrap());
-        let gpa = Gpa(0xe000);
+        let gpa = Gpa::new(0xe000);
         let length =
             carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(0x20_0000).unwrap());
         reservation
@@ -3989,7 +3989,7 @@ mod tests {
         assert_eq!(existing.inventory_revision.get(), receipt.revision());
         // A fragmented kernel row authenticates its exact logical extent,
         // while the owner lookup uses the larger physical lease independently.
-        let owner_gpa = Gpa(0x8000);
+        let owner_gpa = Gpa::new(0x8000);
         let owner_length =
             carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(0x400000).unwrap());
         let (_, fragmented) = authority
@@ -4015,7 +4015,7 @@ mod tests {
                     frame,
                     gpa,
                     length,
-                    owner_gpa: Gpa(gpa.0 + 4096),
+                    owner_gpa: Gpa::new(gpa.raw() + 4096),
                     owner_length,
                 })
                 .is_err()
@@ -4030,7 +4030,7 @@ mod tests {
                 .authenticate_frame_backing(carrick_hal::FrameBackingAuthentication {
                     mapping,
                     frame,
-                    gpa: Gpa(gpa.0 + 4096),
+                    gpa: Gpa::new(gpa.raw() + 4096),
                     length,
                     owner_gpa: gpa,
                     owner_length: length
@@ -4080,7 +4080,7 @@ mod tests {
         let mapping = reservation.claim_mapping().unwrap();
         let generation =
             carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::new(1).unwrap());
-        let physical_base = Gpa(0x20_000);
+        let physical_base = Gpa::new(0x20_000);
         let physical_len =
             carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(0x4000).unwrap());
         reservation
@@ -4126,7 +4126,7 @@ mod tests {
             })),
         );
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa(0x3000), 4).unwrap().unwrap();
+        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
 
         with_foreign_mutation(&foreign, |mutation| {
             assert!(matches!(

@@ -844,12 +844,12 @@ fn install_mm_sparse(
     let asid = NonZeroU16::new(ordinal as u16).expect("nonzero test ASID");
     let binding = CarrierForeignMmBinding {
         asid: carrick_hal::ForeignAsid::from_kernel_allocation(asid),
-        stage1_root: Gpa(root),
+        stage1_root: Gpa::new(root),
     };
     let snapshot = TestSnapshot {
         mm: nonzero(ordinal),
         asid,
-        stage1_root: Gpa(root),
+        stage1_root: Gpa::new(root),
         backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(17),
         vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(19),
         frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(
@@ -859,8 +859,8 @@ fn install_mm_sparse(
         executable_ranges: Vec::new(),
         readable_ranges: vec![
             carrick_hal::ForeignReadableRange::from_kernel_projection(
-                GuestVa(TEST_VA),
-                GuestVa(TEST_VA + vma_len as u64),
+                GuestVa::new(TEST_VA),
+                GuestVa::new(TEST_VA + vma_len as u64),
             )
             .unwrap(),
         ],
@@ -875,7 +875,7 @@ fn install_mm_sparse(
     if vma_len > data_len {
         let deferred = Arc::new(carrick_guest_mem::DeferredAnonymousState::new());
         deferred
-            .reserve_fresh(GuestVa(TEST_VA + data_len as u64), vma_len - data_len)
+            .reserve_fresh(GuestVa::new(TEST_VA + data_len as u64), vma_len - data_len)
             .unwrap();
         *state.deferred_anonymous.write() = Some((
             carrick_hal::ForeignMmId::from_kernel_allocation(nonzero(ordinal)),
@@ -905,7 +905,7 @@ fn read_installed(
     lease.read(
         &installed.live,
         &installed.snapshot,
-        GuestVa(TEST_VA),
+        GuestVa::new(TEST_VA),
         dst,
         deadline,
     )
@@ -922,7 +922,7 @@ fn read_instructions_installed(
     lease.read_instructions(
         &installed.live,
         &installed.snapshot,
-        GuestVa(TEST_VA),
+        GuestVa::new(TEST_VA),
         dst,
         deadline,
     )
@@ -1278,7 +1278,7 @@ fn guest_owned_foreign_cow_without_a_lent_vcpu_refuses_without_mutation() {
         lease.break_cow(
             &mut invalidator,
             &child.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             Instant::now() + Duration::from_secs(1),
         ),
@@ -1389,7 +1389,7 @@ fn guest_owned_foreign_cow_publishes_through_the_lent_vcpu_before_retirement() {
         .break_cow(
             &mut lending,
             &child.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             Instant::now() + Duration::from_secs(1),
         )
@@ -1477,7 +1477,7 @@ fn guest_owned_foreign_cow_refusal_before_submission_rolls_back_every_stage() {
         let result = lease.break_cow(
             &mut lending,
             &installed.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             Instant::now() + Duration::from_secs(1),
         );
@@ -1569,7 +1569,7 @@ fn guest_owned_foreign_cow_el1_refusal_rolls_back_every_stage() {
         let result = lease.break_cow(
             &mut lending,
             &installed.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             Instant::now() + Duration::from_secs(1),
         );
@@ -1641,7 +1641,7 @@ fn guest_owned_foreign_cow_refuses_a_retiring_target_before_borrowing_its_ttbr0(
         lease.break_cow(
             &mut lending,
             &installed.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             Instant::now() + Duration::from_secs(1),
         ),
@@ -1695,7 +1695,7 @@ fn foreign_el1_publisher_authenticates_the_exact_target_before_submission() {
     };
     // Another MM's root under the target's identity is not the target.
     let mut wrong_root = requested.binding;
-    wrong_root.stage1_root = Gpa(other.owners.0[0].0);
+    wrong_root.stage1_root = Gpa::new(other.owners.0[0].0);
     assert!(matches!(
         ForeignEl1Publisher::authenticate(&mut lending, &target.state, requested.mm, wrong_root),
         Err(carrick_hal::ForeignMmTransportError::MissingBinding)
@@ -1805,7 +1805,7 @@ fn guest_owned_foreign_pristine_write_publishes_user_writable_through_the_lent_v
         .break_cow(
             &mut lending,
             &installed.snapshot,
-            GuestVa(target_va),
+            GuestVa::new(target_va),
             4,
             Instant::now() + Duration::from_secs(1),
         )
@@ -1823,7 +1823,7 @@ fn guest_owned_foreign_pristine_write_publishes_user_writable_through_the_lent_v
             ..
         }]
     ));
-    assert_eq!(receipt.range_start(), GuestVa(target_va));
+    assert_eq!(receipt.range_start(), GuestVa::new(target_va));
     let new_key = (receipt.physical_base().raw(), receipt.physical_len());
     assert_eq!(
         tables
@@ -2185,7 +2185,7 @@ fn foreign_cow_write_keeps_the_shared_parent_owner_unchanged() {
         .break_cow(
             &mut invalidator,
             &child.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             deadline,
         )
@@ -2218,7 +2218,7 @@ fn foreign_cow_write_keeps_the_shared_parent_owner_unchanged() {
             &child.live,
             &post,
             cow.as_ref(),
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             b"new!",
             deadline,
         )
@@ -2266,8 +2266,8 @@ fn rx_ptrace_text_cow_case(guest: bool) {
     );
     child.snapshot.executable_ranges = vec![
         carrick_hal::ForeignExecutableRange::from_kernel_projection(
-            GuestVa(TEST_VA),
-            GuestVa(TEST_VA + 0x2000),
+            GuestVa::new(TEST_VA),
+            GuestVa::new(TEST_VA + 0x2000),
         )
         .expect("nonempty executable fixture range"),
     ];
@@ -2363,7 +2363,7 @@ fn rx_ptrace_text_cow_case(guest: bool) {
         .expect("retain RX ptrace text state");
     let ptrace_authority = TestPtraceTextAuthority {
         snapshot: child.snapshot.clone(),
-        start: GuestVa(request_va),
+        start: GuestVa::new(request_va),
         len: 4,
     };
     let plan = lease
@@ -2409,7 +2409,7 @@ fn rx_ptrace_text_cow_case(guest: bool) {
         .break_cow_prepared_ptrace_text(
             &mut invalidator,
             &child.snapshot,
-            GuestVa(request_va),
+            GuestVa::new(request_va),
             4,
             &plan,
             deadline,
@@ -2437,7 +2437,7 @@ fn rx_ptrace_text_cow_case(guest: bool) {
         after_ap, before_ap,
         "a same-IPA alias at another semantic VA must not widen RX stage-1 AP",
     );
-    assert_eq!(cow.range_start(), GuestVa(TEST_VA));
+    assert_eq!(cow.range_start(), GuestVa::new(TEST_VA));
     assert_eq!(cow.range_len(), 0x2000);
 
     let new_key = (cow.physical_base().raw(), cow.physical_len());
@@ -2488,8 +2488,8 @@ fn ptrace_text_cow_rejects_source_alias_shorter_than_authenticated_span() {
     );
     child.snapshot.executable_ranges = vec![
         carrick_hal::ForeignExecutableRange::from_kernel_projection(
-            GuestVa(TEST_VA),
-            GuestVa(TEST_VA + 0x2000),
+            GuestVa::new(TEST_VA),
+            GuestVa::new(TEST_VA + 0x2000),
         )
         .expect("two-leaf executable fixture range"),
     ];
@@ -2559,7 +2559,7 @@ fn ptrace_text_cow_rejects_source_alias_shorter_than_authenticated_span() {
         .expect("retain short-alias RX state");
     let ptrace_authority = TestPtraceTextAuthority {
         snapshot: child.snapshot.clone(),
-        start: GuestVa(TEST_VA + 0x100),
+        start: GuestVa::new(TEST_VA + 0x100),
         len: 4,
     };
     let plan = lease
@@ -2578,7 +2578,7 @@ fn ptrace_text_cow_rejects_source_alias_shorter_than_authenticated_span() {
     let rejected = lease.break_cow_prepared_ptrace_text(
         &mut invalidator,
         &child.snapshot,
-        GuestVa(TEST_VA + 0x100),
+        GuestVa::new(TEST_VA + 0x100),
         4,
         &plan,
         deadline,
@@ -2621,8 +2621,8 @@ fn ptrace_text_cow_uses_authenticated_span_when_preexisting_arm_differs() {
     );
     child.snapshot.executable_ranges = vec![
         carrick_hal::ForeignExecutableRange::from_kernel_projection(
-            GuestVa(TEST_VA),
-            GuestVa(TEST_VA + 0x2000),
+            GuestVa::new(TEST_VA),
+            GuestVa::new(TEST_VA + 0x2000),
         )
         .expect("two-leaf executable fixture range"),
     ];
@@ -2702,7 +2702,7 @@ fn ptrace_text_cow_uses_authenticated_span_when_preexisting_arm_differs() {
         .expect("retain mismatched-arm RX state");
     let ptrace_authority = TestPtraceTextAuthority {
         snapshot: child.snapshot.clone(),
-        start: GuestVa(TEST_VA + 0x100),
+        start: GuestVa::new(TEST_VA + 0x100),
         len: 4,
     };
     let plan = lease
@@ -2717,13 +2717,13 @@ fn ptrace_text_cow_uses_authenticated_span_when_preexisting_arm_differs() {
         .break_cow_prepared_ptrace_text(
             &mut invalidator,
             &child.snapshot,
-            GuestVa(TEST_VA + 0x100),
+            GuestVa::new(TEST_VA + 0x100),
             4,
             &plan,
             deadline,
         )
         .expect("an ordinary fork arm must not override the authenticated executable span");
-    assert_eq!(cow.range_start(), GuestVa(TEST_VA));
+    assert_eq!(cow.range_start(), GuestVa::new(TEST_VA));
     assert_eq!(cow.range_len(), 0x2000);
     assert_eq!(
         invalidator.calls, 1,
@@ -2753,7 +2753,7 @@ fn foreign_cow_one_compound_authorizes_distinct_subrange_writes() {
         .break_cow(
             &mut invalidator,
             &child.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             deadline,
         )
@@ -2765,7 +2765,7 @@ fn foreign_cow_one_compound_authorizes_distinct_subrange_writes() {
             &child.live,
             &post,
             cow.as_ref(),
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             b"one!",
             deadline,
         )
@@ -2776,7 +2776,7 @@ fn foreign_cow_one_compound_authorizes_distinct_subrange_writes() {
             &child.live,
             &post,
             cow.as_ref(),
-            GuestVa(TEST_VA + 0x1000),
+            GuestVa::new(TEST_VA + 0x1000),
             b"two!",
             deadline,
         )
@@ -2823,7 +2823,7 @@ fn retained_foreign_lease_advances_across_two_compound_cow_commits() {
         .break_cow(
             &mut invalidator,
             &child.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             deadline,
         )
@@ -2840,7 +2840,7 @@ fn retained_foreign_lease_advances_across_two_compound_cow_commits() {
             &child.live,
             &after_first,
             first.as_ref(),
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             b"one!",
             deadline,
         )
@@ -2852,7 +2852,7 @@ fn retained_foreign_lease_advances_across_two_compound_cow_commits() {
         .break_cow(
             &mut invalidator,
             &after_first,
-            GuestVa(second_va),
+            GuestVa::new(second_va),
             4,
             deadline,
         )
@@ -2863,7 +2863,7 @@ fn retained_foreign_lease_advances_across_two_compound_cow_commits() {
             &child.live,
             &after_second,
             second.as_ref(),
-            GuestVa(second_va),
+            GuestVa::new(second_va),
             b"two!",
             deadline,
         )
@@ -2906,7 +2906,7 @@ fn retained_foreign_lease_rejects_unrelated_or_tampered_successor_snapshot() {
         .break_cow(
             &mut invalidator,
             &child.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             deadline,
         )
@@ -2922,7 +2922,7 @@ fn retained_foreign_lease_rejects_unrelated_or_tampered_successor_snapshot() {
 
     let second_va = TEST_VA + CowArmedRanges::COMPOUND_SIZE;
     let tampered_break =
-        lease.break_cow(&mut invalidator, &tampered, GuestVa(second_va), 4, deadline);
+        lease.break_cow(&mut invalidator, &tampered, GuestVa::new(second_va), 4, deadline);
     assert!(
         matches!(
             tampered_break,
@@ -2935,7 +2935,7 @@ fn retained_foreign_lease_rejects_unrelated_or_tampered_successor_snapshot() {
         &child.live,
         &tampered,
         first.as_ref(),
-        GuestVa(TEST_VA),
+        GuestVa::new(TEST_VA),
         b"fail",
         deadline,
     );
@@ -2982,7 +2982,7 @@ fn concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit() {
             calls: 0,
             fail_call: None,
         };
-        lease_clone1.break_cow(&mut invalidator, &snap1, GuestVa(TEST_VA), 4, deadline)
+        lease_clone1.break_cow(&mut invalidator, &snap1, GuestVa::new(TEST_VA), 4, deadline)
     });
     let handle2 = std::thread::spawn(move || {
         barrier2.wait();
@@ -2991,7 +2991,7 @@ fn concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit() {
             calls: 0,
             fail_call: None,
         };
-        lease_clone2.break_cow(&mut invalidator, &snap2, GuestVa(TEST_VA), 4, deadline)
+        lease_clone2.break_cow(&mut invalidator, &snap2, GuestVa::new(TEST_VA), 4, deadline)
     });
 
     let res1 = handle1.join().expect("thread 1 panic");
@@ -3035,7 +3035,7 @@ fn foreign_cow_failpoint_leaves_lease_at_sn_and_retry_succeeds() {
     let failed = lease.break_cow(
         &mut invalidator,
         &child.snapshot,
-        GuestVa(TEST_VA),
+        GuestVa::new(TEST_VA),
         4,
         deadline,
     );
@@ -3053,7 +3053,7 @@ fn foreign_cow_failpoint_leaves_lease_at_sn_and_retry_succeeds() {
         .break_cow(
             &mut invalidator,
             &child.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             deadline,
         )
@@ -3065,7 +3065,7 @@ fn foreign_cow_failpoint_leaves_lease_at_sn_and_retry_succeeds() {
             &child.live,
             &post,
             succeeded.as_ref(),
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             b"new!",
             deadline,
         )
@@ -3100,7 +3100,7 @@ fn foreign_cow_prepare_write_rejects_in_span_leaf_discontinuity() {
         .break_cow(
             &mut invalidator,
             &child.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             deadline,
         )
@@ -3140,7 +3140,7 @@ fn foreign_cow_prepare_write_rejects_in_span_leaf_discontinuity() {
         &child.live,
         &after_cow,
         cow.as_ref(),
-        GuestVa(TEST_VA),
+        GuestVa::new(TEST_VA),
         &crossed_src,
         deadline,
     );
@@ -3180,7 +3180,7 @@ fn foreign_cow_prepare_write_rejects_semantic_span_end_plus_one() {
         .break_cow(
             &mut invalidator,
             &child.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             deadline,
         )
@@ -3193,7 +3193,7 @@ fn foreign_cow_prepare_write_rejects_semantic_span_end_plus_one() {
         &child.live,
         &after_cow,
         cow.as_ref(),
-        GuestVa(end_plus_one_va),
+        GuestVa::new(end_plus_one_va),
         b"ab",
         deadline,
     );
@@ -3211,7 +3211,7 @@ fn foreign_cow_prepare_write_rejects_semantic_span_end_plus_one() {
         &child.live,
         &after_cow,
         cow.as_ref(),
-        GuestVa(at_end_va),
+        GuestVa::new(at_end_va),
         b"a",
         deadline,
     );
@@ -3245,7 +3245,7 @@ fn foreign_cow_prepare_write_rejects_out_of_span_alias() {
         .break_cow(
             &mut invalidator,
             &child.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             deadline,
         )
@@ -3296,7 +3296,7 @@ fn foreign_cow_prepare_write_rejects_out_of_span_alias() {
         &child.live,
         &after_cow,
         cow.as_ref(),
-        GuestVa(alias_va),
+        GuestVa::new(alias_va),
         b"test",
         deadline,
     );
@@ -3337,7 +3337,7 @@ fn foreign_cow_each_reversible_boundary_restores_exact_stage1_inventory_and_owne
         let result = lease.break_cow(
             &mut invalidator,
             &installed.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             Instant::now() + Duration::from_secs(1),
         );
@@ -3380,7 +3380,7 @@ fn foreign_cow_invalidation_failure_rolls_back_and_republishes_the_old_stage1() 
             .break_cow(
                 &mut invalidator,
                 &installed.snapshot,
-                GuestVa(TEST_VA),
+                GuestVa::new(TEST_VA),
                 4,
                 Instant::now() + Duration::from_secs(1),
             )
@@ -3405,7 +3405,7 @@ fn foreign_cow_commit_cannot_be_reported_as_retryable_by_final_snapshot_contenti
     let result = lease.break_cow(
         &mut invalidator,
         &installed.snapshot,
-        GuestVa(TEST_VA),
+        GuestVa::new(TEST_VA),
         4,
         Instant::now() + Duration::from_secs(1),
     );
@@ -3421,8 +3421,8 @@ fn make_execute_only(installed: &mut InstalledMm, len: usize) {
     installed.snapshot.readable_ranges.clear();
     installed.snapshot.executable_ranges = vec![
         carrick_hal::ForeignExecutableRange::from_kernel_projection(
-            GuestVa(TEST_VA),
-            GuestVa(TEST_VA + len as u64),
+            GuestVa::new(TEST_VA),
+            GuestVa::new(TEST_VA + len as u64),
         )
         .unwrap(),
     ];
@@ -3494,7 +3494,7 @@ fn instruction_fetch_carrier_reads_execute_only_deferred_bytes() {
     assert!(
         matches!(read_instructions_installed(&transport, &installed, &mut bytes),
         Err(carrick_hal::ForeignMmTransportError::Translation(va))
-            if va == GuestVa(TEST_VA + OWNER_LEN as u64))
+            if va == GuestVa::new(TEST_VA + OWNER_LEN as u64))
     );
 }
 
@@ -3678,13 +3678,13 @@ fn foreign_mm_read_unmaterialized_remote_page_within_vma_reads_zeros_and_full_le
     let beyond_res = lease.read(
         &installed.live,
         &installed.snapshot,
-        GuestVa(TEST_VA + vma_len as u64),
+        GuestVa::new(TEST_VA + vma_len as u64),
         &mut beyond,
         deadline,
     );
     assert!(matches!(
         beyond_res,
-        Err(carrick_hal::ForeignMmTransportError::Translation(va)) if va == GuestVa(TEST_VA + vma_len as u64)
+        Err(carrick_hal::ForeignMmTransportError::Translation(va)) if va == GuestVa::new(TEST_VA + vma_len as u64)
     ));
 }
 
@@ -3735,14 +3735,14 @@ fn foreign_mm_read_backed_page_without_stage1_or_recipe_reads_zeros() {
     let beyond_res = lease.read(
         &installed.live,
         &installed.snapshot,
-        GuestVa(TEST_VA + vma_len as u64),
+        GuestVa::new(TEST_VA + vma_len as u64),
         &mut beyond,
         deadline,
     );
     assert!(matches!(
         beyond_res,
         Err(carrick_hal::ForeignMmTransportError::Translation(va))
-            if va == GuestVa(TEST_VA + vma_len as u64)
+            if va == GuestVa::new(TEST_VA + vma_len as u64)
     ));
 }
 
@@ -3829,7 +3829,7 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
 
     let mut bytes = [0_u8; 4];
     let receipt = lease
-        .read(&live, &snapshot, GuestVa(TEST_VA), &mut bytes, deadline)
+        .read(&live, &snapshot, GuestVa::new(TEST_VA), &mut bytes, deadline)
         .expect("old retained token must keep exact carrier state readable");
     assert_eq!(&bytes, b"old!");
     assert!(receipt.authenticates(&snapshot));
@@ -4058,7 +4058,7 @@ fn foreign_mm_read_deadline_bounds_mutation_coordinator_contention() {
     let result = lease.read(
         &installed.live,
         &installed.snapshot,
-        GuestVa(TEST_VA),
+        GuestVa::new(TEST_VA),
         &mut bytes,
         started + TEST_DEADLINE,
     );
@@ -4327,7 +4327,7 @@ fn copied_fork_child_activation_publishes_exact_foreign_mm_binding() {
     let transport = Arc::new(CarrierForeignMmTransport::new());
     let mm = NonZeroU64::new(2).unwrap();
     let asid = NonZeroU16::new(5).unwrap();
-    let stage1_root = Gpa(0x8800_0020_0000);
+    let stage1_root = Gpa::new(0x8800_0020_0000);
     let transaction =
         carrick_hal::KernelTransactionId::from_kernel_allocation(NonZeroU64::new(701).unwrap());
     let receipt = carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
@@ -4450,8 +4450,8 @@ fn copied_fork_child_activation_publishes_exact_foreign_mm_binding() {
         mapping_ids: Vec::new(),
         executable_ranges: vec![
             carrick_hal::ForeignExecutableRange::from_kernel_projection(
-                GuestVa(0x0040_0000),
-                GuestVa(0x0040_4000),
+                GuestVa::new(0x0040_0000),
+                GuestVa::new(0x0040_4000),
             )
             .unwrap(),
         ],
@@ -4497,13 +4497,13 @@ impl carrick_mmu_core::aarch64::TableArenaSource for TestArenaSource {
             .lock()
             .unwrap()
             .pop()
-            .map(|gpa| carrick_mmu_core::aarch64::SubstrateGpa(gpa.0))
+            .map(|gpa| carrick_mmu_core::aarch64::SubstrateGpa(gpa.raw()))
     }
     fn return_arena(&mut self, base: carrick_mmu_core::aarch64::SubstrateGpa) {
         self.returned
             .lock()
             .unwrap()
-            .push(carrick_guest_mem::Gpa(base.0));
+            .push(carrick_guest_mem::Gpa::new(base.0));
     }
 }
 
@@ -4513,7 +4513,7 @@ fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() 
     let transport = Arc::new(CarrierForeignMmTransport::new());
     let mm = NonZeroU64::new(2).unwrap();
     let asid = NonZeroU16::new(5).unwrap();
-    let stage1_root = Gpa(0x8800_0020_0000);
+    let stage1_root = Gpa::new(0x8800_0020_0000);
     let transaction =
         carrick_hal::KernelTransactionId::from_kernel_allocation(NonZeroU64::new(701).unwrap());
     let receipt = carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
@@ -4612,7 +4612,7 @@ fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() 
     manager
         .rebase(stage1_root.raw(), None)
         .expect("rebase to stage1_root");
-    let ext_base = carrick_guest_mem::Gpa(0xb0_0000_0000);
+    let ext_base = carrick_guest_mem::Gpa::new(0xb0_0000_0000);
     let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
     let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let source = TestArenaSource {
@@ -4672,7 +4672,7 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
     let transport = Arc::new(CarrierForeignMmTransport::new());
     let mm = NonZeroU64::new(3).unwrap();
     let asid = NonZeroU16::new(6).unwrap();
-    let stage1_root = Gpa(0x8800_0040_0000);
+    let stage1_root = Gpa::new(0x8800_0040_0000);
     let transaction =
         carrick_hal::KernelTransactionId::from_kernel_allocation(NonZeroU64::new(702).unwrap());
     let receipt = carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
@@ -4771,7 +4771,7 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
     manager
         .rebase(stage1_root.raw(), None)
         .expect("rebase to stage1_root");
-    let ext_base = carrick_guest_mem::Gpa(0xc0_0000_0000);
+    let ext_base = carrick_guest_mem::Gpa::new(0xc0_0000_0000);
     let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
     let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let source = TestArenaSource {
@@ -4868,7 +4868,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     let transport = Arc::new(CarrierForeignMmTransport::new());
     let mm = NonZeroU64::new(4).unwrap();
     let asid = NonZeroU16::new(7).unwrap();
-    let stage1_root = Gpa(0x8800_0060_0000);
+    let stage1_root = Gpa::new(0x8800_0060_0000);
     let transaction =
         carrick_hal::KernelTransactionId::from_kernel_allocation(NonZeroU64::new(703).unwrap());
     let receipt = carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
@@ -4967,7 +4967,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     parent_manager
         .rebase(stage1_root.raw(), None)
         .expect("rebase to stage1_root");
-    let ext_base = carrick_guest_mem::Gpa(0xd0_0000_0000);
+    let ext_base = carrick_guest_mem::Gpa::new(0xd0_0000_0000);
     let available = std::sync::Arc::new(std::sync::Mutex::new(vec![ext_base]));
     let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let source = TestArenaSource {
@@ -5033,7 +5033,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     let child_root_base = 0x8800_0080_0000_u64;
     let mut child_page_tables = parent_authority.snapshot_image().unwrap();
     child_page_tables.declare_offline_private_image();
-    let child_ext_base = carrick_guest_mem::Gpa(0xe0_0000_0000);
+    let child_ext_base = carrick_guest_mem::Gpa::new(0xe0_0000_0000);
     let child_available = std::sync::Arc::new(std::sync::Mutex::new(vec![child_ext_base]));
     let child_returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut child_source = TestArenaSource {
@@ -6016,7 +6016,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
     let child_snapshot = TestSnapshot {
         mm: NonZeroU64::new(871).unwrap(),
         asid: NonZeroU16::new(2).unwrap(),
-        stage1_root: Gpa(root_slot_base),
+        stage1_root: Gpa::new(root_slot_base),
         backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(1),
         vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
         frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
@@ -7393,7 +7393,7 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
     let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(806).unwrap());
     let binding = CarrierForeignMmBinding {
         asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(7).unwrap()),
-        stage1_root: Gpa(physical_ipa),
+        stage1_root: Gpa::new(physical_ipa),
     };
     transport.register_identity(mm, binding, &state);
     let snapshot = CarrierForeignMmSnapshot {
@@ -7405,8 +7405,8 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
         mapping_ids,
         executable_ranges: vec![
             carrick_hal::ForeignExecutableRange::from_kernel_projection(
-                GuestVa(0x0040_0000),
-                GuestVa(0x0040_4000),
+                GuestVa::new(0x0040_0000),
+                GuestVa::new(0x0040_4000),
             )
             .unwrap(),
         ],
@@ -7453,7 +7453,7 @@ fn owned_foreign_mm_registration_teardown_is_exact_and_stale_safe() {
     let transport = Arc::new(CarrierForeignMmTransport::new());
     let binding = CarrierForeignMmBinding {
         asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(9).unwrap()),
-        stage1_root: Gpa(0x8800_0040_0000),
+        stage1_root: Gpa::new(0x8800_0040_0000),
     };
     let make_state = || {
         MmAccessState::new_unbound(
@@ -8355,7 +8355,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     let child_snapshot = TestSnapshot {
         mm: std::num::NonZeroU64::new(102).unwrap(),
         asid: std::num::NonZeroU16::new(5).unwrap(),
-        stage1_root: carrick_guest_mem::Gpa(root_slot_base),
+        stage1_root: carrick_guest_mem::Gpa::new(root_slot_base),
         backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(1),
         vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
         frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
@@ -8405,7 +8405,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
 
     // Tampered stage1 root rejected via state_for / retain
     let bad_root_snapshot = TestSnapshot {
-        stage1_root: carrick_guest_mem::Gpa(root_slot_base + 0x1000),
+        stage1_root: carrick_guest_mem::Gpa::new(root_slot_base + 0x1000),
         ..child_snapshot.clone()
     };
     let bad_root_res = endpoint.retain(&bad_root_snapshot, deadline);
@@ -11244,7 +11244,7 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
     let missing_snapshot = TestSnapshot {
         mm: std::num::NonZeroU64::new(888).unwrap(),
         asid: std::num::NonZeroU16::new(1).unwrap(),
-        stage1_root: carrick_guest_mem::Gpa(0x1000),
+        stage1_root: carrick_guest_mem::Gpa::new(0x1000),
         backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(1),
         vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
         frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
@@ -11415,7 +11415,7 @@ fn native_code_content_foreign_write_revokes_backing_dependencies() {
         .break_cow(
             &mut invalidator,
             &child.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             deadline,
         )
@@ -11434,7 +11434,7 @@ fn native_code_content_foreign_write_revokes_backing_dependencies() {
         .read_instructions(
             &child.live,
             &post,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             &mut captured,
             deadline,
         )
@@ -11453,7 +11453,7 @@ fn native_code_content_foreign_write_revokes_backing_dependencies() {
             &child.live,
             &post,
             cow.as_ref(),
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             b"new!",
             deadline,
         )
@@ -11505,7 +11505,7 @@ fn native_code_content_raw_data_pointer_revokes_and_blocks_observation() {
         .break_cow(
             &mut invalidator,
             &installed.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             deadline,
         )
@@ -11527,7 +11527,7 @@ fn native_code_content_raw_data_pointer_revokes_and_blocks_observation() {
             &installed.live,
             &post,
             cow.as_ref(),
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             deadline,
         )
@@ -12327,7 +12327,7 @@ fn guest_retained_reuse_publishes_one_deferred_alias_without_host_writes() {
         .published
         .lock()
         .expect("kernel grant survives the verified receipt");
-    assert_eq!((gpa, length), (Gpa(new_physical_ipa), new_len));
+    assert_eq!((gpa, length), (Gpa::new(new_physical_ipa), new_len));
     assert!(
         carrick_hal::FrameCowAuthority::mapping_is_live(
             &*fixture.authority,
@@ -12891,7 +12891,7 @@ mod guest_cow {
             .read(
                 &child.live,
                 &settled,
-                GuestVa(TEST_VA),
+                GuestVa::new(TEST_VA),
                 &mut bytes,
                 deadline,
             )
@@ -13108,7 +13108,7 @@ mod guest_cow {
             carrick_hal::ForeignMmId::from_kernel_allocation(mm),
             CarrierForeignMmBinding {
                 asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(7).unwrap()),
-                stage1_root: Gpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
+                stage1_root: Gpa::new(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
             },
         );
         assert_eq!(
@@ -13172,7 +13172,7 @@ mod guest_cow {
         let (second, second_tables, second_handle) = make_pending(808);
         let binding = CarrierForeignMmBinding {
             asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(7).unwrap()),
-            stage1_root: Gpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
+            stage1_root: Gpa::new(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
         };
         first.install_identity(
             carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(807).unwrap()),
@@ -13534,7 +13534,7 @@ mod guest_cow {
             carrick_hal::ForeignMmId::from_kernel_allocation(mm),
             CarrierForeignMmBinding {
                 asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(7).unwrap()),
-                stage1_root: Gpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
+                stage1_root: Gpa::new(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
             },
         );
         assert_eq!(pending.live_descriptor_owner(), LiveDescriptorOwner::Guest);
@@ -13583,7 +13583,7 @@ mod guest_cow {
                     asid: carrick_hal::ForeignAsid::from_kernel_allocation(
                         NonZeroU16::new(1).unwrap(),
                     ),
-                    stage1_root: Gpa(root),
+                    stage1_root: Gpa::new(root),
                 },
                 &state,
             )
@@ -14367,7 +14367,7 @@ fn exercise_retained_import(journal_case: u8) {
     stale.owner.as_mut().unwrap().1 = nonzero(stale.owner.unwrap().1.get() + 1);
     assert!(
         source
-            .retain_import_source(Gpa(source_ipa), 4096, stale)
+            .retain_import_source(Gpa::new(source_ipa), 4096, stale)
             .is_err()
     );
     assert!(zone.spaces.find(guard.mm.get()).is_none());
@@ -14417,7 +14417,7 @@ fn exercise_retained_import(journal_case: u8) {
             binding,
             carrick_hal::PreAdmissionPermit::new(&guard).unwrap(),
             source
-                .retain_import_source(Gpa(source_ipa), 4096, receipt)
+                .retain_import_source(Gpa::new(source_ipa), 4096, receipt)
                 .unwrap(),
             ReservationRange::new(VA, VA + 4096).unwrap(),
             ReservationProtection::READ_WRITE,
@@ -14488,7 +14488,7 @@ fn exercise_retained_import(journal_case: u8) {
             binding,
             carrick_hal::PreAdmissionPermit::new(&guard).unwrap(),
             target
-                .retain_import_source(Gpa(first_ipa), 4096, first_receipt)
+                .retain_import_source(Gpa::new(first_ipa), 4096, first_receipt)
                 .unwrap(),
             ReservationRange::new(VA + 0x4000, VA + 0x5000).unwrap(),
             ReservationProtection::READ_WRITE,
@@ -14544,7 +14544,7 @@ fn exercise_retained_import(journal_case: u8) {
             binding,
             carrick_hal::PreAdmissionPermit::new(&guard).unwrap(),
             source
-                .retain_import_source(Gpa(source_ipa), 4096, receipt)
+                .retain_import_source(Gpa::new(source_ipa), 4096, receipt)
                 .unwrap(),
             ReservationRange::new(VA, VA + 4096).unwrap(),
             ReservationProtection::READ_WRITE,
@@ -14603,7 +14603,7 @@ fn exercise_retained_import(journal_case: u8) {
         b"away"
     );
     let retained = source
-        .retain_import_source(Gpa(source_ipa), 4096, receipt)
+        .retain_import_source(Gpa::new(source_ipa), 4096, receipt)
         .unwrap();
     assert_eq!(
         source_custody.retire_stage2_record_using(identity, |_, _| Ok(())),
@@ -14615,7 +14615,7 @@ fn exercise_retained_import(journal_case: u8) {
         .remove(&(source_ipa, 16384));
     assert!(
         source
-            .retain_import_source(Gpa(source_ipa), 4096, receipt)
+            .retain_import_source(Gpa::new(source_ipa), 4096, receipt)
             .is_err()
     );
     drop(source_owner);

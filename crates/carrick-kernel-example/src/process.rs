@@ -132,7 +132,7 @@ pub struct ExampleStage1Projection {
 impl ExampleStage1Projection {
     /// The projection for ASID `asid`.
     pub fn new(asid: NonZeroU16) -> Result<Self, Stage1RootError> {
-        let root = Stage1Root::for_aarch64_4k(Gpa(u64::from(asid.get()) << 12))?;
+        let root = Stage1Root::for_aarch64_4k(Gpa::new(u64::from(asid.get()) << 12))?;
         let binding = MmBinding::for_aarch64(Asid::from_registry_allocation(asid), root);
         Ok(Self {
             asid,

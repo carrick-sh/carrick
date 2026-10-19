@@ -104,7 +104,7 @@ impl PrivateAnonymousWitness {
                     carrick_hal::MappingId::from_kernel_allocation(backing.mapping_id),
                     carrick_hal::FrameId::from_kernel_allocation(backing.frame_id),
                     carrick_hal::MappingGeneration::from_backend_counter(backing.owner_generation),
-                    carrick_guest_mem::Gpa(output.raw()),
+                    carrick_guest_mem::Gpa::new(output.raw()),
                     carrick_hal::FrameLength::from_mapping_extent(length),
                 ) {
                     return Err(fail("private witness inventory not settled"));

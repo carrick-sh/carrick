@@ -425,7 +425,7 @@ impl CarrierMaintenanceRoot {
     }
 
     pub const fn raw(self) -> u64 {
-        self.0.0
+        self.0.raw()
     }
 }
 // Field byte offsets within the per-process identity page (one little-endian
@@ -795,12 +795,12 @@ pub const LINUX_EL1_IMAGE_SIZE: u64 = carrick_el1_abi::EL1_IMAGE_SIZE;
 /// Carrier-only transient aliases; one pair for each exact executor slot.
 pub const LINUX_EL1_SERVICE_COPY: carrick_guest_mem::GuestVaRange =
     carrick_guest_mem::GuestVaRange::from_len(
-        carrick_guest_mem::GuestVa(carrick_el1_abi::EL1_SERVICE_COPY_BASE),
+        carrick_guest_mem::GuestVa::new(carrick_el1_abi::EL1_SERVICE_COPY_BASE),
         carrick_el1_abi::EL1_SERVICE_COPY_SIZE as usize,
     );
 /// Retained L3 table plus slot claims, inside the shared EL1 region.
 pub const LINUX_EL1_SERVICE_COPY_TABLE: ServiceCopyTableExtent = ServiceCopyTableExtent {
-    base: Gpa(carrick_el1_abi::EL1_SERVICE_COPY_TABLE_BASE),
+    base: Gpa::new(carrick_el1_abi::EL1_SERVICE_COPY_TABLE_BASE),
     len: core::mem::size_of::<carrick_el1_abi::ServiceCopyTable>(),
 };
 /// Physical custody geometry, distinct from the transient virtual alias span.
@@ -6408,8 +6408,8 @@ mod tests {
         execute: bool,
     ) -> MemoryRegionMetadata {
         MemoryRegionMetadata {
-            start: GuestVa(start),
-            end: GuestVa(end),
+            start: GuestVa::new(start),
+            end: GuestVa::new(end),
             perms: SegmentPerms {
                 read,
                 write,
@@ -6421,13 +6421,13 @@ mod tests {
 
     fn valid_metadata() -> AddressSpaceMetadata {
         AddressSpaceMetadata {
-            entry: GuestVa(0x1000),
-            initial_stack_pointer: GuestVa(0x8ff0),
+            entry: GuestVa::new(0x1000),
+            initial_stack_pointer: GuestVa::new(0x8ff0),
             linux_auxv_image: vec![1, 2, 3, 4],
             regions: vec![
                 MemoryRegionMetadata {
-                    start: GuestVa(0x1000),
-                    end: GuestVa(0x2000),
+                    start: GuestVa::new(0x1000),
+                    end: GuestVa::new(0x2000),
                     perms: SegmentPerms {
                         read: true,
                         write: false,
@@ -6436,8 +6436,8 @@ mod tests {
                     shared: false,
                 },
                 MemoryRegionMetadata {
-                    start: GuestVa(0x8000),
-                    end: GuestVa(0x9000),
+                    start: GuestVa::new(0x8000),
+                    end: GuestVa::new(0x9000),
                     perms: SegmentPerms {
                         read: true,
                         write: true,
@@ -6550,7 +6550,7 @@ mod tests {
     #[test]
     fn address_space_metadata_rejects_stack_pointer_outside_writable_region() {
         let mut metadata = valid_metadata();
-        metadata.initial_stack_pointer = GuestVa(0x7000);
+        metadata.initial_stack_pointer = GuestVa::new(0x7000);
 
         assert!(matches!(
             AddressSpace::from_metadata(metadata),
@@ -6561,8 +6561,8 @@ mod tests {
     #[test]
     fn address_space_metadata_accepts_ro_span_in_readable_writable_merged_region() {
         let metadata = AddressSpaceMetadata {
-            entry: GuestVa(0x4000),
-            initial_stack_pointer: GuestVa(0x5ff0),
+            entry: GuestVa::new(0x4000),
+            initial_stack_pointer: GuestVa::new(0x5ff0),
             linux_auxv_image: Vec::new(),
             regions: vec![region(0x4000, 0x6000, true, true, true)],
             ro_spans: vec![RoSpan {

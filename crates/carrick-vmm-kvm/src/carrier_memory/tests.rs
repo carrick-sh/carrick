@@ -484,7 +484,7 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
                 frame,
                 mapping,
                 generation,
-                gpa: carrick_guest_mem::Gpa(gpa),
+                gpa: carrick_guest_mem::Gpa::new(gpa),
                 length: FrameLength::from_mapping_extent(nz(PAGE)),
                 permissions: MemPerms {
                     read: true,
@@ -959,7 +959,7 @@ fn inherited_compound_inventory_authenticates_only_exact_live_owner_pages() {
                 frame,
                 mapping,
                 generation,
-                gpa: carrick_guest_mem::Gpa(0x800000),
+                gpa: carrick_guest_mem::Gpa::new(0x800000),
                 length: FrameLength::from_mapping_extent(nz(0x4000)),
                 permissions: MemPerms {
                     read: true,
@@ -1290,7 +1290,7 @@ fn refused_retire_child_mutates_nothing_and_its_retry_completes() {
             frame,
             mapping,
             generation,
-            gpa: carrick_guest_mem::Gpa(0x800000),
+            gpa: carrick_guest_mem::Gpa::new(0x800000),
             length: FrameLength::from_mapping_extent(nz(PAGE)),
             permissions: carrick_hal::MemPerms {
                 read: true,
@@ -1392,7 +1392,7 @@ fn inherited_inventory_edge_survives_protect_advancing_mapping_generation() {
                 frame,
                 mapping,
                 generation,
-                gpa: carrick_guest_mem::Gpa(gpa),
+                gpa: carrick_guest_mem::Gpa::new(gpa),
                 length: FrameLength::from_mapping_extent(nz(PAGE)),
                 permissions: MemPerms {
                     read: true,

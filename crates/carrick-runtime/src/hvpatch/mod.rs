@@ -2062,8 +2062,8 @@ mod tests {
         assert_eq!(
             replacement.vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x9000),
-                end: carrick_guest_mem::GuestVa(0xa000),
+                start: carrick_guest_mem::GuestVa::new(0x9000),
+                end: carrick_guest_mem::GuestVa::new(0xa000),
                 access: VMA_RX_ACCESS,
             }],
         );
@@ -2095,8 +2095,8 @@ mod tests {
         assert_eq!(
             retained_parent.vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x7000),
-                end: carrick_guest_mem::GuestVa(0x8000),
+                start: carrick_guest_mem::GuestVa::new(0x7000),
+                end: carrick_guest_mem::GuestVa::new(0x8000),
                 access: VMA_RX_ACCESS,
             }],
             "shared-child exec must not freeze the backend retained by the surviving parent",
@@ -2115,8 +2115,8 @@ mod tests {
         let source: carrick_kernel::kernel::SharedVmaSnapshotSource =
             std::sync::Arc::new(ChangeAfterExecValidationVmaSource::new(vec![
                 carrick_kernel::kernel::VmaSummary {
-                    start: carrick_guest_mem::GuestVa(0x1000),
-                    end: carrick_guest_mem::GuestVa(0x2000),
+                    start: carrick_guest_mem::GuestVa::new(0x1000),
+                    end: carrick_guest_mem::GuestVa::new(0x2000),
                     access: VMA_RX_ACCESS,
                 },
             ]));
@@ -2336,8 +2336,8 @@ mod tests {
         assert_eq!(
             observed.vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x9000),
-                end: carrick_guest_mem::GuestVa(0xa000),
+                start: carrick_guest_mem::GuestVa::new(0x9000),
+                end: carrick_guest_mem::GuestVa::new(0xa000),
                 access: VMA_RX_ACCESS,
             }],
             "a private exec replacement must accept its later dispatcher authority",
@@ -2396,13 +2396,13 @@ mod tests {
             (parent_after_child.vmas, child_after_parent.vmas),
             (
                 vec![carrick_kernel::kernel::VmaSummary {
-                    start: carrick_guest_mem::GuestVa(0x3000),
-                    end: carrick_guest_mem::GuestVa(0x4000),
+                    start: carrick_guest_mem::GuestVa::new(0x3000),
+                    end: carrick_guest_mem::GuestVa::new(0x4000),
                     access: VMA_RX_ACCESS,
                 }],
                 vec![carrick_kernel::kernel::VmaSummary {
-                    start: carrick_guest_mem::GuestVa(0x5000),
-                    end: carrick_guest_mem::GuestVa(0x6000),
+                    start: carrick_guest_mem::GuestVa::new(0x5000),
+                    end: carrick_guest_mem::GuestVa::new(0x6000),
                     access: VMA_RX_ACCESS,
                 }],
             ),
@@ -2449,13 +2449,13 @@ mod tests {
             (parent_observed.vmas, child_observed.vmas),
             (
                 vec![carrick_kernel::kernel::VmaSummary {
-                    start: carrick_guest_mem::GuestVa(0x1000),
-                    end: carrick_guest_mem::GuestVa(0x2000),
+                    start: carrick_guest_mem::GuestVa::new(0x1000),
+                    end: carrick_guest_mem::GuestVa::new(0x2000),
                     access: VMA_RX_ACCESS,
                 }],
                 vec![carrick_kernel::kernel::VmaSummary {
-                    start: carrick_guest_mem::GuestVa(0x3000),
-                    end: carrick_guest_mem::GuestVa(0x4000),
+                    start: carrick_guest_mem::GuestVa::new(0x3000),
+                    end: carrick_guest_mem::GuestVa::new(0x4000),
                     access: VMA_RX_ACCESS,
                 }],
             ),
@@ -2504,8 +2504,8 @@ mod tests {
                 .expect("live parent while exec is staged")
                 .vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x1000),
-                end: carrick_guest_mem::GuestVa(0x2000),
+                start: carrick_guest_mem::GuestVa::new(0x1000),
+                end: carrick_guest_mem::GuestVa::new(0x2000),
                 access: VMA_RX_ACCESS,
             }],
         );
@@ -2516,8 +2516,8 @@ mod tests {
                 .expect("private staged source")
                 .vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x3000),
-                end: carrick_guest_mem::GuestVa(0x4000),
+                start: carrick_guest_mem::GuestVa::new(0x3000),
+                end: carrick_guest_mem::GuestVa::new(0x4000),
                 access: VMA_RX_ACCESS,
             }],
         );
@@ -2529,8 +2529,8 @@ mod tests {
                 .expect("child remains on live shared source after abandon")
                 .vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x1000),
-                end: carrick_guest_mem::GuestVa(0x2000),
+                start: carrick_guest_mem::GuestVa::new(0x1000),
+                end: carrick_guest_mem::GuestVa::new(0x2000),
                 access: VMA_RX_ACCESS,
             }],
         );
@@ -2588,8 +2588,8 @@ mod tests {
                 .expect("promoted child source")
                 .vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x3000),
-                end: carrick_guest_mem::GuestVa(0x4000),
+                start: carrick_guest_mem::GuestVa::new(0x3000),
+                end: carrick_guest_mem::GuestVa::new(0x4000),
                 access: VMA_RX_ACCESS,
             }],
         );
@@ -2600,8 +2600,8 @@ mod tests {
                 .expect("retained parent source")
                 .vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x5000),
-                end: carrick_guest_mem::GuestVa(0x6000),
+                start: carrick_guest_mem::GuestVa::new(0x5000),
+                end: carrick_guest_mem::GuestVa::new(0x6000),
                 access: VMA_RX_ACCESS,
             }],
         );
@@ -2670,8 +2670,8 @@ mod tests {
                 .expect("promoted child source")
                 .vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x3000),
-                end: carrick_guest_mem::GuestVa(0x4000),
+                start: carrick_guest_mem::GuestVa::new(0x3000),
+                end: carrick_guest_mem::GuestVa::new(0x4000),
                 access: VMA_RX_ACCESS,
             }],
         );
@@ -2682,8 +2682,8 @@ mod tests {
                 .expect("retained parent source")
                 .vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x1000),
-                end: carrick_guest_mem::GuestVa(0x2000),
+                start: carrick_guest_mem::GuestVa::new(0x1000),
+                end: carrick_guest_mem::GuestVa::new(0x2000),
                 access: VMA_RX_ACCESS,
             }],
         );
@@ -2858,23 +2858,23 @@ mod tests {
             ),
             (
                 vec![carrick_kernel::kernel::VmaSummary {
-                    start: carrick_guest_mem::GuestVa(0x3000),
-                    end: carrick_guest_mem::GuestVa(0x4000),
+                    start: carrick_guest_mem::GuestVa::new(0x3000),
+                    end: carrick_guest_mem::GuestVa::new(0x4000),
                     access: VMA_RX_ACCESS,
                 }],
                 vec![carrick_kernel::kernel::VmaSummary {
-                    start: carrick_guest_mem::GuestVa(0x5000),
-                    end: carrick_guest_mem::GuestVa(0x6000),
+                    start: carrick_guest_mem::GuestVa::new(0x5000),
+                    end: carrick_guest_mem::GuestVa::new(0x6000),
                     access: VMA_RX_ACCESS,
                 }],
                 vec![carrick_kernel::kernel::VmaSummary {
-                    start: carrick_guest_mem::GuestVa(0x7000),
-                    end: carrick_guest_mem::GuestVa(0x8000),
+                    start: carrick_guest_mem::GuestVa::new(0x7000),
+                    end: carrick_guest_mem::GuestVa::new(0x8000),
                     access: VMA_RX_ACCESS,
                 }],
                 vec![carrick_kernel::kernel::VmaSummary {
-                    start: carrick_guest_mem::GuestVa(0x9000),
-                    end: carrick_guest_mem::GuestVa(0xa000),
+                    start: carrick_guest_mem::GuestVa::new(0x9000),
+                    end: carrick_guest_mem::GuestVa::new(0xa000),
                     access: VMA_RX_ACCESS,
                 }],
             ),
@@ -3174,7 +3174,7 @@ mod tests {
                 frame,
                 mapping,
                 generation,
-                gpa: carrick_guest_mem::Gpa(0x4000),
+                gpa: carrick_guest_mem::Gpa::new(0x4000),
                 length: carrick_hal::FrameLength::from_mapping_extent(
                     std::num::NonZeroU64::new(0x4000).unwrap(),
                 ),
@@ -3299,8 +3299,8 @@ mod tests {
         assert_eq!(
             replacement.vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x3000),
-                end: carrick_guest_mem::GuestVa(0x4000),
+                start: carrick_guest_mem::GuestVa::new(0x3000),
+                end: carrick_guest_mem::GuestVa::new(0x4000),
                 access: VMA_RX_ACCESS,
             }]
         );
@@ -3348,8 +3348,8 @@ mod tests {
         assert_eq!(
             observed.vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x5000),
-                end: carrick_guest_mem::GuestVa(0x6000),
+                start: carrick_guest_mem::GuestVa::new(0x5000),
+                end: carrick_guest_mem::GuestVa::new(0x6000),
                 access: VMA_RX_ACCESS,
             }]
         );
@@ -3390,8 +3390,8 @@ mod tests {
         assert_eq!(
             observed.vmas,
             vec![carrick_kernel::kernel::VmaSummary {
-                start: carrick_guest_mem::GuestVa(0x5000),
-                end: carrick_guest_mem::GuestVa(0x6000),
+                start: carrick_guest_mem::GuestVa::new(0x5000),
+                end: carrick_guest_mem::GuestVa::new(0x6000),
                 access: VMA_RX_ACCESS,
             }]
         );

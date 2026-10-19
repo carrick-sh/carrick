@@ -4257,7 +4257,7 @@ mod overlay_dispatch_tests {
                 _guest_addr: u64,
             ) -> Option<carrick_guest_mem::SharedFutexLocation> {
                 Some(carrick_guest_mem::SharedFutexLocation::Direct {
-                    word: HostVa(&self.word as *const u32 as usize),
+                    word: HostVa::new(&self.word as *const u32 as usize),
                     waiter_key: &self.word as *const u32 as usize,
                 })
             }
@@ -4456,7 +4456,7 @@ mod overlay_dispatch_tests {
                 _guest_addr: u64,
             ) -> Option<carrick_guest_mem::SharedFutexLocation> {
                 Some(carrick_guest_mem::SharedFutexLocation::Direct {
-                    word: HostVa(&self.word as *const u32 as usize),
+                    word: HostVa::new(&self.word as *const u32 as usize),
                     waiter_key: &self.word as *const u32 as usize,
                 })
             }
@@ -4465,7 +4465,7 @@ mod overlay_dispatch_tests {
         impl CurrentMmMemory for SharedWord {}
         let mut memory = SharedWord { word: 0 };
         let location = carrick_guest_mem::SharedFutexLocation::Direct {
-            word: HostVa(&memory.word as *const u32 as usize),
+            word: HostVa::new(&memory.word as *const u32 as usize),
             waiter_key: &memory.word as *const u32 as usize,
         };
         let reporter = CompatReporter::default();
@@ -7144,12 +7144,12 @@ mod container_policy_dispatch_tests {
         );
         let parent_state = Arc::clone(&dispatcher.mem().lock().deferred_anonymous);
         parent_state
-            .reserve_fresh(GuestVa(0x10000), 0x3000)
+            .reserve_fresh(GuestVa::new(0x10000), 0x3000)
             .unwrap();
         for page in [0x10000, 0x11000, 0x12000] {
             assert!(
                 parent_state
-                    .copy_pristine_zero(GuestVa(page), &mut [1; 4])
+                    .copy_pristine_zero(GuestVa::new(page), &mut [1; 4])
                     .unwrap()
             );
         }
@@ -7165,20 +7165,20 @@ mod container_policy_dispatch_tests {
         let child_state = Arc::clone(&child.mem().lock().deferred_anonymous);
         assert!(!Arc::ptr_eq(&parent_state, &child_state));
         assert_eq!(child_state.snapshot(), before);
-        child_state.retire(GuestVa(0x10000), 0x1000).unwrap();
+        child_state.retire(GuestVa::new(0x10000), 0x1000).unwrap();
         assert_eq!(parent_state.snapshot(), before);
         parent_state
-            .begin_materialization(GuestVa(0x12000), 0x1000)
+            .begin_materialization(GuestVa::new(0x12000), 0x1000)
             .unwrap()
             .commit();
         assert!(
             child_state
-                .copy_pristine_zero(GuestVa(0x12000), &mut [1; 4])
+                .copy_pristine_zero(GuestVa::new(0x12000), &mut [1; 4])
                 .unwrap()
         );
         assert!(
             !parent_state
-                .copy_pristine_zero(GuestVa(0x12000), &mut [1; 4])
+                .copy_pristine_zero(GuestVa::new(0x12000), &mut [1; 4])
                 .unwrap()
         );
     }
@@ -7195,12 +7195,12 @@ mod container_policy_dispatch_tests {
         );
         let parent_state = Arc::clone(&dispatcher.mem().lock().deferred_anonymous);
         parent_state
-            .reserve_fresh(GuestVa(0x10000), 0x3000)
+            .reserve_fresh(GuestVa::new(0x10000), 0x3000)
             .unwrap();
         for page in [0x10000, 0x11000, 0x12000] {
             assert!(
                 parent_state
-                    .copy_pristine_zero(GuestVa(page), &mut [1; 4])
+                    .copy_pristine_zero(GuestVa::new(page), &mut [1; 4])
                     .unwrap()
             );
         }
@@ -7230,22 +7230,22 @@ mod container_policy_dispatch_tests {
         let child_state = Arc::clone(&child.mem().lock().deferred_anonymous);
         assert_eq!(
             child_state.snapshot().pristine,
-            vec![GuestVa(0x11000)..GuestVa(0x13000)]
+            vec![GuestVa::new(0x11000)..GuestVa::new(0x13000)]
         );
         assert_eq!(
             child_state.snapshot().zero_read_resident,
-            vec![GuestVa(0x12000)..GuestVa(0x13000)]
+            vec![GuestVa::new(0x12000)..GuestVa::new(0x13000)]
         );
         let mut bytes = [7; 4];
         assert!(
             !child_state
-                .copy_pristine_zero(GuestVa(0x10000), &mut bytes)
+                .copy_pristine_zero(GuestVa::new(0x10000), &mut bytes)
                 .unwrap()
         );
         assert_eq!(bytes, [7; 4]);
         assert!(
             child_state
-                .copy_pristine_zero(GuestVa(0x11000), &mut bytes)
+                .copy_pristine_zero(GuestVa::new(0x11000), &mut bytes)
                 .unwrap()
         );
         assert_eq!(bytes, [0; 4]);

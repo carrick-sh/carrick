@@ -401,7 +401,7 @@ impl PersistentCarrierMappings {
     }
 
     pub(crate) fn maintenance_root(&self) -> carrick_mem::memory::CarrierMaintenanceRoot {
-        carrick_mem::memory::CarrierMaintenanceRoot(carrick_guest_mem::Gpa(
+        carrick_mem::memory::CarrierMaintenanceRoot(carrick_guest_mem::Gpa::new(
             carrick_mem::memory::LINUX_CARRIER_MAINT_ROOT_BASE,
         ))
     }
@@ -411,7 +411,7 @@ impl PersistentCarrierMappings {
         address: u64,
         length: usize,
     ) -> Option<std::ptr::NonNull<u8>> {
-        let mapping = self.mappings.mapping_for_range(GuestVa(address), length)?;
+        let mapping = self.mappings.mapping_for_range(GuestVa::new(address), length)?;
         let offset = usize::try_from(address.checked_sub(mapping.start)?).ok()?;
         std::ptr::NonNull::new(unsafe { mapping.host_addr.add(offset) })
     }

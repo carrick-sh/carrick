@@ -568,7 +568,7 @@ mod tests {
 
     impl MmBackend for DanglingMappingBackend {
         fn snapshot(&self, _deadline: Instant) -> Result<MmBackendSnapshot, SnapshotError> {
-            let root = crate::kernel::Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(0x1000))
+            let root = crate::kernel::Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa::new(0x1000))
                 .expect("aligned stage-1 root");
             let asid = Asid::from_registry_allocation(
                 std::num::NonZeroU16::new(1).expect("nonzero test ASID"),

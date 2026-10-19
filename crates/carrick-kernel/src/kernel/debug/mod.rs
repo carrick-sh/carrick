@@ -96,7 +96,7 @@ mod tests {
             &self,
             _deadline: std::time::Instant,
         ) -> Result<crate::kernel::MmBackendSnapshot, crate::kernel::SnapshotError> {
-            let root = crate::kernel::Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(0x1000))
+            let root = crate::kernel::Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa::new(0x1000))
                 .expect("aligned stage-1 root");
             let asid = crate::kernel::Asid::from_registry_allocation(
                 std::num::NonZeroU16::new(1).expect("nonzero test ASID"),
@@ -109,8 +109,8 @@ mod tests {
                     ttbr0: crate::kernel::Ttbr0::for_aarch64(asid, root),
                 },
                 vmas: vec![crate::kernel::VmaSummary {
-                    start: carrick_guest_mem::GuestVa(0x1000),
-                    end: carrick_guest_mem::GuestVa(0x2000),
+                    start: carrick_guest_mem::GuestVa::new(0x1000),
+                    end: carrick_guest_mem::GuestVa::new(0x2000),
                     access: crate::kernel::VmaAccess {
                         readable: true,
                         writable: true,

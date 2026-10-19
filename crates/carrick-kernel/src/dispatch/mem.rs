@@ -269,7 +269,7 @@ impl MemAuthority {
                 // existed; the backend owns materialized child zero frames.
                 forked
                     .deferred_anonymous
-                    .clear_zero_read_residency(GuestVa(range.va), range.len as usize)
+                    .clear_zero_read_residency(GuestVa::new(range.va), range.len as usize)
                     .unwrap_or_else(|_| {
                         carrick_fatal!(
                             "dispatch::deferred_anonymous_fork",
@@ -919,12 +919,12 @@ pub(super) fn page_rounded_range(
     if length == 0 {
         return Ok(None);
     }
-    let start = GuestVa(page_floor(address.0, page_size));
+    let start = GuestVa::new(page_floor(address.raw(), page_size));
     let end = address
-        .0
+        .raw()
         .checked_add(length)
         .and_then(|end| page_ceil(end, page_size))
-        .map(GuestVa)
+        .map(GuestVa::new)
         .ok_or(LINUX_ENOMEM)?;
     carrick_vfs::GuestMemoryRange::new(start, end)
         .map(Some)
@@ -970,7 +970,7 @@ pub(super) fn locked_ranges_insert(
         end = end.max(existing.end().raw());
         remove_end += 1;
     }
-    let Some(merged) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)) else {
+    let Some(merged) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)) else {
         return;
     };
     ranges.splice(index..remove_end, [merged]);
@@ -985,7 +985,7 @@ pub(super) fn locked_ranges_remove(
         remove.start().raw(),
         remove.end().raw(),
         |range| (range.start().raw(), range.end().raw()),
-        |_, start, end| carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)),
+        |_, start, end| carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)),
     );
 }
 
@@ -1828,7 +1828,7 @@ impl<'a> MemView<'a> {
         pages: u64,
         page_size: u64,
     ) -> Option<Vec<u8>> {
-        let live_residency = memory.resident_pages(GuestVa(address), pages, page_size);
+        let live_residency = memory.resident_pages(GuestVa::new(address), pages, page_size);
         let mem_authority_30 = self.mem();
         let mem = mem_authority_30.lock();
         let mm_key = self.mm_authority().mm_id.raw();
@@ -2101,7 +2101,7 @@ impl<'a> MemView<'a> {
                 "shared-anon rollback range overflows at 0x{address:x} for {guest_length} bytes"
             )));
         };
-        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(address), GuestVa(end)) else {
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(address), GuestVa::new(end)) else {
             return Err(MemoryError::HostMap(format!(
                 "shared-anon rollback range is empty at 0x{address:x}"
             )));
@@ -2387,7 +2387,7 @@ impl SyscallDispatcher {
         let Some(end) = page.checked_add(view.linux_page_size()) else {
             return false;
         };
-        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(page), GuestVa(end)) else {
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(page), GuestVa::new(end)) else {
             return false;
         };
         let mut mem = authority.mem.lock();

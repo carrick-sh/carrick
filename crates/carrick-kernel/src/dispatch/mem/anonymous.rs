@@ -294,7 +294,7 @@ pub(in crate::dispatch) fn carried_flags(vma: &SemanticVma) -> ReservationNodeFl
 }
 
 fn guest_range(start: u64, end: u64) -> Option<carrick_vfs::GuestMemoryRange> {
-    carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end))
+    carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
 }
 
 /// `[start, end)` minus the sorted, disjoint `covered` pieces.

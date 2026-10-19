@@ -246,7 +246,7 @@ impl PacketSocket {
     }
 
     pub(crate) fn set_mapped_va(&self, va: GuestVa) {
-        self.mapped_va.store(va.0, Ordering::Release);
+        self.mapped_va.store(va.raw(), Ordering::Release);
     }
 
     pub(crate) fn initial_ring_bytes(&self) -> Option<Vec<u8>> {

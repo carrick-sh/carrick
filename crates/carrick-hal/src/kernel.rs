@@ -426,7 +426,7 @@ mod tests {
             frame,
             mapping,
             generation,
-            gpa: Gpa(0x4000),
+            gpa: Gpa::new(0x4000),
             length: FrameLength::from_mapping_extent(id(0x4000)),
             permissions: MemPerms {
                 read: true,

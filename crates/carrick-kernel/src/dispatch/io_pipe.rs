@@ -184,7 +184,7 @@ fn read_host_pipe_into_owner(
         };
         let page_left = (4096 - (address as usize & 4095)).min(buf.len() - delivered);
         let Some(range) =
-            carrick_guest_mem::GuestWriteRange::new(carrick_guest_mem::GuestVa(address), page_left)
+            carrick_guest_mem::GuestWriteRange::new(carrick_guest_mem::GuestVa::new(address), page_left)
         else {
             return Ok(if delivered > 0 {
                 DispatchOutcome::returned_len_or_errno(delivered)
@@ -533,9 +533,9 @@ pub(crate) fn read_host_pipe(
     }
     if let Some(host_ptr) = memory.host_ptr_for_write(guest_addr, length) {
         let range = [carrick_guest_mem::HostWriteRange {
-            guest: carrick_guest_mem::GuestVa(guest_addr),
+            guest: carrick_guest_mem::GuestVa::new(guest_addr),
             len: length,
-            host: carrick_guest_mem::HostVa(host_ptr as usize),
+            host: carrick_guest_mem::HostVa::new(host_ptr as usize),
         }];
         let _host_write = match carrick_guest_mem::HostWriteGuard::new(memory, &range) {
             Ok(g) => g,

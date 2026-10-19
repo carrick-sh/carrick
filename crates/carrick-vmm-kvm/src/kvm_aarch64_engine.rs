@@ -389,7 +389,7 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         self.ram
             .shared_futex_host_addr(backing_gpa.raw(), 4)
             .map(|word| SharedFutexLocation::Direct {
-                word: HostVa(word),
+                word: HostVa::new(word),
                 waiter_key: word,
             })
     }

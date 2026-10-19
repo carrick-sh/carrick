@@ -57,8 +57,8 @@ impl MmBackend for FixtureBackend {
             binding: self.binding,
             vmas: vec![
                 VmaSummary {
-                    start: GuestVa(0x1000),
-                    end: GuestVa(0x2000),
+                    start: GuestVa::new(0x1000),
+                    end: GuestVa::new(0x2000),
                     access: VmaAccess {
                         readable: true,
                         writable: false,
@@ -67,8 +67,8 @@ impl MmBackend for FixtureBackend {
                     },
                 },
                 VmaSummary {
-                    start: GuestVa(0x2000),
-                    end: GuestVa(0x3000),
+                    start: GuestVa::new(0x2000),
+                    end: GuestVa::new(0x3000),
                     access: VmaAccess {
                         readable: true,
                         writable: false,
@@ -77,8 +77,8 @@ impl MmBackend for FixtureBackend {
                     },
                 },
                 VmaSummary {
-                    start: GuestVa(0x3000),
-                    end: GuestVa(0x4000),
+                    start: GuestVa::new(0x3000),
+                    end: GuestVa::new(0x4000),
                     access: VmaAccess {
                         readable: true,
                         writable: true,
@@ -87,8 +87,8 @@ impl MmBackend for FixtureBackend {
                     },
                 },
                 VmaSummary {
-                    start: GuestVa(0x4000),
-                    end: GuestVa(0x5000),
+                    start: GuestVa::new(0x4000),
+                    end: GuestVa::new(0x5000),
                     access: VmaAccess {
                         readable: true,
                         writable: false,
@@ -245,7 +245,7 @@ pub struct MutableFixtureBackend {
 impl MutableFixtureBackend {
     fn new() -> Arc<Self> {
         let asid = Asid::from_registry_allocation(NonZeroU16::new(9).expect("nonzero ASID"));
-        let root = Stage1Root::for_aarch64_4k(Gpa(0xa000)).expect("aligned stage-1 root");
+        let root = Stage1Root::for_aarch64_4k(Gpa::new(0xa000)).expect("aligned stage-1 root");
         Arc::new(Self {
             binding: MmBinding::for_aarch64(asid, root),
             backend_revision: Arc::new(AtomicU64::new(41)),
@@ -290,8 +290,8 @@ impl MmBackend for MutableFixtureBackend {
             revision: self.backend_revision.load(Ordering::Acquire),
             binding: self.binding,
             vmas: vec![VmaSummary {
-                start: GuestVa(0x3000),
-                end: GuestVa(0x4000),
+                start: GuestVa::new(0x3000),
+                end: GuestVa::new(0x4000),
                 access: *self.access.read(),
             }],
             vma_revision: Some(VmaRevision::from_authority_raw(
@@ -566,7 +566,7 @@ impl ForeignMmReadLease for MockCowLease {
             None => (va, self.physical_len as usize),
         };
         let start = if self.fault == MockCowFault::WrongRange {
-            GuestVa(authorized_start.raw() + 1)
+            GuestVa::new(authorized_start.raw() + 1)
         } else {
             authorized_start
         };
@@ -606,7 +606,7 @@ impl ForeignMmReadLease for MockCowLease {
             self.fault,
             MockCowFault::WrongPhysical | MockCowFault::ForgedConsistentPhysical
         ) {
-            Gpa(self.physical_base.raw().checked_add(0x4000).unwrap())
+            Gpa::new(self.physical_base.raw().checked_add(0x4000).unwrap())
         } else {
             self.physical_base
         };
@@ -749,7 +749,7 @@ impl ForeignMmTransport for MockCowTransport {
 
 pub fn fixture_backend() -> Arc<dyn MmBackend> {
     let asid = Asid::from_registry_allocation(NonZeroU16::new(7).expect("nonzero ASID"));
-    let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("aligned stage-1 root");
+    let root = Stage1Root::for_aarch64_4k(Gpa::new(0x8000)).expect("aligned stage-1 root");
     Arc::new(FixtureBackend {
         binding: MmBinding::for_aarch64(asid, root),
     })
@@ -950,7 +950,7 @@ pub fn cow_fixture(
     let bytes = Arc::new(parking_lot::Mutex::new(b"same".to_vec()));
     let counters = MockCowCounters::default();
     let mm = child.shared().mm().id();
-    let physical_base = Gpa(0xb000);
+    let physical_base = Gpa::new(0xb000);
     let physical_len = 0x4000;
     let (mapping, frame, inventory_revision) =
         publish_cow_mapping(kernel, mm, physical_base, physical_len);
@@ -961,7 +961,7 @@ pub fn cow_fixture(
     let proof = crate::kernel::KernelForeignCowProof::new(
         Arc::clone(kernel),
         mm,
-        GuestVa(0x3000),
+        GuestVa::new(0x3000),
         std::num::NonZeroUsize::new(physical_len as usize).unwrap(),
         inventory_revision,
         mapping,
@@ -973,7 +973,7 @@ pub fn cow_fixture(
     let ptrace_proof = crate::kernel::KernelForeignCowProof::new(
         Arc::clone(kernel),
         mm,
-        GuestVa(0x3000),
+        GuestVa::new(0x3000),
         std::num::NonZeroUsize::new(0x1000).unwrap(),
         inventory_revision,
         mapping,

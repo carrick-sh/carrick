@@ -708,7 +708,7 @@ where
             carrick_abi::CARRICK_PRIVATE_X86_POLL => sys_poll(
                 StandaloneHostFds,
                 engine,
-                carrick_guest_mem::GuestVa(args[0]),
+                carrick_guest_mem::GuestVa::new(args[0]),
                 args[1] as u32,
                 args[2] as i32,
                 poll_host_fds,
@@ -1217,10 +1217,10 @@ fn sys_poll<E: carrick_guest_mem::GuestMemory>(
     let bytes = if count == 0 {
         Vec::new()
     } else {
-        if fds.0.checked_add(length as u64).is_none() {
+        if fds.raw().checked_add(length as u64).is_none() {
             return LINUX_EFAULT.guest_retval();
         }
-        match engine.read_bytes(fds.0, length) {
+        match engine.read_bytes(fds.raw(), length) {
             Ok(bytes) => bytes,
             Err(_) => return LINUX_EFAULT.guest_retval(),
         }
@@ -1327,7 +1327,7 @@ fn sys_poll<E: carrick_guest_mem::GuestMemory>(
         .bits();
         // Only the result field is writable, not the descriptor or interest.
         if engine
-            .write_bytes(fds.0 + (index * 8 + 6) as u64, &revents.to_le_bytes())
+            .write_bytes(fds.raw() + (index * 8 + 6) as u64, &revents.to_le_bytes())
             .is_err()
         {
             return LINUX_EFAULT.guest_retval();

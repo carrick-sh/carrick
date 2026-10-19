@@ -41,7 +41,7 @@ unsafe impl Send for ReservationBankBacking {}
 unsafe impl Sync for ReservationBankBacking {}
 unsafe impl RetainedMetadataBacking for ReservationBankBacking {
     fn host_base(&self) -> HostVa {
-        HostVa(self.0.as_ptr() as usize)
+        HostVa::new(self.0.as_ptr() as usize)
     }
     fn mapped_len(&self) -> usize {
         self.0.len()

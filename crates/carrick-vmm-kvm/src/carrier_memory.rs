@@ -61,10 +61,10 @@ fn inventory_page_live(
     // inventory and must never be conflated with the physical owner generation.
     gpa.raw().is_multiple_of(PAGE)
         && row.frame == carrick_hal::FrameId::from_kernel_allocation(identity.frame_id)
-        && gpa.raw() >= row.gpa.0
+        && gpa.raw() >= row.gpa.raw()
         && gpa.raw().checked_add(PAGE).is_some_and(|end| {
             row.gpa
-                .0
+                .raw()
                 .checked_add(row.length.raw())
                 .is_some_and(|limit| end <= limit)
         })
@@ -141,7 +141,7 @@ impl BackingExtent {
     /// Host view of this retained extent; never a guest VA or a GPA.
     pub(crate) fn host_base(&self) -> Result<carrick_guest_mem::HostVa, MemoryError> {
         self.ptr(self.base.raw(), self.len)
-            .map(|ptr| carrick_guest_mem::HostVa(ptr as usize))
+            .map(|ptr| carrick_guest_mem::HostVa::new(ptr as usize))
             .ok_or_else(|| error("retained extent host mapping"))
     }
 }

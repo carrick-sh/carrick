@@ -21,7 +21,7 @@ use std::cell::{Cell, RefCell};
 #[test]
 fn locked_ranges_insert_keeps_the_set_sorted_and_merged() {
     fn range(start: u64, end: u64) -> carrick_vfs::GuestMemoryRange {
-        carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end)).expect("valid range")
+        carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)).expect("valid range")
     }
     fn pairs(ranges: &[carrick_vfs::GuestMemoryRange]) -> Vec<(u64, u64)> {
         ranges
@@ -3742,8 +3742,8 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
         .snapshot_until(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .expect("VMA authority snapshot");
     assert!(snapshot.vmas.contains(&crate::kernel::VmaSummary {
-        start: GuestVa(layout.heap_base),
-        end: GuestVa(layout.heap_base + LINUX_PAGE_SIZE),
+        start: GuestVa::new(layout.heap_base),
+        end: GuestVa::new(layout.heap_base + LINUX_PAGE_SIZE),
         access: crate::kernel::VmaAccess {
             readable: true,
             writable: true,
@@ -3752,8 +3752,8 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
         },
     }));
     assert!(snapshot.vmas.contains(&crate::kernel::VmaSummary {
-        start: GuestVa(layout.mmap_base + (2 * LINUX_PAGE_SIZE)),
-        end: GuestVa(layout.mmap_base + (3 * LINUX_PAGE_SIZE)),
+        start: GuestVa::new(layout.mmap_base + (2 * LINUX_PAGE_SIZE)),
+        end: GuestVa::new(layout.mmap_base + (3 * LINUX_PAGE_SIZE)),
         access: crate::kernel::VmaAccess {
             readable: true,
             writable: true,
@@ -3762,8 +3762,8 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
         },
     }));
     assert!(snapshot.vmas.contains(&crate::kernel::VmaSummary {
-        start: GuestVa(BOOT),
-        end: GuestVa(BOOT + LINUX_PAGE_SIZE),
+        start: GuestVa::new(BOOT),
+        end: GuestVa::new(BOOT + LINUX_PAGE_SIZE),
         access: crate::kernel::VmaAccess {
             readable: true,
             writable: false,
@@ -3772,8 +3772,8 @@ fn guest_vma_occupancy_excludes_hidden_arenas_but_includes_live_ranges() {
         },
     }));
     assert!(!snapshot.vmas.iter().any(|vma| {
-        vma.start == GuestVa(layout.mmap_base)
-            || vma.end == GuestVa(layout.heap_base + layout.heap_size)
+        vma.start == GuestVa::new(layout.mmap_base)
+            || vma.end == GuestVa::new(layout.heap_base + layout.heap_size)
     }));
     assert!(
         snapshot
@@ -4794,7 +4794,7 @@ fn high_va_private_anonymous_mmap_returns_empty_alias_payload() {
     else {
         panic!("expected high-VA alias outcome, got {outcome:?}");
     };
-    assert_eq!(mapped_va, GuestVa(va));
+    assert_eq!(mapped_va, GuestVa::new(va));
     assert_eq!(len, LINUX_PAGE_SIZE);
     assert!(
         !backing.is_file(),
@@ -4844,7 +4844,7 @@ fn hvpatch_low_fixed_hole_maps_a_host_alias() {
     else {
         panic!("expected low fixed hole to use an alias, got {outcome:?}");
     };
-    assert_eq!(va, GuestVa(VA));
+    assert_eq!(va, GuestVa::new(VA));
     assert_eq!(len, LINUX_PAGE_SIZE);
     assert!(payload.is_empty());
     assert_eq!(memory.zero_backing_calls.get(), 0);
@@ -4940,7 +4940,7 @@ fn alias_window_advisory_hint_with_protection_maps_alias() {
     else {
         panic!("expected protected high advisory hint to map an alias, got {outcome:?}");
     };
-    assert_eq!(mapped_va, GuestVa(va));
+    assert_eq!(mapped_va, GuestVa::new(va));
     assert_eq!(mapped_len, len);
     assert!(payload.is_empty());
     assert!(!backing.is_file());
@@ -5119,7 +5119,7 @@ fn shared_anonymous_high_advisory_hint_is_selected_then_committed_lazily() {
     let DispatchOutcome::MapHostAlias { va, backing, .. } = commit else {
         panic!("shared high advisory hint must commit through a host alias: {commit:?}");
     };
-    assert_eq!(va, GuestVa(address));
+    assert_eq!(va, GuestVa::new(address));
     assert!(backing.is_shared());
 }
 
@@ -5581,7 +5581,7 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
         shared_file_alias: Some(SharedFileAliasCommit {
             description: Arc::clone(&description),
             mapping: description.retain_mapping(),
-            extent_base: carrick_guest_mem::Gpa(base),
+            extent_base: carrick_guest_mem::Gpa::new(base),
             row_file_offset: 0,
         }),
     });
@@ -5626,7 +5626,7 @@ fn shared_file_fixed_mremap_moves_page_and_preserves_file_offset() {
             .find(|entry| entry.range.start().raw() == dst)
             .expect("dst shared file alias map entry");
         assert_eq!(alias.row_file_offset, PAGE);
-        assert_eq!(alias.extent_base, carrick_guest_mem::Gpa(base));
+        assert_eq!(alias.extent_base, carrick_guest_mem::Gpa::new(base));
     }
     let dirty = memory.read_bytes(dst, 1).unwrap();
     assert_eq!(dirty[0], 0x77);
@@ -5770,7 +5770,7 @@ fn shared_file_fixed_mremap_repoint_failure_lowers_to_enomem() {
         shared_file_alias: Some(SharedFileAliasCommit {
             description: Arc::clone(&description),
             mapping: description.retain_mapping(),
-            extent_base: carrick_guest_mem::Gpa(base),
+            extent_base: carrick_guest_mem::Gpa::new(base),
             row_file_offset: 0,
         }),
     });
@@ -5850,7 +5850,7 @@ fn shared_file_fixed_mremap_rejects_missing_maymove_or_overlapping_ranges() {
         shared_file_alias: Some(SharedFileAliasCommit {
             description: Arc::clone(&description),
             mapping: description.retain_mapping(),
-            extent_base: carrick_guest_mem::Gpa(base),
+            extent_base: carrick_guest_mem::Gpa::new(base),
             row_file_offset: 0,
         }),
     });
@@ -6595,14 +6595,14 @@ fn large_vma_mmap_protection_failure_rolls_back_after_predecessor_retirement() {
     assert!(
         mem.lock()
             .deferred_anonymous
-            .reserve_fresh(GuestVa(base + 1), LINUX_PAGE_SIZE as usize)
+            .reserve_fresh(GuestVa::new(base + 1), LINUX_PAGE_SIZE as usize)
             .is_err(),
         "unaligned reserve_fresh must return an error"
     );
     assert!(
         mem.lock()
             .deferred_anonymous
-            .reserve_fresh(GuestVa(base), 0)
+            .reserve_fresh(GuestVa::new(base), 0)
             .is_err(),
         "zero-length reserve_fresh must return an error"
     );

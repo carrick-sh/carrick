@@ -190,13 +190,13 @@ impl ThreadLedgerActivityLease {
         )))
     }
     pub fn backing_base(&self) -> HostVa {
-        HostVa(self.0.slab.base().addr())
+        HostVa::new(self.0.slab.base().addr())
     }
     pub const fn backing_len(&self) -> usize {
         SLAB_BYTES
     }
     pub fn activity_address(&self) -> HostVa {
-        HostVa(std::ptr::from_ref(&self.0.activity).addr())
+        HostVa::new(std::ptr::from_ref(&self.0.activity).addr())
     }
 }
 impl Deref for ThreadLedgerActivityLease {
@@ -273,7 +273,7 @@ impl ThreadLifecycleLease {
     }
 
     pub fn backing_base(&self) -> HostVa {
-        HostVa(self.0.slab.base().addr())
+        HostVa::new(self.0.slab.base().addr())
     }
 
     pub const fn backing_len(&self) -> usize {
@@ -281,7 +281,7 @@ impl ThreadLifecycleLease {
     }
 
     pub fn page_address(&self) -> HostVa {
-        HostVa(std::ptr::from_ref(&**self.0).addr())
+        HostVa::new(std::ptr::from_ref(&**self.0).addr())
     }
 }
 
@@ -474,7 +474,7 @@ impl ThreadControlLease {
 
     /// Granule-aligned base of the control-only page this lease pins.
     pub fn backing_base(&self) -> HostVa {
-        HostVa(self.allocation().page.page.slab.base().addr())
+        HostVa::new(self.allocation().page.page.slab.base().addr())
     }
 
     pub const fn backing_len(&self) -> usize {
@@ -482,7 +482,7 @@ impl ThreadControlLease {
     }
 
     pub fn slot_address(&self) -> HostVa {
-        HostVa(std::ptr::from_ref(self.deref()).addr())
+        HostVa::new(std::ptr::from_ref(self.deref()).addr())
     }
 }
 
@@ -635,7 +635,7 @@ mod tests {
         let first_page = first_slot.lifecycle();
         let second_page = second_slot.lifecycle();
         assert_ne!(first_page.backing_base(), second_page.backing_base());
-        assert_eq!(first_page.backing_base().0 % PAGE_BYTES, 0);
+        assert_eq!(first_page.backing_base().raw() % PAGE_BYTES, 0);
         assert_eq!(first_page.backing_len(), SLAB_BYTES);
         first_page.close();
         assert_eq!(
@@ -668,7 +668,7 @@ mod tests {
         let address = lease.slot_address();
         // The arena retains the free allocation throughout this controlled
         // late-retain window, just as a page scan did before Reaped filtering.
-        let control = unsafe { &*(address.0 as *const ThreadControlSlot) };
+        let control = unsafe { &*(address.raw() as *const ThreadControlSlot) };
         drop(lease);
         let retained = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
         let other = arena.allocate(key);

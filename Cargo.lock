@@ -626,6 +626,7 @@ dependencies = [
 name = "carrick-guest-arch"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "zerocopy",
 ]
 
@@ -635,6 +636,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-el1-abi",
  "carrick-fatal",
+ "carrick-guest-arch",
  "libc",
  "parking_lot",
  "serde",

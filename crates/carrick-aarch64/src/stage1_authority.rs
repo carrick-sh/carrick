@@ -2015,11 +2015,11 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .pop()
-                .map(|gpa| SubstrateGpa(gpa.0))
+                .map(|gpa| SubstrateGpa(gpa.raw()))
         }
 
         fn return_arena(&mut self, gpa: SubstrateGpa) {
-            self.returned.lock().unwrap().push(Gpa(gpa.0));
+            self.returned.lock().unwrap().push(Gpa::new(gpa.0));
         }
     }
 
@@ -2493,13 +2493,13 @@ pub(crate) mod tests {
     }
 
     fn exercise_rollback_retirement(retire_first: bool, fail_retirement: bool) {
-        let root = Gpa(LINUX_PAGE_TABLES_BASE);
-        let ext_base = Gpa(0xb0_0000_0000);
+        let root = Gpa::new(LINUX_PAGE_TABLES_BASE);
+        let ext_base = Gpa::new(0xb0_0000_0000);
         let available = Arc::new(Mutex::new(vec![ext_base]));
         let returned = Arc::new(Mutex::new(Vec::new()));
 
         let source = CountingArenaSource {
-            id: TableArenaSourceId(SubstrateGpa(root.0)),
+            id: TableArenaSourceId(SubstrateGpa(root.raw())),
             available: Arc::clone(&available),
             returned: Arc::clone(&returned),
         };
@@ -2546,7 +2546,7 @@ pub(crate) mod tests {
         let mut host_arena1 = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
         let p0 = host_arena0.as_mut_ptr();
         let p1 = host_arena1.as_mut_ptr();
-        let resolver = TestArenas([(LINUX_PAGE_TABLES_BASE, p0), (ext_base.0, p1)]);
+        let resolver = TestArenas([(LINUX_PAGE_TABLES_BASE, p0), (ext_base.raw(), p1)]);
 
         authority
             .edit(
@@ -2572,14 +2572,14 @@ pub(crate) mod tests {
                                 resolver,
                                 |e| e,
                                 |bases| {
-                                    assert_eq!(bases, &[ext_base.0]);
+                                    assert_eq!(bases, &[ext_base.raw()]);
                                     assert!(
                                         returned.lock().unwrap().is_empty(),
                                         "arena address escaped before backing retirement"
                                     );
                                     assert!(available.lock().unwrap().is_empty());
                                     if fail_retirement {
-                                        Err(PageTableError::UnresolvedArena(ext_base.0))
+                                        Err(PageTableError::UnresolvedArena(ext_base.raw()))
                                     } else {
                                         Ok(())
                                     }
@@ -2596,7 +2596,7 @@ pub(crate) mod tests {
                     } else {
                         unsafe { editor.rollback_undo(resolver).unwrap() }
                     };
-                    assert_eq!(popped, vec![ext_base.0], "rollback popped extension arena");
+                    assert_eq!(popped, vec![ext_base.raw()], "rollback popped extension arena");
                     assert_eq!(editor.pool_stats().3, 1, "manager restored to 1 arena");
                     Ok::<(), ()>(())
                 },
@@ -2654,11 +2654,11 @@ pub(crate) mod tests {
 
     #[test]
     fn concurrent_vfork_children_share_authority_and_detach_independently() {
-        let root = Gpa(LINUX_PAGE_TABLES_BASE);
+        let root = Gpa::new(LINUX_PAGE_TABLES_BASE);
         let available = Arc::new(Mutex::new(Vec::new()));
         let returned = Arc::new(Mutex::new(Vec::new()));
         let source = CountingArenaSource {
-            id: TableArenaSourceId(SubstrateGpa(root.0)),
+            id: TableArenaSourceId(SubstrateGpa(root.raw())),
             available,
             returned,
         };
@@ -2762,11 +2762,11 @@ pub(crate) mod tests {
 
     #[test]
     fn vfork_shares_prevents_exclusive_path_even_if_called_as_first_or_only_child() {
-        let root = Gpa(LINUX_PAGE_TABLES_BASE);
+        let root = Gpa::new(LINUX_PAGE_TABLES_BASE);
         let available = Arc::new(Mutex::new(Vec::new()));
         let returned = Arc::new(Mutex::new(Vec::new()));
         let source = CountingArenaSource {
-            id: TableArenaSourceId(SubstrateGpa(root.0)),
+            id: TableArenaSourceId(SubstrateGpa(root.raw())),
             available,
             returned,
         };
@@ -3318,7 +3318,7 @@ pub(crate) mod tests {
         authority
             .install_source(Box::new(CountingArenaSource {
                 id: TableArenaSourceId(SubstrateGpa(old)),
-                available: Arc::new(Mutex::new(vec![Gpa(capacity)])),
+                available: Arc::new(Mutex::new(vec![Gpa::new(capacity)])),
                 returned: returned.clone(),
             }))
             .unwrap();
@@ -3446,7 +3446,7 @@ pub(crate) mod tests {
                 authority.snapshot_image().unwrap().as_bytes(),
                 original.as_bytes()
             );
-            assert_eq!(*publisher.returned.lock().unwrap(), vec![Gpa(pool)]);
+            assert_eq!(*publisher.returned.lock().unwrap(), vec![Gpa::new(pool)]);
             assert!(publisher.resolver.arenas.lock().unwrap().is_empty());
             assert_eq!(
                 publisher.retired.lock().unwrap().len(),
@@ -3472,7 +3472,7 @@ pub(crate) mod tests {
         assert!(error.contains("authority changed"));
         assert_eq!(authority.root_base(), Some(0x9b_4000_0000));
         assert_eq!(*publisher.retired.lock().unwrap(), vec![pool]);
-        assert_eq!(*publisher.returned.lock().unwrap(), vec![Gpa(pool)]);
+        assert_eq!(*publisher.returned.lock().unwrap(), vec![Gpa::new(pool)]);
     }
 
     #[test]
@@ -3699,7 +3699,7 @@ pub(crate) mod tests {
         multi_mgr.arenas[0].next_free = multi_mgr.arenas[0].capacity as u64;
         let multi_authority = Stage1Authority::new_with_manager(Some(multi_mgr));
         let ext_bases: Vec<Gpa> = (0..30)
-            .map(|i| Gpa(0x90_0000_0000 + (i as u64) * 0x20_0000))
+            .map(|i| Gpa::new(0x90_0000_0000 + (i as u64) * 0x20_0000))
             .collect();
         let source = Box::new(CountingArenaSource {
             id: TableArenaSourceId(SubstrateGpa(0x90_0000_0000)),
@@ -4006,7 +4006,7 @@ pub(crate) mod tests {
         );
 
         let extension = LINUX_PAGE_TABLES_BASE + 0x40_0000;
-        let available = Arc::new(Mutex::new(vec![Gpa(extension)]));
+        let available = Arc::new(Mutex::new(vec![Gpa::new(extension)]));
         let returned = Arc::new(Mutex::new(Vec::new()));
         authority
             .install_source(Box::new(CountingArenaSource {

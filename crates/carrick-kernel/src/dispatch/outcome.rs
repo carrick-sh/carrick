@@ -1101,7 +1101,7 @@ impl GuestMemory for LinearMemory {
             // lookup, but no host call outlives the dispatch that owns it.
             Some(unsafe {
                 carrick_guest_mem::HostRead::retained(
-                    carrick_guest_mem::GuestVa(address),
+                    carrick_guest_mem::GuestVa::new(address),
                     self.bytes[offset..end].as_ptr(),
                     len,
                     None,

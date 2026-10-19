@@ -130,7 +130,7 @@ impl CarrierLifecycleMappings {
         }
         let authority = self.access.map_retained(backing)?;
         let pin = authority.pin()?;
-        let guest_base = GuestVa(pin.extent().base());
+        let guest_base = GuestVa::new(pin.extent().base());
         drop(pin);
         state.pages.insert(
             key,

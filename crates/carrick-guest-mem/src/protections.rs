@@ -447,15 +447,15 @@ impl MemoryProtections {
         };
         match (unmapped, denied) {
             (Some(unmapped), Some(denied)) if denied < unmapped => Some(GuestMemoryFault {
-                address: crate::GuestVa(denied),
+                address: crate::GuestVa::new(denied),
                 kind: GuestMemoryFaultKind::AccessDenied,
             }),
             (Some(unmapped), _) => Some(GuestMemoryFault {
-                address: crate::GuestVa(unmapped),
+                address: crate::GuestVa::new(unmapped),
                 kind: GuestMemoryFaultKind::Unmapped,
             }),
             (None, Some(denied)) => Some(GuestMemoryFault {
-                address: crate::GuestVa(denied),
+                address: crate::GuestVa::new(denied),
                 kind: GuestMemoryFaultKind::AccessDenied,
             }),
             (None, None) => None,
@@ -844,29 +844,29 @@ mod tests {
         p.set_no_access(0x5000, 0x1000, true);
 
         assert_eq!(
-            p.first_access_fault(crate::GuestVa(0x2ffc), 8, GuestMemoryAccess::Read),
+            p.first_access_fault(crate::GuestVa::new(0x2ffc), 8, GuestMemoryAccess::Read),
             Some(GuestMemoryFault {
-                address: crate::GuestVa(0x3000),
+                address: crate::GuestVa::new(0x3000),
                 kind: GuestMemoryFaultKind::Unmapped,
             }),
             "read-only bytes must not turn a later read hole into ACCERR"
         );
         assert_eq!(
-            p.first_access_fault(crate::GuestVa(0x2ffc), 8, GuestMemoryAccess::Write),
+            p.first_access_fault(crate::GuestVa::new(0x2ffc), 8, GuestMemoryAccess::Write),
             Some(GuestMemoryFault {
-                address: crate::GuestVa(0x2ffc),
+                address: crate::GuestVa::new(0x2ffc),
                 kind: GuestMemoryFaultKind::AccessDenied,
             })
         );
         assert_eq!(
-            p.first_access_fault(crate::GuestVa(0x4ffc), 8, GuestMemoryAccess::Read),
+            p.first_access_fault(crate::GuestVa::new(0x4ffc), 8, GuestMemoryAccess::Read),
             Some(GuestMemoryFault {
-                address: crate::GuestVa(0x5000),
+                address: crate::GuestVa::new(0x5000),
                 kind: GuestMemoryFaultKind::AccessDenied,
             })
         );
         assert_eq!(
-            p.first_access_fault(crate::GuestVa(0x1000), 8, GuestMemoryAccess::Write),
+            p.first_access_fault(crate::GuestVa::new(0x1000), 8, GuestMemoryAccess::Write),
             None
         );
     }

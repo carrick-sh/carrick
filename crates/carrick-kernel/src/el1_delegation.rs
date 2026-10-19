@@ -1958,7 +1958,7 @@ fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
         let chunk =
             (args[1] - delivered).min((4096 - (destination as usize & 4095)) as u64) as usize;
         let Some(range) =
-            carrick_guest_mem::GuestWriteRange::new(carrick_guest_mem::GuestVa(destination), chunk)
+            carrick_guest_mem::GuestWriteRange::new(carrick_guest_mem::GuestVa::new(destination), chunk)
         else {
             return Some(if delivered > 0 {
                 crate::dispatch::DispatchOutcome::Returned {

@@ -1223,7 +1223,7 @@ impl GuestMemory for HostPtrPayloadMemory {
         // SAFETY: the fixture's byte vector outlives every dispatch using it.
         Some(unsafe {
             carrick_guest_mem::HostRead::retained(
-                carrick_guest_mem::GuestVa(address),
+                carrick_guest_mem::GuestVa::new(address),
                 self.bytes.as_ptr().add(offset),
                 len,
                 None,

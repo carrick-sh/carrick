@@ -48,9 +48,9 @@ impl WriteFixture {
 
     fn range(&self, offset: usize, len: usize) -> HostWriteRange {
         HostWriteRange {
-            guest: GuestVa(TEST_VA + offset as u64),
+            guest: GuestVa::new(TEST_VA + offset as u64),
             len,
-            host: HostVa(self.owner().ptr() as usize + offset),
+            host: HostVa::new(self.owner().ptr() as usize + offset),
         }
     }
 }
@@ -130,7 +130,7 @@ fn native_code_content_partial_host_write_admission_rolls_back_on_error_and_unwi
     let before = owner.mapping.pin_count();
     let first = fixture.range(0, 4);
     let mut stale = fixture.range(4096, 4);
-    stale.host = HostVa(stale.host.raw() + 1);
+    stale.host = HostVa::new(stale.host.raw() + 1);
     assert!(HostWriteGuard::new(&mut fixture, &[first, stale]).is_err());
     assert_eq!(
         owner.mapping.pin_count(),
@@ -182,7 +182,7 @@ fn native_code_content_host_write_rejects_stale_owner_permissions_and_bounds() {
         protections.set_no_access(TEST_VA, 4096, false);
     }
     let overflow = HostWriteRange {
-        guest: GuestVa(u64::MAX),
+        guest: GuestVa::new(u64::MAX),
         len: 2,
         host: valid.host,
     };
@@ -356,9 +356,9 @@ fn native_code_content_structural_syscall_write_uses_owner_offset_and_pin() {
     assert!(outside.is_current());
     let mut writes = HostWrites::default();
     let range = HostWriteRange {
-        guest: GuestVa(0x400000),
+        guest: GuestVa::new(0x400000),
         len: 4,
-        host: HostVa(owner.ptr() as usize + 4096),
+        host: HostVa::new(owner.ptr() as usize + 4096),
     };
     writes.begin(&task, custody, &[range]).unwrap();
     assert_eq!(
@@ -514,7 +514,7 @@ fn native_code_content_syscall_copy_after_cow_preserves_source_dependency() {
         .break_cow(
             &mut invalidator,
             &fixture.installed.snapshot,
-            GuestVa(TEST_VA),
+            GuestVa::new(TEST_VA),
             4,
             Instant::now() + Duration::from_secs(1),
         )

@@ -172,7 +172,7 @@ fn a_backend_boots_a_root_and_forks_through_public_kernel_operations() {
     let projection: &dyn Stage1MmProjection = stage1.as_ref();
     assert_eq!(
         projection.foreign_mm_binding().stage1_root(),
-        Gpa(0x4000),
+        Gpa::new(0x4000),
         "the projection publishes the stage-1 root its mm backend was built on"
     );
     assert_eq!(stage1.binding(), binding);

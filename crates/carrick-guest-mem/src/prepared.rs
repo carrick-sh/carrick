@@ -500,7 +500,7 @@ mod read_continuation_tests {
     #[test]
     fn stream_preparation_bounds_bytes_and_empty_range_population() {
         let limit = carrick_el1_abi::MM_PORTAL_MAX_BYTES as usize;
-        let range = |len| GuestWriteRange::new(GuestVa(0x4001), len).unwrap();
+        let range = |len| GuestWriteRange::new(GuestVa::new(0x4001), len).unwrap();
         assert!(PreparedStreamRanges::new(&[range(limit)]).is_ok());
         assert!(matches!(
             PreparedStreamRanges::new(&[range(limit), range(1)]),

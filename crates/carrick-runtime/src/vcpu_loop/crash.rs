@@ -680,11 +680,11 @@ where
                 let subranges: Vec<std::ops::Range<carrick_guest_mem::GuestVa>> =
                     match &deferred_anonymous {
                         Some(deferred) => deferred
-                            .materialized_subranges(carrick_guest_mem::GuestVa(map.start), length),
+                            .materialized_subranges(carrick_guest_mem::GuestVa::new(map.start), length),
                         None => {
                             vec![
-                                carrick_guest_mem::GuestVa(map.start)
-                                    ..carrick_guest_mem::GuestVa(map.end),
+                                carrick_guest_mem::GuestVa::new(map.start)
+                                    ..carrick_guest_mem::GuestVa::new(map.end),
                             ]
                         }
                     };
@@ -1268,7 +1268,7 @@ mod tests {
             .deferred_anonymous_state(root.task().shared().mm().id())
             .expect("deferred anonymous state");
         deferred
-            .reserve_fresh(carrick_guest_mem::GuestVa(sparse_addr), sparse_len)
+            .reserve_fresh(carrick_guest_mem::GuestVa::new(sparse_addr), sparse_len)
             .expect("reserve fresh 64GiB VMA");
 
         // Touch 3 distinct pages: first, middle, last
@@ -1277,15 +1277,15 @@ mod tests {
         let page_last = sparse_addr + (64 << 30) - 4096;
 
         deferred
-            .begin_materialization(carrick_guest_mem::GuestVa(page_first), 4096)
+            .begin_materialization(carrick_guest_mem::GuestVa::new(page_first), 4096)
             .expect("materialize first")
             .commit();
         deferred
-            .begin_materialization(carrick_guest_mem::GuestVa(page_middle), 4096)
+            .begin_materialization(carrick_guest_mem::GuestVa::new(page_middle), 4096)
             .expect("materialize middle")
             .commit();
         deferred
-            .begin_materialization(carrick_guest_mem::GuestVa(page_last), 4096)
+            .begin_materialization(carrick_guest_mem::GuestVa::new(page_last), 4096)
             .expect("materialize last")
             .commit();
 
@@ -1455,10 +1455,10 @@ mod tests {
             .deferred_anonymous_state(root.task().shared().mm().id())
             .expect("deferred anonymous state");
         deferred
-            .reserve_fresh(carrick_guest_mem::GuestVa(target_addr), target_len)
+            .reserve_fresh(carrick_guest_mem::GuestVa::new(target_addr), target_len)
             .expect("reserve VMA");
         deferred
-            .begin_materialization(carrick_guest_mem::GuestVa(target_addr), target_len)
+            .begin_materialization(carrick_guest_mem::GuestVa::new(target_addr), target_len)
             .expect("materialize")
             .commit();
 

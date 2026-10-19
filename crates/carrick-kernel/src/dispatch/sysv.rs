@@ -1706,7 +1706,7 @@ impl SysvWaitState {
         let waiter_key = self.blocked_id as usize;
         DispatchOutcome::WaitOnSharedWord {
             location: carrick_guest_mem::SharedFutexLocation::Direct {
-                word: carrick_guest_mem::HostVa(self.word.addr()),
+                word: carrick_guest_mem::HostVa::new(self.word.addr()),
                 waiter_key,
             },
             waiter_key,
@@ -2432,8 +2432,8 @@ impl<'a> IpcView<'a> {
             Ok(DispatchOutcome::MapHostAlias {
                 success_retval: va as i64,
                 transaction,
-                va: GuestVa(va),
-                ipa: Gpa(ipa),
+                va: GuestVa::new(va),
+                ipa: Gpa::new(ipa),
                 len: map_len,
                 payload: Vec::new(),
                 backing: HostAliasBacking::File {
@@ -5810,7 +5810,7 @@ mod ipc_set_tests {
             .lock()
             .attachments
             .insert(addr, shmid);
-        let range = carrick_vfs::GuestMemoryRange::new(GuestVa(addr), GuestVa(addr + len))
+        let range = carrick_vfs::GuestMemoryRange::new(GuestVa::new(addr), GuestVa::new(addr + len))
             .expect("shmat metadata range");
         let writable_memfd = kernel_file_description(
             std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {

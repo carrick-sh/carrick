@@ -423,7 +423,7 @@ mod tests {
             let hits_b = Arc::new(AtomicUsize::new(0));
             let locations: Vec<_> = (0..count)
                 .map(|offset| SharedFutexLocation::File {
-                    word: HostVa(std::ptr::from_ref(&word) as usize),
+                    word: HostVa::new(std::ptr::from_ref(&word) as usize),
                     identity: SharedFutexFileIdentity {
                         device: 42,
                         inode: 73,
@@ -485,7 +485,7 @@ mod tests {
         let word = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(7)));
         let addr = std::ptr::from_ref(word) as usize;
         let location = SharedFutexLocation::Direct {
-            word: HostVa(addr),
+            word: HostVa::new(addr),
             waiter_key: addr,
         };
         let futex = Arc::new(FutexTableFutex::new(
@@ -542,13 +542,13 @@ mod tests {
         let first_word = std::sync::atomic::AtomicU32::new(7);
         let second_word = std::sync::atomic::AtomicU32::new(42);
         let first = SharedFutexLocation::File {
-            word: HostVa(std::ptr::from_ref(&first_word) as usize),
+            word: HostVa::new(std::ptr::from_ref(&first_word) as usize),
             identity: first_identity,
             offset,
             waiter_key: first_hint,
         };
         let second = SharedFutexLocation::File {
-            word: HostVa(std::ptr::from_ref(&second_word) as usize),
+            word: HostVa::new(std::ptr::from_ref(&second_word) as usize),
             identity: second_identity,
             offset,
             waiter_key: second_hint,
@@ -597,7 +597,7 @@ mod tests {
         };
         let word = std::sync::atomic::AtomicU32::new(7);
         let location = SharedFutexLocation::File {
-            word: HostVa(std::ptr::from_ref(&word) as usize),
+            word: HostVa::new(std::ptr::from_ref(&word) as usize),
             identity,
             offset: 0x40,
             waiter_key: carrick_host::futex_key::shared_futex_waiter_key(identity, 0x40),
@@ -624,7 +624,7 @@ mod tests {
             let address = 0x1000 + index * 8;
             let location = if index % 2 == 0 {
                 SharedFutexLocation::Direct {
-                    word: HostVa(address),
+                    word: HostVa::new(address),
                     waiter_key: address,
                 }
             } else {
@@ -634,7 +634,7 @@ mod tests {
                 };
                 let offset = index as u64 * 4;
                 SharedFutexLocation::File {
-                    word: HostVa(address),
+                    word: HostVa::new(address),
                     identity,
                     offset,
                     waiter_key: carrick_host::futex_key::shared_futex_waiter_key(identity, offset),
@@ -668,7 +668,7 @@ mod tests {
             inode: 0x5678,
         };
         let location = |offset| SharedFutexLocation::File {
-            word: HostVa(0x1000 + offset as usize),
+            word: HostVa::new(0x1000 + offset as usize),
             identity,
             offset,
             waiter_key: carrick_host::futex_key::shared_futex_waiter_key(identity, offset),
@@ -693,7 +693,7 @@ mod tests {
             inode: 0x5678,
         };
         let location = |offset| SharedFutexLocation::File {
-            word: HostVa(Arc::as_ptr(&word) as usize),
+            word: HostVa::new(Arc::as_ptr(&word) as usize),
             identity,
             offset,
             waiter_key: carrick_host::futex_key::shared_futex_waiter_key(identity, offset),
@@ -735,7 +735,7 @@ mod tests {
             inode: 0x5678,
         };
         let location = |offset| SharedFutexLocation::File {
-            word: HostVa(Arc::as_ptr(&word) as usize),
+            word: HostVa::new(Arc::as_ptr(&word) as usize),
             identity,
             offset,
             waiter_key: carrick_host::futex_key::shared_futex_waiter_key(identity, offset),
@@ -775,7 +775,7 @@ mod tests {
         let addr = std::ptr::from_ref(word) as usize;
         let key = addr ^ 0x5a5a;
         let location = SharedFutexLocation::Direct {
-            word: HostVa(addr),
+            word: HostVa::new(addr),
             waiter_key: key,
         };
         let shared = SharedFutexTable::new();
@@ -804,7 +804,7 @@ mod tests {
         let word = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(9)));
         let addr = std::ptr::from_ref(word) as usize;
         let location = SharedFutexLocation::Direct {
-            word: HostVa(addr),
+            word: HostVa::new(addr),
             waiter_key: addr,
         };
         let futex = FutexTableFutex::new(Arc::new(FutexTable::default()), SharedFutexTable::new());
@@ -821,7 +821,7 @@ mod tests {
         let word = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(9)));
         let addr = std::ptr::from_ref(word) as usize;
         let location = SharedFutexLocation::Direct {
-            word: HostVa(addr),
+            word: HostVa::new(addr),
             waiter_key: addr,
         };
         let futex = FutexTableFutex::new(Arc::new(FutexTable::default()), SharedFutexTable::new());
@@ -906,7 +906,7 @@ mod tests {
 
     fn native_location(word: usize, waiter_key: usize) -> SharedFutexLocation {
         SharedFutexLocation::Direct {
-            word: HostVa(word),
+            word: HostVa::new(word),
             waiter_key,
         }
     }

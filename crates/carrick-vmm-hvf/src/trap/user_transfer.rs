@@ -243,7 +243,7 @@ impl TransferCustody for UserTransferCustody {
         };
         let binding = CarrierForeignMmBinding {
             asid: carrick_hal::ForeignAsid::from_kernel_allocation(asid),
-            stage1_root: carrick_guest_mem::Gpa(target.ttbr0() & 0x0000_ffff_ffff_f000),
+            stage1_root: carrick_guest_mem::Gpa::new(target.ttbr0() & 0x0000_ffff_ffff_f000),
         };
         let state = transport
             .states

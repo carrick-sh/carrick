@@ -112,7 +112,7 @@ fn observe_resident(
         let physical = foreign_stage1_translate(
             &inner.backing,
             snapshot.binding().stage1_root(),
-            carrick_guest_mem::GuestVa(address),
+            carrick_guest_mem::GuestVa::new(address),
             &mut owners,
         )?;
         let extent = inner.backing.extent_for(physical, chunk)?;

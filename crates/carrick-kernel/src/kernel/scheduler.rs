@@ -7246,7 +7246,7 @@ mod tests {
             crate::dispatch::DispatchOutcome::SharedFutexWait {
                 target: crate::dispatch::SharedFutexTarget::new(
                     SharedFutexLocation::Direct {
-                        word: HostVa(waiter_key),
+                        word: HostVa::new(waiter_key),
                         waiter_key,
                     },
                     waiter_key,
@@ -7254,7 +7254,7 @@ mod tests {
                 generation: kernel.shared_futex().table().prepare_wait(
                     carrick_thread::platform_futex::carrier_shared_futex_key(
                         SharedFutexLocation::Direct {
-                            word: HostVa(waiter_key),
+                            word: HostVa::new(waiter_key),
                             waiter_key,
                         },
                     ),
@@ -7308,7 +7308,7 @@ mod tests {
             kernel.shared_futex().table().wake(
                 carrick_thread::platform_futex::carrier_shared_futex_key(
                     SharedFutexLocation::Direct {
-                        word: HostVa(waiter_key),
+                        word: HostVa::new(waiter_key),
                         waiter_key,
                     },
                 ),

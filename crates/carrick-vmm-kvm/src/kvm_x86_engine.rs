@@ -265,7 +265,7 @@ impl X86Vmm for KvmVmm {
         self.ram
             .shared_futex_host_addr(gpa.raw(), len)
             .map(|word| SharedFutexLocation::Direct {
-                word: HostVa(word),
+                word: HostVa::new(word),
                 waiter_key: word,
             })
     }
@@ -328,7 +328,7 @@ impl X86Vmm for KvmVmm {
             // exec=true: KVM is eager — the leaf's NX is (re)applied by the
             // backend `protect_range` → `set_rw`/`set_readonly` per the mmap prot,
             // so the alias leaf itself stays executable (prior behaviour).
-            .map_aliased(GuestVa(va), Gpa(gpa), len, writable, true)
+            .map_aliased(GuestVa::new(va), Gpa::new(gpa), len, writable, true)
             .map_err(|e| TrapError::Hypervisor(format!("kvm-x86: PML4 map_aliased: {e:?}")))?;
         let bytes = page_tables.bytes();
         // SAFETY: `pt_host` backs the full PML4 table region in the live guest;
@@ -385,7 +385,7 @@ impl X86Vmm for KvmVmm {
             })
         })?;
         self.edit_page_tables(va, len, |mgr| {
-            mgr.map_aliased(GuestVa(va), Gpa(overlay_gpa), len_u64, true, true)
+            mgr.map_aliased(GuestVa::new(va), Gpa::new(overlay_gpa), len_u64, true, true)
                 .map(|()| true)
         })
         // `Pml4Manager` is process-persistent. A failed multi-leaf edit may have
@@ -403,7 +403,7 @@ impl X86Vmm for KvmVmm {
             })
         })?;
         self.edit_page_tables(va, len, |mgr| {
-            mgr.map_aliased(GuestVa(va), Gpa(va), len_u64, true, true)
+            mgr.map_aliased(GuestVa::new(va), Gpa::new(va), len_u64, true, true)
                 .map(|()| true)
         })
         .map_err(RepointPrivateError::indeterminate)
@@ -435,7 +435,7 @@ impl X86Vmm for KvmVmm {
         self.edit_page_tables(va, len, |mgr| {
             // exec=true: `back_fixed_anon` only seeds the leaf; the caller's
             // `protect_range`/`set_rw` re-applies the prot (incl. NX) for KVM.
-            mgr.map_aliased(GuestVa(va), Gpa(va), len_u64, writable, true)
+            mgr.map_aliased(GuestVa::new(va), Gpa::new(va), len_u64, writable, true)
                 .map(|()| true)
         })
     }

@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn composes_validated_stage1_root_and_asid() {
-        let root = Stage1Root::for_aarch64_4k(Gpa(0x1234_5000)).expect("aligned root");
+        let root = Stage1Root::for_aarch64_4k(Gpa::new(0x1234_5000)).expect("aligned root");
 
         assert_eq!(
             Ttbr0::for_aarch64(asid(1), root).raw(),
@@ -286,12 +286,12 @@ mod tests {
     #[test]
     fn rejects_unaligned_or_out_of_range_stage1_roots() {
         assert_eq!(
-            Stage1Root::for_aarch64_4k(Gpa(0x1234_5001)),
-            Err(Stage1RootError::Unaligned(Gpa(0x1234_5001)))
+            Stage1Root::for_aarch64_4k(Gpa::new(0x1234_5001)),
+            Err(Stage1RootError::Unaligned(Gpa::new(0x1234_5001)))
         );
         assert_eq!(
-            Stage1Root::for_aarch64_4k(Gpa(0x0001_0000_0000_0000)),
-            Err(Stage1RootError::OutOfRange(Gpa(0x0001_0000_0000_0000)))
+            Stage1Root::for_aarch64_4k(Gpa::new(0x0001_0000_0000_0000)),
+            Err(Stage1RootError::OutOfRange(Gpa::new(0x0001_0000_0000_0000)))
         );
     }
 }

@@ -787,7 +787,7 @@ impl X86Vmm for NvmmVmm {
         page_tables
             // exec=true preserves NVMM's prior executable-leaf behaviour (its NX,
             // like KVM's, is applied by the backend protect_range/set_rw path).
-            .map_aliased(GuestVa(va), Gpa(mapped_ipa), len, writable, true)
+            .map_aliased(GuestVa::new(va), Gpa::new(mapped_ipa), len, writable, true)
             .map_err(|e| TrapError::Hypervisor(format!("nvmm-x86: PML4 map_aliased: {e:?}")))?;
         let bytes = page_tables.bytes();
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pt_host, bytes.len()) };

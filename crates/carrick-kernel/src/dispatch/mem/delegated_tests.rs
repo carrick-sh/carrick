@@ -2524,7 +2524,7 @@ fn alias_mmap(
         DispatchOutcome::MapHostAlias {
             transaction, va, ..
         } => {
-            assert_eq!(va, GuestVa(address));
+            assert_eq!(va, GuestVa::new(address));
             transaction
         }
         other => panic!("expected a host-alias install, got {other:?}"),
@@ -4060,7 +4060,7 @@ fn delegated_frame_grant_span_carries_pristine_provenance() {
         (
             start,
             len,
-            state.covers_pristine(carrick_guest_mem::GuestVa(start), len as usize),
+            state.covers_pristine(carrick_guest_mem::GuestVa::new(start), len as usize),
         )
     };
     twin.same("an untouched mapping's grant span", |d, _| {
@@ -4244,7 +4244,7 @@ fn delegated_fork_materialized_drops_unconsumed_stock_provenance_only_in_child()
                 .deferred_anonymous_state(dispatcher.mm_authority().mm_id)
                 .unwrap();
             state
-                .begin_pristine_materialization(GuestVa(plan.start()), plan.len() as usize)
+                .begin_pristine_materialization(GuestVa::new(plan.start()), plan.len() as usize)
                 .unwrap()
                 .unwrap()
                 .commit();
@@ -4931,7 +4931,7 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool) {
                 .deferred_anonymous_state(dispatcher.mm_authority().mm_id)
                 .unwrap();
             state
-                .begin_pristine_materialization(GuestVa(plan.start()), plan.len() as usize)
+                .begin_pristine_materialization(GuestVa::new(plan.start()), plan.len() as usize)
                 .unwrap()
                 .unwrap()
                 .commit();

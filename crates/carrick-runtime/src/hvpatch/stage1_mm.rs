@@ -280,7 +280,7 @@ impl Stage1MmLease {
 
     pub(crate) fn root_slot_base(&self) -> carrick_guest_mem::Gpa {
         self.root_slot
-            .map(|s| carrick_guest_mem::Gpa(s.base()))
+            .map(|s| carrick_guest_mem::Gpa::new(s.base()))
             .unwrap_or_else(|| self.state.binding().stage1_root.gpa())
     }
 
@@ -405,7 +405,7 @@ impl Stage1MmLease {
         if !lifecycle.is_live() {
             return Err(Stage1MmError::Retired);
         }
-        let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
+        let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa::new(stage1_root))?;
         let binding = MmBinding {
             asid: self.asid.asid(),
             stage1_root,
@@ -539,7 +539,7 @@ impl carrick_hal::stage1_mm::ForeignMmInstaller for Stage1MmLease {
 impl carrick_mmu_core::aarch64::TableArenaSource for Stage1MmTableArenaSource {
     fn id(&self) -> carrick_mmu_core::aarch64::TableArenaSourceId {
         carrick_mmu_core::aarch64::TableArenaSourceId(carrick_mmu_core::aarch64::SubstrateGpa(
-            self.lease.root_slot_base().0,
+            self.lease.root_slot_base().raw(),
         ))
     }
 
@@ -639,7 +639,7 @@ impl Stage1MmPool {
         asids: AsidAllocator,
     ) -> Result<(Self, Arc<Stage1MmLease>), Stage1MmError> {
         let asid = asids.allocate()?;
-        let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
+        let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa::new(stage1_root))?;
         let root = Arc::new(Stage1MmLease::new(asid, stage1_root, None));
         Ok((
             Self {
@@ -660,7 +660,7 @@ impl Stage1MmPool {
         stage1_root: u64,
     ) -> Result<Arc<Stage1MmLease>, Stage1MmError> {
         let asid = self.inner.lock().asids.allocate()?;
-        let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
+        let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa::new(stage1_root))?;
         Ok(Arc::new(Stage1MmLease::new(asid, stage1_root, None)))
     }
 
@@ -670,7 +670,7 @@ impl Stage1MmPool {
             .free_root_slots
             .pop_first()
             .ok_or(Stage1MmError::RootSlotExhausted)?;
-        let stage1_root = match Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(root_slot.base()))
+        let stage1_root = match Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa::new(root_slot.base()))
         {
             Ok(root) => root,
             Err(error) => {
@@ -2729,7 +2729,7 @@ mod tests {
 
         let child = second_root.prepare_child().expect("second root child");
         assert_ne!(
-            child.binding().stage1_root.gpa().0,
+            child.binding().stage1_root.gpa().raw(),
             first_resources.tables.arenas()[0].address().raw(),
             "second root child must not collide with the carrier's reserved fork-table arena"
         );

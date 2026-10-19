@@ -1421,7 +1421,7 @@ impl BlockedContinuation {
                     let outputs = clear_on_timeout
                         .into_iter()
                         .map(|(address, len)| {
-                            GuestOutputRange::new(GuestVa(address), len, mm, asid_generation)
+                            GuestOutputRange::new(GuestVa::new(address), len, mm, asid_generation)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     Self::WaitOnFdsSelect(new_state(
@@ -1588,7 +1588,7 @@ impl BlockedContinuation {
                 let outputs = remaining
                     .map(|pointer| {
                         GuestOutputRange::new(
-                            GuestVa(pointer.0),
+                            GuestVa::new(pointer.0),
                             std::mem::size_of::<libc::timespec>(),
                             mm,
                             asid_generation,

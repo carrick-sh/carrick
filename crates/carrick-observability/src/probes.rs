@@ -3979,7 +3979,7 @@ impl TranslatedRangeReset {
 ///     epoch,
 ///     sequence,
 ///     unit_id,
-///     HostVa(0x1000)..HostVa(0x2000),
+///     HostVa::new(0x1000)..HostVa::new(0x2000),
 /// ).unwrap();
 /// let _ = TranslatedRangeAdd::Private(shared);
 /// ```
@@ -4014,7 +4014,7 @@ impl TranslatedRangeAdd {
 /// let _ = TranslatedPrivateRange {
 ///     epoch,
 ///     sequence,
-///     range: HostVa(0x1000)..HostVa(0x2000),
+///     range: HostVa::new(0x1000)..HostVa::new(0x2000),
 /// };
 /// ```
 #[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
@@ -5166,10 +5166,10 @@ mod translated_range_probe_abi {
     #[test]
     fn translated_range_rejects_empty_inverted_and_unaligned_extents() {
         for range in [
-            HostVa(0x1000)..HostVa(0x1000),
-            HostVa(0x2000)..HostVa(0x1000),
-            HostVa(0x1001)..HostVa(0x2000),
-            HostVa(0x1000)..HostVa(0x2002),
+            HostVa::new(0x1000)..HostVa::new(0x1000),
+            HostVa::new(0x2000)..HostVa::new(0x1000),
+            HostVa::new(0x1001)..HostVa::new(0x2000),
+            HostVa::new(0x1000)..HostVa::new(0x2002),
         ] {
             assert!(
                 TranslatedPrivateRange::private(epoch(1), sequence(1), range.clone()).is_err(),
@@ -5197,13 +5197,13 @@ mod translated_range_probe_abi {
         ) -> Result<TranslatedSharedRange, TranslatedRangeError> = TranslatedSharedRange::shared;
 
         let private =
-            TranslatedPrivateRange::private(epoch(2), sequence(3), HostVa(0x1000)..HostVa(0x2000))
+            TranslatedPrivateRange::private(epoch(2), sequence(3), HostVa::new(0x1000)..HostVa::new(0x2000))
                 .unwrap_or_else(|error| unreachable!("valid private range: {error}"));
         let shared = TranslatedSharedRange::shared(
             epoch(2),
             sequence(4),
             unit_id(5),
-            HostVa(0x3000)..HostVa(0x4000),
+            HostVa::new(0x3000)..HostVa::new(0x4000),
         )
         .unwrap_or_else(|error| unreachable!("valid shared range: {error}"));
 
@@ -5217,11 +5217,11 @@ mod translated_range_probe_abi {
         );
         assert_eq!(private.epoch(), epoch(2));
         assert_eq!(private.sequence(), sequence(3));
-        assert_eq!(private.range(), &(HostVa(0x1000)..HostVa(0x2000)));
+        assert_eq!(private.range(), &(HostVa::new(0x1000)..HostVa::new(0x2000)));
         assert_eq!(shared.epoch(), epoch(2));
         assert_eq!(shared.sequence(), sequence(4));
         assert_eq!(shared.unit_id(), unit_id(5));
-        assert_eq!(shared.range(), &(HostVa(0x3000)..HostVa(0x4000)));
+        assert_eq!(shared.range(), &(HostVa::new(0x3000)..HostVa::new(0x4000)));
     }
 
     #[test]
@@ -5327,19 +5327,19 @@ mod native_owned_range_probe_abi {
         let epoch = NativeOwnedRangeEpoch::new(7).expect("nonzero epoch");
         let sequence = NativeOwnedRangeSequence::new(2).expect("nonzero sequence");
         for range in [
-            HostVa(0x4000)..HostVa(0x4000),
-            HostVa(0x8000)..HostVa(0x4000),
-            HostVa(0x4001)..HostVa(0x8000),
-            HostVa(0x4000)..HostVa(0x8001),
+            HostVa::new(0x4000)..HostVa::new(0x4000),
+            HostVa::new(0x8000)..HostVa::new(0x4000),
+            HostVa::new(0x4001)..HostVa::new(0x8000),
+            HostVa::new(0x4000)..HostVa::new(0x8001),
         ] {
             assert!(NativeOwnedRange::new(epoch, sequence, range, 0x4000).is_err());
         }
 
-        let range = NativeOwnedRange::new(epoch, sequence, HostVa(0x4000)..HostVa(0xc000), 0x4000)
+        let range = NativeOwnedRange::new(epoch, sequence, HostVa::new(0x4000)..HostVa::new(0xc000), 0x4000)
             .expect("aligned nonempty range");
         assert_eq!(range.epoch().get(), 7);
         assert_eq!(range.sequence().get(), 2);
-        assert_eq!(range.range(), &(HostVa(0x4000)..HostVa(0xc000)));
+        assert_eq!(range.range(), &(HostVa::new(0x4000)..HostVa::new(0xc000)));
     }
 
     #[test]

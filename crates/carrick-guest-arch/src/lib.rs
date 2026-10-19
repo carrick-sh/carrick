@@ -55,6 +55,214 @@ ordinal!(
     UserStackOffset,
 );
 
+/// Guest virtual address (lower-half user or upper-half supervisor linear address).
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+#[cfg_attr(feature = "serde", derive(::serde::Serialize, ::serde::Deserialize))]
+pub struct GuestVa(u64);
+
+impl GuestVa {
+    #[inline]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn from_user_va(va: UserVa) -> Self {
+        Self(va.raw())
+    }
+
+    #[inline]
+    pub const fn to_user_va(self) -> UserVa {
+        UserVa::new(self.0)
+    }
+
+    #[inline]
+    pub const fn to_descriptor_va(self) -> UserVa {
+        UserVa::new(self.0)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn page_base(self) -> u64 {
+        self.0 & !0xfff
+    }
+
+    #[inline]
+    pub const fn page_offset(self) -> usize {
+        (self.0 & 0xfff) as usize
+    }
+
+    #[inline]
+    pub const fn crosses_page(self, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        match self.page_offset().checked_add(len) {
+            Some(end) => end > 4096,
+            None => true,
+        }
+    }
+
+    #[inline]
+    pub const fn checked_add(self, offset: u64) -> Option<Self> {
+        match self.0.checked_add(offset) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
+    }
+
+    #[inline]
+    pub const fn is_canonical_48bit(self) -> bool {
+        ((self.0 as i64) << 16 >> 16) as u64 == self.0
+    }
+}
+
+impl core::fmt::LowerHex for GuestVa {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl core::fmt::Display for GuestVa {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "GuestVa(0x{:x})", self.0)
+    }
+}
+
+/// A guest physical address (stage-2 / memslot / IPA space).
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+#[cfg_attr(feature = "serde", derive(::serde::Serialize, ::serde::Deserialize))]
+pub struct Gpa(u64);
+
+impl Gpa {
+    #[inline]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn from_frame_gpa(frame: FrameGpa) -> Self {
+        Self(frame.raw())
+    }
+
+    #[inline]
+    pub const fn to_frame_gpa(self) -> FrameGpa {
+        FrameGpa::new(self.0)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn page_base(self) -> u64 {
+        self.0 & !0xfff
+    }
+
+    #[inline]
+    pub const fn page_offset(self) -> usize {
+        (self.0 & 0xfff) as usize
+    }
+
+    #[inline]
+    pub const fn checked_add(self, offset: u64) -> Option<Self> {
+        match self.0.checked_add(offset) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
+    }
+}
+
+impl core::fmt::LowerHex for Gpa {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl core::fmt::Display for Gpa {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "Gpa(0x{:x})", self.0)
+    }
+}
+
+/// A host virtual address (a pointer within Carrick's own address space).
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+#[cfg_attr(feature = "serde", derive(::serde::Serialize, ::serde::Deserialize))]
+pub struct HostVa(usize);
+
+impl HostVa {
+    #[inline]
+    pub const fn new(raw: usize) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn from_raw(raw: usize) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub fn from_ptr<T>(ptr: *const T) -> Self {
+        Self(ptr as usize)
+    }
+
+    #[inline]
+    pub fn from_mut_ptr<T>(ptr: *mut T) -> Self {
+        Self(ptr as usize)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> usize {
+        self.0
+    }
+
+    #[inline]
+    pub const fn page_base(self) -> usize {
+        self.0 & !0xfff
+    }
+
+    #[inline]
+    pub const fn as_ptr<T>(self) -> *const T {
+        self.0 as *const T
+    }
+
+    #[inline]
+    pub const fn as_mut_ptr<T>(self) -> *mut T {
+        self.0 as *mut T
+    }
+}
+
+impl core::fmt::LowerHex for HostVa {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl core::fmt::Display for HostVa {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "HostVa(0x{:x})", self.0)
+    }
+}
+
+
 /// Native address-space register bits, including ARM ASID or x86 control
 /// bits. This is distinct from a physical root and conveys no MM authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -2735,7 +2735,7 @@ impl<'a> ProcView<'a> {
                                         let Some(authority) = process.mm_access_authority() else {
                                             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
                                         };
-                                        let remote_va = carrick_guest_mem::GuestVa(addr.0);
+                                        let remote_va = carrick_guest_mem::GuestVa::new(addr.0);
                                         let range = match foreign.read_range(remote_va, 8) {
                                             Ok(Some(r)) => r,
                                             _ => return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO)),
@@ -2809,7 +2809,7 @@ impl<'a> ProcView<'a> {
                             return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_EIO));
                         }
                         let staged_data = data.to_le_bytes();
-                        let remote_va = carrick_guest_mem::GuestVa(addr.0);
+                        let remote_va = carrick_guest_mem::GuestVa::new(addr.0);
                         let mutation_tid = cx.tid();
                         macro_rules! commit_transport_poke {
                             ($mm:expr, $with_mutation:ident) => {{
@@ -4062,7 +4062,7 @@ impl<'a> ProcView<'a> {
                             break;
                         }
 
-                        let remote_va = carrick_guest_mem::GuestVa(remote_va_raw);
+                        let remote_va = carrick_guest_mem::GuestVa::new(remote_va_raw);
                         let range = match foreign.read_range(remote_va, want_len) {
                             Ok(Some(r)) => r,
                             _ => break,
@@ -4232,7 +4232,7 @@ impl<'a> ProcView<'a> {
                                 break;
                             }
 
-                            let remote_va = carrick_guest_mem::GuestVa(cur_remote_va_raw);
+                            let remote_va = carrick_guest_mem::GuestVa::new(cur_remote_va_raw);
                             let write_range = match foreign.write_range(remote_va, want_len) {
                                 Ok(Some(r)) => r,
                                 _ => {
@@ -4738,8 +4738,8 @@ mod kernel_process_dispatch_tests {
                 revision: 17,
                 binding: self.binding,
                 vmas: vec![VmaSummary {
-                    start: GuestVa(TARGET_VA),
-                    end: GuestVa(TARGET_VA + self.pages * 0x1000),
+                    start: GuestVa::new(TARGET_VA),
+                    end: GuestVa::new(TARGET_VA + self.pages * 0x1000),
                     access: VmaAccess {
                         readable: true,
                         writable: true,
@@ -4817,10 +4817,10 @@ mod kernel_process_dispatch_tests {
             if FOREIGN_LEASE_STALE_ONCE.with(|stale| stale.replace(false)) {
                 return Err(ForeignMmTransportError::LeaseStale);
             }
-            if va.0 < TARGET_VA || self.payload.is_empty() {
+            if va.raw() < TARGET_VA || self.payload.is_empty() {
                 return Err(ForeignMmTransportError::Translation(va));
             }
-            let offset = (va.0 - TARGET_VA) as usize;
+            let offset = (va.raw() - TARGET_VA) as usize;
             for (i, b) in dst.iter_mut().enumerate() {
                 *b = self.payload[(offset + i) % self.payload.len()];
             }
@@ -5038,7 +5038,7 @@ mod kernel_process_dispatch_tests {
         let asid = Asid::from_registry_allocation(
             NonZeroU16::new((registry_id as u16).max(1)).expect("nonzero ASID"),
         );
-        let root = Stage1Root::for_aarch64_4k(Gpa(0x8000)).expect("aligned stage-1 root");
+        let root = Stage1Root::for_aarch64_4k(Gpa::new(0x8000)).expect("aligned stage-1 root");
         let backend: Arc<dyn MmBackend> = Arc::new(ProcessVmBackend::with_pages(
             MmBinding::for_aarch64(asid, root),
             pages,
