@@ -1180,15 +1180,21 @@ where
             | DispatchOutcome::WaitOnHvpatchChild { .. }
             | DispatchOutcome::WaitOnPtraceStopSettle { .. }
             | DispatchOutcome::WaitOnSignals { .. }
-            // The single-threaded path dispatches without a thread context,
-            // so the in-guest zone never serves its futexes.
+            // A zone mm's futexes resolve to its zone queue with or without a
+            // thread context (#685). This loop has no zone continuation to
+            // park a thread on (only the persistent executor's `zone_park`
+            // does), so a zone wait completes EINTR like the other blocking
+            // outcomes here; a zone wake completes with its count below.
             | DispatchOutcome::ZoneFutexWait { .. }
             | DispatchOutcome::WaitOnSleep { .. } => {
                 let value = crate::linux_abi::LINUX_EINTR.guest_retval();
                 complete_single_threaded_syscall(runtime, &mut completion, &reporter, value)?;
                 last_syscall_retval = Some(value);
             }
-            DispatchOutcome::ZoneFutexWoken { value, .. } => {
+            DispatchOutcome::ZoneFutexWoken { value, woken } => {
+                // The wake made these waiters host-owned: hand them back to
+                // their continuations, as the threaded loop does.
+                carrick_kernel::el1_zone::hand_back(&woken);
                 complete_single_threaded_syscall(runtime, &mut completion, &reporter, value)?;
                 last_syscall_retval = Some(value);
             }

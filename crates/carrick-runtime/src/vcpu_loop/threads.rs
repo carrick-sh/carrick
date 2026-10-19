@@ -38,6 +38,32 @@ impl PendingChildTidClear {
         })
     }
 
+    /// Retire the thread through the host lane, clearing and waking its
+    /// `clear_child_tid` word unless an in-zone exit already did (#685): EL1
+    /// marks the control slot when a host claim requeues its exit after the
+    /// wake, and the exit then re-runs here. A second clear could land on a
+    /// stack the woken joiner already released, and a second wake would wake
+    /// a second joiner.
+    fn retire_and_wake<M, R, D>(
+        &self,
+        memory: &mut M,
+        retire: impl FnOnce() -> Result<R, D>,
+        wake: impl FnOnce(),
+    ) -> Result<Result<R, D>, carrick_guest_mem::MemoryPrepareError>
+    where
+        M: carrick_guest_mem::CurrentMmMemory,
+    {
+        if self
+            .context
+            .thread()
+            .control_slot()
+            .child_tid_cleared_in_zone_at(self.clear.address().raw())
+        {
+            return Ok(retire());
+        }
+        retire_with_child_tid_clear(memory, &self.clear, retire, wake)
+    }
+
     fn validate(
         &self,
         current: &carrick_kernel::kernel::KernelContext,
@@ -965,7 +991,7 @@ where
         let Some(clear) = self.child_tid_clear.as_ref() else {
             return Ok(retire());
         };
-        let result = retire_with_child_tid_clear(engine, &clear.clear, retire, || {
+        let result = clear.retire_and_wake(engine, retire, || {
             wake_persistent_child_tid(kernel, &self.futex, clear.clear.address().raw(), clear.mm);
         })?;
         if result.is_ok()
@@ -1006,9 +1032,8 @@ where
                 pending.push(clear);
                 return Err(PersistentThreadExitDisposition::Failed(error));
             }
-            let result = retire_with_child_tid_clear(
+            let result = clear.retire_and_wake(
                 engine,
-                &clear.clear,
                 || {
                     let retired = process.exit_exact_thread(&clear.context);
                     if clear.context.thread().child_tid_cleared_in_zone() {
@@ -1130,7 +1155,7 @@ where
                 if let Err(error) = clear.validate(context) {
                     return PersistentThreadExitDisposition::Failed(error);
                 }
-                match retire_with_child_tid_clear(engine, &clear.clear, retire, || {
+                match clear.retire_and_wake(engine, retire, || {
                     wake_persistent_child_tid(
                         kernel,
                         &self.futex,
@@ -1723,5 +1748,231 @@ mod child_tid_owner_tests {
         assert_eq!(engine.prepared_commits, 1);
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
         assert!(!registry.is_clear_child_tid_addr(VA));
+    }
+
+    /// #685 fixture: a zeroed zone (the valid empty state the host maps),
+    /// leaked for the 'static the carrier's mapping has.
+    fn leaked_zone() -> &'static carrick_el1_abi::ZoneTables {
+        let layout = std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>();
+        // SAFETY: all-zero is the valid empty zone state.
+        unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<carrick_el1_abi::ZoneTables>();
+            assert!(!ptr.is_null());
+            &*ptr
+        }
+    }
+
+    /// A joiner parked in the zone queue of `mm` on the CLEARTID word, as EL1
+    /// parks a `FUTEX_WAIT_PRIVATE` it serves (or the host's `zone_park`).
+    fn park_zone_joiner(
+        zone: &carrick_el1_abi::ZoneTables,
+        joiner: &carrick_kernel::kernel::KernelContext,
+        mm: carrick_kernel::kernel::MmId,
+    ) -> carrick_el1_abi::RecordId {
+        let key = joiner.thread().key();
+        park_zone_waiter(
+            zone,
+            u64::try_from(key.tid.raw()).unwrap(),
+            key.serial.raw(),
+            mm,
+        )
+    }
+
+    fn park_zone_waiter(
+        zone: &carrick_el1_abi::ZoneTables,
+        tid: u64,
+        serial: u64,
+        mm: carrick_kernel::kernel::MmId,
+    ) -> carrick_el1_abi::RecordId {
+        let guard = zone
+            .lock(
+                carrick_el1_abi::ZoneTables::bucket_of_with_context(mm.raw(), VA),
+                &carrick_kernel::el1_zone::HostLockWait,
+            )
+            .unwrap();
+        let record = zone
+            .alloc_record(carrick_el1_abi::ThreadIdentity {
+                tid,
+                serial,
+                mm: mm.raw(),
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        let seq = zone.next_seq(record);
+        zone.enqueue(&guard, record, seq, mm.raw(), VA, u32::MAX, 0)
+            .unwrap();
+        zone.publish_park(record, seq);
+        record
+    }
+
+    fn zone_joiner_parked(
+        zone: &carrick_el1_abi::ZoneTables,
+        record: carrick_el1_abi::RecordId,
+    ) -> bool {
+        matches!(
+            zone.record(record).claim(),
+            carrick_el1_abi::Claim::Parked { .. }
+        )
+    }
+
+    /// #685 production witness: a job with no zone key (`zone_mm: None`, a
+    /// host-born member cancelled at the loop top before its first
+    /// `refresh_zone_key`) retires a sibling through the real
+    /// `handle_persistent_thread_exit`; the joiner parked in the zone queue
+    /// of that mm must be woken.
+    #[test]
+    fn serial_host_zone_joiner_woken_by_unkeyed_thread_exit() {
+        let zone = leaked_zone();
+        carrick_kernel::el1_zone::with_test_zone(zone, || {
+            let (kernel, root) = clear_kernel(72_610);
+            let sibling = clear_sibling(&root);
+            let tid = ThreadId::from_kernel_thread_identity(sibling.thread().key().tid.raw());
+            let registry = Arc::new(ThreadRegistry::new(tid));
+            registry.set_clear_child_tid(tid, VA);
+            let mut state = clear_state(&kernel, &sibling, registry, VcpuThreadRegistry::new());
+            state.zone_mm = None;
+            // Two distinct joiners of the mm; the CLEARTID wake count is 1.
+            let joiner = park_zone_joiner(zone, &root, sibling.shared().mm().id());
+            let second = park_zone_waiter(zone, 9_999, 99_990, sibling.shared().mm().id());
+            let dependency = Arc::new(ClearDependency::default());
+            dependency.0.store(true, Ordering::Release);
+            let mut engine = clear_engine(&sibling, &dependency);
+            let (table_wakes, _subscription) = clear_wakes(&state.futex);
+            assert!(matches!(
+                state.handle_persistent_thread_exit(&kernel, &mut engine, 0, 0),
+                PersistentThreadExitDisposition::Done(VcpuLoopOutcome::ThreadDone)
+            ));
+            assert_eq!(engine.guest_memory[&VA], [0; 4]);
+            assert!(
+                !zone_joiner_parked(zone, joiner),
+                "lost wake: the exit woke a queue other than the mm's zone queue"
+            );
+            assert!(
+                zone_joiner_parked(zone, second),
+                "the exit delivered more than its one CLEARTID wake"
+            );
+            assert_eq!(table_wakes.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    /// #685 production witness, terminal variant: the last thread's
+    /// `commit_terminal_child_tid` from a job with no zone key wakes the
+    /// zone joiner of its mm (a CLONE_VM peer sharing it).
+    #[test]
+    fn serial_host_zone_joiner_woken_by_unkeyed_terminal_commit() {
+        let zone = leaked_zone();
+        carrick_kernel::el1_zone::with_test_zone(zone, || {
+            let (kernel, root) = clear_kernel(72_620);
+            let tid = ThreadId::from_kernel_thread_identity(root.thread().key().tid.raw());
+            let registry = Arc::new(ThreadRegistry::new(tid));
+            registry.set_clear_child_tid(tid, VA);
+            let mut state = clear_state(&kernel, &root, registry, VcpuThreadRegistry::new());
+            state.zone_mm = None;
+            state.capture_child_tid_clear().unwrap();
+            let joiner = park_zone_joiner(zone, &root, root.shared().mm().id());
+            let dependency = Arc::new(ClearDependency::default());
+            dependency.0.store(true, Ordering::Release);
+            let mut engine = clear_engine(&root, &dependency);
+            let (table_wakes, _subscription) = clear_wakes(&state.futex);
+            state.withdraw_persistent_terminal_owner_runtime(&kernel, &mut engine);
+            let graph_exit = root
+                .kernel()
+                .prepare_task_exit_key(
+                    root.task().key(),
+                    carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                    None,
+                )
+                .unwrap();
+            let publication = state
+                .commit_terminal_child_tid(&kernel, &mut engine, || {
+                    graph_exit.retire_notifying(|_| {})
+                })
+                .unwrap()
+                .unwrap();
+            // Publish before asserting: an abandoned publication is fatal.
+            publication.publish().unwrap();
+            assert_eq!(engine.guest_memory[&VA], [0; 4]);
+            assert!(
+                !zone_joiner_parked(zone, joiner),
+                "lost wake: the terminal clear woke a queue other than the mm's zone queue"
+            );
+            assert_eq!(table_wakes.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    /// #685 production witness, drain variant: the exit owner's
+    /// `drain_child_tid_clears` from a job with no zone key retires an
+    /// unadopted sibling and wakes the zone joiner of its mm.
+    #[test]
+    fn serial_host_zone_joiner_woken_by_unkeyed_clear_drain() {
+        let zone = leaked_zone();
+        carrick_kernel::el1_zone::with_test_zone(zone, || {
+            let (kernel, root) = clear_kernel(72_630);
+            let sibling = clear_sibling(&root);
+            sibling.thread().control_slot().set_clear_child_tid(VA);
+            let root_tid = ThreadId::from_kernel_thread_identity(root.thread().key().tid.raw());
+            let registry = Arc::new(ThreadRegistry::new(root_tid));
+            let threads = VcpuThreadRegistry::new();
+            let mut owner = clear_state(&kernel, &root, registry, threads.clone());
+            owner.zone_mm = None;
+            let receipt = kernel.try_claim_persistent_process_exit(root_tid).unwrap();
+            assert_eq!(receipt.claim, super::terminal::ProcessExitClaim::Owner);
+            owner.publish_persistent_sibling_stop(&kernel).unwrap();
+            assert_eq!(threads.1.lock().pending.len(), 1);
+            let joiner = park_zone_joiner(zone, &root, sibling.shared().mm().id());
+            let dependency = Arc::new(ClearDependency::default());
+            dependency.0.store(true, Ordering::Release);
+            let mut engine = clear_engine(&sibling, &dependency);
+            let (table_wakes, _subscription) = clear_wakes(&owner.futex);
+            assert!(owner.drain_child_tid_clears(&kernel, &mut engine).is_ok());
+            assert!(!sibling.exact_thread_is_live());
+            assert_eq!(engine.guest_memory[&VA], [0; 4]);
+            assert!(
+                !zone_joiner_parked(zone, joiner),
+                "lost wake: the drain woke a queue other than the mm's zone queue"
+            );
+            assert_eq!(table_wakes.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    /// #685: an in-zone exit that cleared and woke the word, then had its
+    /// release requeued by a host claim, marks the control slot. The host
+    /// lane that then retires the thread must neither clear the word again
+    /// (the joiner may already have released that stack) nor wake again.
+    #[test]
+    fn serial_host_zone_cleared_child_tid_is_not_cleared_or_woken_again() {
+        let zone = leaked_zone();
+        carrick_kernel::el1_zone::with_test_zone(zone, || {
+            let (kernel, root) = clear_kernel(72_640);
+            let sibling = clear_sibling(&root);
+            let tid = ThreadId::from_kernel_thread_identity(sibling.thread().key().tid.raw());
+            let registry = Arc::new(ThreadRegistry::new(tid));
+            registry.set_clear_child_tid(tid, VA);
+            let slot = sibling.thread().control_slot();
+            slot.set_clear_child_tid(VA);
+            slot.mark_child_tid_cleared_in_zone(VA);
+            let mut state = clear_state(&kernel, &sibling, registry, VcpuThreadRegistry::new());
+            state.zone_mm = None;
+            // A second joiner that parked after the in-zone wake.
+            let joiner = park_zone_joiner(zone, &root, sibling.shared().mm().id());
+            let dependency = Arc::new(ClearDependency::default());
+            dependency.0.store(true, Ordering::Release);
+            let mut engine = clear_engine(&sibling, &dependency);
+            let before = engine.guest_memory[&VA].clone();
+            let (table_wakes, _subscription) = clear_wakes(&state.futex);
+            assert!(matches!(
+                state.handle_persistent_thread_exit(&kernel, &mut engine, 0, 0),
+                PersistentThreadExitDisposition::Done(VcpuLoopOutcome::ThreadDone)
+            ));
+            assert!(!sibling.exact_thread_is_live());
+            assert_eq!(engine.guest_memory[&VA], before, "a second clear");
+            assert_eq!(engine.prepared_commits, 0);
+            assert!(zone_joiner_parked(zone, joiner), "a second wake");
+            assert_eq!(table_wakes.load(Ordering::SeqCst), 0);
+        });
     }
 }

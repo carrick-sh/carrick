@@ -38,11 +38,7 @@ struct TerminalNativeWaitWake;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_vmm_hvf::metadata_grant::NativeWaitChannelWake for TerminalNativeWaitWake {
     fn wake(&self, mm: carrick_el1_abi::EntryMmKey, address: std::num::NonZeroU64) -> Option<u32> {
-        let zone = carrick_kernel::el1_zone::zone()?;
-        let wake =
-            carrick_kernel::el1_zone::wake(zone, mm.raw(), address.get(), u32::MAX, u32::MAX);
-        carrick_kernel::el1_zone::hand_back(&wake.handed);
-        Some(wake.count)
+        carrick_kernel::el1_zone::wake_exit_wait_channel(mm, address)
     }
 }
 
@@ -1772,10 +1768,9 @@ where
         // retains the address until Settled, so a concurrent ring reader
         // never observes freed control storage.
         if let Some((mm, address)) = page.exit_wait()
-            && let Some(zone) = carrick_kernel::el1_zone::zone()
+            && let Some(address) = std::num::NonZeroU64::new(address)
         {
-            let wake = carrick_kernel::el1_zone::wake(zone, mm.raw(), address, u32::MAX, u32::MAX);
-            carrick_kernel::el1_zone::hand_back(&wake.handed);
+            let _ = carrick_kernel::el1_zone::wake_exit_wait_channel(mm, address);
         }
     }
 

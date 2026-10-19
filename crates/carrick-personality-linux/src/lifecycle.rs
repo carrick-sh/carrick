@@ -1129,6 +1129,13 @@ fn serve_exit<'a>(
         }
     }
     if !native.release_current(record.reference) {
+        // A host claim requeued the record after the clear and wake above
+        // (`CurrentRelease::Requeued`): the exit re-runs, in the zone or on
+        // the host. The joiner is already woken; suppress the second clear
+        // and wake (#685).
+        if clear_child_tid != 0 {
+            slot.mark_child_tid_cleared_in_zone(clear_child_tid);
+        }
         return None;
     }
     if admission.commit_with_member(slot).is_err() {

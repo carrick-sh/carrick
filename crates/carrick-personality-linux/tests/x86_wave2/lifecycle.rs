@@ -118,6 +118,8 @@ struct Turn<'a> {
     fail_copy: Option<u64>,
     wakes: u64,
     adopted: bool,
+    fail_release: bool,
+    clears: u64,
 }
 use carrick_guest_arch::UserVa;
 use carrick_personality_linux::abi::entry::SyscallResult;
@@ -141,6 +143,8 @@ impl<'a> Turn<'a> {
             fail_copy: None,
             wakes: 0,
             adopted: false,
+            fail_release: false,
+            clears: 0,
         }
     }
     fn syscall(&mut self, ordinal: u64, args: [u64; 6]) -> dispatch::CompletionRoute {
@@ -190,6 +194,7 @@ impl UserCopy for Turn<'_> {
             return false;
         }
         self.words[index] = u32::from_le_bytes(src.try_into().unwrap());
+        self.clears += u64::from(index == 1);
         true
     }
 }
@@ -285,6 +290,10 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
     fn release_current(&mut self, record: RecordRef) -> bool {
         assert_eq!(self.current, Some(record));
         assert_eq!(self.words[1], 0, "clear before retirement");
+        if std::mem::take(&mut self.fail_release) {
+            // A host claim requeued the record (`CurrentRelease::Requeued`).
+            return false;
+        }
         self.handoff = carrick_core::entry::retire_current(
             self.binding,
             BornInZoneSource {
@@ -441,5 +450,58 @@ pub fn x5_linux_clone_exit() {
             );
             assert_eq!(peer.words, [71, 72]);
         }
+    }
+}
+
+/// #685: an in-zone exit that cleared and woke the CLEARTID word, then lost
+/// `release_current` to a host claim, declines the rest of the exit. The
+/// re-run exit (in the zone or on the host lane) must not clear and wake a
+/// second time: the control slot records the clear.
+pub fn x5_exit_requeued_after_wake_wakes_once() {
+    for x86 in [false, true] {
+        let a = Process::new(7);
+        let mut turn = Turn::new(&a, x86);
+        let entry = a
+            .page
+            .stock(
+                0,
+                EntryIdentity {
+                    tid: 50,
+                    visible_tid: 7,
+                    thread_serial: 5050,
+                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
+                    uid_credit: 1,
+                },
+            )
+            .unwrap();
+        a.slots[1].reset_for_host_birth(BlockedMask(0)).unwrap();
+        let args = [FLAGS, 0xdead0000, 0x1000, 0x77770000, 0x1004, 0];
+        assert_eq!(turn.syscall(220, args), dispatch::CompletionRoute::Served);
+        assert_eq!(turn.words, [7, 7]);
+        turn.enter_child();
+        assert_eq!(a.slots[1].clear_child_tid(), 0x1004);
+        turn.fail_release = true;
+        assert_eq!(turn.syscall(93, [0; 6]), dispatch::CompletionRoute::Forward);
+        assert_eq!((turn.words[1], turn.wakes), (0, 1));
+        assert_eq!(a.slots[1].clear_child_tid(), 0, "no clear left pending");
+        assert!(
+            a.slots[1].child_tid_cleared_in_zone_at(0x1004),
+            "the host lane sees the in-zone clear"
+        );
+        assert!(!a.slots[1].child_tid_cleared_in_zone_at(0x1000));
+        let clears = turn.clears;
+        // The exit re-runs in the zone: it retires without a second clear
+        // or wake.
+        assert_eq!(turn.syscall(93, [0; 6]), dispatch::CompletionRoute::Served);
+        assert_eq!(
+            (turn.clears - clears, turn.wakes),
+            (0, 1),
+            "a second clear or wake reached the joiner's word"
+        );
+        a.page.reap(entry).unwrap();
+        // A newer address from set_tid_address replaces the record.
+        a.slots[1].set_clear_child_tid(0x2000);
+        assert_eq!(a.slots[1].clear_child_tid(), 0x2000);
+        assert!(!a.slots[1].child_tid_cleared_in_zone_at(0x1004));
     }
 }

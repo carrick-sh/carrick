@@ -506,9 +506,24 @@ impl PartialEq for ZoneFutexQueue {
 
 impl Eq for ZoneFutexQueue {}
 
+/// Wake every waiter of a lifecycle exit-wait channel (`exit_wait()` of a
+/// task's lifecycle page): a carrier-internal rendezvous keyed by the ABI
+/// entry mm, not a guest futex, so it does not go through
+/// [`FutexQueueAuthority`]. Hands the woken back; `None` without a zone.
+pub fn wake_exit_wait_channel(
+    mm: carrick_el1_abi::EntryMmKey,
+    address: std::num::NonZeroU64,
+) -> Option<u32> {
+    let zone = zone()?;
+    let woken = wake(zone, mm.raw(), address.get(), u32::MAX, u32::MAX);
+    hand_back(&woken.handed);
+    Some(woken.count)
+}
+
 /// Host `FUTEX_WAKE(_BITSET)` on a zone process: wake up to `count` waiters
-/// of `(mm, uaddr)` matching `bitset`.
-pub fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> ZoneWake {
+/// of `(mm, uaddr)` matching `bitset`. Guest futexes reach it only through
+/// [`ZoneFutexQueue::wake`].
+fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> ZoneWake {
     let mut wake = ZoneWake::default();
     let mut placements = Vec::new();
     let mut transfers = Vec::new();
@@ -543,8 +558,9 @@ pub fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> 
 /// check `check` (the CMP value comparison; `Err` aborts with that errno),
 /// wake up to `wake_count` waiters of `from`, then move up to
 /// `requeue_count` of the rest to `to`. Returns the woken records and the
-/// number moved.
-pub fn requeue<E>(
+/// number moved. Guest futexes reach it only through
+/// [`ZoneFutexQueue::requeue`].
+fn requeue<E>(
     zone: &ZoneTables,
     mm: u64,
     from: u64,

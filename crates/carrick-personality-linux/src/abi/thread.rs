@@ -296,6 +296,12 @@ impl AltStack {
     }
 }
 
+/// Tag on a `ThreadControlSlot::clear_child_tid` word: the in-zone exit
+/// already cleared and woke this address. Bit 63 is never a user address
+/// (Linux's clear of a kernel address faults and wakes nobody, the same
+/// outcome as "nothing pending").
+const CHILD_TID_CLEARED_IN_ZONE: u64 = 1 << 63;
+
 /// Per-thread control state served at EL1. Single writer per field: the
 /// owning thread writes `blocked` (`store_blocked_then_read_pending`) and the
 /// altstack/robust record; other threads and the host only read (senders read
@@ -492,14 +498,45 @@ impl ThreadControlSlot {
         })
     }
 
-    /// The thread's `clear_child_tid` address (0 = none).
+    /// The thread's pending `clear_child_tid` address (0 = none, including
+    /// a word an in-zone exit already cleared and woke).
     pub fn clear_child_tid(&self) -> u64 {
-        self.clear_child_tid.load(Ordering::Acquire)
+        let word = self.clear_child_tid.load(Ordering::Acquire);
+        if word & CHILD_TID_CLEARED_IN_ZONE != 0 {
+            0
+        } else {
+            word
+        }
     }
 
     /// Owner-written `clear_child_tid` (`set_tid_address(2)`).
     pub fn set_clear_child_tid(&self, address: u64) {
         self.clear_child_tid.store(address, Ordering::Release);
+    }
+
+    /// An in-zone exit cleared `address` and woke its joiner, then declined
+    /// the rest of the exit to the host (#685). Record that the clear is
+    /// done, so neither a re-served exit nor the host lane clears and wakes
+    /// it a second time. Only the owner writes this word while it runs, so a
+    /// failed exchange means a newer `set_tid_address` replaced it: that
+    /// address is still pending.
+    pub fn mark_child_tid_cleared_in_zone(&self, address: u64) {
+        if address == 0 || address & CHILD_TID_CLEARED_IN_ZONE != 0 {
+            return;
+        }
+        let _ = self.clear_child_tid.compare_exchange(
+            address,
+            address | CHILD_TID_CLEARED_IN_ZONE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Whether an in-zone exit already cleared and woke `address`.
+    pub fn child_tid_cleared_in_zone_at(&self, address: u64) -> bool {
+        address != 0
+            && address & CHILD_TID_CLEARED_IN_ZONE == 0
+            && self.clear_child_tid.load(Ordering::Acquire) == address | CHILD_TID_CLEARED_IN_ZONE
     }
 
     /// Masker half of the Dekker pair: install `new`, then read the shared
