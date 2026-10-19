@@ -140,6 +140,20 @@ pub enum Commands {
     CommitTrailers(crate::commit_trailers::CommitTrailersArgs),
 
     #[command(
+        name = "copyout-debt",
+        about = "Ratchet direct user-memory writes in the syscall dispatcher"
+    )]
+    CopyoutDebt {
+        #[arg(long, help = "Print current per-file direct-write counts for review")]
+        list: bool,
+        #[arg(
+            long,
+            help = "Actual change-range base; defaults to CARRICK_AUTHORITY_BASE"
+        )]
+        base: Option<String>,
+    },
+
+    #[command(
         name = "terminal-custody",
         about = "Ratchet neutral terminal decision ownership"
     )]
@@ -627,6 +641,23 @@ where
             let info = resolve_repo_info(cli.root.as_deref())?;
             crate::test_lanes::run(&info.repository_root, args, writer)?;
             Ok(())
+        }
+        Commands::CopyoutDebt { list, base } => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            if list {
+                for (path, count) in crate::copyout_debt::discover(&info.repository_root)
+                    .map_err(CliError::Impact)?
+                {
+                    writeln!(writer, "{count}\t{path}").map_err(|source| CliError::Io {
+                        path: PathBuf::from("stdout"),
+                        source,
+                    })?;
+                }
+                Ok(())
+            } else {
+                crate::copyout_debt::check(&info.repository_root, base.as_deref())
+                    .map_err(CliError::Impact)
+            }
         }
         Commands::TerminalCustody { list, base } => {
             let info = resolve_repo_info(cli.root.as_deref())?;
