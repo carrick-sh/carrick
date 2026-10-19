@@ -1034,6 +1034,7 @@ name = "carrick-softmmu"
 version = "0.1.0"
 dependencies = [
  "carrick-conformance-contract",
+ "carrick-core",
  "carrick-core-abi",
  "carrick-guest-arch",
  "carrick-mmu-core",

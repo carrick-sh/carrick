@@ -37,9 +37,11 @@ uses the crate-owned `AuthenticatedDescriptorWords` adapter to perform atomic
 output address, and permission bits are unchanged, walk restart on a material
 descriptor change, and every failed CAS counted against `MAX_AD_CAS_RETRIES`
 with typed `AdCasRetryExhausted` counted in `SoftWalkerStats`), authenticates
-`[leaf_base, leaf_base + leaf.size)` to mint `AuthenticatedGpa`, requires TLB
-shootdowns on `ExtentTable` retirement/replacement, and invalidates write-plane
-entries across CPUs when an authenticated frame becomes a code page.
+`[leaf_base, leaf_base + leaf.size)` to mint `AuthenticatedGpa`, publishes a
+domain-wide invalidation on `ExtentTable` retirement/replacement that every
+seated soft vCPU serves at block entry (`softmmu.x86.physical-retirement`), and
+invalidates write-plane entries across explicitly supplied TLBs when an
+authenticated frame becomes a code page (cross-vCPU publication is #684).
 """
 
 [bindings]

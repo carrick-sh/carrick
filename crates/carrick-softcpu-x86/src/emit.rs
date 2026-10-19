@@ -25,8 +25,19 @@ pub enum JitStage {
 /// Error returned if a block cannot be emitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EmitError {
-    EncodeFailed { va: u64, detail: String },
-    HostJit { va: u64, stage: JitStage },
+    EncodeFailed {
+        va: u64,
+        detail: String,
+    },
+    HostJit {
+        va: u64,
+        stage: JitStage,
+    },
+    /// The memory's physical inventory is not the one this CPU is seated in:
+    /// its retirements would never reach this CPU's TLB.
+    ForeignInventory {
+        va: u64,
+    },
 }
 
 /// Output of [`emit_block`].

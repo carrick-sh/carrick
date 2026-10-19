@@ -28,13 +28,15 @@
 
 pub use carrick_softmmu::{
     Access as SoftAccessKind, Access, AuthenticatedDescriptorWords, AuthenticatedGpa, Cpl,
-    CpuAccessMode, DescriptorRefusal, ExtentRecord, ExtentTable, FrameGpa, GuestVa, HostVa,
-    LinearPlacement, LiveDescriptorWords, MmioHoles, OwnerGeneration,
-    PAGE_BASE_MASK_4K as SOFT_TLB_PAGE_MASK, PAGE_OFFSET_MASK_4K as SOFT_TLB_OFFSET_MASK,
-    PAGE_SHIFT_4K as SOFT_TLB_PAGE_SHIFT, PAGE_SIZE_4K as SOFT_TLB_PAGE_SIZE, PageFaultErrorCode,
-    PageFaultInfo, PlacementError, ResolvedAccess, ResolvedSpan, RootGpa, SOFT_TLB_BITS,
-    SOFT_TLB_ENTRIES, SOFT_TLB_INDEX_MASK, SoftCpuException, SoftFaultClass, SoftMmuMemory,
-    SoftTlb, SoftTlbEntry, SoftTlbPlane, SoftTlbStats, SoftTranslationError, SoftWalker, Stage1Gpa,
+    CpuAccessMode, DescriptorRefusal, DomainCompletion, ExtentEditError, ExtentRecord, ExtentTable,
+    FrameGpa, GuestVa, HostVa, LinearPlacement, LiveDescriptorWords, LookupAdmission, MmioHoles,
+    OwnerGeneration, PAGE_BASE_MASK_4K as SOFT_TLB_PAGE_MASK,
+    PAGE_OFFSET_MASK_4K as SOFT_TLB_OFFSET_MASK, PAGE_SHIFT_4K as SOFT_TLB_PAGE_SHIFT,
+    PAGE_SIZE_4K as SOFT_TLB_PAGE_SIZE, PageFaultErrorCode, PageFaultInfo, PendingRetirement,
+    PlacementError, ResolvedAccess, ResolvedSpan, RetiredIdentity, Retirement, RootGpa,
+    SOFT_TLB_BITS, SOFT_TLB_ENTRIES, SOFT_TLB_INDEX_MASK, SoftCpuException, SoftFaultClass,
+    SoftMmuMemory, SoftRequester, SoftSeatError, SoftTlb, SoftTlbEntry, SoftTlbPlane, SoftTlbStats,
+    SoftTranslationError, SoftVcpuSeat, SoftWalker, Stage1Gpa,
     TLB_TAG_AC_BIT as SOFT_TLB_TAG_AC_BIT, TLB_TAG_CPL3_BIT as SOFT_TLB_TAG_CPL3_BIT,
     TLB_TAG_INVALID as SOFT_TLB_INVALID_TAG, WalkOutcome,
 };
@@ -94,7 +96,23 @@ use crate::context::SoftCpuContext;
 
 /// Walk `va` through `ctx.walker` and `mem`, filling `ctx.tlb` and returning the host byte pointer
 /// and authenticated [`AuthenticatedGpa`] of the resolved 4 KiB frame.
+///
+/// On a parked CPU the returned pointer is usable only inside an admission
+/// ([`SoftCpuContext::admit_host_access`]); a running CPU's pointers stay
+/// usable until its next block entry.
 pub fn translate_with_frame<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    va: u64,
+    kind: SoftAccessKind,
+) -> Result<(*mut u8, AuthenticatedGpa), SoftPageFault> {
+    let admission = ctx.admit_host_access();
+    let result = walk_with_frame(ctx, mem, va, kind);
+    ctx.release_host_access(admission);
+    result
+}
+
+fn walk_with_frame<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     mem: &mut M,
     va: u64,
@@ -127,7 +145,23 @@ pub fn translate_with_frame<M: SoftMmuMemory>(
 }
 
 /// Translate `va` using `ctx.tlb` as a front cache, falling back to `ctx.walker` on a miss.
+///
+/// A parked CPU is admitted for the lookup, so a retirement that completed
+/// while it was parked is served before its TLB is probed. The pointer rule
+/// of [`translate_with_frame`] applies.
 pub fn translate_va<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    va: u64,
+    kind: SoftAccessKind,
+) -> Result<*mut u8, SoftPageFault> {
+    let admission = ctx.admit_host_access();
+    let result = probe_or_walk(ctx, mem, va, kind);
+    ctx.release_host_access(admission);
+    result
+}
+
+fn probe_or_walk<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     mem: &mut M,
     va: u64,
@@ -136,7 +170,7 @@ pub fn translate_va<M: SoftMmuMemory>(
     if let Some(host_addr) = ctx.tlb.probe(GuestVa::new(va), 1, kind, ctx.access_mode()) {
         return Ok(host_addr as *mut u8);
     }
-    translate_with_frame(ctx, mem, va, kind).map(|(ptr, _)| ptr)
+    walk_with_frame(ctx, mem, va, kind).map(|(ptr, _)| ptr)
 }
 
 /// Read `dst.len()` bytes starting at guest `va`, pre-validating all spanned pages.
@@ -167,7 +201,23 @@ pub fn write_guest_bytes<M: SoftMmuMemory>(
     })
 }
 
+/// Validate then copy a span. The admission covers both passes and every
+/// copy, so no pointer outlives the CPU's admission.
 fn walk_span<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    va: u64,
+    len: usize,
+    kind: SoftAccessKind,
+    commit: impl FnMut(usize, *mut u8, usize),
+) -> Result<(), SoftPageFault> {
+    let admission = ctx.admit_host_access();
+    let result = walk_span_admitted(ctx, mem, va, len, kind, commit);
+    ctx.release_host_access(admission);
+    result
+}
+
+fn walk_span_admitted<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     mem: &mut M,
     va: u64,
@@ -180,7 +230,7 @@ fn walk_span<M: SoftMmuMemory>(
         while off < len {
             let chunk =
                 (len - off).min((SOFT_TLB_PAGE_SIZE - (cur & SOFT_TLB_OFFSET_MASK)) as usize);
-            let ptr = translate_va(ctx, mem, cur, kind)?;
+            let ptr = probe_or_walk(ctx, mem, cur, kind)?;
             if pass {
                 commit(off, ptr, chunk);
             }

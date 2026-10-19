@@ -114,16 +114,37 @@ impl AuthenticatedGpa {
 }
 
 /// Logical owner generation authenticating a physical frame extent against a live stage-1 walk.
+///
+/// Zero is never a generation, and the successor of the last one is refused
+/// rather than wrapped: a wrapped generation could re-authenticate a stale
+/// extent record under an identity that was already retired.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OwnerGeneration(u64);
+pub struct OwnerGeneration(core::num::NonZeroU64);
 
 impl OwnerGeneration {
-    pub const fn new(raw: u64) -> Self {
+    /// The first generation an owner issues.
+    pub const FIRST: Self = Self(core::num::NonZeroU64::MIN);
+
+    pub const fn new(raw: core::num::NonZeroU64) -> Self {
         Self(raw)
     }
+    /// `None` for zero, which is never a generation.
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match core::num::NonZeroU64::new(raw) {
+            Some(raw) => Some(Self(raw)),
+            None => None,
+        }
+    }
     pub const fn raw(self) -> u64 {
-        self.0
+        self.0.get()
+    }
+    /// The next generation, or `None` once the counter is exhausted.
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
     }
 }
 
@@ -341,6 +362,12 @@ pub enum SoftTranslationError {
         va: GuestVa,
         frame_gpa: AuthenticatedGpa,
         error: crate::placement::PlacementError,
+    },
+    /// A write to a code page could not advance the frame's code generation
+    /// (exhausted); the write is refused rather than saturating.
+    CodeGenerationExhausted {
+        va: GuestVa,
+        frame_gpa: AuthenticatedGpa,
     },
 }
 

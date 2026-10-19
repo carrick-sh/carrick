@@ -11,7 +11,7 @@ use carrick_softcpu_x86::{
     OwnerGeneration, PF_ERR_INSTR, PF_ERR_PRESENT, PF_ERR_USER, PF_ERR_WRITE, RootGpa,
     SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK, SOFT_TLB_PAGE_SIZE, SensitiveOp, SoftAccessKind,
     SoftCpu, SoftCpuExit, SoftMmuMemory, X86Exception, X86ExceptionVector, read_guest_bytes, reg,
-    translate_with_frame,
+    translate_va, translate_with_frame,
 };
 use goblin::elf::Elf;
 use goblin::elf::program_header::{PF_W, PF_X, PT_LOAD};
@@ -53,7 +53,7 @@ struct TestSoftMmuMemory {
 
 impl TestSoftMmuMemory {
     const POOL_BYTES: u64 = 16 * 1024 * 1024;
-    const GEN: OwnerGeneration = OwnerGeneration::new(1);
+    const GEN: OwnerGeneration = OwnerGeneration::FIRST;
 
     fn root() -> RootGpa {
         RootGpa::page_aligned(FrameGpa::new(0)).expect("aligned root")
@@ -71,7 +71,7 @@ impl TestSoftMmuMemory {
         let placement =
             unsafe { LinearPlacement::new(aligned, Self::POOL_BYTES, MmioHoles::empty()) }
                 .expect("valid placement");
-        let mut extents = ExtentTable::new();
+        let mut extents = ExtentTable::new().expect("fresh invalidation domain");
         let rec = ExtentRecord::new(FrameGpa::new(0), Self::POOL_BYTES, Self::GEN);
         assert!(extents.install(rec));
         extents.set_root_generation(Self::root(), Self::GEN);
@@ -275,7 +275,7 @@ fn run_static_elf_fixture(elf_bytes: &[u8]) -> ElfRunResult {
         assert!(mem.write_direct(rsp + (i * 8) as u64, &w.to_le_bytes()));
     }
 
-    let mut cpu = SoftCpu::new().expect("create SoftCpu");
+    let mut cpu = SoftCpu::new(mem.extents()).expect("create SoftCpu");
     cpu.context_mut().rip = elf.entry.wrapping_add(bias);
     cpu.context_mut().gpr[reg::RSP] = rsp;
 
@@ -359,7 +359,7 @@ fn setup_snippet(code: &[u8]) -> (SoftCpu, TestSoftMmuMemory, u64) {
     mem.map_range(code_va, 4096, PagePerms::USER_RX);
     mem.write_direct(code_va, code);
     mem.map_range(stack_va, 8192, PagePerms::USER_RW);
-    let mut cpu = SoftCpu::new().expect("SoftCpu");
+    let mut cpu = SoftCpu::new(mem.extents()).expect("SoftCpu");
     cpu.context_mut().rip = code_va;
     cpu.context_mut().gpr[reg::RSP] = stack_va + 4096;
     (cpu, mem, code_va)
@@ -367,6 +367,223 @@ fn setup_snippet(code: &[u8]) -> (SoftCpu, TestSoftMmuMemory, u64) {
 
 fn step_ok(cpu: &mut SoftCpu, mem: &mut TestSoftMmuMemory, exp: SoftCpuExit) {
     assert_eq!(cpu.step_block(mem).unwrap(), exp);
+}
+
+// ---------------------------------------------------------------------------
+// Physical retirement through the neutral invalidation domain (#681 slice 2,
+// #607): the soft CPU's block entry is its safe point and host-side guest
+// access admits a parked CPU before probing its TLB.
+// ---------------------------------------------------------------------------
+
+const RETIRE_DATA_VA: u64 = 0x2000_0000;
+const RETIRE_VALUE: u64 = 0x1122_3344_5566_7788;
+const RETIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `mov rax, [rdi]; syscall` over a data page whose frame is its own
+/// extent, so retiring that extent leaves code and page tables live.
+fn setup_retirable_data() -> (TestSoftMmuMemory, u64, FrameGpa) {
+    let (code_va, stack_va) = (0x0040_0000u64, 0x0080_0000u64);
+    let mut mem = TestSoftMmuMemory::new();
+    mem.map_range(code_va, 4096, PagePerms::USER_RX);
+    mem.write_direct(code_va, &[0x48, 0x8B, 0x07, 0x0F, 0x05]);
+    mem.map_range(stack_va, 8192, PagePerms::USER_RW);
+    mem.map_range(RETIRE_DATA_VA, 4096, PagePerms::USER_RW);
+    assert!(mem.write_direct(RETIRE_DATA_VA, &RETIRE_VALUE.to_le_bytes()));
+    let data = mem.frame_for_va(RETIRE_DATA_VA).unwrap();
+    let pool = mem
+        .extents_mut()
+        .remove(FrameGpa::new(0), None)
+        .unwrap()
+        .unwrap();
+    // No CPU is seated yet: the split completes at once.
+    let completion = pool.pending.try_complete().expect("no CPU seated");
+    mem.extents_mut().reclaim(&completion);
+    let page = SOFT_TLB_PAGE_SIZE;
+    let tail = TestSoftMmuMemory::POOL_BYTES - data.raw() - page;
+    for (base, len) in [
+        (0, data.raw()),
+        (data.raw(), page),
+        (data.raw() + page, tail),
+    ] {
+        assert!(mem.extents_mut().install(ExtentRecord::new(
+            FrameGpa::new(base),
+            len,
+            TestSoftMmuMemory::GEN
+        )));
+    }
+    (mem, code_va, data)
+}
+
+fn retirable_cpu(mem: &TestSoftMmuMemory, code_va: u64) -> SoftCpu {
+    let mut cpu = SoftCpu::new(mem.extents()).expect("SoftCpu");
+    cpu.context_mut().rip = code_va;
+    cpu.context_mut().gpr[reg::RSP] = 0x0080_0000 + 4096;
+    cpu.context_mut().gpr[reg::RDI] = RETIRE_DATA_VA;
+    cpu.context_mut().cr3 = TestSoftMmuMemory::root().address().raw();
+    cpu
+}
+
+fn bounded_relax() -> impl FnMut() -> Result<(), &'static str> {
+    let deadline = std::time::Instant::now() + RETIRE_WAIT;
+    move || {
+        if std::time::Instant::now() > deadline {
+            return Err("retirement wait exceeded its bound");
+        }
+        std::thread::yield_now();
+        Ok(())
+    }
+}
+
+/// Red-first (#607) at the soft CPU: a running peer whose inline JIT probe
+/// hits a translation of the data frame. Without a shootdown that reaches
+/// it, its next block reads the retired frame through the stale entry.
+#[test]
+fn running_peer_that_hits_through_step_block_misses_after_retirement() {
+    let (mem, code_va, data) = setup_retirable_data();
+    let mem = std::sync::Arc::new(std::sync::Mutex::new(mem));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let peer = {
+        let mem = std::sync::Arc::clone(&mem);
+        std::thread::spawn(move || {
+            let mut cpu = retirable_cpu(&mem.lock().unwrap(), code_va);
+            let expect = SoftCpuExit::Syscall {
+                rip: code_va + 3,
+                next_rip: code_va + 5,
+            };
+            step_ok(&mut cpu, &mut mem.lock().unwrap(), expect);
+            let misses = cpu.context().tlb_stats().misses;
+            cpu.context_mut().rip = code_va;
+            cpu.context_mut().gpr[reg::RAX] = 0;
+            step_ok(&mut cpu, &mut mem.lock().unwrap(), expect);
+            assert_eq!(cpu.context().gpr[reg::RAX], RETIRE_VALUE);
+            assert_eq!(
+                cpu.context().tlb_stats().misses,
+                misses,
+                "the second load hit the inline TLB"
+            );
+            ready_tx.send(()).unwrap();
+            // Running between blocks until the retirement kicks it.
+            let deadline = std::time::Instant::now() + RETIRE_WAIT;
+            while !cpu.exit_requested() {
+                assert!(std::time::Instant::now() < deadline, "no kick");
+                std::thread::yield_now();
+            }
+            cpu.context_mut().rip = code_va;
+            cpu.context_mut().gpr[reg::RAX] = 0;
+            let exit = cpu.step_block(&mut *mem.lock().unwrap()).unwrap();
+            cpu.park();
+            (exit, cpu.context().gpr[reg::RAX])
+        })
+    };
+    ready_rx.recv_timeout(RETIRE_WAIT).unwrap();
+    let retirement = mem
+        .lock()
+        .unwrap()
+        .extents_mut()
+        .remove(data, None)
+        .unwrap()
+        .unwrap();
+    let pending = retirement
+        .pending
+        .try_complete()
+        .expect_err("the running peer has not reached block entry");
+    let completion = pending
+        .wait(None, bounded_relax())
+        .map_err(|(_, error)| error)
+        .unwrap();
+    mem.lock().unwrap().extents_mut().reclaim(&completion);
+    let (exit, rax) = peer.join().unwrap();
+    assert_eq!(exit, pf(code_va, PF_ERR_USER, RETIRE_DATA_VA));
+    assert_eq!(rax, 0, "no byte of the retired frame was read");
+}
+
+/// Host-side `translate_va` on a parked CPU after the retirement completed:
+/// the admission serves the retirement before the TLB is probed.
+#[test]
+fn host_translate_va_after_completion_misses_on_a_parked_cpu() {
+    let (mut mem, code_va, data) = setup_retirable_data();
+    let mut cpu = retirable_cpu(&mem, code_va);
+    let mut bytes = [0u8; 8];
+    for _ in 0..2 {
+        read_guest_bytes(
+            cpu.context_mut(),
+            &mut mem,
+            RETIRE_DATA_VA,
+            &mut bytes,
+            SoftAccessKind::Read,
+        )
+        .unwrap();
+    }
+    assert_eq!(u64::from_le_bytes(bytes), RETIRE_VALUE);
+    assert!(
+        cpu.context().tlb_stats().hits > 0,
+        "the helper hit its fill"
+    );
+    assert!(
+        !cpu.context().seat().is_running(),
+        "helpers leave it parked"
+    );
+
+    let retirement = mem.extents_mut().remove(data, None).unwrap().unwrap();
+    let completion = retirement
+        .pending
+        .try_complete()
+        .expect("a parked CPU never holds a retirement");
+    mem.extents_mut().reclaim(&completion);
+    assert!(
+        translate_va(
+            cpu.context_mut(),
+            &mut mem,
+            RETIRE_DATA_VA,
+            SoftAccessKind::Read
+        )
+        .is_err(),
+        "translate_va served a stale TLB addend"
+    );
+    assert!(
+        read_guest_bytes(
+            cpu.context_mut(),
+            &mut mem,
+            RETIRE_DATA_VA,
+            &mut bytes,
+            SoftAccessKind::Read,
+        )
+        .is_err()
+    );
+}
+
+/// A CPU that retires from inside its own execution is served inline and
+/// never kicked, so it completes without waiting on its own safe point.
+#[test]
+fn retirement_issued_by_a_running_cpu_completes_without_waiting_on_itself() {
+    let (mut mem, code_va, data) = setup_retirable_data();
+    let mut cpu = retirable_cpu(&mem, code_va);
+    let expect = SoftCpuExit::Syscall {
+        rip: code_va + 3,
+        next_rip: code_va + 5,
+    };
+    step_ok(&mut cpu, &mut mem, expect);
+    assert!(cpu.context().seat().is_running());
+    let kicks = mem.extents().retirement_kicks();
+    let retirement = mem
+        .extents_mut()
+        .remove(data, Some(cpu.requester()))
+        .unwrap()
+        .unwrap();
+    assert!(retirement.pending.counts(cpu.context().seat().cpu()));
+    assert_eq!(
+        mem.extents().retirement_kicks(),
+        kicks,
+        "never kicks itself"
+    );
+    let completion = retirement
+        .pending
+        .wait(Some(cpu.requester()), bounded_relax())
+        .map_err(|(_, error)| error)
+        .unwrap();
+    mem.extents_mut().reclaim(&completion);
+    cpu.context_mut().rip = code_va;
+    step_ok(&mut cpu, &mut mem, pf(code_va, PF_ERR_USER, RETIRE_DATA_VA));
 }
 
 #[test]
@@ -414,7 +631,7 @@ fn page_fault_witnesses_read_write_ro_nx_smap_and_straddle_fetch() {
     mem.map_range(user_data, 4096, PagePerms::USER_RW);
     mem.write_direct(user_data, &0xCAFE_BABE_1234_5678u64.to_le_bytes());
     cpu.context_mut().set_cpl(0);
-    cpu.context_mut().tlb.flush_all();
+    cpu.context_mut().flush_tlb();
     cpu.context_mut().gpr[reg::RDI] = user_data;
     step_ok(&mut cpu, &mut mem, pf(code_va, PF_ERR_PRESENT, user_data));
     cpu.context_mut().rflags |= 1 << 18;
@@ -499,7 +716,7 @@ fn general_protection_witnesses_privileged_at_cpl3_and_sensitive_at_cpl0() {
         step_ok(&mut cpu, &mut mem, expected);
         mem.set_page_perms(code_va, PagePerms::KERNEL_RX);
         cpu.context_mut().set_cpl(0);
-        cpu.context_mut().tlb.flush_all();
+        cpu.context_mut().flush_tlb();
         cpu.context_mut().rip = code_va;
         let next_rip = code_va + bytes.len() as u64;
         step_ok(
@@ -618,7 +835,7 @@ fn page_crossing_bounce_buffer_handles_read_write_rmw_and_second_page_fault_atom
     assert_eq!(written_b, init_val);
 
     mem.set_page_perms(base_va + 0x1000, PagePerms::USER_RO);
-    cpu.context_mut().tlb.flush_all();
+    cpu.context_mut().flush_tlb();
     let before_bytes = mem.read_direct(straddle_a, 8).unwrap();
 
     mem.write_direct(code_va, &[0x48, 0x89, 0x1F, 0x0F, 0x05]);
@@ -884,7 +1101,6 @@ fn gen_random_block(rng: &mut Xorshift64) -> Vec<u8> {
 fn differential_property_tests_match_native_host_x86_64_cpu() {
     let mut rng = Xorshift64(0x853c_49e6_748f_ea9b);
     let mut native_jit = JitCodeBuffer::new(64 * 1024).expect("native diff JIT");
-    let mut cpu = SoftCpu::new().expect("SoftCpu");
     const ARITH_FLAGS: u64 = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
 
     for trial in 0..200 {
@@ -894,6 +1110,7 @@ fn differential_property_tests_match_native_host_x86_64_cpu() {
 
         let (code_va, data_va, stack_va) = (0x0040_0000u64, 0x2000_0000u64, 0x3000_0000u64);
         let mut mem = TestSoftMmuMemory::new();
+        let mut cpu = SoftCpu::new(mem.extents()).expect("SoftCpu");
         mem.map_range(code_va, 4096, PagePerms::USER_RX);
         mem.write_direct(code_va, &guest_code);
         mem.map_range(data_va, 8192, PagePerms::USER_RW);
@@ -909,7 +1126,7 @@ fn differential_property_tests_match_native_host_x86_64_cpu() {
         let (rbp_offset, rsp_offset) = (0xFE0u64, 4096u64);
         let init_flags = 0x202 | (rng.next() & ARITH_FLAGS);
 
-        cpu.context_mut().tlb.flush_all();
+        cpu.context_mut().flush_tlb();
         cpu.context_mut().gpr = init_gprs;
         (
             cpu.context_mut().gpr[reg::RBP],
@@ -1267,7 +1484,7 @@ fn legacy_x87_images_cross_pages_with_full_span_and_atomic_faults() {
     cpu.step_block(&mut mem).unwrap();
     assert_eq!(&cpu.context_mut().fxsave.0[..2], &0x027fu16.to_le_bytes());
     mem.set_page_perms(0x2000_1000, PagePerms::USER_RO);
-    cpu.context_mut().tlb.flush_all();
+    cpu.context_mut().flush_tlb();
     mem.write_direct(va, &[0xdd, 0x37]);
     cpu.context_mut().rip = va;
     let before = mem.read_direct(addr, 108).unwrap();
@@ -1822,9 +2039,9 @@ fn rep_copy_translation_work_is_page_chunked() {
         cpu.context_mut().gpr[reg::RSI] = src;
         cpu.context_mut().gpr[reg::RDI] = dst;
         cpu.context_mut().gpr[reg::RCX] = count as u64;
-        cpu.context_mut().tlb.reset_stats();
+        cpu.context_mut().reset_tlb_stats();
         cpu.step_block(&mut mem).unwrap();
-        let stats = cpu.context().tlb.stats();
+        let stats = cpu.context().tlb_stats();
         assert!(
             stats.hits + stats.misses <= 4,
             "page-chunk translation budget: n={count}, {stats:?}"

@@ -22,7 +22,7 @@ contracts = ["kernel.wait.child-exit-notification-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-observability/src/work_meter.rs"
-contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.execution.native-code-density", "softmmu.x86.tlb-walker"]
+contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.execution.native-code-density", "softmmu.x86.tlb-walker", "softmmu.x86.physical-retirement"]
 
 [[surfaces]]
 path = "crates/carrick-mem/src/memory.rs"
@@ -1514,11 +1514,11 @@ contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
 
 [[surfaces]]
 path = "crates/carrick-softmmu/src/lib.rs"
-contracts = ["softmmu.x86.tlb-walker"]
+contracts = ["softmmu.x86.tlb-walker", "softmmu.x86.physical-retirement"]
 
 [[surfaces]]
 path = "crates/carrick-softmmu/src/domains.rs"
-contracts = ["softmmu.x86.tlb-walker"]
+contracts = ["softmmu.x86.tlb-walker", "softmmu.x86.physical-retirement"]
 
 [[surfaces]]
 path = "crates/carrick-softmmu/src/placement.rs"
@@ -1530,7 +1530,15 @@ contracts = ["softmmu.x86.tlb-walker"]
 
 [[surfaces]]
 path = "crates/carrick-softmmu/src/walker.rs"
-contracts = ["softmmu.x86.tlb-walker"]
+contracts = ["softmmu.x86.tlb-walker", "softmmu.x86.physical-retirement"]
+
+[[surfaces]]
+path = "crates/carrick-softmmu/src/retirement.rs"
+contracts = ["softmmu.x86.physical-retirement"]
+
+[[surfaces]]
+path = "crates/carrick-softmmu/src/retirement/tests.rs"
+contracts = ["softmmu.x86.physical-retirement"]
 
 [[surfaces]]
 path = "crates/carrick-softmmu/tests/softmmu_contract.rs"
@@ -1550,7 +1558,7 @@ contracts = ["x86.softcpu.level0"]
 
 [[surfaces]]
 path = "crates/carrick-softcpu-x86/src/mmu.rs"
-contracts = ["x86.softcpu.level0"]
+contracts = ["x86.softcpu.level0", "softmmu.x86.physical-retirement"]
 
 [[surfaces]]
 path = "crates/carrick-softcpu-x86/src/decode.rs"
@@ -1566,7 +1574,7 @@ contracts = ["x86.softcpu.level0"]
 
 [[surfaces]]
 path = "crates/carrick-softcpu-x86/src/context.rs"
-contracts = ["x86.softcpu.level0"]
+contracts = ["x86.softcpu.level0", "softmmu.x86.physical-retirement"]
 
 [[surfaces]]
 path = "crates/carrick-softcpu-x86/src/emit.rs"
@@ -1574,11 +1582,11 @@ contracts = ["x86.softcpu.level0"]
 
 [[surfaces]]
 path = "crates/carrick-softcpu-x86/src/cpu.rs"
-contracts = ["x86.softcpu.level0"]
+contracts = ["x86.softcpu.level0", "softmmu.x86.physical-retirement"]
 
 [[surfaces]]
 path = "crates/carrick-softcpu-x86/tests/softcpu_level0.rs"
-contracts = ["x86.softcpu.level0"]
+contracts = ["x86.softcpu.level0", "softmmu.x86.physical-retirement"]
 
 [[surfaces]]
 path = "crates/carrick-core-abi/src/lib.rs"

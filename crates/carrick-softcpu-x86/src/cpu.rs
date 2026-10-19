@@ -2,6 +2,7 @@
 
 use std::ptr::NonNull;
 
+use carrick_softmmu::{ExtentTable, SoftRequester, SoftSeatError};
 use iced_x86::{Instruction, Mnemonic};
 
 use crate::block::{BlockExit, BlockFetchFault, PlannedBlock, plan_block_from_memory};
@@ -173,16 +174,43 @@ pub struct SoftCpu {
     pub max_block_span: usize,
 }
 
+/// Why a [`SoftCpu`] could not be created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoftCpuNewError {
+    /// Every member of the inventory's invalidation domain is seated.
+    Seat(SoftSeatError),
+    /// The host refused the JIT code buffer.
+    Jit,
+}
+
 impl SoftCpu {
-    /// Create a new [`SoftCpu`] initialized for 64-bit user mode (`CPL = 3`).
-    #[must_use]
-    pub fn new() -> Option<Self> {
-        Some(Self {
-            ctx: Box::new(SoftCpuContext::new()),
-            jit: JitCodeBuffer::new(DEFAULT_JIT_CAPACITY)?,
+    /// Create a new [`SoftCpu`] initialized for 64-bit user mode (`CPL = 3`),
+    /// seated in `extents`' invalidation domain and parked.
+    pub fn new(extents: &ExtentTable) -> Result<Self, SoftCpuNewError> {
+        let ctx = SoftCpuContext::new(extents).map_err(SoftCpuNewError::Seat)?;
+        Ok(Self {
+            ctx: Box::new(ctx),
+            jit: JitCodeBuffer::new(DEFAULT_JIT_CAPACITY).ok_or(SoftCpuNewError::Jit)?,
             max_block_insns: 64,
             max_block_span: 4096,
         })
+    }
+
+    /// Stop translating before this CPU's thread blocks or idles: retirements
+    /// never wait for a parked CPU, and its next block entry serves what it
+    /// owes before its first translation.
+    pub fn park(&mut self) {
+        self.ctx.seat.park();
+    }
+
+    /// Whether a retirement asked this CPU to reach block entry.
+    pub fn exit_requested(&self) -> bool {
+        self.ctx.seat.exit_requested()
+    }
+
+    /// This CPU as the requester of a retirement it issues itself.
+    pub fn requester(&mut self) -> SoftRequester<'_> {
+        self.ctx.requester()
     }
 
     /// Borrow architectural state; gateway addresses and memory bindings stay private.
@@ -205,9 +233,18 @@ impl SoftCpu {
     }
 
     /// Plan, emit, and execute one basic block starting at `self.ctx.rip` over `mem`.
+    ///
+    /// Block entry is this CPU's invalidation safe point: it enters a parked
+    /// CPU (serving what it owes) and otherwise checks its own debt with
+    /// own-line loads, flushing only when a retirement is owed. The CPU stays
+    /// running after the block; [`Self::park`] before blocking.
     pub fn step_block<M: SoftMmuMemory>(&mut self, mem: &mut M) -> Result<SoftCpuExit, EmitError> {
         self.ctx.pending_exception = None;
         crate::context::prepare_gateway(self.ctx.rip)?;
+        if !mem.extents().is_member(&self.ctx.seat) {
+            return Err(EmitError::ForeignInventory { va: self.ctx.rip });
+        }
+        self.ctx.seat.block_entry(&mut self.ctx.tlb);
         self.ctx.reset_bounce();
         self.ctx.sync_tlb_tag_bits();
 

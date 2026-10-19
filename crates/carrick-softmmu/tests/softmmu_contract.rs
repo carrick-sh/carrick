@@ -14,13 +14,14 @@ use carrick_mmu_core::x86::descriptor_txn::{
     MAX_AD_CAS_RETRIES, NX, PRESENT, USER, WRITE, translate_leaf,
 };
 use carrick_softmmu::{
-    AccessOutcome, AuthenticatedDescriptorWords, Cpl, CpuAccessMode, ExtentRecord, ExtentTable,
-    FrameGpa, GuestVa, LAPIC_MMIO_BASE_GPA, LAPIC_MMIO_SIZE_BYTES, LinearPlacement, MmioHole,
-    MmioHoles, OwnerGeneration, PAGE_OFFSET_MASK_4K, PAGE_SIZE_4K, PageFaultClass,
-    PageFaultErrorCode, PageFaultInfo, PlacementError, ResolvedAccess, ResolvedSpan, RootGpa,
-    SOFT_TLB_ENTRIES, SoftCpuException, SoftMmuMemory, SoftTlb, SoftTlbEntry, SoftTlbPlane,
-    SoftTranslationError, SoftWalker, TLB_TAG_AC_BIT, TLB_TAG_CPL3_BIT, TLB_TAG_NXE_OFF_BIT,
-    TLB_TAG_SMAP_OFF_BIT, TLB_TAG_SMEP_OFF_BIT, TLB_TAG_WP_OFF_BIT, WalkOutcome, X86HostPage4K,
+    AccessOutcome, AuthenticatedDescriptorWords, Cpl, CpuAccessMode, ExtentEditError, ExtentRecord,
+    ExtentTable, FrameGpa, GuestVa, LAPIC_MMIO_BASE_GPA, LAPIC_MMIO_SIZE_BYTES, LinearPlacement,
+    MmioHole, MmioHoles, OwnerGeneration, PAGE_OFFSET_MASK_4K, PAGE_SIZE_4K, PageFaultClass,
+    PageFaultErrorCode, PageFaultInfo, PlacementError, ResolvedAccess, ResolvedSpan, Retirement,
+    RootGpa, SOFT_TLB_ENTRIES, SoftCpuException, SoftMmuMemory, SoftTlb, SoftTlbEntry,
+    SoftTlbPlane, SoftTranslationError, SoftWalker, TLB_TAG_AC_BIT, TLB_TAG_CPL3_BIT,
+    TLB_TAG_NXE_OFF_BIT, TLB_TAG_SMAP_OFF_BIT, TLB_TAG_SMEP_OFF_BIT, TLB_TAG_WP_OFF_BIT,
+    WalkOutcome, X86HostPage4K,
 };
 
 const TEST_SPAN_BYTES: u64 = 0x0100_0000;
@@ -62,6 +63,21 @@ const fn pte(gpa: u64, w: bool, u: bool, x: bool, cow: bool) -> u64 {
     desc
 }
 
+fn generation(raw: u64) -> OwnerGeneration {
+    OwnerGeneration::from_raw(raw).expect("nonzero owner generation")
+}
+
+/// Complete a retirement no running CPU owes and release its identities.
+fn retire_now<T>(
+    mem: &mut VecGuestMemory,
+    edit: Result<Option<Retirement<T>>, ExtentEditError>,
+) -> Option<T> {
+    let Retirement { retired, pending } = edit.expect("retirement published")?;
+    let completion = pending.try_complete().expect("every counted CPU is parked");
+    mem.extents_mut().reclaim(&completion);
+    Some(retired)
+}
+
 fn root_gpa(raw: u64) -> RootGpa {
     RootGpa::page_aligned(FrameGpa::new(raw)).expect("4 KiB-aligned root GPA")
 }
@@ -101,7 +117,7 @@ impl VecGuestMemory {
             backing: Arc::new(backing),
             aligned_word_offset,
             placement,
-            extents: ExtentTable::new(),
+            extents: ExtentTable::new().expect("fresh invalidation domain"),
             descriptor_loads: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -282,7 +298,7 @@ impl Rig {
 fn setup_memory() -> Result<VecGuestMemory, PlacementError> {
     let holes = MmioHoles::x86_default().with_hole(CUSTOM_MMIO_GPA, PAGE_SIZE_4K)?;
     let mut mem = VecGuestMemory::with_holes(TEST_SPAN_BYTES, holes)?;
-    let gen1 = OwnerGeneration::new(1);
+    let gen1 = generation(1);
     for gpa in [
         PML4_A_GPA, PDPT_A_GPA, PD_A_GPA, PT_A_GPA, PML4_B_GPA, PDPT_B_GPA, PD_B_GPA, PT_B_GPA,
         F1_GPA, F2_GPA, F3_GPA, F4_GPA,
@@ -363,7 +379,7 @@ fn linear_placement_enforces_alignment_bounds_and_mmio_holes() -> Result<(), Pla
     assert!(!placement.is_mmio_hole(LAPIC_MMIO_BASE_GPA + LAPIC_MMIO_SIZE_BYTES));
 
     let mut rig = Rig::new()?;
-    let gen1 = OwnerGeneration::new(1);
+    let gen1 = generation(1);
     let mode = CpuAccessMode::ring3();
     let before_mmio = CUSTOM_MMIO_GPA - PAGE_SIZE_4K;
     assert!(
@@ -423,7 +439,7 @@ fn linear_placement_enforces_alignment_bounds_and_mmio_holes() -> Result<(), Pla
 fn huge_page_authentication_2m_and_1g_at_zero_page_and_tail_offsets() -> Result<(), PlacementError>
 {
     let mut rig = Rig::new()?;
-    let gen1 = OwnerGeneration::new(1);
+    let gen1 = generation(1);
     let mode = CpuAccessMode::ring3();
     let f = PRESENT | WRITE | USER;
 
@@ -441,10 +457,11 @@ fn huge_page_authentication_2m_and_1g_at_zero_page_and_tail_offsets() -> Result<
         assert_eq!(r.host_addr, host_2m_base + (offset as usize));
     }
 
-    let _ = rig
+    let removed = rig
         .mem
         .extents_mut()
-        .remove(FrameGpa::new(HUGE_2M_BASE_GPA), &mut [&mut rig.tlb]);
+        .remove(FrameGpa::new(HUGE_2M_BASE_GPA), None);
+    assert!(retire_now(&mut rig.mem, removed).is_some());
     let short_2m = HUGE_2M_SIZE - PAGE_SIZE_4K;
     assert!(
         rig.mem
@@ -1034,6 +1051,9 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
 -> Result<(), PlacementError> {
     let mut rig = Rig::new()?;
     let mut tlb_cpu1 = SoftTlb::new();
+    // Both TLBs are members of the inventory's domain, parked between steps.
+    let mut seat_cpu0 = rig.mem.extents().register_vcpu(&mut rig.tlb).unwrap();
+    let mut seat_cpu1 = rig.mem.extents().register_vcpu(&mut tlb_cpu1).unwrap();
     let mode = CpuAccessMode::ring3();
 
     let va_rw = GuestVa::new(0x0000_0080_0000);
@@ -1048,7 +1068,7 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
     assert!(
         !rig.mem
             .extents_mut()
-            .set_root_generation(rig.root, OwnerGeneration::new(9))
+            .set_root_generation(rig.root, generation(9))
     );
     let unreg_root = root_gpa(0x0000_9000);
     assert_eq!(rig.mem.extents().expected_generation(unreg_root), None);
@@ -1131,51 +1151,59 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
     );
 
     rig.probe_tlb(&mut tlb_cpu1, va_rw, Access::Read, mode);
-    assert!(
-        rig.mem
-            .extents_mut()
-            .remove(FrameGpa::new(F4_GPA), &mut [&mut rig.tlb, &mut tlb_cpu1])
-            .is_some()
-    );
+    let removed = rig.mem.extents_mut().remove(FrameGpa::new(F4_GPA), None);
+    assert!(retire_now(&mut rig.mem, removed).is_some());
+    // Each CPU serves the retirement at its next block entry, then parks.
+    for (seat, tlb) in [
+        (&mut seat_cpu0, &mut rig.tlb),
+        (&mut seat_cpu1, &mut tlb_cpu1),
+    ] {
+        assert!(seat.block_entry(tlb));
+        seat.park();
+    }
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
 
     let _ = rig.probe_ram(va_rw, Access::Read, mode);
     rig.probe_tlb(&mut tlb_cpu1, va_rw, Access::Read, mode);
-    let retired_pt = ExtentRecord::new(
-        FrameGpa::new(PT_A_GPA),
-        PAGE_SIZE_4K,
-        OwnerGeneration::new(2),
-    );
+    let retired_pt = ExtentRecord::new(FrameGpa::new(PT_A_GPA), PAGE_SIZE_4K, generation(2));
     assert!(!rig.mem.extents_mut().install(retired_pt));
-    assert!(
-        rig.mem
-            .extents_mut()
-            .replace(retired_pt, &mut [&mut rig.tlb, &mut tlb_cpu1])
-    );
+    let replaced = rig.mem.extents_mut().replace(retired_pt, None);
+    assert!(retire_now(&mut rig.mem, replaced).is_some());
+    for (seat, tlb) in [
+        (&mut seat_cpu0, &mut rig.tlb),
+        (&mut seat_cpu1, &mut tlb_cpu1),
+    ] {
+        assert!(seat.block_entry(tlb));
+        seat.park();
+    }
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
     assert_ne!(rig.mem.get(PT_A_GPA, idx(va_rw, 3)), 0);
     assert_eq!(rig.walk(va_rw, Access::Read, mode), Err(missing_tbl));
 
-    let restored_pt = ExtentRecord::new(
-        FrameGpa::new(PT_A_GPA),
-        PAGE_SIZE_4K,
-        OwnerGeneration::new(1),
-    );
-    assert!(
-        rig.mem
-            .extents_mut()
-            .replace(restored_pt, &mut [&mut rig.tlb, &mut tlb_cpu1])
-    );
+    let restored_pt = ExtentRecord::new(FrameGpa::new(PT_A_GPA), PAGE_SIZE_4K, generation(1));
+    let restored = rig.mem.extents_mut().replace(restored_pt, None);
+    assert!(retire_now(&mut rig.mem, restored).is_some());
+    for (seat, tlb) in [
+        (&mut seat_cpu0, &mut rig.tlb),
+        (&mut seat_cpu1, &mut tlb_cpu1),
+    ] {
+        assert!(seat.block_entry(tlb));
+        seat.park();
+    }
     let _ = rig.probe_ram(va_rw, Access::Read, mode);
     rig.probe_tlb(&mut tlb_cpu1, va_rw, Access::Read, mode);
-    assert_eq!(
-        rig.mem
-            .extents_mut()
-            .remove_root_generation(rig.root, &mut [&mut rig.tlb, &mut tlb_cpu1]),
-        Some(OwnerGeneration::new(1))
-    );
+    let root = rig.root;
+    let removed_root = rig.mem.extents_mut().remove_root_generation(root, None);
+    assert_eq!(retire_now(&mut rig.mem, removed_root), Some(generation(1)));
+    for (seat, tlb) in [
+        (&mut seat_cpu0, &mut rig.tlb),
+        (&mut seat_cpu1, &mut tlb_cpu1),
+    ] {
+        assert!(seat.block_entry(tlb));
+        seat.park();
+    }
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(rig.walk(va_rw, Access::Read, mode), Err(missing_tbl));
@@ -1364,7 +1392,7 @@ fn concurrent_pte_writer_snapshot_consistency_and_structural_budgets() -> Result
     for extent_count in [1u64, 16, 256] {
         let mut b_mem =
             VecGuestMemory::with_placement_span(0x0200_0000, span_1g, MmioHoles::x86_default())?;
-        let gen1 = OwnerGeneration::new(1);
+        let gen1 = generation(1);
         assert!(b_mem.install_extent(FrameGpa::new(PML4_A_GPA), 4 * PAGE_SIZE_4K, gen1));
         for i in 0..extent_count {
             let gpa = 0x0100_0000 + i * 2 * PAGE_SIZE_4K;
