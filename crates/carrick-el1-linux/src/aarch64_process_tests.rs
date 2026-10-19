@@ -3066,6 +3066,12 @@ fn arm_route_action(
 
 #[cfg(test)]
 fn run_as(fixture: &Fixture, tid: i32, generation: u64, serial: u64, control: &ThreadControlSlot) {
+    // Between two threads' calls the host boundary consumes both owed-work
+    // flags (`settle_el1_boundary`) before it binds the next thread.
+    let _ = fixture.task.linux.take_served_boundary();
+    if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
+        doorbell.settled();
+    }
     fixture
         .task
         .set(El1TaskId::from_linux_tid(tid), generation, 5);

@@ -135,10 +135,7 @@ pub fn publish_current_task(
     // Binding never erases the host-work doorbell: it may announce a
     // deferred zone completion or owed wake that only a settling boundary
     // drains; the new task's next boundary settles it (#641).
-    current_task
-        .linux
-        .served_with_work
-        .store(0, Ordering::Relaxed);
+    current_task.linux.retire_served_boundary();
     current_task
         .execution
         .task
