@@ -4249,7 +4249,7 @@ pub fn el1_vectors_bytes() -> Vec<u8> {
 /// Callers must map the fail-closed control page before installing this page.
 pub fn el1_vectors_bytes_fd_ceiling() -> Vec<u8> {
     let mut bytes = el1_vectors_bytes();
-    const HANDLER_BASE: usize = 16 * AARCH64_VECTOR_SLOT_SIZE;
+    const HANDLER_BASE: usize = VECTOR_HANDLER_BASE;
     write_fstat_ceiling_dispatcher(&mut bytes, HANDLER_BASE, false);
     bytes
 }
@@ -4836,7 +4836,7 @@ fn el1_vectors_bytes_shim_inner(fd_ceiling: bool) -> Vec<u8> {
     };
 
     // Handlers go in the nop tail right after the 16-slot (2 KiB) vector table.
-    const HANDLER_BASE: usize = 16 * AARCH64_VECTOR_SLOT_SIZE; // 0x800
+    const HANDLER_BASE: usize = VECTOR_HANDLER_BASE; // 0x800
     const PAGE_HANDLER_LEN: usize = 14 * 4;
     const FSTAT_CEILING_COUNTED_HANDLER_LEN: usize = 26 * 4;
     let base = LINUX_IDENTITY_PAGE_BASE;
@@ -4969,12 +4969,77 @@ pub fn el1_vectors_bytes_shim_fd_ceiling() -> Vec<u8> {
 const MAILBOX_HANDLER_OFFSET: usize = 0xA00;
 const MAILBOX_HANDLER_SIZE: usize = 0x200;
 /// The current-EL synchronous handler (exception fixups, stack-guard check,
-/// fail-loud report): every vector image's 0x200 slot branches here.
-const EL1_CUR_EL_SYNC_HANDLER_OFFSET: usize = MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE;
+/// fail-loud report): every vector image's 0x200 slot branches here, past
+/// the clock transport and before the EL1 hook.
+const EL1_CUR_EL_SYNC_HANDLER_OFFSET: usize = el1_clock::ENTRY + el1_clock::SIZE;
 const EL1_CUR_EL_SYNC_HANDLER_SIZE: usize = 0x100;
-const _: () = assert!(
-    EL1_CUR_EL_SYNC_HANDLER_OFFSET + EL1_CUR_EL_SYNC_HANDLER_SIZE <= EL1_VECTOR_HOOK_OFFSET
-);
+/// The legacy-mailbox fstat ceiling handler (fd ceiling without the
+/// identity fast path).
+const MAILBOX_FSTAT_HANDLER_OFFSET: usize = 0x900;
+const MAILBOX_FSTAT_HANDLER_SIZE: usize = 0x100;
+/// The shim and identity fast-path handlers after the 2 KiB vector table.
+const VECTOR_HANDLER_BASE: usize = 16 * AARCH64_VECTOR_SLOT_SIZE;
+const VECTOR_HANDLER_SIZE: usize = 0x100;
+
+/// Every occupant of the 16 KiB EL1 vector page, as `(name, offset, size)`.
+/// Each writer stays inside its own entry (asserted where it emits, and by
+/// `vector_page_occupants_stay_in_their_regions` over every image), and
+/// the entries are pairwise disjoint (asserted here). Writers placed by bare
+/// literals once overlapped: the relocated current-EL handler and the clock
+/// transport both claimed 0xC00.
+const VECTOR_PAGE_REGIONS: [(&str, usize, usize); 10] = [
+    ("vector table", 0, 16 * AARCH64_VECTOR_SLOT_SIZE),
+    (
+        "identity and fstat fast paths",
+        VECTOR_HANDLER_BASE,
+        VECTOR_HANDLER_SIZE,
+    ),
+    (
+        "mailbox fstat ceiling",
+        MAILBOX_FSTAT_HANDLER_OFFSET,
+        MAILBOX_FSTAT_HANDLER_SIZE,
+    ),
+    (
+        "syscall mailbox",
+        MAILBOX_HANDLER_OFFSET,
+        MAILBOX_HANDLER_SIZE,
+    ),
+    ("clock transport", el1_clock::ENTRY, el1_clock::SIZE),
+    (
+        "current-EL synchronous",
+        EL1_CUR_EL_SYNC_HANDLER_OFFSET,
+        EL1_CUR_EL_SYNC_HANDLER_SIZE,
+    ),
+    ("EL1 vector hook", EL1_VECTOR_HOOK_OFFSET, 0x1000),
+    ("EL0 IRQ hook", EL0_IRQ_HOOK_OFFSET, 0x1000),
+    (
+        "EL0 fault hook",
+        EL0_FAULT_HOOK_OFFSET,
+        RESUME_INVALIDATION_OFFSET - EL0_FAULT_HOOK_OFFSET,
+    ),
+    (
+        "resume invalidation",
+        RESUME_INVALIDATION_OFFSET,
+        LINUX_EL1_VECTORS_SIZE as usize - RESUME_INVALIDATION_OFFSET,
+    ),
+];
+const _: () = {
+    let mut i = 0;
+    while i < VECTOR_PAGE_REGIONS.len() {
+        let (_, a, a_len) = VECTOR_PAGE_REGIONS[i];
+        assert!(a + a_len <= LINUX_EL1_VECTORS_SIZE as usize);
+        let mut j = i + 1;
+        while j < VECTOR_PAGE_REGIONS.len() {
+            let (_, b, b_len) = VECTOR_PAGE_REGIONS[j];
+            assert!(
+                a + a_len <= b || b + b_len <= a,
+                "vector page occupants overlap"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
 /// The ordinary request capture: the same offset in every mailbox image (the
 /// optional fstat guard and EL1 hook branch are NOP-padded when absent).
 const MAILBOX_CAPTURE_OFFSET: usize = MAILBOX_HANDLER_OFFSET + 44;
@@ -5630,7 +5695,8 @@ fn el1_vectors_bytes_mailbox_with_layout(
     // ceiling guard.  Put its handler in unused vector-page tail space and
     // branch its fallback directly into the normal mailbox capture below;
     // this retains the configured transport for every ineligible call.
-    let mailbox_fstat_handler = (fd_ceiling && !identity_fast_path).then_some(0x900_usize);
+    let mailbox_fstat_handler =
+        (fd_ceiling && !identity_fast_path).then_some(MAILBOX_FSTAT_HANDLER_OFFSET);
     if let Some(handler) = mailbox_fstat_handler {
         emit(&mut bytes, &mut cursor, enc_cmp_x8_imm(80));
         let branch_pc = cursor;
@@ -8940,6 +9006,59 @@ mod el1_shim_tests {
         assert!(pc + 8 <= slot_end, "dispatcher overruns its 0x80 slot");
     }
 
+    /// Every EL1 vector image a builder can produce: the legacy and shim
+    /// pages, every mailbox configuration, and the clock transport images the
+    /// HVF carrier installs by default (`with_el1_vectors_mailbox_clock`).
+    fn every_vector_image() -> Vec<(String, Vec<u8>)> {
+        let mut images = vec![
+            ("legacy".to_owned(), el1_vectors_bytes()),
+            ("legacy fd".to_owned(), el1_vectors_bytes_fd_ceiling()),
+            ("shim".to_owned(), el1_vectors_bytes_shim()),
+            ("shim fd".to_owned(), el1_vectors_bytes_shim_fd_ceiling()),
+        ];
+        for identity in [false, true] {
+            for fd in [false, true] {
+                for irq in [El1IrqMode::Masked, El1IrqMode::Gic] {
+                    for el1 in [false, true] {
+                        images.push((
+                            format!("mailbox identity={identity} fd={fd} el1={el1} {irq:?}"),
+                            el1_vectors_bytes_mailbox_irq(identity, fd, el1, irq),
+                        ));
+                    }
+                    images.push((
+                        format!("clock identity={identity} fd={fd} {irq:?}"),
+                        el1_vectors_bytes_mailbox_clock(identity, fd, irq),
+                    ));
+                }
+            }
+        }
+        images
+    }
+
+    /// #369 review P0: every word any builder writes past the vector table
+    /// lies inside one declared `VECTOR_PAGE_REGIONS` entry, and the clock
+    /// transport ends inside its own. Two writers once both took 0xC00.
+    #[test]
+    fn vector_page_occupants_stay_in_their_regions() {
+        let clock = clock_handler_layout();
+        let clock_end = (clock.end - LINUX_EL1_VECTORS_BASE) as usize;
+        assert!(clock_end <= el1_clock::ENTRY + el1_clock::SIZE);
+        for (name, page) in every_vector_image() {
+            for offset in (16 * AARCH64_VECTOR_SLOT_SIZE..page.len()).step_by(4) {
+                let word = rd_u32(&page, offset);
+                if word == AARCH64_NOP_OPCODE || word == 0 {
+                    continue;
+                }
+                assert!(
+                    VECTOR_PAGE_REGIONS
+                        .iter()
+                        .any(|(_, base, len)| (*base..base + len).contains(&offset)),
+                    "{name}: word {word:#010x} at {offset:#x} is in no declared region"
+                );
+            }
+        }
+    }
+
     /// #369: the current-EL synchronous handler stores nothing when the
     /// scratch it would push lands in an EL1 stack guard. The x0/SP swap,
     /// one-bit test and swap back are exact; the guard path restores both
@@ -9025,19 +9144,12 @@ mod el1_shim_tests {
                 .to_vec()
         };
         let expected = handler(&page);
-        for variant in [
-            el1_vectors_bytes_fd_ceiling(),
-            el1_vectors_bytes_shim(),
-            el1_vectors_bytes_shim_fd_ceiling(),
-            el1_vectors_bytes_mailbox(false),
-            el1_vectors_bytes_mailbox_fd_ceiling(true),
-            el1_vectors_bytes_mailbox_irq(true, true, true, El1IrqMode::Masked),
-            el1_vectors_bytes_mailbox_irq(true, true, true, El1IrqMode::Gic),
-        ] {
-            assert_eq!(handler(&variant), expected);
+        for (name, variant) in every_vector_image() {
+            assert_eq!(handler(&variant), expected, "{name}: handler bytes differ");
             assert_eq!(
                 rd_u32(&variant, AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET),
-                rd_u32(&page, AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET)
+                rd_u32(&page, AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET),
+                "{name}: 0x200 slot does not branch to the handler"
             );
         }
     }
@@ -9051,11 +9163,11 @@ mod el1_shim_tests {
     /// shim inherits these slots from the legacy builder).
     #[test]
     fn current_el_sync_slots_fail_loud_via_hvc3() {
-        for page in [el1_vectors_bytes(), el1_vectors_bytes_shim()] {
+        for (name, page) in every_vector_image() {
             assert_eq!(
                 rd_u32(&page, AARCH64_VECTOR_CUR_EL_SP0_SYNC_OFFSET),
                 HVC3,
-                "current-EL SP_EL0 sync slot (0x000) must trap loud"
+                "current-EL SP_EL0 sync slot (0x000) must trap loud ({name})"
             );
             assert_eq!(
                 rd_u32(&page, AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET),
@@ -9063,12 +9175,12 @@ mod el1_shim_tests {
                     AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET as u64,
                     EL1_CUR_EL_SYNC_HANDLER_OFFSET as u64
                 ),
-                "current-EL SP_ELx sync slot (0x200) must branch to its handler"
+                "current-EL SP_ELx sync slot (0x200) must branch to its handler ({name})"
             );
             assert_eq!(
                 rd_u32(&page, EL1_CUR_EL_SYNC_HANDLER_OFFSET),
                 0xD100_83FF,
-                "current-EL SP_ELx handler must begin with the fixup check"
+                "current-EL SP_ELx handler must begin with the fixup check ({name})"
             );
             let handler_bytes = &page[EL1_CUR_EL_SYNC_HANDLER_OFFSET
                 ..EL1_CUR_EL_SYNC_HANDLER_OFFSET + EL1_CUR_EL_SYNC_HANDLER_SIZE];
@@ -9076,14 +9188,14 @@ mod el1_shim_tests {
                 handler_bytes
                     .chunks_exact(4)
                     .any(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()) == HVC3),
-                "current-EL SP_ELx handler must contain the HVC3 fail-loud trap"
+                "current-EL SP_ELx handler must contain the HVC3 fail-loud trap ({name})"
             );
             // A non-sync spurious slot (0x080 = current-EL SP_EL0 IRQ) is still a
             // bare eret — harmless interrupts are ignored, not aborted.
             assert_eq!(
                 rd_u32(&page, 0x080),
                 ERET,
-                "spurious IRQ slot must stay a bare eret"
+                "spurious IRQ slot must stay a bare eret ({name})"
             );
         }
     }
