@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 14;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 15;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
@@ -296,11 +296,84 @@ impl AltStack {
     }
 }
 
-/// Tag on a `ThreadControlSlot::clear_child_tid` word: the in-zone exit
-/// already cleared and woke this address. Bit 63 is never a user address
-/// (Linux's clear of a kernel address faults and wakes nobody, the same
-/// outcome as "nothing pending").
-const CHILD_TID_CLEARED_IN_ZONE: u64 = 1 << 63;
+/// The protocol states of the shared `ThreadControlSlot::clear_child_tid`
+/// word (#685). EL1 and the host read and write the word only through
+/// [`ClearChildTidState::encode`] and [`ClearChildTidState::decode`].
+///
+/// Encoding: `0` is [`Self::None`]; a user address `a` is
+/// [`Self::Pending`]; `a | CLEARED_IN_ZONE` is [`Self::ClearedInZone`]: an
+/// in-zone exit already cleared and woke `a`, then declined the rest of the
+/// exit, so no lane may clear or wake it again.
+///
+/// The tag is bit 63. No address a guest thread can clear has it: user
+/// addresses lie below [`Self::USER_ADDRESS_LIMIT`] (2^48 covers the
+/// AArch64 48-bit TTBR0 range carrick configures and the x86_64 4-level
+/// lower half, 2^47; the hosts' `UserVaCeiling`s are checked against it in
+/// carrick-kernel). An address at or above the limit is not a user address:
+/// Linux's exit-time clear of it faults and wakes nobody, and carrick has no
+/// tagged-address ABI (`PR_SET_TAGGED_ADDR_CTRL`), so it is stored as
+/// [`Self::None`].
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum ClearChildTidState {
+    None,
+    Pending(carrick_guest_arch::UserVa),
+    ClearedInZone(carrick_guest_arch::UserVa),
+}
+
+// No user address can carry the `ClearedInZone` tag.
+const _: () = assert!(
+    ClearChildTidState::USER_ADDRESS_LIMIT <= ClearChildTidState::CLEARED_IN_ZONE
+        && ClearChildTidState::USER_ADDRESS_LIMIT.is_power_of_two()
+);
+
+impl ClearChildTidState {
+    /// Exclusive bound of any user address either guest ISA can name.
+    pub const USER_ADDRESS_LIMIT: u64 = 1 << 48;
+    const CLEARED_IN_ZONE: u64 = 1 << 63;
+
+    /// The state `set_tid_address(address)` (or `CLONE_CHILD_CLEARTID`)
+    /// leaves.
+    pub const fn for_user_address(address: u64) -> Self {
+        if address == 0 || address >= Self::USER_ADDRESS_LIMIT {
+            Self::None
+        } else {
+            Self::Pending(carrick_guest_arch::UserVa::new(address))
+        }
+    }
+
+    pub const fn encode(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::Pending(address) => address.raw(),
+            Self::ClearedInZone(address) => address.raw() | Self::CLEARED_IN_ZONE,
+        }
+    }
+
+    pub const fn decode(word: u64) -> Self {
+        let address = word & !Self::CLEARED_IN_ZONE;
+        if address == 0 || address >= Self::USER_ADDRESS_LIMIT {
+            Self::None
+        } else if word & Self::CLEARED_IN_ZONE != 0 {
+            Self::ClearedInZone(carrick_guest_arch::UserVa::new(address))
+        } else {
+            Self::Pending(carrick_guest_arch::UserVa::new(address))
+        }
+    }
+
+    /// The address an exit must still clear and wake.
+    pub const fn pending(self) -> Option<carrick_guest_arch::UserVa> {
+        match self {
+            Self::Pending(address) => Some(address),
+            Self::None | Self::ClearedInZone(_) => None,
+        }
+    }
+}
 
 /// Per-thread control state served at EL1. Single writer per field: the
 /// owning thread writes `blocked` (`store_blocked_then_read_pending`) and the
@@ -459,8 +532,10 @@ impl ThreadControlSlot {
         self.alt_flags.store(0, Ordering::Relaxed);
         self.robust_head.store(0, Ordering::Relaxed);
         self.robust_len.store(0, Ordering::Relaxed);
-        self.clear_child_tid
-            .store(clear_child_tid, Ordering::Relaxed);
+        self.clear_child_tid.store(
+            ClearChildTidState::for_user_address(clear_child_tid).encode(),
+            Ordering::Relaxed,
+        );
         self.entry
             .store(entry.map_or(0, EntryRef::pack), Ordering::Release);
         Ok(())
@@ -498,35 +573,42 @@ impl ThreadControlSlot {
         })
     }
 
+    /// The protocol state of the `clear_child_tid` word.
+    pub fn clear_child_tid_state(&self) -> ClearChildTidState {
+        ClearChildTidState::decode(self.clear_child_tid.load(Ordering::Acquire))
+    }
+
     /// The thread's pending `clear_child_tid` address (0 = none, including
     /// a word an in-zone exit already cleared and woke).
     pub fn clear_child_tid(&self) -> u64 {
-        let word = self.clear_child_tid.load(Ordering::Acquire);
-        if word & CHILD_TID_CLEARED_IN_ZONE != 0 {
-            0
-        } else {
-            word
-        }
+        self.clear_child_tid_state()
+            .pending()
+            .map_or(0, carrick_guest_arch::UserVa::raw)
     }
 
     /// Owner-written `clear_child_tid` (`set_tid_address(2)`).
     pub fn set_clear_child_tid(&self, address: u64) {
-        self.clear_child_tid.store(address, Ordering::Release);
+        self.clear_child_tid.store(
+            ClearChildTidState::for_user_address(address).encode(),
+            Ordering::Release,
+        );
     }
 
     /// An in-zone exit cleared `address` and woke its joiner, then declined
-    /// the rest of the exit to the host (#685). Record that the clear is
-    /// done, so neither a re-served exit nor the host lane clears and wakes
-    /// it a second time. Only the owner writes this word while it runs, so a
-    /// failed exchange means a newer `set_tid_address` replaced it: that
-    /// address is still pending.
+    /// the rest of the exit to the host (#685): move the word from
+    /// `Pending(address)` to `ClearedInZone(address)`, so neither a
+    /// re-served exit nor the host lane clears and wakes it a second time.
+    /// Only the owner writes this word while it runs, so a failed exchange
+    /// means a newer `set_tid_address` replaced it: that address is still
+    /// pending.
     pub fn mark_child_tid_cleared_in_zone(&self, address: u64) {
-        if address == 0 || address & CHILD_TID_CLEARED_IN_ZONE != 0 {
+        let ClearChildTidState::Pending(pending) = ClearChildTidState::for_user_address(address)
+        else {
             return;
-        }
+        };
         let _ = self.clear_child_tid.compare_exchange(
-            address,
-            address | CHILD_TID_CLEARED_IN_ZONE,
+            ClearChildTidState::Pending(pending).encode(),
+            ClearChildTidState::ClearedInZone(pending).encode(),
             Ordering::AcqRel,
             Ordering::Acquire,
         );
@@ -534,9 +616,10 @@ impl ThreadControlSlot {
 
     /// Whether an in-zone exit already cleared and woke `address`.
     pub fn child_tid_cleared_in_zone_at(&self, address: u64) -> bool {
-        address != 0
-            && address & CHILD_TID_CLEARED_IN_ZONE == 0
-            && self.clear_child_tid.load(Ordering::Acquire) == address | CHILD_TID_CLEARED_IN_ZONE
+        matches!(
+            self.clear_child_tid_state(),
+            ClearChildTidState::ClearedInZone(cleared) if cleared.raw() == address
+        )
     }
 
     /// Masker half of the Dekker pair: install `new`, then read the shared
@@ -1842,6 +1925,47 @@ mod tests {
             r.join().unwrap();
         }
         assert_eq!(s.read_altstack().sp, 200_000);
+    }
+
+    #[test]
+    fn clear_child_tid_codec_round_trips_and_never_tags_a_user_address() {
+        use carrick_guest_arch::UserVa;
+        let limit = ClearChildTidState::USER_ADDRESS_LIMIT;
+        for address in [4, 0x1004, 0x7fff_ffff_f000, limit - 4] {
+            let pending = ClearChildTidState::for_user_address(address);
+            assert_eq!(pending, ClearChildTidState::Pending(UserVa::new(address)));
+            assert_eq!(pending.encode(), address, "a pending word is the address");
+            assert_eq!(ClearChildTidState::decode(pending.encode()), pending);
+            let cleared = ClearChildTidState::ClearedInZone(UserVa::new(address));
+            assert_ne!(cleared.encode(), address);
+            assert_eq!(ClearChildTidState::decode(cleared.encode()), cleared);
+            assert_eq!(cleared.pending(), None);
+        }
+        for not_user in [0, limit, 1 << 63, u64::MAX] {
+            assert_eq!(
+                ClearChildTidState::for_user_address(not_user),
+                ClearChildTidState::None
+            );
+        }
+        assert_eq!(ClearChildTidState::decode(0), ClearChildTidState::None);
+        assert_eq!(
+            ClearChildTidState::decode(1 << 63),
+            ClearChildTidState::None
+        );
+
+        let s = ThreadControlSlot::new();
+        s.set_clear_child_tid(0x1004);
+        assert_eq!(s.clear_child_tid(), 0x1004);
+        s.mark_child_tid_cleared_in_zone(0x2000);
+        assert!(
+            !s.child_tid_cleared_in_zone_at(0x1004),
+            "only the pending address"
+        );
+        s.mark_child_tid_cleared_in_zone(0x1004);
+        assert_eq!(s.clear_child_tid(), 0);
+        assert!(s.child_tid_cleared_in_zone_at(0x1004));
+        s.set_clear_child_tid(1 << 63);
+        assert_eq!(s.clear_child_tid_state(), ClearChildTidState::None);
     }
 
     #[test]
