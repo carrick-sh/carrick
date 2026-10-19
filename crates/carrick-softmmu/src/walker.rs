@@ -64,24 +64,43 @@ impl ExtentRecord {
 /// [`ExtentTable::reclaim`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetiredIdentity {
-    ExtentBase(FrameGpa),
-    ExtentGeneration(OwnerGeneration),
+    /// A retired extent: no install may overlap its span or reuse its
+    /// generation until completion, so none of its frames is re-owned while
+    /// a peer can still translate to it.
+    Extent(ExtentRecord),
     Root(RootGpa),
     RootGeneration(OwnerGeneration),
+}
+
+/// A new owner a replacement publishes only once the retirement it waits
+/// on completes. Its span (or root) is reserved meanwhile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deferred {
+    Extent(ExtentRecord),
+    RootGeneration(RootGpa, OwnerGeneration),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReclaimItem {
+    Retired(RetiredIdentity),
+    Publish(Deferred),
 }
 
 /// Why an [`ExtentTable`] edit was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtentEditError {
-    /// Nothing changed: the record is malformed or overlaps, a retired
-    /// identity it names is still pending, or the table is terminal.
+    /// Nothing changed: the record is malformed or overlaps a live extent,
+    /// a pending retirement or a deferred publication.
     Refused,
     /// Nothing changed: the requester is a member of another inventory.
     ForeignRequester,
     /// The edit is in place but its invalidation could not be requested: the
-    /// domain's generation counter is exhausted. The table is now terminal
-    /// and refuses every later edit; the caller must stop its CPUs.
+    /// domain's generation counter is exhausted. The table is now terminal:
+    /// every seated CPU refuses to translate and every later edit returns
+    /// [`Self::Terminal`].
     Exhausted,
+    /// Nothing changed: the table went terminal on an earlier exhaustion.
+    Terminal,
 }
 
 /// A retired value and the invalidation every soft vCPU owes for it.
@@ -91,13 +110,22 @@ pub struct Retirement<T> {
     pub pending: PendingRetirement,
 }
 
+/// What [`ExtentTable::reclaim`] released.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reclaimed {
+    /// Retired identities that became reusable.
+    pub identities: usize,
+    /// Deferred replacements that became live.
+    pub published: usize,
+}
+
 /// Physical extent inventory and frame-keyed code-page tracker
 /// authenticating `(Stage1Gpa, len, OwnerGeneration) -> AuthenticatedGpa`.
 ///
 /// It owns the invalidation domain of every soft vCPU translating through
 /// it: extent and root-generation retirement is a domain-wide request
-/// (`crate::retirement`), and the retired identities wait in a
-/// [`ReclaimQueue`] until the request completes.
+/// (`crate::retirement`), and the retired identities and deferred
+/// replacements wait in a [`ReclaimQueue`] until the request completes.
 #[derive(Debug)]
 pub struct ExtentTable {
     by_base: BTreeMap<u64, ExtentRecord>,
@@ -105,7 +133,7 @@ pub struct ExtentTable {
     code_pages: BTreeMap<u64, (bool, u64)>,
     extents_visited: AtomicU64,
     domain: SoftDomainHandle,
-    reclaim: ReclaimQueue<RetiredIdentity>,
+    reclaim: ReclaimQueue<ReclaimItem>,
     terminal: bool,
 }
 
@@ -119,6 +147,10 @@ pub enum ExtentCloneError {
     Terminal,
     /// No fresh invalidation domain could be issued.
     Exhausted,
+}
+
+const fn spans_overlap(a: ExtentRecord, b: ExtentRecord) -> bool {
+    a.base.raw() < b.end_gpa() && b.base.raw() < a.end_gpa()
 }
 
 impl ExtentTable {
@@ -178,24 +210,74 @@ impl ExtentTable {
         self.domain.kicks()
     }
 
-    /// Retired identities still waiting for their completion.
+    /// Whether an exhausted retirement made this inventory terminal.
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    /// Retired identities and deferred replacements still waiting.
     pub fn pending_identities(&self) -> usize {
         self.reclaim.len()
     }
 
-    /// Release the identities a completed retirement took out of use.
-    /// Returns how many became reusable.
-    pub fn reclaim(&mut self, completion: &DomainCompletion) -> usize {
-        self.reclaim.drain_ready(completion).len()
+    /// Release what a completed retirement held back: its retired
+    /// identities become reusable and its deferred replacements go live. A
+    /// completion also covers every earlier retirement of this inventory
+    /// (they are all domain-wide), including one whose pending request was
+    /// dropped.
+    pub fn reclaim(&mut self, completion: &DomainCompletion) -> Reclaimed {
+        let mut reclaimed = Reclaimed::default();
+        for item in self.reclaim.drain_ready(completion) {
+            match item {
+                ReclaimItem::Retired(_) => reclaimed.identities += 1,
+                ReclaimItem::Publish(Deferred::Extent(record)) => {
+                    // Its span stayed reserved, so nothing can overlap it.
+                    self.by_base.insert(record.base.raw(), record);
+                    reclaimed.published += 1;
+                }
+                ReclaimItem::Publish(Deferred::RootGeneration(root, generation)) => {
+                    self.root_generations
+                        .insert(root.address().raw(), generation);
+                    reclaimed.published += 1;
+                }
+            }
+        }
+        reclaimed
     }
 
-    fn is_pending(&self, identity: RetiredIdentity) -> bool {
-        self.reclaim.iter().any(|pending| *pending == identity)
+    /// Recover from a dropped [`PendingRetirement`]: publish an empty
+    /// domain-wide invalidation whose completion releases every earlier
+    /// retirement's identities and deferred replacements.
+    pub fn retire_abandoned(
+        &mut self,
+        requester: Option<SoftRequester<'_>>,
+    ) -> Result<PendingRetirement, ExtentEditError> {
+        self.admit_edit(requester.as_ref())?;
+        self.publish(&[], requester)
+    }
+
+    fn extent_reserved(&self, record: ExtentRecord) -> bool {
+        self.reclaim.iter().any(|item| match *item {
+            ReclaimItem::Retired(RetiredIdentity::Extent(retired)) => {
+                spans_overlap(retired, record) || retired.generation == record.generation
+            }
+            ReclaimItem::Publish(Deferred::Extent(deferred)) => spans_overlap(deferred, record),
+            _ => false,
+        })
+    }
+
+    fn root_reserved(&self, root: RootGpa, generation: OwnerGeneration) -> bool {
+        self.reclaim.iter().any(|item| match *item {
+            ReclaimItem::Retired(RetiredIdentity::Root(retired)) => retired == root,
+            ReclaimItem::Retired(RetiredIdentity::RootGeneration(retired)) => retired == generation,
+            ReclaimItem::Publish(Deferred::RootGeneration(deferred, _)) => deferred == root,
+            _ => false,
+        })
     }
 
     fn admit_edit(&self, requester: Option<&SoftRequester<'_>>) -> Result<(), ExtentEditError> {
         if self.terminal {
-            return Err(ExtentEditError::Refused);
+            return Err(ExtentEditError::Terminal);
         }
         if requester.is_some_and(|requester| !requester.seat.belongs_to(&self.domain)) {
             return Err(ExtentEditError::ForeignRequester);
@@ -204,35 +286,45 @@ impl ExtentTable {
     }
 
     /// Publish the domain-wide invalidation for an edit already in place and
-    /// queue its retired identities.
-    fn retire(
+    /// queue what it holds back.
+    fn publish(
         &mut self,
-        identities: [RetiredIdentity; 2],
+        items: &[ReclaimItem],
         requester: Option<SoftRequester<'_>>,
     ) -> Result<PendingRetirement, ExtentEditError> {
         match commit_domain(&self.domain, InvalidationKind::Unmap, requester) {
             Ok(pending) => {
-                for identity in identities {
-                    self.reclaim.push(pending.reclaim_tag(), identity);
+                for item in items {
+                    self.reclaim.push(pending.reclaim_tag(), *item);
                 }
                 Ok(pending)
             }
-            // The edit is in place and cannot be invalidated: terminal.
+            // The edit is in place and cannot be invalidated: stop every
+            // CPU and refuse every later edit.
             Err(CommitRefused::Exhausted | CommitRefused::ForeignRequester) => {
-                self.terminal = true;
+                self.make_terminal();
                 Err(ExtentEditError::Exhausted)
             }
         }
     }
 
+    fn make_terminal(&mut self) {
+        self.terminal = true;
+        self.domain.make_terminal();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_for_test(&mut self) {
+        self.make_terminal();
+    }
+
     /// Register the expected [`OwnerGeneration`] for walks under an
-    /// unregistered `root` (`false` if already registered, or if the root or
-    /// generation is still pending retirement).
+    /// unregistered `root` (`false` if already registered, terminal, or if
+    /// the root or generation is still held by a pending retirement).
     pub fn set_root_generation(&mut self, root: RootGpa, generation: OwnerGeneration) -> bool {
         if self.terminal
             || self.root_generations.contains_key(&root.address().raw())
-            || self.is_pending(RetiredIdentity::Root(root))
-            || self.is_pending(RetiredIdentity::RootGeneration(generation))
+            || self.root_reserved(root, generation)
         {
             return false;
         }
@@ -241,7 +333,10 @@ impl ExtentTable {
         true
     }
     /// Replace (or set) `root`'s [`OwnerGeneration`]. Replacing a live
-    /// generation retires it: every soft vCPU owes the returned invalidation.
+    /// generation retires it and defers the new one: walks under `root` find
+    /// no generation until the retirement completes and
+    /// [`Self::reclaim`] publishes it, so the new owner never coexists with a
+    /// peer's translation of the old one.
     pub fn replace_root_generation(
         &mut self,
         root: RootGpa,
@@ -249,21 +344,19 @@ impl ExtentTable {
         requester: Option<SoftRequester<'_>>,
     ) -> Result<Option<Retirement<OwnerGeneration>>, ExtentEditError> {
         self.admit_edit(requester.as_ref())?;
-        if self.is_pending(RetiredIdentity::Root(root))
-            || self.is_pending(RetiredIdentity::RootGeneration(generation))
-        {
+        if self.root_reserved(root, generation) {
             return Err(ExtentEditError::Refused);
         }
-        let Some(previous) = self
-            .root_generations
-            .insert(root.address().raw(), generation)
-        else {
+        let Some(previous) = self.root_generations.remove(&root.address().raw()) else {
+            self.root_generations
+                .insert(root.address().raw(), generation);
             return Ok(None);
         };
-        let pending = self.retire(
-            [
-                RetiredIdentity::Root(root),
-                RetiredIdentity::RootGeneration(previous),
+        let pending = self.publish(
+            &[
+                ReclaimItem::Retired(RetiredIdentity::Root(root)),
+                ReclaimItem::Retired(RetiredIdentity::RootGeneration(previous)),
+                ReclaimItem::Publish(Deferred::RootGeneration(root, generation)),
             ],
             requester,
         )?;
@@ -282,10 +375,10 @@ impl ExtentTable {
         let Some(removed) = self.root_generations.remove(&root.address().raw()) else {
             return Ok(None);
         };
-        let pending = self.retire(
-            [
-                RetiredIdentity::Root(root),
-                RetiredIdentity::RootGeneration(removed),
+        let pending = self.publish(
+            &[
+                ReclaimItem::Retired(RetiredIdentity::Root(root)),
+                ReclaimItem::Retired(RetiredIdentity::RootGeneration(removed)),
             ],
             requester,
         )?;
@@ -343,18 +436,14 @@ impl ExtentTable {
         }
     }
 
-    fn extent_pending(&self, record: ExtentRecord) -> bool {
-        self.is_pending(RetiredIdentity::ExtentBase(record.base))
-            || self.is_pending(RetiredIdentity::ExtentGeneration(record.generation))
-    }
-
     /// Install a new, non-overlapping extent (`false` if unaligned, empty,
-    /// overlapping any existing extent, or naming a base or generation that
-    /// is still pending retirement).
+    /// terminal, overlapping any live extent, overlapping the span or reusing
+    /// the generation of an extent whose retirement is pending, or
+    /// overlapping a deferred replacement).
     pub fn install(&mut self, record: ExtentRecord) -> bool {
         if self.terminal
             || !self.validate_non_overlapping(record, false)
-            || self.extent_pending(record)
+            || self.extent_reserved(record)
         {
             return false;
         }
@@ -362,24 +451,29 @@ impl ExtentTable {
         true
     }
     /// Replace (or install) an extent at `record.base`. Replacing a live
-    /// extent retires it: every soft vCPU owes the returned invalidation.
+    /// extent retires it and defers `record`: the frames have no owner until
+    /// the retirement completes and [`Self::reclaim`] publishes `record`, so
+    /// the new owner never coexists with a peer's translation of the old one
+    /// (a walk in the window faults as unauthenticated, as hardware faults
+    /// between unmap-plus-shootdown and remap).
     pub fn replace(
         &mut self,
         record: ExtentRecord,
         requester: Option<SoftRequester<'_>>,
     ) -> Result<Option<Retirement<ExtentRecord>>, ExtentEditError> {
         self.admit_edit(requester.as_ref())?;
-        if !self.validate_non_overlapping(record, true) || self.extent_pending(record) {
+        if !self.validate_non_overlapping(record, true) || self.extent_reserved(record) {
             return Err(ExtentEditError::Refused);
         }
-        let Some(old) = self.by_base.insert(record.base.raw(), record) else {
+        let Some(old) = self.by_base.remove(&record.base.raw()) else {
+            self.by_base.insert(record.base.raw(), record);
             return Ok(None);
         };
         self.clear_code_pages_in_span(old.base.raw(), old.end_gpa());
-        let pending = self.retire(
-            [
-                RetiredIdentity::ExtentBase(old.base),
-                RetiredIdentity::ExtentGeneration(old.generation),
+        let pending = self.publish(
+            &[
+                ReclaimItem::Retired(RetiredIdentity::Extent(old)),
+                ReclaimItem::Publish(Deferred::Extent(record)),
             ],
             requester,
         )?;
@@ -389,7 +483,8 @@ impl ExtentTable {
         }))
     }
     /// Retire the extent starting at `base`: every soft vCPU owes the
-    /// returned invalidation before its base or generation is reusable.
+    /// returned invalidation before any frame of its span or its generation
+    /// is reusable.
     pub fn remove(
         &mut self,
         base: FrameGpa,
@@ -400,11 +495,8 @@ impl ExtentTable {
             return Ok(None);
         };
         self.clear_code_pages_in_span(old.base.raw(), old.end_gpa());
-        let pending = self.retire(
-            [
-                RetiredIdentity::ExtentBase(old.base),
-                RetiredIdentity::ExtentGeneration(old.generation),
-            ],
+        let pending = self.publish(
+            &[ReclaimItem::Retired(RetiredIdentity::Extent(old))],
             requester,
         )?;
         Ok(Some(Retirement {

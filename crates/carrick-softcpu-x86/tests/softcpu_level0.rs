@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_softcpu_x86::{
     ExtentRecord, ExtentTable, FrameGpa, JitCodeBuffer, LinearPlacement, MmioHoles,
-    OwnerGeneration, PF_ERR_INSTR, PF_ERR_PRESENT, PF_ERR_USER, PF_ERR_WRITE, RootGpa,
-    SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK, SOFT_TLB_PAGE_SIZE, SensitiveOp, SoftAccessKind,
-    SoftCpu, SoftCpuExit, SoftMmuMemory, X86Exception, X86ExceptionVector, read_guest_bytes, reg,
-    translate_va, translate_with_frame, write_guest_bytes,
+    OwnerGeneration, PF_ERR_INSTR, PF_ERR_PRESENT, PF_ERR_USER, PF_ERR_WRITE, RetirementWaitError,
+    RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK, SOFT_TLB_PAGE_SIZE, SensitiveOp,
+    SoftAccessKind, SoftCpu, SoftCpuExit, SoftMmuMemory, X86Exception, X86ExceptionVector,
+    read_guest_bytes, reg, translate_va, translate_with_frame, write_guest_bytes,
 };
 use goblin::elf::Elf;
 use goblin::elf::program_header::{PF_W, PF_X, PT_LOAD};
@@ -450,29 +450,32 @@ fn running_peer_that_hits_through_step_block_misses_after_retirement() {
                 rip: code_va + 3,
                 next_rip: code_va + 5,
             };
-            step_ok(&mut cpu, &mut mem.lock().unwrap(), expect);
-            let misses = cpu.context().tlb_stats().misses;
-            cpu.context_mut().rip = code_va;
-            cpu.context_mut().gpr[reg::RAX] = 0;
-            step_ok(&mut cpu, &mut mem.lock().unwrap(), expect);
-            assert_eq!(cpu.context().gpr[reg::RAX], RETIRE_VALUE);
+            // One run of blocks: running throughout, parked when it drops.
+            let mut run = cpu.run();
+            assert_eq!(run.step_block(&mut *mem.lock().unwrap()).unwrap(), expect);
+            let misses = run.context().tlb_stats().misses;
+            run.context_mut().rip = code_va;
+            run.context_mut().gpr[reg::RAX] = 0;
+            assert_eq!(run.step_block(&mut *mem.lock().unwrap()).unwrap(), expect);
+            assert_eq!(run.context().gpr[reg::RAX], RETIRE_VALUE);
             assert_eq!(
-                cpu.context().tlb_stats().misses,
+                run.context().tlb_stats().misses,
                 misses,
                 "the second load hit the inline TLB"
             );
             ready_tx.send(()).unwrap();
             // Running between blocks until the retirement kicks it.
             let deadline = std::time::Instant::now() + RETIRE_WAIT;
-            while !cpu.exit_requested() {
+            while !run.exit_requested() {
                 assert!(std::time::Instant::now() < deadline, "no kick");
                 std::thread::yield_now();
             }
-            cpu.context_mut().rip = code_va;
-            cpu.context_mut().gpr[reg::RAX] = 0;
-            let exit = cpu.step_block(&mut *mem.lock().unwrap()).unwrap();
-            cpu.park();
-            (exit, cpu.context().gpr[reg::RAX])
+            run.context_mut().rip = code_va;
+            run.context_mut().gpr[reg::RAX] = 0;
+            let exit = run.step_block(&mut *mem.lock().unwrap()).unwrap();
+            let rax = run.context().gpr[reg::RAX];
+            drop(run);
+            (exit, rax)
         })
     };
     ready_rx.recv_timeout(RETIRE_WAIT).unwrap();
@@ -605,6 +608,43 @@ fn a_cpu_of_another_inventory_gets_no_cached_translation_on_any_path() {
     );
 }
 
+/// Running and host admission are scopes: a finished run, a single
+/// `step_block`, and a dropped `HostAccess` all leave the CPU parked, so a
+/// host retirement completes at once instead of waiting on a forgotten park.
+#[test]
+fn every_run_and_host_access_parks_when_it_ends() {
+    let (mut mem, code_va, data) = setup_retirable_data();
+    let mut cpu = retirable_cpu(&mem, code_va);
+    let expect = SoftCpuExit::Syscall {
+        rip: code_va + 3,
+        next_rip: code_va + 5,
+    };
+    step_ok(&mut cpu, &mut mem, expect);
+    assert!(
+        !cpu.context().seat().is_running(),
+        "step_block parks after its block"
+    );
+    {
+        let mut run = cpu.run();
+        run.context_mut().rip = code_va;
+        assert_eq!(run.step_block(&mut mem).unwrap(), expect);
+        assert!(run.context().seat().is_running());
+    }
+    assert!(!cpu.context().seat().is_running(), "a dropped run parks");
+    {
+        let access = cpu.context_mut().admit_host_access(mem.extents()).unwrap();
+        assert!(access.seat().is_running());
+        // Dropped without any explicit release.
+    }
+    assert!(!cpu.context().seat().is_running(), "a dropped access parks");
+    let retirement = mem.extents_mut().remove(data, None).unwrap().unwrap();
+    let completion = retirement
+        .pending
+        .try_complete()
+        .expect("no CPU is left running");
+    mem.extents_mut().reclaim(&completion);
+}
+
 /// A CPU that retires from inside its own execution is served inline and
 /// never kicked, so it completes without waiting on its own safe point.
 #[test]
@@ -615,28 +655,37 @@ fn retirement_issued_by_a_running_cpu_completes_without_waiting_on_itself() {
         rip: code_va + 3,
         next_rip: code_va + 5,
     };
-    step_ok(&mut cpu, &mut mem, expect);
-    assert!(cpu.context().seat().is_running());
+    let mut run = cpu.run();
+    assert_eq!(run.step_block(&mut mem).unwrap(), expect);
+    assert!(run.context().seat().is_running());
     let kicks = mem.extents().retirement_kicks();
     let retirement = mem
         .extents_mut()
-        .remove(data, Some(cpu.requester()))
+        .remove(data, Some(run.requester()))
         .unwrap()
         .unwrap();
-    assert!(retirement.pending.counts(cpu.context().seat().cpu()));
+    assert!(retirement.pending.counts(run.context().seat().cpu()));
     assert_eq!(
         mem.extents().retirement_kicks(),
         kicks,
         "never kicks itself"
     );
-    let completion = retirement
+    // Without itself as the requester its own thread is refused, not wedged.
+    let (pending, error) = retirement
         .pending
-        .wait(Some(cpu.requester()), bounded_relax())
+        .wait(None, bounded_relax())
+        .expect_err("its own thread runs a counted CPU");
+    assert_eq!(error, RetirementWaitError::SelfWait);
+    let completion = pending
+        .wait(Some(run.requester()), bounded_relax())
         .map_err(|(_, error)| error)
         .unwrap();
     mem.extents_mut().reclaim(&completion);
-    cpu.context_mut().rip = code_va;
-    step_ok(&mut cpu, &mut mem, pf(code_va, PF_ERR_USER, RETIRE_DATA_VA));
+    run.context_mut().rip = code_va;
+    assert_eq!(
+        run.step_block(&mut mem).unwrap(),
+        pf(code_va, PF_ERR_USER, RETIRE_DATA_VA)
+    );
 }
 
 #[test]

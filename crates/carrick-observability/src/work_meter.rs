@@ -148,10 +148,14 @@ pub enum WorkMetric {
     /// Kicks one invalidation request delivered. At most one per counted
     /// member that was running; none for a stopped member.
     InvalidationKicks,
+    /// Read-modify-writes plus stores on shared member words by one
+    /// steady-state safe point (a debt-free block entry of a running soft
+    /// vCPU). Loads on the member's own line are the only allowed work.
+    InvalidationSteadyStateSharedWrites,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 58;
+    pub const COUNT: usize = 59;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -211,6 +215,7 @@ impl WorkMetric {
         Self::InvalidationSteadyStateRmws,
         Self::InvalidationMembersCounted,
         Self::InvalidationKicks,
+        Self::InvalidationSteadyStateSharedWrites,
     ];
 }
 

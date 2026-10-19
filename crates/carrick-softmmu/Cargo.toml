@@ -12,6 +12,10 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+# Thread identity for refusing a CPU's own thread waiting on itself.
+std = []
+
 [dependencies]
 carrick-core = { path = "../carrick-core" }
 carrick-core-abi = { path = "../carrick-core-abi" }

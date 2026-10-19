@@ -2,7 +2,7 @@
 
 use std::ptr::NonNull;
 
-use carrick_softmmu::{ExtentTable, SoftRequester, SoftSeatError};
+use carrick_softmmu::{ExtentTable, InventoryTerminal, SoftRequester, SoftSeatError};
 use iced_x86::{Instruction, Mnemonic};
 
 use crate::block::{BlockExit, BlockFetchFault, PlannedBlock, plan_block_from_memory};
@@ -174,6 +174,45 @@ pub struct SoftCpu {
     pub max_block_span: usize,
 }
 
+/// A run of blocks on one [`SoftCpu`]; the CPU parks when this drops.
+pub struct RunningCpu<'c> {
+    cpu: &'c mut SoftCpu,
+}
+
+impl RunningCpu<'_> {
+    /// One block; this CPU stays running until the guard drops.
+    pub fn step_block<M: SoftMmuMemory>(&mut self, mem: &mut M) -> Result<SoftCpuExit, EmitError> {
+        // SAFETY: this guard parks the CPU on drop.
+        unsafe { self.cpu.step_block_in_run(mem) }
+    }
+
+    pub fn context(&self) -> &SoftCpuContext {
+        &self.cpu.ctx
+    }
+
+    /// Mutate architectural state between blocks of the run.
+    pub fn context_mut(&mut self) -> &mut SoftCpuContext {
+        &mut self.cpu.ctx
+    }
+
+    /// Whether a retirement asked this CPU to reach block entry.
+    pub fn exit_requested(&self) -> bool {
+        self.cpu.ctx.seat.exit_requested()
+    }
+
+    /// This running CPU as the requester of a retirement it issues itself:
+    /// served inline, never kicked.
+    pub fn requester(&mut self) -> SoftRequester<'_> {
+        self.cpu.ctx.requester()
+    }
+}
+
+impl Drop for RunningCpu<'_> {
+    fn drop(&mut self) {
+        self.cpu.ctx.seat.park();
+    }
+}
+
 /// Why a [`SoftCpu`] could not be created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SoftCpuNewError {
@@ -196,11 +235,11 @@ impl SoftCpu {
         })
     }
 
-    /// Stop translating before this CPU's thread blocks or idles: retirements
-    /// never wait for a parked CPU, and its next block entry serves what it
-    /// owes before its first translation.
-    pub fn park(&mut self) {
-        self.ctx.seat.park();
+    /// Run a sequence of blocks. Block entry inside the run costs own-line
+    /// loads only; dropping the guard parks the CPU, so a finished run never
+    /// holds a retirement up.
+    pub fn run(&mut self) -> RunningCpu<'_> {
+        RunningCpu { cpu: self }
     }
 
     /// Whether a retirement asked this CPU to reach block entry.
@@ -208,7 +247,7 @@ impl SoftCpu {
         self.ctx.seat.exit_requested()
     }
 
-    /// This CPU as the requester of a retirement it issues itself.
+    /// This (parked) CPU as the requester of a retirement it issues itself.
     pub fn requester(&mut self) -> SoftRequester<'_> {
         self.ctx.requester()
     }
@@ -232,19 +271,31 @@ impl SoftCpu {
         Ok(SoftCpuExit::Exception(exc))
     }
 
-    /// Plan, emit, and execute one basic block starting at `self.ctx.rip` over `mem`.
-    ///
-    /// Block entry is this CPU's invalidation safe point: it enters a parked
-    /// CPU (serving what it owes) and otherwise checks its own debt with
-    /// own-line loads, flushing only when a retirement is owed. The CPU stays
-    /// running after the block; [`Self::park`] before blocking.
+    /// Plan, emit, and execute one basic block starting at `self.ctx.rip`
+    /// over `mem`, as a run of one block: the CPU parks again afterwards.
+    /// A loop of blocks uses [`Self::run`].
     pub fn step_block<M: SoftMmuMemory>(&mut self, mem: &mut M) -> Result<SoftCpuExit, EmitError> {
+        self.run().step_block(mem)
+    }
+
+    /// One block on a running CPU. Block entry is the invalidation safe
+    /// point: it enters a parked CPU (serving what it owes) and otherwise
+    /// checks its own debt with own-line loads, flushing only when owed.
+    ///
+    /// # Safety
+    /// Called only by [`RunningCpu`], whose drop parks the CPU.
+    unsafe fn step_block_in_run<M: SoftMmuMemory>(
+        &mut self,
+        mem: &mut M,
+    ) -> Result<SoftCpuExit, EmitError> {
         self.ctx.pending_exception = None;
         crate::context::prepare_gateway(self.ctx.rip)?;
         if !mem.extents().is_member(&self.ctx.seat) {
             return Err(EmitError::ForeignInventory { va: self.ctx.rip });
         }
-        self.ctx.seat.block_entry(&mut self.ctx.tlb);
+        // SAFETY: the caller is a `RunningCpu`, which parks on drop.
+        unsafe { self.ctx.seat.block_entry_unguarded(&mut self.ctx.tlb) }
+            .map_err(|InventoryTerminal| EmitError::InventoryTerminal { va: self.ctx.rip })?;
         self.ctx.reset_bounce();
         self.ctx.sync_tlb_tag_bits();
 

@@ -27,7 +27,7 @@
 
 #![no_std]
 extern crate alloc;
-#[cfg(test)]
+#[cfg(any(test, feature = "std"))]
 extern crate std;
 
 pub mod domains;
@@ -56,8 +56,8 @@ pub use placement::{
     MmioHoles, PlacementError, PlacementGpa, X86HostPage4K,
 };
 pub use retirement::{
-    LookupAdmission, PendingRetirement, SOFT_VCPU_MEMBERS, SoftDomainHandle, SoftRequester,
-    SoftSeatError, SoftVcpuSeat,
+    InventoryTerminal, LookupAdmission, PendingRetirement, RetirementWaitError, RunningSeat,
+    SOFT_VCPU_MEMBERS, SeatAdmission, SoftDomainHandle, SoftRequester, SoftSeatError, SoftVcpuSeat,
 };
 pub use tlb::{
     SOFT_TLB_BITS, SOFT_TLB_ENTRIES, SOFT_TLB_INDEX_MASK, SoftTlb, SoftTlbEntry, SoftTlbPlane,
@@ -66,6 +66,6 @@ pub use tlb::{
 };
 pub use walker::{
     AccessOutcome, AuthenticatedDescriptorWords, ExtentCloneError, ExtentEditError, ExtentRecord,
-    ExtentTable, ResolvedAccess, ResolvedSpan, RetiredIdentity, Retirement, SoftMmuMemory,
-    SoftWalker, SoftWalkerStats, WalkOutcome,
+    ExtentTable, Reclaimed, ResolvedAccess, ResolvedSpan, RetiredIdentity, Retirement,
+    SoftMmuMemory, SoftWalker, SoftWalkerStats, WalkOutcome,
 };
