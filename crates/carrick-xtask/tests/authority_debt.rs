@@ -97,8 +97,58 @@ fn a_reviewed_owner_move_transfers_its_ceiling() {
             .ratchet(&base, &moves)
             .unwrap_err()
             .to_string()
-            .contains("increase"),
+            .contains("exceeds what the source gave up"),
         "a move that increases the total fails"
+    );
+}
+fn pair(first: (&str, u64), second: (&str, u64)) -> AuthorityDebtCeilings {
+    let mut policy = owned(first.0, first.1);
+    policy
+        .counters
+        .push(owned(second.0, second.1).counters.remove(0));
+    policy
+}
+#[test]
+fn moves_refuse_existing_destinations_stale_entries_and_masked_growth() {
+    let moves = moved("carrick_kernel::poll", "carrick_kernel::readiness");
+    let existing = pair(
+        ("carrick_kernel::poll", 3),
+        ("carrick_kernel::readiness", 1),
+    );
+    assert!(
+        owned("carrick_kernel::readiness", 4)
+            .ratchet(&existing, &moves)
+            .is_err(),
+        "a move into an existing destination fails"
+    );
+    let landed = owned("carrick_kernel::readiness", 3);
+    assert!(
+        owned("carrick_kernel::readiness", 3)
+            .ratchet(&landed, &moves)
+            .unwrap_err()
+            .to_string()
+            .contains("stale"),
+        "a landed move is stale"
+    );
+    let wide = pair(("carrick_kernel::poll", 3), ("carrick_kernel::other", 5));
+    assert!(
+        pair(
+            ("carrick_kernel::readiness", 4),
+            ("carrick_kernel::other", 1)
+        )
+        .ratchet(&wide, &moves)
+        .is_err(),
+        "destination growth is not masked by a shrink elsewhere"
+    );
+    let split = pair(
+        ("carrick_kernel::poll", 4),
+        ("carrick_kernel::readiness", 0),
+    );
+    assert!(
+        split
+            .ratchet(&owned("carrick_kernel::poll", 3), &moves)
+            .is_err(),
+        "a split whose source grows fails"
     );
 }
 #[test]
@@ -107,7 +157,7 @@ fn unmapped_removal_and_unmapped_destination_fail() {
     let unrelated = moved("carrick_kernel::other", "carrick_kernel::readiness");
     assert!(
         owned("carrick_kernel::readiness", 3)
-            .ratchet(&base, &unrelated)
+            .ratchet(&base, &MoveMap::default())
             .unwrap_err()
             .to_string()
             .contains("removed nonzero counter"),
@@ -115,8 +165,11 @@ fn unmapped_removal_and_unmapped_destination_fail() {
     );
     assert!(
         owned("carrick_kernel::readiness", 3)
-            .ratchet(&base, &MoveMap::default())
-            .is_err()
+            .ratchet(&base, &unrelated)
+            .unwrap_err()
+            .to_string()
+            .contains("stale"),
+        "a move whose source is not in the base is stale"
     );
 }
 #[test]

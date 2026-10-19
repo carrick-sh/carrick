@@ -1,13 +1,18 @@
-//! Reviewed moves of debt cohorts between owners or crates.
+//! Reviewed moves of debt cohorts between owners or crates, for one change.
 //!
 //! The authority-debt and terminal-custody ratchets key debt by owner path
-//! or crate name, so moving code (a crate split, a module rename) would read
-//! as one removed cohort plus one new cohort. A move listed here is
-//! transferred instead: both sides of the comparison name every moved key by
-//! its destination before comparing, so the moved cohort's total must stay
-//! equal or fall, while unmapped removals and new keys stay errors.
+//! or crate name, so moving code (a crate split, a module rename) reads as a
+//! removed cohort plus a new one. An entry here admits exactly that change
+//! and nothing else:
+//! - it applies only while its source exists in the PR base and its
+//!   destination does not; any other entry is stale and fails, so the file
+//!   returns to empty once the move lands (delete-at-zero);
+//! - the source key is compared on its own (head ≤ base), and the new
+//!   destination key is admitted only up to what the source gave up
+//!   (`base(source) − head(source)`), so a split cannot pool its halves and a
+//!   move cannot hide growth in an existing destination.
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub const MOVES_PATH: &str = "scripts/migrate/authority-moves.json";
@@ -17,7 +22,7 @@ pub const MOVES_PATH: &str = "scripts/migrate/authority-moves.json";
 pub struct DebtMove {
     pub from: String,
     pub to: String,
-    /// The issue whose reviewed change performed the move.
+    /// The issue whose reviewed change performs the move.
     pub issue: u32,
 }
 
@@ -31,57 +36,88 @@ pub struct DebtMoves {
     pub terminal_custody: Vec<DebtMove>,
 }
 
-/// A validated one-to-one map from a moved key to its destination.
+/// A validated one-to-one list of moves.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MoveMap(BTreeMap<String, String>);
+pub struct MoveMap(Vec<(String, String)>);
 
 impl MoveMap {
     pub fn new(moves: &[DebtMove]) -> Result<Self, String> {
-        let mut map = BTreeMap::new();
+        let mut sources = BTreeSet::new();
+        let mut destinations = BTreeSet::new();
         for entry in moves {
             if entry.from.is_empty() || entry.to.is_empty() || entry.from == entry.to {
                 return Err(format!("invalid debt move: {entry:?}"));
             }
-            if map.insert(entry.from.clone(), entry.to.clone()).is_some() {
+            if !sources.insert(entry.from.as_str()) {
                 return Err(format!("debt move source listed twice: {}", entry.from));
             }
+            if !destinations.insert(entry.to.as_str()) {
+                return Err(format!("debt move destination listed twice: {}", entry.to));
+            }
         }
-        if let Some(chained) = map.values().find(|to| map.contains_key(*to)) {
-            return Err(format!(
-                "debt move destination is itself moved (chains hide the cohort): {chained}"
-            ));
+        if let Some(chained) = destinations.intersection(&sources).next() {
+            return Err(format!("debt move destination is itself moved: {chained}"));
         }
-        Ok(Self(map))
+        Ok(Self(
+            moves
+                .iter()
+                .map(|entry| (entry.from.clone(), entry.to.clone()))
+                .collect(),
+        ))
     }
 
-    /// The name a key is compared under: its destination when moved.
-    pub fn canonical<'a>(&'a self, key: &'a str) -> &'a str {
-        self.0.get(key).map_or(key, String::as_str)
-    }
-
-    /// Sum `counts` under canonical names, so a moved cohort compares as one.
-    pub fn transfer<K: Ord>(
+    /// Check every move against `base` and `head` and return the keys it
+    /// settled; the caller compares every other key with its usual rules.
+    ///
+    /// `name` reads a key's owner or crate and `rename` builds the same key
+    /// under another one, so one source key maps to one destination key.
+    pub fn settle<K: Ord + Clone + std::fmt::Debug>(
         &self,
-        counts: impl IntoIterator<Item = (K, u64)>,
-        rename: impl Fn(&K, &str) -> K,
+        base: &BTreeMap<K, u64>,
+        head: &BTreeMap<K, u64>,
         name: impl Fn(&K) -> &str,
-    ) -> BTreeMap<K, u64> {
-        let mut transferred = BTreeMap::new();
-        for (key, count) in counts {
-            let canonical = self.canonical(name(&key)).to_owned();
-            let key = if canonical == name(&key) {
-                key
-            } else {
-                rename(&key, &canonical)
-            };
-            *transferred.entry(key).or_insert(0) += count;
+        rename: impl Fn(&K, &str) -> K,
+    ) -> Result<BTreeSet<K>, String> {
+        let mut settled = BTreeSet::new();
+        for (from, to) in &self.0 {
+            if base.keys().any(|key| name(key) == to) {
+                return Err(format!(
+                    "stale debt move {from} -> {to}: the destination already exists in the base; \
+                     delete landed moves"
+                ));
+            }
+            let sources: Vec<_> = base.keys().filter(|key| name(key) == from).collect();
+            if sources.is_empty() {
+                return Err(format!(
+                    "stale debt move {from} -> {to}: the source does not exist in the base"
+                ));
+            }
+            for source in sources {
+                let destination = rename(source, to);
+                let given = base[source];
+                let kept = head.get(source).copied().unwrap_or(0);
+                let moved = head.get(&destination).copied().unwrap_or(0);
+                if kept > given {
+                    return Err(format!(
+                        "debt move source grew: {source:?}: {given} -> {kept}"
+                    ));
+                }
+                if moved > given - kept {
+                    return Err(format!(
+                        "debt move destination exceeds what the source gave up: \
+                         {destination:?}: {moved} > {given} - {kept}"
+                    ));
+                }
+                settled.insert(source.clone());
+                settled.insert(destination);
+            }
         }
-        transferred
+        Ok(settled)
     }
 }
 
 impl DebtMoves {
-    /// Load the checked-in map; an absent file lists no moves.
+    /// Load the checked-in list; an absent file lists no moves.
     pub fn load(root: &Path) -> Result<Self, String> {
         let path = root.join(MOVES_PATH);
         if !path.exists() {
@@ -121,29 +157,45 @@ mod tests {
         }
     }
 
+    fn counts(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect()
+    }
+
+    fn settle(map: &MoveMap, base: &[(&str, u64)], head: &[(&str, u64)]) -> Result<(), String> {
+        map.settle(
+            &counts(base),
+            &counts(head),
+            |k| k.as_str(),
+            |_, n| n.to_owned(),
+        )
+        .map(|_| ())
+    }
+
     #[test]
     fn duplicate_self_and_chained_moves_are_refused() {
         assert!(MoveMap::new(&[entry("a", "a")]).is_err());
         assert!(MoveMap::new(&[entry("a", "b"), entry("a", "c")]).is_err());
+        assert!(MoveMap::new(&[entry("a", "c"), entry("b", "c")]).is_err());
         assert!(MoveMap::new(&[entry("a", "b"), entry("b", "c")]).is_err());
-        assert!(MoveMap::new(&[entry("a", "c"), entry("b", "c")]).is_ok());
     }
 
     #[test]
-    fn transfer_sums_a_moved_cohort_under_its_destination() {
-        let map = MoveMap::new(&[entry("old", "new")]).unwrap();
-        let counts = map.transfer(
-            [
-                ("old".to_owned(), 6),
-                ("new".to_owned(), 22),
-                ("other".to_owned(), 1),
-            ],
-            |_, name| name.to_owned(),
-            |key| key.as_str(),
-        );
-        assert_eq!(
-            counts,
-            BTreeMap::from([("new".to_owned(), 28), ("other".to_owned(), 1)])
-        );
+    fn a_split_is_bounded_by_what_the_source_gave_up() {
+        let map = MoveMap::new(&[entry("lane", "lane-linux")]).unwrap();
+        assert!(settle(&map, &[("lane", 28)], &[("lane", 6), ("lane-linux", 22)]).is_ok());
+        assert!(settle(&map, &[("lane", 28)], &[("lane-linux", 28)]).is_ok());
+        // The source grows while the destination shrinks to keep the total.
+        assert!(settle(&map, &[("lane", 28)], &[("lane", 29), ("lane-linux", 0)]).is_err());
+        assert!(settle(&map, &[("lane", 28)], &[("lane", 7), ("lane-linux", 22)]).is_err());
+    }
+
+    #[test]
+    fn an_existing_destination_or_a_landed_move_is_stale() {
+        let map = MoveMap::new(&[entry("a", "b")]).unwrap();
+        // Moving into an existing cohort would hide its new debt.
+        assert!(settle(&map, &[("a", 3), ("b", 2)], &[("b", 5)]).is_err());
+        // After landing the base names the destination: the entry is stale.
+        assert!(settle(&map, &[("b", 3)], &[("b", 3)]).is_err());
+        assert!(settle(&map, &[("c", 3)], &[("c", 3)]).is_err());
     }
 }

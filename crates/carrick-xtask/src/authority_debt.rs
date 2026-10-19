@@ -198,24 +198,33 @@ impl AuthorityDebtCeilings {
         }
         Ok(())
     }
-    /// Compare against the PR base. Cohorts listed in `moves` are compared
-    /// under their destination owner on both sides, so a reviewed move keeps
-    /// its total; unmapped removals and new cohorts stay errors.
+    /// Compare against the PR base. A reviewed move in `moves` settles its
+    /// source and new destination cohorts (`debt_moves`); every other cohort
+    /// may only fall, and unmapped removals and new cohorts stay errors.
     pub fn ratchet(&self, base: &Self, moves: &MoveMap) -> Result<(), DebtError> {
         self.validate()?;
         base.validate()?;
-        let transfer = |policy: &Self| {
-            moves.transfer(
-                policy.counters.iter().map(|c| (c.key(), c.ceiling)),
+        let old: BTreeMap<_, _> = base.counters.iter().map(|c| (c.key(), c.ceiling)).collect();
+        let new: BTreeMap<_, _> = self.counters.iter().map(|c| (c.key(), c.ceiling)).collect();
+        let settled = moves
+            .settle(
+                &old,
+                &new,
+                |key| key.owner.as_str(),
                 |key, owner| Key {
                     owner: owner.to_owned(),
                     ..key.clone()
                 },
-                |key| key.owner.as_str(),
             )
-        };
-        let old = transfer(base);
-        let new = transfer(self);
+            .map_err(DebtError::Policy)?;
+        let old: BTreeMap<_, _> = old
+            .into_iter()
+            .filter(|(k, _)| !settled.contains(k))
+            .collect();
+        let new: BTreeMap<_, _> = new
+            .into_iter()
+            .filter(|(k, _)| !settled.contains(k))
+            .collect();
         for (key, ceiling) in &old {
             if *ceiling != 0 && !new.contains_key(key) {
                 return fail(format!("removed nonzero counter: {key:?} = {ceiling}"));

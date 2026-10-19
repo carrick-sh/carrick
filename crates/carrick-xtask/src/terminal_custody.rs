@@ -360,24 +360,31 @@ fn crate_sites(sites: &BTreeSet<String>) -> BTreeMap<String, Vec<&str>> {
     crates
 }
 
-/// Per-crate ceilings may only fall. Crates listed in `moves` are compared
-/// under their destination on both sides, so a reviewed crate split keeps
-/// its combined total; an unmapped new crate is still an increase.
+/// Per-crate ceilings may only fall. A reviewed move in `moves` settles its
+/// source crate and new destination crate (`debt_moves`); an unmapped new
+/// crate is still an increase.
 fn ratchet(
     current: &BTreeMap<String, usize>,
     base: &BTreeMap<String, usize>,
     moves: &MoveMap,
 ) -> Result<(), String> {
-    let transfer = |counts: &BTreeMap<String, usize>| {
-        moves.transfer(
-            counts
-                .iter()
-                .map(|(name, count)| (name.clone(), *count as u64)),
-            |_, name| name.to_owned(),
-            |name| name.as_str(),
-        )
+    let widen = |counts: &BTreeMap<String, usize>| -> BTreeMap<String, u64> {
+        counts
+            .iter()
+            .map(|(name, count)| (name.clone(), *count as u64))
+            .collect()
     };
-    let (current, base) = (transfer(current), transfer(base));
+    let (current, base) = (widen(current), widen(base));
+    let settled = moves.settle(
+        &base,
+        &current,
+        |name| name.as_str(),
+        |_, name| name.to_owned(),
+    )?;
+    let current: BTreeMap<_, _> = current
+        .into_iter()
+        .filter(|(name, _)| !settled.contains(name))
+        .collect();
     for (name, count) in &current {
         let previous = base.get(name).copied().unwrap_or(0);
         if *count > previous {
@@ -733,6 +740,41 @@ mod tests {
         );
         let unrelated = BTreeMap::from([("lane".to_owned(), 6), ("other".to_owned(), 22)]);
         assert!(ratchet(&unrelated, &base, &moves).is_err());
+        let source_grows = BTreeMap::from([("lane".to_owned(), 29), ("lane-linux".to_owned(), 0)]);
+        assert!(
+            ratchet(&source_grows, &base, &moves).is_err(),
+            "a split whose source grows fails even when the total holds"
+        );
+        let shifted = BTreeMap::from([("lane".to_owned(), 7), ("lane-linux".to_owned(), 21)]);
+        assert!(
+            ratchet(
+                &shifted,
+                &BTreeMap::from([("lane".to_owned(), 6), ("lane-linux".to_owned(), 22)]),
+                &moves
+            )
+            .is_err(),
+            "after landing the entry is stale, so halves cannot trade debt"
+        );
+        let existing = BTreeMap::from([("lane".to_owned(), 28), ("lane-linux".to_owned(), 2)]);
+        assert!(
+            ratchet(
+                &BTreeMap::from([("lane-linux".to_owned(), 30)]),
+                &existing,
+                &moves
+            )
+            .is_err(),
+            "a move into an existing destination fails"
+        );
+        let wide = BTreeMap::from([("lane".to_owned(), 28), ("other".to_owned(), 5)]);
+        let masked = BTreeMap::from([
+            ("lane".to_owned(), 6),
+            ("lane-linux".to_owned(), 25),
+            ("other".to_owned(), 2),
+        ]);
+        assert!(
+            ratchet(&masked, &wide, &moves).is_err(),
+            "growth in the destination is not masked by a shrink elsewhere"
+        );
     }
 
     #[test]
