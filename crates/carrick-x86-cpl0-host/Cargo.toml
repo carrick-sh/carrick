@@ -1,0 +1,44 @@
+[package]
+name = "carrick-x86-cpl0-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_x86_cpl0_host"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-abi = { path = "../carrick-abi" }
+carrick-core = { path = "../carrick-core" }
+carrick-core-abi = { path = "../carrick-core-abi" }
+carrick-el1 = { path = "../carrick-el1" }
+carrick-el1-linux = { path = "../carrick-el1-linux" }
+carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-fatal.workspace = true
+carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-hal = { path = "../carrick-hal" }
+carrick-mem = { path = "../carrick-mem" }
+carrick-mmu-core = { path = "../carrick-mmu-core" }
+carrick-sched-core = { path = "../carrick-sched-core" }
+carrick-x86 = { path = "../carrick-x86" }
+libc.workspace = true
+static_assertions = "1"
+
+[features]
+test-support = ["dep:carrick-kernel"]
+
+[dependencies.carrick-kernel]
+path = "../carrick-kernel"
+optional = true
+features = ["test-support"]
+
+[dev-dependencies]
+carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
+
+[package.metadata.carrick.test-lanes]
+"*" = "host"

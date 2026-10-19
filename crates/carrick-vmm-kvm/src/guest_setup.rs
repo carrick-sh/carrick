@@ -8,7 +8,6 @@
 //! `BroughtUp`, the trap engine's alias/protection/exec-reset helpers) and the
 //! x86_64 fork/vfork VM rebuild are each `cfg`-gated to the architecture that
 //! calls them; the window/slot model in between is shared.
-use std::sync::{Arc, RwLock};
 
 use carrick_hal::{HostAliasBacking, HostAliasSharing, HvVm, MemPerms, OsError};
 #[cfg(target_arch = "aarch64")]
@@ -20,7 +19,6 @@ use carrick_mem::memory::{
     LINUX_NULL_GUARD_END, LINUX_PAGE_TABLES_BASE, stage1_identity_page_tables,
     va_in_shared_aperture,
 };
-use carrick_mem::protections::MemoryProtections;
 
 use crate::kvm::{KvmVcpu, KvmVm};
 
@@ -39,32 +37,7 @@ use crate::kvm::{KvmVcpu, KvmVm};
 ///
 /// NOTE: it must NOT be `LINUX_HEAP_BASE` (256 GiB) — that collides with the
 /// guest heap region.
-pub const SENTINEL_GPA: u64 = 0x50_0000_0000; // 320 GiB
-
-/// Guest-physical address the EL1 vector stores to on an EL0 *fault* (a data /
-/// instruction abort or alignment fault, as opposed to an `svc`). Distinct from
-/// [`SENTINEL_GPA`] so the host distinguishes a syscall trap from a fault trap
-/// by the MMIO `gpa` alone. Same dual constraints as SENTINEL_GPA: stage-1
-/// identity-mapped yet UNMAPPED in every KVM slot. 324 GiB sits in the same
-/// heap/mmap gap (between 320 GiB SENTINEL and 384 GiB `LINUX_MMAP_BASE`), so
-/// the store always faults to stage-2 / MMIO.
-pub const FAULT_SENTINEL_GPA: u64 = 0x51_0000_0000; // 324 GiB
-
-/// Guest-physical address the EL1 stage-1 MAINTENANCE trampoline stores to once
-/// it has flushed the stage-1 TLB. Same dual constraints as [`SENTINEL_GPA`]:
-/// stage-1 identity-mapped (so the EL1 store translates) yet UNMAPPED in every
-/// KVM slot (so it faults out as `KVM_EXIT_MMIO { gpa: MAINT_SENTINEL_GPA, .. }`
-/// — the completion vehicle). 328 GiB sits in the same heap/mmap gap as the
-/// other two sentinels (between 324 GiB FAULT_SENTINEL and 384 GiB
-/// `LINUX_MMAP_BASE`), so the store always faults to stage-2 / MMIO.
-///
-/// This is the KVM analogue of HVF's `hvc #1` maintenance-complete marker: KVM
-/// runs the guest with PSCI 0.2 enabled, so a guest `hvc` traps to EL2 and is
-/// consumed by KVM's PSCI/SMCCC handler (an unknown function-id is reflected
-/// back to the guest, NOT surfaced as a userspace exit) — it would never reach
-/// us. The MMIO sentinel store is the SAME proven mechanism the syscall/fault
-/// vectors use, so the maintenance run uses it too instead of `hvc #1`.
-pub const MAINT_SENTINEL_GPA: u64 = 0x52_0000_0000; // 328 GiB
+pub use carrick_x86_cpl0_host::guest_ram::{FAULT_SENTINEL_GPA, MAINT_SENTINEL_GPA, SENTINEL_GPA};
 
 /// Base of the KVM alias-GPA arena: a free identity hole between the private
 /// overlay (608+2 GiB) and the stack (~1 TiB), within the 40-bit nested-KVM IPA
@@ -100,51 +73,6 @@ fn align_up_slot(addr: u64) -> Result<u64, OsError> {
     addr.checked_add(KVM_SLOT_ALIGN - 1)
         .map(|a| a & !(KVM_SLOT_ALIGN - 1))
         .ok_or_else(|| OsError::new(format!("kvm: region end 0x{addr:x} overflows on align")))
-}
-
-/// Copy ONLY the RESIDENT pages of `[src, src+scan)` into `dst` (which must back
-/// `total` >= `scan` bytes). Used by the `vfork(2)` shadow seed + copy-back so a
-/// multi-GB window doesn't fault in every untouched page (the OOM-`SIGKILL` a
-/// naive `memcpy` causes). `mincore` reports which of `src`'s pages are resident
-/// WITHOUT committing them; non-resident pages are left untouched in `dst` (lazily
-/// zero under `MAP_NORESERVE` — correct, since the parent never touched them
-/// either). On `mincore` failure, fall back to copying the bounded `scan` prefix
-/// in full (correct, just less sparse). Mirrors HVF's `clone_region_for_child`.
-#[cfg(target_arch = "x86_64")]
-fn copy_resident_pages(src: *const u8, dst: *mut u8, scan: usize, total: usize) {
-    if scan == 0 {
-        return;
-    }
-    let page = {
-        let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if p <= 0 { 4096usize } else { p as usize }
-    };
-    let n_pages = scan.div_ceil(page);
-    let mut resident = vec![0u8; n_pages];
-    // Linux `mincore` vec arg is `*mut c_uchar` (u8); resident[] is u8.
-    let rc = unsafe {
-        libc::mincore(
-            src as *mut libc::c_void,
-            scan,
-            resident.as_mut_ptr() as *mut libc::c_uchar,
-        )
-    };
-    if rc != 0 {
-        // mincore failed — copy the bounded prefix in full (still bounded by
-        // `scan`, so the arena's used-prefix bound keeps this from OOMing).
-        // SAFETY: `src`/`dst` each back at least `total` >= `scan` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, scan.min(total)) };
-        return;
-    }
-    for (i, &flag) in resident.iter().enumerate() {
-        if flag & 1 != 0 {
-            let off = i * page;
-            let len = page.min(total - off);
-            // SAFETY: `off + len <= total`; both pointers back `total` bytes and
-            // the mappings are distinct (non-overlapping).
-            unsafe { std::ptr::copy_nonoverlapping(src.add(off), dst.add(off), len) };
-        }
-    }
 }
 
 // The aarch64 vector table layout (matches carrick-mem's el1_vectors_bytes):
@@ -327,214 +255,36 @@ pub fn el1_maintenance_sentinel_bytes() -> Vec<u8> {
     bytes
 }
 
-/// Whether the host `mmap` backing a guest-physical window is shared across
-/// `fork(2)` (`MAP_SHARED`) or copy-on-write snapshotted (`MAP_PRIVATE`).
-///
-/// The KVM slot `flags` field is always `0` in both cases — KVM does not
-/// distinguish; only the HOST mmap flags change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WindowKind {
-    /// `MAP_PRIVATE`: copy-on-write on fork (image, heap, stack, page-tables,
-    /// vectors, trampoline, private overlay).
-    Private,
-    /// `MAP_SHARED`: writes are visible across `fork(2)` — used for the
-    /// boot-mapped shared aperture `[LINUX_SHARED_FILE_BASE,
-    /// LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE)` so that guest
-    /// `MAP_SHARED` futex words survive the fork used by `clone(2)`.
-    Shared,
-}
+#[cfg(target_arch = "x86_64")]
+pub use carrick_x86_cpl0_host::guest_ram::VforkShadows;
+pub use carrick_x86_cpl0_host::guest_ram::{GuestRam, WindowDesc, WindowKind};
 
-/// Multi-window host-backed guest RAM. The MVP used a single low window; a real
-/// binary additionally needs the high runtime regions (stack near 1 TiB,
-/// heap @ 256 GiB, mmap arena @ 384 GiB, sigreturn @ 192 GiB), which sit far
-/// above the low window and at sparse, huge GPAs. Each is its own `MAP_NORESERVE`
-/// window (lazily committed) and its own KVM slot — discrete windows, NOT one
-/// giant slot, so the SENTINEL gpa stays UNMAPPED (the MMIO trap vehicle relies
-/// on it faulting to stage-2). All windows are MAP_PRIVATE for now (no fork; the
-/// host-MAP_SHARED fork-coherence model is the full-backend Phase D work).
-pub struct GuestRam {
-    windows: Arc<RwLock<Vec<WindowDesc>>>,
-    /// Guest-physical ranges the guest has made PROT_NONE (mmap(PROT_NONE)/
-    /// mprotect/munmap). carrick backs the whole arena with accessible host
-    /// memory, so a PROT_NONE buffer is otherwise readable on the syscall path —
-    /// a guest passing such a buffer to a syscall must instead see EFAULT. This
-    /// is the HOST-SIDE syscall-read check (cheap, no page tables). Making the
-    /// GUEST itself fault mid-EL0 is the COMPLEMENTARY stage-1 path:
-    /// `protect_range`/`unmap_range`/`unmap_alias_range` edit the live stage-1
-    /// descriptors (via `Aarch64EngineCore::pt_edit_and_flush`,
-    /// which also runs the EL1-maintenance TLBI so a RE-protect of an already-
-    /// walked page takes effect) and the Phase-4 EL0-fault→SIGSEGV path delivers
-    /// the resulting abort — so these are LIVE overrides, not no-ops.
-    ///
-    /// SHARED (`Arc`) with every sibling vCPU thread's `GuestRam`, exactly like
-    /// HVF: a `clone(CLONE_VM)` thread group runs on one VM, so a `mprotect`
-    /// made by any thread MUST be observed by every other thread's syscall-path
-    /// checks. A per-thread copy diverges — one thread reserves a region
-    /// PROT_NONE, another commits it, and the first then wrongly EFAULTs a valid
-    /// buffer there (the Go-on-KVM `futexwakeup … EFAULT` crash). A `fork(2)`
-    /// child gets an INDEPENDENT copy (the COW of the whole process duplicates
-    /// the `Arc`'s target); `execve` starts fresh. The neutral-core type is
-    /// shared with HVF: [`carrick_mem::protections::MemoryProtections`].
-    protections: Arc<MemoryProtections>,
-    /// Whether this `GuestRam` OWNS its window mmaps (and must `munmap` them on
-    /// drop). `true` for the initial / fork-child / execve RAM. `false` for a
-    /// `clone(CLONE_THREAD)` sibling's view (see [`Self::from_shared_windows`]):
-    /// a sibling shares the SAME host mmaps as the parent thread (threads share
-    /// the address space, no fork), so it must NEVER `munmap` them — the parent
-    /// engine owns them and frees them at process exit. Double-`munmap` (or a
-    /// sibling freeing pages a live parent vCPU still uses) would be UB.
-    owns_windows: bool,
-}
-
-/// `munmap` the host backing of every window when the `GuestRam` is dropped.
-///
-/// For the long-lived initial / forked-child RAM this never fires in practice
-/// (the engine lives for the process). It matters for
-/// `Aarch64EngineCore::execve_into`, which REPLACES `self.ram`
-/// with a fresh `GuestRam` for the new image: the OLD `GuestRam` drops here and
-/// must release its host mmaps, or repeated execve would leak the prior image's
-/// windows (heap/mmap-arena/stack near 1 TiB are huge VA reservations).
-///
-/// The caller MUST have unregistered the KVM slots backed by these windows
-/// before the drop (execve does: `unmap_memory_slot` for each old slot first),
-/// so no live vCPU references the pages being unmapped.
-impl Drop for GuestRam {
-    fn drop(&mut self) {
-        // A non-owning sibling VIEW (`clone(CLONE_THREAD)`) must NOT free the
-        // shared host mmaps — the owning parent does, at process exit.
-        if !self.owns_windows {
-            return;
-        }
-        let mut windows = self.windows.write().unwrap_or_else(|e| e.into_inner());
-        for w in windows.iter() {
-            // SAFETY: `host`..`host+len` is the mmap this window owns (created in
-            // `add_window`); it is unmapped exactly once, on drop. KVM slots over
-            // it were already deleted by the execve caller.
-            unsafe {
-                libc::munmap((w.host as *mut u8).cast::<libc::c_void>(), w.len);
-            }
-        }
-        windows.clear();
-    }
-}
-
-impl GuestRam {
-    pub(crate) fn new() -> Self {
-        Self {
-            windows: Arc::new(RwLock::new(Vec::new())),
-            protections: Arc::new(MemoryProtections::default()),
-            owns_windows: true,
-        }
-    }
-
-    /// The shared PROT_NONE bookkeeping handle, cloned into a `clone(CLONE_VM)`
-    /// sibling so it observes this thread's `mprotect`s (and vice versa).
-    pub(crate) fn shared_protections(&self) -> Arc<MemoryProtections> {
-        Arc::clone(&self.protections)
-    }
-
-    /// Borrow the PROT_NONE set for the shared `GuestMemory::protections()` gate.
-    #[cfg(target_arch = "aarch64")]
-    pub(crate) fn protections_ref(&self) -> &MemoryProtections {
-        &self.protections
-    }
-
-    /// Whether [gpa, gpa+len) overlaps any PROT_NONE range (so a syscall buffer
-    /// there must fault with EFAULT). Delegates to the SHARED, process-wide
-    /// [`MemoryProtections`] so a sibling thread's `mprotect` is visible here.
-    #[cfg(target_arch = "aarch64")]
-    pub(crate) fn range_no_access(&self, gpa: u64, len: usize) -> bool {
-        self.protections.range_no_access(gpa, len)
-    }
-
-    /// Record (`no_access=true`) or clear (`false`) a PROT_NONE range on the
-    /// SHARED bookkeeping (interior-mutable, so `&self`): the change is observed
-    /// by every sibling vCPU thread's syscall-path access checks.
-    #[cfg(target_arch = "aarch64")]
-    pub(crate) fn set_no_access(&self, gpa: u64, len: usize, no_access: bool) {
-        self.protections.set_no_access(gpa, len, no_access);
-    }
-
-    /// mmap `len` bytes (lazy, `MAP_NORESERVE`) to back guest-physical
-    /// [base, base+len) and record the window. Refuses any window that would
-    /// cover [`SENTINEL_GPA`] — that page MUST stay unmapped so the EL1 vector's
-    /// sentinel store faults out as `KVM_EXIT_MMIO` (the syscall trap vehicle).
-    ///
-    /// `kind` selects the host mmap flags:
-    /// - [`WindowKind::Private`] → `MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE`
-    ///   (copy-on-write on fork; used for image/heap/stack/page-tables/vectors).
-    /// - [`WindowKind::Shared`] → `MAP_SHARED|MAP_ANONYMOUS|MAP_NORESERVE`
-    ///   (writes survive fork; used for the shared aperture so guest `MAP_SHARED`
-    ///   futex words remain coherent across the `fork` used by `clone(2)`).
-    ///
-    /// The KVM slot `flags` field is always `0` regardless of `kind`.
-    pub(crate) fn add_window(
+pub(crate) trait GuestRamKvmExt {
+    fn add_alias(
         &mut self,
-        base: u64,
-        len: usize,
-        kind: WindowKind,
-    ) -> Result<(), OsError> {
-        if len == 0 {
-            return Ok(());
-        }
-        let end = base
-            .checked_add(len as u64)
-            .ok_or_else(|| OsError::new(format!("kvm: window 0x{base:x}+{len} overflows")))?;
-        if (base <= SENTINEL_GPA && SENTINEL_GPA < end)
-            || (base <= FAULT_SENTINEL_GPA && FAULT_SENTINEL_GPA < end)
-            || (base <= MAINT_SENTINEL_GPA && MAINT_SENTINEL_GPA < end)
-        {
-            return Err(OsError::new(format!(
-                "kvm: window 0x{base:x}..0x{end:x} would back a sentinel gpa \
-                 (syscall 0x{SENTINEL_GPA:x} / fault 0x{FAULT_SENTINEL_GPA:x} / \
-                 maint 0x{MAINT_SENTINEL_GPA:x}); all must stay unmapped"
-            )));
-        }
-        let mmap_flags = match kind {
-            WindowKind::Private => libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            WindowKind::Shared => libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-        };
-        // SAFETY: anonymous mapping (no fd); we own it for the VM's life.
-        // MAP_SHARED|MAP_ANONYMOUS is used for the shared aperture so that guest
-        // MAP_SHARED futex words remain coherent across fork(2)/clone(2); KVM
-        // slot flags stay 0 in both cases — only the host mmap flags change.
-        let host = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                mmap_flags,
-                -1,
-                0,
-            )
-        };
-        if host == libc::MAP_FAILED {
-            return Err(OsError::new(format!(
-                "kvm: guest RAM mmap failed for 0x{base:x}+{len}"
-            )));
-        }
-        self.windows
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(WindowDesc {
-                base,
-                host: host.cast::<u8>() as usize,
-                len,
-                kind,
-                slot_gpa: None,
-            });
-        Ok(())
-    }
+        vm: &mut KvmVm,
+        va: u64,
+        gpa: u64,
+        len: u64,
+        payload: &[u8],
+        backing: HostAliasBacking,
+    ) -> Result<(), OsError>;
 
-    /// Back a dynamic ALIAS mapping on the LIVE VM: host-mmap the backing (a
-    /// `MAP_SHARED` dup'd fd for a guest `mmap(MAP_SHARED, fd)`, coherent across
-    /// fork + other openers; or `MAP_PRIVATE|MAP_ANON` seeded with `payload`),
-    /// register a NEW KVM memory slot at `gpa` (a low identity hole), and track
-    /// the window keyed by the guest `va` (which differs from `gpa`). The caller
-    /// then builds the VA->`gpa` stage-1 path via `map_aliased`. The host backing
-    /// is owned by this `GuestRam` and `munmap`'d on drop. Mirrors HVF's
-    /// `map_host_alias`, with a KVM slot in place of `hv_vm_map`.
-    pub(crate) fn add_alias(
+    #[cfg(target_arch = "x86_64")]
+    fn rebuild_vm_for_child(&self) -> Result<(KvmVm, KvmVcpu), OsError>;
+
+    #[cfg(target_arch = "x86_64")]
+    fn rebuild_vm_for_child_vfork(
+        &self,
+        shadows: &VforkShadows,
+    ) -> Result<(KvmVm, KvmVcpu), OsError>;
+
+    #[cfg(target_arch = "aarch64")]
+    fn build_for_image(image: &AddressSpace) -> Result<GuestRam, OsError>;
+}
+
+impl GuestRamKvmExt for GuestRam {
+    fn add_alias(
         &mut self,
         vm: &mut KvmVm,
         va: u64,
@@ -545,8 +295,6 @@ impl GuestRam {
     ) -> Result<(), OsError> {
         let size = usize::try_from(align_up_slot(len)?)
             .map_err(|_| OsError::new(format!("kvm: alias len {len} too large")))?;
-        // The slot GPA must never back a sentinel (the KVM alias arena sits at
-        // 640..704 GiB, above both 320/324 GiB sentinels, but assert the contract).
         let gpa_end = gpa
             .checked_add(size as u64)
             .ok_or_else(|| OsError::new(format!("kvm: alias slot 0x{gpa:x}+{size} overflows")))?;
@@ -566,12 +314,6 @@ impl GuestRam {
                 sharing,
             } => {
                 let raw_fd = fd.as_raw_fd();
-                // MAP_SHARED of the dup'd fd: writes hit the page cache (coherent
-                // with other openers + across fork). MAP_PRIVATE: a per-mapping
-                // COW view, so clean pages keep tracking the file while stored
-                // pages detach — the host is always RW for that view because
-                // the guest prot is enforced in the stage-1 leaf. We own the
-                // dup; mmap takes its own reference, so close it once mapped.
                 let (flags, prot, kind) = match sharing {
                     HostAliasSharing::Shared => (libc::MAP_SHARED, host_prot, WindowKind::Shared),
                     HostAliasSharing::Private => (
@@ -622,437 +364,45 @@ impl GuestRam {
                 (h.cast::<u8>(), kind)
             }
         };
-        // Register the LIVE KVM slot at the alias GPA. On failure, unmap before
-        // returning so we never leak the host backing.
         if let Err(e) = vm.map_memory(gpa, host, size, MemPerms::ReadWriteExec) {
             unsafe { libc::munmap(host.cast::<libc::c_void>(), size) };
             return Err(e);
         }
-        self.windows
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(WindowDesc {
-                base: va,
-                host: host as usize,
-                len: size,
-                kind,
-                slot_gpa: Some(gpa),
-            });
+        // SAFETY: this path created `host`, mapped the complete range into the
+        // VM, and transfers its mapping ownership into `GuestRam`.
+        unsafe { self.push_window(va, host, size, kind, Some(gpa)) };
         Ok(())
     }
 
-    /// The window whose [base, base+len) wholly contains [gpa, gpa+len), with
-    /// the host offset of `gpa` within it.
-    fn locate(&self, gpa: u64, len: usize) -> Option<(WindowDesc, usize)> {
-        self.windows
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .find_map(|w| {
-                let off = gpa.checked_sub(w.base)?;
-                ((off as usize).checked_add(len)? <= w.len).then_some((*w, off as usize))
-            })
-    }
-
-    /// The syscall-buffer backing lookup, WITHOUT the PROT_NONE gate — the
-    /// shared default `GuestMemory::read_bytes`/`write_bytes` already ran it on
-    /// the guest VA. Keeps the NULL-guard (a backing fact) + the IPA-translated
-    /// single-region lookup via the neutral
-    /// [`carrick_guest_mem::region::safe_guest_access_translated_in`]. This is
-    /// the backing-only path the `*_raw` trait methods call.
-    ///
-    /// The stage-1 tables leave VA 0..LINUX_NULL_GUARD_END UNMAPPED (Linux's
-    /// default vm.mmap_min_addr), but KVM's flat low identity window DOES back
-    /// GPA 0, so without the NULL guard a NULL syscall buffer would silently
-    /// read/write that backing instead of EFAULTing (LTP pipe05). Zero-length
-    /// accesses stay exempt (`read(fd, NULL, 0)` returns 0 on Linux).
-    #[cfg(target_arch = "aarch64")]
-    pub(crate) fn safe_access_translated_raw(
-        &self,
-        va: u64,
-        ipa: u64,
-        len: usize,
-    ) -> Result<*mut u8, carrick_guest_mem::region::GuestAccessError> {
-        if len > 0 && va < LINUX_NULL_GUARD_END {
-            return Err(carrick_guest_mem::region::GuestAccessError::OutOfBounds);
-        }
-        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
-        carrick_guest_mem::region::safe_guest_access_translated_in(
-            // PROT_NONE gated in the default GuestMemory::read_bytes/write_bytes.
-            |_g, _l| false,
-            windows
-                .iter()
-                .map(|w| carrick_guest_mem::region::GuestMemoryRegion {
-                    base: w.base,
-                    len: w.len,
-                    host_addr: w.host as *mut u8,
-                }),
-            va,
-            ipa,
-            len,
-        )
-    }
-
-    /// Copy `data` to guest-physical `gpa` (must lie wholly within one window).
-    /// `pub(crate)` so the `GuestMemory` impl on `crate::trap_engine::KvmTrapEngine`
-    /// can service guest `write_bytes` through the same bounds-checked path
-    /// bring-up uses; the guest VA is identity-mapped to this GPA.
-    pub(crate) fn write_gpa(&mut self, gpa: u64, data: &[u8]) -> Result<(), OsError> {
-        let (host, off) = {
-            let (w, off) = self.locate(gpa, data.len()).ok_or_else(|| {
-                OsError::new(format!("kvm: write gpa 0x{gpa:x} out of guest RAM"))
-            })?;
-            (w.host, off)
-        };
-        // SAFETY: bounds checked by `locate`; host points at `len` writable bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), (host as *mut u8).add(off), data.len());
-        }
-        Ok(())
-    }
-
-    /// Rebuild a fresh `KvmVm` + `KvmVcpu` over THIS `GuestRam`'s existing host
-    /// mmaps — the child side of `Aarch64EngineCore::fork`.
-    ///
-    /// After `libc::fork`, the child's inherited KVM fds point at the PARENT's
-    /// kernel VM and are useless, so the child opens `/dev/kvm` afresh
-    /// (`KVM_CREATE_VM`), re-registers EVERY window in the SAME order / GPA /
-    /// slot id over the COW-inherited host VAs (the `SENTINEL_GPA` hole stays
-    /// unmapped), and creates a vCPU (`KVM_CREATE_VCPU` + preferred-target init,
-    /// via [`KvmVm::add_vcpu`]). PRIVATE windows are the Linux-COW copies; the
-    /// `MAP_SHARED` aperture re-registers the SAME (inherited) host pages, so its
-    /// writes stay coherent across the fork. The vCPU is returned UNPROGRAMMED;
-    /// the caller restores the parent's `Aarch64VcpuSnapshot` onto it.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn rebuild_vm_for_child(&self) -> Result<(KvmVm, KvmVcpu), OsError> {
+    fn rebuild_vm_for_child(&self) -> Result<(KvmVm, KvmVcpu), OsError> {
         let mut vm = KvmVm::create_empty()?;
-        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
-        for w in windows.iter() {
-            // An ALIAS window's KVM slot lives at `slot_gpa` (a <1 TiB hole), NOT
-            // at `w.base` (the guest VA, e.g. 1 TiB — at/above the 40-bit nested
-            // IPA cap, which KVM rejects with EFAULT). Mirror the boot/sibling
-            // registration path (`window_slots` -> `slot_gpa.unwrap_or(base)`); a
-            // plain identity window has slot_gpa=None so this is `w.base`. Without
-            // this, a fork AFTER a map_host_alias (e.g. `go build` exec'ing
-            // `go tool compile`) crashed the child rebuild with
-            // KVM_SET_USER_MEMORY_REGION(gpa=1 TiB): Bad address.
-            vm.map_memory(
-                w.slot_gpa.unwrap_or(w.base),
-                w.host as *mut u8,
-                w.len,
-                MemPerms::ReadWriteExec,
-            )?;
+        for (gpa, host, len) in self.slot_windows() {
+            vm.map_memory(gpa, host, len, MemPerms::ReadWriteExec)?;
         }
         let vcpu = vm.add_vcpu()?;
         Ok((vm, vcpu))
     }
 
-    /// `vfork(2)` (`CLONE_VM|CLONE_VFORK`) PARENT, PRE-`libc::fork` half.
-    ///
-    /// A `Private` (COW) window is NOT shared across `fork(2)` — the child's guest
-    /// writes land in its own copy, invisible to the suspended parent, so the
-    /// CLONE_VM "writes visible to the parent" contract breaks (the `vforkvmshare`
-    /// gap). HVF gets sharing for free because its guest RAM is host-`MAP_SHARED`;
-    /// KVM's is host-`MAP_PRIVATE` (deliberate, so an ordinary fork COWs for free).
-    ///
-    /// Bridge the two WITHOUT making the parent's long-lived RAM shared (which
-    /// would break the parent's NEXT ordinary fork): for every `Private` window
-    /// allocate a `MAP_SHARED|MAP_ANONYMOUS` SHADOW of the same length, seed it
-    /// with the window's current contents, and return the shadow list. The CHILD
-    /// re-registers its KVM slots over the shadows ([`Self::rebuild_vm_for_child_vfork`]),
-    /// so the child's guest writes hit the shared shadow; the parent — SUSPENDED
-    /// for the whole vfork window — copies the shadow back into its private window
-    /// on resume ([`Self::finish_vfork_parent`]), making the child's writes visible.
-    ///
-    /// `Shared` windows (the futex aperture, file aliases) already survive fork
-    /// coherently, so they carry NO shadow (the child maps the inherited host page
-    /// as-is, exactly like an ordinary fork).
-    ///
-    /// NOTE on page tables: HVF keeps the stage-1 page-table BACKING private even
-    /// for a vfork child (defense-in-depth against a pre-execve child PT edit
-    /// corrupting the suspended parent). On the x86 KVM layout the PML4/CR3 backing
-    /// is FUSED into the low identity window (trampoline + GDT + PML4 + low image),
-    /// so it cannot be excluded without splitting that window. This is sound for a
-    /// LEGAL vfork-for-exec child — the only thing it may do is `execve`/`_exit`,
-    /// neither of which edits page tables (execve rebuilds a fresh VM + tables),
-    /// and the parent is SUSPENDED for the whole window — exactly the Go `os/exec`
-    /// / glibc `posix_spawn` shape this targets.
-    ///
-    /// `arena_high_water` is the guest's mmap-arena high-water (the runtime
-    /// publishes it pre-fork). The seed copy is **mincore-gated**: only RESIDENT
-    /// pages are copied into the shadow (the rest stay lazily zero under
-    /// `MAP_NORESERVE`), and the residency scan over the 32 GiB arena window is
-    /// bounded to `[LINUX_MMAP_BASE, arena_high_water)`. A naive full-window memcpy
-    /// would FAULT IN every byte of every window — committing the whole multi-GB
-    /// arena → OOM-`SIGKILL` (the exact failure this gates against). This mirrors
-    /// the HVF child-snapshot `clone_region_for_child`.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn prepare_vfork_shadows(
-        &self,
-        arena_high_water: u64,
-    ) -> Result<VforkShadows, OsError> {
-        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
-        let mut shadows = Vec::new();
-        for w in windows.iter() {
-            if w.kind != WindowKind::Private {
-                continue;
-            }
-            // SAFETY: anonymous MAP_SHARED mapping we own for the vfork window; the
-            // child maps over it and the parent munmaps it in finish_vfork_parent.
-            let shadow = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    w.len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                    -1,
-                    0,
-                )
-            };
-            if shadow == libc::MAP_FAILED {
-                // Roll back the shadows already mapped, then signal failure so the
-                // caller degrades to a plain (non-suspending) fork rather than
-                // sharing nothing.
-                for s in &shadows {
-                    let s: &VforkShadow = s;
-                    unsafe { libc::munmap(s.shadow as *mut libc::c_void, s.len) };
-                }
-                return Err(OsError::new(format!(
-                    "kvm: vfork shadow mmap failed for window 0x{:x}+{}",
-                    w.base, w.len
-                )));
-            }
-            // Seed the shadow with the window's RESIDENT contents (only) so the
-            // child sees the parent's pre-fork state without committing untouched
-            // arena/heap/stack pages. The arena window's scan is bounded to the
-            // used prefix; other windows scan in full (they are small).
-            let scan = if w.base == carrick_mem::memory::LINUX_MMAP_BASE {
-                arena_high_water
-                    .saturating_sub(w.base)
-                    .min(w.len as u64)
-                    .try_into()
-                    .unwrap_or(w.len)
-            } else {
-                w.len
-            };
-            copy_resident_pages(w.host as *const u8, shadow as *mut u8, scan, w.len);
-            shadows.push(VforkShadow {
-                base: w.base,
-                slot_gpa: w.slot_gpa,
-                private_host: w.host,
-                shadow: shadow as usize,
-                len: w.len,
-            });
-        }
-        Ok(VforkShadows { shadows })
-    }
-
-    /// `vfork(2)` CHILD, POST-`libc::fork` half: rebuild a fresh `KvmVm` + `KvmVcpu`
-    /// like [`Self::rebuild_vm_for_child`], but register every `Private` window's
-    /// KVM slot over its SHARED SHADOW (so the child's guest writes are visible to
-    /// the parent), and re-point the window's `host` at the shadow so the child's
-    /// syscall-buffer `read`/`write`/`host_ptr` see the same shared bytes. `Shared`
-    /// windows keep their inherited host page (already fork-coherent). The shadows
-    /// are owned by the parent's `VforkShadows`; the child must NOT munmap them —
-    /// it detaches on execve (a fresh VM) or `_exit` (process death).
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn rebuild_vm_for_child_vfork(
+    fn rebuild_vm_for_child_vfork(
         &self,
         shadows: &VforkShadows,
     ) -> Result<(KvmVm, KvmVcpu), OsError> {
         let mut vm = KvmVm::create_empty()?;
-        let mut windows = self.windows.write().unwrap_or_else(|e| e.into_inner());
-        for w in windows.iter_mut() {
-            // A Private window registers over its shadow (shared with the parent);
-            // a Shared window keeps the inherited host page (already coherent).
-            let host = shadows
-                .shadow_for(w.base, w.slot_gpa)
-                .inspect(|&s| w.host = s)
-                .unwrap_or(w.host);
-            vm.map_memory(
-                w.slot_gpa.unwrap_or(w.base),
-                host as *mut u8,
-                w.len,
-                MemPerms::ReadWriteExec,
-            )?;
+        self.replace_private_windows_with_vfork_shadows(shadows);
+        for (gpa, host, len) in self.slot_windows() {
+            vm.map_memory(gpa, host, len, MemPerms::ReadWriteExec)?;
         }
-        drop(windows);
         let vcpu = vm.add_vcpu()?;
         Ok((vm, vcpu))
     }
 
-    /// `vfork(2)` PARENT, on RESUME (the child has execve'd or `_exit`ed, so the
-    /// shared window is quiescent — the parent was suspended for the whole window).
-    /// Copy each shadow's RESIDENT pages back into the parent's private window, so
-    /// the child's shared writes become visible to the parent (CLONE_VM), then
-    /// release the shadows. The copy-back is mincore-gated for the same reason the
-    /// seed is: only pages the child actually touched (made resident in the shared
-    /// shadow) are copied — a full copy-back would fault in every untouched arena
-    /// page in the PARENT, re-introducing the OOM. Idempotent against an empty
-    /// `VforkShadows` (pipe-failure degrade path).
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn finish_vfork_parent(&self, shadows: VforkShadows) {
-        for s in &shadows.shadows {
-            // Copy back only the shadow's resident pages (what the child wrote).
-            copy_resident_pages(
-                s.shadow as *const u8,
-                s.private_host as *mut u8,
-                s.len,
-                s.len,
-            );
-            // SAFETY: `shadow` is the mapping we created in prepare_vfork_shadows;
-            // it is unmapped exactly once here (the child never owned/freed it).
-            unsafe { libc::munmap(s.shadow as *mut libc::c_void, s.len) };
-        }
-    }
-
-    /// Read `len` bytes of LIVE guest memory at guest-physical `gpa` (so guest
-    /// writes are visible). `gpa` must lie wholly within one backed window — e.g.
-    /// a `write(2)` buffer the guest passed in `x1`.
-    pub fn read(&self, gpa: u64, len: usize) -> Result<Vec<u8>, OsError> {
-        let (w, off) = self.locate(gpa, len).ok_or_else(|| {
-            OsError::new(format!("kvm: read gpa 0x{gpa:x}+{len} out of guest RAM"))
-        })?;
-        let mut out = vec![0u8; len];
-        // SAFETY: bounds checked by `locate`; host points at `len` readable bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping((w.host as *mut u8).add(off), out.as_mut_ptr(), len);
-        }
-        Ok(out)
-    }
-
-    /// Diagnostic: describe why an access at `[gpa, gpa+len)` would (not) resolve
-    /// — the located window or the nearest windows, plus no_access state. Gated
-    /// callers only (CARRICK_MEM_DEBUG); allocates, so never on the hot path.
     #[cfg(target_arch = "aarch64")]
-    pub(crate) fn debug_access(&self, gpa: u64, len: usize) -> String {
-        let located = self.locate(gpa, len).is_some();
-        let no_access = self.range_no_access(gpa, len);
-        // The PROT_NONE intervals straddling (or within ~16 MiB of) the access,
-        // so a stale-reserve vs genuine-uncommitted range is distinguishable.
-        let near: Vec<String> = self
-            .protections
-            .snapshot()
-            .into_iter()
-            .filter(|&(s, e)| {
-                e > gpa.saturating_sub(0x100_0000) && s < gpa.saturating_add(0x100_0000)
-            })
-            .map(|(s, e)| format!("[0x{s:x}..0x{e:x})"))
-            .collect();
-        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
-        let mut wins: Vec<String> = windows
-            .iter()
-            .map(|w| {
-                format!(
-                    "[0x{:x}..0x{:x} {:?}{}]",
-                    w.base,
-                    w.base + w.len as u64,
-                    w.kind,
-                    w.slot_gpa
-                        .map(|g| format!(" slot_gpa=0x{g:x}"))
-                        .unwrap_or_default()
-                )
-            })
-            .collect();
-        wins.sort();
-        format!(
-            "gpa=0x{gpa:x} len={len} located={located} no_access={no_access} \
-             no_access_ranges_near={} windows({})={}",
-            if near.is_empty() {
-                "(none)".to_string()
-            } else {
-                near.join(" ")
-            },
-            windows.len(),
-            wins.join(" ")
-        )
-    }
-
-    /// Host virtual address of the `len`-byte span at guest-physical `gpa`,
-    /// regardless of window kind, or `None` if it does not lie wholly within one
-    /// backed window. Used by the live stage-1 page-table editor to `sync_to_host`
-    /// changed descriptors straight into the guest's page-table backing (at
-    /// `LINUX_PAGE_TABLES_BASE`, in the low window). Unlike
-    /// [`Self::shared_futex_host_addr`], this does NOT require a `Shared` window.
-    pub(crate) fn host_ptr(&self, gpa: u64, len: usize) -> Option<*mut u8> {
-        let (w, off) = self.locate(gpa, len)?;
-        // SAFETY: `locate` proved [gpa, gpa+len) ⊆ this window, so `host + off`
-        // points at `len` valid bytes of that window's backing.
-        Some(unsafe { (w.host as *mut u8).add(off) })
-    }
-
-    /// Host virtual address of the `len`-byte word at guest-physical `gpa`, but
-    /// ONLY when it lies wholly within a `WindowKind::Shared` window (the
-    /// boot-mapped `MAP_SHARED|MAP_ANONYMOUS` aperture). That backing is the SAME
-    /// physical page in parent and child across `fork(2)`, so it is a valid
-    /// target for a bare host `SYS_futex` cross-process rendezvous (see
-    /// `crate::kvm_futex::KvmFutex::shared_wait`). Returns `None` for a word in
-    /// a `Private` (COW) window — those futexes stay in-process via the parking-
-    /// lot [`carrick_thread::thread::FutexTable`]. The engine passes the exact
-    /// stage-1-translated backing GPA: a private overlay therefore resolves
-    /// outside this shared window instead of aliasing the stale aperture page.
-    pub fn shared_futex_host_addr(&self, gpa: u64, len: usize) -> Option<usize> {
-        let (w, off) = self.locate(gpa, len)?;
-        if w.kind != WindowKind::Shared {
-            return None;
-        }
-        // SAFETY: `locate` proved [gpa, gpa+len) ⊆ this window, so `host + off`
-        // points at `len` valid bytes of the shared aperture backing.
-        Some(unsafe { (w.host as *mut u8).add(off) } as usize)
-    }
-}
-
-/// Result of bring-up: a VM + a vCPU initialised to the EL1 trampoline, ready
-/// for the trap engine to drive. `ram` is kept alive (its mmap backs KVM).
-/// Result of the aarch64 KVM bring-up. The x86_64 analogue is `BroughtUpX86`
-/// in `guest_setup_x86.rs` (Task 2).
-#[cfg(target_arch = "aarch64")]
-pub struct BroughtUp {
-    pub vm: KvmVm,
-    pub vcpu: KvmVcpu,
-    pub ram: GuestRam,
-    pub entry: u64,
-}
-
-/// The low window covers the user image's low segments AND the kernel region
-/// (EL0 trampoline / EL1 vectors / stage-1 page tables) at 180 GiB.
-#[cfg(target_arch = "aarch64")]
-const KERNEL_HOLE_END: u64 = 0x2D_0020_0000; // LINUX_KERNEL_REGION_BASE + 2 MiB
-
-impl GuestRam {
-    /// Build a fresh `GuestRam` over a freshly-`mmap`'d set of host windows for
-    /// `image`, and write the image segments + the architectural bring-up pages
-    /// (EL0 trampoline / stage-1 identity tables / EL1 sentinel vectors) into
-    /// them. This is the shared "lay out the guest physical RAM for an image"
-    /// step used by BOTH the initial [`bring_up`] and
-    /// `Aarch64EngineCore::execve_into` — execve replaces the
-    /// guest image in place by building a new `GuestRam` here and re-registering
-    /// its windows on the LIVE VM (the slots having first been unmapped).
-    ///
-    /// It does NOT touch any KVM object (no slot registration, no vCPU
-    /// programming) — those steps differ between bring-up (fresh VM) and execve
-    /// (live VM remap), so the caller drives them via [`Self::windows_for_kvm`]
-    /// and [`program_sysregs`].
-    #[cfg(target_arch = "aarch64")]
-    pub(crate) fn build_for_image(image: &AddressSpace) -> Result<Self, OsError> {
+    fn build_for_image(image: &AddressSpace) -> Result<GuestRam, OsError> {
         let mut ram = GuestRam::new();
-        // Low window covers image segments + kernel-region pages; always private
-        // (image text/data/bss are per-process, not shared across fork).
         ram.add_window(0, KERNEL_HOLE_END as usize, WindowKind::Private)?;
 
-        // 1. ELF + runtime regions (identity GPA == region.start). `load_elf`
-        //    also appends the guest's high runtime reservations (sigreturn @
-        //    192 GiB, heap @ 256 GiB, mmap arena @ 384 GiB, shared aperture @
-        //    576 GiB, private overlay @ 608 GiB), and `with_linux_initial_stack`
-        //    appends the stack near 1 TiB. Low regions land in the low window;
-        //    each HIGH region (>= KERNEL_HOLE_END) gets its own MAP_NORESERVE
-        //    window + KVM slot, page-aligned and lazily committed. (`add_window`
-        //    refuses any window that would back the unmapped SENTINEL gpa.)
-        //
-        //    WindowKind is derived from the MemoryRegion's `shared` flag:
-        //    - `shared: true`  → MAP_SHARED (the boot-mapped shared aperture)
-        //    - `shared: false` → MAP_PRIVATE (all other regions)
-        //    The KVM slot `flags` field stays 0 in both cases.
         for region in image.regions() {
             if region.start < KERNEL_HOLE_END {
                 let bytes = region.bytes();
@@ -1063,9 +413,6 @@ impl GuestRam {
             }
             let base = align_down_slot(region.start);
             let end = align_up_slot(region.end)?;
-            // Derive kind from carrick-mem's `shared` flag, cross-checked against
-            // the shared-aperture address range. Both must agree: if a region is
-            // marked shared it must lie in the shared aperture, and vice versa.
             debug_assert_eq!(
                 region.shared,
                 va_in_shared_aperture(base, end - base),
@@ -1082,19 +429,11 @@ impl GuestRam {
                 ram.write_gpa(region.start, bytes)?;
             }
         }
-        // 2. Architectural bring-up pages (low window). The per-ISA trampoline
-        //    bytes come from the engine's GuestArch (the x86_64 seam); free
-        //    function, so name the engine explicitly (as `program_sysregs`).
         use carrick_hal::GuestArch as _;
         ram.write_gpa(
             LINUX_EL0_TRAMPOLINE_BASE,
             &<crate::trap_engine::KvmTrapEngine as carrick_hal::ThreadedEngine>::Arch::entry_trampoline_bytes(),
         )?;
-        // Seed pristine boot tables ONLY when the image did not carry its own
-        // stage-1 region: `with_stage1_page_tables` now bakes the ELF images'
-        // read-only spans (.text/.rodata write protection) into the region
-        // bytes the loop above already wrote — overwriting them here with the
-        // pristine identity image would silently strip that enforcement.
         let image_carries_stage1 = image
             .regions()
             .iter()
@@ -1102,145 +441,11 @@ impl GuestRam {
         if !image_carries_stage1 {
             ram.write_gpa(LINUX_PAGE_TABLES_BASE, &stage1_identity_page_tables())?;
         }
-        // 3. Our sentinel vector (NOT carrick-mem's hvc #2 variant).
         ram.write_gpa(LINUX_EL1_VECTORS_BASE, &el1_vectors_sentinel_bytes())?;
-        // 4. Our stage-1 MAINTENANCE trampoline (NOT carrick-mem's hvc #1
-        //    variant). The canonical AddressSpace already placed `el1_maintenance_
-        //    bytes()` (the HVF `hvc #1` version) at LINUX_EL1_MAINT_BASE via the
-        //    region loop above; OVERWRITE it with the KVM MMIO-sentinel variant so
-        //    run_el1_maintenance's flush completes via a KVM_EXIT_MMIO instead of an
-        //    `hvc` that PSCI would swallow. The page is inside the kernel hole's
-        //    first 2 MiB block, so stage-1 maps it EL1-executable (AP=00/UXN=1/
-        //    PXN=0) — runnable at EL1 by construction.
         ram.write_gpa(LINUX_EL1_MAINT_BASE, &el1_maintenance_sentinel_bytes())?;
         Ok(ram)
     }
-
-    /// Iterate every window as `(base, host, len)` for `KVM_SET_USER_MEMORY_REGION`
-    /// registration, in slot order. Used by both bring-up and execve to publish
-    /// the windows onto a (fresh or live) VM via [`KvmVm::map_memory`].
-    pub(crate) fn windows_for_kvm(&self) -> Vec<(u64, *mut u8, usize)> {
-        // An alias window registers its KVM slot at `slot_gpa` (a low identity
-        // hole), NOT `base` (its high guest VA); an ordinary window has base==gpa.
-        self.windows
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|w| (w.slot_gpa.unwrap_or(w.base), w.host as *mut u8, w.len))
-            .collect()
-    }
-
-    /// Shared, `Send`-safe descriptors of this RAM's host-backed windows.
-    /// `clone(CLONE_THREAD)` siblings receive the SAME handle, so high-VA alias
-    /// windows added by any thread are immediately visible to every sibling's
-    /// syscall-buffer path.
-    pub(crate) fn window_descriptors(&self) -> Arc<RwLock<Vec<WindowDesc>>> {
-        Arc::clone(&self.windows)
-    }
-
-    /// Build a NON-OWNING `GuestRam` view over windows another thread owns (a
-    /// `clone(CLONE_THREAD)` sibling). The windows alias the SAME host mmaps the
-    /// parent engine owns; this view records them so the sibling's `read`/`write`
-    /// syscall-buffer path works, but its `Drop` is a NO-OP (`owns_windows =
-    /// false`) — only the owning parent `munmap`s, at process exit. `no_access`
-    /// starts empty: the sibling shares the parent's address space, but the
-    /// HOST-SIDE PROT_NONE bookkeeping is per-engine (a future Phase-4 concern);
-    /// the MVP threads fixture touches no PROT_NONE buffers.
-    /// Build a NON-OWNING sibling view over the parent's window descriptors,
-    /// SHARING the parent's PROT_NONE bookkeeping (`protections`) so the sibling
-    /// observes the parent's (and every other sibling's) `mprotect`s — and they
-    /// observe its. A fresh per-thread set would diverge (the Go-on-KVM EFAULT
-    /// crash); see [`MemoryProtections`]'s sharing contract.
-    pub(crate) fn from_shared_windows(
-        windows: Arc<RwLock<Vec<WindowDesc>>>,
-        protections: Arc<MemoryProtections>,
-    ) -> Self {
-        Self {
-            windows,
-            protections,
-            owns_windows: false,
-        }
-    }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shared_window_views_observe_late_insertions() {
-        let mut parent = GuestRam::new();
-        parent
-            .add_window(0x1000, 0x1000, WindowKind::Private)
-            .expect("initial window");
-        let sibling =
-            GuestRam::from_shared_windows(parent.window_descriptors(), parent.shared_protections());
-
-        assert!(sibling.host_ptr(0x1000, 1).is_some());
-
-        parent
-            .add_window(0x9000, 0x1000, WindowKind::Private)
-            .expect("late window");
-        assert!(
-            sibling.host_ptr(0x9000, 1).is_some(),
-            "sibling views must observe high-VA aliases added after clone"
-        );
-    }
-}
-
-/// A `Send` descriptor of one host-backed guest window, used to hand a
-/// `clone(CLONE_THREAD)` sibling a view of the SAME backing across host threads.
-/// `host` is a `usize` (not `*mut u8`) so the enclosing sibling-spec is `Send`;
-/// it is the same host VA in every thread of the process (no fork involved).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct WindowDesc {
-    pub base: u64,
-    pub host: usize,
-    pub len: usize,
-    pub kind: WindowKind,
-    /// Alias windows: the KVM-slot GPA (differs from `base`). `None` for ordinary
-    /// identity windows.
-    pub slot_gpa: Option<u64>,
-}
-
-/// One `Private` window's `vfork(2)` SHARED SHADOW (see
-/// [`GuestRam::prepare_vfork_shadows`]). `private_host` is the parent's
-/// (COW-private) window backing; `shadow` is the `MAP_SHARED` mapping the child
-/// registers its KVM slot over. The window is identified by `(base, slot_gpa)`
-/// (the same key the rebuild registration uses).
-#[cfg(target_arch = "x86_64")]
-pub(crate) struct VforkShadow {
-    base: u64,
-    slot_gpa: Option<u64>,
-    private_host: usize,
-    shadow: usize,
-    len: usize,
-}
-
-/// The set of `vfork(2)` shadows a vfork parent prepared pre-`libc::fork`. Carried
-/// across the fork (the child consults it in `rebuild_vm_for_child_vfork`; the
-/// parent reconciles + releases it in `finish_vfork_parent`).
-#[cfg(target_arch = "x86_64")]
-pub(crate) struct VforkShadows {
-    shadows: Vec<VforkShadow>,
-}
-
-#[cfg(target_arch = "x86_64")]
-impl VforkShadows {
-    /// Whether any window has a shadow (false on the pipe-failure degrade path).
-    pub(crate) fn is_empty(&self) -> bool {
-        self.shadows.is_empty()
-    }
-
-    /// The shadow host pointer for the window keyed by `(base, slot_gpa)`, if any.
-    fn shadow_for(&self, base: u64, slot_gpa: Option<u64>) -> Option<usize> {
-        self.shadows
-            .iter()
-            .find(|s| s.base == base && s.slot_gpa == slot_gpa)
-            .map(|s| s.shadow)
-    }
-}
-
 /// Whether the stage-1 leaf for an alias may be writable. A shared file is
 /// mapped on the host at the guest's prot, so a read-only host view must not
 /// be reachable through a writable leaf (the host would SIGBUS); private
@@ -1273,7 +478,7 @@ pub fn bring_up(image: &AddressSpace) -> Result<BroughtUp, OsError> {
 
     // 4. Create VM + publish every window as its own KVM memory slot.
     let mut vm = KvmVm::create(image)?;
-    for (base, host, len) in ram.windows_for_kvm() {
+    for (base, host, len) in ram.slot_windows() {
         vm.map_memory(base, host, len, MemPerms::ReadWriteExec)?;
     }
     let mut vcpu = vm.add_vcpu()?;
@@ -1580,13 +785,7 @@ mod window_kind_tests {
         ram.add_window(0xC0_0000_0000, 0x10000, WindowKind::Private)
             .expect("high private window");
 
-        let kinds: Vec<WindowKind> = ram
-            .windows
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|w| w.kind)
-            .collect();
+        let kinds = ram.window_kinds();
         assert_eq!(kinds[0], WindowKind::Private, "low window must be Private");
         assert_eq!(
             kinds[1],
@@ -1716,5 +915,32 @@ mod window_kind_tests {
              (expected 0x{BEFORE:02x}, got 0x{:02x})",
             results[1]
         );
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod vfork_tests {
+    use super::*;
+
+    #[test]
+    fn vfork_rebuild_host_reads_shadow_bytes() {
+        let mut ram = GuestRam::new();
+        ram.add_window(0x1000, 0x1000, WindowKind::Private).unwrap();
+        ram.add_window(0x3000, 0x1000, WindowKind::Shared).unwrap();
+        ram.write_gpa(0x1000, b"parent").unwrap();
+        ram.write_gpa(0x3000, b"shared").unwrap();
+        let original = ram.read(0x1000, 6).unwrap();
+        let shadows = ram.prepare_vfork_shadows(0).unwrap();
+        let shadow = shadows.shadow_for(0x1000, None).unwrap();
+        // SAFETY: this fixture owns the stopped, six-byte shadow mapping.
+        unsafe { std::ptr::copy_nonoverlapping(b"child!".as_ptr(), shadow as *mut u8, 6) };
+        let rebuilt = ram.rebuild_vm_for_child_vfork(&shadows).unwrap();
+        let private = ram.read(0x1000, 6).unwrap();
+        let shared = ram.read(0x3000, 6).unwrap();
+        drop(rebuilt);
+        ram.finish_vfork_parent(shadows);
+        ram.write_gpa(0x1000, &original).unwrap();
+        assert_eq!(&private, b"child!", "host must read the child's shadow");
+        assert_eq!(&shared, b"shared");
     }
 }

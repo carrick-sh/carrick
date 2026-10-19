@@ -7,7 +7,7 @@ semantic_authority = [
   "man 2 rt_sigtimedwait: a blocked signal in the wait set is consumed by the waiter",
   "native x86_64 Linux execution of the identical static assembly fixtures",
 ]
-fixture = "carrick-vmm-kvm::cpl0_boot::production_work_port_tests; carrick-cli::x86_kvm_run::mounted_static_x86_signal_{restarts_owned_wait4,wait_pingpong}_matches_native"
+fixture = "carrick-x86-cpl0-host::cpl0_boot::production_work_port_tests; carrick-cli::x86_kvm_run::mounted_static_x86_signal_{restarts_owned_wait4,wait_pingpong}_matches_native"
 scale_points = [1, 2]
 structural_budgets = []
 rationale = """
@@ -20,7 +20,7 @@ No polling, time extension, or executor serialization is part of the contract.
 """
 
 [bindings]
-vm_free = "carrick-vmm-kvm::cpl0_boot::production_work_port_tests::{completed_cpl0_work_has_a_production_boundary,work_boundary_consumes_only_the_stopped_tasks_flags_once}"
+vm_free = "carrick-x86-cpl0-host::cpl0_boot::production_work_port_tests::{completed_cpl0_work_has_a_production_boundary,work_boundary_consumes_only_the_stopped_tasks_flags_once}"
 embed = "KVM production carrier: carrick-cli::x86_kvm_run::{mounted_static_x86_signal_restarts_owned_wait4_matches_native,mounted_static_x86_signal_wait_pingpong_matches_native}"
 
 [bindings.unresolved]

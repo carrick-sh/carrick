@@ -13,6 +13,7 @@ use carrick_x86::interrupts::*;
 use kvm_bindings::{Msrs, kvm_msi, kvm_msr_entry};
 use std::num::NonZeroU64;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 pub const SECOND_ROOT: u64 = 0x180_0000;
@@ -121,7 +122,7 @@ pub fn witness(
     boundary: KickBoundary,
 ) -> Result<ProgressObservation, TrapError> {
     let mut carrier = Cpl0Carrier::boot_inner(frame_inventory, image, programs, true)?;
-    let ram = &carrier.custody.ram;
+    let ram = Arc::clone(carrier.custody.ram());
     if size_of::<ZoneTables<ParkedContextWords>>() > (PROGRESS_STATE - PROGRESS_ZONE) as usize
         || size_of::<ProgressState>() > (SECOND_ROOT - 0x170_0000) as usize
     {
@@ -151,7 +152,7 @@ pub fn witness(
     for (vector, pc) in [(TIMER_VECTOR, timer), (KICK_VECTOR, kick)] {
         carrier
             .custody
-            ._vm
+            .memory_mut()
             .write(
                 FrameGpa::new(idt + u64::from(vector) * 16),
                 &interrupt_gate(pc),
@@ -211,13 +212,13 @@ pub fn witness(
         for offset in [72, 80] {
             carrier
                 .custody
-                ._vm
+                .memory_mut()
                 .write(FrameGpa::new(gpa + offset), &u32::MAX.to_le_bytes())
                 .map_err(|e| fail(e.to_string()))?;
         }
         carrier
             .custody
-            ._vm
+            .memory_mut()
             .write(
                 FrameGpa::new(gpa + fs - PROGRESS_DATA + 8),
                 &(0xf500 + index).to_le_bytes(),
@@ -225,7 +226,7 @@ pub fn witness(
             .map_err(|e| fail(e.to_string()))?;
         carrier
             .custody
-            ._vm
+            .memory_mut()
             .write(
                 FrameGpa::new(gpa + gs - PROGRESS_DATA + 16),
                 &(0x6500 + index).to_le_bytes(),
@@ -351,7 +352,7 @@ pub fn witness(
                     KickBoundary::Return => PROGRESS_RETURN_PORT,
                 };
                 if port == chosen {
-                    inject_kick(carrier.custody._vm.vm(), ApicId(0))?;
+                    inject_kick(carrier.custody.memory().vm(), ApicId(0))?;
                     injected = true;
                 }
             }
@@ -368,7 +369,7 @@ pub fn witness(
                 for (index, bytes) in data.iter_mut().enumerate() {
                     let pointer = carrier
                         .custody
-                        .ram
+                        .ram()
                         .host_ptr(data_map(index as u64).gpa, bytes.len())
                         .ok_or_else(|| fail("data readback"))?;
                     unsafe { bytes.copy_from_slice(core::slice::from_raw_parts(pointer, 96)) };

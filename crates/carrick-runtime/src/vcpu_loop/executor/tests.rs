@@ -1965,14 +1965,14 @@ fn kvm_binding_requires_issued_task_mm_and_saved_x86_generation() {
         asid_generation: 1,
     };
     let binding =
-        super::kvm::KvmTaskBinding::new(&context, &state, arch, ExecutionGeneration::INITIAL)
+        super::cpl0::Cpl0TaskBinding::new(&context, &state, arch, ExecutionGeneration::INITIAL)
             .expect("issued KVM root binding");
     binding
         .validate_task_state(&state)
         .expect("exact x86 state");
     let scheduler = Arc::new(Scheduler::new(kernel));
-    let directory = Arc::new(super::kvm::KvmTaskBindingDirectory::default());
-    <super::kvm::KvmTaskBindingDirectory as TaskBindingResolver<_>>::install_scheduler(
+    let directory = Arc::new(super::cpl0::Cpl0TaskBindingDirectory::default());
+    <super::cpl0::Cpl0TaskBindingDirectory as TaskBindingResolver<_>>::install_scheduler(
         &directory, &scheduler,
     )
     .expect("install KVM resolver");
@@ -2008,7 +2008,7 @@ fn kvm_binding_requires_issued_task_mm_and_saved_x86_generation() {
         .expect("activate KVM root");
     assert_eq!(scheduler.queued_len(), 1);
     assert!(Arc::ptr_eq(
-        &<super::kvm::KvmTaskBindingDirectory as TaskBindingResolver<_>>::resolve(
+        &<super::cpl0::Cpl0TaskBindingDirectory as TaskBindingResolver<_>>::resolve(
             directory.as_ref(),
             context.thread().key(),
             generation,
@@ -2022,7 +2022,7 @@ fn kvm_binding_requires_issued_task_mm_and_saved_x86_generation() {
     let mut wrong_task = arch.task();
     wrong_task.task = TaskSerial::new(nonzero(context.task().key().serial.raw() + 1));
     assert!(
-        super::kvm::KvmTaskBinding::new(
+        super::cpl0::Cpl0TaskBinding::new(
             &context,
             &state,
             GuestArchBinding::x86(wrong_task, arch.context()),

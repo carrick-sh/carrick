@@ -965,6 +965,7 @@ dependencies = [
  "carrick-vmm-kvm",
  "carrick-vmm-nvmm",
  "carrick-x86",
+ "carrick-x86-cpl0-host",
  "clap",
  "fd-lock",
  "flate2",
@@ -1203,6 +1204,7 @@ dependencies = [
  "carrick-thread",
  "carrick-timer-core",
  "carrick-x86",
+ "carrick-x86-cpl0-host",
  "carrick-xtask",
  "getrandom 0.3.4",
  "goblin",
@@ -1285,6 +1287,29 @@ dependencies = [
  "carrick-syscall-abi",
  "carrick-test-support",
  "carrick-x86-carrier",
+]
+
+[[package]]
+name = "carrick-x86-cpl0-host"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-core",
+ "carrick-core-abi",
+ "carrick-el1",
+ "carrick-el1-abi",
+ "carrick-el1-linux",
+ "carrick-fatal",
+ "carrick-guest-arch",
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-kernel",
+ "carrick-mem",
+ "carrick-mmu-core",
+ "carrick-sched-core",
+ "carrick-x86",
+ "libc",
+ "static_assertions",
 ]
 
 [[package]]

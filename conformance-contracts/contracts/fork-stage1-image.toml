@@ -1,9 +1,10 @@
 schema_version = 1
 id = "kernel.fork.stage1-image"
 title = "Fork stage-1 image recycling"
-guest_surfaces = ["syscall:clone", "syscall:fork", "syscall:wait4", "kernel:stage1_image"]
+guest_surfaces = ["syscall:vfork", "syscall:clone", "syscall:fork", "syscall:wait4", "kernel:stage1_image"]
 semantic_authority = [
   "man 2 fork",
+  "man 2 vfork",
   "man 2 wait4",
   "conformance-probes/probe-inventory.json:forkserial",
 ]
@@ -49,3 +50,6 @@ rationale = "Each fork's COW projection scans the process's own mapping and alia
 maximum = 2.0
 statistic = "p50"
 minimum_samples = 20
+
+[bindings.unresolved]
+x86_vfork = "KVM binding carrick-vmm-kvm::guest_setup::vfork_tests::vfork_rebuild_host_reads_shadow_bytes reads distinct child shadow bytes through the host GuestRam after a real VM rebuild and preserves shared window bytes. Red on PR #663 before write-locked descriptor redirection. The shadow publication visits each window once and copies no backing bytes. This binding does not prove the complete vfork/exec lifecycle, signed HVF execution, or a Docker runtime ratio; those existing bindings remain required."

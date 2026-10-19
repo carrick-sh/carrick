@@ -122,7 +122,7 @@ mod initial_x86_forward_tests {
 pub struct Runtime;
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-pub use crate::vcpu_loop::executor::kvm::ForwardAuthorityRefusal;
+pub use crate::vcpu_loop::executor::cpl0::ForwardAuthorityRefusal;
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 pub struct PreparedKvmPoolOutcome {
@@ -323,7 +323,7 @@ fn run_prepared_kvm_pool_with_debug(
     let (root_cpu, physical) = parts.into_factory();
     let physical = Arc::new(physical);
     let reporter = Arc::new(carrick_kernel::compat::CompatReporter::default());
-    let stats = Arc::new(executor::kvm::KvmForwardStats::default());
+    let stats = Arc::new(executor::cpl0::Cpl0ForwardStats::default());
     if let Some((_, ref physical_debug)) = debug_server {
         physical_debug.attach(&physical);
     }
@@ -344,13 +344,13 @@ fn run_prepared_kvm_pool_with_debug(
     let generation = scheduler
         .publish_initial_task_state_gated(root_context.thread(), state.clone())
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-    let binding = Arc::new(executor::kvm::KvmTaskBinding::new(
+    let binding = Arc::new(executor::cpl0::Cpl0TaskBinding::new(
         &root_context,
         &state,
         root_cpu.binding(),
         generation,
     )?);
-    let directory = Arc::new(executor::kvm::KvmTaskBindingDirectory::default());
+    let directory = Arc::new(executor::cpl0::Cpl0TaskBindingDirectory::default());
     let dormant = directory.prepare_submission(
         &scheduler,
         executor::TaskSubmissionShape::Root,
@@ -361,8 +361,8 @@ fn run_prepared_kvm_pool_with_debug(
     )?;
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     let (max_loaded_exits, max_idle_exits) = lane_exit_budgets.unwrap_or((max_traps, max_traps));
-    let factory = Arc::new(executor::kvm::KvmPersistentExecutorFactory::new(
-        executor::kvm::KvmPersistentExecutorConfig {
+    let factory = Arc::new(executor::cpl0::Cpl0PersistentExecutorFactory::new(
+        executor::cpl0::Cpl0PersistentExecutorConfig {
             physical: Arc::clone(&physical),
             dispatcher: Arc::clone(&dispatcher),
             reporter: Arc::clone(&reporter),

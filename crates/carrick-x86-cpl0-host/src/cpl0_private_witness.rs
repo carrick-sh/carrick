@@ -4,9 +4,9 @@ use carrick_guest_arch::CpuId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-pub(crate) struct SettledPrivateGrant<'a> {
+pub(crate) struct SettledPrivateGrant<'a, M: crate::carrier_memory::CarrierMemoryIo> {
     pub cpu: CpuId,
-    pub memory: &'a crate::carrier_memory::CarrierMemory,
+    pub memory: &'a crate::carrier_memory::CarrierMemory<M>,
     pub inventory: &'a dyn carrick_hal::PhysicalFrameInventory,
     pub binding: carrick_el1_abi::ExecutionBinding,
     pub context: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
@@ -45,9 +45,9 @@ pub(crate) struct PrivateAnonymousWitness {
     peer_grants: u64,
 }
 impl PrivateAnonymousWitness {
-    pub(crate) fn record_settled(
+    pub(crate) fn record_settled<M: crate::carrier_memory::CarrierMemoryIo>(
         &mut self,
-        grant: SettledPrivateGrant<'_>,
+        grant: SettledPrivateGrant<'_, M>,
     ) -> Result<(), carrick_hal::TrapError> {
         use carrick_guest_arch::{FrameGpa, UserVa};
         use carrick_mmu_core::x86::descriptor_txn::{
@@ -221,30 +221,26 @@ impl PrivateAnonymousWitness {
     }
     /// Count authenticated anonymous leaves, excluding other physical loans
     /// such as an inherited process-entry stack's COW replacement.
-    pub(crate) fn private_pages(&self) -> u64 {
+    pub fn private_pages(&self) -> u64 {
         self.rows.values().map(|pages| pages.len() as u64).sum()
     }
-    pub(crate) fn cross_mm_private_aliases(&self) -> u64 {
+    pub fn cross_mm_private_aliases(&self) -> u64 {
         self.aliases
     }
-    pub(crate) fn peer_active_private_grants(&self) -> u64 {
+    pub fn peer_active_private_grants(&self) -> u64 {
         self.peer_grants
     }
 }
 
-impl crate::cpl0_boot::Cpl0Carrier {
+impl<M: crate::carrier_memory::CarrierMemoryIo> crate::cpl0_boot::Cpl0HostCustody<M> {
     pub fn anonymous_private_mms(&self) -> Vec<PrivateAnonymousMmEvidence> {
-        self.custody.private_anonymous_witness.rows()
+        self.private_anonymous_witness.rows()
     }
     pub fn cross_mm_private_aliases(&self) -> u64 {
-        self.custody
-            .private_anonymous_witness
-            .cross_mm_private_aliases()
+        self.private_anonymous_witness.cross_mm_private_aliases()
     }
     pub fn peer_active_private_grants(&self) -> u64 {
-        self.custody
-            .private_anonymous_witness
-            .peer_active_private_grants()
+        self.private_anonymous_witness.peer_active_private_grants()
     }
 }
 

@@ -471,7 +471,7 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         // ids/order a fresh VM would use), then publish them on the LIVE VM. The
         // SENTINEL_GPA hole stays unmapped.
         self.vm.reset_slot_counter();
-        for (base, host, len) in new_ram.windows_for_kvm() {
+        for (base, host, len) in new_ram.slot_windows() {
             self.vm
                 .map_memory(base, host, len, MemPerms::ReadWriteExec)
                 .map_err(os_to_trap)?;
@@ -528,7 +528,7 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         // `Aarch64SiblingSpec`.
         Ok(KvmAarch64SiblingBuilder {
             vm: self.vm.vm_handle(),
-            windows: self.ram.window_descriptors(),
+            windows: self.ram.shared_windows(),
             protections: self.ram.shared_protections(),
             // Reserve the sibling's VCPU_LIVE slot NOW — this runs while the parent
             // is suspended at the trapped clone, BEFORE the guest can race ahead
@@ -591,7 +591,7 @@ pub struct KvmAarch64SiblingBuilder {
     /// `Send`-safe descriptors of the parent's host windows (raw `*mut u8` carried
     /// as `usize`; same VA in the sibling thread — no fork). The sibling builds a
     /// NON-OWNING `GuestRam` view over these.
-    windows: Arc<RwLock<Vec<WindowDesc>>>,
+    windows: carrick_x86_cpl0_host::guest_ram::SharedWindows,
     /// The parent's PROT_NONE bookkeeping, SHARED (Arc clone) so the sibling's
     /// syscall-path access checks observe the parent's (and every sibling's)
     /// `mprotect(PROT_NONE)`. Carried into the sibling's `GuestRam`.
