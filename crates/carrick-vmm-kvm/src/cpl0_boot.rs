@@ -1983,7 +1983,7 @@ impl ProductionCpuFactory {
                         " actual_kvm_run={} pending_host_work={} served_with_work={}",
                         custody.actual_run[index as usize].load(Ordering::Acquire) != 0,
                         task.linux.has_pending_host_work(),
-                        task.linux.served_with_work.load(Ordering::Acquire),
+                        task.linux.served_word(),
                     ));
                 }
             }
@@ -5763,13 +5763,7 @@ impl Cpl0Carrier {
                     self.custody.kicks += 1;
                 }
                 WORK_PORT => {
-                    if self
-                        .task(index)
-                        .linux
-                        .served_with_work
-                        .swap(0, Ordering::AcqRel)
-                        == 0
-                    {
+                    if self.task(index).linux.take_served_boundary().is_none() {
                         return Err(fail("work exit without completed syscall"));
                     }
                     // This standalone carrier has no zone or host wake

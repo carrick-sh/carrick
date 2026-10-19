@@ -7407,10 +7407,7 @@ pub(crate) mod tests {
             unsafe { &*((region as usize + offset) as *const carrick_el1_abi::CurrentTask) };
 
         // Test 1: negative return value (-22, -EINVAL)
-        current_task
-            .linux
-            .served_with_work
-            .store(1, std::sync::atomic::Ordering::Relaxed);
+        current_task.linux.record_completed_with_work();
         let frame_err = carrick_hal::RawSyscall {
             current_guest_sp: Some(0x80_000),
             number: carrick_abi::CanonicalNr(carrick_abi::syscall::nr::READ.raw()),
@@ -7430,10 +7427,7 @@ pub(crate) mod tests {
         state.retire_syscall().unwrap();
 
         // Test 2: non-negative return value (42)
-        current_task
-            .linux
-            .served_with_work
-            .store(1, std::sync::atomic::Ordering::Relaxed);
+        current_task.linux.record_completed_with_work();
         let frame_ok = carrick_hal::RawSyscall {
             current_guest_sp: Some(0x80_000),
             number: carrick_abi::CanonicalNr(carrick_abi::syscall::nr::READ.raw()),

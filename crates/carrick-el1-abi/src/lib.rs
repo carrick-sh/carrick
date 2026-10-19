@@ -784,7 +784,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(CurrentTask, linux.file_table) as u64,
         (core::mem::offset_of!(CurrentTask, linux) + LinuxTaskState::PENDING_HOST_WORK_OFFSET)
             as u64,
-        core::mem::offset_of!(CurrentTask, linux.served_with_work) as u64,
+        (core::mem::offset_of!(CurrentTask, linux) + LinuxTaskState::SERVED_WITH_WORK_OFFSET)
+            as u64,
         core::mem::offset_of!(CurrentTask, mm.key) as u64,
         core::mem::offset_of!(CurrentTask, mm.thread_generation) as u64,
         core::mem::offset_of!(CurrentTask, metadata.lifecycle_page) as u64,
@@ -1187,7 +1188,9 @@ const _: () = {
     assert!(
         core::mem::offset_of!(CurrentTask, linux) + LinuxTaskState::PENDING_HOST_WORK_OFFSET == 40
     );
-    assert!(core::mem::offset_of!(CurrentTask, linux.served_with_work) == 44);
+    assert!(
+        core::mem::offset_of!(CurrentTask, linux) + LinuxTaskState::SERVED_WITH_WORK_OFFSET == 44
+    );
     assert!(core::mem::offset_of!(CurrentTask, mm.key) == 48);
     assert!(core::mem::offset_of!(CurrentTask, mm.thread_generation) == 56);
     assert!(core::mem::offset_of!(CurrentTask, metadata.lifecycle_page) == 64);
@@ -1286,7 +1289,7 @@ impl CurrentTask {
         self.linux.fixup_pc.store(0, Ordering::Relaxed);
         self.linux.orig_arg0.store(0, Ordering::Relaxed);
         // The host-work doorbell survives: only a settling boundary takes it.
-        self.linux.served_with_work.store(0, Ordering::Release);
+        self.linux.retire_served_boundary();
         self.mm.key.store(0, Ordering::Release);
         self.mm.thread_generation.store(0, Ordering::Release);
         self.root_generation.store(0, Ordering::Release);
@@ -1303,8 +1306,9 @@ impl CurrentTask {
         self.linux.file_table.store(file_table, Ordering::Release);
         // The host-work doorbell survives rebinding: it announces owed work
         // that is not this task's (owed wakes, deferred completions), and
-        // only a settling boundary may take it (#641).
-        self.linux.served_with_work.store(0, Ordering::Release);
+        // only a settling boundary may take it (#641). The previous task's
+        // served boundary moves its owed work there too.
+        self.linux.retire_served_boundary();
     }
 }
 
@@ -3116,7 +3120,7 @@ pub fn prepare_idle_entry(slot: usize) -> Option<u64> {
     task.linux.file_table.store(0, Ordering::Relaxed);
     task.mm.thread_generation.store(0, Ordering::Relaxed);
     task.publish_lifecycle(0, 0);
-    task.linux.served_with_work.store(0, Ordering::Relaxed);
+    task.linux.retire_served_boundary();
     task.mm.key.store(0, Ordering::Release);
     let frame = el1_slot_frame_va(slot);
     let frame_offset = (frame - EL1_REGION_BASE) as usize;
@@ -3354,7 +3358,7 @@ pub fn write_current_task_census(out: &mut impl core::fmt::Write) -> core::fmt::
         let task = unsafe { &*((ptr + offset) as *const CurrentTask) };
         let tid = task.execution.task.load(Ordering::Acquire);
         let pending = u32::from(task.linux.has_pending_host_work());
-        let served = task.linux.served_with_work.load(Ordering::Acquire);
+        let served = task.linux.served_word();
         if tid == 0 && pending == 0 && served == 0 {
             continue;
         }
@@ -3398,7 +3402,7 @@ pub fn peek_served_with_work(slot: usize) -> bool {
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task.linux.served_with_work.load(Ordering::Acquire) != 0
+    current_task.linux.served_boundary_pending()
 }
 
 /// Atomically take the served-with-work boundary of an executor slot: `None`
@@ -4067,23 +4071,14 @@ mod tests {
         // whatever its stale `orig_arg0` and syscall number.
         task.linux.orig_arg0.store(0, Ordering::Relaxed);
         task.linux.record_completed_with_work();
-        assert_eq!(
-            task.linux.served_with_work.load(Ordering::Relaxed),
-            SERVED_WAKES_OWED
-        );
+        assert_eq!(task.linux.served_word(), SERVED_WAKES_OWED);
         // A call owing its commit replays with the preserved argument ...
         task.linux.record_commit_owed(0x6000);
-        assert_eq!(
-            task.linux.served_with_work.load(Ordering::Relaxed),
-            SERVED_COMMIT_OWED
-        );
+        assert_eq!(task.linux.served_word(), SERVED_COMMIT_OWED);
         assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), 0x6000);
         // ... and a later blocked drain (`record_completed_with_work`) keeps it.
         task.linux.record_completed_with_work();
-        assert_eq!(
-            task.linux.served_with_work.load(Ordering::Relaxed),
-            SERVED_COMMIT_OWED
-        );
+        assert_eq!(task.linux.served_word(), SERVED_COMMIT_OWED);
     }
 
     use super::*;
@@ -4256,7 +4251,7 @@ mod tests {
             40
         );
         assert_eq!(
-            core::mem::offset_of!(CurrentTask, linux.served_with_work),
+            core::mem::offset_of!(CurrentTask, linux) + LinuxTaskState::SERVED_WITH_WORK_OFFSET,
             44
         );
     }
@@ -4433,7 +4428,7 @@ mod tests {
         assert_eq!(task_5.linux.file_table.load(Ordering::Acquire), 200);
         assert_eq!(task_6.linux.file_table.load(Ordering::Acquire), 0);
 
-        task_5.linux.served_with_work.store(1, Ordering::Relaxed);
+        task_5.linux.record_completed_with_work();
         assert!(take_served_with_work(5));
         assert!(!take_served_with_work(5));
 

@@ -406,7 +406,7 @@ fn x86_block_pending_unblock_owes_work_before_return() {
     let (unblocked, frame) = w.call(0, sigprocmask(1));
     assert_eq!((unblocked, frame.rax), (Action::ServedWithWork, 0));
     assert_eq!(slot.blocked(), BlockedMask(0));
-    assert_eq!(w.tasks[0].linux.served_with_work.load(Ordering::Acquire), 1);
+    assert_eq!(w.tasks[0].linux.served_word(), 1);
 }
 
 #[test]
@@ -430,8 +430,8 @@ fn pending_host_work_completes_once_and_leaves_with_work() {
     let w = World::new(LifecycleHatches::ON);
     w.tasks[1].linux.mark_pending_host_work();
     assert_eq!(w.robust(1, 0xb000, 24), (Action::ServedWithWork, 0));
-    assert_ne!(w.tasks[1].linux.served_with_work.load(Ordering::Relaxed), 0);
-    assert_eq!(w.tasks[0].linux.served_with_work.load(Ordering::Relaxed), 0);
+    assert_ne!(w.tasks[1].linux.served_word(), 0);
+    assert_eq!(w.tasks[0].linux.served_word(), 0);
     assert_eq!(w.heads(), [(0, 0), (0xb000, 24)]);
     assert_eq!(w.served(), 1);
     assert_eq!(w.publications.load(Ordering::Relaxed), 1);

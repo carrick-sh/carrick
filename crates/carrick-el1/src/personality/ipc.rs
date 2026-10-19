@@ -2239,7 +2239,7 @@ mod tests {
         );
         assert_eq!(u64::from_ne_bytes(value), 7);
         assert!(!w.zone.record(current).has_object_operation());
-        assert_eq!(task.linux.served_with_work.load(Ordering::Acquire), 1);
+        assert_eq!(task.linux.served_word(), 1);
     }
 
     /// Host work pending at entry (the host kicked the vCPU, or a write
@@ -2275,7 +2275,7 @@ mod tests {
             task.linux.has_pending_host_work(),
             "the host still sees its work"
         );
-        assert_eq!(task.linux.served_with_work.load(Ordering::Acquire), 1);
+        assert_eq!(task.linux.served_word(), 1);
         assert_eq!(w.counters.served[SYS_READ].load(Ordering::Relaxed), 1);
         assert_eq!(w.counters.served[SYS_WRITE].load(Ordering::Relaxed), 1);
         assert_eq!(host_calls(&w), 0);
@@ -2319,7 +2319,7 @@ mod tests {
             task.linux.has_pending_host_work(),
             "the host still sees its work"
         );
-        assert_eq!(task.linux.served_with_work.load(Ordering::Acquire), 0);
+        assert_eq!(task.linux.served_word(), 0);
         assert_eq!(w.counters.forwarded[SYS_READ].load(Ordering::Relaxed), 0);
         assert_eq!(host_calls(&w), 0);
     }
@@ -2370,7 +2370,7 @@ mod tests {
             task.linux.has_pending_host_work(),
             "the host still sees its work"
         );
-        assert_eq!(task.linux.served_with_work.load(Ordering::Acquire), 0);
+        assert_eq!(task.linux.served_word(), 0);
     }
 
     /// N communicating pairs of processes, pipes both ways plus an eventfd,

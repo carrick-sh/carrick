@@ -49,10 +49,7 @@ fn anonymous_reservation_routing_counts_two_mm_fallback_without_effects() {
                     );
                     assert_eq!(action, Action::Forward);
                     assert_eq!(frame.x, original, "forwarding cannot consume arguments");
-                    assert_eq!(
-                        tasks[slot].linux.served_with_work.load(Ordering::Acquire),
-                        0
-                    );
+                    assert_eq!(tasks[slot].linux.served_word(), 0);
                 }
             }
         }
@@ -269,7 +266,7 @@ fn test_dispatch_syscall_with_regions_exit_pending_work() {
     if let Some(doorbell) = tasks[0].linux.take_host_work_doorbell() {
         doorbell.settled();
     }
-    tasks[0].linux.served_with_work.store(0, Ordering::Relaxed);
+    tasks[0].linux.take_served_boundary();
     let mut buf = [0u8; 16];
     let mut cache_mem = [0u8; 4096];
     let cache_ptr = cache_mem.as_mut_ptr();
@@ -304,7 +301,7 @@ fn test_dispatch_syscall_with_regions_exit_pending_work() {
 
     assert_eq!(action_write, Action::ServedWithWork);
     assert_eq!(frame_write.x[0], 16);
-    assert_eq!(tasks[0].linux.served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(tasks[0].linux.served_word(), 1);
     assert_eq!(counters.served[64].load(Ordering::Relaxed), 1);
 }
 
