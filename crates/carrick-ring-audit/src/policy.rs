@@ -134,6 +134,18 @@ pub const RECURSION: &[RecursionRule] = &[
                 pattern: "Reservations<Policy,Geometry,C>::observe_tree",
                 max_live: 29,
             },
+            RecursionMember {
+                pattern: "Reservations<Policy,Geometry,C>::insert",
+                max_live: 29,
+            },
+            RecursionMember {
+                pattern: "Reservations<Policy,Geometry,C>::erase",
+                max_live: 29,
+            },
+            RecursionMember {
+                pattern: "Reservations<Policy,Geometry,C>::gap",
+                max_live: 29,
+            },
         ],
         why: "AVL height bound: storage holds at most 1024 + 256 * 4096 nodes, and an AVL tree \
               of fewer than F(31) - 1 = 1346268 nodes is at most 29 levels high",
@@ -244,6 +256,11 @@ pub const INDIRECT: &[IndirectRule] = &[
         why: "native process service and drop glue behind trait objects",
     },
     IndirectRule {
+        caller: "carrick_progress_",
+        budget: 0x800,
+        why: "the CPL0 fixture's progress interrupt hooks",
+    },
+    IndirectRule {
         caller: "carrick_x86_",
         budget: 0x800,
         why: "carrier personality hooks",
@@ -256,11 +273,29 @@ pub const INDIRECT: &[IndirectRule] = &[
 /// fits. Until then a deep enough recursion runs into the guard page.
 pub const AARCH64_BOUNDED_CEILING: u64 = 0x6800;
 
+/// Ratchets on the ARM entry chain with every indirect call resolved to the
+/// deepest address-taken function (#705): 30750 bytes with each recursion
+/// once and 58639 at the recursion bounds, against 16064 usable. The image
+/// takes the address of hundreds of functions and the audit cannot tell
+/// which a given `dyn` call reaches, so the bound is sound but loose: the
+/// worst resolved chain re-enters the scheduler through a drop guard's
+/// indirect call. Each may only decrease, toward the usable stack; until
+/// then a chain that deep would run into the guard page.
+pub const AARCH64_RESOLVED_CEILING: u64 = 0x7900;
+pub const AARCH64_RESOLVED_BOUNDED_CEILING: u64 = 0xe600;
+
+/// CPL0's resolved chains fit its 60 KiB stack (45306 / 56506 bytes worst),
+/// so its resolved limits are the stack itself.
+pub const X86_64_RESOLVED_CEILING: u64 = carrick_el1_abi::X86_CPL0_ENTRY_STACK_BUDGET;
+pub const X86_64_RESOLVED_BOUNDED_CEILING: u64 = carrick_el1_abi::X86_CPL0_ENTRY_STACK_BUDGET;
+
 pub const AARCH64: Policy = Policy {
     arch: Arch::Aarch64,
     entries: &["carrick_el1_syscall"],
     stack_budget: carrick_el1_abi::EL1_ENTRY_STACK_BUDGET,
     bounded_ceiling: AARCH64_BOUNDED_CEILING,
+    resolved_ceiling: AARCH64_RESOLVED_CEILING,
+    resolved_bounded_ceiling: AARCH64_RESOLVED_BOUNDED_CEILING,
     guard: carrick_el1_abi::EL1_STACK_GUARD_SIZE,
     function_ceiling: RING_FUNCTION_FRAME_CEILING,
     named_ceilings: EL1_EXIT_FRAME_CEILINGS,
@@ -279,6 +314,8 @@ pub const X86_64: Policy = Policy {
     ],
     stack_budget: carrick_el1_abi::X86_CPL0_ENTRY_STACK_BUDGET,
     bounded_ceiling: carrick_el1_abi::X86_CPL0_ENTRY_STACK_BUDGET,
+    resolved_ceiling: X86_64_RESOLVED_CEILING,
+    resolved_bounded_ceiling: X86_64_RESOLVED_BOUNDED_CEILING,
     guard: carrick_el1_abi::X86_CPL0_KERNEL_STACK_GUARD_SIZE,
     function_ceiling: RING_FUNCTION_FRAME_CEILING,
     named_ceilings: &[],
@@ -298,6 +335,8 @@ const fn unoptimized_mir(policy: Policy) -> Policy {
         entries: &[],
         stack_budget: u64::MAX,
         bounded_ceiling: u64::MAX,
+        resolved_ceiling: u64::MAX,
+        resolved_bounded_ceiling: u64::MAX,
         guard: u64::MAX,
         function_ceiling: u64::MAX,
         ..policy

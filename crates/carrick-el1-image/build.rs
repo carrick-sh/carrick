@@ -23,14 +23,17 @@ pub(crate) fn loaded_image_size(symbols: &str) -> Result<u64, String> {
 }
 
 /// The ring stack audit (#338, #369) over this exact image: every frame,
-/// the #338 exit-frame pins, and each entry chain's worst case.
-fn check_ring_stack(disassembly: &str) {
-    use carrick_ring_audit::frames::{Arch, Image, audit};
-    let image = Image::parse(Arch::Aarch64, disassembly, None)
-        .unwrap_or_else(|error| panic!("EL1 ring stack audit cannot parse the image: {error}"));
+/// the #338 exit-frame pins, and each entry chain's worst case, with every
+/// indirect call resolved against the image's address-taken functions.
+fn check_ring_stack(llvm_objdump: &Path, elf_path: &Path) {
     // Under `cargo clippy` the nested build is `clippy-driver`'s, too.
-    let policy = carrick_ring_audit::policy::for_build(Arch::Aarch64, cfg!(clippy));
-    let report = audit(&image, policy);
+    let select = if cfg!(clippy) {
+        |arch| carrick_ring_audit::policy::for_build(arch, true)
+    } else {
+        |arch| carrick_ring_audit::policy::for_build(arch, false)
+    };
+    let report = carrick_ring_audit::audit_image_with(llvm_objdump, elf_path, select)
+        .unwrap_or_else(|error| panic!("EL1 ring stack audit cannot read the image: {error}"));
     for line in carrick_ring_audit::summary(&report).lines() {
         println!("cargo:warning={line}");
     }
@@ -60,7 +63,7 @@ fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) -> u64 {
     }
     let stdout = String::from_utf8(output.stdout).expect("disassembly not valid utf-8");
 
-    check_ring_stack(&stdout);
+    check_ring_stack(llvm_objdump, elf_path);
 
     // The in-guest thread switch saves and restores the guest's FP/SIMD
     // state in exactly these two audited routines (`carrick-el1`

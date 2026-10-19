@@ -57,6 +57,10 @@ pub struct Function {
     /// Whether the function touches its frame page by page as it grows it
     /// (LLVM inline stack probes), so it cannot step over a guard.
     pub probes: bool,
+    /// Whether the image takes this function's address (a data word, or an
+    /// `adrp`/`add`, `adr` or `lea [rip]` in code): a possible target of
+    /// every indirect call.
+    pub address_taken: bool,
 }
 
 /// A parsed ring image.
@@ -187,8 +191,13 @@ fn aarch64_sub_amount(operands: &str, destination: &str, base: &str) -> Option<u
 /// The same counting rule `carrick-el1-image` pinned for #338, over the
 /// whole body so a shrink-wrapped prologue is not missed.
 fn aarch64_frame(body: &[(u64, &str)], dynamic: &mut Vec<String>) -> u64 {
+    // x9 is LLVM's probe/realign target. Between `sub x9, sp, #N` and the
+    // end of its probe loop (`cmp sp, x9`) or realignment (`and sp, x9`),
+    // the loop's `sub sp, sp, #4096` steps are part of N; a residual
+    // `sub sp, sp, #R` after the loop is counted again.
     let mut frame = 0_u64;
     let mut aligned = false;
+    let mut in_probe = false;
     let mut alignment = 64_u64;
     for (_, text) in body {
         let (mnemonic, operands) = split_instruction(text);
@@ -204,15 +213,22 @@ fn aarch64_frame(body: &[(u64, &str)], dynamic: &mut Vec<String>) -> u64 {
         if mnemonic == "sub" {
             if let Some(amount) = aarch64_sub_amount(operands, "x9", "sp") {
                 aligned = true;
+                in_probe = true;
                 frame = frame.saturating_add(amount);
-            } else if aligned && let Some(amount) = aarch64_sub_amount(operands, "x9", "x9") {
+            } else if in_probe && let Some(amount) = aarch64_sub_amount(operands, "x9", "x9") {
                 frame = frame.saturating_add(amount);
-            } else if !aligned && let Some(amount) = aarch64_sub_amount(operands, "sp", "sp") {
+            } else if !in_probe && let Some(amount) = aarch64_sub_amount(operands, "sp", "sp") {
                 frame = frame.saturating_add(amount);
             } else if operands.starts_with("sp, sp, x") || operands.starts_with("sp, sp, w") {
                 dynamic.push((*text).to_owned());
             }
             continue;
+        }
+        if mnemonic == "cmp" && operands == "sp, x9" {
+            in_probe = false;
+        }
+        if mnemonic == "and" && operands.starts_with("sp, x9, ") {
+            in_probe = false;
         }
         if mnemonic == "and"
             && let Some(mask) = operands.strip_prefix("sp, x9, ")
@@ -462,6 +478,7 @@ impl Image {
                 indirect_calls,
                 stray_targets,
                 dynamic_adjustments: dynamic,
+                address_taken: false,
                 probes: function.body.iter().any(|(_, text)| {
                     let (mnemonic, operands) = split_instruction(text);
                     match arch {
@@ -473,6 +490,53 @@ impl Image {
                     }
                 }),
             });
+        }
+        // Every address the image materializes: a target of indirect calls.
+        let mut taken = BTreeSet::new();
+        for function in &raw_functions {
+            let mut pages: BTreeMap<String, u64> = BTreeMap::new();
+            for (_, text) in &function.body {
+                let (mnemonic, operands) = split_instruction(text);
+                let mut parts = operands.split(',').map(str::trim);
+                let destination = parts.next().unwrap_or_default().to_owned();
+                let address = match (arch, mnemonic) {
+                    (Arch::Aarch64, "adrp") => {
+                        if let Some(page) = parts.next().and_then(branch_target) {
+                            pages.insert(destination, page);
+                        }
+                        None
+                    }
+                    (Arch::Aarch64, "adr") => parts.next().and_then(branch_target),
+                    (Arch::Aarch64, "add") => {
+                        let base = parts.next().and_then(|base| pages.get(base).copied());
+                        let offset = parts
+                            .next()
+                            .and_then(immediate)
+                            .and_then(|offset| u64::try_from(offset).ok());
+                        base.zip(offset)
+                            .map(|(base, offset)| base.wrapping_add(offset))
+                    }
+                    (Arch::X86_64, "lea") if operands.contains("[rip") => rip_slot(operands),
+                    (Arch::X86_64, "mov" | "movabs") => parts
+                        .next()
+                        .and_then(immediate)
+                        .and_then(|value| u64::try_from(value).ok()),
+                    _ => None,
+                };
+                if let Some(index) = address.and_then(|address| by_start.get(&address)) {
+                    taken.insert(*index);
+                }
+            }
+        }
+        if let Some(data) = data {
+            for word in data.words() {
+                if let Some(index) = by_start.get(&word) {
+                    taken.insert(*index);
+                }
+            }
+        }
+        for index in taken {
+            functions[index].address_taken = true;
         }
         Ok(Self { arch, functions })
     }
@@ -533,6 +597,12 @@ pub struct Policy {
     /// reviewed bound. It may only decrease, toward `stack_budget`; beyond
     /// the usable stack the guard page faults at run time.
     pub bounded_ceiling: u64,
+    /// Ratchet on each entry chain with every indirect call resolved to the
+    /// deepest address-taken function (each recursion once). May only
+    /// decrease, toward `stack_budget`.
+    pub resolved_ceiling: u64,
+    /// The same with every recursion at its bound; may only decrease.
+    pub resolved_bounded_ceiling: u64,
     /// The unmapped guard below each stack: a larger frame must probe it.
     pub guard: u64,
     /// Ceiling for every function's own frame in the image.
@@ -570,11 +640,23 @@ pub enum Depth {
     Bounded,
 }
 
+/// How an entry chain charges indirect calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// Each indirect call costs its `IndirectRule` budget.
+    Declared,
+    /// Each indirect call costs the larger of its budget and the deepest
+    /// address-taken function's own (declared) chain: every function whose
+    /// address the image takes is a possible target.
+    Resolved,
+}
+
 /// One entry's worst case.
 #[derive(Clone, Debug)]
 pub struct EntryDepth {
     pub entry: String,
     pub kind: Depth,
+    pub resolution: Resolution,
     pub depth: u64,
     pub budget: u64,
     pub chain: Vec<Link>,
@@ -627,6 +709,10 @@ pub enum Violation {
 #[derive(Clone, Debug)]
 pub struct Report {
     pub arch: Arch,
+    /// Address-taken functions: the possible targets of every indirect call.
+    pub indirect_targets: usize,
+    /// The deepest address-taken target's own chain, per depth kind.
+    pub deepest_target: Vec<(Depth, String, u64)>,
     /// Usable stack bytes per entry chain.
     pub stack_budget: u64,
     pub entries: Vec<EntryDepth>,
@@ -670,11 +756,15 @@ impl fmt::Display for EntryDepth {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             formatter,
-            "{} ({}): worst case {} of {} bytes ({} bytes headroom)",
+            "{} ({}, {}): worst case {} of {} bytes ({} bytes headroom)",
             self.entry,
             match self.kind {
                 Depth::Certain => "each recursion once",
                 Depth::Bounded => "recursion at its bound",
+            },
+            match self.resolution {
+                Resolution::Declared => "indirect calls at their budgets",
+                Resolution::Resolved => "indirect calls resolved to every address-taken target",
             },
             self.depth,
             self.budget,
@@ -892,8 +982,16 @@ pub fn audit(image: &Image, policy: &Policy) -> Report {
             None => violations.push(Violation::MissingEntry { entry }),
         }
     }
+    // Every address-taken function is a possible target of every indirect
+    // call, so each is audited as an entry of its own (and covered by the
+    // same recursion and indirect-call rules).
+    // A policy with no entries (the pins-only clippy policy) audits no chain.
+    let targets: Vec<usize> = (0..image.functions.len())
+        .filter(|index| !policy.entries.is_empty() && image.functions[*index].address_taken)
+        .collect();
     let mut reachable = BTreeSet::new();
     let mut work = roots.clone();
+    work.extend(targets.iter().copied());
     while let Some(node) = work.pop() {
         if reachable.insert(node) {
             work.extend(image.functions[node].calls.iter().copied());
@@ -992,8 +1090,7 @@ pub fn audit(image: &Image, policy: &Policy) -> Report {
             })
         })
         .collect();
-    let mut entries = Vec::new();
-    for kind in [Depth::Certain, Depth::Bounded] {
+    let compute = |kind: Depth, charge: &dyn Fn(usize) -> Option<u64>| {
         // Deepest chain per component, children first (Tarjan emits them first).
         let mut depth = vec![0_u64; all.len()];
         let mut next_hop: Vec<Option<Hop>> = vec![None; all.len()];
@@ -1019,88 +1116,145 @@ pub fn audit(image: &Image, policy: &Policy) -> Report {
                         hop = Some(Hop::Call(*callee));
                     }
                 }
-                if let Some((budget, rule)) = indirect_budget.get(member) {
-                    let candidate = budget.saturating_add(overhead);
+                if let Some(bytes) = charge(*member) {
+                    let candidate = bytes.saturating_add(overhead);
                     if candidate > best {
                         best = candidate;
-                        hop = Some(Hop::Indirect(*member, rule));
+                        hop = Some(Hop::Indirect(*member));
                     }
                 }
             }
             depth[id] = own.saturating_add(best);
             next_hop[id] = hop;
         }
+        (depth, next_hop)
+    };
 
-        for &root in &roots {
-            let Some(&id) = component_of.get(&root) else {
-                continue;
+    let mut entries = Vec::new();
+    let mut deepest_target = Vec::new();
+    for kind in [Depth::Certain, Depth::Bounded] {
+        // Declared budgets first: what each address-taken target's own
+        // chain needs when its indirect calls are charged their rules.
+        let declared = |member: usize| indirect_budget.get(&member).map(|(budget, _)| *budget);
+        let (target_depth, target_hops) = compute(kind, &declared);
+        let deepest = targets
+            .iter()
+            .filter_map(|target| {
+                component_of
+                    .get(target)
+                    .map(|id| (target_depth[*id], *target))
+            })
+            .max();
+        let target_max = deepest.map_or(0, |(bytes, _)| bytes);
+        if let Some((bytes, target)) = deepest {
+            deepest_target.push((kind, image.functions[target].name.clone(), bytes));
+        }
+        // Then every indirect call is charged the larger of its rule and the
+        // deepest address-taken target, whose chain follows in the report.
+        let resolved = |member: usize| {
+            indirect_budget
+                .get(&member)
+                .map(|(budget, _)| (*budget).max(target_max))
+        };
+        let (resolved_depth, resolved_hops) = compute(kind, &resolved);
+
+        for resolution in [Resolution::Declared, Resolution::Resolved] {
+            let (depth, next_hop) = match resolution {
+                Resolution::Declared => (&target_depth, &target_hops),
+                Resolution::Resolved => (&resolved_depth, &resolved_hops),
             };
-            let mut chain = Vec::new();
-            let mut current = Some(Hop::Call(root));
-            let mut steps = 0;
-            while let Some(hop) = current.take() {
-                steps += 1;
-                if steps > all.len() + 1 {
-                    break;
-                }
-                let lead = if chain.is_empty() { 0 } else { overhead };
-                match hop {
-                    Hop::Indirect(caller, rule) => {
-                        let budget = indirect_budget
-                            .get(&caller)
-                            .map_or(0, |(budget, _)| *budget);
-                        chain.push(Link::Indirect {
-                            caller: image.functions[caller].name.clone(),
-                            rule,
-                            budget: budget + overhead,
-                        });
+            for &root in &roots {
+                let Some(&id) = component_of.get(&root) else {
+                    continue;
+                };
+                let mut chain = Vec::new();
+                let mut current = Some(Hop::Call(root));
+                let mut hops = next_hop;
+                let mut steps = 0;
+                while let Some(hop) = current.take() {
+                    steps += 1;
+                    if steps > 2 * all.len() + 2 {
+                        break;
                     }
-                    Hop::Call(function) => {
-                        let Some(&component) = component_of.get(&function) else {
-                            break;
-                        };
-                        match (component_cost[component], kind) {
-                            (Some((iterations, bytes)), _) => chain.push(Link::Recursion {
-                                members: all[component]
-                                    .iter()
-                                    .map(|member| image.functions[*member].name.clone())
-                                    .collect(),
-                                iterations: if kind == Depth::Certain {
-                                    1
-                                } else {
-                                    iterations
-                                },
-                                bytes: lead
-                                    + if kind == Depth::Certain {
-                                        once[component]
-                                    } else {
-                                        bytes.max(once[component])
-                                    },
-                            }),
-                            (None, _) => chain.push(Link::Call {
-                                name: image.functions[function].name.clone(),
-                                frame: image.functions[function].frame + lead,
-                            }),
+                    let lead = if chain.is_empty() { 0 } else { overhead };
+                    match hop {
+                        Hop::Indirect(caller) => {
+                            let rule = indirect_budget.get(&caller).map_or("", |(_, rule)| *rule);
+                            let budget = indirect_budget
+                                .get(&caller)
+                                .map_or(0, |(budget, _)| *budget);
+                            match deepest {
+                                // The target's own chain is the deeper charge.
+                                Some((bytes, target))
+                                    if resolution == Resolution::Resolved
+                                        && bytes > budget
+                                        && std::ptr::eq(hops, &resolved_hops) =>
+                                {
+                                    chain.push(Link::Indirect {
+                                        caller: image.functions[caller].name.clone(),
+                                        rule,
+                                        budget: overhead,
+                                    });
+                                    hops = &target_hops;
+                                    current = Some(Hop::Call(target));
+                                }
+                                _ => chain.push(Link::Indirect {
+                                    caller: image.functions[caller].name.clone(),
+                                    rule,
+                                    budget: budget + overhead,
+                                }),
+                            }
                         }
-                        current = next_hop[component];
+                        Hop::Call(function) => {
+                            let Some(&component) = component_of.get(&function) else {
+                                break;
+                            };
+                            match component_cost[component] {
+                                Some((iterations, bytes)) => chain.push(Link::Recursion {
+                                    members: all[component]
+                                        .iter()
+                                        .map(|member| image.functions[*member].name.clone())
+                                        .collect(),
+                                    iterations: if kind == Depth::Certain {
+                                        1
+                                    } else {
+                                        iterations
+                                    },
+                                    bytes: lead
+                                        + if kind == Depth::Certain {
+                                            once[component]
+                                        } else {
+                                            bytes.max(once[component])
+                                        },
+                                }),
+                                None => chain.push(Link::Call {
+                                    name: image.functions[function].name.clone(),
+                                    frame: image.functions[function].frame + lead,
+                                }),
+                            }
+                            current = hops[component];
+                        }
                     }
                 }
+                let budget = match (kind, resolution) {
+                    (Depth::Certain, Resolution::Declared) => policy.stack_budget,
+                    (Depth::Bounded, Resolution::Declared) => policy.bounded_ceiling,
+                    (Depth::Certain, Resolution::Resolved) => policy.resolved_ceiling,
+                    (Depth::Bounded, Resolution::Resolved) => policy.resolved_bounded_ceiling,
+                };
+                let entry = EntryDepth {
+                    entry: image.functions[root].name.clone(),
+                    kind,
+                    resolution,
+                    depth: depth[id],
+                    budget,
+                    chain,
+                };
+                if entry.depth > budget {
+                    violations.push(Violation::EntryBudget(entry.clone()));
+                }
+                entries.push(entry);
             }
-            let budget = match kind {
-                Depth::Certain => policy.stack_budget,
-                Depth::Bounded => policy.bounded_ceiling,
-            };
-            let entry = EntryDepth {
-                entry: image.functions[root].name.clone(),
-                kind,
-                depth: depth[id],
-                budget,
-                chain,
-            };
-            if entry.depth > budget {
-                violations.push(Violation::EntryBudget(entry.clone()));
-            }
-            entries.push(entry);
         }
     }
 
@@ -1108,6 +1262,8 @@ pub fn audit(image: &Image, policy: &Policy) -> Report {
         arch: image.arch,
         stack_budget: policy.stack_budget,
         entries,
+        indirect_targets: targets.len(),
+        deepest_target,
         largest_frame,
         reachable: reachable.len(),
         violations,
@@ -1117,7 +1273,7 @@ pub fn audit(image: &Image, policy: &Policy) -> Report {
 #[derive(Clone, Copy, Debug)]
 enum Hop {
     Call(usize),
-    Indirect(usize, &'static str),
+    Indirect(usize),
 }
 
 #[cfg(test)]
@@ -1133,6 +1289,8 @@ mod tests {
             entries: ENTRY,
             stack_budget: 0x1000,
             bounded_ceiling: 0x1000,
+            resolved_ceiling: 0x1000,
+            resolved_bounded_ceiling: 0x1000,
             guard: 0x1000,
             function_ceiling: 0x800,
             named_ceilings: &[],
@@ -1175,6 +1333,24 @@ mod tests {
         assert_eq!(entry.frame, 0x20 + 0x1000 + 0x40);
         assert!(entry.probes);
         assert_eq!(function(&image, "realigned").frame, 0x10 + 0xc0 + 63);
+    }
+
+    #[test]
+    fn aarch64_frames_count_a_residual_after_the_probe_loop() {
+        let image = image(
+            Arch::Aarch64,
+            "0000000000001000 <entry>:\n\
+             \x20   1000:\tstp\tx29, x30, [sp, #-0x40]!\n\
+             \x20   1004:\tsub\tx9, sp, #0x20, lsl #12  // =0x20000\n\
+             \x20   1008:\tsub\tsp, sp, #0x1, lsl #12   // =0x1000\n\
+             \x20   100c:\tcmp\tsp, x9\n\
+             \x20   1010:\tstr\txzr, [sp]\n\
+             \x20   1014:\tb.ne\t0x1008 <entry+0x8>\n\
+             \x20   1018:\tsub\tsp, sp, #0x40\n\
+             \x20   101c:\tret\n",
+        );
+        // The pre-index, the loop target, the residual, realignment slack.
+        assert_eq!(function(&image, "entry").frame, 0x40 + 0x20000 + 0x40 + 63);
     }
 
     #[test]
@@ -1295,6 +1471,51 @@ mod tests {
         // indirect budget.
         assert_eq!(depth(Depth::Certain), Some(0x10 + 0x100));
         assert_eq!(depth(Depth::Bounded), Some(0x10 + 4 * 0x80));
+    }
+
+    /// #369 review P1: an indirect call is charged the deepest function
+    /// whose address the image takes, not only its declared budget.
+    #[test]
+    fn indirect_calls_resolve_to_the_deepest_address_taken_function() {
+        let image = image(
+            Arch::Aarch64,
+            "0000000000001000 <entry>:\n\
+             \x20   1000:\tstp\tx29, x30, [sp, #-0x10]!\n\
+             \x20   1004:\tadr\tx8, 0x1100 <deep>\n\
+             \x20   1008:\tblr\tx8\n\
+             \x20   100c:\tret\n\
+             \n\
+             0000000000001100 <deep>:\n\
+             \x20   1100:\tstp\tx29, x30, [sp, #-0x10]!\n\
+             \x20   1104:\tsub\tsp, sp, #0x7f0\n\
+             \x20   1108:\tret\n",
+        );
+        assert!(function(&image, "deep").address_taken);
+        assert!(!function(&image, "entry").address_taken);
+        const INDIRECT: &[IndirectRule] = &[IndirectRule {
+            caller: "entry",
+            budget: 0x100,
+            why: "test",
+        }];
+        let policy = Policy {
+            indirect: INDIRECT,
+            ..policy(Arch::Aarch64)
+        };
+        let report = audit(&image, &policy);
+        let depth = |resolution| {
+            report
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.entry == "entry"
+                        && entry.kind == Depth::Certain
+                        && entry.resolution == resolution
+                })
+                .map(|entry| entry.depth)
+        };
+        assert_eq!(depth(Resolution::Declared), Some(0x10 + 0x100));
+        assert_eq!(depth(Resolution::Resolved), Some(0x10 + 0x800));
+        assert_eq!(report.indirect_targets, 1);
     }
 
     #[test]
