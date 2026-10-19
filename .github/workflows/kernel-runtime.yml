@@ -546,6 +546,7 @@ jobs:
         run: >-
           target/release/carrick-xtask ci-receipt select-baseline --lane hvf
           --before-sha "$BEFORE_SHA" --candidate-sha "$GITHUB_SHA"
+          --wait-minutes 90 --poll-seconds 60
       - name: Check out the selected baseline cleanly
         if: ${{ steps.baseline.outputs.reuse != 'true' }}
         uses: actions/checkout@v4
@@ -579,7 +580,7 @@ jobs:
           target/release/carrick-xtask ci-receipt gate --lane hvf
           --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
           --candidate-sha "$GITHUB_SHA" --run-attempt "$GITHUB_RUN_ATTEMPT"
-          --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 90 --poll-seconds 60
+          --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 0
 
   kvm-gate:
     name: KVM · receipt gate vs receipted main ancestor
@@ -635,6 +636,7 @@ jobs:
         run: >-
           target/release/carrick-xtask ci-receipt select-baseline --lane kvm
           --before-sha "$BEFORE_SHA" --candidate-sha "$GITHUB_SHA"
+          --wait-minutes 90 --poll-seconds 60
       - name: Check out the selected baseline cleanly
         if: ${{ steps.baseline.outputs.reuse != 'true' }}
         uses: actions/checkout@v4
@@ -668,7 +670,7 @@ jobs:
           target/release/carrick-xtask ci-receipt gate --lane kvm
           --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
           --candidate-sha "$GITHUB_SHA" --run-attempt "$GITHUB_RUN_ATTEMPT"
-          --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 90 --poll-seconds 60
+          --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 0
 
   gate-xtask-cache:
     name: Warm the receipt-gate xtask cache
