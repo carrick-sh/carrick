@@ -123,11 +123,19 @@ fn seat<'t, const N: usize>(
     MemberSeat::claim(table, cpu(raw), venue).expect("free seat")
 }
 
-fn served<const N: usize>(table: &ServedTable<N>, member: usize, kind: InvalidationKind) -> u64 {
+fn served<const N: usize>(
+    table: &ServedTable<N>,
+    member: usize,
+    kind: InvalidationKind,
+) -> Option<InvalidationGeneration> {
     table.members()[member].served(kind)
 }
 
-fn owed<const N: usize>(table: &ServedTable<N>, member: usize, kind: InvalidationKind) -> u64 {
+fn owed<const N: usize>(
+    table: &ServedTable<N>,
+    member: usize,
+    kind: InvalidationKind,
+) -> Option<InvalidationGeneration> {
     table.members()[member].owed(kind)
 }
 
@@ -338,7 +346,10 @@ fn exhausted_counter_pins_at_max_and_commit_refuses_without_publishing() {
     let counter = GenerationCounter::<NearMax>::with_domain(domain());
     assert_eq!(counter.issue().map(|g| g.value().get()), Ok(u64::MAX));
     assert_eq!(counter.issue(), Err(GenerationExhausted));
-    assert_eq!(counter.latest(Ordering::Relaxed), u64::MAX);
+    assert_eq!(
+        counter.latest(Ordering::Relaxed).map(|g| g.value().get()),
+        Some(u64::MAX)
+    );
 
     let table = ServedTable::<1, NearMax>::with_domain(domain());
     let mut venue = RecordingVenue::new();
@@ -354,7 +365,13 @@ fn exhausted_counter_pins_at_max_and_commit_refuses_without_publishing() {
             stage(&table, ctx(A), InvalidationKind::Unmap).commit(None, &mut venue),
             Err(CommitError::Exhausted)
         ));
-        assert_eq!(table.counter().latest(Ordering::Relaxed), u64::MAX);
+        assert_eq!(
+            table
+                .counter()
+                .latest(Ordering::Relaxed)
+                .map(|g| g.value().get()),
+            Some(u64::MAX)
+        );
         assert_eq!(
             table.members()[0].owed(InvalidationKind::Unmap),
             owed_before
@@ -433,7 +450,10 @@ fn running_member_serves_before_completion_and_stopped_debt_survives() {
         assert!(generation.served_by(served(&table, 1, InvalidationKind::Unmap)));
 
         // The stopped member still owes the generation and serves on entry.
-        assert!(owed(&table, 2, InvalidationKind::Unmap) >= generation.value().get());
+        assert!(
+            owed(&table, 2, InvalidationKind::Unmap)
+                .is_some_and(|o| o.value() >= generation.value())
+        );
         assert!(!generation.served_by(served(&table, 2, InvalidationKind::Unmap)));
         assert!(stopped.has_debt());
         assert_eq!(stopped_venue.invalidations, CLAIM_FLUSHES);
@@ -658,7 +678,9 @@ fn install_failure_leaves_debt_visible_and_served_on_entry() {
         Err(VenueError::Injected)
     );
     assert!(member.has_debt(), "the failed install's debt stays visible");
-    assert!(generation.value().get() <= owed(&table, 1, InvalidationKind::Unmap));
+    assert!(
+        owed(&table, 1, InvalidationKind::Unmap).is_some_and(|o| o.value() >= generation.value())
+    );
     member.enter(&mut venue).expect("enter");
     assert!(!member.has_debt());
     assert!(generation.served_by(served(&table, 1, InvalidationKind::Unmap)));
@@ -777,11 +799,11 @@ fn staging_has_no_effect_until_commit() {
     seat.install(ctx(A), &mut venue).expect("install");
     stage(&table, ctx(A), InvalidationKind::Unmap).rollback();
     drop(stage(&table, ctx(A), InvalidationKind::RevokeWrite));
-    assert_eq!(table.counter().latest(Ordering::Relaxed), 0);
+    assert!(table.counter().latest(Ordering::Relaxed).is_none());
     assert!(table.members().iter().all(|member| {
         InvalidationKind::ALL
             .iter()
-            .all(|&kind| member.owed(kind) == 0)
+            .all(|&kind| member.owed(kind).is_none())
     }));
     assert!(!seat.has_debt());
 }
@@ -825,7 +847,7 @@ fn seats_are_exclusive_and_bounded() {
         stage(&table, ctx(A), InvalidationKind::Unmap).commit(Some(&mut foreign), &mut venue),
         Err(CommitError::ForeignSeat)
     ));
-    assert_eq!(table.counter().latest(Ordering::Relaxed), 0);
+    assert!(table.counter().latest(Ordering::Relaxed).is_none());
 }
 
 #[test]
