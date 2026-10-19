@@ -415,8 +415,9 @@ impl ExecutorKick for WorkerKick {
         if current.is_some() {
             return false;
         }
-        self.need_resched.store(false, Ordering::Release);
-        self.shutdown_interrupted.store(false, Ordering::Release);
+        if !self.shutdown_interrupted.load(Ordering::Acquire) {
+            self.need_resched.store(false, Ordering::Release);
+        }
         *current = Some(binding);
         true
     }
@@ -425,8 +426,9 @@ impl ExecutorKick for WorkerKick {
         let mut current = self.binding.lock();
         if *current == Some(binding) {
             *current = None;
-            self.need_resched.store(false, Ordering::Release);
-            self.shutdown_interrupted.store(false, Ordering::Release);
+            if !self.shutdown_interrupted.load(Ordering::Acquire) {
+                self.need_resched.store(false, Ordering::Release);
+            }
         }
     }
 

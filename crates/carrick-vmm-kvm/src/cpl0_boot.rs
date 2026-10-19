@@ -2790,9 +2790,10 @@ impl<'a> ForwardVenue<'a> {
             Some(initial) if context.mm == initial.mm => {
                 carrick_el1_abi::EntryTaskKey::from_raw(initial.thread.tid)
             }
-            _ => task.visible_pid().map_or(binding.task, |pid| {
-                carrick_el1_abi::EntryTaskKey::from_raw(u64::from(pid))
-            }),
+            _ => carrick_el1_abi::EntryTaskKey::from_raw(u64::from(
+                task.visible_pid()
+                    .ok_or_else(|| fail("stopped forward task has no visible pid"))?,
+            )),
         };
         let execution = admit_forward_execution(
             cpu,
@@ -4068,10 +4069,6 @@ impl Cpl0Carrier {
             },
             file_table,
         )?;
-        self.task(0)
-            .linux
-            .file_table
-            .store(file_table, Ordering::Release);
         self.task(0).publish_visible_pid(tid as u32);
         zone.current_or_new(
             slot,
@@ -4087,58 +4084,6 @@ impl Cpl0Carrier {
             },
         )
         .map_err(|_| fail("production scheduler record exhausted"))?;
-        Ok(())
-    }
-
-    /// Admit a host pipe pair into the initial task's CPL0 file table while
-    /// all vCPUs are stopped before the pool starts.
-    pub fn admit_initial_pipe_fds(&mut self, read_fd: i32, write_fd: i32) -> Result<(), TrapError> {
-        let file_table = self
-            .custody
-            .initial_task
-            .map_or(5, |root| root.thread.file_table)
-            .max(1);
-        let binding = self.file_region_binding();
-        let tables = self
-            .file_tables(binding)
-            .map_err(|error| fail(format!("initial pipe file tables: {error:?}")))?;
-        carrick_el1::personality::file_table::admit_stdio(
-            tables.fd_map(),
-            tables.opens(),
-            tables.objects(),
-            file_table,
-            [true; 3],
-        );
-        let read_admitted = carrick_el1::personality::file_table::admit_host_fd(
-            tables.fd_map(),
-            tables.opens(),
-            tables.objects(),
-            file_table,
-            read_fd,
-            read_fd,
-            carrick_el1_abi::DELEGATED_FLAG_READABLE,
-        );
-        if read_admitted.is_none() {
-            return Err(fail("failed to admit initial pipe read fd"));
-        }
-        let write_admitted = carrick_el1::personality::file_table::admit_host_fd(
-            tables.fd_map(),
-            tables.opens(),
-            tables.objects(),
-            file_table,
-            write_fd,
-            write_fd,
-            carrick_el1_abi::DELEGATED_FLAG_WRITABLE,
-        );
-        if write_admitted.is_none() {
-            let _ = carrick_el1::personality::file_table::close_host_binding(
-                tables.fd_map(),
-                tables.opens(),
-                file_table,
-                read_fd,
-            );
-            return Err(fail("failed to admit initial pipe write fd"));
-        }
         Ok(())
     }
 

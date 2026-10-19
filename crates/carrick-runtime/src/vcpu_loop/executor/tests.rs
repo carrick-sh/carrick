@@ -8219,3 +8219,28 @@ fn shutdown_kick_wakes_guest_parked_worker_and_treats_preemption_after_close_as_
         );
     }
 }
+
+#[test]
+fn shutdown_kick_stays_set_when_a_closing_worker_claims_a_row() {
+    let (kernel, root) = bootstrap(68_109);
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let receipts = Arc::new(ReceiptLog::default());
+    let kick = Arc::new(WorkerKick::new(receipts));
+    let registration = scheduler
+        .register_executor(Arc::clone(&kick) as Arc<dyn ExecutorKick>)
+        .expect("register worker");
+    let authority = enqueue_root(&scheduler, &root, publish(&root, 504));
+    drop(authority);
+    kick.interrupt_for_shutdown();
+    let running = scheduler.take(&registration).expect("claim closing row");
+    assert!(
+        kick.is_shutdown_interrupted(),
+        "a row claimed after close must observe the sticky shutdown before guest entry"
+    );
+    scheduler
+        .settle_blocked(running, BlockedReason::HostWait)
+        .expect("settle claimed row");
+    scheduler
+        .unregister_executor(&registration)
+        .expect("unregister worker");
+}
