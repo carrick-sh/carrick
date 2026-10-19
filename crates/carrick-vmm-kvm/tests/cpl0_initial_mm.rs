@@ -10,6 +10,111 @@ use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
 use kvm_pool_fixture::{physical_inventory, run_pool_fixture, run_pool_fixture_with};
 use std::path::PathBuf;
 
+/// Only CPU 0 (the loaded lane) may schedule the root and its inherited children.
+const ROOT_AFFINITY_LOADED: u64 = 1;
+/// Only the idle peer (CPU 1) may schedule the root once it leaves CPU 0;
+/// its forked children inherit the mask, so EL1 queues them only there.
+const ROOT_AFFINITY_IDLE_PEER: u64 = 2;
+
+fn try_run_pool_fixture_with_root_affinity(
+    elf: &[u8],
+    max_exits: usize,
+    affinity: u64,
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_kernel::run_result::RuntimeError,
+> {
+    let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF program");
+    kvm_pool_fixture::try_run_program_with_root_affinity(&program, max_exits, affinity, |_| {})
+}
+
+fn try_run_pool_fixture_with_loaded_pre_entry_hook(
+    elf: &[u8],
+    loaded_exits: usize,
+    idle_exits: usize,
+    affinity: u64,
+    hook: impl Fn(&std::sync::atomic::AtomicBool, &carrick_vmm_kvm::KvmKickHandle)
+    + Send
+    + Sync
+    + 'static,
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_kernel::run_result::RuntimeError,
+> {
+    let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF program");
+    let image = prepare_x86_elf(&program).expect("x86 ELF program");
+    let extent =
+        Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
+    let mut carrier =
+        Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    let root = dispatcher.capture_one_task_context().expect("issued root");
+    carrier
+        .bind_initial_task_identity(InitialTaskBinding {
+            task: root.task().key(),
+            mm: carrick_hal::MmGeneration::new(root.shared().mm().id().nonzero()),
+            thread: carrick_sched_core::ThreadIdentity {
+                tid: carrick_el1_abi::El1TaskId::from_linux_tid(root.thread().key().tid.raw())
+                    .raw(),
+                serial: root.thread().key().serial.raw(),
+                mm: 0,
+                file_table: root.resources().files().id().raw(),
+                generation: carrick_kernel::kernel::objects::ExecutionGeneration::INITIAL.raw(),
+                affinity,
+                lifecycle_page: 0,
+                control_slot: 0,
+            },
+        })
+        .expect("bind issued root");
+    carrier
+        .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
+        .expect("initial guest MM");
+    carrick_runtime::prepare::try_run_prepared_kvm_pool_with_loaded_pre_entry_hook(
+        carrier,
+        root,
+        dispatcher,
+        loaded_exits,
+        idle_exits,
+        std::sync::Arc::new(hook),
+    )
+    .map_err(|failure| failure.error)
+}
+
+fn try_run_pool_fixture_with_lane_exit_budgets(
+    elf: &[u8],
+    loaded_exits: usize,
+    idle_exits: usize,
+    affinity: u64,
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_kernel::run_result::RuntimeError,
+> {
+    try_run_pool_fixture_with_loaded_pre_entry_hook(
+        elf,
+        loaded_exits,
+        idle_exits,
+        affinity,
+        |_, _| {},
+    )
+}
+
+fn try_run_pool_fixture_with_typed_failure(
+    elf: &[u8],
+    max_exits: usize,
+    affinity: u64,
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_runtime::prepare::PreparedKvmPoolFailure,
+> {
+    let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF program");
+    kvm_pool_fixture::try_run_program_with_root_affinity_typed(
+        &program,
+        max_exits,
+        affinity,
+        |_| {},
+    )
+}
+
 const ELF_X86_64_MACHINE: u16 = 62;
 const ELF_LOAD_VA: u64 = 0x400000;
 const X86_SYS_WRITE: u8 = 1;
@@ -1299,12 +1404,8 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
 #[test]
 fn idle_peer_syscall_trap_hands_task_back_to_host_and_delivers_stdout() {
     let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_forked_child_stdout.S");
-    let outcome = kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
-        &elf,
-        32,
-        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
-    )
-    .expect("idle peer handback run");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 32, ROOT_AFFINITY_IDLE_PEER)
+        .expect("idle peer handback run");
     assert_eq!(outcome.run.exit_code, 7);
     assert_eq!(outcome.run.stdout, b"E");
     assert!(outcome.run.stderr.is_empty());
@@ -1325,12 +1426,8 @@ fn idle_peer_syscall_trap_hands_task_back_to_host_and_delivers_stdout() {
 #[test]
 fn loaded_lane_child_syscall_trap_hands_task_back_to_host_and_delivers_stdout() {
     let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_forked_child_stdout.S");
-    let outcome = kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
-        &elf,
-        32,
-        kvm_pool_fixture::ROOT_AFFINITY_LOADED,
-    )
-    .expect("loaded lane child handback run");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 32, ROOT_AFFINITY_LOADED)
+        .expect("loaded lane child handback run");
     assert_eq!(outcome.run.exit_code, 7);
     assert_eq!(outcome.run.stdout, b"E");
     assert!(outcome.run.stderr.is_empty());
@@ -1355,12 +1452,8 @@ fn idle_lane_exit_budget_failure_completes_the_run() {
     let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_forked_child_stdout.S");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = kvm_pool_fixture::try_run_pool_fixture_with_lane_exit_budgets(
-            &elf,
-            64,
-            0,
-            kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
-        );
+        let result =
+            try_run_pool_fixture_with_lane_exit_budgets(&elf, 64, 0, ROOT_AFFINITY_IDLE_PEER);
         let _ = tx.send(result);
     });
     let result = rx.recv_timeout(std::time::Duration::from_secs(30)).expect(
@@ -1392,11 +1485,11 @@ fn loaded_lane_shutdown_kick_between_check_and_entry_is_sticky() {
     let observed = std::sync::Arc::clone(&injected);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = kvm_pool_fixture::try_run_pool_fixture_with_loaded_pre_entry_hook(
+        let result = try_run_pool_fixture_with_loaded_pre_entry_hook(
             &elf,
             64,
             64,
-            kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
+            ROOT_AFFINITY_IDLE_PEER,
             move |need_resched, kick| {
                 if !injected.swap(true, Ordering::AcqRel) {
                     need_resched.store(true, Ordering::Release);
@@ -1437,11 +1530,7 @@ fn forward_authority_fixture(variant: &str) -> Vec<u8> {
 #[test]
 fn in_zone_child_host_read_is_refused_not_served_under_root_context() {
     let elf = forward_authority_fixture("CHILD_STDIN_READ");
-    let failure = match kvm_pool_fixture::try_run_pool_fixture_with_typed_failure(
-        &elf,
-        64,
-        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
-    ) {
+    let failure = match try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER) {
         Ok(outcome) => panic!(
             "the child's read was served under another task's authority: exit {}",
             outcome.run.exit_code
@@ -1463,11 +1552,7 @@ fn in_zone_child_host_read_is_refused_not_served_under_root_context() {
 #[test]
 fn in_zone_child_blocking_wait_is_refused_before_any_token() {
     let elf = forward_authority_fixture("CHILD_POLL_WAIT");
-    let failure = match kvm_pool_fixture::try_run_pool_fixture_with_typed_failure(
-        &elf,
-        64,
-        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
-    ) {
+    let failure = match try_run_pool_fixture_with_typed_failure(&elf, 64, ROOT_AFFINITY_IDLE_PEER) {
         Ok(outcome) => panic!(
             "the child's wait parked on another task's lease: exit {}",
             outcome.run.exit_code
@@ -1488,12 +1573,8 @@ fn in_zone_child_blocking_wait_is_refused_before_any_token() {
 #[test]
 fn in_zone_child_exit_is_reaped_by_parent_not_published_as_run_exit() {
     let elf = forward_authority_fixture("CHILD_EXIT_STATUS");
-    let outcome = kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
-        &elf,
-        64,
-        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
-    )
-    .expect("child exit run");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .expect("child exit run");
     assert_eq!(outcome.run.exit_code, 7);
     assert!(outcome.run.stdout.is_empty());
 }
@@ -1505,12 +1586,8 @@ fn in_zone_child_exit_is_reaped_by_parent_not_published_as_run_exit() {
 #[test]
 fn in_zone_child_stdout_write_resolves_through_childs_own_table() {
     let elf = forward_authority_fixture("CHILD_STDOUT_REDIRECT");
-    let outcome = kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
-        &elf,
-        64,
-        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
-    )
-    .expect("child redirect run");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .expect("child redirect run");
     assert_eq!(outcome.run.exit_code, 7);
     assert!(outcome.run.stdout.is_empty(), "{:?}", outcome.run.stdout);
     assert_eq!(outcome.run.stderr, b"P");
@@ -1527,12 +1604,8 @@ fn in_zone_child_pipe2_and_unfaulted_cow_read_matches_native_oracle() {
         "../../../carrick-cli/tests/fixtures/x86_forked_child_forward_authority.S",
         &["-DCHILD_PIPE_DUP2_STDOUT", "-DCHILD_PIPE_UNFAULTED_COW"],
     );
-    let outcome = kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
-        &elf,
-        64,
-        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
-    )
-    .expect("child raw pipe2 and unfaulted COW read run");
+    let outcome = try_run_pool_fixture_with_root_affinity(&elf, 64, ROOT_AFFINITY_IDLE_PEER)
+        .expect("child raw pipe2 and unfaulted COW read run");
     assert_eq!(outcome.run.exit_code, 7);
     assert_eq!(outcome.run.stdout, b"P");
     assert!(outcome.run.stderr.is_empty());
