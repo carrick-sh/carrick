@@ -59,7 +59,6 @@ pub(crate) enum InitialForwardClass {
     Host(&'static str),
     Refuse(&'static str),
 }
-
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 impl InitialForwardClass {
     pub(crate) const fn family(self) -> &'static str {
@@ -177,7 +176,6 @@ impl From<carrick_hal::TrapError> for PreparedKvmPoolFailure {
         Self::from(RuntimeError::from(error))
     }
 }
-
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 impl carrick_kernel::kernel::debug::PhysicalCaptureProvider for KvmPhysicalDebug {
@@ -1439,6 +1437,7 @@ impl PreparedRun {
                 max_traps,
                 kvm_debug,
             )
+            .map_err(|failure| failure.error)
             .map(|outcome| outcome.run)
         } else {
             Err(RuntimeError::Unsupported(format!(

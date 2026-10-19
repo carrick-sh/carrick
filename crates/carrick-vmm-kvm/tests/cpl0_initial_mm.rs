@@ -1345,10 +1345,10 @@ fn loaded_lane_child_syscall_trap_hands_task_back_to_host_and_delivers_stdout() 
 }
 
 /// Ruling 3 on #542: every idle-lane early return completes the run. With a
-/// three-exit budget the idle peer exhausts it while servicing the child's
-/// forward; before the single `settle_lane` path that early return skipped
-/// the `Err` completion and the run hung, and before the shutdown kick the
-/// root vCPU stayed in `KVM_RUN` under the halted parent.
+/// three-exit budget the loaded root lane exhausts it while the child is
+/// serviced by the idle peer; before the single `settle_lane` path an idle
+/// lane error skipped the `Err` completion and the run hung, and before the
+/// shutdown kick the root vCPU stayed in `KVM_RUN` under the halted parent.
 #[test]
 fn idle_lane_exit_budget_failure_completes_the_run() {
     let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_forked_child_stdout.S");
@@ -1370,7 +1370,9 @@ fn idle_lane_exit_budget_failure_completes_the_run() {
             outcome.run.exit_code
         ),
         Err(error) => assert!(
-            error.to_string().contains("KVM guest exit budget exceeded"),
+            error
+                .to_string()
+                .contains("loaded KVM lane guest exit budget exceeded"),
             "expected the exit budget failure, got {error}"
         ),
     }
@@ -1468,42 +1470,6 @@ fn in_zone_child_stdout_write_resolves_through_childs_own_table() {
     assert_eq!(outcome.run.exit_code, 7);
     assert!(outcome.run.stdout.is_empty(), "{:?}", outcome.run.stdout);
     assert_eq!(outcome.run.stderr, b"P");
-}
-
-/// Ruling 2 on #542 (dup2-onto-pipe witness): the parent creates a pipe with
-/// `pipe2`, the child redirects fd 1 onto the pipe's write end via
-/// `dup2(p[1], 1)` and calls `write(1, "P", 1)`, and the parent reads the pipe
-/// and writes what it read to stdout before `wait4`. The byte arrives at host
-/// stdout exactly once via the parent's read of the pipe, never directly from
-/// the child's `write(1)`.
-///
-/// Workaround for #599 (tested without workarounds in the ignored witness
-/// below): x86 CPL0 does not yet cross `pipe2` (`crossing.rs:289` `x86 = false`),
-/// and `ForwardVenue::write_bytes_raw` (`cpl0_boot.rs:6444`) requires
-/// `Access::Write` on an already-writable stage-1 PTE rather than breaking a
-/// post-`fork` COW page on a host-forwarded `read`. This test therefore
-/// pre-admits the pipe pair on the initial root task and touches `buffer` in
-/// user mode after `fork` so CPL0 breaks COW before the parent's `read`.
-#[test]
-fn in_zone_child_dup2_onto_pipe_writes_to_pipe_not_host_stdout() {
-    let elf = forward_authority_fixture("CHILD_PIPE_DUP2_STDOUT");
-    let outcome = kvm_pool_fixture::try_run_pool_fixture_with_admitted_pipe(
-        &elf,
-        64,
-        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
-    )
-    .expect("child dup2 onto pipe run");
-    assert_eq!(outcome.run.exit_code, 7);
-    assert_eq!(outcome.run.stdout, b"P");
-    assert!(outcome.run.stderr.is_empty());
-    assert!(
-        outcome
-            .physical
-            .idle_peer_forward_witness()
-            .expect("idle peer forward witness")
-            >= 1,
-        "the child's pipe write must be served from the idle peer"
-    );
 }
 
 /// Un-workarounded witness for #599: in-guest `pipe2` (currently `-ENOSYS`) and

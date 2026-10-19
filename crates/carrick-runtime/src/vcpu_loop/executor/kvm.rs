@@ -429,6 +429,10 @@ impl ForwardAuthority {
             Self::InZoneChild
         }
     }
+
+    const fn may_use_host_task_context(self) -> bool {
+        matches!(self, Self::Task)
+    }
 }
 
 /// A forward refused before any forward token is taken, because serving it
@@ -668,6 +672,9 @@ impl KvmPersistentExecutor {
                     ));
                 }
                 if let Some(host_fd) = object.host_fd() {
+                    if !authority.may_use_host_task_context() {
+                        return refuse(ForwardAuthorityRefusal::HostTaskContext { native: 1 });
+                    }
                     let fd_arg = u64::try_from(host_fd.raw()).map_err(|_| {
                         TrapError::Hypervisor("negative host object write fd".into())
                     })?;
@@ -822,49 +829,10 @@ impl KvmPersistentExecutor {
                             ),
                         ));
                     }
-                    if let Some(host_fd) = object.host_fd() {
-                        let fd_arg = u64::try_from(host_fd.raw()).map_err(|_| {
-                            TrapError::Hypervisor("negative host object write fd".into())
-                        })?;
-                        let kernel = binding.fresh_context()?;
-                        let SyscallNorm::Plain(host_raw) = X8664GuestArch::normalize_syscall(
-                            &carrick_guest_mem::X8664SyscallFrame {
-                                rax: 1,
-                                rdi: fd_arg,
-                                rsi: write_buf_arg,
-                                rdx: write_len_arg,
-                                r10: 0,
-                                r8: 0,
-                                r9: 0,
-                            },
-                        ) else {
-                            return Err(TrapError::Hypervisor(
-                                "unexpected arch_prctl normalizing x86 write".into(),
-                            ));
-                        };
-                        let request = SyscallRequest::from_raw(host_raw)
-                            .with_current_guest_sp(Some(frame.rsp));
-                        self.stats.record(class)?;
-                        let outcome = dispatcher
-                            .dispatch(&kernel, request, venue, &self.reporter)
-                            .map_err(|error| {
-                                TrapError::Hypervisor(format!(
-                                    "dispatch x86 in-zone host object write: {error}"
-                                ))
-                            })?;
-                        return match outcome {
-                            DispatchOutcome::Returned { value } => Ok(ForwardDecision::Immediate(
-                                InitialSyscallDisposition::Return(value),
-                            )),
-                            DispatchOutcome::Errno { errno } => Ok(ForwardDecision::Immediate(
-                                InitialSyscallDisposition::Refused(errno),
-                            )),
-                            _ if !can_block => refuse(ForwardAuthorityRefusal::BlockingWait),
-                            other => Ok(ForwardDecision::Blocked(
-                                ForwardRequest::Syscall(request),
-                                Box::new(other),
-                            )),
-                        };
+                    if object.host_fd().is_some() {
+                        return refuse(ForwardAuthorityRefusal::HostTaskContext {
+                            native: raw.native_number.0,
+                        });
                     }
                 }
                 return refuse(ForwardAuthorityRefusal::HostTaskContext {
@@ -1095,7 +1063,7 @@ impl KvmPersistentExecutor {
             .ok_or_else(|| TrapError::Hypervisor("KVM exit count overflow".into()))?;
         if exited > self.max_exits {
             return Err(TrapError::Hypervisor(
-                "KVM guest exit budget exceeded".into(),
+                "loaded KVM lane guest exit budget exceeded".into(),
             ));
         }
         let stopped =
@@ -1177,7 +1145,7 @@ impl KvmPersistentExecutor {
                     .ok_or_else(|| TrapError::Hypervisor("KVM exit count overflow".into()))?;
                 if exited > self.max_exits {
                     return Err(TrapError::Hypervisor(
-                        "KVM guest exit budget exceeded".into(),
+                        "idle KVM lane guest exit budget exceeded".into(),
                     ));
                 }
                 let task = self.physical.idle_peer_task()?;
@@ -1597,6 +1565,12 @@ mod tests {
     use carrick_kernel::kernel::objects::ExecutorId;
     use carrick_kernel::kernel::{Kernel, KernelContext, LinuxSignal, RootBootstrap, Scheduler};
     use std::sync::Arc;
+
+    #[test]
+    fn in_zone_child_host_fd_write_cannot_use_root_task_context() {
+        assert!(ForwardAuthority::Task.may_use_host_task_context());
+        assert!(!ForwardAuthority::InZoneChild.may_use_host_task_context());
+    }
 
     fn bootstrap(pid: i32) -> (Arc<Kernel>, KernelContext) {
         let input = RootBootstrap::for_reference_model(
