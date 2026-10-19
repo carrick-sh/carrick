@@ -172,19 +172,17 @@ pub struct SoftCpu {
     jit: JitCodeBuffer,
     pub max_block_insns: usize,
     pub max_block_span: usize,
-    shootdown: Option<VcpuShootdown>,
 }
 
 impl SoftCpu {
     /// Create a new [`SoftCpu`] initialized for 64-bit user mode (`CPL = 3`).
     #[must_use]
-    pub fn new() -> Option<Self> {
+    pub fn new(shootdown: VcpuShootdown) -> Option<Self> {
         Some(Self {
-            ctx: Box::new(SoftCpuContext::new()),
+            ctx: Box::new(SoftCpuContext::new(shootdown)),
             jit: JitCodeBuffer::new(DEFAULT_JIT_CAPACITY)?,
             max_block_insns: 64,
             max_block_span: 4096,
-            shootdown: None,
         })
     }
 
@@ -198,16 +196,9 @@ impl SoftCpu {
         &mut self.ctx
     }
 
-    /// Bind this CPU's local TLB to its extent-table retirement authority.
-    pub fn bind_shootdown(&mut self, registration: VcpuShootdown) {
-        self.shootdown = Some(registration);
-    }
-
     /// Publish that this CPU is parked and cannot look up a translation until resumed.
-    pub fn leave_parked(&self) {
-        if let Some(registration) = &self.shootdown {
-            registration.leave_parked();
-        }
+    pub fn leave_parked(&mut self) {
+        self.ctx.shootdown.leave_parked(&mut self.ctx.tlb);
     }
 
     fn raise(&mut self, exc: X86Exception) -> Result<SoftCpuExit, EmitError> {
@@ -221,14 +212,9 @@ impl SoftCpu {
 
     /// Plan, emit, and execute one basic block starting at `self.ctx.rip` over `mem`.
     pub fn step_block<M: SoftMmuMemory>(&mut self, mem: &mut M) -> Result<SoftCpuExit, EmitError> {
-        if let Some(registration) = &self.shootdown {
-            registration.enter_running(&mut self.ctx.tlb);
-        }
+        self.ctx.shootdown.enter_running(&mut self.ctx.tlb);
         let result = self.step_block_running(mem);
-        if let Some(registration) = &self.shootdown {
-            registration.synchronize(&mut self.ctx.tlb);
-            registration.leave_idle();
-        }
+        self.ctx.shootdown.leave_idle(&mut self.ctx.tlb);
         result
     }
 

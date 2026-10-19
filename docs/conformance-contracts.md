@@ -1361,7 +1361,8 @@ unchanged (restarting the walk on a material change and counting every failed
 CAS against `MAX_AD_CAS_RETRIES`, with typed `AdCasRetryExhausted` counted in
 `SoftWalkerStats`), non-canonical `#GP(0)`/`#SS(0)` and MMIO outcomes, leaf
 extent authentication over `[leaf_base, +leaf.size)`, and frame-keyed code-page
-write shootdowns across per-CPU `SoftTlb`s.
+write invalidation across explicitly supplied `SoftTlb`s. Cross-vCPU
+frame-keyed code-page publication remains #684.
 
 VM-free bindings in `crates/carrick-softmmu/tests/softmmu_contract.rs` cover
 all permission, CR-gating (including `Execute` -> `Read` SMAP isolation), and
@@ -1374,7 +1375,7 @@ software-available bits `9..=11`), cross-page split accesses, MMIO hole exclusio
 production `AuthenticatedDescriptorWords` `LinearPlacement`-backed atomic access
 (rejecting disagreeing raw-PA mappings, retired table frames, and unregistered
 roots), `ExtentTable` `remove` / `replace` / `remove_root_generation` TLB
-shootdowns, frame-keyed code-page alias invalidation across CPUs, a two-thread
+shootdowns, frame-keyed code-page alias invalidation across supplied TLBs, a two-thread
 `invlpg` + `mov cr3` shootdown test, a concurrent PTE writer
 snapshot-consistency race witness, and structural budget bounds across
 `{1, 16, 256}` extents and `{2, 3, 4}` page-table levels.

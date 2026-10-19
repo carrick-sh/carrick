@@ -39,20 +39,24 @@ output address, and permission bits are unchanged, walk restart on a material
 descriptor change, and every failed CAS counted against `MAX_AD_CAS_RETRIES`
 with typed `AdCasRetryExhausted` counted in `SoftWalkerStats`), authenticates
 `[leaf_base, leaf_base + leaf.size)` to mint `AuthenticatedGpa`, requires TLB
-shootdowns on `ExtentTable` retirement/replacement, and invalidates write-plane
-entries across CPUs when an authenticated frame becomes a code page.
+shootdowns on `ExtentTable` retirement/replacement. Code-page publication
+invalidates only explicitly supplied write planes; cross-vCPU frame-keyed
+publication is tracked by #684.
 
 Extent and root-generation retirement publish an extent-table-owned epoch and
-return a linear `PendingShootdown` token. Running registered peers are kicked
-and must flush before acknowledging; idle and parked peers acknowledge without
-blocking retirement but must synchronize their authority-and-epoch stamp before
-their next lookup. The retired record or generation is inaccessible until the
-token's condition-variable barrier completes. Steady-state hits retain the
-direct-mapped O(1) path without an entry scan.
+return a linear `PendingShootdown` token. `SoftCpu` construction requires a
+registration in that table's shared coordinator, and every Rust lookup guard
+validates the registration identity. Running registered peers are kicked and
+must flush before acknowledging; idle and parked peers acknowledge without
+blocking retirement but atomically publish Running and acquire the epoch before
+their next lookup. A pending base or generation cannot be installed again, and
+dropping its token is a fatal protocol violation. Steady-state block
+entry and hits retain the direct-mapped O(1) path: one epoch load, no coordinator
+mutex, and no entry scan.
 """
 
 [bindings]
-vm_free = "carrick-softmmu::softmmu_contract::linear_placement_enforces_alignment_bounds_and_mmio_holes; huge_page_authentication_2m_and_1g_at_zero_page_and_tail_offsets; invlpg_on_large_page_evicts_all_sibling_slots; red_first_non_present_precedence_ignored_nonleaf_bits_and_reserved_bits; cr_gating_smep_smap_wp_and_id_error_code_bit; fault_classes_non_canonical_gp_ss_mmio_non_fault_and_descriptor_load; hardware_accessed_and_dirty_bits_updated_via_cas; frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal; permission_classes_not_present_write_cow_nx_and_upper_half_va; page_crossing_access_misses_tlb_and_validates_both_pages; concurrent_pte_writer_snapshot_consistency_and_structural_budgets; two_thread_invlpg_eviction_and_cr3_root_switch_flush_match_hardware; carrick-softmmu::shootdown::tests::{running_peer_cannot_use_stale_addend_after_retirement_completes,idle_peer_resynchronizes_before_resume_lookup,parked_peer_does_not_hold_retirement_barrier,retirement_work_is_linear_in_peers_and_hits_do_not_scan_entries}"
+vm_free = "carrick-softcpu-x86::softcpu_level0::idle_read_helper_cannot_hit_a_retired_extent_after_completion; carrick-softmmu::softmmu_contract::linear_placement_enforces_alignment_bounds_and_mmio_holes; huge_page_authentication_2m_and_1g_at_zero_page_and_tail_offsets; invlpg_on_large_page_evicts_all_sibling_slots; red_first_non_present_precedence_ignored_nonleaf_bits_and_reserved_bits; cr_gating_smep_smap_wp_and_id_error_code_bit; fault_classes_non_canonical_gp_ss_mmio_non_fault_and_descriptor_load; hardware_accessed_and_dirty_bits_updated_via_cas; frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal; permission_classes_not_present_write_cow_nx_and_upper_half_va; page_crossing_access_misses_tlb_and_validates_both_pages; concurrent_pte_writer_snapshot_consistency_and_structural_budgets; two_thread_invlpg_eviction_and_cr3_root_switch_flush_match_hardware; carrick-softmmu::shootdown::tests::{running_peer_cannot_use_stale_addend_after_retirement_completes,idle_peer_resynchronizes_before_resume_lookup,parked_peer_does_not_hold_retirement_barrier,idle_to_running_race_acknowledges_the_admitted_epoch,parked_to_running_race_acknowledges_the_admitted_epoch,pending_extent_identity_cannot_be_reused_until_completion,pending_root_and_generation_cannot_be_reused_until_completion,dropping_pending_retirement_is_fatal,retirement_work_is_linear_in_peers_and_hits_do_not_scan_entries}"
 
 [bindings.unresolved]
 embed_structural = "Software vCPU carrier integration (`carrick-vmm-soft`) lands in slices 2-3 of #578; slice 1a (#580) is the standalone `no_std` MMU/TLB crate."
@@ -73,7 +77,7 @@ metric = "lifecycle_entry_visits"
 base = 0
 per_unit = 1
 layers = ["vm-free"]
-rationale = "One retirement visits each of n registered peers exactly once at 1, 8, and 32 peers."
+rationale = "One retirement visits each of n registered software-vCPU registrations exactly once at 1, 8, and 32 peers."
 
 [[structural_budgets]]
 kind = "affine"
@@ -81,11 +85,11 @@ metric = "page_table_invalidations"
 base = 0
 per_unit = 1
 layers = ["vm-free"]
-rationale = "One retirement issues at most one kick per running peer and no kick for an idle or parked peer."
+rationale = "This fixture counts shootdown kick publications: one retirement issues at most one kick per running peer and none for an idle or parked peer."
 
 [[structural_budgets]]
 kind = "exact"
-metric = "host_backend_calls"
+metric = "shootdown_coordinator_lock_acquisitions"
 value = 0
 layers = ["vm-free"]
-rationale = "A synchronized TLB hit performs a direct tag lookup and triggers no full flush or O(entries) scan."
+rationale = "A synchronized block entry and TLB hit each perform one epoch Acquire load, with zero coordinator mutex acquisitions, full flushes, or O(entries) scans."

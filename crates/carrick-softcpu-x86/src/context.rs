@@ -14,7 +14,7 @@ use crate::emit::{EmitError, JitStage};
 use crate::mmu::{
     Cpl, CpuAccessMode, FrameGpa, RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK,
     SOFT_TLB_PAGE_SIZE, SoftAccessKind, SoftMmuMemory, SoftPageFault, SoftTlb, SoftWalker,
-    is_canonical_va, translate_va,
+    VcpuShootdown, is_canonical_va, translate_va,
 };
 
 /// Monomorphized translation callback for active [`SoftMmuMemory`] during block execution.
@@ -215,7 +215,7 @@ pub struct SoftCpuContext {
     bounce_active: u64,
     bounce_buf: [u8; 64],
     pub fxsave: FxsaveArea,
-    pub tlb: SoftTlb,
+    pub(crate) tlb: SoftTlb,
     pub walker: SoftWalker,
     pub cpl: u8,
     pub pkru: u32,
@@ -237,6 +237,7 @@ pub struct SoftCpuContext {
     virt_rsp_spill: u64,
     pub x87_code_selector: u16,
     pub x87_data_selector: u16,
+    pub(crate) shootdown: VcpuShootdown,
 }
 
 const _: () = {
@@ -257,15 +258,9 @@ const _: () = {
     assert!(offset_of!(SoftCpuContext, tlb) == CTX_TLB_READ_OFF);
 };
 
-impl Default for SoftCpuContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SoftCpuContext {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(shootdown: VcpuShootdown) -> Self {
         let gw = gateway_trampolines().ok();
         let mut ctx = Self {
             gpr: [0; 16],
@@ -313,9 +308,23 @@ impl SoftCpuContext {
             virt_rsp_spill: 0,
             x87_code_selector: 0,
             x87_data_selector: 0,
+            shootdown,
         };
         ctx.sync_tlb_tag_bits();
         ctx
+    }
+
+    #[must_use]
+    pub const fn tlb_stats(&self) -> crate::mmu::SoftTlbStats {
+        self.tlb.stats()
+    }
+
+    pub fn flush_tlb(&mut self) {
+        self.tlb.flush_all();
+    }
+
+    pub fn reset_tlb_stats(&mut self) {
+        self.tlb.reset_stats();
     }
 
     pub(crate) fn prepare_block(
@@ -1665,12 +1674,15 @@ fn build_gateway() -> Result<GatewayTrampolines, JitStage> {
 mod tests {
     use super::*;
     use crate::JitCodeBuffer;
+    fn test_shootdown() -> VcpuShootdown {
+        crate::mmu::ExtentTable::new().register_vcpu(std::sync::Arc::new(|| {}))
+    }
     #[test]
     fn gateway_returns_with_host_df_and_fp_controls_restored() {
         // Capture DF in a native wrapper immediately after the translated exit,
         // then restore host DF/FP controls before Rust even on the broken gateway.
         use crate::cpu::JitCodeBuffer;
-        let mut ctx = SoftCpuContext::new();
+        let mut ctx = SoftCpuContext::new(test_shootdown());
         let mut block_jit = JitCodeBuffer::new(4096).unwrap();
         // std; jmp [r15 + exit trampoline] exercises the gateway's host return.
         let mut code = vec![0xfd, 0x41, 0xff, 0xa7];
@@ -1744,12 +1756,13 @@ mod tests {
         let generation = OwnerGeneration::new(1);
         assert!(extents.install(ExtentRecord::new(FrameGpa::new(0), 6 * 4096, generation)));
         extents.set_root_generation(RootGpa::page_aligned(FrameGpa::new(0)).unwrap(), generation);
+        let registration = extents.register_vcpu(std::sync::Arc::new(|| {}));
         let mut memory = Memory(placement, extents);
         // SAFETY: the 16 bytes span the last eight bytes of frame 4 and the first eight of frame 5.
         unsafe {
             std::ptr::write_bytes(host_base.add(0x4ff8), 0x55, 16);
         }
-        let mut ctx = SoftCpuContext::new();
+        let mut ctx = SoftCpuContext::new(registration);
         ctx.bounce_buf.fill(0xcc);
         ctx.active_mem_ptr = Some(NonNull::from(&mut memory).cast());
         ctx.active_translate_fn = Some(translate_for_mem::<Memory>);
@@ -1792,7 +1805,7 @@ mod tests {
             let addr = jit.publish(&[0xc3]).unwrap();
             assert_eq!(permissions(addr), "r-xp");
         }
-        let ctx = SoftCpuContext::new();
+        let ctx = SoftCpuContext::new(test_shootdown());
         for addr in [
             ctx.slow_path_fn,
             ctx.bounce_commit_fn,
@@ -1835,7 +1848,7 @@ mod tests {
 
     #[test]
     fn fp_leaf_allocation_is_once_across_repeated_blocks() {
-        let mut cpu = crate::SoftCpu::new().unwrap();
+        let mut cpu = crate::SoftCpu::new(test_shootdown()).unwrap();
         let planned = fp_block();
         crate::cpu::JIT_ALLOCATIONS.with(|count| count.set(0));
         for _ in 0..3 {
@@ -1845,7 +1858,7 @@ mod tests {
     }
 
     fn fp_host_failure(publish: bool) {
-        let mut cpu = crate::SoftCpu::new().unwrap();
+        let mut cpu = crate::SoftCpu::new(test_shootdown()).unwrap();
         let planned = fp_block();
         crate::cpu::FAIL_SMALL_JIT.with(|fault| fault.set(Some(publish)));
         let result = cpu.execute_planned_block(&planned, &mut NoMemory);
@@ -1883,7 +1896,7 @@ mod tests {
         TEST_GATEWAY.with(|slot| *slot.borrow_mut() = Some(OnceLock::new()));
         let _reset = Reset;
         crate::cpu::FAIL_SMALL_JIT.with(|fault| fault.set(Some(publish)));
-        let mut cpu = crate::SoftCpu::new().unwrap();
+        let mut cpu = crate::SoftCpu::new(test_shootdown()).unwrap();
         let allocations = crate::cpu::JIT_ALLOCATIONS.with(|count| count.get());
         let planned = fp_block();
         cpu.context_mut().rip = planned.start;

@@ -138,10 +138,12 @@ pub enum WorkMetric {
     LifecycleEntryVisits,
     /// Stage-1 paging descriptor words loaded on an uncontended software TLB miss.
     DescriptorLoadsPerMiss,
+    /// Coordinator mutex acquisitions on a synchronized software-vCPU block entry.
+    ShootdownCoordinatorLockAcquisitions,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 55;
+    pub const COUNT: usize = 56;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -198,6 +200,7 @@ impl WorkMetric {
         Self::ChildExitNotificationWakeDeliveries,
         Self::LifecycleEntryVisits,
         Self::DescriptorLoadsPerMiss,
+        Self::ShootdownCoordinatorLockAcquisitions,
     ];
 }
 

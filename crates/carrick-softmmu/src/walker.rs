@@ -2,6 +2,8 @@
 //! [`LinearPlacement`], [`ExtentTable`], and [`SoftTlb`].
 
 use alloc::collections::BTreeMap;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_mmu_core::x86::descriptor_txn::{
@@ -16,7 +18,8 @@ use crate::domains::{
 };
 use crate::placement::{HostVa, LinearPlacement, PlacementError};
 use crate::shootdown::{
-    PendingShootdown, ShootdownCoordinator, ShootdownKick, ShootdownStats, VcpuShootdown,
+    PendingShootdown, RetiredIdentity, ShootdownCoordinator, ShootdownKick, ShootdownStats,
+    VcpuShootdown, VcpuShootdownState,
 };
 use crate::tlb::SoftTlb;
 use alloc::sync::Arc;
@@ -74,7 +77,7 @@ impl Clone for ExtentTable {
             root_generations: self.root_generations.clone(),
             code_pages: self.code_pages.clone(),
             extents_visited: AtomicU64::new(self.extents_visited.load(Ordering::Relaxed)),
-            shootdown: ShootdownCoordinator::new(),
+            shootdown: Arc::clone(&self.shootdown),
         }
     }
 }
@@ -102,9 +105,32 @@ impl ExtentTable {
     pub fn shootdown_stats(&self) -> ShootdownStats {
         self.shootdown.stats()
     }
+    pub fn synchronize_vcpu(&self, registration: &VcpuShootdown, tlb: &mut SoftTlb) {
+        assert!(
+            registration.belongs_to(&self.shootdown),
+            "vCPU registration belongs to a different extent table"
+        );
+        registration.synchronize(tlb);
+    }
+    pub fn begin_vcpu_lookup(
+        &self,
+        registration: &VcpuShootdown,
+        tlb: &mut SoftTlb,
+    ) -> VcpuShootdownState {
+        assert!(
+            registration.belongs_to(&self.shootdown),
+            "vCPU registration belongs to a different extent table"
+        );
+        registration.begin_lookup(tlb)
+    }
     /// Register the expected [`OwnerGeneration`] for walks under an unregistered `root` (`false` if already registered).
     pub fn set_root_generation(&mut self, root: RootGpa, generation: OwnerGeneration) -> bool {
-        if self.root_generations.contains_key(&root.address().raw()) {
+        if self.root_generations.contains_key(&root.address().raw())
+            || self.shootdown.has_pending(&[
+                RetiredIdentity::Root(root.address().raw()),
+                RetiredIdentity::RootGeneration(generation.raw()),
+            ])
+        {
             return false;
         }
         self.root_generations
@@ -116,11 +142,23 @@ impl ExtentTable {
         &mut self,
         root: RootGpa,
         generation: OwnerGeneration,
-    ) -> PendingShootdown<Option<OwnerGeneration>> {
+    ) -> Result<PendingShootdown<Option<OwnerGeneration>>, OwnerGeneration> {
+        if self.shootdown.has_pending(&[
+            RetiredIdentity::Root(root.address().raw()),
+            RetiredIdentity::RootGeneration(generation.raw()),
+        ]) {
+            return Err(generation);
+        }
         let prev = self
             .root_generations
             .insert(root.address().raw(), generation);
-        self.shootdown.begin(prev)
+        let identities = prev.map_or_else(Vec::new, |old| {
+            vec![
+                RetiredIdentity::Root(root.address().raw()),
+                RetiredIdentity::RootGeneration(old.raw()),
+            ]
+        });
+        Ok(self.shootdown.begin(identities, prev))
     }
     /// Remove `root`'s generation registration and return its mandatory shootdown barrier.
     pub fn remove_root_generation(
@@ -128,7 +166,13 @@ impl ExtentTable {
         root: RootGpa,
     ) -> PendingShootdown<Option<OwnerGeneration>> {
         let removed = self.root_generations.remove(&root.address().raw());
-        self.shootdown.begin(removed)
+        let identities = removed.map_or_else(Vec::new, |old| {
+            vec![
+                RetiredIdentity::Root(root.address().raw()),
+                RetiredIdentity::RootGeneration(old.raw()),
+            ]
+        });
+        self.shootdown.begin(identities, removed)
     }
     /// Return the registered [`OwnerGeneration`] for `root` (`None` if `root` is unregistered).
     pub fn expected_generation(&self, root: RootGpa) -> Option<OwnerGeneration> {
@@ -181,7 +225,12 @@ impl ExtentTable {
 
     /// Install a new, non-overlapping extent (`false` if unaligned, empty, or overlapping any existing extent).
     pub fn install(&mut self, record: ExtentRecord) -> bool {
-        if !self.validate_non_overlapping(record, false) {
+        if !self.validate_non_overlapping(record, false)
+            || self.shootdown.has_pending(&[
+                RetiredIdentity::ExtentBase(record.base.raw()),
+                RetiredIdentity::ExtentGeneration(record.generation.raw()),
+            ])
+        {
             return false;
         }
         self.by_base.insert(record.base.raw(), record);
@@ -192,7 +241,12 @@ impl ExtentTable {
         &mut self,
         record: ExtentRecord,
     ) -> Result<PendingShootdown<Option<ExtentRecord>>, ExtentRecord> {
-        if !self.validate_non_overlapping(record, true) {
+        if !self.validate_non_overlapping(record, true)
+            || self.shootdown.has_pending(&[
+                RetiredIdentity::ExtentBase(record.base.raw()),
+                RetiredIdentity::ExtentGeneration(record.generation.raw()),
+            ])
+        {
             return Err(record);
         }
         let base = record.base.raw();
@@ -200,7 +254,13 @@ impl ExtentTable {
         if let Some(old) = old {
             self.clear_code_pages_in_span(old.base.raw(), old.end_gpa());
         }
-        Ok(self.shootdown.begin(old))
+        let identities = old.map_or_else(Vec::new, |retired| {
+            vec![
+                RetiredIdentity::ExtentBase(retired.base.raw()),
+                RetiredIdentity::ExtentGeneration(retired.generation.raw()),
+            ]
+        });
+        Ok(self.shootdown.begin(identities, old))
     }
     /// Retire the extent starting at `base` and return its mandatory shootdown barrier.
     pub fn remove(&mut self, base: FrameGpa) -> Option<PendingShootdown<ExtentRecord>> {
@@ -208,7 +268,15 @@ impl ExtentTable {
         if let Some(old) = removed {
             self.clear_code_pages_in_span(old.base.raw(), old.end_gpa());
         }
-        removed.map(|record| self.shootdown.begin(record))
+        removed.map(|record| {
+            self.shootdown.begin(
+                vec![
+                    RetiredIdentity::ExtentBase(record.base.raw()),
+                    RetiredIdentity::ExtentGeneration(record.generation.raw()),
+                ],
+                record,
+            )
+        })
     }
     /// Look up the single predecessor extent covering `[gpa, gpa + len_bytes)`.
     pub fn lookup_span(&self, gpa: u64, len_bytes: u64) -> Option<ExtentRecord> {

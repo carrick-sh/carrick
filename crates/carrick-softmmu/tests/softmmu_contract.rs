@@ -1143,8 +1143,8 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
     );
     shootdown_cpu0.enter_running(&mut rig.tlb);
     shootdown_cpu1.enter_running(&mut tlb_cpu1);
-    shootdown_cpu0.leave_idle();
-    shootdown_cpu1.leave_idle();
+    shootdown_cpu0.leave_idle(&mut rig.tlb);
+    shootdown_cpu1.leave_idle(&mut tlb_cpu1);
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
 
@@ -1165,8 +1165,8 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
     );
     shootdown_cpu0.enter_running(&mut rig.tlb);
     shootdown_cpu1.enter_running(&mut tlb_cpu1);
-    shootdown_cpu0.leave_idle();
-    shootdown_cpu1.leave_idle();
+    shootdown_cpu0.leave_idle(&mut rig.tlb);
+    shootdown_cpu1.leave_idle(&mut tlb_cpu1);
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
     assert_ne!(rig.mem.get(PT_A_GPA, idx(va_rw, 3)), 0);
@@ -1186,8 +1186,8 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
     );
     shootdown_cpu0.enter_running(&mut rig.tlb);
     shootdown_cpu1.enter_running(&mut tlb_cpu1);
-    shootdown_cpu0.leave_idle();
-    shootdown_cpu1.leave_idle();
+    shootdown_cpu0.leave_idle(&mut rig.tlb);
+    shootdown_cpu1.leave_idle(&mut tlb_cpu1);
     let _ = rig.probe_ram(va_rw, Access::Read, mode);
     rig.probe_tlb(&mut tlb_cpu1, va_rw, Access::Read, mode);
     assert_eq!(
@@ -1199,8 +1199,8 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
     );
     shootdown_cpu0.enter_running(&mut rig.tlb);
     shootdown_cpu1.enter_running(&mut tlb_cpu1);
-    shootdown_cpu0.leave_idle();
-    shootdown_cpu1.leave_idle();
+    shootdown_cpu0.leave_idle(&mut rig.tlb);
+    shootdown_cpu1.leave_idle(&mut tlb_cpu1);
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(rig.walk(va_rw, Access::Read, mode), Err(missing_tbl));
@@ -1439,6 +1439,10 @@ fn concurrent_pte_writer_snapshot_consistency_and_structural_budgets() -> Result
 
         let mut work = WorkSnapshot::new();
         work.insert(WorkMetric::DescriptorLoadsPerMiss, loads_4k)
+            .unwrap();
+        work.insert(WorkMetric::LifecycleEntryVisits, 0).unwrap();
+        work.insert(WorkMetric::PageTableInvalidations, 0).unwrap();
+        work.insert(WorkMetric::ShootdownCoordinatorLockAcquisitions, 0)
             .unwrap();
         observations.push(ContractObservation {
             contract_id: ContractId::new("softmmu.x86.tlb-walker").unwrap(),

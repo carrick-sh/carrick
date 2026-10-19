@@ -36,7 +36,7 @@ pub use carrick_softmmu::{
     SOFT_TLB_ENTRIES, SOFT_TLB_INDEX_MASK, SoftCpuException, SoftFaultClass, SoftMmuMemory,
     SoftTlb, SoftTlbEntry, SoftTlbPlane, SoftTlbStats, SoftTranslationError, SoftWalker, Stage1Gpa,
     TLB_TAG_AC_BIT as SOFT_TLB_TAG_AC_BIT, TLB_TAG_CPL3_BIT as SOFT_TLB_TAG_CPL3_BIT,
-    TLB_TAG_INVALID as SOFT_TLB_INVALID_TAG, WalkOutcome,
+    TLB_TAG_INVALID as SOFT_TLB_INVALID_TAG, VcpuShootdown, WalkOutcome,
 };
 
 /// Hardware x86 `#PF` error-code bits.
@@ -100,30 +100,39 @@ pub fn translate_with_frame<M: SoftMmuMemory>(
     va: u64,
     kind: SoftAccessKind,
 ) -> Result<(*mut u8, AuthenticatedGpa), SoftPageFault> {
-    let root = ctx.root_gpa().ok_or(SoftPageFault::new(va, 0))?;
-    let mode = ctx.access_mode();
-    match ctx
-        .walker
-        .walk_and_fill(mem, &mut ctx.tlb, root, GuestVa::new(va), kind, mode)
-    {
-        Ok(WalkOutcome::Ram(resolved)) => Ok((resolved.host_addr as *mut u8, resolved.frame_gpa)),
-        Err(SoftTranslationError::CpuException(SoftCpuException::PageFault(info))) => {
-            Err(SoftPageFault::from_info(info))
-        }
-        Ok(WalkOutcome::Mmio { .. }) | Err(_) => {
-            let mut bits = if mode.cpl == Cpl::Ring3 {
-                PF_ERR_USER
-            } else {
-                0
-            };
-            if kind == SoftAccessKind::Write {
-                bits |= PF_ERR_WRITE;
-            } else if kind == SoftAccessKind::Execute {
-                bits |= PF_ERR_INSTR;
+    let previous = mem
+        .extents()
+        .begin_vcpu_lookup(&ctx.shootdown, &mut ctx.tlb);
+    let result = (|| {
+        let root = ctx.root_gpa().ok_or(SoftPageFault::new(va, 0))?;
+        let mode = ctx.access_mode();
+        match ctx
+            .walker
+            .walk_and_fill(mem, &mut ctx.tlb, root, GuestVa::new(va), kind, mode)
+        {
+            Ok(WalkOutcome::Ram(resolved)) => {
+                Ok((resolved.host_addr as *mut u8, resolved.frame_gpa))
             }
-            Err(SoftPageFault::new(va, bits))
+            Err(SoftTranslationError::CpuException(SoftCpuException::PageFault(info))) => {
+                Err(SoftPageFault::from_info(info))
+            }
+            Ok(WalkOutcome::Mmio { .. }) | Err(_) => {
+                let mut bits = if mode.cpl == Cpl::Ring3 {
+                    PF_ERR_USER
+                } else {
+                    0
+                };
+                if kind == SoftAccessKind::Write {
+                    bits |= PF_ERR_WRITE;
+                } else if kind == SoftAccessKind::Execute {
+                    bits |= PF_ERR_INSTR;
+                }
+                Err(SoftPageFault::new(va, bits))
+            }
         }
-    }
+    })();
+    ctx.shootdown.end_lookup(previous, &mut ctx.tlb);
+    result
 }
 
 /// Translate `va` using `ctx.tlb` as a front cache, falling back to `ctx.walker` on a miss.
@@ -133,10 +142,17 @@ pub fn translate_va<M: SoftMmuMemory>(
     va: u64,
     kind: SoftAccessKind,
 ) -> Result<*mut u8, SoftPageFault> {
-    if let Some(host_addr) = ctx.tlb.probe(GuestVa::new(va), 1, kind, ctx.access_mode()) {
-        return Ok(host_addr as *mut u8);
-    }
-    translate_with_frame(ctx, mem, va, kind).map(|(ptr, _)| ptr)
+    let previous = mem
+        .extents()
+        .begin_vcpu_lookup(&ctx.shootdown, &mut ctx.tlb);
+    let result =
+        if let Some(host_addr) = ctx.tlb.probe(GuestVa::new(va), 1, kind, ctx.access_mode()) {
+            Ok(host_addr as *mut u8)
+        } else {
+            translate_with_frame(ctx, mem, va, kind).map(|(ptr, _)| ptr)
+        };
+    ctx.shootdown.end_lookup(previous, &mut ctx.tlb);
+    result
 }
 
 /// Read `dst.len()` bytes starting at guest `va`, pre-validating all spanned pages.

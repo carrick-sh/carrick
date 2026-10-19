@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 use carrick_softcpu_x86::{
     ExtentRecord, ExtentTable, FrameGpa, JitCodeBuffer, LinearPlacement, MmioHoles,
@@ -275,7 +276,8 @@ fn run_static_elf_fixture(elf_bytes: &[u8]) -> ElfRunResult {
         assert!(mem.write_direct(rsp + (i * 8) as u64, &w.to_le_bytes()));
     }
 
-    let mut cpu = SoftCpu::new().expect("create SoftCpu");
+    let registration = mem.extents().register_vcpu(std::sync::Arc::new(|| {}));
+    let mut cpu = SoftCpu::new(registration).expect("create SoftCpu");
     cpu.context_mut().rip = elf.entry.wrapping_add(bias);
     cpu.context_mut().gpr[reg::RSP] = rsp;
 
@@ -359,10 +361,68 @@ fn setup_snippet(code: &[u8]) -> (SoftCpu, TestSoftMmuMemory, u64) {
     mem.map_range(code_va, 4096, PagePerms::USER_RX);
     mem.write_direct(code_va, code);
     mem.map_range(stack_va, 8192, PagePerms::USER_RW);
-    let mut cpu = SoftCpu::new().expect("SoftCpu");
+    let registration = mem.extents().register_vcpu(std::sync::Arc::new(|| {}));
+    let mut cpu = SoftCpu::new(registration).expect("SoftCpu");
     cpu.context_mut().rip = code_va;
     cpu.context_mut().gpr[reg::RSP] = stack_va + 4096;
     (cpu, mem, code_va)
+}
+
+#[test]
+fn idle_read_helper_cannot_hit_a_retired_extent_after_completion() {
+    let mut memory = TestSoftMmuMemory::new();
+    let va = 0x0040_0000;
+    memory.map_range(va, 4096, PagePerms::USER_RW);
+    assert!(memory.write_direct(va, &[0x5a]));
+    let registration = memory.extents().register_vcpu(Arc::new(|| {}));
+    let memory = Arc::new(Mutex::new(memory));
+    let (filled_tx, filled_rx) = mpsc::channel();
+    let (retired_tx, retired_rx) = mpsc::channel();
+
+    std::thread::scope(|scope| {
+        let memory_for_cpu = Arc::clone(&memory);
+        scope.spawn(move || {
+            let mut cpu = SoftCpu::new(registration).expect("SoftCpu");
+            cpu.context_mut().cr3 = TestSoftMmuMemory::root().address().raw();
+            let mut byte = [0];
+            read_guest_bytes(
+                cpu.context_mut(),
+                &mut *memory_for_cpu.lock().unwrap(),
+                va,
+                &mut byte,
+                SoftAccessKind::Read,
+            )
+            .unwrap();
+            assert_eq!(byte, [0x5a]);
+            assert!(
+                cpu.context().tlb_stats().hits > 0,
+                "fixture did not hit its fill"
+            );
+            filled_tx.send(()).unwrap();
+            retired_rx.recv().unwrap();
+            assert!(
+                read_guest_bytes(
+                    cpu.context_mut(),
+                    &mut *memory_for_cpu.lock().unwrap(),
+                    va,
+                    &mut byte,
+                    SoftAccessKind::Read,
+                )
+                .is_err(),
+                "idle helper served a stale TLB addend"
+            );
+        });
+
+        filled_rx.recv().unwrap();
+        let pending = memory
+            .lock()
+            .unwrap()
+            .extents_mut()
+            .remove(FrameGpa::new(0))
+            .unwrap();
+        pending.complete();
+        retired_tx.send(()).unwrap();
+    });
 }
 
 fn step_ok(cpu: &mut SoftCpu, mem: &mut TestSoftMmuMemory, exp: SoftCpuExit) {
@@ -414,7 +474,7 @@ fn page_fault_witnesses_read_write_ro_nx_smap_and_straddle_fetch() {
     mem.map_range(user_data, 4096, PagePerms::USER_RW);
     mem.write_direct(user_data, &0xCAFE_BABE_1234_5678u64.to_le_bytes());
     cpu.context_mut().set_cpl(0);
-    cpu.context_mut().tlb.flush_all();
+    cpu.context_mut().flush_tlb();
     cpu.context_mut().gpr[reg::RDI] = user_data;
     step_ok(&mut cpu, &mut mem, pf(code_va, PF_ERR_PRESENT, user_data));
     cpu.context_mut().rflags |= 1 << 18;
@@ -499,7 +559,7 @@ fn general_protection_witnesses_privileged_at_cpl3_and_sensitive_at_cpl0() {
         step_ok(&mut cpu, &mut mem, expected);
         mem.set_page_perms(code_va, PagePerms::KERNEL_RX);
         cpu.context_mut().set_cpl(0);
-        cpu.context_mut().tlb.flush_all();
+        cpu.context_mut().flush_tlb();
         cpu.context_mut().rip = code_va;
         let next_rip = code_va + bytes.len() as u64;
         step_ok(
@@ -618,7 +678,7 @@ fn page_crossing_bounce_buffer_handles_read_write_rmw_and_second_page_fault_atom
     assert_eq!(written_b, init_val);
 
     mem.set_page_perms(base_va + 0x1000, PagePerms::USER_RO);
-    cpu.context_mut().tlb.flush_all();
+    cpu.context_mut().flush_tlb();
     let before_bytes = mem.read_direct(straddle_a, 8).unwrap();
 
     mem.write_direct(code_va, &[0x48, 0x89, 0x1F, 0x0F, 0x05]);
@@ -884,7 +944,6 @@ fn gen_random_block(rng: &mut Xorshift64) -> Vec<u8> {
 fn differential_property_tests_match_native_host_x86_64_cpu() {
     let mut rng = Xorshift64(0x853c_49e6_748f_ea9b);
     let mut native_jit = JitCodeBuffer::new(64 * 1024).expect("native diff JIT");
-    let mut cpu = SoftCpu::new().expect("SoftCpu");
     const ARITH_FLAGS: u64 = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
 
     for trial in 0..200 {
@@ -894,6 +953,8 @@ fn differential_property_tests_match_native_host_x86_64_cpu() {
 
         let (code_va, data_va, stack_va) = (0x0040_0000u64, 0x2000_0000u64, 0x3000_0000u64);
         let mut mem = TestSoftMmuMemory::new();
+        let registration = mem.extents().register_vcpu(std::sync::Arc::new(|| {}));
+        let mut cpu = SoftCpu::new(registration).expect("SoftCpu");
         mem.map_range(code_va, 4096, PagePerms::USER_RX);
         mem.write_direct(code_va, &guest_code);
         mem.map_range(data_va, 8192, PagePerms::USER_RW);
@@ -909,7 +970,7 @@ fn differential_property_tests_match_native_host_x86_64_cpu() {
         let (rbp_offset, rsp_offset) = (0xFE0u64, 4096u64);
         let init_flags = 0x202 | (rng.next() & ARITH_FLAGS);
 
-        cpu.context_mut().tlb.flush_all();
+        cpu.context_mut().flush_tlb();
         cpu.context_mut().gpr = init_gprs;
         (
             cpu.context_mut().gpr[reg::RBP],
@@ -1267,7 +1328,7 @@ fn legacy_x87_images_cross_pages_with_full_span_and_atomic_faults() {
     cpu.step_block(&mut mem).unwrap();
     assert_eq!(&cpu.context_mut().fxsave.0[..2], &0x027fu16.to_le_bytes());
     mem.set_page_perms(0x2000_1000, PagePerms::USER_RO);
-    cpu.context_mut().tlb.flush_all();
+    cpu.context_mut().flush_tlb();
     mem.write_direct(va, &[0xdd, 0x37]);
     cpu.context_mut().rip = va;
     let before = mem.read_direct(addr, 108).unwrap();
@@ -1822,9 +1883,9 @@ fn rep_copy_translation_work_is_page_chunked() {
         cpu.context_mut().gpr[reg::RSI] = src;
         cpu.context_mut().gpr[reg::RDI] = dst;
         cpu.context_mut().gpr[reg::RCX] = count as u64;
-        cpu.context_mut().tlb.reset_stats();
+        cpu.context_mut().reset_tlb_stats();
         cpu.step_block(&mut mem).unwrap();
-        let stats = cpu.context().tlb.stats();
+        let stats = cpu.context().tlb_stats();
         assert!(
             stats.hits + stats.misses <= 4,
             "page-chunk translation budget: n={count}, {stats:?}"
