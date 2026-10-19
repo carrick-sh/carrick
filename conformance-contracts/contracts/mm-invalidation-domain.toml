@@ -1,0 +1,27 @@
+schema_version = 1
+id = "kernel.mm.invalidation-domain"
+title = "A translation invalidation reaches every member that may cache it, stopped members included"
+guest_surfaces = [
+  "syscall:munmap",
+  "syscall:mprotect",
+  "syscall:madvise",
+  "kernel:stage1-mmu",
+  "kernel:frame-inventory",
+  "scheduler:page-table-quiescence",
+]
+semantic_authority = [
+  "man 2 munmap: references to pages in the unmapped range are invalid after the call returns, on every thread of the process",
+  "man 2 mprotect: an access that violates the new protection raises SIGSEGV on every thread, so revoked write permission cannot survive in another CPU's cached translation",
+  "Intel SDM vol. 3A 4.10.4: software must invalidate cached translations on every logical processor that may hold them before reusing the frame (TLB shootdown)",
+]
+fixture = "unit:invalidation-domain-stopped-member"
+scale_points = [1, 2, 3]
+rationale = "Slice 1a of #681: the neutral invalidation domain in carrick-core::mm::retirement::invalidation with its shared layout in carrick-core-abi::mm::served. Debt is per member (owed/served watermarks raised by fetch_max), never per sender, so a request for context B cannot overwrite a stopped member's outstanding debt for context A (the #692 shape of today's x86 per-sender request cells, witnessed red by a model of that protocol). Two Dekker pairs, each closed by SeqCst fences, are loom-checked: install-versus-request (counted or served) and entry-versus-request (kicked or served before execution); removing any one of the four fences fails its loom model. Structural invariant: the per-safe-point steady-state check is own-line loads only, exactly owed[2] + served[2] per check, with zero read-modify-writes and zero stores, asserted by an instrumented word. No backend consumes the domain in this slice; slices 2-7 migrate softmmu, HVF, x86 CPL0 and the ASID allocator onto it."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-core::mm::retirement::invalidation::tests::per_sender_cell_model_loses_stopped_member_debt_692; carrick-core::mm::retirement::invalidation::tests::domain_keeps_stopped_member_debt_across_later_requests; carrick-core::mm::retirement::invalidation::tests::running_member_serves_before_completion_and_stopped_debt_survives; carrick-core::mm::retirement::invalidation::tests::steady_state_check_is_own_line_loads_with_zero_rmws (4 loads per check, 0 RMW, 0 stores); carrick-core::mm::retirement::invalidation::tests::exhausted_counter_pins_at_max_and_commit_refuses_without_publishing; carrick-core::mm::retirement::invalidation::loom_models (just test-loom)"
+
+[bindings.unresolved]
+embed_structural = "No execution venue consumes the domain in slice 1a. The signed binding arrives with the first backend slice (softmmu slice 2, HVF slice 4, x86 CPL0 slice 5); until then no guest execution, kick delivery or architectural invalidation is claimed."
+docker = "Internal invalidation invariant with no guest-visible change in this slice. The Linux-visible obligations (munmap/mprotect on multi-threaded processes) are carried by the backend slices that adopt the domain."
