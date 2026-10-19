@@ -40,6 +40,11 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
     }
     carrick_el1_linux::mm_portal::initialize_pending_forks();
     let frame_ref = unsafe { &mut *frame };
+    #[cfg(feature = "frame-budget-red-fixture")]
+    if frame_ref.esr == u64::MAX {
+        frame_ref.x[0] = frame_budget_red_fixture(frame_ref.x[0]);
+        return carrick_el1_abi::Action::Served as u64;
+    }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_MAINTENANCE_ESR {
         carrick_el1_linux::mm_portal::serve_backing_maintenance_hw(frame_ref);
         return carrick_el1_abi::Action::Served as u64;
@@ -118,4 +123,21 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// The ring stack audit's AArch64 red fixture (#369): a by-value record
+/// large enough that LLVM probes it with a loop and then subtracts a
+/// residual, on the EL1 entry chain. Built only by
+/// `cargo xtask frame-budget --red-fixture`, which requires the audit to
+/// count the whole frame and reject this image.
+#[cfg(all(target_os = "none", feature = "frame-budget-red-fixture"))]
+#[inline(never)]
+fn frame_budget_red_fixture(seed: u64) -> u64 {
+    let mut record = [0_u64; 16 * 1024 + 7];
+    for (index, word) in record.iter_mut().enumerate() {
+        *word = core::hint::black_box(seed ^ index as u64);
+    }
+    core::hint::black_box(&record)
+        .iter()
+        .fold(0, |folded, word| folded ^ word)
 }

@@ -77,6 +77,17 @@ impl ElfData {
         Ok(Self { arch, sections })
     }
 
+    /// Every naturally aligned little-endian word of the data sections.
+    pub fn words(&self) -> impl Iterator<Item = u64> + '_ {
+        self.sections.iter().flat_map(|(base, data)| {
+            let skip = ((8 - (base % 8)) % 8) as usize;
+            data.get(skip..)
+                .unwrap_or_default()
+                .chunks_exact(8)
+                .filter_map(|word| word.try_into().ok().map(u64::from_le_bytes))
+        })
+    }
+
     /// The little-endian word the image loads at `address`, if any section
     /// holds all eight bytes.
     pub fn word_at(&self, address: u64) -> Option<u64> {

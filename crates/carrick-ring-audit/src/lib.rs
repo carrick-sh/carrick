@@ -44,16 +44,34 @@ pub fn audit_image(llvm_objdump: &Path, elf: &Path) -> Result<Report, String> {
 /// The deepest entry chain of each kind on one line apiece, then every
 /// violation: what an image build prints.
 pub fn summary(report: &Report) -> String {
-    use frames::Depth;
+    use frames::{Depth, Resolution};
     let mut text = String::new();
-    for (kind, label) in [
-        (Depth::Certain, "each recursion once"),
-        (Depth::Bounded, "recursion at its bound"),
+    for (kind, resolution, label) in [
+        (
+            Depth::Certain,
+            Resolution::Declared,
+            "each recursion once, indirect calls at their budgets",
+        ),
+        (
+            Depth::Bounded,
+            Resolution::Declared,
+            "recursion at its bound, indirect calls at their budgets",
+        ),
+        (
+            Depth::Certain,
+            Resolution::Resolved,
+            "each recursion once, indirect calls resolved",
+        ),
+        (
+            Depth::Bounded,
+            Resolution::Resolved,
+            "recursion at its bound, indirect calls resolved",
+        ),
     ] {
         if let Some(entry) = report
             .entries
             .iter()
-            .filter(|entry| entry.kind == kind)
+            .filter(|entry| entry.kind == kind && entry.resolution == resolution)
             .max_by_key(|entry| entry.depth)
         {
             text.push_str(&format!(
@@ -61,6 +79,12 @@ pub fn summary(report: &Report) -> String {
                 report.arch, entry.depth, entry.entry, entry.budget, report.stack_budget
             ));
         }
+    }
+    for (kind, name, bytes) in &report.deepest_target {
+        text.push_str(&format!(
+            "{:?} deepest of {} indirect-call targets ({kind:?}): {bytes} bytes, {name}\n",
+            report.arch, report.indirect_targets
+        ));
     }
     if let Some((name, frame)) = &report.largest_frame {
         text.push_str(&format!(

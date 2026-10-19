@@ -41,7 +41,7 @@ pub enum FrameBudgetError {
 }
 
 /// The red fixture's oversized function, as the audit names it.
-pub const RED_FIXTURE_FUNCTION: &str = "fixture_personality::frame_budget_red_fixture";
+pub const RED_FIXTURE_FUNCTION: &str = "frame_budget_red_fixture";
 
 /// Cargo as `cargo run` supplies it, else the first `cargo` on `PATH`
 /// (whose sibling `rustc` honours this checkout's toolchain pin).
@@ -87,6 +87,8 @@ fn ring_images(root: &Path) -> Result<Vec<PathBuf>, FrameBudgetError> {
         &target,
         &[
             "-p",
+            "carrick-el1-linux",
+            "--bin",
             "carrick-el1",
             "--target",
             "aarch64-unknown-none-softfloat",
@@ -113,8 +115,24 @@ fn ring_images(root: &Path) -> Result<Vec<PathBuf>, FrameBudgetError> {
     ])
 }
 
-fn red_fixture_image(root: &Path) -> Result<PathBuf, FrameBudgetError> {
+/// The two red fixture images: the EL1 image and the CPL0 fixture image,
+/// each with its `frame-budget-red-fixture` record.
+fn red_fixture_images(root: &Path) -> Result<Vec<PathBuf>, FrameBudgetError> {
     let target = root.join("target/frame-budget-red");
+    build(
+        root,
+        &target,
+        &[
+            "-p",
+            "carrick-el1-linux",
+            "--bin",
+            "carrick-el1",
+            "--features",
+            "frame-budget-red-fixture",
+            "--target",
+            "aarch64-unknown-none-softfloat",
+        ],
+    )?;
     build(
         root,
         &target,
@@ -129,7 +147,10 @@ fn red_fixture_image(root: &Path) -> Result<PathBuf, FrameBudgetError> {
             "x86_64-unknown-none",
         ],
     )?;
-    Ok(target.join("x86_64-unknown-none/release/carrick-x86-cpl0-fixture"))
+    Ok(vec![
+        target.join("aarch64-unknown-none-softfloat/release/carrick-el1"),
+        target.join("x86_64-unknown-none/release/carrick-x86-cpl0-fixture"),
+    ])
 }
 
 /// Whether `violations` name the red fixture's frame on its entry chain.
@@ -154,18 +175,19 @@ pub fn run(
     let objdump = carrick_ring_audit::toolchain::llvm_objdump(&cargo())
         .map_err(FrameBudgetError::Toolchain)?;
     if args.red_fixture {
-        let image = red_fixture_image(root)?;
-        let report = carrick_ring_audit::audit_image(&objdump, &image)
-            .map_err(FrameBudgetError::Toolchain)?;
-        write!(out, "{}", carrick_ring_audit::summary(&report))?;
-        if !rejects_red_fixture(&report.violations) {
-            return Err(FrameBudgetError::RedFixturePassed);
+        for image in red_fixture_images(root)? {
+            let report = carrick_ring_audit::audit_image(&objdump, &image)
+                .map_err(FrameBudgetError::Toolchain)?;
+            write!(out, "{}", carrick_ring_audit::summary(&report))?;
+            if !rejects_red_fixture(&report.violations) {
+                return Err(FrameBudgetError::RedFixturePassed);
+            }
+            writeln!(
+                out,
+                "red fixture rejected ({:?}): {RED_FIXTURE_FUNCTION} has an oversized frame on a ring entry chain",
+                report.arch
+            )?;
         }
-        writeln!(
-            out,
-            "red fixture rejected: {} has an oversized frame on a ring entry chain",
-            RED_FIXTURE_FUNCTION
-        )?;
         return Ok(());
     }
     let images = if args.elf.is_empty() {
