@@ -1394,6 +1394,13 @@ root generations wait in a `ReclaimQueue` that only the exact
 successor, the code-page generation refuses on exhaustion, and an exhausted
 domain counter makes the inventory terminal. `carrick-softmmu` is `no_std` with
 only `alloc`: there is no lock to take.
+Every TLB-using path (`step_block`, `translate_va`, `translate_with_frame`,
+`read_guest_bytes`, `write_guest_bytes`) is gated on membership: the helpers
+require a `HostAccess` proof that only `SoftCpuContext::admit_host_access`
+mints, after checking the CPU is seated in the memory's inventory, and a
+foreign CPU fails closed before probing. `ExtentTable` has no `Clone`;
+`try_clone` copies the records into a fresh, memberless domain and is refused
+while any retirement is pending.
 
 The red-first witness is the #607 shape: a running peer holding a translation
 of a retired extent kept serving `Some(stale_host_address)` on main, because

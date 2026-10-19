@@ -109,22 +109,16 @@ pub struct ExtentTable {
     terminal: bool,
 }
 
-/// A clone is a second inventory over the same soft vCPUs: it shares the
-/// invalidation domain, so a retirement in either copy reaches every CPU,
-/// and copies the records. Retired identities still pending stay refused in
-/// the copy that retired them; the clone starts with none pending.
-impl Clone for ExtentTable {
-    fn clone(&self) -> Self {
-        Self {
-            by_base: self.by_base.clone(),
-            root_generations: self.root_generations.clone(),
-            code_pages: self.code_pages.clone(),
-            extents_visited: AtomicU64::new(self.extents_visited.load(Ordering::Relaxed)),
-            domain: self.domain.clone(),
-            reclaim: ReclaimQueue::new(),
-            terminal: self.terminal,
-        }
-    }
+/// Why [`ExtentTable::try_clone`] refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtentCloneError {
+    /// A retirement is still pending: a copy would forget which identities
+    /// must stay refused until its completion.
+    Pending,
+    /// The table is terminal.
+    Terminal,
+    /// No fresh invalidation domain could be issued.
+    Exhausted,
 }
 
 impl ExtentTable {
@@ -137,6 +131,31 @@ impl ExtentTable {
             code_pages: BTreeMap::new(),
             extents_visited: AtomicU64::new(0),
             domain: SoftDomainHandle::new()?,
+            reclaim: ReclaimQueue::new(),
+            terminal: false,
+        })
+    }
+
+    /// An independent copy of the records in a fresh invalidation domain
+    /// with no members. There is no `Clone`: a copy that shared this
+    /// domain but not its reclaim queue could reuse an identity whose
+    /// retirement is still in flight. Refused while any retirement is
+    /// pending; soft vCPUs seated here are not members of the copy, so
+    /// they refuse to translate through it.
+    pub fn try_clone(&self) -> Result<Self, ExtentCloneError> {
+        if self.terminal {
+            return Err(ExtentCloneError::Terminal);
+        }
+        if !self.reclaim.is_empty() {
+            return Err(ExtentCloneError::Pending);
+        }
+        Ok(Self {
+            by_base: self.by_base.clone(),
+            root_generations: self.root_generations.clone(),
+            code_pages: self.code_pages.clone(),
+            extents_visited: AtomicU64::new(self.extents_visited.load(Ordering::Relaxed)),
+            domain: SoftDomainHandle::new()
+                .map_err(|GenerationExhausted| ExtentCloneError::Exhausted)?,
             reclaim: ReclaimQueue::new(),
             terminal: false,
         })

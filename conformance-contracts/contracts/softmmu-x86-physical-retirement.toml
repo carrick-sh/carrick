@@ -33,6 +33,13 @@ wait in a `ReclaimQueue` and are refused for reuse until the exact
 `DomainCompletion` releases them. `OwnerGeneration` is NonZero with a refusing
 successor; the code-page generation refuses on exhaustion instead of
 saturating; an exhausted domain counter makes the inventory terminal.
+Every TLB-using path (`step_block`, `translate_va`, `translate_with_frame`,
+`read_guest_bytes`, `write_guest_bytes`) is gated on membership: the helpers
+require a `HostAccess` proof that only `SoftCpuContext::admit_host_access`
+mints, after checking the CPU is seated in the memory's inventory, and a
+foreign CPU fails closed before probing. `ExtentTable` has no `Clone`;
+`try_clone` copies the records into a fresh, memberless domain and is refused
+while any retirement is pending.
 
 Witnesses: the #607 red-first two-thread stale-addend case (on main the peer
 TLB was flushed only if the retiring thread could borrow it; omitted, the peer
@@ -46,7 +53,7 @@ really hits through `step_block`, host-side `translate_va` after completion).
 """
 
 [bindings]
-vm_free = "carrick-softmmu::retirement::tests::{running_peer_cannot_use_stale_addend_after_retirement_completes,parked_peer_resynchronizes_at_block_entry_and_is_never_kicked,host_admission_of_a_parked_peer_serves_before_its_probe,retirement_from_inside_a_running_peer_serves_itself_without_deadlock,pending_extent_identities_are_refused_until_their_completion,pending_root_and_generation_are_refused_until_their_completion,a_seat_of_another_inventory_is_refused_before_any_edit,owner_generation_refuses_exhaustion,concurrent_running_parked_transitions_never_outlive_a_completion,retirement_is_linear_in_peers_and_block_entry_is_rmw_free (evaluates the structural budgets at 2, 16 and 64 seated members)}; carrick-softmmu::walker::tests::code_generation_refuses_exhaustion_instead_of_saturating; carrick-softcpu-x86::softcpu_level0::{running_peer_that_hits_through_step_block_misses_after_retirement,host_translate_va_after_completion_misses_on_a_parked_cpu,retirement_issued_by_a_running_cpu_completes_without_waiting_on_itself} (x86_64 host lane); carrick-core::mm::retirement::invalidation::tests::{domain_request_counts_every_seated_member_whatever_its_context,owning_handle_seat_moves_to_its_own_thread_and_serves_requests,reclaim_iter_lists_outstanding_objects_until_their_exact_release}; carrick-core::mm::retirement::invalidation::loom_models::loom_models_claim_races_domain_request_counts_or_flushes (just test-loom)"
+vm_free = "carrick-softmmu::retirement::tests (test-support/retirement_unit.rs)::{running_peer_cannot_use_stale_addend_after_retirement_completes,parked_peer_resynchronizes_at_block_entry_and_is_never_kicked,host_admission_of_a_parked_peer_serves_before_its_probe,retirement_from_inside_a_running_peer_serves_itself_without_deadlock,pending_extent_identities_are_refused_until_their_completion,pending_root_and_generation_are_refused_until_their_completion,a_seat_of_another_inventory_is_refused_before_any_edit,owner_generation_refuses_exhaustion,a_copy_cannot_reuse_an_identity_whose_retirement_is_pending,concurrent_running_parked_transitions_never_outlive_a_completion,retirement_is_linear_in_peers_and_block_entry_is_rmw_free (evaluates the structural budgets at 2, 16 and 64 seated members)}; carrick-softmmu::walker::tests::code_generation_refuses_exhaustion_instead_of_saturating; carrick-softcpu-x86::softcpu_level0::{running_peer_that_hits_through_step_block_misses_after_retirement,host_translate_va_after_completion_misses_on_a_parked_cpu,retirement_issued_by_a_running_cpu_completes_without_waiting_on_itself,a_cpu_of_another_inventory_gets_no_cached_translation_on_any_path} (x86_64 host lane); carrick-core::mm::retirement::invalidation::tests::{domain_request_counts_every_seated_member_whatever_its_context,owning_handle_seat_moves_to_its_own_thread_and_serves_requests,reclaim_iter_lists_outstanding_objects_until_their_exact_release}; carrick-core::mm::retirement::invalidation::loom_models::loom_models_claim_races_domain_request_counts_or_flushes (just test-loom)"
 
 [bindings.unresolved]
 embed_structural = "Software vCPU carrier integration (`carrick-vmm-soft`) lands in later slices of #578; the soft CPU is proved by the VM-free x86_64 lane."

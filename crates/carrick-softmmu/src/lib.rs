@@ -65,7 +65,7 @@ pub use tlb::{
     TLB_TAG_NXE_OFF_BIT, TLB_TAG_SMAP_OFF_BIT, TLB_TAG_SMEP_OFF_BIT, TLB_TAG_WP_OFF_BIT,
 };
 pub use walker::{
-    AccessOutcome, AuthenticatedDescriptorWords, ExtentEditError, ExtentRecord, ExtentTable,
-    ResolvedAccess, ResolvedSpan, RetiredIdentity, Retirement, SoftMmuMemory, SoftWalker,
-    SoftWalkerStats, WalkOutcome,
+    AccessOutcome, AuthenticatedDescriptorWords, ExtentCloneError, ExtentEditError, ExtentRecord,
+    ExtentTable, ResolvedAccess, ResolvedSpan, RetiredIdentity, Retirement, SoftMmuMemory,
+    SoftWalker, SoftWalkerStats, WalkOutcome,
 };
