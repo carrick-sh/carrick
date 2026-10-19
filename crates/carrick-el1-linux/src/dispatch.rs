@@ -4,7 +4,8 @@ extern crate alloc;
 use super::cow_resolver::dispatch_fault;
 use super::{file, inotify, ipc, lifecycle, sched};
 use crate::file::UserCopy;
-use crate::memory;
+use crate::sched::LinuxSchedEntry;
+use carrick_el1::memory;
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
     DelegatedOpenFile, FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES, MAX_ZONE_OPEN_FILES,
@@ -271,7 +272,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
             };
             let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
             sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
-            let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
+            let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
             let mut service =
                 match super::aarch64_process::Aarch64NativeProcessService::new(task, slot) {
                     Ok(service) => service,
@@ -947,7 +948,7 @@ pub fn invalid_completion(reason: NativeInvariant) -> ! {
     #[cfg(target_os = "none")]
     {
         let _ = reason;
-        crate::substrate::sched::hw::fatal_entry_binding();
+        carrick_el1::substrate::sched::hw::fatal_entry_binding();
     }
     #[cfg(not(target_os = "none"))]
     carrick_fatal::carrick_fatal!(
@@ -1501,7 +1502,7 @@ impl<
             }
         }
         let res = match frame.x[0] {
-            1 => crate::alloc::run_guest_allocator_test(frame.x[1], frame.x[2]),
+            1 => carrick_el1::alloc::run_guest_allocator_test(frame.x[1], frame.x[2]),
             _ => 1,
         };
         if res == carrick_el1_abi::METADATA_GRANT_PENDING {
@@ -1515,7 +1516,7 @@ impl<
                 if let (Some(key), Some(operation), Some(resume)) = (
                     carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(generation),
                     carrick_sched_core::object_wait::OperationToken::metadata_request(generation),
-                    crate::substrate::sched::object_wait::OperationResumePc::new(
+                    carrick_el1::substrate::sched::object_wait::OperationResumePc::new(
                         saved.elr.wrapping_sub(4),
                     ),
                 ) && let Ok(snapshot) = sched.observe_object(key)
@@ -1570,7 +1571,7 @@ impl<
             && memory::delegated_anonymous_root(
                 _ordinal,
                 task,
-                crate::substrate::sched::object_wait::space_access(zone.tables, slot),
+                carrick_el1::substrate::sched::object_wait::space_access(zone.tables, slot),
                 memory::reservations::shared_guest(),
             )
             .is_some()
@@ -1605,7 +1606,7 @@ impl<
         ) else {
             return DelegatedStep::NotDelegated;
         };
-        let access = crate::substrate::sched::object_wait::space_access(zone.tables, slot);
+        let access = carrick_el1::substrate::sched::object_wait::space_access(zone.tables, slot);
         match memory::serve_delegated_anonymous(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
@@ -1649,7 +1650,7 @@ impl<
         let (Some(zone), Some(slot)) = (self.zone.as_ref(), self.frame.slot()) else {
             return PermissionStep::Forward;
         };
-        let access = crate::substrate::sched::object_wait::space_access(zone.tables, slot);
+        let access = carrick_el1::substrate::sched::object_wait::space_access(zone.tables, slot);
         match memory::try_serve_mprotect(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
@@ -1673,7 +1674,7 @@ impl<
         let (Some(zone), Some(slot)) = (self.zone.as_ref(), self.frame.slot()) else {
             return RetirementStep::Forward;
         };
-        let access = crate::substrate::sched::object_wait::space_access(zone.tables, slot);
+        let access = carrick_el1::substrate::sched::object_wait::space_access(zone.tables, slot);
         match memory::try_serve_munmap(
             match self.frame.arm_frame() {
                 Some(frame) => frame,
@@ -1940,19 +1941,19 @@ impl<
 impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context: DispatchContext>
     El1PendingFamilies<'_, F, C, U, G, Context>
 {
-    fn file_access(&self) -> crate::substrate::file_notification::FileAccess<'_> {
+    fn file_access(&self) -> carrick_el1::substrate::file_notification::FileAccess<'_> {
         match (self.zone.as_ref(), self.frame.slot()) {
             (Some(zone), Some(slot)) => {
-                crate::substrate::file_notification::FileAccess::notified(zone.tables, slot)
+                carrick_el1::substrate::file_notification::FileAccess::notified(zone.tables, slot)
             }
             _ => {
                 #[cfg(any(test, feature = "host-test"))]
                 {
-                    crate::substrate::file_notification::FileAccess::SourceFreeModel
+                    carrick_el1::substrate::file_notification::FileAccess::SourceFreeModel
                 }
                 #[cfg(not(any(test, feature = "host-test")))]
                 {
-                    crate::substrate::file_notification::FileAccess::Unavailable
+                    carrick_el1::substrate::file_notification::FileAccess::Unavailable
                 }
             }
         }
@@ -1961,7 +1962,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
 
 #[allow(clippy::too_many_arguments)]
 fn try_serve_file_syscall<'a, F, G: SyscallFrame>(
-    access: crate::substrate::file_notification::FileAccess<'a>,
+    access: carrick_el1::substrate::file_notification::FileAccess<'a>,
     frame: &G,
     nr: usize,
     current_tasks: &[CurrentTask],

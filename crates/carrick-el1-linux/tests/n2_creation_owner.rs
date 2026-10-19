@@ -21,13 +21,14 @@ use core::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use carrick_el1::personality::lifecycle::{LifecycleThread, LifecycleVenue};
-use carrick_el1::{Zone, dispatch_syscall_with_lifecycle, sched};
 use carrick_el1_abi::{
     Action, BlockedMask, Counters, CurrentTask, El1TaskId, EntryIdentity, EntryRef, EntryState,
     InotifyNameCache, SlotId, THREAD_POOL_ENTRIES, ThreadControlSlot, ThreadLifecyclePage,
     TrapFrame, ZoneTables,
 };
+use carrick_el1_linux::dispatch::{Zone, dispatch_syscall_with_lifecycle};
+use carrick_el1_linux::lifecycle::{LifecycleThread, LifecycleVenue};
+use carrick_el1_linux::sched;
 
 // The plan's 18 numeric IDs, plus robust-list 99 and execve/execveat 221/281.
 const CREATION_IDS: [usize; 21] = [

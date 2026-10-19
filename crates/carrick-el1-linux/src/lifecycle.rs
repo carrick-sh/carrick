@@ -17,8 +17,8 @@ pub use carrick_personality_linux::thread::{LifecycleThread, SYS_SET_ROBUST_LIST
 #[cfg(test)]
 type RawExitBeforeCommitHook = std::vec::Vec<(usize, std::boxed::Box<dyn FnOnce() + Send>)>;
 #[cfg(test)]
-static RAW_EXIT_BEFORE_COMMIT_HOOK: crate::lock::SpinLock<RawExitBeforeCommitHook> =
-    crate::lock::SpinLock::new(std::vec::Vec::new());
+static RAW_EXIT_BEFORE_COMMIT_HOOK: carrick_el1::lock::SpinLock<RawExitBeforeCommitHook> =
+    carrick_el1::lock::SpinLock::new(std::vec::Vec::new());
 
 #[cfg(test)]
 pub(super) fn install_raw_exit_before_commit_hook(
@@ -737,23 +737,24 @@ impl<
         let Some(task) = self.current_tasks.get(task_idx) else {
             return Err(carrick_personality_linux::abi::signal::LINUX_EFAULT);
         };
-        let mut copy = crate::file::ValidatedCopy {
+        let mut copy = LinuxUserCopy(crate::file::ValidatedCopy {
             task,
             validator: &crate::file::HardwareValidator,
-        };
+        });
         self.frame.restore_signal_frame(&mut copy)
     }
 }
 
-impl<V: crate::file::MemoryValidator> carrick_personality_linux::lifecycle::UserCopy
-    for crate::file::ValidatedCopy<'_, V>
-{
+/// The Linux lifecycle user-copy interface over a neutral validated copy.
+pub struct LinuxUserCopy<T>(pub T);
+
+impl<T: crate::file::UserCopy> carrick_personality_linux::lifecycle::UserCopy for LinuxUserCopy<T> {
     fn copy_out(&mut self, dst: carrick_guest_arch::UserVa, src: &[u8]) -> bool {
-        crate::file::UserCopy::copy_out(self, dst.raw(), src)
+        crate::file::UserCopy::copy_out(&mut self.0, dst.raw(), src)
     }
 
     fn copy_in(&mut self, dst: &mut [u8], src: carrick_guest_arch::UserVa) -> bool {
-        crate::file::UserCopy::copy_in(self, dst, src.raw())
+        crate::file::UserCopy::copy_in(&mut self.0, dst, src.raw())
     }
 }
 

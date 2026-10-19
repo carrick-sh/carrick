@@ -1,8 +1,8 @@
 //! Retained signal resources for an admitted fresh native process.
 //! Signal and child-exit decisions remain in the shared Linux signal policy.
 extern crate alloc;
-use crate::lock::SpinLock;
 use alloc::sync::Arc;
+use carrick_el1::lock::SpinLock;
 use carrick_personality_linux::signal::{EnqueueOutcome, SignalInbox, StaleTarget};
 use carrick_sched_core::process::exit::{
     DefaultSignalDisposition, ExitSignalDisposition, ExitSignalSource, ExitSignalState,

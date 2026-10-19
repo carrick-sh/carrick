@@ -2,16 +2,33 @@
 use carrick_guest_arch::{ReturnKind, UserFlags, UserReturn, UserVa};
 use carrick_personality_linux::signal::{SignalBackend, SignalFrameParams};
 
-use crate::isa::ArchError;
-use crate::isa::x86::X86Backend;
-use crate::isa::x86::context::native::NativeFrame;
+use carrick_el1::isa::ArchError;
+use carrick_el1::isa::x86::X86Backend;
+use carrick_el1::isa::x86::context::native::NativeFrame;
 
 use carrick_syscall_abi::{
     LinuxSiginfo as Siginfo, X8664Rtsigframe as RtSigframe, X8664Ucontext as Ucontext,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
-impl X86Backend {
+/// The Linux signal-frame codec over the neutral x86 backend's types.
+pub struct LinuxX86Backend;
+
+impl carrick_guest_arch::ArchTypes for LinuxX86Backend {
+    type Error = <X86Backend as carrick_guest_arch::ArchTypes>::Error;
+    type NativeFrame = <X86Backend as carrick_guest_arch::ArchTypes>::NativeFrame;
+    type SavedContext = <X86Backend as carrick_guest_arch::ArchTypes>::SavedContext;
+    type Context = <X86Backend as carrick_guest_arch::ArchTypes>::Context;
+    type Root = <X86Backend as carrick_guest_arch::ArchTypes>::Root;
+    type MmOwner = <X86Backend as carrick_guest_arch::ArchTypes>::MmOwner;
+    type DrainTicket = <X86Backend as carrick_guest_arch::ArchTypes>::DrainTicket;
+    type DrainReceipt = <X86Backend as carrick_guest_arch::ArchTypes>::DrainReceipt;
+    type UserTransfer = <X86Backend as carrick_guest_arch::ArchTypes>::UserTransfer;
+    type HardwareInterrupt = <X86Backend as carrick_guest_arch::ArchTypes>::HardwareInterrupt;
+    type InterruptMask = <X86Backend as carrick_guest_arch::ArchTypes>::InterruptMask;
+}
+
+impl LinuxX86Backend {
     #[inline(never)]
     pub fn setup_signal_frame_with_resume<'a>(
         &mut self,
@@ -141,7 +158,7 @@ impl X86Backend {
     }
 }
 
-impl SignalBackend for X86Backend {
+impl SignalBackend for LinuxX86Backend {
     fn setup_signal_frame<'a>(
         &mut self,
         frame: &mut NativeFrame,

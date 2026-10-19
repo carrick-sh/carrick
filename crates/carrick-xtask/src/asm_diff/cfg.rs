@@ -181,7 +181,10 @@ fn reachability(key: &Key, asm: &Assembly) -> Vec<Truth> {
             },
             Target {
                 os: "none",
-                allocator_control: key.krate == "carrick-el1",
+                allocator_control: matches!(
+                    key.krate.as_str(),
+                    "carrick-el1" | "carrick-el1-linux"
+                ),
             },
         ]
     };

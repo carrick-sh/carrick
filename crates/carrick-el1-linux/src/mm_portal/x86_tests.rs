@@ -1,7 +1,7 @@
 //! The production reservation/permit owner, exercised over x86 descriptors.
 use super::test_support::*;
 use super::*;
-use crate::fault::{NoopCowResolver, NoopPreparedResolver};
+use carrick_el1::fault::{NoopCowResolver, NoopPreparedResolver};
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_mmu_core::x86::descriptor_txn::{NX, PRESENT, USER, WRITE};
 use carrick_sched_core::AddressSpaces;
@@ -179,8 +179,8 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86RetiredOwner {
 
 #[test]
 fn x86_pending_brk_maintenance_scrubs_private_grant_and_keeps_leaf_invalid() {
-    use crate::memory::reservations::{Decision, RootReleaseVenue};
     use carrick_core::mm::cow::{CowCopyWindow, GuestCowVenue};
+    use carrick_el1::memory::reservations::{Decision, RootReleaseVenue};
     use carrick_el1_abi::{
         PortalBackingMaintenance, ReservationBackingReceipt, ReservationCompletion,
     };
@@ -238,7 +238,7 @@ fn x86_pending_brk_maintenance_scrubs_private_grant_and_keeps_leaf_invalid() {
                 index.index(),
                 mm,
                 &view,
-                &crate::memory::reservations::NoRootWait,
+                &carrick_el1::memory::reservations::NoRootWait,
             )
             .unwrap();
         root.begin_host_proposal().unwrap();

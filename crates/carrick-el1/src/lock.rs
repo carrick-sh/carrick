@@ -27,8 +27,8 @@ impl<T> SpinLock<T> {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         self.locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .ok()

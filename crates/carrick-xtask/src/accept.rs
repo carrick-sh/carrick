@@ -283,6 +283,8 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
             "-p",
             "carrick-el1",
             "-p",
+            "carrick-el1-linux",
+            "-p",
             "carrick-el1-abi",
             "-p",
             "carrick-sched-core",
@@ -343,6 +345,8 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
             "carrick-xtask",
             "-p",
             "carrick-el1",
+            "-p",
+            "carrick-el1-linux",
             "-p",
             "carrick-kernel-example",
             "--no-default-features",
@@ -2213,6 +2217,7 @@ mod tests {
             .unwrap();
         for package in [
             "carrick-el1",
+            "carrick-el1-linux",
             "carrick-el1-abi",
             "carrick-sched-core",
             "carrick-fd-core",

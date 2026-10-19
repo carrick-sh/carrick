@@ -17,7 +17,7 @@ pub const O_NONBLOCK: u32 = 0x0000_0800;
 /// Service `inotify_add_watch(fd, pathname, mask)` (nr 27) at EL1.
 #[allow(clippy::too_many_arguments)]
 pub fn el1_inotify_add_watch<'a>(
-    access: crate::substrate::file_notification::FileAccess<'a>,
+    access: carrick_el1::substrate::file_notification::FileAccess<'a>,
     inotify_fd: i32,
     pathname_va: u64,
     mask: u32,
@@ -33,7 +33,7 @@ pub fn el1_inotify_add_watch<'a>(
     // entry can have a live file table without a published file venue.
     if matches!(
         access,
-        crate::substrate::file_notification::FileAccess::Unavailable
+        carrick_el1::substrate::file_notification::FileAccess::Unavailable
     ) {
         return Err(Action::Forward);
     }
@@ -103,7 +103,7 @@ pub fn el1_inotify_add_watch<'a>(
         _ => return Err(Action::Forward),
     };
 
-    crate::substrate::watches::add(
+    carrick_el1::substrate::watches::add(
         access,
         file,
         inotify,
@@ -115,7 +115,7 @@ pub fn el1_inotify_add_watch<'a>(
 
 /// Service `inotify_rm_watch(fd, wd)` (nr 28) at EL1.
 pub fn el1_inotify_rm_watch<'a>(
-    access: crate::substrate::file_notification::FileAccess<'a>,
+    access: carrick_el1::substrate::file_notification::FileAccess<'a>,
     inotify_fd: i32,
     wd: i32,
     cur_task: &CurrentTask,
@@ -154,7 +154,7 @@ pub fn el1_inotify_rm_watch<'a>(
         _ => return Err(Action::Forward),
     };
 
-    crate::substrate::watches::remove(
+    carrick_el1::substrate::watches::remove(
         access,
         file,
         inotify,

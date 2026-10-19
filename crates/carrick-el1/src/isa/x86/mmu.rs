@@ -103,7 +103,7 @@ pub fn hardware_live_root() -> Result<RootGpa, ArchError> {
 
 /// Borrow the one upper supervisor direct window for the live portal root.
 /// The portal owner authenticates the MM grant before calling this leaf.
-pub(crate) fn portal_descriptor_words(target: u64) -> Result<NativeDescriptorWords, ArchError> {
+pub fn portal_descriptor_words(target: u64) -> Result<NativeDescriptorWords, ArchError> {
     let root = RootGpa::page_aligned(FrameGpa::new(target)).ok_or(ArchError::Unbound)?;
     if root.address().raw() != target {
         return Err(ArchError::Unbound);
@@ -138,7 +138,7 @@ pub fn portal_root_is_live(target: u64) -> bool {
 }
 
 /// Drain all non-global translations after a portal grant under the live root.
-pub(crate) fn portal_invalidate_root(target: u64) -> Result<(), ArchError> {
+pub fn portal_invalidate_root(target: u64) -> Result<(), ArchError> {
     if live_root()?.address().raw() != target {
         return Err(ArchError::Unbound);
     }
@@ -279,7 +279,7 @@ impl LiveDescriptorWords for ForkDescriptorWords {
 
 /// Exact physical page-table window reached through a retained supervisor
 /// alias for a CPL0 transaction. Construction requires the caller's MM editor.
-pub(crate) struct NativeDescriptorWords {
+pub struct NativeDescriptorWords {
     context: AddressContext<RootGpa>,
     base: u64,
     end: u64,

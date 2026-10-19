@@ -607,12 +607,12 @@ mod tests {
 
     #[test]
     fn native_child_tid_copy_supplies_its_empty_cow_pool_before_writing() {
-        use crate::personality::mm_portal::test_support::{Region, admit_kind, nodes};
         use carrick_core::mm::transaction::{
             SelectionVenues, UserWriteError, UserWriteRequest, UserWriteVenue,
         };
         use carrick_core::mm::transfer::ValidatedChunk;
         use carrick_el1_abi::{Aarch64ParkedContext, PortalGrantWindow};
+        use carrick_el1_linux::mm_portal::test_support::{Region, admit_kind, nodes};
 
         struct TypedCow<'a> {
             arena: &'a Arena,
@@ -724,7 +724,7 @@ mod tests {
             let mm = admit_kind(&region, &spaces, MM, ROOT | ASID, 4, 0, false);
             let view = nodes(&region);
             let portal =
-                crate::personality::mm_portal::MmPortal::new(nz(1), region.table(), &spaces, &view);
+                carrick_el1_linux::mm_portal::MmPortal::new(nz(1), region.table(), &spaces, &view);
             let residency = residency_table();
             let mut venue = CopyVenue {
                 cow: TypedCow {

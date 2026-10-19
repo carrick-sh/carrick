@@ -58,11 +58,11 @@ ASSEMBLY_BOUNDARIES = frozenset(
         PurePosixPath("crates/carrick-vmm-kvm/src/guest_setup.rs"),
         PurePosixPath("crates/carrick-vmm-kvm/src/kvm.rs"),
         PurePosixPath("crates/carrick-el1/src/file.rs"),
-        PurePosixPath("crates/carrick-el1/src/entry.rs"),
+        PurePosixPath("crates/carrick-el1-linux/src/entry.rs"),
         # Reviewed EL1 physical effects and exact live-root authentication;
         # matches the six-site N1 assembly receipt and Semgrep boundary list.
         PurePosixPath("crates/carrick-el1/src/fault.rs"),
-        PurePosixPath("crates/carrick-el1/src/personality/mm_portal/production.rs"),
+        PurePosixPath("crates/carrick-el1-linux/src/mm_portal/production.rs"),
         PurePosixPath("crates/carrick-el1/src/sched/hw.rs"),
         PurePosixPath("crates/carrick-el1/src/sched/aarch64_context.rs"),
         # ARM EL1 TTBR0/HVC instructions moved intact into the ISA leaf.

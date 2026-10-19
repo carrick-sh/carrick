@@ -111,7 +111,7 @@ fn emit(arguments: core::fmt::Arguments<'_>) {
     let mut diagnostic = carrick_el1_abi::NativeForkDiagnostic::new();
     // Bounded, allocation-free and failure-only; no verdict depends on this reply.
     let _ = core::fmt::write(&mut diagnostic, arguments);
-    crate::isa::aarch64::cross_hvc_fork_refusal(&diagnostic);
+    carrick_el1::isa::aarch64::cross_hvc_fork_refusal(&diagnostic);
 }
 
 #[cfg(test)]

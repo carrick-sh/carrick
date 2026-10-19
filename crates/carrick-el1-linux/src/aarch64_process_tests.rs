@@ -457,8 +457,8 @@ struct Fixture {
     task: CurrentTask,
     slot: SlotId,
     address: AddressContext<RootGpa>,
-    region: &'static crate::personality::mm_portal::test_support::Region,
-    tables: crate::personality::mm_portal::test_support::Tables,
+    region: &'static crate::mm_portal::test_support::Region,
+    tables: crate::mm_portal::test_support::Tables,
     maintenance: CallerInvalidatesAsid,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
@@ -516,7 +516,7 @@ impl Fixture {
     ) -> Self {
         let file_table = leader.file_table;
 
-        let region_box = Box::new(crate::personality::mm_portal::test_support::Region::new());
+        let region_box = Box::new(crate::mm_portal::test_support::Region::new());
         let region = Box::leak(region_box);
         let zone: &'static ZoneTables<Aarch64ParkedContext> = unsafe {
             &*region
@@ -576,7 +576,7 @@ impl Fixture {
                 },
             )
             .unwrap();
-        let view = crate::personality::mm_portal::test_support::nodes(region);
+        let view = crate::mm_portal::test_support::nodes(region);
         let mut owner = table
             .lock_el1_resolved(index.index(), mm, &view, 0)
             .unwrap();
@@ -590,7 +590,7 @@ impl Fixture {
         owner.finish_import().unwrap();
         drop(owner);
 
-        let tables = crate::personality::mm_portal::test_support::Tables::new(root_gpa, IPA, 2);
+        let tables = crate::mm_portal::test_support::Tables::new(root_gpa, IPA, 2);
         let maintenance = CallerInvalidatesAsid;
 
         Self {
@@ -1971,7 +1971,7 @@ pub fn with_native_terminal_host_handback(
         &[],
         &[],
         &cache,
-        None::<crate::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+        None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
         None,
         Some(&fixture),
         Some(&mut entry),
@@ -2215,26 +2215,33 @@ fn arm_root_setup_enters_production_process_venue() {
     ] {
         frame.x[..6].copy_from_slice(&args);
         frame.x[8] = nr;
-        let route = super::dispatch::dispatch_arm_syscall_with_native_process(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            &[],
-            &[],
-            &[],
-            &[],
-            &cache,
-            None::<crate::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
-            None,
-            Some(&*fixture),
-            fixture.page,
-            fixture.control,
-            ThreadCtx::ZERO,
-            ttbr0,
-            &mut service,
-            |_| core::ptr::null_mut(),
-        )
-        .unwrap();
+        let route =
+            super::dispatch::dispatch_arm_syscall_with_native_process(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &cache,
+                None::<
+                    crate::dispatch::Zone<
+                        '_,
+                        crate::sched::FakeCpu,
+                        crate::sched::HardwareUserWord,
+                    >,
+                >,
+                None,
+                Some(&*fixture),
+                fixture.page,
+                fixture.control,
+                ThreadCtx::ZERO,
+                ttbr0,
+                &mut service,
+                |_| core::ptr::null_mut(),
+            )
+            .unwrap();
         assert_eq!(frame.x[0] as i64, expected, "production ARM syscall {nr}");
         assert_eq!(
             route,
@@ -2298,26 +2305,33 @@ fn arm_signal_setup_then_plain_fork_returns_one_child() {
     ] {
         frame.x[..6].copy_from_slice(&args);
         frame.x[8] = nr;
-        let route = super::dispatch::dispatch_arm_syscall_with_native_process(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            &[],
-            &[],
-            &[],
-            &[],
-            &cache,
-            None::<crate::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
-            None,
-            Some(&*fixture),
-            fixture.page,
-            fixture.control,
-            ThreadCtx::ZERO,
-            ttbr0,
-            &mut service,
-            |_| core::ptr::null_mut(),
-        )
-        .unwrap();
+        let route =
+            super::dispatch::dispatch_arm_syscall_with_native_process(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &cache,
+                None::<
+                    crate::dispatch::Zone<
+                        '_,
+                        crate::sched::FakeCpu,
+                        crate::sched::HardwareUserWord,
+                    >,
+                >,
+                None,
+                Some(&*fixture),
+                fixture.page,
+                fixture.control,
+                ThreadCtx::ZERO,
+                ttbr0,
+                &mut service,
+                |_| core::ptr::null_mut(),
+            )
+            .unwrap();
         assert_eq!(
             route,
             carrick_personality_linux::dispatch::CompletionRoute::WithWork
@@ -2840,7 +2854,7 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
         &[],
         &[],
         &cache,
-        None::<crate::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+        None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
         None,
         Some(&*fixture),
         fixture.page,
@@ -2947,7 +2961,7 @@ fn arm_owned_raw_exit_retires_only_one_of_two_live_threads() {
         &[],
         &[],
         &cache,
-        Some(crate::Zone {
+        Some(crate::dispatch::Zone {
             tables: fixture.zone,
             cpu: &mut cpu,
             user: &user,
@@ -3018,7 +3032,7 @@ fn arm_call(
         &[],
         &[],
         &cache,
-        Some(crate::Zone {
+        Some(crate::dispatch::Zone {
             tables: fixture.zone,
             cpu: &mut cpu,
             user: &crate::sched::HardwareUserWord,
@@ -4536,7 +4550,7 @@ fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
         &[],
         &[],
         &cache,
-        Some(crate::Zone {
+        Some(crate::dispatch::Zone {
             tables: fixture.zone,
             cpu: &mut cpu,
             user: &crate::sched::HardwareUserWord,
@@ -5000,7 +5014,7 @@ fn arm_unadmitted_thread_runs_ordinary_calls_and_refuses_owner_calls() {
             &[],
             &[],
             &cache,
-            None::<crate::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+            None::<crate::dispatch::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
             None,
             |_| core::ptr::null_mut(),
             refused,
@@ -5507,7 +5521,7 @@ fn arm_concurrent_exit_group_callers_wake_all_and_settle_owner() {
         &[],
         &[],
         &cache,
-        Some(crate::Zone {
+        Some(crate::dispatch::Zone {
             tables: fixture.zone,
             cpu: &mut cpu,
             user: &crate::sched::HardwareUserWord,
@@ -5658,7 +5672,7 @@ fn arm_unadopted_exit_wakes_unplaceable_closing_owner_without_process_venue() {
         &[],
         &[],
         &cache,
-        Some(crate::Zone {
+        Some(crate::dispatch::Zone {
             tables: fixture.zone,
             cpu: &mut cpu,
             user: &crate::sched::HardwareUserWord,

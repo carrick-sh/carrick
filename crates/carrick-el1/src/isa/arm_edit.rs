@@ -185,8 +185,8 @@ impl carrick_guest_arch::MmuEditBackend for super::aarch64::Aarch64Backend {
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-pub(crate) struct El1TableMaintenance {
-    pub(crate) ttbr0: u64,
+pub struct El1TableMaintenance {
+    pub ttbr0: u64,
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]

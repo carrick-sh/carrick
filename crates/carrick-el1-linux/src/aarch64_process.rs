@@ -40,8 +40,8 @@ use super::native_process_runtime::{
     NativeProcessRuntime, NativeProcessService,
 };
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-use crate::memory::reservations;
-use crate::memory::reservations::{NativeReservationGeometry, SharedReservations};
+use carrick_el1::memory::reservations;
+use carrick_el1::memory::reservations::{NativeReservationGeometry, SharedReservations};
 
 pub type Mm = AddressContext<RootGpa>;
 
@@ -50,7 +50,7 @@ struct CurrentMmMaintenance;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for CurrentMmMaintenance {
     fn publish_barrier(&self) {
-        let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
+        let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
         crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, ttbr0);
     }
     fn invalidate_range(&self, _va: u64, _len: u64) {
@@ -681,7 +681,7 @@ impl ForkStockCrossing for HvcForkStockCrossing {
     fn cross_cow_supply(&self, address: UserVa, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            crate::isa::aarch64::cross_hvc_cow_supply(address.raw(), cpu)
+            carrick_el1::isa::aarch64::cross_hvc_cow_supply(address.raw(), cpu)
                 .map_err(|_| NativeProcessError::Fault)
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
@@ -693,7 +693,7 @@ impl ForkStockCrossing for HvcForkStockCrossing {
     fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            crate::isa::aarch64::cross_hvc_child_retire(record_gpa, cpu)
+            carrick_el1::isa::aarch64::cross_hvc_child_retire(record_gpa, cpu)
                 .map_err(|_| NativeProcessError::Fault)
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
@@ -709,7 +709,7 @@ impl ForkStockCrossing for HvcForkStockCrossing {
     ) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            crate::isa::aarch64::cross_hvc_wait_channel_wake(
+            carrick_el1::isa::aarch64::cross_hvc_wait_channel_wake(
                 channel.mm.raw(),
                 channel.address.get(),
                 cpu,
@@ -726,7 +726,7 @@ impl ForkStockCrossing for HvcForkStockCrossing {
     fn cross_fork_stock(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            crate::isa::aarch64::cross_hvc_fork_stock(record_gpa, cpu).map_err(|status| {
+            carrick_el1::isa::aarch64::cross_hvc_fork_stock(record_gpa, cpu).map_err(|status| {
                 // SAFETY: the synchronous crossing retains its owned,
                 // aligned loan or settlement record on this EL1 stack.
                 let tag = unsafe { *(record_gpa as *const u64) };
@@ -766,7 +766,7 @@ impl ForkStockCrossing for HvcForkStockCrossing {
     fn cross_root_exit(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            crate::isa::aarch64::cross_hvc_root_exit(record_gpa, cpu)
+            carrick_el1::isa::aarch64::cross_hvc_root_exit(record_gpa, cpu)
                 .map_err(|_| NativeProcessError::Fault)
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
@@ -869,21 +869,21 @@ struct NativeWriteVenue<'a, X> {
     slot: SlotId,
     crossing: &'a X,
     slots: &'a carrick_el1_abi::MmPortalSlots,
-    prepared: crate::fault::HardwarePreparedResolver,
-    cow: crate::personality::cow_resolver::HardwareCowResolver,
+    prepared: carrick_el1::fault::HardwarePreparedResolver,
+    cow: crate::cow_resolver::HardwareCowResolver,
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteVenue<'_, X> {
-    type Prepared = crate::fault::HardwarePreparedResolver;
-    type Cow = crate::personality::cow_resolver::HardwareCowResolver;
+    type Prepared = carrick_el1::fault::HardwarePreparedResolver;
+    type Cow = crate::cow_resolver::HardwareCowResolver;
     type Error = NativeProcessError;
 
     fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow> {
         SelectionVenues {
             prepared: &mut self.prepared,
             cow: &mut self.cow,
-            residency: crate::isa::frame_grant_residency_guest(),
+            residency: carrick_el1::isa::frame_grant_residency_guest(),
             slot: u32::from(self.slot.raw()),
         }
     }
@@ -914,10 +914,10 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
         fence: &carrick_core::mm::transfer::ValidatedChunk<'_, Aarch64ParkedContext>,
         bytes: &[u8],
     ) -> bool {
-        let mut copy = crate::file::ValidatedCopy {
+        let mut copy = crate::lifecycle::LinuxUserCopy(crate::file::ValidatedCopy {
             task: self.task,
             validator: &crate::file::HardwareValidator,
-        };
+        });
         carrick_personality_linux::lifecycle::UserCopy::copy_out(
             &mut copy,
             UserVa::new(fence.selected().va.raw()),
@@ -1025,7 +1025,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         } else {
             #[cfg(all(target_os = "none", target_arch = "aarch64"))]
             {
-                let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
+                let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
                 let words = super::mm_portal::production::current_mm_words(
                     ttbr0,
                     ttbr0,
@@ -1465,7 +1465,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            let live = crate::isa::aarch64::hardware_live_ttbr();
+            let live = carrick_el1::isa::aarch64::hardware_live_ttbr();
             let idle = self.zone.spaces.idle_ttbr();
             if live & AARCH64_ROOT_ADDRESS_MASK != mm.root.address().raw() || idle == 0 {
                 fatal();
@@ -1500,7 +1500,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
+            let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
             if ttbr0 & AARCH64_ROOT_ADDRESS_MASK != mm.root.address().raw() {
                 return Err(NativeProcessError::Stale);
             }
@@ -1531,8 +1531,8 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 slot: self.slot,
                 crossing: &self.crossing,
                 slots,
-                prepared: crate::fault::HardwarePreparedResolver,
-                cow: crate::personality::cow_resolver::HardwareCowResolver {
+                prepared: carrick_el1::fault::HardwarePreparedResolver,
+                cow: crate::cow_resolver::HardwareCowResolver {
                     service_slot: Some(carrick_el1_abi::SlotId::new(self.slot.raw())),
                     completion: None,
                     publication: None,
@@ -1560,10 +1560,10 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
-            let mut copy = crate::file::ValidatedCopy {
+            let mut copy = crate::lifecycle::LinuxUserCopy(crate::file::ValidatedCopy {
                 task: self.task,
                 validator: &crate::file::HardwareValidator,
-            };
+            });
             if !carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, address, bytes)
             {
                 return Err(NativeProcessError::Fault);

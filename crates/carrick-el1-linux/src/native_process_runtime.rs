@@ -8,8 +8,8 @@ use super::{
     native_process_signals::{NativeExitSignals, NativeProcessSignals},
     process_owner::{GuestProcessOwner, GuestTask, GuestTaskMetadata, NativeProcessCustody},
 };
-use crate::lock::SpinLock;
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
+use carrick_el1::lock::SpinLock;
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, EntryHandoffReceipt, EntryIdentity, EntryRef, ExecutionBinding,
     Lifecycle, ThreadControlSlot, ThreadLifecyclePage,
@@ -250,7 +250,7 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         }
         #[cfg(target_os = "none")]
         {
-            let mut backend = crate::isa::signal_clock();
+            let mut backend = carrick_el1::isa::signal_clock();
             use carrick_guest_arch::InterruptBackend;
             let now = backend
                 .counter()
@@ -280,7 +280,7 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         #[cfg(target_os = "none")]
         {
             use carrick_guest_arch::InterruptBackend;
-            crate::isa::signal_clock()
+            carrick_el1::isa::signal_clock()
                 .arm_timer(Some(deadline))
                 .map_err(|_| NativeProcessError::Unsupported)
         }
@@ -293,7 +293,7 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         #[cfg(target_os = "none")]
         {
             use carrick_guest_arch::InterruptBackend;
-            crate::isa::signal_clock()
+            carrick_el1::isa::signal_clock()
                 .counter()
                 .map_err(|_| NativeProcessError::Unsupported)
         }
@@ -4150,7 +4150,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 wait_status,
                 || {
                     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-                    crate::isa::aarch64::check_process_stack(self.source.slot);
+                    carrick_el1::isa::aarch64::check_process_stack(self.source.slot);
                 },
             ) {
                 Ok(published) => published,
@@ -6629,7 +6629,7 @@ mod tests {
 
     #[test]
     fn cpl0_clear_tid_dependency_names_the_arm_reference() {
-        let design = include_str!("../../../../docs/design/arm-ring-first-flip.md");
+        let design = include_str!("../../../docs/design/arm-ring-first-flip.md");
         assert!(design.contains("shared-cpl0-thread-exit-clear-tid"));
         assert!(
             design.contains("exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it")
@@ -6641,7 +6641,7 @@ mod tests {
         let production = source.split("mod tests {").next().unwrap();
         assert!(!production.contains(concat!("fn exec", "_completed(")));
         assert!(
-            include_str!("../../../../docs/design/arm-ring-first-flip.md")
+            include_str!("../../../docs/design/arm-ring-first-flip.md")
                 .contains("shared-owner-exec-completion")
         );
     }

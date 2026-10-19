@@ -19,7 +19,7 @@ use carrick_sched_core::{SlotId, ZoneTables};
 use core::num::NonZeroU64;
 
 use super::native_process_runtime::NativeProcessError;
-use crate::lock::SpinLock;
+use carrick_el1::lock::SpinLock;
 
 /// A closed child space awaiting retirement, keyed by the exact carrier,
 /// zone and reservation table it was published in.

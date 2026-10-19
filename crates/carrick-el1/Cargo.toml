@@ -12,10 +12,8 @@ carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-core = { path = "../carrick-core" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
-carrick-inotify-core = { path = "../carrick-inotify-core" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-sched-core = { path = "../carrick-sched-core" }
-carrick-signal-core = { path = "../carrick-signal-core" }
 zerocopy.workspace = true
 
 [features]
@@ -23,25 +21,16 @@ default = []
 host-test = ["carrick-sched-core/host-test", "carrick-core/host-test", "carrick-personality-linux/host-test"]
 allocator-test-control = []
 
-[[bin]]
-name = "carrick-el1"
-path = "src/entry.rs"
-
 [lib]
 path = "src/lib.rs"
 
 [dev-dependencies]
-carrick-abi = { path = "../carrick-abi" }
-carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
-carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-el1-linux = { path = "../carrick-el1-linux", features = ["host-test"] }
 carrick-test-support = { path = "../carrick-test-support" }
 carrick-core = { path = "../carrick-core", features = ["host-test"] }
-carrick-aarch64 = { path = "../carrick-aarch64" }
-carrick-hal = { path = "../carrick-hal" }
 carrick-sched-core = { path = "../carrick-sched-core", features = ["host-test"] }
 carrick-personality-linux = { path = "../carrick-personality-linux", features = ["host-test"] }
 carrick-mem = { path = "../carrick-mem" }
 
 [target.'cfg(not(target_os = "none"))'.dependencies]
-carrick-fatal = { path = "../carrick-fatal" }
 libc.workspace = true

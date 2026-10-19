@@ -410,7 +410,7 @@ macro_rules! compiler_catalog_owned {
                 "crates/carrick-el1/src/fault.rs": (
                     'pub unsafe fn emit() { core::arch::asm!("hvc #1"); }\n'
                 ),
-                "crates/carrick-el1/src/personality/mm_portal/production.rs": (
+                "crates/carrick-el1-linux/src/mm_portal/production.rs": (
                     'pub unsafe fn emit() { core::arch::asm!("mrs x0, ttbr0_el1"); }\n'
                 ),
                 "crates/carrick-host/src/host_proc.rs": (

@@ -24,8 +24,8 @@ const UNBLOCKABLE: u64 = 0x0004_0100;
 
 const SS_DISABLE: u32 = 2;
 
-use crate::personality::dispatch::{Zone, dispatch_syscall_with_lifecycle};
-use crate::personality::sched::{FakeCpu, HardwareUserWord, SYS_FUTEX};
+use crate::dispatch::{Zone, dispatch_syscall_with_lifecycle};
+use crate::sched::{FakeCpu, HardwareUserWord, SYS_FUTEX};
 use carrick_el1_abi::{
     EntryRef, InotifyNameCache, LifecycleHatches, PendingSignals, SlotId, ThreadControlSlot,
     ThreadLifecyclePage, ZoneTables,
@@ -216,13 +216,7 @@ impl World {
             zone: &*self.zone,
             slot: SLOT,
         };
-        match crate::personality::dispatch::dispatch_syscall_with_native::<
-            _,
-            _,
-            _,
-            _,
-            Aarch64ParkedContext,
-        >(
+        match crate::dispatch::dispatch_syscall_with_native::<_, _, _, _, Aarch64ParkedContext>(
             frame,
             &self.counters,
             &self.tasks,
@@ -1329,7 +1323,7 @@ fn process_native_hooks_require_every_execution_identity_component() {
         }
     }
     let mut world = World::new(LifecycleHatches::ON);
-    let expected = crate::personality::common_entry::execution_binding(world.task());
+    let expected = crate::common_entry::execution_binding(world.task());
     assert!(world.venue.leader_slot().publish_visible_tid(41));
     let mut bindings = [expected; 5];
     bindings[1].task = carrick_el1_abi::EntryTaskKey::from_raw(99);
@@ -1408,7 +1402,7 @@ fn process_native_hooks_require_every_execution_identity_component() {
         }
         assert_eq!(probe.calls, if index == 0 { 3 } else { 0 });
         assert_eq!(
-            crate::personality::common_entry::execution_binding(world.task()),
+            crate::common_entry::execution_binding(world.task()),
             expected
         );
     }
@@ -1416,7 +1410,7 @@ fn process_native_hooks_require_every_execution_identity_component() {
 
 #[test]
 fn x86_split_result_does_not_read_argument_zero() {
-    use crate::personality::dispatch::{El1PendingFamilies, GuestDispatchFrame};
+    use crate::dispatch::{El1PendingFamilies, GuestDispatchFrame};
     use carrick_guest_arch::NativeReturnWord;
     use carrick_personality_linux::dispatch::SyscallFrame;
     use carrick_syscall_abi::CanonicalNr;
@@ -1553,7 +1547,7 @@ fn clone_uses_the_exact_stamped_dispatch_identity() {
     w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
     assert!(w.venue.leader_slot().publish_visible_tid(41));
     let mut probe = BirthProbe {
-        binding: crate::personality::common_entry::execution_binding(w.task()),
+        binding: crate::common_entry::execution_binding(w.task()),
     };
     let mut frame = TrapFrame {
         slot: SLOT_IDX as u64,
@@ -1630,7 +1624,7 @@ fn clone_refuses_missing_dispatch_identity_without_registering() {
     w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
     assert_eq!(w.venue.leader_slot().visible_tid(), None);
     let mut probe = BirthProbe {
-        binding: crate::personality::common_entry::execution_binding(w.task()),
+        binding: crate::common_entry::execution_binding(w.task()),
     };
     let mut frame = TrapFrame {
         slot: SLOT_IDX as u64,
@@ -1717,7 +1711,7 @@ fn clone_missing_nonleader_identity_cannot_inherit_leader() {
     w.task().set(El1TaskId::from_linux_tid(70), 1, 5);
     assert_eq!(w.venue.child_slot(1).visible_tid(), None);
     let mut probe = BirthProbe {
-        binding: crate::personality::common_entry::execution_binding(w.task()),
+        binding: crate::common_entry::execution_binding(w.task()),
     };
     let mut frame = TrapFrame {
         slot: SLOT_IDX as u64,
@@ -1804,7 +1798,7 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
     w.task().set(El1TaskId::from_linux_tid(70), 1, 5);
     assert!(w.venue.child_slot(1).publish_visible_tid(42));
     let mut probe = BirthProbe {
-        binding: crate::personality::common_entry::execution_binding(w.task()),
+        binding: crate::common_entry::execution_binding(w.task()),
     };
     let mut frame = TrapFrame {
         slot: SLOT_IDX as u64,
@@ -1884,7 +1878,7 @@ impl carrick_personality_linux::dispatch::SyscallFrame for Cpl0IdentityFrame {
         carrick_personality_linux::dispatch::SyscallFrame::user_sp(&self.0)
     }
 }
-impl crate::personality::dispatch::GuestDispatchFrame for Cpl0IdentityFrame {
+impl crate::dispatch::GuestDispatchFrame for Cpl0IdentityFrame {
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
         carrick_guest_arch::NativeOrdinal::new(218)
     }
@@ -1914,9 +1908,7 @@ fn set_tid_address_cpl0_records_word_and_returns_the_exact_tid() {
         }
         assert!(w.venue.leader_slot().publish_visible_tid(40));
         w.venue.leader_slot().set_clear_child_tid(0x6000);
-        let mut owner = IdentityOwner(crate::personality::common_entry::execution_binding(
-            w.task(),
-        ));
+        let mut owner = IdentityOwner(crate::common_entry::execution_binding(w.task()));
         let mut frame = Cpl0IdentityFrame(TrapFrame {
             slot: SLOT_IDX as u64,
             ..Default::default()
@@ -1924,7 +1916,7 @@ fn set_tid_address_cpl0_records_word_and_returns_the_exact_tid() {
         frame.0.x[0] = 0x7000;
         frame.0.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw();
         let names = InotifyNameCache::new();
-        let route = crate::personality::dispatch::dispatch_syscall_with_native::<
+        let route = crate::dispatch::dispatch_syscall_with_native::<
             _,
             FakeCpu,
             HardwareUserWord,
@@ -1984,14 +1976,12 @@ fn set_tid_address_arm_child_registers_the_word_that_exit_clears_and_wakes() {
         u64::from(CHILD_TID)
     );
     assert_eq!(w.venue.child_slot(0).clear_child_tid(), 0);
-    let mut owner = IdentityOwner(crate::personality::common_entry::execution_binding(
-        w.task(),
-    ));
+    let mut owner = IdentityOwner(crate::common_entry::execution_binding(w.task()));
     frame.slot = SLOT_IDX as u64;
     frame.x[0] = addr(&*word);
     frame.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw();
     let names = InotifyNameCache::new();
-    let route = crate::personality::dispatch::dispatch_syscall_with_native::<
+    let route = crate::dispatch::dispatch_syscall_with_native::<
         _,
         FakeCpu,
         HardwareUserWord,
@@ -2088,7 +2078,7 @@ fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
     // and timer path must run after that guard, even if it reenters the graph.
     struct GraphOwner<'a> {
         binding: carrick_el1_abi::ExecutionBinding,
-        graph: &'a crate::lock::SpinLock<()>,
+        graph: &'a carrick_el1::lock::SpinLock<()>,
         page: &'a ThreadLifecyclePage,
         zone: &'a ZoneTables,
         settlements: &'a core::cell::Cell<u32>,
@@ -2155,7 +2145,7 @@ fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
     let w = World::new(LifecycleHatches::ON);
     assert!(w.venue.leader_slot().publish_visible_tid(PARENT_TID as u32));
     w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
-    let graph = crate::lock::SpinLock::new(());
+    let graph = carrick_el1::lock::SpinLock::new(());
     let checks = core::cell::Cell::new(0_u32);
     let probe = || {
         if w.zone.slot(SLOT).queued() != 0 {
@@ -2170,7 +2160,7 @@ fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
         probe: &probe,
     };
     let mut owner = GraphOwner {
-        binding: crate::personality::common_entry::execution_binding(w.task()),
+        binding: crate::common_entry::execution_binding(w.task()),
         graph: &graph,
         page: w.page(),
         zone: &w.zone,
@@ -2223,7 +2213,7 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
     // and timer path must run after that guard, even if it reenters the graph.
     struct GraphOwner<'a> {
         binding: carrick_el1_abi::ExecutionBinding,
-        graph: &'a crate::lock::SpinLock<()>,
+        graph: &'a carrick_el1::lock::SpinLock<()>,
         page: &'a ThreadLifecyclePage,
         zone: &'a ZoneTables,
         settlements: &'a core::cell::Cell<u32>,
@@ -2290,7 +2280,7 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
     let w = World::new(LifecycleHatches::ON);
     assert!(w.venue.leader_slot().publish_visible_tid(PARENT_TID as u32));
     w.venue.stock(0, CHILD_TID, CHILD_VISIBLE);
-    let graph = crate::lock::SpinLock::new(());
+    let graph = carrick_el1::lock::SpinLock::new(());
     let checks = core::cell::Cell::new(0_u32);
     let probe = || {
         if w.zone.slot(SLOT).queued() != 0 {
@@ -2305,7 +2295,7 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
         probe: &probe,
     };
     let mut owner = GraphOwner {
-        binding: crate::personality::common_entry::execution_binding(w.task()),
+        binding: crate::common_entry::execution_binding(w.task()),
         graph: &graph,
         page: w.page(),
         zone: &w.zone,
@@ -2420,7 +2410,7 @@ fn clone_terminal_failure_witness(mode: u8) {
     // and timer path must run after that guard, even if it reenters the graph.
     struct GraphOwner<'a> {
         binding: carrick_el1_abi::ExecutionBinding,
-        graph: &'a crate::lock::SpinLock<()>,
+        graph: &'a carrick_el1::lock::SpinLock<()>,
         page: &'a ThreadLifecyclePage,
         zone: &'a ZoneTables,
         settlements: &'a core::cell::Cell<u32>,
@@ -2531,7 +2521,7 @@ fn clone_terminal_failure_witness(mode: u8) {
     } else {
         None
     };
-    let graph = crate::lock::SpinLock::new(());
+    let graph = carrick_el1::lock::SpinLock::new(());
     let checks = core::cell::Cell::new(0_u32);
     let probe = || {
         if w.zone.slot(SLOT).queued() != 0 {
@@ -2546,7 +2536,7 @@ fn clone_terminal_failure_witness(mode: u8) {
         probe: &probe,
     };
     let mut owner = GraphOwner {
-        binding: crate::personality::common_entry::execution_binding(w.task()),
+        binding: crate::common_entry::execution_binding(w.task()),
         graph: &graph,
         page: w.page(),
         zone: &w.zone,
@@ -2590,7 +2580,7 @@ fn clone_terminal_failure_witness(mode: u8) {
         .err()
         .expect("clone must stop the run rather than return an errno");
     let failure = payload
-        .downcast::<crate::personality::native_run_failure::NativeRunFailurePanic>()
+        .downcast::<crate::native_run_failure::NativeRunFailurePanic>()
         .expect("typed terminal cause");
     assert_eq!(failure.binding, owner.binding);
     assert_eq!(
@@ -2652,7 +2642,7 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
         }
     }
     let mut w = World::new(LifecycleHatches::ON);
-    let binding = crate::personality::common_entry::execution_binding(w.task());
+    let binding = crate::common_entry::execution_binding(w.task());
     let mut failed = Failed { binding };
     let mut frame = TrapFrame {
         slot: SLOT_IDX as u64,
@@ -2660,7 +2650,7 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
     };
     frame.x[8] = 94;
     let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::personality::dispatch::dispatch_syscall_with_native(
+        crate::dispatch::dispatch_syscall_with_native(
             &mut frame,
             &w.counters,
             &w.tasks,
@@ -2684,7 +2674,7 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
     }));
     let payload = stopped.expect_err("ARM must consume the terminal failure before returning Idle");
     let failure = payload
-        .downcast::<crate::personality::native_run_failure::NativeRunFailurePanic>()
+        .downcast::<crate::native_run_failure::NativeRunFailurePanic>()
         .expect("typed ARM completion cause");
     assert_eq!(failure.binding, binding);
     assert_eq!(

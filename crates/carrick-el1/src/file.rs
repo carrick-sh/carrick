@@ -7,7 +7,7 @@ use carrick_el1_abi::{
 };
 use core::sync::atomic::Ordering;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "host-test"))]
 std::thread_local! {
     pub static SIMULATE_COPY_FAULT: core::sync::atomic::AtomicBool =
         const { core::sync::atomic::AtomicBool::new(false) };
@@ -21,7 +21,7 @@ std::thread_local! {
 /// `dest` and `src` must be valid for pointer arithmetic. Faults on accessing user memory
 /// are safely caught by the EL1 fixup mechanism.
 #[inline(never)]
-pub(crate) unsafe fn copy_to_user_guarded(
+pub unsafe fn copy_to_user_guarded(
     cur_task: &CurrentTask,
     dest: *mut u8,
     src: *const u8,
@@ -63,7 +63,7 @@ pub(crate) unsafe fn copy_to_user_guarded(
     #[cfg(not(target_os = "none"))]
     {
         let _ = cur_task;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "host-test"))]
         if SIMULATE_COPY_FAULT.with(|f| f.load(Ordering::Relaxed)) {
             return false;
         }
@@ -88,7 +88,7 @@ pub(crate) unsafe fn copy_to_user_guarded(
 /// `dest` and `src` must be valid for pointer arithmetic. Faults on accessing user memory
 /// are safely caught by the EL1 fixup mechanism.
 #[inline(never)]
-pub(crate) unsafe fn copy_from_user_guarded(
+pub unsafe fn copy_from_user_guarded(
     cur_task: &CurrentTask,
     dest: *mut u8,
     src: *const u8,
@@ -130,7 +130,7 @@ pub(crate) unsafe fn copy_from_user_guarded(
     #[cfg(not(target_os = "none"))]
     {
         let _ = cur_task;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "host-test"))]
         if SIMULATE_COPY_FAULT.with(|f| f.load(Ordering::Relaxed)) {
             return false;
         }

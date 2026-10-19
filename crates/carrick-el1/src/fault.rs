@@ -230,6 +230,21 @@ impl PreparedPageResolver for HardwarePreparedResolver {
     }
 }
 
+/// Invalidate this CPL0 CPU's TLB entry for the page holding `va` in the
+/// live root.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn invalidate_local_page(va: u64) {
+    // SAFETY: INVLPG is local to this CPL0 CPU and the live root.
+    unsafe {
+        core::arch::asm!(
+            "invlpg [{}]",
+            in(reg) va & !4095,
+            options(nostack, preserves_flags)
+        )
+    }
+}
+
 /// CPL0 publication of a host-backed prepared leaf while the shared fault
 /// dispatcher holds this MM's exact guest editor.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -587,6 +602,7 @@ pub trait CowCopyWindow {
 /// Borrow the existing slot-scoped copy aliases for one bounded owner operation.
 /// The closure cannot carry table words or copy aliases across a host supply.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[allow(clippy::result_unit_err)]
 pub fn with_hardware_cow_venue<R>(
     ttbr0: u64,
     service_slot: Option<carrick_el1_abi::SlotId>,
@@ -2521,8 +2537,8 @@ mod tests {
 
     #[test]
     fn owner_cow_fault_preserves_validated_empty_pool_supply() {
-        use crate::personality::mm_portal::test_support::{IPA, ROOT, RW, Tables, VA};
         use carrick_el1_abi::FrameGrantResidencyTable;
+        use carrick_el1_linux::mm_portal::test_support::{IPA, ROOT, RW, Tables, VA};
         use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
         struct EmptyCow<'a>(
             &'a Tables,

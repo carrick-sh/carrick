@@ -1,6 +1,6 @@
 //! Explicit per-frame policy avoids process-global aperture mutation in tests.
-use carrick_el1::personality::dispatch::GuestDispatchFrame;
 use carrick_el1_abi::TrapFrame;
+use carrick_el1_linux::dispatch::GuestDispatchFrame;
 use carrick_guest_arch::{NativeOrdinal, NativeReturnWord, SlotId, UserVa};
 use carrick_guest_mem::ArmRingFirst;
 use carrick_personality_linux::crossing::HostCrossingSet;

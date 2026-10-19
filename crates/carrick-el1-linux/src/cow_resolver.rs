@@ -2,7 +2,7 @@
 //! reconcile a parent write with this personality's pending fork custody,
 //! and the ARM data-abort entry that selects them.
 #[cfg(target_os = "none")]
-use crate::fault::*;
+use carrick_el1::fault::*;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use carrick_el1_abi::CurrentTask;
 use carrick_el1_abi::{Action, Counters, TrapFrame};
@@ -26,8 +26,8 @@ impl CowResolver for HardwareCowResolver {
         sequence: core::num::NonZeroU64,
         completion: carrick_el1_abi::CowGrantCompletion,
         words: &W,
-    ) -> Result<(), crate::personality::mm_portal::MmError> {
-        crate::personality::mm_portal::reconcile_pending_parent_write(
+    ) -> Result<(), crate::mm_portal::MmError> {
+        crate::mm_portal::reconcile_pending_parent_write(
             slot as usize,
             handle,
             sequence,
@@ -49,7 +49,7 @@ impl CowResolver for HardwareCowResolver {
     fn resolve_cow_outcome(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> CowResolution {
         let outcome =
             with_hardware_cow_venue(ttbr0, self.service_slot, self.publication, |venue| {
-                crate::cow::resolve_guest_cow(
+                carrick_el1::cow::resolve_guest_cow(
                     venue,
                     mm_key,
                     far,
@@ -65,8 +65,8 @@ impl CowResolver for HardwareCowResolver {
                         }
                     },
                     || {
-                        let mut cpu = crate::substrate::sched::HardwareCpu;
-                        crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
+                        let mut cpu = carrick_el1::substrate::sched::HardwareCpu;
+                        carrick_el1::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
                     },
                 )
             });
@@ -107,8 +107,8 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
         sequence: core::num::NonZeroU64,
         completion: carrick_el1_abi::CowGrantCompletion,
         words: &W,
-    ) -> Result<(), crate::personality::mm_portal::MmError> {
-        crate::personality::mm_portal::reconcile_pending_parent_write(
+    ) -> Result<(), crate::mm_portal::MmError> {
+        crate::mm_portal::reconcile_pending_parent_write(
             slot as usize,
             handle,
             sequence,
@@ -129,19 +129,10 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
                 core::ptr::copy_nonoverlapping(source as *const u8, destination as *mut u8, 4096)
             }
         };
-        let invalidate = || {
-            // A stale writable TLB entry can make a permission fault
-            // retryable even when the live leaf is already writable.
-            // SAFETY: INVLPG is local to this CPL0 CPU and the live root.
-            unsafe {
-                core::arch::asm!(
-                    "invlpg [{}]",
-                    in(reg) far & !4095,
-                    options(nostack, preserves_flags)
-                )
-            }
-        };
-        let venue = carrick_core::mm::cow::GuestCowVenue::<crate::cow::X86CowMmu, _> {
+        // A stale writable TLB entry can make a permission fault
+        // retryable even when the live leaf is already writable.
+        let invalidate = || carrick_el1::fault::invalidate_local_page(far);
+        let venue = carrick_core::mm::cow::GuestCowVenue::<carrick_el1::cow::X86CowMmu, _> {
             words: self.words,
             root: carrick_mmu_core::aarch64::SubstrateGpa(root),
             pool: self.pool,
@@ -156,7 +147,7 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
         // resolve_x86_guest_cow authenticates the live CR3 and retained
         // supplied descriptor-word authority before reading or changing descriptors.
         let outcome = unsafe {
-            crate::cow::resolve_x86_guest_cow(&venue, mm_key, far, copy_page, invalidate)
+            carrick_el1::cow::resolve_x86_guest_cow(&venue, mm_key, far, copy_page, invalidate)
         };
         handle_cow_outcome(outcome, &mut self.completion)
     }
@@ -195,7 +186,7 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
             frame,
             counters,
             current_tasks,
-            crate::substrate::sched::object_wait::space_access(
+            carrick_el1::substrate::sched::object_wait::space_access(
                 zone,
                 carrick_sched_core::SlotId::new(frame.slot as u8),
             ),
@@ -208,9 +199,9 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
             },
             Some(PreparedFaultPath::<_> {
-                residency: crate::isa::frame_grant_residency_guest(),
+                residency: carrick_el1::isa::frame_grant_residency_guest(),
                 resolver: &mut HardwarePreparedResolver,
-                roots: Some(crate::memory::reservations::shared_guest()),
+                roots: Some(carrick_el1::memory::reservations::shared_guest()),
                 file_slots: Some(unsafe {
                     &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
                 }),

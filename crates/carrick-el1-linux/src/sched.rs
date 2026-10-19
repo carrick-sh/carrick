@@ -1,5 +1,5 @@
 //! Native scheduler transport for the Linux-owned futex client.
-pub use crate::substrate::sched::*;
+pub use carrick_el1::substrate::sched::*;
 use carrick_el1_abi::TrapFrame;
 use carrick_el1_abi::{ReservationMm, UserVa};
 use carrick_guest_arch::CounterTick;
@@ -18,10 +18,10 @@ pub struct HardwareCpu;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl ThreadCpu for HardwareCpu {
     fn save(&mut self, frame: &TrapFrame, ctx: &mut carrick_el1_abi::Aarch64ParkedContext) {
-        crate::substrate::sched::hw::HardwareCpu.save(frame, ctx);
+        carrick_el1::substrate::sched::hw::HardwareCpu.save(frame, ctx);
     }
     fn load(&mut self, frame: &mut TrapFrame, ctx: &carrick_el1_abi::Aarch64ParkedContext) {
-        crate::substrate::sched::hw::HardwareCpu.load(frame, ctx);
+        carrick_el1::substrate::sched::hw::HardwareCpu.load(frame, ctx);
     }
     fn resume_lifecycle(
         &mut self,
@@ -37,45 +37,42 @@ impl ThreadCpu for HardwareCpu {
         super::aarch64_process::resume_production(zone, task, slot, record)
     }
     fn set_translation(&mut self, a: u64, b: u64) {
-        crate::substrate::sched::hw::HardwareCpu.set_translation(a, b);
+        carrick_el1::substrate::sched::hw::HardwareCpu.set_translation(a, b);
     }
     fn invalidate_asid(&mut self, root: u64) {
-        crate::substrate::sched::hw::HardwareCpu.invalidate_asid(root);
+        carrick_el1::substrate::sched::hw::HardwareCpu.invalidate_asid(root);
     }
     fn now(&self) -> u64 {
-        crate::substrate::sched::hw::HardwareCpu.now()
+        carrick_el1::substrate::sched::hw::HardwareCpu.now()
     }
     fn freq(&self) -> u64 {
-        crate::substrate::sched::hw::HardwareCpu.freq()
+        carrick_el1::substrate::sched::hw::HardwareCpu.freq()
     }
     fn set_timer(&mut self, deadline: Option<u64>) {
-        crate::substrate::sched::hw::HardwareCpu.set_timer(deadline);
+        carrick_el1::substrate::sched::hw::HardwareCpu.set_timer(deadline);
     }
     fn send_sgi(&mut self, route: u64) {
-        crate::substrate::sched::hw::HardwareCpu.send_sgi(route);
+        carrick_el1::substrate::sched::hw::HardwareCpu.send_sgi(route);
     }
     fn ack_irq(&mut self) -> u32 {
-        crate::substrate::sched::hw::HardwareCpu.ack_irq()
+        carrick_el1::substrate::sched::hw::HardwareCpu.ack_irq()
     }
     fn end_irq(&mut self, intid: u32) {
-        crate::substrate::sched::hw::HardwareCpu.end_irq(intid);
+        carrick_el1::substrate::sched::hw::HardwareCpu.end_irq(intid);
     }
     fn wait_for_interrupt(&mut self) {
-        crate::substrate::sched::hw::HardwareCpu.wait_for_interrupt();
+        carrick_el1::substrate::sched::hw::HardwareCpu.wait_for_interrupt();
     }
     fn spin(&mut self) {
-        crate::substrate::sched::hw::HardwareCpu.spin();
+        carrick_el1::substrate::sched::hw::HardwareCpu.spin();
     }
     fn own_sgi_target(&self) -> u64 {
-        crate::substrate::sched::hw::HardwareCpu.own_sgi_target()
+        carrick_el1::substrate::sched::hw::HardwareCpu.own_sgi_target()
     }
 }
 
 pub fn is_served_futex_op(frame: &TrapFrame) -> bool {
-    ::carrick_personality_linux::sched::is_served_futex_op(
-        frame.x[8],
-        crate::personality::sched::args(frame),
-    )
+    ::carrick_personality_linux::sched::is_served_futex_op(frame.x[8], crate::sched::args(frame))
 }
 fn args(frame: &TrapFrame) -> [u64; 6] {
     [
@@ -127,20 +124,30 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
         )
     }
 }
-impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
-    pub fn serve_futex(&mut self, frame: &mut TrapFrame) -> Option<Served> {
+/// Linux entry points over the neutral scheduler: futex service and the
+/// timer-expiry result its interrupt and idle paths report.
+pub trait LinuxSchedEntry {
+    fn serve_futex(&mut self, frame: &mut TrapFrame) -> Option<Served>;
+    fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action;
+    fn serve_idle_entry(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action;
+}
+impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
+    fn serve_futex(&mut self, frame: &mut TrapFrame) -> Option<Served> {
         if !is_served_futex_op(frame) {
             return None;
         }
         let call = FutexCall {
-            args: crate::personality::sched::args(frame),
+            args: crate::sched::args(frame),
         };
         ::carrick_personality_linux::sched::serve_futex(call, &mut Adapter { sched: self, frame })
     }
-    pub fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action {
+    fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action {
         self.interrupt(frame, ETIMEDOUT_RESULT)
     }
-    pub fn serve_idle_entry(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action {
+    fn serve_idle_entry(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action {
         self.idle_entry(frame, ETIMEDOUT_RESULT)
     }
 }
+
+#[cfg(test)]
+mod tests;

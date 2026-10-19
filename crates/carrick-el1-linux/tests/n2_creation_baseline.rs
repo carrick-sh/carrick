@@ -4,12 +4,13 @@ use carrick_el1::fault::{
     dispatch_fault_with_prepared,
 };
 use carrick_el1::memory::reservations::{Decision, Layout, Placement, SharedReservations};
-use carrick_el1::{Zone, dispatch_syscall_with_lifecycle, sched};
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, FrameGrantMailbox, FrameGrantResidencyTable, InotifyNameCache,
     ReservationBackingReceipt, ReservationCompletion, ReservationMm, ReservationProtection,
     ReservationRange, TrapFrame,
 };
+use carrick_el1_linux::dispatch::{Zone, dispatch_syscall_with_lifecycle};
+use carrick_el1_linux::sched;
 use carrick_sched_core::AddressSpaces;
 use core::sync::atomic::Ordering;
 

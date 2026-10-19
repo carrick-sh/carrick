@@ -2,11 +2,11 @@
 #[cfg(target_os = "none")]
 use super::{El1MmHandle, GuestVa, TransferIntent};
 use super::{MmError, MmErrorLinux};
-use crate::memory::reservations::NativeReservationGeometry;
 pub use carrick_core::mm::transaction::{
     SelectionVenues, TRANSFER_CHUNK_BYTES, TransferStep, admit_service_root, bind_service_root,
     grant_target, prepare_transfer, serve_transfer, settle_prepared_service,
 };
+use carrick_el1::memory::reservations::NativeReservationGeometry;
 #[cfg(target_os = "none")]
 use carrick_el1_abi::PinnedMetadataExtent;
 #[cfg(any(test, target_os = "none"))]
@@ -27,14 +27,14 @@ impl<C: carrick_el1_abi::EntryContext> carrick_core::mm::transaction::OwnerVenue
         zone: &carrick_sched_core::ZoneTables<C>,
         slot: carrick_sched_core::SlotId,
     ) -> carrick_sched_core::spaces::notification::SpaceAccess<'_, C> {
-        crate::substrate::sched::object_wait::space_access(zone, slot)
+        carrick_el1::substrate::sched::object_wait::space_access(zone, slot)
     }
     fn deliver_completion(
         zone: &carrick_sched_core::ZoneTables<C>,
         slot: carrick_sched_core::SlotId,
         effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>,
     ) {
-        crate::substrate::sched::object_wait::deliver_completion(zone, slot, effects)
+        carrick_el1::substrate::sched::object_wait::deliver_completion(zone, slot, effects)
     }
     fn encode_error(error: MmError) -> u32 {
         error.errno()
@@ -99,7 +99,7 @@ unsafe impl PinnedMetadataExtent for GuestMetadataPin {
 #[cfg(target_os = "none")]
 pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let Some(executor_slot) = carrick_el1_abi::service_slot_from_stack(
-        crate::substrate::sched::hw::read_current_sp(),
+        carrick_el1::substrate::sched::hw::read_current_sp(),
         frame.slot,
     ) else {
         frame.x[0] = 3;
@@ -125,7 +125,7 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let portal = MmPortal::<GuestMetadataPin> {
         backend: core::marker::PhantomData,
         carrier: request.operation.carrier,
-        roots: crate::memory::reservations::shared_guest(),
+        roots: carrick_el1::memory::reservations::shared_guest(),
         spaces: &zone.spaces,
         nodes: None,
         zone: Some(zone),
@@ -157,7 +157,7 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) live_ttbr, options(nomem, nostack));
     }
     #[cfg(target_arch = "x86_64")]
-    let words = match crate::isa::x86::portal_descriptor_words(grant.ttbr0) {
+    let words = match carrick_el1::isa::x86::portal_descriptor_words(grant.ttbr0) {
         Ok(words) => words,
         Err(_) => {
             service.complete(0, 3);
@@ -199,9 +199,9 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
 #[cfg(target_os = "none")]
 pub(crate) fn yield_host_effect() {
     #[cfg(target_arch = "aarch64")]
-    crate::isa::aarch64::yield_host_effect();
+    carrick_el1::isa::aarch64::yield_host_effect();
     #[cfg(target_arch = "x86_64")]
-    crate::isa::x86::yield_host_effect();
+    carrick_el1::isa::x86::yield_host_effect();
 }
 
 /// Selection entry for a borrowed target root. Input x1..x7 is carrier, MM,
@@ -210,7 +210,7 @@ pub(crate) fn yield_host_effect() {
 #[cfg(target_os = "none")]
 pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let Some(executor_slot) = carrick_el1_abi::service_slot_from_stack(
-        crate::substrate::sched::hw::read_current_sp(),
+        carrick_el1::substrate::sched::hw::read_current_sp(),
         frame.slot,
     ) else {
         frame.x[0] = 3;
@@ -234,7 +234,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let portal = MmPortal::<GuestMetadataPin> {
             backend: core::marker::PhantomData,
             carrier,
-            roots: crate::memory::reservations::shared_guest(),
+            roots: carrick_el1::memory::reservations::shared_guest(),
             spaces: &zone.spaces,
             nodes: None,
             zone: Some(zone),
@@ -260,8 +260,8 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             core::arch::asm!("mrs {}, ttbr0_el1", out(reg) live_ttbr, options(nomem, nostack));
         }
         #[cfg(target_arch = "x86_64")]
-        let words =
-            crate::isa::x86::portal_descriptor_words(grant.ttbr0).map_err(|_| MmError::Stale)?;
+        let words = carrick_el1::isa::x86::portal_descriptor_words(grant.ttbr0)
+            .map_err(|_| MmError::Stale)?;
         #[cfg(target_arch = "aarch64")]
         let table = carrick_el1_abi::service_target_table_window(live_ttbr, grant.ttbr0)
             .ok_or(MmError::Stale)?;
@@ -303,14 +303,14 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         }
         .map_err(|_| MmError::Core)?;
         #[cfg(target_arch = "aarch64")]
-        let prepared = &mut crate::fault::HardwarePreparedResolver;
+        let prepared = &mut carrick_el1::fault::HardwarePreparedResolver;
         #[cfg(target_arch = "x86_64")]
         let prepared = &mut carrick_core::mm::transfer::resolver::NoopPreparedResolver;
         #[cfg(target_arch = "x86_64")]
         // CPL0 COW is unavailable until its sole descriptor authority is bound.
         let mut cow = carrick_core::mm::transfer::resolver::NoopCowResolver;
         #[cfg(target_arch = "aarch64")]
-        let mut cow = crate::personality::cow_resolver::HardwareCowResolver {
+        let mut cow = crate::cow_resolver::HardwareCowResolver {
             publication: slots.executable(frame.slot as usize),
             completion: None,
             service_slot: Some(executor_slot),
@@ -321,7 +321,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             carrick_core::mm::transaction::SelectionVenues {
                 prepared,
                 cow: &mut cow,
-                residency: crate::isa::frame_grant_residency_guest(),
+                residency: carrick_el1::isa::frame_grant_residency_guest(),
                 slot: frame.slot as u32,
             },
         )? {
@@ -379,7 +379,7 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     frame.x[0] = 22;
     frame.x[14] = 0;
     let Some(executor_slot) = carrick_el1_abi::service_slot_from_stack(
-        crate::substrate::sched::hw::read_current_sp(),
+        carrick_el1::substrate::sched::hw::read_current_sp(),
         frame.slot,
     ) else {
         return;
@@ -399,7 +399,7 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let portal = MmPortal::<GuestMetadataPin> {
         backend: core::marker::PhantomData,
         carrier,
-        roots: crate::memory::reservations::shared_guest(),
+        roots: carrick_el1::memory::reservations::shared_guest(),
         spaces: &zone.spaces,
         nodes: None,
         zone: Some(zone),
@@ -425,12 +425,12 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         core::arch::asm!("mrs {}, ttbr0_el1",out(reg)ttbr,options(nomem,nostack));
     }
     #[cfg(target_arch = "x86_64")]
-    let words = match crate::isa::x86::portal_descriptor_words(target.grant().ttbr0) {
+    let words = match carrick_el1::isa::x86::portal_descriptor_words(target.grant().ttbr0) {
         Ok(words) => words,
         Err(_) => return,
     };
     #[cfg(target_arch = "aarch64")]
-    let maintenance = crate::fault::El1TableMaintenance {
+    let maintenance = carrick_el1::isa::arm_edit::El1TableMaintenance {
         ttbr0: target.grant().ttbr0,
     };
     #[cfg(target_arch = "aarch64")]
@@ -441,14 +441,14 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     if apply_grant::<NativePortalMmu, _>(
         slot,
         &words,
-        crate::isa::frame_grant_residency_guest(),
+        carrick_el1::isa::frame_grant_residency_guest(),
         target,
         || {
             #[cfg(target_arch = "aarch64")]
             crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, root);
             #[cfg(target_arch = "x86_64")]
-            if crate::isa::x86::portal_invalidate_root(root).is_err() {
-                crate::isa::x86::fatal_entry_binding();
+            if carrick_el1::isa::x86::portal_invalidate_root(root).is_err() {
+                carrick_el1::isa::x86::fatal_entry_binding();
             }
         },
     )
@@ -461,7 +461,7 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
 #[cfg(target_os = "none")]
 pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let Some(executor_slot) = carrick_el1_abi::service_slot_from_stack(
-        crate::substrate::sched::hw::read_current_sp(),
+        carrick_el1::substrate::sched::hw::read_current_sp(),
         frame.slot,
     ) else {
         frame.x[0] = 3;
@@ -495,7 +495,7 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             core::arch::asm!("mrs {}, ttbr0_el1",out(reg)live,options(nomem,nostack));
         }
         #[cfg(target_arch = "x86_64")]
-        let valid = crate::isa::x86::portal_descriptor_words(root).is_ok();
+        let valid = carrick_el1::isa::x86::portal_descriptor_words(root).is_ok();
         #[cfg(target_arch = "aarch64")]
         let valid = carrick_el1_abi::service_target_table_window(live, root).is_some();
         if !valid {
@@ -504,7 +504,7 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let portal = MmPortal::<GuestMetadataPin> {
             backend: core::marker::PhantomData,
             carrier,
-            roots: crate::memory::reservations::shared_guest(),
+            roots: carrick_el1::memory::reservations::shared_guest(),
             spaces: &zone.spaces,
             nodes: None,
             zone: Some(zone),

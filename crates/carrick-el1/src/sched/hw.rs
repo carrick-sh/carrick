@@ -454,7 +454,7 @@ pub fn restore_irq(guard: IrqGuard) {
 /// Non-returning native fatal transport after an entry loses its exact binding.
 /// Guest syscall replay or a return through another task is forbidden.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-pub(crate) fn fatal_entry_binding() -> ! {
+pub fn fatal_entry_binding() -> ! {
     // SAFETY: this runs at EL1. HVC #3 is the image's fatal boundary, with
     // the established panic sentinel and no guest return/result publication.
     unsafe {
@@ -469,6 +469,6 @@ pub(crate) fn fatal_entry_binding() -> ! {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) fn fatal_entry_binding() -> ! {
+pub fn fatal_entry_binding() -> ! {
     crate::isa::x86::fatal_entry_binding()
 }

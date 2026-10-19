@@ -1,4 +1,5 @@
-//! Carrick guest EL1 image: neutral mechanisms and Linux personality.
+//! Carrick guest EL1 runtime: neutral mechanisms. The Linux personality
+//! client and the image binary live in `carrick-el1-linux`.
 //!
 //! One kernel body is compiled into the AArch64 EL1 and x86_64 CPL0 images.
 #![cfg_attr(target_os = "none", no_std)]
@@ -10,14 +11,8 @@ pub mod fault;
 pub mod isa;
 pub mod lock;
 pub mod memory;
-pub mod personality;
 pub mod substrate;
-pub use personality::dispatch::*;
-pub use personality::{file, inotify, sched};
 
-#[cfg(test)]
-#[path = "personality/native_ownership_tests.rs"]
-mod native_ownership_tests;
 #[cfg(test)]
 #[path = "isa/x86/context_resume.rs"]
 mod x86_context_resume_tests;

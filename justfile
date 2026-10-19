@@ -410,8 +410,8 @@ test *ARGS: _test-stdio
         # a test moved out of `src/` used to leave every gate silently. The
         # host-lane selection is DERIVED from Cargo metadata (`test-lanes args --lane host`
         # via `_test-unit-lanes`), and `lint-domains-source` runs `test-lanes check`.
-        {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1 {{ARGS}}
-        just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1 {{ARGS}}
+        {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1-linux {{ARGS}}
+        just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1-linux {{ARGS}}
         just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
         just --justfile {{justfile()}} _test-unit-host {{ARGS}}
         just --justfile {{justfile()}} _test-unit-vfs {{ARGS}}
@@ -422,13 +422,13 @@ test *ARGS: _test-stdio
         just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
         just --justfile {{justfile()}} _test-unit-host {{ARGS}}
         just --justfile {{justfile()}} _test-unit-runtime {{ARGS}}
-        {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1 {{ARGS}}
-        just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1 {{ARGS}}
+        {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1-linux {{ARGS}}
+        just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1-linux {{ARGS}}
     fi
 
 # Unit groups are whole Cargo selections: newly added tests stay selected.
 test-shard-a *ARGS: _test-stdio
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1 {{ARGS}}
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1-linux {{ARGS}}
 
 # Consolidates workspace, mm-owner, CLI, host, VFS, kernel, runtime, HVF and
 # EL1 unit selections into one shard so hosted macOS runs fit within the
@@ -440,8 +440,8 @@ test-shard-b *ARGS: _test-stdio
     just --justfile {{justfile()}} _test-unit-host {{ARGS}}
     just --justfile {{justfile()}} _test-unit-vfs {{ARGS}}
     # EL1 production-routing witnesses must not inherit kernel-example's or
-    # runtime's carrick-el1/host-test feature. Keep their original package selection.
-    just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1 {{ARGS}}
+    # runtime's carrick-el1-linux/host-test feature. Keep their original package selection.
+    just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1-linux {{ARGS}}
     just --justfile {{justfile()}} _test-unit-kernel {{ARGS}}
     just --justfile {{justfile()}} _test-unit-runtime {{ARGS}}
     just --justfile {{justfile()}} _test-unit-hvf {{ARGS}}
@@ -462,7 +462,7 @@ _test-stdio:
 
 [private]
 _test-unit-mm-owner *ARGS:
-    {{_admit}} {{_cargo}} test -p carrick-el1 --doc mm_portal
+    {{_admit}} {{_cargo}} test -p carrick-el1-linux --doc mm_portal
     # Shared owner witnesses and X1 use host-owned descriptors; no VM/Docker.
     just --justfile {{justfile()}} test-mm-owner {{ARGS}}
 

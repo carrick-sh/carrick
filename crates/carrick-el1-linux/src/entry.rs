@@ -38,34 +38,34 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
     if frame.is_null() {
         return carrick_el1_abi::Action::Forward as u64;
     }
-    carrick_el1::personality::mm_portal::initialize_pending_forks();
+    carrick_el1_linux::mm_portal::initialize_pending_forks();
     let frame_ref = unsafe { &mut *frame };
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_MAINTENANCE_ESR {
-        carrick_el1::personality::mm_portal::serve_backing_maintenance_hw(frame_ref);
+        carrick_el1_linux::mm_portal::serve_backing_maintenance_hw(frame_ref);
         return carrick_el1_abi::Action::Served as u64;
     }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_FORK_ESR {
-        carrick_el1::personality::mm_portal::serve_fork_hw(frame_ref);
+        carrick_el1_linux::mm_portal::serve_fork_hw(frame_ref);
         return carrick_el1_abi::Action::Served as u64;
     }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_FORK_FINISH_ESR {
-        carrick_el1::personality::mm_portal::finish_fork_hw(frame_ref);
+        carrick_el1_linux::mm_portal::finish_fork_hw(frame_ref);
         return carrick_el1_abi::Action::Served as u64;
     }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_BIND_ESR {
-        carrick_el1::personality::mm_portal::bind_transfer_hw(frame_ref);
+        carrick_el1_linux::mm_portal::bind_transfer_hw(frame_ref);
         return carrick_el1_abi::Action::Served as u64;
     }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_GRANT_ESR {
-        carrick_el1::personality::mm_portal::serve_grant_hw(frame_ref);
+        carrick_el1_linux::mm_portal::serve_grant_hw(frame_ref);
         return carrick_el1_abi::Action::Served as u64;
     }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_SELECT_ESR {
-        carrick_el1::personality::mm_portal::select_transfer_hw(frame_ref);
+        carrick_el1_linux::mm_portal::select_transfer_hw(frame_ref);
         return carrick_el1_abi::Action::Served as u64;
     }
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_SERVICE_ESR {
-        carrick_el1::personality::mm_portal::serve_transfer_hw(frame_ref);
+        carrick_el1_linux::mm_portal::serve_transfer_hw(frame_ref);
         return carrick_el1_abi::Action::Served as u64;
     }
     if frame_ref.esr == carrick_el1_abi::DESCRIPTOR_DRAIN_ESR {
@@ -74,7 +74,7 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
     }
     let counters_ref =
         unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
-    let action = carrick_el1::dispatch_entry(frame_ref, counters_ref);
+    let action = carrick_el1_linux::dispatch::dispatch_entry(frame_ref, counters_ref);
     carrick_el1::fault::drain_before_el0_hw(frame_ref, action) as u64
 }
 

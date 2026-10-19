@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 #[cfg(any(test, feature = "host-test"))]
-use crate::lock::SpinLock;
+use carrick_el1::lock::SpinLock;
 use carrick_el1_abi::{
     DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE, DELEGATED_STATE_DEAD, DELEGATED_STATE_GUEST,
     DelegatedFile, DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, HostBoundFd, HostObjectBinding,
@@ -596,7 +596,7 @@ pub fn resolve_poll(
     fd_map: &[FdMapSlot],
     open_table: &[DelegatedOpenFile],
     _object_table: &[DelegatedFile],
-    _ipc: Option<&crate::personality::ipc::IpcVenue<'_>>,
+    _ipc: Option<&crate::ipc::IpcVenue<'_>>,
     file_table: u64,
     pollfds: &mut [PollFd],
 ) -> i32 {
@@ -617,7 +617,7 @@ pub fn resolve_poll_with_host_readiness(
     fd_map: &[FdMapSlot],
     open_table: &[DelegatedOpenFile],
     _object_table: &[DelegatedFile],
-    _ipc: Option<&crate::personality::ipc::IpcVenue<'_>>,
+    _ipc: Option<&crate::ipc::IpcVenue<'_>>,
     file_table: u64,
     pollfds: &mut [PollFd],
     host_entries: Option<&[HostReadinessEntry]>,
@@ -700,7 +700,7 @@ impl PollContinuation {
         fd_map: &[FdMapSlot],
         open_table: &[DelegatedOpenFile],
         object_table: &[DelegatedFile],
-        ipc: Option<&crate::personality::ipc::IpcVenue<'_>>,
+        ipc: Option<&crate::ipc::IpcVenue<'_>>,
     ) -> Option<i32> {
         let ready = resolve_poll(
             fd_map,
@@ -719,7 +719,7 @@ impl PollContinuation {
         fd_map: &[FdMapSlot],
         open_table: &[DelegatedOpenFile],
         object_table: &[DelegatedFile],
-        ipc: Option<&crate::personality::ipc::IpcVenue<'_>>,
+        ipc: Option<&crate::ipc::IpcVenue<'_>>,
     ) -> (i32, Vec<PollFd>) {
         let ready = resolve_poll(
             fd_map,

@@ -100,7 +100,7 @@ pub const fn sgi_target_of(mpidr: u64) -> u64 {
 
 /// The running thread's identity, as the host published it (for the
 /// host-loaded thread) or EL1 did after a switch.
-pub(crate) fn identity_of(task: &CurrentTask, affinity: u64) -> ThreadIdentity {
+pub fn identity_of(task: &CurrentTask, affinity: u64) -> ThreadIdentity {
     ThreadIdentity {
         tid: task.execution.task.load(Ordering::Relaxed),
         serial: task.mm.thread_generation.load(Ordering::Relaxed),
@@ -172,11 +172,11 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         }
         Ok(record)
     }
-    pub(crate) fn ticks(&self, ns: u64) -> u64 {
+    pub fn ticks(&self, ns: u64) -> u64 {
         (u128::from(ns) * u128::from(self.cpu.freq()) / 1_000_000_000) as u64
     }
 
-    pub(crate) fn wake_word(
+    pub fn wake_word(
         &mut self,
         frame: &mut TrapFrame,
         mm: u64,
@@ -221,7 +221,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn wait_word(
+    pub fn wait_word(
         &mut self,
         frame: &mut TrapFrame,
         mm: u64,
@@ -307,7 +307,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// The running thread parked (or exited in the zone): run the next
     /// runnable thread, or leave for the host when that thread needs its
     /// executor, or idle.
-    pub(crate) fn run_next(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
+    pub fn run_next(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
         match self.run_ready(frame) {
             Some(progress) => progress,
             None => self.idle(frame, timeout_result),
@@ -317,7 +317,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// Consume already-ready zone work after an owned native park. No work
     /// leaves the caller's host handoff intact, so its execution capacity can
     /// be released without sending a native child to a host-task adopter.
-    pub(crate) fn run_ready(&mut self, frame: &mut TrapFrame) -> Option<Served> {
+    pub fn run_ready(&mut self, frame: &mut TrapFrame) -> Option<Served> {
         loop {
             if let Some(switched) = self.zone.switch_in_full(self.slot) {
                 match self.load(frame, switched) {
@@ -338,7 +338,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// its creator wrote, joins this vCPU's run queue: it runs when the
     /// running thread parks, when an idle vCPU steals it, or when the slice
     /// ends (the tick migrates it to an idle vCPU first).
-    pub(crate) fn enqueue_born(&mut self, record: carrick_el1_abi::RecordId) {
+    pub fn enqueue_born(&mut self, record: carrick_el1_abi::RecordId) {
         let (zone, slot) = (self.zone, self.slot);
         let was_empty = zone.slot(slot).queued() == 0;
         zone.requeue_preempted(slot, record);
@@ -351,7 +351,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// A guest yield is a fairness boundary for runnable work already owned
     /// by this EL1 zone. Save the caller's zero result before switching: the
     /// frame after the switch belongs to the sibling's suspended syscall.
-    pub(crate) fn yield_queued(&mut self, frame: &mut TrapFrame) -> Option<Served> {
+    pub fn yield_queued(&mut self, frame: &mut TrapFrame) -> Option<Served> {
         if self.zone.runnable_head(self.slot).is_none()
             || self.task.linux.has_pending_host_work()
             || self.task.lifecycle_refs().is_some_and(|(page, control)| {
@@ -496,7 +496,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// Nothing is runnable on this vCPU: poll, then park in WFI, until a
     /// thread is queued here (by another vCPU, or this vCPU's timer ending
     /// its timed park) or host work arrives.
-    pub(crate) fn idle(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
+    pub fn idle(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
         let (zone, slot) = (self.zone, self.slot);
         zone.counters
             .el1_idle_entries
@@ -773,7 +773,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
 }
 
 #[path = "sched/hw.rs"]
-pub(crate) mod hw;
+pub mod hw;
 #[cfg(target_os = "none")]
 pub use hw::HardwareCpu;
 pub use hw::HardwareUserWord;
@@ -948,7 +948,3 @@ impl ThreadCpu for FakeCpu {
         sgi_target_of(self.mpidr)
     }
 }
-
-#[cfg(test)]
-#[path = "sched/tests.rs"]
-mod tests;

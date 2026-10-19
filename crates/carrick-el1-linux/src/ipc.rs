@@ -36,11 +36,11 @@
 //!   ([`IpcHandback`]) and carries the original `x0` and syscall number.
 
 use super::sched::{Sched, Served, ThreadCpu, UserWord};
-use crate::substrate::file::UserCopy;
-use crate::substrate::ipc::{
+use carrick_el1::substrate::file::UserCopy;
+use carrick_el1::substrate::ipc::{
     PrefixCopy, StepStatus, from_sched_token, to_sched_token, transfer, wait_key,
 };
-use crate::substrate::sched::object_wait::OperationResumePc;
+use carrick_el1::substrate::sched::object_wait::OperationResumePc;
 pub use carrick_el1_abi::ipc::IPC_HANDBACK_NR;
 use carrick_el1_abi::ipc::fd::{AccessMode, Error as FdError, Fd, TableId};
 use carrick_el1_abi::ipc::pipe::{WaitFor, WakeSet};
@@ -766,7 +766,7 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use crate::substrate::sched::{FakeCpu, HardwareUserWord};
+    use carrick_el1::substrate::sched::{FakeCpu, HardwareUserWord};
     use carrick_el1_abi::ipc::fd::{Description, StatusFlags};
     use carrick_el1_abi::ipc::{
         End, EventMode, Extent, IPC_POOL_ALIGN, IpcDirectory, IpcPipeStorage, LockWait,
@@ -2124,7 +2124,7 @@ mod tests {
         // host test reads process memory directly.
         let mut byte = [b'x'];
         let mut frame = syscall(SYS_WRITE, wfd, byte.as_mut_ptr() as u64, 1, A_SVC);
-        let action = crate::personality::dispatch::dispatch_syscall_with_ipc(
+        let action = crate::dispatch::dispatch_syscall_with_ipc(
             &mut frame,
             w.counters,
             &tasks,
@@ -2133,7 +2133,7 @@ mod tests {
             &[],
             &[],
             names,
-            Some(crate::personality::dispatch::Zone {
+            Some(crate::dispatch::Zone {
                 tables: &w.zone,
                 cpu: &mut cpu,
                 user: &HardwareUserWord,
@@ -2179,7 +2179,7 @@ mod tests {
             &*std::alloc::alloc_zeroed(Layout::new::<carrick_el1_abi::InotifyNameCache>()).cast()
         };
         let mut cpu = FakeCpu::default();
-        crate::personality::dispatch::dispatch_syscall_with_ipc(
+        crate::dispatch::dispatch_syscall_with_ipc(
             frame,
             w.counters,
             tasks,
@@ -2188,7 +2188,7 @@ mod tests {
             &[],
             &[],
             names,
-            Some(crate::personality::dispatch::Zone {
+            Some(crate::dispatch::Zone {
                 tables: &w.zone,
                 cpu: &mut cpu,
                 user: &HardwareUserWord,
