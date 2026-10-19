@@ -2027,6 +2027,35 @@ impl<'a> NetView<'a> {
             };
             let host_type = host_socktype_backing(family, base_type);
 
+            // Prepare the `sv` copyout before creating anything. An admitted
+            // EL1 owner may refuse a host copyout transiently (its editor is
+            // busy with a sibling thread's edit, or the page needs physical
+            // supply); that refusal parks the task and retries this syscall.
+            // Collapsing it into the copyout's EFAULT after both ends existed
+            // failed a live thread's valid stack array (#695 control).
+            enum SvOutput<'m, M> {
+                Prepared(Box<dyn carrick_guest_mem::PreparedGuestWrite + 'm>),
+                Direct(&'m mut M),
+            }
+            let sv_output = if memory.user_memory_venue()
+                == carrick_guest_mem::UserMemoryVenue::Owner
+            {
+                let Some(range) = carrick_guest_mem::GuestWriteRange::new(
+                    carrick_guest_mem::GuestVa::new(sv_addr),
+                    <LinuxFdPair as carrick_abi::KernelAbi>::ABI_SIZE,
+                ) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                };
+                match memory.prepare_write(&[range]) {
+                    Ok(permit) => SvOutput::Prepared(permit),
+                    Err(error) => {
+                        return Ok(crate::el1_delegation::owner_prepare_refusal(error));
+                    }
+                }
+            } else {
+                SvOutput::Direct(memory)
+            };
+
             let mut host_fds: [i32; 2] = [-1, -1];
             let rc =
                 unsafe { libc::socketpair(host_family, host_type, protocol, host_fds.as_mut_ptr()) };
@@ -2102,7 +2131,15 @@ impl<'a> NetView<'a> {
                 }
             };
             let pair = LinuxFdPair { read_fd, write_fd };
-            if write_kernel_struct_raw(memory, sv_addr, &pair).is_err() {
+            let written = match sv_output {
+                // A prepared owner permit cannot fail after consumption.
+                SvOutput::Prepared(permit) => {
+                    permit.commit(&[carrick_abi::KernelAbi::abi_bytes(&pair)]);
+                    Ok(())
+                }
+                SvOutput::Direct(memory) => write_kernel_struct_raw(memory, sv_addr, &pair),
+            };
+            if written.is_err() {
                 let removed = {
                     let files = this.captured_file_table();
                     let mut table = files.write_open_files();
