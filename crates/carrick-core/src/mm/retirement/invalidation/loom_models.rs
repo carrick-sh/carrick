@@ -106,7 +106,7 @@ fn leaked_table() -> &'static Table {
     )))
 }
 
-fn seat(table: &'static Table, member: u32) -> MemberSeat<'static, 2, LoomWord> {
+fn seat(table: &'static Table, member: u32) -> MemberSeat<&'static Table, 2, LoomWord> {
     MemberSeat::claim(table, CpuId::new(member), &mut LoomVenue::default())
         .map_err(|_| ())
         .expect("free seat")
@@ -115,7 +115,7 @@ fn seat(table: &'static Table, member: u32) -> MemberSeat<'static, 2, LoomWord> 
 fn commit(
     table: &'static Table,
     venue: &mut LoomVenue,
-) -> PendingInvalidation<'static, 2, LoomWord> {
+) -> PendingInvalidation<&'static Table, 2, LoomWord> {
     stage(table, context(0x1000, 1), InvalidationKind::Unmap)
         .commit(None, venue)
         .map_err(|_| ())
@@ -124,7 +124,10 @@ fn commit(
 
 /// The completion verdict is safe: if it completes, member 1 has served the
 /// generation or is stopped with the debt recorded.
-fn assert_verdict_safe(table: &'static Table, pending: PendingInvalidation<'static, 2, LoomWord>) {
+fn assert_verdict_safe(
+    table: &'static Table,
+    pending: PendingInvalidation<&'static Table, 2, LoomWord>,
+) {
     let generation = pending.generation();
     let member = &table.members()[1];
     if pending.try_complete().is_ok() {
@@ -315,5 +318,30 @@ fn loom_models_claim_races_request() {
 
         assert_verdict_safe(table, pending);
         drop(seat);
+    });
+}
+
+/// A member claiming its seat concurrently with a domain-wide request (the
+/// seat Dekker pair): the request counts the member, or the claim's
+/// admission flush covers the generation before the member can translate.
+#[test]
+fn loom_models_claim_races_domain_request_counts_or_flushes() {
+    model(|| {
+        let table = leaked_table();
+        let member = loom::thread::spawn(move || seat(table, 1));
+        let pending = stage_domain::<_, 2, LoomWord, Tag>(table, InvalidationKind::Unmap)
+            .commit(None, &mut LoomVenue::default())
+            .map_err(|_| ())
+            .expect("commit");
+        let counted = pending.counts(CpuId::new(1));
+        let generation = pending.generation();
+        let member_seat = member.join().expect("member");
+        let served = table.members()[1].served(InvalidationKind::Unmap);
+        assert!(
+            counted || generation.served_by(served),
+            "a claimed member was neither counted nor flushed"
+        );
+        assert_verdict_safe(table, pending);
+        drop(member_seat);
     });
 }

@@ -119,7 +119,7 @@ fn seat<'t, const N: usize>(
     table: &'t ServedTable<N>,
     raw: u32,
     venue: &mut RecordingVenue,
-) -> MemberSeat<'t, N> {
+) -> MemberSeat<&'t ServedTable<N>, N> {
     MemberSeat::claim(table, cpu(raw), venue).expect("free seat")
 }
 
@@ -143,9 +143,9 @@ fn commit<'t, const N: usize>(
     table: &'t ServedTable<N>,
     key: (u64, u64),
     kind: InvalidationKind,
-    requester: Option<&mut MemberSeat<'t, N>>,
+    requester: Option<&mut MemberSeat<&'t ServedTable<N>, N>>,
     venue: &mut RecordingVenue,
-) -> PendingInvalidation<'t, N> {
+) -> PendingInvalidation<&'t ServedTable<N>, N> {
     stage(table, ctx(key), kind)
         .commit(requester, venue)
         .map_err(|_| ())
@@ -226,8 +226,8 @@ impl StoppedMemberProtocol for PerSenderCellModel {
 /// caches (and seats) for the whole scenario, as real vCPUs do.
 struct DomainModel {
     table: &'static ServedTable<3>,
-    member: MemberSeat<'static, 3>,
-    requester: MemberSeat<'static, 3>,
+    member: MemberSeat<&'static ServedTable<3>, 3>,
+    requester: MemberSeat<&'static ServedTable<3>, 3>,
     member_venue: RecordingVenue,
     requester_venue: RecordingVenue,
 }
@@ -573,7 +573,7 @@ const FIXTURE: &str = "carrick-core::mm::retirement::invalidation::tests";
 fn steady_state_work<const N: usize>() -> ContractObservation {
     let table = ServedTable::<N, CountingWord>::with_domain(domain());
     let mut venues: Vec<RecordingVenue> = (0..N).map(|_| RecordingVenue::new()).collect();
-    let mut seats: Vec<MemberSeat<'_, N, CountingWord>> = venues
+    let mut seats: Vec<MemberSeat<&ServedTable<N, CountingWord>, N, CountingWord>> = venues
         .iter_mut()
         .enumerate()
         .map(|(index, venue)| {
@@ -882,4 +882,108 @@ fn domain_nonces_are_unique_and_the_counter_refuses_at_max() {
         );
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2 extensions: domain-wide requests, owning table handles and
+// reclaim inspection (the softmmu physical venue needs all three).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn domain_request_counts_every_seated_member_whatever_its_context() {
+    let table = table3();
+    let mut in_a_venue = RecordingVenue::new();
+    let mut in_a = seat(&table, 1, &mut in_a_venue);
+    in_a.install(ctx(A), &mut in_a_venue).expect("install A");
+    in_a.enter(&mut in_a_venue).expect("enter");
+    let mut bare_venue = RecordingVenue::new();
+    // Seated with no context installed and stopped: still owes the request.
+    let mut bare = seat(&table, 2, &mut bare_venue);
+
+    let mut venue = RecordingVenue::new();
+    let pending = stage_domain::<_, 3, AtomicU64, Tag>(&table, InvalidationKind::Unmap)
+        .commit(None, &mut venue)
+        .map_err(|_| ())
+        .expect("commit");
+    assert!(pending.counts(cpu(1)) && pending.counts(cpu(2)));
+    assert!(!pending.counts(cpu(0)), "an unseated member is not counted");
+    assert_eq!(pending.counted_members(), 2);
+    assert!(venue.kicked(1), "the running member is kicked");
+    assert!(!venue.kicked(2), "the stopped member is not kicked");
+    let pending = pending.try_complete().expect_err("member 1 is running");
+    in_a.serve(&mut in_a_venue).expect("serve");
+    let generation = pending.generation();
+    let _proof = pending.try_complete().expect("served or stopped");
+    assert!(bare.has_debt(), "the stopped member keeps its debt");
+    bare.enter(&mut bare_venue).expect("enter");
+    assert!(generation.served_by(served(&table, 2, InvalidationKind::Unmap)));
+
+    // A context request still skips a member in another context.
+    let context_only = commit(&table, B, InvalidationKind::Unmap, None, &mut venue);
+    assert!(!context_only.counts(cpu(1)));
+}
+
+/// An owning handle, as a member that outlives any borrow scope holds it.
+#[derive(Clone, Debug)]
+struct SharedTable(std::sync::Arc<ServedTable<3>>);
+
+// SAFETY: the handle and its clones share one `Arc`, so they always name the
+// one table it owns.
+unsafe impl TableHandle<3, AtomicU64> for SharedTable {
+    fn table(&self) -> &ServedTable<3> {
+        &self.0
+    }
+}
+
+#[test]
+fn owning_handle_seat_moves_to_its_own_thread_and_serves_requests() {
+    let handle = SharedTable(std::sync::Arc::new(table3()));
+    let mut member_venue = RecordingVenue::new();
+    let mut member =
+        MemberSeat::claim(handle.clone(), cpu(1), &mut member_venue).expect("free seat");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    // The seat moves into a `'static` thread: no borrow of the table.
+    let thread = std::thread::spawn(move || {
+        member.enter(&mut member_venue).expect("enter");
+        ready_tx.send(()).expect("ready");
+        go_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("go arrives");
+        member.serve(&mut member_venue).expect("serve");
+        member.stop();
+        member_venue.invalidations
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("member entered");
+    let mut venue = RecordingVenue::new();
+    let pending = stage_domain::<_, 3, AtomicU64, Tag>(handle.clone(), InvalidationKind::Unmap)
+        .commit(None, &mut venue)
+        .map_err(|_| ())
+        .expect("commit");
+    assert!(pending.counts(cpu(1)) && venue.kicked(1));
+    let pending = pending.try_complete().expect_err("running and unserved");
+    go_tx.send(()).expect("go");
+    let flushes = thread.join().expect("member thread");
+    assert_eq!(flushes, CLAIM_FLUSHES + 1);
+    let completion = pending.try_complete().expect("served");
+    assert_eq!(completion.kind(), InvalidationKind::Unmap);
+    assert!(!handle.table().members()[1].is_seated());
+}
+
+#[test]
+fn reclaim_iter_lists_outstanding_objects_until_their_exact_release() {
+    let table = table3();
+    let mut venue = RecordingVenue::new();
+    let mut queue = ReclaimQueue::new();
+    let first = commit(&table, A, InvalidationKind::Unmap, None, &mut venue);
+    queue.push(first.reclaim_tag(), 7u64);
+    let second = commit(&table, A, InvalidationKind::Unmap, None, &mut venue);
+    queue.push(second.reclaim_tag(), 9u64);
+    assert!(queue.iter().any(|&item| item == 7));
+    let first = first.try_complete().expect("no member counted");
+    assert_eq!(queue.drain_ready(&first), Vec::from([7]));
+    assert_eq!(queue.iter().copied().collect::<Vec<_>>(), Vec::from([9]));
+    let _ = second;
 }
