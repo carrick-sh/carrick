@@ -2347,6 +2347,14 @@
     "excluded": false,
     "runner": "generic"
   },
+  "sigignpending": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic",
+    "contract_ids": [
+      "kernel.signal.disposition-authority"
+    ]
+  },
   "siginfo": {
     "class": "conformance",
     "excluded": false,

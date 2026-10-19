@@ -1,0 +1,33 @@
+schema_version = 1
+id = "kernel.signal.disposition-authority"
+title = "One disposition table, rt_sigaction decoder and exec reset for every lane"
+guest_surfaces = ["syscall:rt_sigaction", "syscall:rt_sigpending", "syscall:execve"]
+semantic_authority = ["man 2 sigaction", "man 7 signal", "man 2 sigpending", "man 2 execve"]
+fixture = "probe:sigignpending"
+scale_points = [1, 2]
+structural_budgets = []
+rationale = """
+carrick-signal-core owns the disposition table (ActionTable), the pending
+discard an install implies (SIG_IGN, or SIG_DFL whose default is ignore,
+removes the signal from the process queue and from every thread queue, blocked
+or not), the execve inheritance rule (caught handlers reset, ignored actions
+kept) and rt_sigaction argument decoding, validation and error order. The EL1
+ring and the host dispatcher each supply only a SigactionPort (guest memory,
+their sighand storage, host mirroring); the host Sighand is a storage adapter
+over ActionTable. Scale points are the two-live-thread discard: a sibling's
+thread-directed pending signal is discarded by the caller's install.
+scripts/migrate/check-signal-core-boundary.py rejects a second decoder or
+disposition map. An install is O(threads in the task) for the discard and
+O(1) otherwise; no polling or generation-time filtering is added.
+The oracle lines are predicted from the man pages and are not yet
+Docker-blessed; the error-order lines (err_*) in particular need the oracle.
+"""
+
+[bindings]
+embed = "probe:sigignpending"
+docker = "probe:sigignpending"
+
+[bindings.unresolved]
+vm_free = "The shared-core move and its host-lane dispatcher tests land in the next layer of this stack."
+docker = "Predicted Linux lines are committed; the Docker bless (gnu and musl) is pending."
+embed_structural = "Signed probe run pending (no HVF in this lane)."
