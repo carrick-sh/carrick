@@ -251,6 +251,11 @@ authority-check-cross TARGET CC CFLAGS AR:
 lint-domains-source:
     cargo test --locked -p carrick-xtask --lib terminal_custody
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- terminal-custody
+    # Direct user-memory writes in dispatch/ that bypass the typed copyout
+    # (#711). Exact per-file ceilings; lower them with each migration and
+    # delete the ratchet at zero.
+    cargo test --locked -p carrick-xtask --lib copyout_debt
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- copyout-debt
     python3 scripts/conformance/check-next-strategy.py
     # Every test target is in exactly one gate lane (Cargo metadata), derived
     # lanes are consumed by their recipes, named-lane targets are named.
