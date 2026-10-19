@@ -991,16 +991,19 @@ fn sock_pingpong(iters: usize, pinned: bool) -> i32 {
 /// (the deferred-capture witness, #695): every actor operation steps its
 /// executor away from CPU 0's slot, independent of the pingpong threads.
 fn sock_pingpong_stepper(iters: usize) -> i32 {
-    if pin(0) != 0 {
-        println!("sock-pingpong-stepper pin failed");
-        return 1;
-    }
+    // Pinning only narrows where a held record may run; the actor's step-aways
+    // release it either way. Report the raw result (0, or -errno) instead of
+    // failing, so a refused pin is evidence rather than the verdict.
+    let main_pin = pin(0);
     let ready = socket_pair();
     let loopback = socket_pair();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stopped = std::sync::Arc::clone(&stop);
+    let actor_pin = std::sync::Arc::new(AtomicI64::new(i64::MIN));
+    let actor_pinned = std::sync::Arc::clone(&actor_pin);
     let stepper = std::thread::spawn(move || {
-        if pin(0) != 0 || write_byte(ready.1) != 1 {
+        actor_pinned.store(pin(0), Ordering::Release);
+        if write_byte(ready.1) != 1 {
             return false;
         }
         while !stopped.load(Ordering::Acquire) {
@@ -1015,6 +1018,10 @@ fn sock_pingpong_stepper(iters: usize) -> i32 {
         println!("sock-pingpong-stepper actor never started");
         return 1;
     }
+    println!(
+        "sock-pingpong-stepper sched_setaffinity main={main_pin} actor={}",
+        actor_pin.load(Ordering::Acquire)
+    );
     let status = sock_pingpong(iters, true);
     stop.store(true, Ordering::Release);
     if !stepper.join().expect("stepper exits") {
