@@ -373,12 +373,14 @@ test-kernel *ARGS:
     {{_admit}} {{_cargo}} test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
     just --justfile {{justfile()}} test-kernel-semantics {{ARGS}}
 
-# Bounded fd, kernel connect/wake and terminal clear protocols (<=2 preemptions).
+# Bounded fd, kernel connect/wake, terminal clear and invalidation-domain
+# protocols (<=2 preemptions; the invalidation Dekker pairs use 3).
 # Pipe venue lock/wake model waits for N1; see the M2 handoff.
 test-loom:
     {{_admit}} {{_cargo}} test --locked -p carrick-fd-core --features loom --lib loom_models
     {{_admit}} {{_cargo}} test --locked -p carrick-kernel --features loom --lib loom_models
     {{_admit}} {{_cargo}} test --locked -p carrick-runtime --features loom --lib terminal_clear_loom
+    {{_admit}} {{_cargo}} test --locked -p carrick-core --features loom --lib loom_models
 
 # The scripted kernel-semantics suites alone (crates/carrick-kernel-example):
 # two-process Linux semantics against the public kernel API with no VMM, no

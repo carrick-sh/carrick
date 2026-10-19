@@ -470,6 +470,7 @@ dependencies = [
  "carrick-mmu-core",
  "carrick-personality-linux",
  "carrick-sched-core",
+ "loom",
  "parking_lot",
  "zerocopy",
 ]

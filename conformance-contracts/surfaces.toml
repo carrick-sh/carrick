@@ -1575,3 +1575,19 @@ contracts = ["core.personality.handle-table"]
 [[surfaces]]
 path = "crates/carrick-kernel-example/tests/personality_handle_table.rs"
 contracts = ["core.personality.handle-table"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/mm/served.rs"
+contracts = ["kernel.mm.invalidation-domain"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/mm/retirement/invalidation.rs"
+contracts = ["kernel.mm.invalidation-domain"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/mm/retirement/invalidation/tests.rs"
+contracts = ["kernel.mm.invalidation-domain"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/mm/retirement/invalidation/loom_models.rs"
+contracts = ["kernel.mm.invalidation-domain"]

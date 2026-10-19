@@ -4,6 +4,8 @@
 use core::fmt;
 use core::ops::DerefMut;
 
+pub mod invalidation;
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,

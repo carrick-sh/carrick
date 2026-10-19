@@ -9,6 +9,8 @@ description = "Neutral MM, fork, COW, and wait/lifecycle substrate for Carrick."
 [features]
 default = []
 host-test = ["carrick-sched-core/host-test"]
+# Substitutes loom words in this crate's unit-test target only, never the ABI.
+loom = []
 
 [dependencies]
 bitflags.workspace = true
@@ -22,6 +24,7 @@ zerocopy.workspace = true
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 parking_lot.workspace = true
+loom = "=0.7.2"
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 
