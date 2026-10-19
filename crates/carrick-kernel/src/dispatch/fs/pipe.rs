@@ -1575,6 +1575,55 @@ mod tests {
     }
 
     #[test]
+    fn blocking_pipe_buf_write_parks_then_completes_atomically() {
+        let pipe = Arc::new(PipeInner::new_connected(17, PIPE_BUF));
+        let authority = WaitFdAuthority::internal(InternalWaitKind::CarrierControl);
+        let fill = vec![0x33; PIPE_BUF - 1];
+        assert_eq!(
+            write_pipe_for_test(&fill, &pipe, 0, 4, authority.clone(), || false),
+            DispatchOutcome::Returned {
+                value: fill.len() as i64
+            }
+        );
+
+        // One byte is free, but this blocking two-byte write is atomic because
+        // it is no larger than PIPE_BUF. It parks without committing a prefix.
+        assert!(matches!(
+            write_pipe_for_test(b"yz", &pipe, 0, 4, authority.clone(), || false),
+            DispatchOutcome::WaitOnFds { .. }
+        ));
+        let mut existing = vec![0; fill.len()];
+        assert_eq!(
+            read_pipe_bytes(
+                &mut existing,
+                &pipe,
+                LINUX_O_NONBLOCK,
+                crate::thread::ThreadId::synthetic_for_tests(17),
+            ),
+            Ok(fill.len())
+        );
+        assert_eq!(existing, fill);
+
+        // Redispatch after the existing readiness continuation wakes commits
+        // the complete write, never an earlier one-byte prefix.
+        assert_eq!(
+            write_pipe_for_test(b"yz", &pipe, 0, 4, authority, || false),
+            DispatchOutcome::Returned { value: 2 }
+        );
+        let mut written = [0; 2];
+        assert_eq!(
+            read_pipe_bytes(
+                &mut written,
+                &pipe,
+                LINUX_O_NONBLOCK,
+                crate::thread::ThreadId::synthetic_for_tests(17),
+            ),
+            Ok(2)
+        );
+        assert_eq!(&written, b"yz");
+    }
+
+    #[test]
     fn in_memory_pipe_interrupted_write_returns_eintr_when_unwritten() {
         let pipe = Arc::new(PipeInner::new_connected(11, 4096));
         let authority = WaitFdAuthority::internal(InternalWaitKind::CarrierControl);

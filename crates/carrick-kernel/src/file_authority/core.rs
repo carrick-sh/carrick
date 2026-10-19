@@ -1228,19 +1228,9 @@ impl FileAuthorityCore {
         capacity: PipeCapacity,
     ) -> Result<Outcome, AuthorityError> {
         let (pipe, _) = self.pipe_for_slot(client, table, expected, fd)?;
-        self.streams
-            .get(&pipe)
-            .ok_or(AuthorityError::NotPipe)?
-            .capacity()?;
-        let mut prepared = self.streams.remove(&pipe).unwrap_or_else(|| {
-            abort_fatal(AuthorityFatal::InvariantViolation(
-                "pipe capacity mutation lost its stream",
-            ))
-        });
-        let result = prepared.set_capacity(capacity);
-        let capacity = prepared.capacity()?;
-        self.streams.insert(pipe, prepared);
-        result?;
+        let stream = self.streams.get_mut(&pipe).ok_or(AuthorityError::NotPipe)?;
+        stream.set_capacity(capacity)?;
+        let capacity = stream.capacity();
         let revision = self.publish_mutation();
         self.stream_revisions.insert(pipe, revision);
         self.refresh_pipe_descriptions(pipe, revision);
@@ -4423,7 +4413,7 @@ fn ensure_cloexec(fd: i32) -> Result<(), AuthorityFatal> {
     Ok(())
 }
 
-fn abort_fatal(error: AuthorityFatal) -> ! {
+pub(super) fn abort_fatal(error: AuthorityFatal) -> ! {
     tracing::error!(%error, "FileAuthority encountered a run-fatal invariant");
     carrick_fatal!(
         "file_authority::core",
