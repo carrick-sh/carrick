@@ -13,6 +13,7 @@ pub mod claims;
 pub mod cli;
 pub mod command;
 pub mod commit_trailers;
+pub mod debt_moves;
 pub mod fixtures;
 pub mod guest_image;
 pub mod host_lease;

@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use carrick_xtask::authority_debt::{AuthorityDebtCeilings, Counter, Family, Lane};
+use carrick_xtask::debt_moves::{DebtMove, MoveMap};
 
 fn fixture_manifests(root: &std::path::Path) {
     if root.join("Cargo.toml").exists() {
@@ -56,10 +57,66 @@ fn ceilings(count: u64) -> AuthorityDebtCeilings {
 fn same_patch_increase_cannot_bless_added_debt() {
     assert!(
         ceilings(4)
-            .ratchet(&ceilings(3))
+            .ratchet(&ceilings(3), &MoveMap::default())
             .unwrap_err()
             .to_string()
             .contains("increase")
+    );
+}
+fn owned(owner: &str, count: u64) -> AuthorityDebtCeilings {
+    let mut policy = ceilings(count);
+    policy.counters[0].owner = owner.into();
+    policy
+}
+fn moved(from: &str, to: &str) -> MoveMap {
+    MoveMap::new(&[DebtMove {
+        from: from.into(),
+        to: to.into(),
+        issue: 673,
+    }])
+    .unwrap()
+}
+#[test]
+fn a_reviewed_owner_move_transfers_its_ceiling() {
+    let moves = moved("carrick_kernel::poll", "carrick_kernel::readiness");
+    let base = owned("carrick_kernel::poll", 3);
+    assert!(
+        owned("carrick_kernel::readiness", 3)
+            .ratchet(&base, &moves)
+            .is_ok(),
+        "a mapped move passes"
+    );
+    assert!(
+        owned("carrick_kernel::readiness", 2)
+            .ratchet(&base, &moves)
+            .is_ok(),
+        "a mapped move may lower the total"
+    );
+    assert!(
+        owned("carrick_kernel::readiness", 4)
+            .ratchet(&base, &moves)
+            .unwrap_err()
+            .to_string()
+            .contains("increase"),
+        "a move that increases the total fails"
+    );
+}
+#[test]
+fn unmapped_removal_and_unmapped_destination_fail() {
+    let base = owned("carrick_kernel::poll", 3);
+    let unrelated = moved("carrick_kernel::other", "carrick_kernel::readiness");
+    assert!(
+        owned("carrick_kernel::readiness", 3)
+            .ratchet(&base, &unrelated)
+            .unwrap_err()
+            .to_string()
+            .contains("removed nonzero counter"),
+        "an unmapped removal fails"
+    );
+    assert!(
+        owned("carrick_kernel::readiness", 3)
+            .ratchet(&base, &MoveMap::default())
+            .is_err()
     );
 }
 #[test]
@@ -68,9 +125,9 @@ fn removed_nonzero_counter_and_new_cohort_fail() {
         schema: 1,
         counters: vec![],
     };
-    assert!(empty.ratchet(&ceilings(1)).is_err());
-    assert!(ceilings(1).ratchet(&empty).is_err());
-    assert!(empty.ratchet(&ceilings(0)).is_ok());
+    assert!(empty.ratchet(&ceilings(1), &MoveMap::default()).is_err());
+    assert!(ceilings(1).ratchet(&empty, &MoveMap::default()).is_err());
+    assert!(empty.ratchet(&ceilings(0), &MoveMap::default()).is_ok());
 }
 #[test]
 fn unknown_families_positions_and_fingerprints_cannot_be_deserialized() {
@@ -94,7 +151,7 @@ fn unknown_families_positions_and_fingerprints_cannot_be_deserialized() {
 fn family_reassignment_duplicate_and_zero_global_debt_fail() {
     let mut head = ceilings(1);
     head.counters[0].family = Family::K1InspectMisc;
-    assert!(head.ratchet(&ceilings(1)).is_err());
+    assert!(head.ratchet(&ceilings(1), &MoveMap::default()).is_err());
     let mut duplicate = ceilings(1);
     duplicate.counters.push(duplicate.counters[0].clone());
     assert!(duplicate.validate().is_err());
