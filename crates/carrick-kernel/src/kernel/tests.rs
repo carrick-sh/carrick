@@ -2114,3 +2114,28 @@ fn futex_queue_authority_cleartid_wake_reaches_one_joiner_in_mm_queue() {
         assert_eq!(f.futex.wake(futex_queue_authority::WORD, 1), 0);
     });
 }
+
+/// The `ClearChildTidState` tag (bit 63) stays clear of every user address
+/// either guest ISA can name: each `UserVaCeiling` is within the codec's
+/// `USER_ADDRESS_LIMIT` (#685).
+#[test]
+fn clear_child_tid_codec_limit_covers_every_guest_user_va_ceiling() {
+    use carrick_personality_linux::abi::thread::ClearChildTidState;
+    for abi in [
+        carrick_abi::LinuxGuestAbi::Aarch64,
+        carrick_abi::LinuxGuestAbi::X86_64,
+    ] {
+        let ceiling = carrick_hal::guest_arch::UserVaCeiling::for_abi(abi).exclusive_end();
+        assert!(
+            ceiling <= ClearChildTidState::USER_ADDRESS_LIMIT,
+            "{abi:?} user VA ceiling {ceiling:#x} exceeds the codec limit"
+        );
+        let highest = ceiling - 4;
+        assert_eq!(
+            ClearChildTidState::decode(ClearChildTidState::for_user_address(highest).encode())
+                .pending()
+                .map(|address| address.raw()),
+            Some(highest)
+        );
+    }
+}
