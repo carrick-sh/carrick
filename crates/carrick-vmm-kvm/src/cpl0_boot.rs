@@ -1876,6 +1876,9 @@ impl Cpl0Carrier {
                 carrick_x86::fault_slot_gpa(carrick_x86::fault_stack_base(LAYOUT), index)?;
             ram.write_gpa(tss + 4, &(DIRECT_VA + fault_stack + 4096).to_le_bytes())
                 .map_err(|e| fail(e.to_string()))?;
+            // The one-page IST1 (#DF) stacks sit back to back with no guard
+            // (#369 covers the kernel stacks only): the #DF handler's frame
+            // is fixed and small, so it cannot reach the next CPU's page.
             let ist_top = DIRECT_VA + IST_STACK_BASE + (index + 1) * 4096;
             ram.write_gpa(tss + 36, &ist_top.to_le_bytes())
                 .map_err(|e| fail(e.to_string()))?;

@@ -373,6 +373,9 @@ const _: () = {
         X86_CPL0_KERNEL_STACK_STRIDE.is_multiple_of(carrick_mmu_core::x86::descriptor_txn::PAGE)
     );
     assert!(X86_CPL0_KERNEL_STACK_SIZE >= EL1_STACK_SIZE);
+    // The CPL0 #PF fixup tests CR2 with a mask and 32-bit immediates.
+    assert!(X86_CPL0_KERNEL_STACK_STRIDE.is_power_of_two());
+    assert!(X86_CPL0_KERNEL_STACK_SLOTS * X86_CPL0_KERNEL_STACK_STRIDE < 1 << 31);
     assert!(
         X86_CPL0_KERNEL_STACKS_GPA + X86_CPL0_KERNEL_STACK_SLOTS * X86_CPL0_KERNEL_STACK_STRIDE
             <= 0xf0_0000
