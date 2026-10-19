@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "authority_debt": [
+    {
+      "from": "carrick_el1::build_program::main::CARGO_MANIFEST_DIR",
+      "to": "carrick_el1_linux::build_program::main::CARGO_MANIFEST_DIR",
+      "issue": 673
+    },
+    {
+      "from": "carrick_el1::build_program::main::TARGET",
+      "to": "carrick_el1_linux::build_program::main::TARGET",
+      "issue": 673
+    },
+    {
+      "from": "carrick_el1::personality::dispatch::invalid_completion",
+      "to": "carrick_el1_linux::dispatch::invalid_completion",
+      "issue": 673
+    },
+    {
+      "from": "carrick_el1::personality::lifecycle::<El1PendingFamilies<'a,F,C,U,G> as LifecycleNative<'a>>::prepare_child",
+      "to": "carrick_el1_linux::lifecycle::<El1PendingFamilies<'a,F,C,U,G> as LifecycleNative<'a>>::prepare_child",
+      "issue": 673
+    },
+    {
+      "from": "carrick_el1::personality::lifecycle::<El1PendingFamilies<'a,F,C,U,G> as LifecycleNative<'a>>::run_next",
+      "to": "carrick_el1_linux::lifecycle::<El1PendingFamilies<'a,F,C,U,G> as LifecycleNative<'a>>::run_next",
+      "issue": 673
+    },
+    {
+      "from": "carrick_kernel::el1_delegation::<HostInstanceLock as carrick_el1::InstanceLockPolicy>::acquire",
+      "to": "carrick_kernel::el1_delegation::<HostInstanceLock as carrick_el1::substrate::file::InstanceLockPolicy>::acquire",
+      "issue": 673
+    }
+  ],
+  "terminal_custody": [
+    {
+      "from": "carrick-el1",
+      "to": "carrick-el1-linux",
+      "issue": 673
+    }
+  ]
+}
