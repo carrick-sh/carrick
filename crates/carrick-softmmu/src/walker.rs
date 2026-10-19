@@ -101,6 +101,9 @@ pub enum ExtentEditError {
     Exhausted,
     /// Nothing changed: the table went terminal on an earlier exhaustion.
     Terminal,
+    /// Nothing changed: the owner to remove is a replacement not yet
+    /// published (its predecessor's retirement is pending). Reclaim first.
+    PublicationPending,
 }
 
 /// A retired value and the invalidation every soft vCPU owes for it.
@@ -225,11 +228,15 @@ impl ExtentTable {
     /// completion also covers every earlier retirement of this inventory
     /// (they are all domain-wide), including one whose pending request was
     /// dropped.
+    ///
+    /// A terminal inventory publishes nothing: its CPUs are stopped and no
+    /// owner may go live through it.
     pub fn reclaim(&mut self, completion: &DomainCompletion) -> Reclaimed {
         let mut reclaimed = Reclaimed::default();
         for item in self.reclaim.drain_ready(completion) {
             match item {
                 ReclaimItem::Retired(_) => reclaimed.identities += 1,
+                ReclaimItem::Publish(_) if self.terminal => {}
                 ReclaimItem::Publish(Deferred::Extent(record)) => {
                     // Its span stayed reserved, so nothing can overlap it.
                     self.by_base.insert(record.base.raw(), record);
@@ -263,6 +270,20 @@ impl ExtentTable {
             }
             ReclaimItem::Publish(Deferred::Extent(deferred)) => spans_overlap(deferred, record),
             _ => false,
+        })
+    }
+
+    /// Whether a deferred replacement at exactly this base awaits its
+    /// predecessor's completion.
+    fn extent_publication_pending(&self, base: FrameGpa) -> bool {
+        self.reclaim.iter().any(|item| {
+            matches!(item, ReclaimItem::Publish(Deferred::Extent(deferred)) if deferred.base == base)
+        })
+    }
+
+    fn root_publication_pending(&self, root: RootGpa) -> bool {
+        self.reclaim.iter().any(|item| {
+            matches!(item, ReclaimItem::Publish(Deferred::RootGeneration(deferred, _)) if *deferred == root)
         })
     }
 
@@ -372,6 +393,13 @@ impl ExtentTable {
         requester: Option<SoftRequester<'_>>,
     ) -> Result<Option<Retirement<OwnerGeneration>>, ExtentEditError> {
         self.admit_edit(requester.as_ref())?;
+        // Refuse rather than withdraw: the deferred generation was never
+        // live, so there is nothing to retire, and withdrawing it would make
+        // a removal silently cancel a replacement whose predecessor is still
+        // in flight. The caller reclaims first and then removes a live owner.
+        if self.root_publication_pending(root) {
+            return Err(ExtentEditError::PublicationPending);
+        }
         let Some(removed) = self.root_generations.remove(&root.address().raw()) else {
             return Ok(None);
         };
@@ -491,6 +519,10 @@ impl ExtentTable {
         requester: Option<SoftRequester<'_>>,
     ) -> Result<Option<Retirement<ExtentRecord>>, ExtentEditError> {
         self.admit_edit(requester.as_ref())?;
+        // Refuse rather than withdraw (see `remove_root_generation`).
+        if self.extent_publication_pending(base) {
+            return Err(ExtentEditError::PublicationPending);
+        }
         let Some(old) = self.by_base.remove(&base.raw()) else {
             return Ok(None);
         };

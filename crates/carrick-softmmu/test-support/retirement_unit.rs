@@ -847,3 +847,87 @@ fn a_copy_cannot_reuse_an_identity_whose_retirement_is_pending() {
     assert!(table.is_member(&seat));
     assert!(!copy.is_member(&seat));
 }
+
+// ---------------------------------------------------------------------------
+// #707 director finding: a removal must not lose to a deferred publication,
+// and a terminal inventory publishes nothing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn removing_an_extent_whose_replacement_is_deferred_is_refused() {
+    let mut table = table_with_extent();
+    let Retirement { pending, .. } = table
+        .replace(
+            ExtentRecord::new(FrameGpa::new(EXTENT), 0x1000, generation(5)),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    // The new owner is not live yet: there is nothing to retire, and a
+    // silent `Ok(None)` would let the reclaim below bring it back.
+    assert_eq!(
+        table.remove(FrameGpa::new(EXTENT), None).map(|_| ()),
+        Err(ExtentEditError::PublicationPending)
+    );
+    let completion = pending.try_complete().expect("no CPU seated");
+    table.reclaim(&completion);
+    // After the publication lands, removal retires it normally.
+    let Retirement { retired, pending } =
+        table.remove(FrameGpa::new(EXTENT), None).unwrap().unwrap();
+    assert_eq!(retired.generation, generation(5));
+    let completion = pending.try_complete().expect("no CPU seated");
+    table.reclaim(&completion);
+    assert_eq!(
+        table.lookup_span(EXTENT, 0x1000),
+        None,
+        "the removed owner stays gone"
+    );
+}
+
+#[test]
+fn removing_a_root_whose_replacement_is_deferred_is_refused() {
+    use carrick_guest_arch::RootGpa;
+    let mut table = ExtentTable::new().unwrap();
+    let root = RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap();
+    assert!(table.set_root_generation(root, generation(7)));
+    let Retirement { pending, .. } = table
+        .replace_root_generation(root, generation(8), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        table.remove_root_generation(root, None).map(|_| ()),
+        Err(ExtentEditError::PublicationPending)
+    );
+    let completion = pending.try_complete().expect("no CPU seated");
+    table.reclaim(&completion);
+    let Retirement { retired, pending } =
+        table.remove_root_generation(root, None).unwrap().unwrap();
+    assert_eq!(retired, generation(8));
+    let completion = pending.try_complete().expect("no CPU seated");
+    table.reclaim(&completion);
+    assert_eq!(
+        table.expected_generation(root),
+        None,
+        "the removed root stays gone"
+    );
+}
+
+#[test]
+fn a_terminal_inventory_publishes_no_deferred_owner() {
+    let mut table = table_with_extent();
+    let Retirement { pending, .. } = table
+        .replace(
+            ExtentRecord::new(FrameGpa::new(EXTENT), 0x1000, generation(5)),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    let completion = pending.try_complete().expect("no CPU seated");
+    table.exhaust_for_test();
+    assert_eq!(table.reclaim(&completion).published, 0);
+    assert_eq!(
+        table.lookup_span(EXTENT, 0x1000),
+        None,
+        "nothing goes live once terminal"
+    );
+}
