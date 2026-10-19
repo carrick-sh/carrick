@@ -914,7 +914,8 @@ fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The EL1 runtime is still mixed: the untouched fault/memory migration
-/// (`fault.rs`, `memory.rs` and its `memory/` children) is not substrate. The
+/// (`fault.rs`, `memory.rs` and its `memory/reservations.rs` child) is not
+/// substrate. The
 /// Linux client and image binary live in `carrick-el1-linux`, which no neutral
 /// module may name. Everything else (including orphan files) is checked, and
 /// every required neutral root must exist. The shared-record ABI is permitted
@@ -955,11 +956,9 @@ fn audit_el1_modules(
     collect_rs_files(&src, &mut files)?;
     for path in files {
         let relative = path.strip_prefix(&src).unwrap_or(&path);
-        if relative.starts_with("memory")
-            || relative
-                .to_str()
-                .is_some_and(|name| ["lib.rs", "fault.rs", "memory.rs"].contains(&name))
-        {
+        if relative.to_str().is_some_and(|name| {
+            ["lib.rs", "fault.rs", "memory.rs", "memory/reservations.rs"].contains(&name)
+        }) {
             continue;
         }
         let canonical = fs::canonicalize(&path).unwrap_or(path.clone());
@@ -1924,16 +1923,21 @@ mod tests {
     #[test]
     fn mm_prepared_custody_and_linux_policy_have_one_owner() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let old = fs::read_to_string(
-            repo.join("crates/carrick-el1/src/personality/reservations/prepared.rs"),
-        )
-        .unwrap_or_default();
+        for removed in [
+            "crates/carrick-el1/src/personality/reservations/prepared.rs",
+            "crates/carrick-el1-linux/src/reservations/prepared.rs",
+        ] {
+            assert!(
+                !repo.join(removed).exists(),
+                "the old ARM prepared-copy owner must stay removed: {removed}"
+            );
+        }
+        let old =
+            fs::read_to_string(repo.join("crates/carrick-el1/src/memory/reservations.rs")).unwrap();
         assert!(
             !old.contains("pub struct ClaimedPreparedCopy"),
             "prepared-copy claim custody must move out of the ARM personality"
         );
-        let old =
-            fs::read_to_string(repo.join("crates/carrick-el1/src/memory/reservations.rs")).unwrap();
         assert!(
             !old.contains("struct Node {"),
             "the original node store must use neutral records"
