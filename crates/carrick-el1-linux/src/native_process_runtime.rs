@@ -2357,6 +2357,35 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         Some(row.parent())
     }
 }
+/// What a fork reserves and captures from its parent before preparing the
+/// child MM. Boxed so the frame live across `prepare_mm` holds one pointer.
+struct ForkReservation<'a, M> {
+    snapshot: carrick_sched_core::process::birth::BirthSnapshot,
+    permit: carrick_sched_core::process::exit::ReservedTaskSet<NonZeroU64>,
+    child_key: TaskKey,
+    thread_serial: NonZeroU64,
+    child_mm: MmGeneration,
+    visible: VisibleIdentity,
+    claim: NativeClaim,
+    thread_claim: NativeClaim,
+    parent_mm: M,
+    identity: TaskIdentity,
+    group: u32,
+    session: u32,
+    signals: NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+    parent_creds: carrick_personality_linux::identity::TaskCredentials,
+    parent_rlimits: carrick_sched_core::process::RlimitSet,
+    parent_umask: u32,
+    parent_personality: u64,
+    parent_dumpable: u32,
+    parent_no_new_privs: bool,
+    parent_comm: [u8; 16],
+    parent_container: VisibleNamespace,
+    parent_identity: ThreadIdentity,
+    blocked: carrick_personality_linux::abi::thread::BlockedMask,
+    parent_page: &'a ThreadLifecyclePage,
+    parent_file_table: u64,
+}
 pub struct NativeProcessEntry<
     'r,
     'a,
@@ -4313,8 +4342,34 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             result: SyscallResult::new(0),
         })
     }
+    /// Fork in three frames (#705). `prepare_mm`'s chain (child tables,
+    /// reservation copy) is the deepest a fork reaches, so the frame live
+    /// across it holds only the boxed reservation and the prepared MM: the
+    /// parent capture and the child's construction and publication each run
+    /// in their own frame, before and after it.
     #[inline(never)]
     fn fork_owned(&mut self, child_tid: ProcessForkChildTid) -> Result<u32, NativeProcessError> {
+        let reservation = self.fork_reserve()?;
+        let prepared =
+            match self
+                .service
+                .prepare_mm(&reservation.parent_mm, self.words, reservation.child_mm)
+            {
+                Ok(p) => p,
+                Err(error) => {
+                    self.runtime
+                        .graph
+                        .lock()
+                        .owner
+                        .rollback_birth(&reservation.permit);
+                    return Err(error);
+                }
+            };
+        self.fork_publish(child_tid, reservation, prepared)
+    }
+    /// Reserve the child's identity and capture everything it inherits.
+    #[inline(never)]
+    fn fork_reserve(&mut self) -> Result<Box<ForkReservation<'a, M>>, NativeProcessError> {
         let (
             snapshot,
             permit,
@@ -4469,13 +4524,72 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 resources.file_table,
             )
         };
-        let prepared = match self.service.prepare_mm(&parent_mm, self.words, child_mm) {
-            Ok(p) => p,
-            Err(error) => {
-                self.runtime.graph.lock().owner.rollback_birth(&permit);
-                return Err(error);
-            }
-        };
+        Ok(Box::new(ForkReservation {
+            snapshot,
+            permit,
+            child_key,
+            thread_serial,
+            child_mm,
+            visible,
+            claim,
+            thread_claim,
+            parent_mm,
+            identity,
+            group,
+            session,
+            signals,
+            parent_creds,
+            parent_rlimits,
+            parent_umask,
+            parent_personality,
+            parent_dumpable,
+            parent_no_new_privs,
+            parent_comm,
+            parent_container,
+            parent_identity,
+            blocked,
+            parent_page,
+            parent_file_table,
+        }))
+    }
+    /// Build, admit and publish the child on its prepared MM. The
+    /// reservation stays boxed until here: unboxed at the call, it would be
+    /// copied into `fork_owned`'s frame, which is live across `prepare_mm`.
+    #[allow(clippy::boxed_local)]
+    #[inline(never)]
+    fn fork_publish(
+        &mut self,
+        child_tid: ProcessForkChildTid,
+        reservation: Box<ForkReservation<'a, M>>,
+        prepared: S::PreparedMm,
+    ) -> Result<u32, NativeProcessError> {
+        let ForkReservation {
+            snapshot,
+            permit,
+            child_key,
+            thread_serial,
+            child_mm,
+            visible,
+            claim,
+            thread_claim,
+            parent_mm: _,
+            identity,
+            group,
+            session,
+            signals,
+            parent_creds,
+            parent_rlimits,
+            parent_umask,
+            parent_personality,
+            parent_dumpable,
+            parent_no_new_privs,
+            parent_comm,
+            parent_container,
+            parent_identity,
+            blocked,
+            parent_page,
+            parent_file_table,
+        } = *reservation;
         let address = self.service.prepared_context(&prepared);
         if address.mm != child_mm {
             self.runtime.graph.lock().owner.rollback_birth(&permit);

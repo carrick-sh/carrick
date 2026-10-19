@@ -992,7 +992,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     for Aarch64NativeProcessService<'a, X>
 {
     type Mm = Mm;
-    type PreparedMm = Prepared<'a>;
+    // Boxed: fork moves the prepared MM through several frames and refusal
+    // paths; by value each move held another copy on the EL1 stack (#705).
+    type PreparedMm = Box<Prepared<'a>>;
     type Born = Born;
 
     /// The HVC root exit crossing becomes the host's whole-process terminal
@@ -1326,13 +1328,13 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             root,
             generation: ContextGeneration::new(completion.child.incarnation()),
         };
-        Ok(Prepared {
+        Ok(Box::new(Prepared {
             loan,
             child,
             words: live,
             address,
             admitted,
-        })
+        }))
     }
 
     fn prepared_mm(&self, prepared: &Self::PreparedMm) -> Self::Mm {
