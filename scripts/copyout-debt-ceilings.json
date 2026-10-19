@@ -1,0 +1,165 @@
+{
+  "schema": 1,
+  "counters": [
+    {
+      "path": "crates/carrick-kernel/src/dispatch/bpf.rs",
+      "ceiling": 3
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/creds.rs",
+      "ceiling": 6
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fd_wait.rs",
+      "ceiling": 2
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/format_stat.rs",
+      "ceiling": 3
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/format_time.rs",
+      "ceiling": 6
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs.rs",
+      "ceiling": 4
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
+      "ceiling": 2
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
+      "ceiling": 31
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs/legacy_aio.rs",
+      "ceiling": 2
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs/locks.rs",
+      "ceiling": 3
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs/mount.rs",
+      "ceiling": 1
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs/notify.rs",
+      "ceiling": 1
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs/pipe.rs",
+      "ceiling": 2
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs/rw.rs",
+      "ceiling": 6
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs/sendfile.rs",
+      "ceiling": 4
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs/stat.rs",
+      "ceiling": 5
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs/transfer.rs",
+      "ceiling": 3
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/fs/xattr.rs",
+      "ceiling": 2
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/futex.rs",
+      "ceiling": 3
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/io_buffers.rs",
+      "ceiling": 6
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/io_pipe.rs",
+      "ceiling": 2
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/ioring.rs",
+      "ceiling": 6
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/keys.rs",
+      "ceiling": 1
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/mem/madvise.rs",
+      "ceiling": 1
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
+      "ceiling": 1
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/mod.rs",
+      "ceiling": 7
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/mqueue.rs",
+      "ceiling": 3
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/net.rs",
+      "ceiling": 4
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
+      "ceiling": 12
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/net/netlink.rs",
+      "ceiling": 1
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/net/packet.rs",
+      "ceiling": 3
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
+      "ceiling": 40
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/net/sockopt.rs",
+      "ceiling": 6
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/net/support.rs",
+      "ceiling": 7
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/perf.rs",
+      "ceiling": 3
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/proc.rs",
+      "ceiling": 21
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/signal.rs",
+      "ceiling": 6
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/syslog.rs",
+      "ceiling": 3
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/sysv.rs",
+      "ceiling": 12
+    },
+    {
+      "path": "crates/carrick-kernel/src/dispatch/time.rs",
+      "ceiling": 17
+    }
+  ]
+}
