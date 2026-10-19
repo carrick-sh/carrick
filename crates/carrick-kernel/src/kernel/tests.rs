@@ -1631,3 +1631,229 @@ fn description_common_survives_the_closed_transition_and_counts_fd_refs() {
     assert_eq!(common.seals(), Some(0b0001));
     assert!(common.secretmem());
 }
+
+#[test]
+#[ignore = "red witness for #685"]
+fn futex_queue_authority_split_wait_wake_lost_wake_witness() {
+    use carrick_abi::{LinuxCloneFlags, LinuxFutexFlags, LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE};
+    use carrick_guest_mem::GuestMemory;
+    use carrick_thread::thread::FutexWaitOutcome;
+    use crate::compat::CompatReporter;
+    use crate::dispatch::outcome::DispatchOutcome;
+    use crate::dispatch::{LinearMemory, SyscallArgs, SyscallRequest};
+    use super::ClonePlan;
+
+    let (kernel, root) = bootstrap(9301);
+    let plan = ClonePlan::from_flags(
+        LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+    )
+    .expect("thread plan");
+    let root_tid = ThreadId::synthetic_for_tests(9301);
+    let sibling_tid = ThreadId::synthetic_for_tests(9302);
+    let _sibling = kernel
+        .clone_thread(&root, plan, sibling_tid, None)
+        .expect("sibling");
+
+    let futex_addr: u64 = 0x10800;
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    memory.write_bytes(futex_addr, &0u32.to_ne_bytes()).unwrap();
+
+    let zone_box: Box<carrick_el1_abi::ZoneTables> = unsafe { Box::new_zeroed().assume_init() };
+    let zone: &'static carrick_el1_abi::ZoneTables = Box::leak(zone_box);
+    let mm: u64 = root.shared().mm().id().raw();
+
+    let futex_table = Arc::new(crate::thread::FutexTable::new());
+    let registry = crate::thread::ThreadRegistry::new(root_tid);
+    let clock = crate::kernel::container::ClockDomain::default();
+    let shared = carrick_thread::platform_futex::SharedFutexTable::new();
+    let reporter = CompatReporter::default();
+
+    // Waiter (root thread) executes FUTEX_WAIT with zone: None -> routes to FutexTable.
+    let wait_req = SyscallRequest::new(
+        98,
+        SyscallArgs::from([
+            futex_addr,
+            LINUX_FUTEX_WAIT | LinuxFutexFlags::PRIVATE.bits(),
+            0,
+            0,
+            0,
+            0,
+        ]),
+    );
+    let outcome = crate::dispatch::futex::dispatch_threaded_futex(
+        &clock,
+        &shared,
+        wait_req,
+        &mut memory,
+        &reporter,
+        &futex_table,
+        root_tid,
+        &registry,
+        None,
+        None,
+        None,
+    );
+    let wait = match outcome {
+        DispatchOutcome::FutexWait { wait, .. } => wait,
+        other => panic!("expected FutexWait, got {other:?}"),
+    };
+
+    let futex_table_clone = Arc::clone(&futex_table);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let waiter_thread = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        futex_table_clone.wait_prepared(
+            wait,
+            Some(std::time::Duration::from_millis(200)),
+            &|| false,
+        )
+    });
+    started_rx.recv().unwrap();
+    // Allow the waiter thread to enter the park loop.
+    std::thread::sleep(std::time::Duration::from_millis(30));
+
+    // Waker (sibling thread) executes FUTEX_WAKE with zone: Some((zone, mm)) -> routes to ZoneTables.
+    let wake_req = SyscallRequest::new(
+        98,
+        SyscallArgs::from([
+            futex_addr,
+            LINUX_FUTEX_WAKE | LinuxFutexFlags::PRIVATE.bits(),
+            1,
+            0,
+            0,
+            0,
+        ]),
+    );
+    let wake_outcome = crate::dispatch::futex::dispatch_threaded_futex(
+        &clock,
+        &shared,
+        wake_req,
+        &mut memory,
+        &reporter,
+        &futex_table,
+        sibling_tid,
+        &registry,
+        None,
+        None,
+        Some((zone, mm)),
+    );
+    assert!(matches!(
+        wake_outcome,
+        DispatchOutcome::ZoneFutexWoken { .. }
+    ));
+
+    // Waiter times out because wake was delivered to ZoneTables instead of FutexTable.
+    let wait_outcome = waiter_thread.join().expect("waiter thread join");
+    assert_eq!(
+        wait_outcome,
+        FutexWaitOutcome::Woken,
+        "lost wake: waiter parked on FutexTable but waker resolved to ZoneTables"
+    );
+}
+
+#[test]
+#[ignore = "red witness for #685"]
+fn futex_queue_authority_split_cleartid_exit_lost_wake_witness() {
+    use carrick_abi::{LinuxCloneFlags, LINUX_FUTEX_WAIT};
+    use carrick_guest_mem::GuestMemory;
+    use carrick_thread::thread::FutexWaitOutcome;
+    use crate::compat::CompatReporter;
+    use crate::dispatch::outcome::DispatchOutcome;
+    use crate::dispatch::{LinearMemory, SyscallArgs, SyscallRequest};
+    use super::ClonePlan;
+
+    let (kernel, root) = bootstrap(9303);
+    let plan = ClonePlan::from_flags(
+        LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+    )
+    .expect("thread plan");
+    let root_tid = ThreadId::synthetic_for_tests(9303);
+    let sibling_tid = ThreadId::synthetic_for_tests(9304);
+    let sibling = kernel
+        .clone_thread(&root, plan, sibling_tid, None)
+        .expect("sibling");
+
+    let ctid_addr: u64 = 0x10800;
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let sibling_raw_tid = sibling.thread().key().tid.raw() as u32;
+    memory.write_bytes(ctid_addr, &sibling_raw_tid.to_ne_bytes()).unwrap();
+
+    let zone_box: Box<carrick_el1_abi::ZoneTables> = unsafe { Box::new_zeroed().assume_init() };
+    let zone: &'static carrick_el1_abi::ZoneTables = Box::leak(zone_box);
+    let mm: u64 = root.shared().mm().id().raw();
+
+    let futex_table = Arc::new(crate::thread::FutexTable::new());
+    let registry = crate::thread::ThreadRegistry::new(root_tid);
+    registry.set_clear_child_tid(sibling_tid, ctid_addr);
+    let clock = crate::kernel::container::ClockDomain::default();
+    let shared = carrick_thread::platform_futex::SharedFutexTable::new();
+    let reporter = CompatReporter::default();
+
+    // Waiter (root thread) waits on ctid_addr via FutexTable (e.g. pthread_join on host).
+    let wait_req = SyscallRequest::new(
+        98,
+        SyscallArgs::from([ctid_addr, LINUX_FUTEX_WAIT, sibling_raw_tid as u64, 0, 0, 0]),
+    );
+    let outcome = crate::dispatch::futex::dispatch_threaded_futex(
+        &clock,
+        &shared,
+        wait_req,
+        &mut memory,
+        &reporter,
+        &futex_table,
+        root_tid,
+        &registry,
+        None,
+        None,
+        None,
+    );
+    let wait = match outcome {
+        DispatchOutcome::FutexWait { wait, .. } => wait,
+        other => panic!("expected FutexWait, got {other:?}"),
+    };
+
+    let futex_table_clone = Arc::clone(&futex_table);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let waiter_thread = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        futex_table_clone.wait_prepared(
+            wait,
+            Some(std::time::Duration::from_millis(200)),
+            &|| false,
+        )
+    });
+    started_rx.recv().unwrap();
+    // Allow the waiter thread to enter the park loop.
+    std::thread::sleep(std::time::Duration::from_millis(30));
+
+    // Sibling thread exits in-guest / in-zone (ThreadRetirementLane::ExitedInZone).
+    // In EL1, exit clears the TID and wakes ZoneTables.
+    memory.write_bytes(ctid_addr, &0u32.to_ne_bytes()).unwrap();
+    let _ = crate::el1_zone::wake(
+        zone,
+        mm,
+        ctid_addr,
+        carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
+        1,
+    );
+    // Graph retirement marks child_tid_cleared_in_zone on the thread.
+    sibling
+        .thread()
+        .child_tid_cleared_in_zone
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    // Host runtime clears/drains child tid (matches `drain_child_tid_clears` in `threads.rs:1013`):
+    if sibling.thread().child_tid_cleared_in_zone() {
+        // Suppress host re-wake on FutexTable because in-zone receipt is true!
+    } else {
+        futex_table.wake(ctid_addr, 1);
+    }
+
+    // Waiter times out because wake was sent to ZoneTables in EL1 and suppressed on host!
+    let wait_outcome = waiter_thread.join().expect("waiter thread join");
+    assert_eq!(
+        wait_outcome,
+        FutexWaitOutcome::Woken,
+        "lost wake: waiter parked on FutexTable on ctid_addr, but exit woke ZoneTables and host re-wake was suppressed"
+    );
+}
