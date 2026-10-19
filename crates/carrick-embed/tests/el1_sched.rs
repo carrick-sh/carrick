@@ -4258,7 +4258,11 @@ fn el1_sched_delayed_notification_survives_parent_reap() {
 /// service placement of the pinned host-served `sock-pingpong` is held off
 /// the guest's run queue and queued on the first slot that may run it just
 /// before that slot's driver steps away (every host-served socket operation
-/// steps away). The auditor must see that exact record captured exactly
+/// steps away). Holding a pingpong thread stalls its partner, so the
+/// workload (`sock-pingpong-stepper`) adds an independent actor pinned to
+/// the same guest CPU whose host-served socket loop steps away whatever the
+/// held thread's partner is doing: the release does not depend on the held
+/// record's own progress. The auditor must see that exact record captured exactly
 /// once. The hold never creates a record, and it releases to the host run
 /// queue at its deadline, which fails this test instead of wedging the run.
 #[test]
@@ -4287,7 +4291,7 @@ fn el1_sched_deferred_handback_capture_observes_guest_records() {
         carrier
             .container(common::SMOKE_IMAGE)
             .pull_policy(PullPolicy::Missing)
-            .command([FIXTURE, "sock-pingpong", "2000", "pinned"])
+            .command([FIXTURE, "sock-pingpong-stepper", "2000"])
             .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
             .auditor(capture.clone())
             .run_blocking(),
@@ -4295,6 +4299,7 @@ fn el1_sched_deferred_handback_capture_observes_guest_records() {
     let outcome = hold.finish();
     assert!(result.success(), "{}", result.stdout_utf8());
     assert!(result.stdout_utf8().contains("sock-pingpong iters=2000"));
+    assert!(result.stdout_utf8().contains("stepper ok"));
     let batches = capture.batches.lock().unwrap();
     println!("deferred handback capture: outcome={outcome:?} batches={batches:?}");
     let HoldOutcome::ReleasedAtStepAway { record, .. } = outcome else {
