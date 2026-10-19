@@ -37,31 +37,7 @@ macro_rules! linux_i32_id {
     };
 }
 
-macro_rules! serial_id {
-    ($name:ident) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        #[repr(transparent)]
-        pub struct $name(NonZeroU64);
-
-        impl $name {
-            pub const fn from_registry_allocation(raw: NonZeroU64) -> Self {
-                Self(raw)
-            }
-
-            pub const fn raw(self) -> u64 {
-                self.0.get()
-            }
-
-            #[allow(dead_code)]
-            pub const fn from_raw_u64(raw: u64) -> Option<Self> {
-                match NonZeroU64::new(raw) {
-                    Some(nz) => Some(Self(nz)),
-                    None => None,
-                }
-            }
-        }
-    };
-}
+use carrick_sched_core::serial_id;
 
 linux_i32_id!(LinuxTid);
 
@@ -89,12 +65,6 @@ serial_id!(FileDescriptionId);
 serial_id!(FsContextId);
 serial_id!(CredentialsId);
 serial_id!(SighandId);
-
-impl MmId {
-    pub const fn nonzero(self) -> NonZeroU64 {
-        self.0
-    }
-}
 
 impl LinuxTid {
     pub(crate) const fn from_registry_allocation(raw: NonZeroI32) -> Self {
