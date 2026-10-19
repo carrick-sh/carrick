@@ -4740,6 +4740,110 @@ fn arm_host_birth_adoption_racing_closing_has_one_cancel_owner() {
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
 }
 
+/// #641 (signed captures at 113108004: `owner_verdict ... first=Adopted
+/// observed=(2,5,43) expected=(2,4233,43)`): a host-born member adopted on
+/// the quantum whose execution generation equals the birth identity's
+/// process generation is later rehomed with its next execution generation.
+/// The host retires it with its exact birth identity, so Closing must
+/// expect that identity, never the rehomed execution binding.
+#[test]
+fn arm_rehomed_adopted_member_settles_on_its_birth_identity() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let control = host_born_sibling(fixture, 42);
+    let birth_identity = control.host_birth_identity().unwrap();
+    let sibling_task = Box::leak(Box::new(CurrentTask::new()));
+    let slot = SlotId::new(1);
+    fixture.zone.drive(slot, 2);
+    fixture.zone.publish_slot(slot, 1, Some(1), 1);
+    fixture.zone.enter_guest(slot);
+    fixture.zone.install_space(slot, 1).unwrap();
+    let mm = fixture.task.mm.key.load(Ordering::Acquire);
+    let bind = |generation: u64| {
+        sibling_task.set(El1TaskId::from_linux_tid(42), generation, 5);
+        sibling_task.mm.key.store(mm, Ordering::Release);
+        sibling_task
+            .mm
+            .thread_generation
+            .store(102, Ordering::Release);
+        sibling_task.publish_visible_pid(41);
+        sibling_task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+        sibling_task.publish_root_generation(fixture.address.generation);
+        let record = fixture
+            .zone
+            .current_or_new(
+                slot,
+                ThreadIdentity {
+                    tid: 42,
+                    serial: 102,
+                    mm,
+                    file_table: 5,
+                    generation,
+                    affinity: 1,
+                    lifecycle_page: fixture.page as *const _ as u64,
+                    control_slot: control as *const _ as u64,
+                },
+            )
+            .unwrap();
+        control.bind_zone_record(fixture.zone.record_ref(record));
+        record
+    };
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot,
+    };
+    // Adoption succeeds on the quantum whose execution generation equals the
+    // birth identity's process generation (12 for this fixture).
+    let first = bind(12);
+    registry()
+        .register_thread(source, sibling_task, fixture.address, fixture.page, control)
+        .expect("adopt host-born sibling");
+    // Its next quantum carries a later execution generation.
+    fixture.zone.discard_unpublished(slot, first);
+    let _ = bind(4_233);
+    registry()
+        .rehome_entry(source, sibling_task, fixture.address, fixture.page, control)
+        .expect("rehome adopted sibling")
+        .expect("registered member rehomes");
+    run_as_leader(fixture);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    // The host retires the member exactly as production does.
+    fixture
+        .page
+        .reserve_cancelled_member_exit()
+        .unwrap()
+        .publish();
+    fixture
+        .page
+        .publish_exact_host_retirement(control, birth_identity);
+    assert_eq!(fixture.page.live(), 0);
+    assert!(matches!(
+        wake_closing_root(fixture, &mut service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(
+        service.crossing.root_exits.load(Ordering::Acquire),
+        1,
+        "closing owner re-parked: {}",
+        fixture.page.closing_verdict()
+    );
+}
+
 #[test]
 fn arm_host_exit_reserved_live_count_does_not_settle_group_before_receipt() {
     use carrick_el1_abi::Lifecycle;
