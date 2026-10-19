@@ -1166,13 +1166,13 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
     rig.probe_tlb(&mut tlb_cpu1, va_rw, Access::Read, mode);
     let removed = rig.mem.extents_mut().remove(FrameGpa::new(F4_GPA), None);
     assert!(retire_now(&mut rig.mem, removed).is_some());
-    // Each CPU serves the retirement at its next block entry, then parks.
+    // Each CPU serves the retirement at its next block entry.
     for (seat, tlb) in [
         (&mut seat_cpu0, &mut rig.tlb),
         (&mut seat_cpu1, &mut tlb_cpu1),
     ] {
-        assert!(seat.block_entry(tlb));
-        seat.park();
+        // One block: the run guard parks the CPU again when it drops.
+        assert!(seat.run().block_entry(tlb).unwrap());
     }
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
@@ -1187,8 +1187,8 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
         (&mut seat_cpu0, &mut rig.tlb),
         (&mut seat_cpu1, &mut tlb_cpu1),
     ] {
-        assert!(seat.block_entry(tlb));
-        seat.park();
+        // One block: the run guard parks the CPU again when it drops.
+        assert!(seat.run().block_entry(tlb).unwrap());
     }
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
@@ -1202,8 +1202,8 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
         (&mut seat_cpu0, &mut rig.tlb),
         (&mut seat_cpu1, &mut tlb_cpu1),
     ] {
-        assert!(seat.block_entry(tlb));
-        seat.park();
+        // One block: the run guard parks the CPU again when it drops.
+        assert!(seat.run().block_entry(tlb).unwrap());
     }
     let _ = rig.probe_ram(va_rw, Access::Read, mode);
     rig.probe_tlb(&mut tlb_cpu1, va_rw, Access::Read, mode);
@@ -1214,8 +1214,8 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
         (&mut seat_cpu0, &mut rig.tlb),
         (&mut seat_cpu1, &mut tlb_cpu1),
     ] {
-        assert!(seat.block_entry(tlb));
-        seat.park();
+        // One block: the run guard parks the CPU again when it drops.
+        assert!(seat.run().block_entry(tlb).unwrap());
     }
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);

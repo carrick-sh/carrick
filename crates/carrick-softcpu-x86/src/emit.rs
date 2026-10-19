@@ -38,6 +38,11 @@ pub enum EmitError {
     ForeignInventory {
         va: u64,
     },
+    /// The inventory went terminal (it could no longer publish a
+    /// retirement): no CPU may translate through it.
+    InventoryTerminal {
+        va: u64,
+    },
 }
 
 /// Output of [`emit_block`].

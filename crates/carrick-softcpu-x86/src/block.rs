@@ -127,6 +127,11 @@ fn fetch_one_insn<M: SoftMmuMemory>(
 }
 
 /// Plan one basic block starting at `entry_va` over `ctx` and `mem`.
+///
+/// Instruction bytes are fetched through [`crate::mmu::translate_with_frame`],
+/// so a CPU not seated in `mem`'s inventory fetches nothing, and the
+/// translations it uses are valid only while this call's `&mut M` borrow
+/// lasts (every retirement needs `mem.extents_mut()`).
 pub fn plan_block_from_memory<M: SoftMmuMemory>(
     entry_va: u64,
     max_insns: usize,

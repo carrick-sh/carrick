@@ -5,7 +5,7 @@
 use super::*;
 use crate::domains::{Access, CpuAccessMode, FrameGpa, GuestVa, OwnerGeneration};
 use crate::tlb::{SOFT_TLB_ENTRIES, SoftTlbEntry};
-use crate::walker::{ExtentRecord, ExtentTable, Retirement};
+use crate::walker::{ExtentEditError, ExtentRecord, ExtentTable, Reclaimed, Retirement};
 use alloc::vec::Vec;
 use carrick_conformance_contract::{
     Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
@@ -79,6 +79,20 @@ fn remove_extent(table: &StdArc<Mutex<ExtentTable>>) -> Retirement<ExtentRecord>
         .expect("extent was live")
 }
 
+fn released(identities: usize) -> Reclaimed {
+    Reclaimed {
+        identities,
+        published: 0,
+    }
+}
+
+fn host_wait(pending: PendingRetirement) -> DomainCompletion {
+    pending
+        .wait(None, bounded())
+        .map_err(|(_, error)| error)
+        .expect("retirement completes")
+}
+
 // ---------------------------------------------------------------------------
 // Red-first witness (#607): a running peer holding a translation of a
 // retired extent. On main the peer's TLB could only be flushed if the
@@ -95,18 +109,24 @@ fn running_peer_cannot_use_stale_addend_after_retirement_completes() {
     let (result_tx, result_rx) = mpsc::channel();
 
     let peer = thread::spawn(move || {
-        assert!(!seat.block_entry(&mut tlb), "a fresh seat owes nothing");
+        let mut run = seat.run();
+        assert!(
+            !run.block_entry(&mut tlb).unwrap(),
+            "a fresh seat owes nothing"
+        );
         cache_translation(&mut tlb, OLD_ADDEND);
         assert!(cached(&tlb).is_some(), "the peer hits its translation");
         ready_tx.send(()).unwrap();
         // Running between blocks until the retirement kicks it.
-        wait_for(|| seat.exit_requested(), "the kick");
+        wait_for(|| run.exit_requested(), "the kick");
         // Still the old translation: no flush happens inside a block.
         assert!(cached(&tlb).is_some());
-        assert!(seat.block_entry(&mut tlb), "block entry serves the debt");
-        assert!(!seat.exit_requested(), "serving consumes the exit flag");
+        assert!(
+            run.block_entry(&mut tlb).unwrap(),
+            "block entry serves the debt"
+        );
+        assert!(!run.exit_requested(), "serving consumes the exit flag");
         result_tx.send(cached(&tlb)).unwrap();
-        seat.park();
     });
 
     ready_rx.recv_timeout(WAIT).unwrap();
@@ -117,9 +137,9 @@ fn running_peer_cannot_use_stale_addend_after_retirement_completes() {
     let pending = pending
         .try_complete()
         .expect_err("a running peer that has not served blocks completion");
-    let completion = pending.wait(None, bounded()).map_err(|(_, e)| e).unwrap();
+    let completion = host_wait(pending);
     assert_eq!(result_rx.recv_timeout(WAIT).unwrap(), None);
-    assert_eq!(table.lock().unwrap().reclaim(&completion), 2);
+    assert_eq!(table.lock().unwrap().reclaim(&completion), released(1));
     assert_eq!(table.lock().unwrap().retirement_kicks(), 1);
     peer.join().unwrap();
 }
@@ -129,9 +149,8 @@ fn parked_peer_resynchronizes_at_block_entry_and_is_never_kicked() {
     let mut table = table_with_extent();
     let mut tlb = SoftTlb::new();
     let mut seat = table.register_vcpu(&mut tlb).unwrap();
-    seat.block_entry(&mut tlb);
+    seat.run().block_entry(&mut tlb).unwrap();
     cache_translation(&mut tlb, OLD_ADDEND);
-    seat.park();
 
     let Retirement { pending, .. } = table.remove(FrameGpa::new(EXTENT), None).unwrap().unwrap();
     // A parked peer never holds the retirement up.
@@ -141,7 +160,7 @@ fn parked_peer_resynchronizes_at_block_entry_and_is_never_kicked() {
     table.reclaim(&completion);
     // Its stale entry survives until it resumes, and is gone before use.
     assert!(cached(&tlb).is_some());
-    assert!(seat.block_entry(&mut tlb));
+    assert!(seat.run().block_entry(&mut tlb).unwrap());
     assert_eq!(cached(&tlb), None);
 }
 
@@ -154,11 +173,12 @@ fn host_admission_of_a_parked_peer_serves_before_its_probe() {
     let Retirement { pending, .. } = table.remove(FrameGpa::new(EXTENT), None).unwrap().unwrap();
     let completion = pending.try_complete().expect("parked");
     table.reclaim(&completion);
-    let admission = seat.admit(&mut tlb);
-    assert_eq!(admission, LookupAdmission::Entered);
-    assert_eq!(cached(&tlb), None, "admission served the retirement");
-    seat.release(admission);
-    assert!(!seat.is_running(), "the admission parks the CPU again");
+    {
+        let admission = seat.admit(&mut tlb).unwrap();
+        assert!(admission.seat().is_running());
+        assert_eq!(cached(&tlb), None, "admission served the retirement");
+    }
+    assert!(!seat.is_running(), "dropping the admission parks the CPU");
 }
 
 #[test]
@@ -166,33 +186,272 @@ fn retirement_from_inside_a_running_peer_serves_itself_without_deadlock() {
     let mut table = table_with_extent();
     let mut tlb = SoftTlb::new();
     let mut seat = table.register_vcpu(&mut tlb).unwrap();
-    seat.block_entry(&mut tlb);
+    let mut run = seat.run();
+    run.block_entry(&mut tlb).unwrap();
     cache_translation(&mut tlb, OLD_ADDEND);
-    assert!(seat.is_running());
 
     let Retirement { pending, .. } = table
-        .remove(
-            FrameGpa::new(EXTENT),
-            Some(SoftRequester::new(&mut seat, &mut tlb)),
-        )
+        .remove(FrameGpa::new(EXTENT), Some(run.requester(&mut tlb)))
         .unwrap()
         .unwrap();
     // Counted, served inline, never kicked: it cannot wait on itself.
-    assert!(pending.counts(seat.cpu()));
+    assert!(pending.counts(run.seat().cpu()));
     assert_eq!(table.retirement_kicks(), 0);
     assert_eq!(cached(&tlb), None);
     let completion = pending
-        .wait(Some(SoftRequester::new(&mut seat, &mut tlb)), bounded())
+        .wait(Some(run.requester(&mut tlb)), bounded())
         .map_err(|(_, e)| e)
         .expect("a self-served retirement completes");
-    assert_eq!(table.reclaim(&completion), 2);
+    assert_eq!(table.reclaim(&completion), released(1));
+}
+
+// ---------------------------------------------------------------------------
+// P1-b (#707 review): running is a scope. A finished run parks, so a host
+// wait never wedges on it; a CPU's own thread waiting without itself as the
+// requester is refused instead of waiting on its own safe point.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_finished_run_parks_so_a_host_wait_never_wedges() {
+    let mut table = table_with_extent();
+    let mut tlb = SoftTlb::new();
+    let mut seat = table.register_vcpu(&mut tlb).unwrap();
+    // A block ran; the embedder now handles a syscall without parking by
+    // hand. The run guard already parked the CPU when it dropped.
+    seat.run().block_entry(&mut tlb).unwrap();
+    assert!(!seat.is_running());
+    let Retirement { pending, .. } = table.remove(FrameGpa::new(EXTENT), None).unwrap().unwrap();
+    let mut polls = 0u32;
+    let completion = pending
+        .wait(None, || {
+            polls += 1;
+            if polls > 100_000 {
+                Err("wedged")
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(|(_, e)| e)
+        .expect("a parked CPU never holds a host wait");
+    assert_eq!(polls, 0, "completed without a single relax");
+    table.reclaim(&completion);
+}
+
+#[test]
+fn a_cpu_thread_waiting_without_itself_as_requester_is_refused() {
+    let mut table = table_with_extent();
+    let mut tlb = SoftTlb::new();
+    let mut seat = table.register_vcpu(&mut tlb).unwrap();
+    let mut run = seat.run();
+    run.block_entry(&mut tlb).unwrap();
+    let Retirement { pending, .. } = table.remove(FrameGpa::new(EXTENT), None).unwrap().unwrap();
+    let mut polls = 0u32;
+    let (pending, error) = pending
+        .wait(None, || {
+            polls += 1;
+            if polls > 10_000 { Err(()) } else { Ok(()) }
+        })
+        .expect_err("this thread runs a CPU that owes the retirement");
+    assert_eq!(error, RetirementWaitError::SelfWait);
+    assert_eq!(polls, 0, "refused before waiting");
+    // Passing itself serves it inline.
+    let completion = pending
+        .wait(Some(run.requester(&mut tlb)), bounded())
+        .map_err(|(_, e)| e)
+        .expect("served as its own requester");
+    drop(run);
+    table.reclaim(&completion);
+}
+
+#[test]
+fn an_unguarded_running_seat_still_wedges_a_host_wait() {
+    // The raw entry point keeps the old shape for embedders with their own
+    // guard; without one, the bound is the only way out.
+    let mut table = table_with_extent();
+    let mut tlb = SoftTlb::new();
+    let mut seat = table.register_vcpu(&mut tlb).unwrap();
+    // SAFETY: deliberately violated (no park) to witness why it is unsafe;
+    // the seat is dropped, stopping it, before the test ends.
+    unsafe { seat.block_entry_unguarded(&mut tlb) }.unwrap();
+    let Retirement { pending, .. } = table.remove(FrameGpa::new(EXTENT), None).unwrap().unwrap();
+    let result = thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let mut polls = 0u32;
+                pending.wait(None, || {
+                    polls += 1;
+                    if polls > 10_000 {
+                        Err("wedged")
+                    } else {
+                        Ok(())
+                    }
+                })
+            })
+            .join()
+            .unwrap()
+            .map(|_| ())
+            .map_err(|(_, e)| e)
+    });
+    assert_eq!(result, Err(RetirementWaitError::Relax("wedged")));
+    drop(seat);
+}
+
+// ---------------------------------------------------------------------------
+// P1-a (#707 review): a pending retirement holds its whole span, and a
+// replacement publishes its new owner only on completion.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pending_retirement_refuses_any_overlapping_install() {
+    let mut table = ExtentTable::new().unwrap();
+    assert!(table.install(ExtentRecord::new(
+        FrameGpa::new(0x1000),
+        0x2000,
+        generation(1)
+    )));
+    let mut tlb = SoftTlb::new();
+    let mut seat = table.register_vcpu(&mut tlb).unwrap();
+    let mut run = seat.run();
+    run.block_entry(&mut tlb).unwrap();
+    let Retirement { pending, .. } = table.remove(FrameGpa::new(0x1000), None).unwrap().unwrap();
+    let pending = pending.try_complete().expect_err("peer running, unserved");
+    // Frame 0x2000 was inside the retired span: no new owner may take it.
+    assert!(!table.install(ExtentRecord::new(
+        FrameGpa::new(0x2000),
+        0x1000,
+        generation(9)
+    )));
+    assert!(!table.install(ExtentRecord::new(FrameGpa::new(0x0), 0x2000, generation(9))));
+    // Adjacent, disjoint frames are fine.
+    assert!(table.install(ExtentRecord::new(
+        FrameGpa::new(0x0),
+        0x1000,
+        generation(10)
+    )));
+    run.block_entry(&mut tlb).unwrap();
+    let completion = pending.try_complete().expect("served");
+    table.reclaim(&completion);
+    assert!(table.install(ExtentRecord::new(
+        FrameGpa::new(0x2000),
+        0x1000,
+        generation(9)
+    )));
+}
+
+#[test]
+fn a_replacement_publishes_its_new_owner_only_on_completion() {
+    let mut table = table_with_extent();
+    let mut tlb = SoftTlb::new();
+    let mut seat = table.register_vcpu(&mut tlb).unwrap();
+    let mut run = seat.run();
+    run.block_entry(&mut tlb).unwrap();
+    let Retirement { retired, pending } = table
+        .replace(
+            ExtentRecord::new(FrameGpa::new(EXTENT), 0x1000, generation(5)),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(retired.generation, generation(1));
+    let pending = pending.try_complete().expect_err("peer running, unserved");
+    // No owner while a peer may still translate to the old one.
+    assert_eq!(table.lookup_span(EXTENT, 0x1000), None);
+    // The deferred owner holds its span.
+    assert!(!table.install(ExtentRecord::new(
+        FrameGpa::new(EXTENT),
+        0x1000,
+        generation(6)
+    )));
+    run.block_entry(&mut tlb).unwrap();
+    let completion = pending.try_complete().expect("served");
+    assert_eq!(
+        table.reclaim(&completion),
+        Reclaimed {
+            identities: 1,
+            published: 1
+        }
+    );
+    assert_eq!(
+        table
+            .lookup_span(EXTENT, 0x1000)
+            .map(|record| record.generation),
+        Some(generation(5))
+    );
+}
+
+#[test]
+fn a_root_replacement_publishes_its_new_generation_only_on_completion() {
+    use carrick_guest_arch::RootGpa;
+    let mut table = ExtentTable::new().unwrap();
+    let root = RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap();
+    assert!(table.set_root_generation(root, generation(7)));
+    let Retirement { retired, pending } = table
+        .replace_root_generation(root, generation(8), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retired, generation(7));
+    assert_eq!(table.expected_generation(root), None);
+    let completion = pending.try_complete().expect("no CPU seated");
+    table.reclaim(&completion);
+    assert_eq!(table.expected_generation(root), Some(generation(8)));
+}
+
+// ---------------------------------------------------------------------------
+// P2s (#707 review): dropped retirements recover, exhaustion stops CPUs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_dropped_retirement_is_recovered_by_a_later_completion() {
+    let mut table = table_with_extent();
+    let dropped = table.remove(FrameGpa::new(EXTENT), None).unwrap().unwrap();
+    drop(dropped);
+    assert_eq!(table.pending_identities(), 1);
+    assert!(!table.install(ExtentRecord::new(
+        FrameGpa::new(EXTENT),
+        0x1000,
+        generation(2)
+    )));
+    let recovery = table.retire_abandoned(None).unwrap();
+    let completion = recovery.try_complete().expect("no CPU seated");
+    assert_eq!(table.reclaim(&completion), released(1));
+    assert_eq!(table.pending_identities(), 0);
+    assert!(table.install(ExtentRecord::new(
+        FrameGpa::new(EXTENT),
+        0x1000,
+        generation(2)
+    )));
+}
+
+#[test]
+fn an_exhausted_inventory_stops_every_cpu_and_refuses_edits_loudly() {
+    let mut table = table_with_extent();
+    let mut tlb = SoftTlb::new();
+    let mut seat = table.register_vcpu(&mut tlb).unwrap();
+    let mut run = seat.run();
+    run.block_entry(&mut tlb).unwrap();
+    // The real exhaustion path's terminal transition (the issue counter
+    // cannot be driven to u64::MAX in a test).
+    table.exhaust_for_test();
+    assert_eq!(run.block_entry(&mut tlb), Err(InventoryTerminal));
+    drop(run);
+    assert!(!seat.is_running(), "a terminal block entry parks");
+    assert!(matches!(seat.admit(&mut tlb), Err(InventoryTerminal)));
+    assert_eq!(
+        table.remove(FrameGpa::new(EXTENT), None).map(|_| ()),
+        Err(ExtentEditError::Terminal)
+    );
+    assert!(!table.install(ExtentRecord::new(
+        FrameGpa::new(0x8000),
+        0x1000,
+        generation(3)
+    )));
 }
 
 #[test]
 fn pending_extent_identities_are_refused_until_their_completion() {
     let mut table = table_with_extent();
     let Retirement { pending, .. } = table.remove(FrameGpa::new(EXTENT), None).unwrap().unwrap();
-    assert_eq!(table.pending_identities(), 2);
+    assert_eq!(table.pending_identities(), 1);
     // Same base, other generation; other base, same generation: both refused.
     assert!(!table.install(ExtentRecord::new(
         FrameGpa::new(EXTENT),
@@ -205,7 +464,7 @@ fn pending_extent_identities_are_refused_until_their_completion() {
         generation(1)
     )));
     let completion = pending.try_complete().expect("no CPU seated");
-    assert_eq!(table.reclaim(&completion), 2);
+    assert_eq!(table.reclaim(&completion), released(1));
     assert!(table.install(ExtentRecord::new(
         FrameGpa::new(EXTENT),
         0x1000,
@@ -285,37 +544,38 @@ fn concurrent_running_parked_transitions_never_outlive_a_completion() {
         let completed = StdArc::clone(&completed);
         let stop = StdArc::clone(&stop);
         thread::spawn(move || {
-            let mut step = 0u64;
-            let mut stamp = None;
-            while !stop.load(Ordering::Acquire) {
-                step += 1;
-                let admission = match step % 3 {
-                    0 => {
-                        seat.block_entry(&mut tlb);
-                        None
-                    }
-                    1 => Some(seat.admit(&mut tlb)),
-                    _ => {
-                        seat.park();
-                        stamp = None;
-                        continue;
-                    }
-                };
-                if let Some(stamped) = stamp
+            // While admitted, a completion after the stamp means this CPU
+            // served it, so the stamped entry must be gone.
+            let check_and_fill = |tlb: &mut SoftTlb, stamp: &mut Option<u64>| {
+                if let Some(stamped) = *stamp
                     && completed.load(Ordering::Acquire) > stamped
                 {
-                    assert_eq!(cached(&tlb), None, "stale entry outlived a completion");
+                    assert_eq!(cached(tlb), None, "stale entry outlived a completion");
                 }
-                if cached(&tlb).is_none() {
-                    stamp = Some(begun.load(Ordering::Acquire));
-                    cache_translation(&mut tlb, OLD_ADDEND);
+                if cached(tlb).is_none() {
+                    *stamp = Some(begun.load(Ordering::Acquire));
+                    cache_translation(tlb, OLD_ADDEND);
                 }
-                if let Some(LookupAdmission::Entered) = admission {
-                    seat.release(LookupAdmission::Entered);
-                    stamp = None;
+            };
+            let mut step = 0u64;
+            while !stop.load(Ordering::Acquire) {
+                step += 1;
+                let mut stamp = None;
+                match step % 3 {
+                    0 => {
+                        let mut run = seat.run();
+                        for _ in 0..3 {
+                            run.block_entry(&mut tlb).unwrap();
+                            check_and_fill(&mut tlb, &mut stamp);
+                        }
+                    }
+                    1 => {
+                        let _admitted = seat.admit(&mut tlb).unwrap();
+                        check_and_fill(&mut tlb, &mut stamp);
+                    }
+                    _ => thread::yield_now(),
                 }
             }
-            seat.park();
         })
     };
 
@@ -323,10 +583,10 @@ fn concurrent_running_parked_transitions_never_outlive_a_completion() {
         begun.store(round + 1, Ordering::Release);
         let Retirement { pending, .. } = remove_extent(&table);
         // Never wait while holding the table lock.
-        let completion = pending.wait(None, bounded()).map_err(|(_, e)| e).unwrap();
+        let completion = host_wait(pending);
         completed.store(round + 1, Ordering::Release);
         let mut guard = table.lock().unwrap();
-        assert_eq!(guard.reclaim(&completion), 2);
+        assert_eq!(guard.reclaim(&completion), released(1));
         assert!(guard.install(ExtentRecord::new(
             FrameGpa::new(EXTENT),
             0x1000,
@@ -422,46 +682,31 @@ fn member_work<const N: usize>(table: &ServedTable<N, CountingWord>) -> Work {
 }
 
 /// RMWs and stores on every member word across 1000 debt-free block
-/// entries of one running seat, on the exact `block_entry` production runs,
-/// in a table with `peers` seated members.
-fn steady_state_block_entry<const N: usize>(peers: usize) -> Work {
-    let table = ServedTable::<N, CountingWord>::with_domain(issue_domain_nonce().unwrap());
-    let exits: Vec<ExitFlag> = (0..N).map(|_| ExitFlag(AtomicBool::new(false))).collect();
-    let kicks = AtomicU64::new(0);
+/// entries of one running `SoftVcpuSeat` (the production seat type, over an
+/// instrumented served word), in a domain with `peers` seated members.
+fn steady_state_block_entry(peers: usize) -> Work {
+    let domain = SoftDomainHandle::<CountingWord>::new().unwrap();
     let mut tlbs: Vec<SoftTlb> = (0..peers).map(|_| SoftTlb::new()).collect();
-    let mut seats = Vec::new();
-    for (index, tlb) in tlbs.iter_mut().enumerate() {
-        let mut venue = SoftVenue {
-            tlb: Some(tlb),
-            exits: &exits,
-            kicks: &kicks,
-            relax: no_relax as NoRelax,
-        };
-        let mut seat = MemberSeat::claim(&table, CpuId::new(index as u32), &mut venue).unwrap();
-        let mut running = false;
-        let Ok(_) = block_entry(&mut seat, &mut running, &mut venue);
-        seats.push((seat, running));
+    let mut seats: Vec<SoftVcpuSeat<CountingWord>> = tlbs
+        .iter_mut()
+        .map(|tlb| SoftVcpuSeat::claim(&domain, tlb).unwrap())
+        .collect();
+    let mut runs: Vec<RunningSeat<'_, CountingWord>> =
+        seats.iter_mut().map(|seat| seat.run()).collect();
+    for (run, tlb) in runs.iter_mut().zip(tlbs.iter_mut()) {
+        run.block_entry(tlb).unwrap();
     }
+    let table = domain.table_for_test();
     let flushes_before = tlbs[0].stats().full_flushes;
     let counter_before = table.counter().latest(Ordering::Relaxed);
-    let before = member_work(&table);
-    {
-        let (seat, running) = &mut seats[0];
-        let mut venue = SoftVenue {
-            tlb: Some(&mut tlbs[0]),
-            exits: &exits,
-            kicks: &kicks,
-            relax: no_relax as NoRelax,
-        };
-        for _ in 0..1000 {
-            let Ok(flushed) = block_entry(seat, running, &mut venue);
-            assert!(!flushed);
-        }
+    let before = member_work(table);
+    for _ in 0..1000 {
+        assert!(!runs[0].block_entry(&mut tlbs[0]).unwrap());
     }
-    let after = member_work(&table);
+    let after = member_work(table);
     assert_eq!(table.counter().latest(Ordering::Relaxed), counter_before);
     assert_eq!(tlbs[0].stats().full_flushes, flushes_before);
-    assert_eq!(kicks.load(Ordering::Relaxed), 0);
+    assert_eq!(domain.kicks(), 0);
     // owed[2] + served[2], own line only, per block entry.
     assert_eq!(after.loads - before.loads, 1000 * 4);
     Work {
@@ -479,7 +724,7 @@ fn observation(peers: u64, counted: u64, kicks: u64, steady: Work) -> ContractOb
         .unwrap();
     work.insert(WorkMetric::InvalidationKicks, kicks).unwrap();
     work.insert(
-        WorkMetric::InvalidationSteadyStateRmws,
+        WorkMetric::InvalidationSteadyStateSharedWrites,
         steady.rmws + steady.stores,
     )
     .unwrap();
@@ -501,13 +746,16 @@ fn observation(peers: u64, counted: u64, kicks: u64, steady: Work) -> ContractOb
 /// One retirement over `peers` running peers plus as many parked ones.
 fn retirement_work(peers: usize) -> (u64, u64) {
     let mut table = table_with_extent();
-    let mut running = Vec::new();
-    for _ in 0..peers {
-        let mut tlb = SoftTlb::new();
-        let mut seat = table.register_vcpu(&mut tlb).unwrap();
-        seat.block_entry(&mut tlb);
-        cache_translation(&mut tlb, OLD_ADDEND);
-        running.push((seat, tlb));
+    let mut running_tlbs: Vec<SoftTlb> = (0..peers).map(|_| SoftTlb::new()).collect();
+    let mut running_seats: Vec<SoftVcpuSeat> = running_tlbs
+        .iter_mut()
+        .map(|tlb| table.register_vcpu(tlb).unwrap())
+        .collect();
+    let mut running: Vec<RunningSeat<'_>> =
+        running_seats.iter_mut().map(|seat| seat.run()).collect();
+    for (run, tlb) in running.iter_mut().zip(running_tlbs.iter_mut()) {
+        run.block_entry(tlb).unwrap();
+        cache_translation(tlb, OLD_ADDEND);
     }
     let mut parked = Vec::new();
     for _ in 0..peers {
@@ -525,12 +773,12 @@ fn retirement_work(peers: usize) -> (u64, u64) {
         "one kick per running peer, none parked"
     );
     let mut pending = pending;
-    for (seat, tlb) in &mut running {
-        assert!(seat.exit_requested());
+    for (run, tlb) in running.iter_mut().zip(running_tlbs.iter_mut()) {
+        assert!(run.exit_requested());
         pending = pending
             .try_complete()
             .expect_err("a running peer is unserved");
-        assert!(seat.block_entry(tlb));
+        assert!(run.block_entry(tlb).unwrap());
         assert_eq!(cached(tlb), None);
     }
     let completion = pending
@@ -539,7 +787,7 @@ fn retirement_work(peers: usize) -> (u64, u64) {
     table.reclaim(&completion);
 
     // A hit stays O(1): 1024 hits on one entry, no flush, no scan.
-    let (_, tlb) = &mut running[0];
+    let tlb = &mut running_tlbs[0];
     cache_translation(tlb, OLD_ADDEND);
     tlb.reset_stats();
     for _ in 0..SOFT_TLB_ENTRIES {
@@ -557,9 +805,9 @@ fn retirement_work(peers: usize) -> (u64, u64) {
 #[test]
 fn retirement_is_linear_in_peers_and_block_entry_is_rmw_free() {
     let scales: [(u64, Work); 3] = [
-        (1, steady_state_block_entry::<2>(2)),
-        (8, steady_state_block_entry::<16>(16)),
-        (32, steady_state_block_entry::<64>(64)),
+        (1, steady_state_block_entry(2)),
+        (8, steady_state_block_entry(16)),
+        (32, steady_state_block_entry(64)),
     ];
     let mut observations = Vec::new();
     for (peers, steady) in scales {

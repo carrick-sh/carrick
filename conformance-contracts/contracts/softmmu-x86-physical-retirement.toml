@@ -13,47 +13,60 @@ rationale = """
 Slice 2 of #681 (#607): the softmmu physical-retirement venue on the neutral
 invalidation domain (`carrick_core::mm::retirement::invalidation`). It replaces
 PR #678's bespoke coordinator; no mutex, condition variable, pending-shootdown
-token or pointer-identity authority remains, and `carrick-softmmu` stays
-`#![no_std]` with only `alloc`, so it has no lock to take.
+token or coordinator authority remains. `carrick-softmmu` uses no lock type;
+its optional `std` feature (enabled by the soft CPU) only names the calling
+thread so a CPU's own thread cannot wait on itself.
 
 `ExtentTable` owns one domain (`ServedTable<64>` behind an owning
 `SoftDomainHandle`). Every soft vCPU is a member holding a `SoftVcpuSeat`;
 its cache is its `SoftTlb`. Extent and root-generation retirement is keyed by
 physical ownership, so it is a domain-wide request (`stage_domain`): every
 seated member owes it whatever root it runs. The kick is the member's exit
-flag; the safe point is block entry; the local invalidation is
-`SoftTlb::flush_all` (Unmap) or `flush_write_plane` (RevokeWrite, #684). A
-running member serves only at block entry, never inside a block, so a pointer
-translated inside a block stays usable until the block ends: no request it
-owes can complete before its next safe point. A parked member is never waited
-on and serves when it re-enters; host-side guest access on a parked member
-(`translate_va`, `read_guest_bytes`, `write_guest_bytes`) enters for the whole
-access. Retired extent bases, owner generations, roots and root generations
-wait in a `ReclaimQueue` and are refused for reuse until the exact
-`DomainCompletion` releases them. `OwnerGeneration` is NonZero with a refusing
-successor; the code-page generation refuses on exhaustion instead of
-saturating; an exhausted domain counter makes the inventory terminal.
-Every TLB-using path (`step_block`, `translate_va`, `translate_with_frame`,
-`read_guest_bytes`, `write_guest_bytes`) is gated on membership: the helpers
-require a `HostAccess` proof that only `SoftCpuContext::admit_host_access`
-mints, after checking the CPU is seated in the memory's inventory, and a
-foreign CPU fails closed before probing. `ExtentTable` has no `Clone`;
-`try_clone` copies the records into a fresh, memberless domain and is refused
-while any retirement is pending.
+flag (cleared before serving, so a later kick survives); the safe point is
+block entry; the local invalidation is `SoftTlb::flush_all` (Unmap) or
+`flush_write_plane` (RevokeWrite, #684). A running member serves only at block
+entry, never inside a block, so a pointer translated inside a block stays
+usable until the block ends.
 
-Witnesses: the #607 red-first two-thread stale-addend case (on main the peer
-TLB was flushed only if the retiring thread could borrow it; omitted, the peer
-probe returned `Some(stale_host_address)`), a parked peer that is never kicked
-and resynchronizes before use, host admission of a parked peer, retirement
-issued from inside a running peer (served inline, never kicked, no
-self-deadlock), identity refusal until completion, a foreign requester refused
-before any edit, and a concurrent Running/Parked transition race against 400
-retirements. The x86 soft CPU carries the integration witnesses (a peer that
-really hits through `step_block`, host-side `translate_va` after completion).
+Running is a scope, not a comment: a CPU runs only inside a `RunningSeat` /
+`RunningCpu` guard (or an `unsafe` unguarded entry whose caller parks on
+every path), and the guard's drop parks it; `SoftCpu::step_block` is a run of
+one block. Host-side guest access goes through a `HostAccess` that borrows
+its CPU's context, is required by every TLB-using helper, checks membership
+and the terminal flag first, and parks a parked CPU again on drop. A parked
+member is never waited on. A thread that runs a counted CPU and waits with no
+requester is refused (`RetirementWaitError::SelfWait`) instead of waiting on
+its own safe point.
+
+A pending retirement holds its whole span: no install may overlap a retired
+extent or reuse its generation until completion, and a replacement publishes
+its new owner (extent or root generation) only when `ExtentTable::reclaim`
+takes the completion, so a new owner never coexists with a peer's translation
+of the old one. Every retirement is domain-wide, so a later completion also
+releases an earlier retirement whose pending request was dropped
+(`retire_abandoned` issues one on demand). `OwnerGeneration` is NonZero with a
+refusing successor; the code-page generation refuses on exhaustion; an
+exhausted domain counter makes the inventory terminal: every CPU refuses to
+translate (`EmitError::InventoryTerminal`) and every later edit returns
+`ExtentEditError::Terminal`. `ExtentTable` has no `Clone`; `try_clone` copies
+the records into a fresh, memberless domain and is refused while any
+retirement is pending.
+
+The protocol takes no lock per block. The carrier does not yet: `step_block`
+takes `&mut M`, so an embedder sharing one memory between CPUs serializes
+blocks with its own lock today; that is the soft carrier's work (#578).
+
+Witnesses: the #607 red-first two-thread stale-addend case, the #707 review
+witnesses (overlapping install and replacement before completion; a forgotten
+park and a self-wait), a parked peer that is never kicked, host admission,
+retirement from inside a running peer, identity refusal, a foreign requester,
+dropped-retirement recovery, terminal stop, and a concurrent Running/Parked
+transition race against 400 retirements. The x86 soft CPU carries the
+integration witnesses.
 """
 
 [bindings]
-vm_free = "carrick-softmmu::retirement::tests (test-support/retirement_unit.rs)::{running_peer_cannot_use_stale_addend_after_retirement_completes,parked_peer_resynchronizes_at_block_entry_and_is_never_kicked,host_admission_of_a_parked_peer_serves_before_its_probe,retirement_from_inside_a_running_peer_serves_itself_without_deadlock,pending_extent_identities_are_refused_until_their_completion,pending_root_and_generation_are_refused_until_their_completion,a_seat_of_another_inventory_is_refused_before_any_edit,owner_generation_refuses_exhaustion,a_copy_cannot_reuse_an_identity_whose_retirement_is_pending,concurrent_running_parked_transitions_never_outlive_a_completion,retirement_is_linear_in_peers_and_block_entry_is_rmw_free (evaluates the structural budgets at 2, 16 and 64 seated members)}; carrick-softmmu::walker::tests::code_generation_refuses_exhaustion_instead_of_saturating; carrick-softcpu-x86::softcpu_level0::{running_peer_that_hits_through_step_block_misses_after_retirement,host_translate_va_after_completion_misses_on_a_parked_cpu,retirement_issued_by_a_running_cpu_completes_without_waiting_on_itself,a_cpu_of_another_inventory_gets_no_cached_translation_on_any_path} (x86_64 host lane); carrick-core::mm::retirement::invalidation::tests::{domain_request_counts_every_seated_member_whatever_its_context,owning_handle_seat_moves_to_its_own_thread_and_serves_requests,reclaim_iter_lists_outstanding_objects_until_their_exact_release}; carrick-core::mm::retirement::invalidation::loom_models::loom_models_claim_races_domain_request_counts_or_flushes (just test-loom)"
+vm_free = "carrick-softmmu::retirement::tests (test-support/retirement_unit.rs)::{running_peer_cannot_use_stale_addend_after_retirement_completes,parked_peer_resynchronizes_at_block_entry_and_is_never_kicked,host_admission_of_a_parked_peer_serves_before_its_probe,retirement_from_inside_a_running_peer_serves_itself_without_deadlock,pending_extent_identities_are_refused_until_their_completion,pending_root_and_generation_are_refused_until_their_completion,a_seat_of_another_inventory_is_refused_before_any_edit,owner_generation_refuses_exhaustion,a_finished_run_parks_so_a_host_wait_never_wedges,a_cpu_thread_waiting_without_itself_as_requester_is_refused,an_unguarded_running_seat_still_wedges_a_host_wait,a_pending_retirement_refuses_any_overlapping_install,a_replacement_publishes_its_new_owner_only_on_completion,a_root_replacement_publishes_its_new_generation_only_on_completion,a_dropped_retirement_is_recovered_by_a_later_completion,an_exhausted_inventory_stops_every_cpu_and_refuses_edits_loudly,a_copy_cannot_reuse_an_identity_whose_retirement_is_pending,concurrent_running_parked_transitions_never_outlive_a_completion,retirement_is_linear_in_peers_and_block_entry_is_rmw_free (evaluates the structural budgets at 2, 16 and 64 seated members)}; carrick-softmmu::walker::tests::code_generation_refuses_exhaustion_instead_of_saturating; carrick-softcpu-x86::softcpu_level0::{running_peer_that_hits_through_step_block_misses_after_retirement,host_translate_va_after_completion_misses_on_a_parked_cpu,retirement_issued_by_a_running_cpu_completes_without_waiting_on_itself,a_cpu_of_another_inventory_gets_no_cached_translation_on_any_path,every_run_and_host_access_parks_when_it_ends} (x86_64 host lane); carrick-core::mm::retirement::invalidation::tests::{domain_request_counts_every_seated_member_whatever_its_context,owning_handle_seat_moves_to_its_own_thread_and_serves_requests,reclaim_iter_lists_outstanding_objects_until_their_exact_release,a_later_domain_wide_completion_covers_earlier_domain_wide_reclaim_only}; carrick-core::mm::retirement::invalidation::loom_models::loom_models_claim_races_domain_request_counts_or_flushes (just test-loom)"
 
 [bindings.unresolved]
 embed_structural = "Software vCPU carrier integration (`carrick-vmm-soft`) lands in later slices of #578; the soft CPU is proved by the VM-free x86_64 lane."
@@ -62,10 +75,10 @@ docker = "Architectural TLB-invalidation contract (Intel SDM ยง4.10.4, AMD APM ย
 
 [[structural_budgets]]
 kind = "exact"
-metric = "invalidation_steady_state_rmws"
+metric = "invalidation_steady_state_shared_writes"
 value = 0
 layers = ["vm-free"]
-rationale = "A debt-free block entry of a running soft vCPU performs exactly owed[2] + served[2] own-line loads and zero shared read-modify-writes or stores on any member word, measured on the production `block_entry` over an instrumented served word at 2, 16 and 64 seated members (the metric counts RMWs plus stores). No coordinator lock exists to acquire."
+rationale = "A debt-free block entry of a running soft vCPU (`RunningSeat::block_entry` on the production `SoftVcpuSeat`, instantiated over an instrumented served word) performs exactly owed[2] + served[2] own-line loads and zero read-modify-writes plus stores on any member word, at 2, 16 and 64 seated members. The protocol takes no lock; the carrier's per-block `&mut M` is the embedder's (see rationale)."
 
 [[structural_budgets]]
 kind = "affine"

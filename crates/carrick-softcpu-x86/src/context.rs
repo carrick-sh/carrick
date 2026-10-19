@@ -261,17 +261,47 @@ const _: () = {
     assert!(offset_of!(SoftCpuContext, tlb) == CTX_TLB_READ_OFF);
 };
 
-/// Proof that a host-side guest access was admitted for this CPU through
-/// a memory whose inventory it is seated in. Not cloneable; constructed only
-/// by [`SoftCpuContext::admit_host_access`], consumed by
-/// [`SoftCpuContext::release_host_access`].
-#[must_use = "release the admission after the last use of its translations"]
-#[derive(Debug)]
-pub struct HostAccess(crate::mmu::LookupAdmission);
+/// A host-side guest access admitted for one CPU through a memory whose
+/// inventory it is seated in. It borrows that CPU's context (so it cannot
+/// be handed to another context) and dereferences to it; every TLB-using
+/// helper in [`crate::mmu`] requires one. Dropping it ends the access: a CPU
+/// that was parked parks again.
+#[must_use = "the access ends when this is dropped"]
+pub struct HostAccess<'c> {
+    ctx: &'c mut SoftCpuContext,
+    admission: Option<crate::mmu::LookupAdmission>,
+}
 
-/// The memory's physical inventory is not the one this CPU is seated in.
+impl std::ops::Deref for HostAccess<'_> {
+    type Target = SoftCpuContext;
+    fn deref(&self) -> &SoftCpuContext {
+        self.ctx
+    }
+}
+
+impl std::ops::DerefMut for HostAccess<'_> {
+    fn deref_mut(&mut self) -> &mut SoftCpuContext {
+        self.ctx
+    }
+}
+
+impl Drop for HostAccess<'_> {
+    fn drop(&mut self) {
+        if let Some(admission) = self.admission.take() {
+            self.ctx.seat.release(admission);
+        }
+    }
+}
+
+/// Why a host-side access was refused before the TLB was touched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ForeignSeat;
+pub enum AdmitRefused {
+    /// The memory's inventory is not the one this CPU is seated in: its
+    /// retirements never reach this TLB.
+    ForeignInventory,
+    /// The inventory went terminal: no CPU may translate.
+    Terminal,
+}
 
 impl SoftCpuContext {
     /// A context seated in `extents`' invalidation domain. Its TLB starts
@@ -351,22 +381,25 @@ impl SoftCpuContext {
         &self.seat
     }
 
-    /// Admit a host-side guest access through `extents` (see
-    /// [`SoftVcpuSeat::admit`]). Refused, before the TLB is touched, when
-    /// this CPU is not seated in `extents`' invalidation domain: that
-    /// inventory's retirements never reach this TLB. The returned proof is
-    /// what every TLB-using helper in [`crate::mmu`] requires.
-    pub fn admit_host_access(&mut self, extents: &ExtentTable) -> Result<HostAccess, ForeignSeat> {
+    /// Admit a host-side guest access through `extents`. Refused, before
+    /// the TLB is touched, when this CPU is not seated in `extents`'
+    /// invalidation domain or the domain is terminal. A parked CPU enters
+    /// (serving what it owes) for as long as the returned access lives.
+    pub fn admit_host_access(
+        &mut self,
+        extents: &ExtentTable,
+    ) -> Result<HostAccess<'_>, AdmitRefused> {
         if !extents.is_member(&self.seat) {
-            return Err(ForeignSeat);
+            return Err(AdmitRefused::ForeignInventory);
         }
-        Ok(HostAccess(self.seat.admit(&mut self.tlb)))
-    }
-
-    /// End a host-side guest access admitted by [`Self::admit_host_access`],
-    /// after the last use of the translations it produced.
-    pub fn release_host_access(&mut self, access: HostAccess) {
-        self.seat.release(access.0);
+        // SAFETY: the returned `HostAccess` releases the admission on drop,
+        // on every path, after the last use of the access's translations.
+        let admission = unsafe { self.seat.admit_unguarded(&mut self.tlb) }
+            .map_err(|_| AdmitRefused::Terminal)?;
+        Ok(HostAccess {
+            ctx: self,
+            admission: Some(admission),
+        })
     }
 
     /// This CPU as the requester of a retirement it issues itself: served

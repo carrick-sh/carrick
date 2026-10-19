@@ -677,7 +677,8 @@
       "descriptor_loads_per_miss": 0,
       "invalidation_steady_state_rmws": 0,
       "invalidation_members_counted": 0,
-      "invalidation_kicks": 0
+      "invalidation_kicks": 0,
+      "invalidation_steady_state_shared_writes": 0
     },
     "dropped_events": 0,
     "unknown_metrics": []
