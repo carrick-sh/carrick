@@ -41,6 +41,8 @@ trace-elf = ["carrick-mem/trace-elf"]
 # compiles it.
 test-support = ["carrick-hal/test-support", "carrick-kernel/test-support"]
 conformance-metrics = ["carrick-kernel/conformance-metrics", "carrick-observability/conformance-metrics"]
+# Loaded KVM lane pre-entry hook for test control, compiled only into test targets.
+kvm-pool-test-control = []
 
 # Platform backend selection (exactly one active at a time). carrick-cli's
 # `default` enables `platform-macos`; a `platform-linux` build links NO HVF.

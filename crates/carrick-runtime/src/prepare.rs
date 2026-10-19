@@ -242,6 +242,7 @@ pub fn run_prepared_kvm_pool(
         dispatcher,
         max_traps,
         debug_server,
+        #[cfg(feature = "kvm-pool-test-control")]
         None,
         None,
     )
@@ -261,6 +262,7 @@ pub fn try_run_prepared_kvm_pool(
         dispatcher,
         max_traps,
         None,
+        #[cfg(feature = "kvm-pool-test-control")]
         None,
         None,
     )
@@ -269,7 +271,11 @@ pub fn try_run_prepared_kvm_pool(
 /// Run the production KVM pool with one fixture callback at the loaded
 /// lane's armed pre-entry boundary.
 #[doc(hidden)]
-#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "platform-linux",
+    feature = "kvm-pool-test-control",
+    target_arch = "x86_64"
+))]
 pub fn try_run_prepared_kvm_pool_with_loaded_pre_entry_hook(
     machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
     root_context: carrick_kernel::kernel::KernelContext,
@@ -290,7 +296,11 @@ pub fn try_run_prepared_kvm_pool_with_loaded_pre_entry_hook(
 }
 
 #[doc(hidden)]
-#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "platform-linux",
+    feature = "kvm-pool-test-control",
+    target_arch = "x86_64"
+))]
 pub type KvmLoadedPreEntryHook = Arc<
     dyn Fn(&std::sync::atomic::AtomicBool, &carrick_vmm_kvm::KvmKickHandle) + Send + Sync + 'static,
 >;
@@ -302,7 +312,7 @@ fn run_prepared_kvm_pool_with_debug(
     dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
     max_traps: usize,
     debug_server: Option<PreparedKvmDebugServer>,
-    loaded_pre_entry_hook: Option<KvmLoadedPreEntryHook>,
+    #[cfg(feature = "kvm-pool-test-control")] loaded_pre_entry_hook: Option<KvmLoadedPreEntryHook>,
     lane_exit_budgets: Option<(usize, usize)>,
 ) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
     use crate::vcpu_loop::executor::{self, PersistentTaskBinding};
@@ -362,6 +372,7 @@ fn run_prepared_kvm_pool_with_debug(
             stats: Arc::clone(&stats),
             scheduler: Arc::clone(&scheduler),
             root_binding: Arc::clone(&binding),
+            #[cfg(feature = "kvm-pool-test-control")]
             loaded_pre_entry_hook,
         },
     )?);
@@ -1486,6 +1497,7 @@ impl PreparedRun {
                 dispatcher,
                 max_traps,
                 kvm_debug,
+                #[cfg(feature = "kvm-pool-test-control")]
                 None,
                 None,
             )

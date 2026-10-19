@@ -35,7 +35,7 @@ goblin.workspace = true
 # cpl0_image_inputs test only reads source files; pulling platform-linux into
 # macOS test feature unification would compile a KVM runtime on a non-KVM host.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-carrick-runtime = { path = "../carrick-runtime", default-features = false, features = ["platform-linux", "syscall-shim", "test-support"] }
+carrick-runtime = { path = "../carrick-runtime", default-features = false, features = ["platform-linux", "syscall-shim", "test-support", "kvm-pool-test-control"] }
 
 [dependencies]
 carrick-core-abi = { path = "../carrick-core-abi" }
