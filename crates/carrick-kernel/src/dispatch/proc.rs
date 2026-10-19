@@ -3173,6 +3173,19 @@ impl<'a> ProcView<'a> {
                     _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
                 };
                 let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
+                // Prepare `infop` before the wait consumes a child event: an
+                // owner refusal parks and retries with the zombie, stop or
+                // continue report still waitable (#711).
+                let infop_out = match super::copyout::prepare(
+                    &mut *cx.memory,
+                    [super::copyout::UserSlot::optional(
+                        infop_addr.0,
+                        crate::linux_abi::LINUX_SIGINFO_SIZE,
+                    )],
+                ) {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
                 let waited = match (pidfd_target, group_target) {
                     (Some(task), _) => process.wait_child_key(task, class, nowait),
                     (None, Some(group)) => process
@@ -3201,22 +3214,15 @@ impl<'a> ProcView<'a> {
                     // ordinary waitid(WEXITED).
                     crate::kernel::WaitResult::Exited(exit)
                     | crate::kernel::WaitResult::StateChanged(exit) => {
-                        if infop_addr.0 != 0 {
-                            let bytes = build_hvpatch_waitid_siginfo(exit);
-                            (*cx.memory).write_bytes(infop_addr.0, &bytes)?;
-                        }
+                        infop_out.commit([&build_hvpatch_waitid_siginfo(exit)])?;
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
                     crate::kernel::WaitResult::StillRunning(precheck) => {
                         if guest_nohang {
-                            if infop_addr.0 != 0 {
-                                (*cx.memory).write_bytes(
-                                    infop_addr.0,
-                                    &[0u8; crate::linux_abi::LINUX_SIGINFO_SIZE],
-                                )?;
-                            }
+                            infop_out.commit([&[0u8; crate::linux_abi::LINUX_SIGINFO_SIZE]])?;
                             return Ok(DispatchOutcome::Returned { value: 0 });
                         }
+                        drop(infop_out);
                         if idtype == LINUX_P_PIDFD && this.pidfd_is_nonblocking(id as i32) {
                             return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                         }
@@ -3256,7 +3262,6 @@ impl<'a> ProcView<'a> {
         }
 
         fn wait4(this, cx, pid: Pid, wstatus_addr: GuestPtr, options: u64, rusage_addr: GuestPtr) {
-            let memory = &mut *cx.memory;
             // Retain unknown bits so the supported-mask rejection stays
             // bit-identical to the raw `options & !SUPPORTED != 0` test.
             let options = LinuxWaitOptions::from_bits_retain(options);
@@ -3277,6 +3282,21 @@ impl<'a> ProcView<'a> {
                 // an untranslated miss would report. The translated value is
                 // also what a park republishes as its exact-child selector.
                 let mut host_target = None;
+                // Prepare the status and rusage outputs before the wait reaps
+                // a child: an owner refusal parks and retries with the zombie
+                // still waitable (#711).
+                let rusage_size =
+                    <carrick_abi::LinuxRusage as carrick_abi::KernelAbi>::ABI_SIZE;
+                let outputs = match super::copyout::prepare(
+                    &mut *cx.memory,
+                    [
+                        super::copyout::UserSlot::optional(wstatus_addr.0, 4),
+                        super::copyout::UserSlot::optional(rusage_addr.0, rusage_size),
+                    ],
+                ) {
+                    Ok(out) => out,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
                 let waited = match pid.0 {
                     -1 => process.wait_child_with_job_control(
                         None,
@@ -3336,19 +3356,14 @@ impl<'a> ProcView<'a> {
                 match waited {
                     crate::kernel::WaitResult::Exited(exit)
                     | crate::kernel::WaitResult::StateChanged(exit) => {
-                        if wstatus_addr.0 != 0 {
-                            memory.write_bytes(wstatus_addr.0, &exit.status().to_ne_bytes())?;
-                        }
-                        if rusage_addr.0 != 0 {
-                            let usage = exit.rusage();
-                            let rusage = super::time::rusage_from(
-                                u64::try_from(usage.user_time.as_micros()).unwrap_or(u64::MAX),
-                                u64::try_from(usage.system_time.as_micros()).unwrap_or(u64::MAX),
-                                0,
-                                0,
-                            );
-                            memory.write_bytes(rusage_addr.0, rusage.abi_bytes())?;
-                        }
+                        let usage = exit.rusage();
+                        let rusage = super::time::rusage_from(
+                            u64::try_from(usage.user_time.as_micros()).unwrap_or(u64::MAX),
+                            u64::try_from(usage.system_time.as_micros()).unwrap_or(u64::MAX),
+                            0,
+                            0,
+                        );
+                        outputs.commit([&exit.status().to_ne_bytes(), rusage.abi_bytes()])?;
                         return Ok(DispatchOutcome::Returned {
                             // The wait receipt retains the namespace pid because
                             // consuming the zombie also releases its live map.
@@ -3359,6 +3374,7 @@ impl<'a> ProcView<'a> {
                         if guest_nohang {
                             return Ok(DispatchOutcome::Returned { value: 0 });
                         }
+                        drop(outputs);
                         let tid = Self::ctx_tid(cx);
                         let non_interrupting = this.non_interrupting_signal_mask(cx.kernel, tid);
                         // See the waitid arm above: a deliverable pending
@@ -5138,6 +5154,79 @@ mod kernel_process_dispatch_tests {
                 lease,
             )
             .unwrap()
+    }
+
+    /// #711: wait4/waitid consume the reported child. A transient owner
+    /// refusal of the status, rusage or siginfo copyout must park and retry
+    /// with the zombie still waitable, not EFAULT after reaping it.
+    #[test]
+    fn wait_status_copyouts_wait_for_an_owner_refusal_without_reaping() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        const STATUS: u64 = INFO_ADDR;
+        const RUSAGE: u64 = INFO_ADDR + 0x40;
+        const SIGINFO: u64 = INFO_ADDR + 0x200;
+        let args = |number: u64, pid: u64| {
+            if number == SYS_WAIT4 {
+                [pid, STATUS, 0, RUSAGE, 0, 0]
+            } else {
+                [LINUX_P_PID, pid, SIGINFO, LINUX_WEXITED, 0, 0]
+            }
+        };
+        for number in [SYS_WAIT4, SYS_WAITID] {
+            let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_400);
+            let child = fork_child(&root, 61_401);
+            let child_id = child.task().key().id;
+            root.kernel()
+                .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(7 << 8), None)
+                .unwrap();
+            let root = refreshed(&root);
+            let mut memory = OwnerRefusingMemory::new(INFO_ADDR, 0x400, 0xa5);
+            let mut call = |memory: &mut OwnerRefusingMemory| {
+                dispatcher
+                    .dispatch_with_lease(
+                        &root,
+                        SyscallRequest::new(
+                            number,
+                            SyscallArgs::from(args(number, child_id.raw() as u64)),
+                        ),
+                        memory,
+                        &CompatReporter::default(),
+                        Some(&lease),
+                    )
+                    .expect("dispatch")
+            };
+            let wait = memory.refuse_next();
+            assert_eq!(
+                call(&mut memory),
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                "syscall {number}: a transient owner refusal is a wait, not EFAULT",
+            );
+            assert_eq!(
+                memory.read_bytes(INFO_ADDR, 0x400).unwrap(),
+                vec![0xa5; 0x400]
+            );
+            let expected = if number == SYS_WAIT4 {
+                i64::from(child_id.raw())
+            } else {
+                0
+            };
+            assert_eq!(
+                call(&mut memory),
+                DispatchOutcome::Returned { value: expected },
+                "syscall {number}: the zombie survived the refused attempt",
+            );
+            if number == SYS_WAIT4 {
+                assert_eq!(
+                    memory.read_bytes(STATUS, 4).unwrap(),
+                    (7i32 << 8).to_ne_bytes()
+                );
+                assert_ne!(memory.read_bytes(RUSAGE, 16).unwrap(), [0xa5; 16]);
+            } else {
+                let signo =
+                    i32::from_ne_bytes(memory.read_bytes(SIGINFO, 4).unwrap().try_into().unwrap());
+                assert_eq!(signo, 17, "SIGCHLD siginfo");
+            }
+        }
     }
 
     #[test]
