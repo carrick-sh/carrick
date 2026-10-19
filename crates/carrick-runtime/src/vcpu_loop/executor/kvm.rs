@@ -86,6 +86,7 @@ pub(crate) struct KvmPersistentExecutorFactory {
     root_binding: Arc<KvmTaskBinding>,
     host_objects: Arc<Mutex<[u32; 3]>>,
     bound_host_fds: Arc<BoundHostFds>,
+    #[cfg(feature = "kvm-pool-test-control")]
     loaded_pre_entry_hook: Option<LoadedPreEntryHook>,
 }
 
@@ -276,9 +277,11 @@ pub(crate) struct KvmPersistentExecutorConfig {
     pub(crate) stats: Arc<KvmForwardStats>,
     pub(crate) scheduler: Arc<Scheduler>,
     pub(crate) root_binding: Arc<KvmTaskBinding>,
+    #[cfg(feature = "kvm-pool-test-control")]
     pub(crate) loaded_pre_entry_hook: Option<LoadedPreEntryHook>,
 }
 
+#[cfg(feature = "kvm-pool-test-control")]
 pub(crate) type LoadedPreEntryHook = crate::prepare::KvmLoadedPreEntryHook;
 
 impl KvmPersistentExecutorFactory {
@@ -309,6 +312,7 @@ impl KvmPersistentExecutorFactory {
             root_binding: config.root_binding,
             host_objects: Arc::new(Mutex::new([1; 3])),
             bound_host_fds,
+            #[cfg(feature = "kvm-pool-test-control")]
             loaded_pre_entry_hook: config.loaded_pre_entry_hook,
         })
     }
@@ -354,6 +358,7 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             host_objects: Arc::clone(&self.host_objects),
             bound_host_fds: Arc::clone(&self.bound_host_fds),
             idle_kick: carrick_vmm_kvm::KvmKickHandle::for_current_thread(),
+            #[cfg(feature = "kvm-pool-test-control")]
             loaded_pre_entry_hook: self.loaded_pre_entry_hook.clone(),
         })
     }
@@ -379,6 +384,7 @@ pub(crate) struct KvmPersistentExecutor {
     completion_sent: bool,
     host_objects: Arc<Mutex<[u32; 3]>>,
     bound_host_fds: Arc<BoundHostFds>,
+    #[cfg(feature = "kvm-pool-test-control")]
     loaded_pre_entry_hook: Option<LoadedPreEntryHook>,
 }
 
@@ -1094,6 +1100,7 @@ impl KvmPersistentExecutor {
             .checked_add(1)
             .ok_or_else(|| TrapError::Hypervisor("KVM total exit count overflow".into()))?;
         self.physical.arm_loaded_kick(task, &self.idle_kick)?;
+        #[cfg(feature = "kvm-pool-test-control")]
         if let Some(hook) = self.loaded_pre_entry_hook.take() {
             hook(need_resched, &self.idle_kick);
         }
