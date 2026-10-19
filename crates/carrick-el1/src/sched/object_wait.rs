@@ -13,10 +13,16 @@ use carrick_sched_core::object_wait::{
 use carrick_sched_core::{RecordId, WakeEffects};
 use core::sync::atomic::Ordering;
 
+/// The most recent host-side wakes a test can read back. Host-test builds
+/// of other crates deliver wakes too and never read the trace, so it keeps
+/// only the newest `NATIVE_WAKE_TRACE_LIMIT` entries instead of growing.
+#[cfg(any(test, feature = "host-test"))]
+const NATIVE_WAKE_TRACE_LIMIT: usize = 256;
+
 #[cfg(any(test, feature = "host-test"))]
 std::thread_local! {
-    static NATIVE_WAKE_TRACE: std::cell::RefCell<std::vec::Vec<(SlotId, u64)>> =
-        const { std::cell::RefCell::new(std::vec::Vec::new()) };
+    static NATIVE_WAKE_TRACE: std::cell::RefCell<std::collections::VecDeque<(SlotId, u64)>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 #[cfg(any(test, feature = "host-test"))]
@@ -26,12 +32,18 @@ pub fn clear_test_wake_trace() {
 
 #[cfg(any(test, feature = "host-test"))]
 pub fn test_wake_trace() -> std::vec::Vec<(SlotId, u64)> {
-    NATIVE_WAKE_TRACE.with(|trace| trace.borrow().clone())
+    NATIVE_WAKE_TRACE.with(|trace| trace.borrow().iter().copied().collect())
 }
 
 #[cfg(any(test, feature = "host-test"))]
 fn record_test_wake(slot: SlotId, target: u64) {
-    NATIVE_WAKE_TRACE.with(|trace| trace.borrow_mut().push((slot, target)));
+    NATIVE_WAKE_TRACE.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        if trace.len() == NATIVE_WAKE_TRACE_LIMIT {
+            trace.pop_front();
+        }
+        trace.push_back((slot, target));
+    });
 }
 
 /// Required completion venue for EL1-held queues. Detached handbacks use
@@ -334,4 +346,22 @@ pub fn space_access<C: carrick_el1_abi::EntryContext>(
         }
     }
     carrick_core::wait::space_access(zone, slot, deliver)
+}
+
+#[cfg(test)]
+mod wake_trace_tests {
+    use super::*;
+
+    #[test]
+    fn the_host_wake_trace_keeps_only_the_newest_entries() {
+        clear_test_wake_trace();
+        for target in 0..(NATIVE_WAKE_TRACE_LIMIT as u64 + 5) {
+            record_test_wake(SlotId::new(1), target);
+        }
+        let trace = test_wake_trace();
+        assert_eq!(trace.len(), NATIVE_WAKE_TRACE_LIMIT);
+        assert_eq!(trace[0], (SlotId::new(1), 5));
+        clear_test_wake_trace();
+        assert!(test_wake_trace().is_empty());
+    }
 }
