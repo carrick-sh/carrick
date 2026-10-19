@@ -615,6 +615,10 @@ path = "crates/carrick-el1/src/fault.rs"
 contracts = ["kernel.el1.fault-entry", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
+path = "crates/carrick-el1/src/cow/test_support.rs"
+contracts = ["kernel.el1.fork-cow"]
+
+[[surfaces]]
 path = "crates/carrick-el1-linux/src/cow_resolver.rs"
 contracts = ["kernel.el1.fault-entry", "kernel.el1.fork-cow"]
 
