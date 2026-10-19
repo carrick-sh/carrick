@@ -956,9 +956,13 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// Exact authority captured at the current syscall boundary. Lifecycle
     /// outcomes consume it rather than recapturing a newer registry generation.
     pub(super) service_kernel_context: Option<carrick_kernel::kernel::KernelContext>,
-    /// The zone key (address-space id) of this thread's process when the
-    /// in-guest zone serves its private futexes; refreshed from the loaded
-    /// task binding at every poll ([`zone`]).
+    /// The zone key (address-space id) of the task this job has loaded,
+    /// when the carrier runs the in-guest zone; refreshed from the loaded
+    /// task binding at every poll ([`zone`]). It keys this job's IPC and
+    /// owner-memory zone waits and its slot address-space checks. It never
+    /// selects a futex queue: that is the mm's own
+    /// [`carrick_kernel::el1_zone::FutexQueueAuthority`] (#685), since this
+    /// cache is `None` before the job's first refresh.
     pub(super) zone_mm: Option<u64>,
     /// An IPC operation this boundary's handback left waiting: the syscall
     /// service parks the thread on its object queue ([`zone`]).
@@ -1721,8 +1725,7 @@ where
         let lease_guard = self.execution_lease.lock();
         let lease = lease_guard.as_ref();
         let work_scope = kernel.dispatcher.work_scope();
-        let thread = ThreadCtx::new(self.this_tid, &self.registry, &self.futex)
-            .with_zone(zone::zone_for(self.zone_mm));
+        let thread = ThreadCtx::new(self.this_tid, &self.registry, &self.futex);
         let thread = if let Some(ref scope) = work_scope {
             thread.with_work_scope(scope)
         } else {
@@ -1902,8 +1905,7 @@ where
                 dispatch_with_panic_backstop(request.number.raw(), self.this_tid, || {
                     let work_scope = kernel.dispatcher.work_scope();
                     let make_thread_ctx = || {
-                        let ctx = ThreadCtx::new(self.this_tid, &self.registry, &self.futex)
-                            .with_zone(zone::zone_for(self.zone_mm));
+                        let ctx = ThreadCtx::new(self.this_tid, &self.registry, &self.futex);
                         if let Some(ref scope) = work_scope {
                             ctx.with_work_scope(scope)
                         } else {

@@ -365,6 +365,147 @@ pub struct ZoneWake {
     pub handed: Vec<RecordRef>,
 }
 
+/// The one queue venue serving an address space's private futexes (#685).
+///
+/// Every waiter and every waker of one mm, host or EL1, must meet in the
+/// same queue. The venue is therefore a function of the address space
+/// alone, resolved from its [`MmId`](crate::kernel::MmId) here and nowhere
+/// else: never from a per-job cache, which a job that has not refreshed it
+/// (or a waker running on another thread's behalf) reads as "no zone"
+/// while the mm's other threads park in the zone.
+///
+/// A carrier either serves private futexes in the zone for every address
+/// space or for none: [`zone`] is decided once, by [`enable`] before any
+/// executor starts, and never changes for a live carrier. So an mm's venue
+/// is fixed for its whole life. The only constructors are
+/// [`FutexQueueAuthority::of_mm`] and [`FutexQueueAuthority::of_context`];
+/// a caller cannot pick a venue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FutexQueueAuthority(FutexQueueVenue);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FutexQueueVenue {
+    /// The in-guest zone's queues, shared with EL1.
+    Zone(ZoneFutexQueue),
+    /// The carrier's host `FutexTable` (no zone on this carrier).
+    Table,
+}
+
+impl FutexQueueAuthority {
+    /// The venue of address space `mm`.
+    pub fn of_mm(mm: crate::kernel::MmId) -> Self {
+        Self(match zone() {
+            Some(tables) => FutexQueueVenue::Zone(ZoneFutexQueue { tables, mm }),
+            None => FutexQueueVenue::Table,
+        })
+    }
+
+    /// The venue of the address space `context` runs in.
+    pub fn of_context(context: &crate::kernel::KernelContext) -> Self {
+        Self::of_mm(context.shared().mm_id())
+    }
+
+    /// The zone queue, when the zone serves this address space; `None`: the
+    /// host `FutexTable` does.
+    pub const fn zone(self) -> Option<ZoneFutexQueue> {
+        match self.0 {
+            FutexQueueVenue::Zone(queue) => Some(queue),
+            FutexQueueVenue::Table => None,
+        }
+    }
+
+    /// Wake the joiner of a cleared `CLONE_CHILD_CLEARTID` word in this
+    /// address space's queue: the host half of a thread retirement whose
+    /// in-zone exit did not wake (EL1's wake is all or nothing, so a
+    /// declined in-zone exit woke nobody). The caller hands back
+    /// `handed`.
+    pub fn wake_child_tid(self, futex: &crate::thread::FutexTable, address: u64) -> ZoneWake {
+        let wake = match self.0 {
+            FutexQueueVenue::Zone(queue) => queue.wake(
+                address,
+                carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
+                carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
+            ),
+            FutexQueueVenue::Table => ZoneWake {
+                count: futex.wake(
+                    address,
+                    carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
+                ),
+                handed: Vec::new(),
+            },
+        };
+        crate::event_ring::rec_futex_wake(address, wake.count);
+        wake
+    }
+}
+
+/// The zone queue of one address space: the zone tables and the mm whose
+/// key (`MmId::raw`, the same key EL1 loads for the task) selects its
+/// buckets. Built only by [`FutexQueueAuthority`].
+#[derive(Clone, Copy)]
+pub struct ZoneFutexQueue {
+    tables: &'static ZoneTables,
+    mm: crate::kernel::MmId,
+}
+
+impl ZoneFutexQueue {
+    pub const fn tables(self) -> &'static ZoneTables {
+        self.tables
+    }
+
+    pub const fn mm(self) -> crate::kernel::MmId {
+        self.mm
+    }
+
+    /// The zone key of the address space (`ThreadIdentity::mm`, the bucket
+    /// context): the ABI spelling of [`Self::mm`].
+    pub const fn key(self) -> u64 {
+        self.mm.raw()
+    }
+
+    /// Host `FUTEX_WAKE(_BITSET)` on this queue.
+    pub fn wake(self, uaddr: u64, bitset: u32, count: u32) -> ZoneWake {
+        wake(self.tables, self.key(), uaddr, bitset, count)
+    }
+
+    /// Host `FUTEX_(CMP_)REQUEUE` on this queue ([`requeue`]).
+    pub fn requeue<E>(
+        self,
+        from: u64,
+        to: u64,
+        wake_count: u32,
+        requeue_count: u32,
+        check: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(Vec<RecordRef>, u32), E> {
+        requeue(
+            self.tables,
+            self.key(),
+            from,
+            to,
+            wake_count,
+            requeue_count,
+            check,
+        )
+    }
+}
+
+impl std::fmt::Debug for ZoneFutexQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZoneFutexQueue")
+            .field("tables", &std::ptr::from_ref(self.tables))
+            .field("mm", &self.mm)
+            .finish()
+    }
+}
+
+impl PartialEq for ZoneFutexQueue {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.tables, other.tables) && self.mm == other.mm
+    }
+}
+
+impl Eq for ZoneFutexQueue {}
+
 /// Host `FUTEX_WAKE(_BITSET)` on a zone process: wake up to `count` waiters
 /// of `(mm, uaddr)` matching `bitset`.
 pub fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> ZoneWake {

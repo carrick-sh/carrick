@@ -447,6 +447,11 @@ impl TaskShared {
         Arc::clone(&self.mm)
     }
 
+    /// The identity of this task's address space, without retaining it.
+    pub fn mm_id(&self) -> MmId {
+        self.mm.id()
+    }
+
     pub fn sighand(&self) -> Arc<Sighand> {
         Arc::clone(&self.sighand)
     }

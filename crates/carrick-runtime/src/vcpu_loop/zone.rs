@@ -541,30 +541,24 @@ where
     }
 
     /// Park this job's thread in the zone for a futex wait the host serves
-    /// (EL1 forwarded it, or never serves it), in the same queues EL1 uses.
-    /// The word is re-checked under the bucket lock, which every waker takes.
+    /// (EL1 forwarded it, or never serves it), in the same queues EL1 uses:
+    /// `queue`, the waiting address space's one queue as the dispatcher
+    /// resolved it from the mm (#685), never this job's cached key. The word
+    /// is re-checked under the bucket lock, which every waker takes.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn zone_park(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         frame: carrick_hal::RawSyscall,
+        queue: carrick_kernel::el1_zone::ZoneFutexQueue,
         uaddr: u64,
         value: u32,
         bitset: u32,
         timeout: Option<std::time::Duration>,
         index: u32,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        let Some((zone, mm)) = zone_for(self.state.zone_mm) else {
-            return self.route_outcome(
-                engine,
-                control,
-                frame,
-                DispatchOutcome::Errno {
-                    errno: crate::linux_abi::LINUX_EAGAIN,
-                },
-            );
-        };
+        let (zone, mm) = (queue.tables(), queue.key());
         let state = engine.snapshot_guest_state_for_publication()?;
         let ctx = zone_ctx_from_state(&state, ZoneExit::Syscall { completed: true })?;
         let request = self

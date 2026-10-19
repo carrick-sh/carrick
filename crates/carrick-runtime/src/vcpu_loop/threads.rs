@@ -127,29 +127,22 @@ where
     }
 }
 
+/// The host lane's `CLONE_CHILD_CLEARTID` wake. The joiner parks in the
+/// queue of the address space the cleared word lives in, which is the
+/// retiring thread's own (`mm`, captured with the clear and validated
+/// against the retiring context), resolved from that mm (#685). Never this
+/// job's cached zone key: a job that retires a thread before its first poll
+/// refresh (a host-born member cancelled at the loop top) has none, and its
+/// wake would land in the host table while the joiner parks in the zone.
 fn wake_persistent_child_tid(
     kernel: &Kernel,
     futex: &FutexTable,
     address: u64,
-    zone_mm: Option<u64>,
+    mm: carrick_kernel::kernel::MmId,
 ) {
-    let count = if let Some((zone, mm)) = zone::zone_for(zone_mm) {
-        let woken = carrick_kernel::el1_zone::wake(
-            zone,
-            mm,
-            address,
-            carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
-            carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
-        );
-        zone::publish_zone_handbacks(kernel, &woken.handed);
-        woken.count
-    } else {
-        futex.wake(
-            address,
-            carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
-        )
-    };
-    carrick_kernel::event_ring::rec_futex_wake(address, count);
+    let woken =
+        carrick_kernel::el1_zone::FutexQueueAuthority::of_mm(mm).wake_child_tid(futex, address);
+    zone::publish_zone_handbacks(kernel, &woken.handed);
 }
 
 pub(super) enum CloneThreadSpawn {
@@ -973,12 +966,7 @@ where
             return Ok(retire());
         };
         let result = retire_with_child_tid_clear(engine, &clear.clear, retire, || {
-            wake_persistent_child_tid(
-                kernel,
-                &self.futex,
-                clear.clear.address().raw(),
-                self.zone_mm,
-            );
+            wake_persistent_child_tid(kernel, &self.futex, clear.clear.address().raw(), clear.mm);
         })?;
         if result.is_ok()
             && let Some(clear) = self.child_tid_clear.take()
@@ -1039,7 +1027,7 @@ where
                         kernel,
                         &self.futex,
                         clear.clear.address().raw(),
-                        self.zone_mm,
+                        clear.mm,
                     )
                 },
             );
@@ -1147,7 +1135,7 @@ where
                         kernel,
                         &self.futex,
                         clear.clear.address().raw(),
-                        self.zone_mm,
+                        clear.mm,
                     );
                 }) {
                     Ok(Ok(retired)) => {

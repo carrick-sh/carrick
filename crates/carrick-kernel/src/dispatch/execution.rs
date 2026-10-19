@@ -538,7 +538,7 @@ impl SyscallDispatcher {
                     thread.registry,
                     hvpatch_linux_tid,
                     thread.work_scope,
-                    thread.zone,
+                    crate::el1_zone::FutexQueueAuthority::of_context(kernel),
                 )
             }
             99 => {
@@ -612,7 +612,7 @@ impl SyscallDispatcher {
                     kernel.kernel().shared_futex(),
                     memory,
                     Some(thread.futex),
-                    thread.zone,
+                    crate::el1_zone::FutexQueueAuthority::of_context(kernel),
                     request.arg(0),
                     request.arg(1),
                     request.arg(2),

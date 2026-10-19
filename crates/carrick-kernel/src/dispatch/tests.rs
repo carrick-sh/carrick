@@ -4351,6 +4351,16 @@ mod overlay_dispatch_tests {
 
     impl CurrentMmMemory for CountingMemory {}
 
+    /// The futex queue venue of an address space on a carrier without the
+    /// in-guest zone (no zone tables are bound on this test thread).
+    fn host_table_futex_queue() -> crate::el1_zone::FutexQueueAuthority {
+        let queue = crate::el1_zone::FutexQueueAuthority::of_mm(
+            crate::kernel::MmId::from_registry_allocation(std::num::NonZeroU64::MIN),
+        );
+        assert_eq!(queue.zone(), None);
+        queue
+    }
+
     #[test]
     fn private_futex_wake_skips_shared_mapping_lookup() {
         let mut memory = CountingMemory::new(0x10000, vec![0u8; 0x1000]);
@@ -4383,7 +4393,7 @@ mod overlay_dispatch_tests {
             &registry,
             None,
             None,
-            None,
+            host_table_futex_queue(),
         );
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
@@ -4421,7 +4431,7 @@ mod overlay_dispatch_tests {
             &registry,
             None,
             None,
-            None,
+            host_table_futex_queue(),
         );
 
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
@@ -4490,7 +4500,7 @@ mod overlay_dispatch_tests {
             &registry,
             None,
             None,
-            None,
+            host_table_futex_queue(),
         );
 
         assert_eq!(
@@ -4548,7 +4558,7 @@ mod overlay_dispatch_tests {
             &registry,
             None,
             None,
-            None,
+            host_table_futex_queue(),
         );
 
         match outcome {
