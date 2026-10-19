@@ -283,9 +283,9 @@ impl ForkTableLedger for El1FrameGrantLedger {
 mod tests {
     use super::*;
     use carrick_el1_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
-        ForkLifecycleLoan, ForkStockExchange, PortalOperation, ReservationGeneration,
-        ReservationMm,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, ForkLifecycleLoan,
+        ForkStockExchange, PortalOperation, ReservationGeneration, ReservationMm,
+        SnapshotGeneration,
     };
     use carrick_guest_arch::{AddressContext, ContextGeneration, CpuId, KernelVa, MmGeneration};
     fn page(addr: u64) -> RootGpa {
@@ -297,7 +297,7 @@ mod tests {
             CpuId::new(cpu),
             ExecutionBinding {
                 task: EntryTaskKey::from_raw(task),
-                generation: EntryGeneration::from_raw(11),
+                generation: SnapshotGeneration::from_raw(11),
                 mm: EntryMmKey::from_raw(mm),
                 thread_generation: EntryThreadGeneration::from_raw(101),
             },
@@ -363,7 +363,11 @@ mod tests {
                 .add(carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize)
                 .cast::<carrick_el1_abi::CurrentTask>()
         };
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 1);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            1,
+        );
         task.mm
             .key
             .store(301, core::sync::atomic::Ordering::Release);
@@ -550,7 +554,11 @@ mod tests {
                 .add(carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize)
                 .cast::<carrick_el1_abi::CurrentTask>()
         };
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 1);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            1,
+        );
         task.mm
             .key
             .store(301, core::sync::atomic::Ordering::Release);

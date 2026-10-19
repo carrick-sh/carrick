@@ -554,10 +554,10 @@ impl NativeLane<'_> {
         self.task.mm.key.store(identity.mm, Ordering::Relaxed);
         self.task
             .publish_lifecycle(identity.lifecycle_page, identity.control_slot);
-        self.task
-            .execution
-            .generation
-            .store(identity.generation, Ordering::Release);
+        self.task.execution.generation.store(
+            carrick_core_abi::SnapshotGeneration::from_raw(identity.generation),
+            Ordering::Release,
+        );
         *self.xsave = context.xsave.clone();
         #[cfg(target_os = "none")]
         {

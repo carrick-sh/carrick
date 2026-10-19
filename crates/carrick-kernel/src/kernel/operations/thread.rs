@@ -504,22 +504,6 @@ impl PreparedThreadClone {
         // namespace member behind.
         let mut publication_valid = task.publish_thread(Arc::clone(&thread)).is_ok();
         if matches!(lane, PublicationLane::HostClone { .. }) {
-            let task_key = task.key();
-            let thread_key = thread.key();
-            if host_birth.is_some() {
-                thread.control_slot().publish_host_birth_identity(
-                    carrick_el1_abi::ExecutionBinding {
-                        task: carrick_el1_abi::EntryTaskKey::from_raw(thread_key.tid.raw() as u64),
-                        generation: carrick_el1_abi::EntryGeneration::from_raw(
-                            task_key.serial.raw(),
-                        ),
-                        mm: carrick_el1_abi::EntryMmKey::from_raw(shared.mm().id().raw()),
-                        thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(
-                            thread_key.serial.raw(),
-                        ),
-                    },
-                );
-            }
             thread
                 .control_lease()
                 .lifecycle()

@@ -20,7 +20,7 @@ fn anonymous_reservation_routing_counts_two_mm_fallback_without_effects() {
         for (slot, task) in tasks.iter().enumerate() {
             task.set(
                 carrick_el1_abi::El1TaskId::from_linux_tid(slot as i32 + 1),
-                1,
+                carrick_el1_abi::SnapshotGeneration::from_raw(1),
                 slot as u64 + 1,
             );
             task.mm.key.store(slot as u64 + 17, Ordering::Release);
@@ -73,7 +73,11 @@ fn unmigrated_family_completes_once_through_linux_owner() {
 fn test_dispatch_syscall_with_regions_served() {
     let counters = Counters::default();
     let tasks = [CurrentTask::new()];
-    tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100); // slot 0: task_id 1, generation 1, file_table 100
+    tasks[0].set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(1),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        100,
+    ); // slot 0: task_id 1, generation 1, file_table 100
 
     let fd_map = [FdMapSlot::new()];
     fd_map[0].set(100, 3, 1, 42); // file_table 100, fd 3 -> handle 1, incarnation 42
@@ -128,7 +132,11 @@ fn test_dispatch_syscall_with_regions_served() {
 fn test_dispatch_syscall_with_regions_entry_pending_work() {
     let counters = Counters::default();
     let tasks = [CurrentTask::new()];
-    tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
+    tasks[0].set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(1),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        100,
+    );
     tasks[0].linux.mark_pending_host_work(); // pending host work set at entry
 
     let fd_map = [FdMapSlot::new()];
@@ -187,7 +195,11 @@ fn test_dispatch_syscall_with_regions_entry_pending_work() {
 fn test_dispatch_syscall_with_regions_exit_pending_work() {
     let counters = Counters::default();
     let tasks = [CurrentTask::new()];
-    tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
+    tasks[0].set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(1),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        100,
+    );
 
     let fd_map = [FdMapSlot::new()];
     fd_map[0].set(100, 3, 1, 42);
@@ -309,7 +321,11 @@ fn test_dispatch_syscall_with_regions_exit_pending_work() {
 fn test_stale_handle_interleaving_forwards() {
     let counters = Counters::default();
     let tasks = [CurrentTask::new()];
-    tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100); // task_id 1, generation 1, file_table 100
+    tasks[0].set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(1),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        100,
+    ); // task_id 1, generation 1, file_table 100
 
     let fd_map = [FdMapSlot::new()];
     // Initially: table 100, fd 3 -> handle 1, incarnation 10
@@ -369,7 +385,11 @@ fn test_thread_sleep_survives_task_generation_bump() {
     let counters = Counters::default();
     let tasks = [CurrentTask::new()];
     // Task has been switched out multiple times, so its scheduling generation is 5
-    tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 5, 100);
+    tasks[0].set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(1),
+        carrick_el1_abi::SnapshotGeneration::from_raw(5),
+        100,
+    );
 
     let fd_map = [FdMapSlot::new()];
     fd_map[0].set(100, 3, 1, 42); // incarnation 42
@@ -426,7 +446,11 @@ fn test_in_guest_read_queues_in_access_and_owes_an_observed_waiter_a_wake() {
 
     let counters = Counters::default();
     let tasks = [CurrentTask::new()];
-    tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
+    tasks[0].set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(1),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        100,
+    );
 
     let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
     fd_map[0].set(100, 3, 1, 42); // fd 3 -> delegated file handle 1
@@ -533,7 +557,11 @@ fn test_in_guest_read_queues_in_access_and_owes_an_observed_waiter_a_wake() {
 fn test_two_open_files_share_one_inode_with_independent_offsets() {
     let counters = Counters::default();
     let tasks = [CurrentTask::new()];
-    tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
+    tasks[0].set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(1),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        100,
+    );
     let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
     fd_map[0].set(100, 3, 1, 7); // fd 3 -> open file 1
     fd_map[1].set(100, 4, 2, 8); // fd 4 -> open file 2
@@ -601,7 +629,11 @@ fn test_inotify_add_watch_write_rm_watch_read_served() {
 
     let counters = Counters::default();
     let tasks = [CurrentTask::new()];
-    tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
+    tasks[0].set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(1),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        100,
+    );
 
     let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
     fd_map[0].set(100, 3, 1, 42); // fd 3 -> delegated file handle 1
@@ -748,7 +780,11 @@ fn test_inotify_add_watch_write_rm_watch_read_served() {
 fn test_inotify_cache_miss_forwards() {
     let counters = Counters::default();
     let tasks = [CurrentTask::new()];
-    tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(1), 1, 100);
+    tasks[0].set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(1),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        100,
+    );
 
     let fd_map = [FdMapSlot::new()];
     fd_map[0].set(100, 4, carrick_el1_abi::FD_HANDLE_INOTIFY_TAG | 1, 42);

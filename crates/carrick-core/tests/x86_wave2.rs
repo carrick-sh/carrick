@@ -34,7 +34,7 @@ impl Lifecycle for NativePool {
     fn host_birth_receipt_returned_exact(
         &self,
         _: usize,
-        _: carrick_core::terminal::HostThreadRetirementReceipt,
+        _: carrick_core::terminal::ThreadBirthIdentity,
     ) -> bool {
         false
     }

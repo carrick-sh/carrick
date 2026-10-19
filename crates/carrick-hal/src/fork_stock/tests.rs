@@ -2,9 +2,9 @@
 
 use super::*;
 use carrick_el1_abi::{
-    EL1_DYNAMIC_METADATA_BASE, El1MmHandle, EntryGeneration, EntryMmKey, EntryTaskKey,
-    EntryThreadGeneration, ForkStockRequest, PortalForkCompletion, PortalOperation,
-    ReservationGeneration,
+    EL1_DYNAMIC_METADATA_BASE, El1MmHandle, EntryMmKey, EntryTaskKey, EntryThreadGeneration,
+    ForkStockRequest, PortalForkCompletion, PortalOperation, ReservationGeneration,
+    SnapshotGeneration,
 };
 use carrick_guest_arch::{ContextGeneration, FrameGpa, KernelVa, MmGeneration};
 use std::cell::RefCell;
@@ -221,7 +221,7 @@ fn execution(task: u64, cpu: u32, mm: u64, root: u64) -> GrantExecution {
         CpuId::new(cpu),
         ExecutionBinding {
             task: EntryTaskKey::from_raw(task),
-            generation: EntryGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(11),
             mm: EntryMmKey::from_raw(mm),
             thread_generation: EntryThreadGeneration::from_raw(101),
         },

@@ -709,7 +709,7 @@ impl Cpl0Carrier {
         let task = self.task(0);
         task.set(
             El1TaskId::from_linux_tid(identity.task.id.raw()),
-            identity.thread.generation,
+            carrick_el1_abi::SnapshotGeneration::from_raw(identity.thread.generation),
             identity.thread.file_table,
         );
         task.mm
@@ -1432,7 +1432,7 @@ impl Cpl0Carrier {
             0,
             carrick_el1_abi::ExecutionBinding {
                 task: carrick_el1_abi::EntryTaskKey::from_raw(tid),
-                generation: carrick_el1_abi::EntryGeneration::from_raw(generation),
+                generation: carrick_el1_abi::SnapshotGeneration::from_raw(generation),
                 mm: carrick_el1_abi::EntryMmKey::from_raw(mm.raw()),
                 thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(serial),
             },
@@ -1990,7 +1990,7 @@ impl Cpl0Carrier {
                 task.write(CurrentTask::new());
                 (*task).set(
                     El1TaskId::from_linux_tid(41 + index as i32),
-                    11 + index as u64,
+                    carrick_el1_abi::SnapshotGeneration::from_raw(11 + index as u64),
                     5,
                 );
                 (*task)
@@ -2891,7 +2891,7 @@ impl Cpl0Carrier {
         let task = self.task(index);
         task.set(
             El1TaskId::from_linux_tid(tid),
-            binding.generation.raw(),
+            binding.generation,
             file_table,
         );
         task.mm.key.store(binding.mm.raw(), Ordering::Release);
@@ -3422,7 +3422,7 @@ impl Cpl0Carrier {
         for index in 0..2 {
             let binding = carrick_el1_abi::ExecutionBinding {
                 task: carrick_el1_abi::EntryTaskKey::from_raw(41 + index as u64),
-                generation: carrick_el1_abi::EntryGeneration::from_raw(11 + index as u64),
+                generation: carrick_el1_abi::SnapshotGeneration::from_raw(11 + index as u64),
                 mm: carrick_el1_abi::EntryMmKey::from_raw(11 + index as u64),
                 thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(
                     101 + index as u64,
@@ -3550,7 +3550,11 @@ impl Cpl0Carrier {
                     thread_serial: 1001
                         + index as u64
                         + 2 * (page.state(0).map_or(0, |(generation, _)| generation) + 1),
-                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_registry_allocation(
+                            core::num::NonZeroU64::MIN,
+                        ),
+                    ),
                     uid_credit: 1,
                 },
             )

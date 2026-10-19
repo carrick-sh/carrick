@@ -1263,7 +1263,9 @@ impl CurrentTask {
     #[inline]
     pub fn clear(&self) {
         self.linux.file_table.store(0, Ordering::Release);
-        self.execution.generation.store(0, Ordering::Release);
+        self.execution
+            .generation
+            .store(SnapshotGeneration::UNISSUED, Ordering::Release);
         self.execution.task.store(0, Ordering::Release);
         self.linux.fixup_pc.store(0, Ordering::Relaxed);
         self.linux.orig_arg0.store(0, Ordering::Relaxed);
@@ -1277,7 +1279,7 @@ impl CurrentTask {
     }
 
     #[inline]
-    pub fn set(&self, task_id: El1TaskId, generation: u64, file_table: u64) {
+    pub fn set(&self, task_id: El1TaskId, generation: SnapshotGeneration, file_table: u64) {
         self.execution.task.store(task_id.raw(), Ordering::Relaxed);
         self.execution
             .generation
@@ -3069,7 +3071,9 @@ pub fn prepare_idle_entry(slot: usize) -> Option<u64> {
     // SAFETY: the record lives in the EL1 region; only atomics are touched.
     let task = unsafe { &*((ptr + offset) as *const CurrentTask) };
     task.execution.task.store(0, Ordering::Relaxed);
-    task.execution.generation.store(0, Ordering::Relaxed);
+    task.execution
+        .generation
+        .store(SnapshotGeneration::UNISSUED, Ordering::Relaxed);
     task.linux.file_table.store(0, Ordering::Relaxed);
     task.mm.thread_generation.store(0, Ordering::Relaxed);
     task.publish_lifecycle(0, 0);
@@ -3888,7 +3892,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0xf5956d02f2b7a4b4);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x5dda158216f8b59f);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
@@ -4251,13 +4255,17 @@ mod tests {
     fn test_current_task_operations() {
         let task = CurrentTask::new();
         assert_eq!(task.execution.task.load(Ordering::Relaxed), 0);
-        assert_eq!(task.execution.generation.load(Ordering::Relaxed), 0);
+        assert_eq!(task.execution.generation.load(Ordering::Relaxed).raw(), 0);
         assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 0);
         assert_eq!(task.root_generation(), None);
 
-        task.set(El1TaskId::from_linux_tid(7), 42, 100);
+        task.set(
+            El1TaskId::from_linux_tid(7),
+            crate::SnapshotGeneration::from_raw(42),
+            100,
+        );
         assert_eq!(task.execution.task.load(Ordering::Relaxed), 7);
-        assert_eq!(task.execution.generation.load(Ordering::Relaxed), 42);
+        assert_eq!(task.execution.generation.load(Ordering::Relaxed).raw(), 42);
         assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 100);
         let root = ContextGeneration::new(core::num::NonZeroU64::new(101).unwrap());
         task.publish_root_generation(root);
@@ -4265,7 +4273,7 @@ mod tests {
 
         task.clear();
         assert_eq!(task.execution.task.load(Ordering::Relaxed), 0);
-        assert_eq!(task.execution.generation.load(Ordering::Relaxed), 0);
+        assert_eq!(task.execution.generation.load(Ordering::Relaxed).raw(), 0);
         assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 0);
         assert_eq!(task.root_generation(), None);
     }
@@ -4273,7 +4281,11 @@ mod tests {
     #[test]
     fn current_task_set_keeps_doorbell_and_clears_served_work_across_switch() {
         let task = CurrentTask::new();
-        task.set(El1TaskId::from_linux_tid(42), 11, 200);
+        task.set(
+            El1TaskId::from_linux_tid(42),
+            crate::SnapshotGeneration::from_raw(11),
+            200,
+        );
         task.linux.fixup_pc.store(0x401000, Ordering::Relaxed);
         task.linux.orig_arg0.store(0xdead_beef, Ordering::Relaxed);
         task.linux.mark_pending_host_work();
@@ -4284,9 +4296,13 @@ mod tests {
         // never the host-work doorbell: it announces owed work (wakes,
         // deferred zone completions) that only a settling boundary may take
         // (#641).
-        task.set(El1TaskId::from_linux_tid(41), 12, 100);
+        task.set(
+            El1TaskId::from_linux_tid(41),
+            crate::SnapshotGeneration::from_raw(12),
+            100,
+        );
         assert_eq!(task.execution.task.load(Ordering::Relaxed), 41);
-        assert_eq!(task.execution.generation.load(Ordering::Relaxed), 12);
+        assert_eq!(task.execution.generation.load(Ordering::Relaxed).raw(), 12);
         assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 100);
         assert_eq!(task.linux.fixup_pc.load(Ordering::Relaxed), 0x401000);
         assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), 0xdead_beef);

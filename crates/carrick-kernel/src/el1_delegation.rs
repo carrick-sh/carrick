@@ -118,7 +118,7 @@ pub fn clear_el1_region_host_ptr() {
 pub fn publish_current_task(
     slot: usize,
     task_id: El1TaskId,
-    generation: u64,
+    generation: carrick_el1_abi::SnapshotGeneration,
     file_table: u64,
     visible_pid: u32,
     root_generation: carrick_el1_abi::ContextGeneration,
@@ -2920,7 +2920,7 @@ mod tests {
                 };
                 task.set(
                     carrick_el1_abi::El1TaskId::from_linux_tid(41),
-                    11,
+                    carrick_el1_abi::SnapshotGeneration::from_raw(11),
                     table().raw(),
                 );
                 let description = open.description.clone();

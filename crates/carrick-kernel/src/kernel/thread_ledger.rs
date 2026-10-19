@@ -520,7 +520,7 @@ impl ThreadIdentityPool {
                     tid: identity.key.tid.raw() as u32,
                     visible_tid,
                     thread_serial: identity.key.serial.raw(),
-                    execution: carrick_el1_abi::EntryGeneration::from_raw(task.key().serial.raw()),
+                    birth: carrick_el1_abi::BirthSerial::of_task(task.key().serial),
                     uid_credit: u64::from(credit.raw()),
                 },
             )

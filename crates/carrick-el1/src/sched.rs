@@ -106,7 +106,7 @@ pub fn identity_of(task: &CurrentTask, affinity: u64) -> ThreadIdentity {
         serial: task.mm.thread_generation.load(Ordering::Relaxed),
         mm: task.mm.key.load(Ordering::Relaxed),
         file_table: task.linux.file_table.load(Ordering::Relaxed),
-        generation: task.execution.generation.load(Ordering::Relaxed),
+        generation: task.execution.generation.load(Ordering::Relaxed).raw(),
         affinity,
         lifecycle_page: task.metadata.lifecycle_page.load(Ordering::Acquire),
         control_slot: task.metadata.control_slot.load(Ordering::Acquire),
@@ -125,9 +125,10 @@ fn publish_identity(task: &CurrentTask, id: ThreadIdentity) {
         .store(id.file_table, Ordering::Relaxed);
     task.mm.key.store(id.mm, Ordering::Relaxed);
     task.publish_lifecycle(id.lifecycle_page, id.control_slot);
-    task.execution
-        .generation
-        .store(id.generation, Ordering::Release);
+    task.execution.generation.store(
+        carrick_el1_abi::SnapshotGeneration::from_raw(id.generation),
+        Ordering::Release,
+    );
 }
 
 /// How a futex syscall EL1 served ended.

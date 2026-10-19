@@ -1750,20 +1750,16 @@ where
     }
 
     fn publish_host_thread_retirement(&self, context: &carrick_kernel::kernel::KernelContext) {
-        use carrick_core_abi::entry::{EntryGeneration, EntryTaskKey, EntryThreadGeneration};
-        let task = context.task().key();
-        let thread = context.thread().key();
-        let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
-            EntryTaskKey::from_raw(thread.tid.raw() as u64),
-            EntryGeneration::from_raw(task.serial.raw()),
-            EntryThreadGeneration::from_raw(thread.serial.raw()),
+        let receipt = carrick_kernel::kernel::host_birth_identity(
+            context.task().key(),
+            context.thread().key(),
         );
         let Some(receipt) = receipt else {
             tracing::error!("retired thread lost exact identity");
             return;
         };
         let page = context.lifecycle_page();
-        page.publish_exact_host_retirement(context.thread().control_slot(), receipt);
+        page.publish_exact_host_retirement(context.thread().control_slot(), receipt.retirement());
         // An Open process can reuse a completed host-birth slot. Closing
         // retains the address until Settled, so a concurrent ring reader
         // never observes freed control storage.

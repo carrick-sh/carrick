@@ -2191,7 +2191,10 @@ mod tests {
         }
         impl LifecycleVenue for Venue {
             fn thread<'a>(&'a self, task: &'a CurrentTask) -> Option<LifecycleThread<'a>> {
-                task.execution.generation.store(12, Ordering::Release);
+                task.execution.generation.store(
+                    carrick_el1_abi::SnapshotGeneration::from_raw(12),
+                    Ordering::Release,
+                );
                 Some(LifecycleThread {
                     page: &self.page,
                     slot: &self.control,
@@ -2213,7 +2216,11 @@ mod tests {
                 };
                 assert!(venue.control.publish_visible_tid(41));
                 let tasks = [CurrentTask::new()];
-                tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+                tasks[0].set(
+                    carrick_el1_abi::El1TaskId::from_linux_tid(41),
+                    carrick_el1_abi::SnapshotGeneration::from_raw(11),
+                    5,
+                );
                 tasks[0].linux.orig_arg0.store(77, Ordering::Relaxed);
                 let counters = Counters::default();
                 let mut frame = TrapFrame::default();
@@ -2266,7 +2273,10 @@ mod tests {
             fn read_u32(&self, task: &CurrentTask, _: u64) -> Option<u32> {
                 let slot = SlotId::new(0);
                 match self.mutation {
-                    0 => task.execution.generation.store(12, Ordering::Release),
+                    0 => task.execution.generation.store(
+                        carrick_el1_abi::SnapshotGeneration::from_raw(12),
+                        Ordering::Release,
+                    ),
                     1 => {
                         let mm = self.identity.mm;
                         let address = (0x2000..0x2400)
@@ -2377,7 +2387,7 @@ mod tests {
                         let tasks = [CurrentTask::new()];
                         tasks[0].set(
                             carrick_el1_abi::El1TaskId::from_linux_tid(41),
-                            identity.generation,
+                            carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
                             5,
                         );
                         tasks[0].mm.key.store(7, Ordering::Release);

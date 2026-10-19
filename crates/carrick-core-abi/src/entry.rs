@@ -1,11 +1,13 @@
 //! Exact execution identity presented at a native entry boundary.
+use carrick_sched_core::process::TaskSerial;
 use carrick_sched_core::{RecordId, SlotId, ThreadCtx, ZoneTables};
 
 /// A scheduler-owned context image; entry custody never interprets its words.
 pub trait EntryContext: Copy + Send + Sync + zerocopy::FromZeros {}
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> EntryContext for C {}
+use core::num::NonZeroU64;
 use core::ptr::NonNull;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 macro_rules! binding_word {
     ($($name:ident),+) => {$(
@@ -18,24 +20,104 @@ macro_rules! binding_word {
         }
     )+};
 }
-binding_word!(
-    EntryTaskKey,
-    EntryGeneration,
-    EntryMmKey,
-    EntryThreadGeneration
-);
+binding_word!(EntryTaskKey, EntryMmKey, EntryThreadGeneration);
+
+/// Version of one published execution snapshot (the host's settlement
+/// generation). It moves on every settlement of the same thread and is never
+/// an incarnation: a thread's [`BirthSerial`] cannot be derived from it.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct SnapshotGeneration(u64);
+impl SnapshotGeneration {
+    /// No snapshot has been issued: an unadopted in-zone birth.
+    pub const UNISSUED: Self = Self(0);
+    /// The first snapshot of a freshly published execution.
+    pub const INITIAL: Self = Self(1);
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+    pub const fn issued(self) -> bool {
+        self.0 != 0
+    }
+}
+
+/// Wire word carrying exactly one [`SnapshotGeneration`].
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct AtomicSnapshotGeneration(AtomicU64);
+impl AtomicSnapshotGeneration {
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+    pub fn load(&self, order: Ordering) -> SnapshotGeneration {
+        SnapshotGeneration(self.0.load(order))
+    }
+    pub fn store(&self, generation: SnapshotGeneration, order: Ordering) {
+        self.0.store(generation.0, order);
+    }
+}
+impl Default for AtomicSnapshotGeneration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The process incarnation a thread was born into: the owning task's
+/// registry serial. Exact host-retirement receipts carry this, never a
+/// snapshot generation, so a settlement cannot change the receipt owed.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct BirthSerial(NonZeroU64);
+impl BirthSerial {
+    pub const fn of_task(serial: TaskSerial) -> Self {
+        Self(serial.nonzero())
+    }
+    pub const fn task_serial(self) -> TaskSerial {
+        TaskSerial::from_registry_allocation(self.0)
+    }
+    pub const fn raw(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Wire word carrying one [`BirthSerial`]; zero means none was published.
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct AtomicBirthSerial(AtomicU64);
+impl AtomicBirthSerial {
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+    pub fn load(&self, order: Ordering) -> Option<BirthSerial> {
+        NonZeroU64::new(self.0.load(order)).map(BirthSerial)
+    }
+    pub fn store(&self, serial: BirthSerial, order: Ordering) {
+        self.0.store(serial.raw(), order);
+    }
+    pub fn clear(&self, order: Ordering) {
+        self.0.store(0, order);
+    }
+}
+impl Default for AtomicBirthSerial {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// The execution prefix of the existing shared current-task wire record.
 #[repr(C, align(8))]
 #[derive(Debug)]
 pub struct ExecutionIdentity {
-    pub generation: AtomicU64,
+    pub generation: AtomicSnapshotGeneration,
     pub task: AtomicU64,
 }
 impl ExecutionIdentity {
     pub const fn new() -> Self {
         Self {
-            generation: AtomicU64::new(0),
+            generation: AtomicSnapshotGeneration::new(),
             task: AtomicU64::new(0),
         }
     }
@@ -80,14 +162,14 @@ const _: () = {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionBinding {
     pub task: EntryTaskKey,
-    pub generation: EntryGeneration,
+    pub generation: SnapshotGeneration,
     pub mm: EntryMmKey,
     pub thread_generation: EntryThreadGeneration,
 }
 
 impl ExecutionBinding {
     pub const fn issued(self) -> bool {
-        self.task.raw() != 0 && self.generation.raw() != 0
+        self.task.raw() != 0 && self.generation.issued()
     }
 }
 
@@ -292,7 +374,14 @@ mod layout_manifest {
                      generation: _,
                      task: _,
                  }: ExecutionIdentity| {};
-        field!(ExecutionIdentity, generation, AtomicU64, 0, 8, 8);
+        field!(
+            ExecutionIdentity,
+            generation,
+            AtomicSnapshotGeneration,
+            0,
+            8,
+            8
+        );
         field!(ExecutionIdentity, task, AtomicU64, 8, 8, 8);
     }
 

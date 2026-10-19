@@ -7230,7 +7230,11 @@ pub(crate) mod tests {
             dispatcher.install_observer(audit.clone());
             let (kernel, context, mut state) = typed_completion_fixture(72_497, dispatcher);
             let task = carrick_el1_abi::CurrentTask::new();
-            task.set(carrick_el1_abi::El1TaskId::from_linux_tid(72_497), 11, 5);
+            task.set(
+                carrick_el1_abi::El1TaskId::from_linux_tid(72_497),
+                carrick_el1_abi::SnapshotGeneration::from_raw(11),
+                5,
+            );
             task.mm.key.store(7, Ordering::Relaxed);
             task.mm.thread_generation.store(13, Ordering::Relaxed);
             task.publish_visible_pid(1);

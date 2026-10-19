@@ -515,6 +515,19 @@ impl Fixture {
         leader: ThreadIdentity,
     ) -> Self {
         let file_table = leader.file_table;
+        // The host records the leader's birth identity when it allocates the
+        // control slot. Its process serial is independent of the snapshot.
+        control.publish_host_birth_identity(
+            carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                carrick_core_abi::EntryTaskKey::from_raw(leader.tid),
+                carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(leader.generation)
+                        .unwrap(),
+                ),
+                carrick_core_abi::EntryThreadGeneration::from_raw(leader.serial),
+            )
+            .unwrap(),
+        );
 
         let region_box = Box::new(crate::mm_portal::test_support::Region::new());
         let region = Box::leak(region_box);
@@ -529,7 +542,7 @@ impl Fixture {
         let task = CurrentTask::new();
         task.set(
             El1TaskId::from_linux_tid(leader.tid as i32),
-            leader.generation,
+            carrick_el1_abi::SnapshotGeneration::from_raw(leader.generation),
             file_table,
         );
         task.mm.key.store(leader.mm, Ordering::Release);
@@ -985,7 +998,7 @@ fn activate(
     let identity = zone.record(binding.record.id).identity();
     task.set(
         El1TaskId::from_linux_tid(binding.key.id.raw()),
-        binding.key.serial.raw(),
+        carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
         identity.file_table,
     );
     task.mm
@@ -1235,12 +1248,16 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
             .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
             .unwrap();
         assert!(control.publish_visible_tid(43));
-        control.publish_host_birth_identity(carrick_el1_abi::ExecutionBinding {
-            task: carrick_el1_abi::EntryTaskKey::from_raw(43),
-            generation: carrick_el1_abi::EntryGeneration::from_raw(13),
-            mm: carrick_el1_abi::EntryMmKey::from_raw(1),
-            thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(103),
-        });
+        control.publish_host_birth_identity(
+            carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                carrick_el1_abi::EntryTaskKey::from_raw(43),
+                carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(13).unwrap(),
+                ),
+                carrick_el1_abi::EntryThreadGeneration::from_raw(103),
+            )
+            .unwrap(),
+        );
         let host_slot = fixture.page.reserve_host_birth().unwrap();
         carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
         assert!(
@@ -1371,7 +1388,7 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
     for candidate in [
         binding,
         carrick_el1_abi::ExecutionBinding {
-            generation: carrick_el1_abi::EntryGeneration::from_raw(binding.generation.raw() + 1),
+            generation: carrick_el1_abi::SnapshotGeneration::from_raw(binding.generation.raw() + 1),
             ..binding
         },
     ] {
@@ -1777,7 +1794,7 @@ fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
     assert_eq!(fixture.zone.slot(fixture.slot).host_record(), Some(current));
     assert_eq!(fixture.zone.record(current).identity(), replacement);
     let next = carrick_el1_abi::ExecutionBinding {
-        generation: carrick_el1_abi::EntryGeneration::from_raw(replacement.generation),
+        generation: carrick_el1_abi::SnapshotGeneration::from_raw(replacement.generation),
         thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(replacement.serial),
         ..old
     };
@@ -1804,7 +1821,7 @@ fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
     ] {
         let binding = carrick_el1_abi::ExecutionBinding {
             task: carrick_el1_abi::EntryTaskKey::from_raw(stale.tid),
-            generation: carrick_el1_abi::EntryGeneration::from_raw(stale.generation),
+            generation: carrick_el1_abi::SnapshotGeneration::from_raw(stale.generation),
             mm: carrick_el1_abi::EntryMmKey::from_raw(stale.mm),
             thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(stale.serial),
         };
@@ -1859,12 +1876,16 @@ pub fn with_native_terminal_host_handback(
         .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
         .unwrap();
     assert!(sibling.publish_visible_tid(42));
-    sibling.publish_host_birth_identity(carrick_el1_abi::ExecutionBinding {
-        task: carrick_el1_abi::EntryTaskKey::from_raw(42),
-        generation: carrick_el1_abi::EntryGeneration::from_raw(12),
-        mm: carrick_el1_abi::EntryMmKey::from_raw(1),
-        thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(102),
-    });
+    sibling.publish_host_birth_identity(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_el1_abi::EntryTaskKey::from_raw(42),
+            carrick_core_abi::entry::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+            ),
+            carrick_el1_abi::EntryThreadGeneration::from_raw(102),
+        )
+        .unwrap(),
+    );
     let birth = fixture.page.reserve_host_birth().unwrap();
     fixture.page.thread_born().unwrap();
     assert!(
@@ -1894,9 +1915,10 @@ pub fn with_native_terminal_host_handback(
         .reserve_cancelled_member_exit()
         .unwrap()
         .publish();
-    fixture
-        .page
-        .publish_exact_host_retirement(&sibling, sibling.host_birth_identity().unwrap());
+    fixture.page.publish_exact_host_retirement(
+        &sibling,
+        sibling.host_birth_identity().unwrap().retirement(),
+    );
     ::core::assert_eq!(fixture.page.live(), 0);
     let guard = fixture
         .zone
@@ -2447,7 +2469,9 @@ fn imported_thread_on_control_and_slot(
                 tid: 42,
                 visible_tid: 42,
                 thread_serial: 102,
-                execution: carrick_core_abi::entry::EntryGeneration::from_raw(12),
+                birth: carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+                ),
                 uid_credit: 0,
             },
         )
@@ -2534,7 +2558,11 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
         let owner = registry()
             .for_entry(source, &fixture.task, fixture.address)
             .unwrap();
-        fixture.task.set(El1TaskId::from_linux_tid(42), 12, 5);
+        fixture.task.set(
+            El1TaskId::from_linux_tid(42),
+            carrick_el1_abi::SnapshotGeneration::from_raw(12),
+            5,
+        );
         fixture
             .task
             .mm
@@ -2623,7 +2651,11 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
             registry().for_record(fixture.zone, record).is_none(),
             notified
         );
-        fixture.task.set(El1TaskId::from_linux_tid(41), 11, 5);
+        fixture.task.set(
+            El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         fixture
             .task
             .mm
@@ -2668,11 +2700,10 @@ fn arm_root_host_lease_renewal_retains_the_admitted_process_owner() {
         .for_entry(source, &fixture.task, fixture.address)
         .unwrap();
     assert!(fixture.zone.slot(fixture.slot).host_record().is_none());
-    fixture
-        .task
-        .execution
-        .generation
-        .store(22, Ordering::Release);
+    fixture.task.execution.generation.store(
+        carrick_el1_abi::SnapshotGeneration::from_raw(22),
+        Ordering::Release,
+    );
     let outcome = fixture.enter(fixture.control, ttbr0, &mut service, |process| {
         assert!(process.has_thread(42))
     });
@@ -2753,8 +2784,24 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
         fixture.zone.switch_in_full(fixture.slot).unwrap().record,
         record
     );
+    let generation = fixture.task.execution.generation.load(Ordering::Acquire);
+    fixture.task.execution.generation.store(
+        carrick_el1_abi::SnapshotGeneration::from_raw(generation.raw() + 1),
+        Ordering::Release,
+    );
+    assert!(
+        fixture
+            .enter(fixture.control, ttbr0, &mut service, |_| panic!(
+                "wrong binding must not enter dispatch"
+            ))
+            .is_err()
+    );
+    fixture
+        .task
+        .execution
+        .generation
+        .store(generation, Ordering::Release);
     for atomic in [
-        &fixture.task.execution.generation,
         &fixture.task.mm.thread_generation,
         &fixture.task.mm.key,
         &fixture.task.metadata.lifecycle_page,
@@ -2821,7 +2868,11 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
     let owner = registry()
         .for_entry(source, &fixture.task, fixture.address)
         .unwrap();
-    fixture.task.set(El1TaskId::from_linux_tid(42), 0, 5);
+    fixture.task.set(
+        El1TaskId::from_linux_tid(42),
+        carrick_el1_abi::SnapshotGeneration::from_raw(0),
+        5,
+    );
     fixture
         .task
         .mm
@@ -2899,11 +2950,10 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
     fixture.zone.publish_slot(slot, 1, Some(0), 1);
     fixture.zone.enter_guest(slot);
     fixture.zone.install_space(slot, 1).unwrap();
-    fixture
-        .task
-        .execution
-        .generation
-        .store(19, Ordering::Release);
+    fixture.task.execution.generation.store(
+        carrick_el1_abi::SnapshotGeneration::from_raw(19),
+        Ordering::Release,
+    );
     service.slot = slot;
     let adopted_source = BornInZoneSource {
         zone: fixture.zone,
@@ -2933,7 +2983,11 @@ fn arm_owned_raw_exit_retires_only_one_of_two_live_threads() {
     fixture
         .enter(fixture.control, ttbr0, &mut service, |_| ())
         .unwrap();
-    fixture.task.set(El1TaskId::from_linux_tid(42), 12, 5);
+    fixture.task.set(
+        El1TaskId::from_linux_tid(42),
+        carrick_el1_abi::SnapshotGeneration::from_raw(12),
+        5,
+    );
     fixture
         .task
         .mm
@@ -2983,7 +3037,11 @@ fn arm_owned_raw_exit_retires_only_one_of_two_live_threads() {
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 1);
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
     assert!(registry().for_record(fixture.zone, record).is_none());
-    fixture.task.set(El1TaskId::from_linux_tid(41), 11, 5);
+    fixture.task.set(
+        El1TaskId::from_linux_tid(41),
+        carrick_el1_abi::SnapshotGeneration::from_raw(11),
+        5,
+    );
     fixture
         .task
         .mm
@@ -3072,9 +3130,11 @@ fn run_as(fixture: &Fixture, tid: i32, generation: u64, serial: u64, control: &T
     if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
         doorbell.settled();
     }
-    fixture
-        .task
-        .set(El1TaskId::from_linux_tid(tid), generation, 5);
+    fixture.task.set(
+        El1TaskId::from_linux_tid(tid),
+        carrick_el1_abi::SnapshotGeneration::from_raw(generation),
+        5,
+    );
     fixture
         .task
         .mm
@@ -3110,12 +3170,16 @@ fn host_born_sibling(fixture: &Fixture, visible_tid: u32) -> &'static ThreadCont
         .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
         .unwrap();
     assert!(control.publish_visible_tid(visible_tid));
-    control.publish_host_birth_identity(carrick_el1_abi::ExecutionBinding {
-        task: carrick_el1_abi::EntryTaskKey::from_raw(u64::from(binding_tid)),
-        generation: carrick_el1_abi::EntryGeneration::from_raw(generation),
-        mm: carrick_el1_abi::EntryMmKey::from_raw(5),
-        thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(thread_generation),
-    });
+    control.publish_host_birth_identity(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_el1_abi::EntryTaskKey::from_raw(u64::from(binding_tid)),
+            carrick_core_abi::entry::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(generation).unwrap(),
+            ),
+            carrick_el1_abi::EntryThreadGeneration::from_raw(thread_generation),
+        )
+        .unwrap(),
+    );
     let birth_slot = fixture.page.reserve_host_birth().expect("host birth slot");
     carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
     assert!(
@@ -3201,16 +3265,20 @@ fn arm_host_born_sibling_raw_exit_retires_exact_owned_thread() {
     assert_eq!(frame.x[0], 0, "host custody keeps its status argument");
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
     assert!(leader_sees_thread(fixture, &mut service, 42));
-    let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+    let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
         carrick_core_abi::entry::EntryTaskKey::from_raw(42),
-        carrick_core_abi::entry::EntryGeneration::from_raw(12),
+        carrick_core_abi::entry::BirthSerial::of_task(
+            carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+        ),
         carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
     )
     .unwrap();
     carrick_el1_abi::Lifecycle::reserve_nonfinal_exit(fixture.page)
         .unwrap()
         .publish();
-    fixture.page.publish_exact_host_retirement(control, receipt);
+    fixture
+        .page
+        .publish_exact_host_retirement(control, receipt.retirement());
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -3379,11 +3447,10 @@ fn arm_host_born_sibling_refuses_stale_or_foreign_binding() {
         let mut page = fixture.page;
         let mut entered = control;
         match defect {
-            Defect::UnissuedGeneration => fixture
-                .task
-                .execution
-                .generation
-                .store(0, Ordering::Release),
+            Defect::UnissuedGeneration => fixture.task.execution.generation.store(
+                carrick_el1_abi::SnapshotGeneration::UNISSUED,
+                Ordering::Release,
+            ),
             Defect::StaleRecordSerial | Defect::StaleRecordGeneration => {
                 let identity = crate::sched::identity_of(&fixture.task, 1);
                 let stale = if matches!(defect, Defect::StaleRecordSerial) {
@@ -3505,16 +3572,20 @@ fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
     assert!(control.host_exit_requested());
     fixture.zone.clear_current(fixture.slot);
     assert!(leader_sees_thread(fixture, &mut service, 42));
-    let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+    let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
         carrick_core_abi::entry::EntryTaskKey::from_raw(42),
-        carrick_core_abi::entry::EntryGeneration::from_raw(12),
+        carrick_core_abi::entry::BirthSerial::of_task(
+            carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+        ),
         carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
     )
     .unwrap();
     carrick_el1_abi::Lifecycle::reserve_nonfinal_exit(fixture.page)
         .unwrap()
         .publish();
-    fixture.page.publish_exact_host_retirement(control, receipt);
+    fixture
+        .page
+        .publish_exact_host_retirement(control, receipt.retirement());
     run_as_leader(fixture);
     registry()
         .for_entry(
@@ -3674,22 +3745,28 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
                 .page
                 .retire_published_host_member(control.entry().unwrap(), control, retirement)
                 .unwrap();
-            let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
                 carrick_core_abi::entry::EntryTaskKey::from_raw(42),
-                carrick_core_abi::entry::EntryGeneration::from_raw(12),
+                carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+                ),
                 carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
             )
             .unwrap();
-            fixture.page.publish_exact_host_retirement(control, receipt);
+            fixture
+                .page
+                .publish_exact_host_retirement(control, receipt.retirement());
         }
         if let Some(control) = adopted_control {
-            let stale = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            let stale = carrick_core::terminal::ThreadBirthIdentity::from_parts(
                 carrick_core_abi::entry::EntryTaskKey::from_raw(42),
-                carrick_core_abi::entry::EntryGeneration::from_raw(11),
+                carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(11).unwrap(),
+                ),
                 carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
             )
             .unwrap();
-            control.publish_host_retirement(stale);
+            control.publish_host_retirement(stale.retirement());
             fixture
                 .page
                 .reserve_cancelled_member_exit()
@@ -3704,13 +3781,17 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
                 0,
                 "stale adopted receipt must not settle Closing"
             );
-            let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
                 carrick_core_abi::entry::EntryTaskKey::from_raw(42),
-                carrick_core_abi::entry::EntryGeneration::from_raw(12),
+                carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+                ),
                 carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
             )
             .unwrap();
-            fixture.page.publish_exact_host_retirement(control, receipt);
+            fixture
+                .page
+                .publish_exact_host_retirement(control, receipt.retirement());
         }
         if matches!(siblings, Siblings::PooledAndUnadoptedHostBorn) {
             let control = unadopted_control.expect("unadopted control");
@@ -3733,7 +3814,7 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
                 .publish();
             fixture
                 .page
-                .publish_exact_host_retirement(control, identity);
+                .publish_exact_host_retirement(control, identity.retirement());
         }
         assert_eq!(fixture.page.live(), 0);
         assert!(matches!(
@@ -3743,6 +3824,76 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
         assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
         assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
     }
+}
+
+/// #680: a host-born member's first execution can carry any snapshot
+/// generation; its birth identity is fixed in its control slot. Adoption must
+/// authenticate the birth identity, not a coincidence between the snapshot
+/// generation and the process serial, and Closing must owe the birth receipt.
+#[test]
+fn arm_host_born_member_adopts_and_settles_at_an_unrelated_execution_generation() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let control = host_born_sibling(fixture, 42);
+    let birth = control.host_birth_identity().unwrap();
+    // The host's first published snapshot of the sibling is unrelated to its
+    // birth serial (production: ExecutionGeneration::INITIAL vs task serial).
+    let first = birth.birth().raw() + 4221;
+    run_as(fixture, 42, first, birth.thread().raw(), control);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 178; // gettid adopts the sibling at its first execution
+    arm_call(fixture, control, &mut service, &mut frame).unwrap();
+    assert_eq!(frame.x[0], 42);
+    assert!(
+        (0..carrick_el1_abi::THREAD_POOL_ENTRIES)
+            .all(|index| fixture.page.host_birth_identity(index) != Some(birth)),
+        "adoption consumed the exact host-birth slot"
+    );
+    // A later settlement republishes it at yet another snapshot generation.
+    run_as(fixture, 42, first + 7, birth.thread().raw(), control);
+    frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 178;
+    arm_call(fixture, control, &mut service, &mut frame).unwrap();
+    assert_eq!(frame.x[0], 42, "renewed execution retains its owner");
+    assert!(leader_sees_thread(fixture, &mut service, 42));
+    run_as_leader(fixture);
+    frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94; // exit_group while the adopted sibling is live
+    let route = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+    fixture
+        .page
+        .reserve_cancelled_member_exit()
+        .unwrap()
+        .publish();
+    fixture
+        .page
+        .publish_exact_host_retirement(control, birth.retirement());
+    assert_eq!(fixture.page.live(), 0);
+    assert!(matches!(
+        wake_closing_root(fixture, &mut service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(
+        service.crossing.root_exits.load(Ordering::Acquire),
+        1,
+        "the birth receipt settles Closing"
+    );
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
 }
 
 #[cfg(test)]
@@ -3815,7 +3966,9 @@ fn arm_pool_raw_exit_closing_at_commit_boundary(
                         tid: 99,
                         visible_tid: 99,
                         thread_serial: 199,
-                        execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
+                        birth: carrick_core_abi::entry::BirthSerial::of_task(
+                            carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+                        ),
                         uid_credit: 0,
                     },
                 )
@@ -3922,13 +4075,17 @@ fn arm_non_graph_retired_pool_member(reallocate: bool, resetting: bool) {
         .page
         .retire_published_host_member(entry, control, membership)
         .unwrap();
-    let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+    let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
         carrick_core_abi::EntryTaskKey::from_raw(42),
-        carrick_core_abi::EntryGeneration::from_raw(12),
+        carrick_core_abi::entry::BirthSerial::of_task(
+            carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+        ),
         carrick_core_abi::EntryThreadGeneration::from_raw(102),
     )
     .unwrap();
-    fixture.page.publish_exact_host_retirement(control, receipt);
+    fixture
+        .page
+        .publish_exact_host_retirement(control, receipt.retirement());
     fixture.zone.free_record(record.id);
     drop(lease);
     let reset = resetting.then(|| control.reserve_reset_for_test().unwrap());
@@ -4035,13 +4192,15 @@ fn arm_pool_retirement_during_scan(restock: bool) {
         let membership = page.reserve_nonfinal_exit().unwrap();
         page.retire_published_host_member(entry, control, membership)
             .unwrap();
-        let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+        let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
             carrick_core_abi::EntryTaskKey::from_raw(42),
-            carrick_core_abi::EntryGeneration::from_raw(12),
+            carrick_core_abi::entry::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+            ),
             carrick_core_abi::EntryThreadGeneration::from_raw(102),
         )
         .unwrap();
-        page.publish_exact_host_retirement(control, receipt);
+        page.publish_exact_host_retirement(control, receipt.retirement());
         zone.free_record(record.id);
         drop(lease);
         if restock {
@@ -4051,7 +4210,9 @@ fn arm_pool_retirement_during_scan(restock: bool) {
                     tid: 99,
                     visible_tid: 99,
                     thread_serial: 199,
-                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(11),
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(11).unwrap(),
+                    ),
                     uid_credit: 0,
                 },
             )
@@ -4105,12 +4266,16 @@ fn arm_host_birth_after_snapshot_is_cancelled_and_settles() {
     control
         .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
         .unwrap();
-    control.publish_host_birth_identity(carrick_el1_abi::ExecutionBinding {
-        task: carrick_core_abi::EntryTaskKey::from_raw(42),
-        generation: carrick_core_abi::EntryGeneration::from_raw(11),
-        mm: carrick_core_abi::EntryMmKey::from_raw(1),
-        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(102),
-    });
+    control.publish_host_birth_identity(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_core_abi::EntryTaskKey::from_raw(42),
+            carrick_core_abi::entry::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(11).unwrap(),
+            ),
+            carrick_core_abi::EntryThreadGeneration::from_raw(102),
+        )
+        .unwrap(),
+    );
     let receipt = control.host_birth_identity().unwrap();
     let page = fixture.page;
     let slot = page.reserve_host_birth().unwrap();
@@ -4136,7 +4301,7 @@ fn arm_host_birth_after_snapshot_is_cancelled_and_settles() {
     );
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
     page.reserve_cancelled_member_exit().unwrap().publish();
-    page.publish_exact_host_retirement(control, receipt);
+    page.publish_exact_host_retirement(control, receipt.retirement());
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
         crate::sched::ResumeAction::Left
@@ -4166,7 +4331,9 @@ fn arm_reserved_pool_control_is_not_transiently_registered() {
                 tid: 42,
                 visible_tid: 42,
                 thread_serial: 102,
-                execution: carrick_core_abi::EntryGeneration::from_raw(11),
+                birth: carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(11).unwrap(),
+                ),
                 uid_credit: 0,
             },
         )
@@ -4224,13 +4391,17 @@ fn arm_non_graph_pool_member_uses_page_identity_after_zone_release() {
         .page
         .retire_published_host_member(entry, control, membership)
         .unwrap();
-    let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+    let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
         carrick_core_abi::EntryTaskKey::from_raw(42),
-        carrick_core_abi::EntryGeneration::from_raw(12),
+        carrick_core_abi::entry::BirthSerial::of_task(
+            carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+        ),
         carrick_core_abi::EntryThreadGeneration::from_raw(102),
     )
     .unwrap();
-    fixture.page.publish_exact_host_retirement(control, receipt);
+    fixture
+        .page
+        .publish_exact_host_retirement(control, receipt.retirement());
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
         crate::sched::ResumeAction::Left
@@ -4344,13 +4515,17 @@ fn arm_graph_pool_host_retirement(unbound: bool) {
         0,
         "host retirement must wait for the exact receipt after Reaped"
     );
-    let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+    let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
         carrick_core_abi::entry::EntryTaskKey::from_raw(42),
-        carrick_core_abi::entry::EntryGeneration::from_raw(12),
+        carrick_core_abi::entry::BirthSerial::of_task(
+            carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+        ),
         carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
     )
     .unwrap();
-    fixture.page.publish_exact_host_retirement(control, receipt);
+    fixture
+        .page
+        .publish_exact_host_retirement(control, receipt.retirement());
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
         crate::sched::ResumeAction::Left
@@ -4643,7 +4818,11 @@ fn arm_host_birth_adoption_racing_closing_has_one_cancel_owner() {
     let control = host_born_sibling(fixture, 42);
     let birth_identity = control.host_birth_identity().unwrap();
     let sibling_task = Box::leak(Box::new(CurrentTask::new()));
-    sibling_task.set(El1TaskId::from_linux_tid(42), 12, 5);
+    sibling_task.set(
+        El1TaskId::from_linux_tid(42),
+        carrick_el1_abi::SnapshotGeneration::from_raw(12),
+        5,
+    );
     sibling_task.mm.key.store(
         fixture.task.mm.key.load(Ordering::Acquire),
         Ordering::Release,
@@ -4732,7 +4911,7 @@ fn arm_host_birth_adoption_racing_closing_has_one_cancel_owner() {
         .publish();
     fixture
         .page
-        .publish_exact_host_retirement(control, birth_identity);
+        .publish_exact_host_retirement(control, birth_identity.retirement());
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
         crate::sched::ResumeAction::Left
@@ -4769,7 +4948,11 @@ fn arm_rehomed_adopted_member_settles_on_its_birth_identity() {
     fixture.zone.install_space(slot, 1).unwrap();
     let mm = fixture.task.mm.key.load(Ordering::Acquire);
     let bind = |generation: u64| {
-        sibling_task.set(El1TaskId::from_linux_tid(42), generation, 5);
+        sibling_task.set(
+            El1TaskId::from_linux_tid(42),
+            carrick_el1_abi::SnapshotGeneration::from_raw(generation),
+            5,
+        );
         sibling_task.mm.key.store(mm, Ordering::Release);
         sibling_task
             .mm
@@ -4831,7 +5014,7 @@ fn arm_rehomed_adopted_member_settles_on_its_birth_identity() {
         .publish();
     fixture
         .page
-        .publish_exact_host_retirement(control, birth_identity);
+        .publish_exact_host_retirement(control, birth_identity.retirement());
     assert_eq!(fixture.page.live(), 0);
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
@@ -4864,7 +5047,11 @@ fn arm_adopted_member_rejects_a_foreign_retirement_receipt() {
     let control = host_born_sibling(fixture, 42);
     let birth_identity = control.host_birth_identity().unwrap();
     let sibling_task = Box::leak(Box::new(CurrentTask::new()));
-    sibling_task.set(El1TaskId::from_linux_tid(42), 12, 5);
+    sibling_task.set(
+        El1TaskId::from_linux_tid(42),
+        carrick_el1_abi::SnapshotGeneration::from_raw(12),
+        5,
+    );
     let mm = fixture.task.mm.key.load(Ordering::Acquire);
     sibling_task.mm.key.store(mm, Ordering::Release);
     sibling_task
@@ -4908,13 +5095,18 @@ fn arm_adopted_member_rejects_a_foreign_retirement_receipt() {
             control,
         )
         .expect("adopt host-born sibling");
-    // A retirement receipt for a different execution of the same thread.
-    let foreign = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+    // A retirement receipt for a different incarnation of the same tid and
+    // thread serial.
+    let foreign = carrick_core::terminal::ThreadBirthIdentity::from_parts(
         birth_identity.task(),
-        carrick_core_abi::EntryGeneration::from_raw(birth_identity.execution().raw() + 1),
+        carrick_core_abi::entry::BirthSerial::of_task(
+            carrick_sched_core::process::TaskSerial::from_raw_u64(birth_identity.birth().raw() + 1)
+                .unwrap(),
+        ),
         birth_identity.thread(),
     )
-    .unwrap();
+    .unwrap()
+    .retirement();
     fixture.page.reserve_nonfinal_exit().unwrap().publish();
     fixture.page.publish_exact_host_retirement(control, foreign);
     run_as_leader(fixture);
@@ -4974,7 +5166,7 @@ fn arm_host_exit_reserved_live_count_does_not_settle_group_before_receipt() {
     retirement.publish();
     fixture
         .page
-        .publish_exact_host_retirement(sibling, identity);
+        .publish_exact_host_retirement(sibling, identity.retirement());
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
         crate::sched::ResumeAction::Left
@@ -5020,7 +5212,7 @@ fn arm_host_retirement_release_racing_settle_reparks_without_quarantine() {
     let worker = std::thread::spawn(move || {
         page.publish_exact_host_retirement_with_hooks(
             sibling,
-            identity,
+            identity.retirement(),
             || {
                 published_tx.send(()).unwrap();
                 release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -5100,7 +5292,7 @@ fn arm_closing_member_set_capacity_uses_static_registry_bound() {
         let identity = control.host_birth_identity().unwrap();
         fixture
             .page
-            .publish_exact_host_retirement(control, identity);
+            .publish_exact_host_retirement(control, identity.retirement());
     }
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
@@ -5314,13 +5506,17 @@ fn arm_exit_group_under_gate(state: carrick_el1_abi::GateState) {
             .page
             .retire_published_host_member(entry, sibling, membership)
             .unwrap();
-        let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+        let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
             carrick_core_abi::EntryTaskKey::from_raw(42),
-            carrick_core_abi::EntryGeneration::from_raw(12),
+            carrick_core_abi::entry::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+            ),
             carrick_core_abi::EntryThreadGeneration::from_raw(102),
         )
         .unwrap();
-        fixture.page.publish_exact_host_retirement(sibling, receipt);
+        fixture
+            .page
+            .publish_exact_host_retirement(sibling, receipt.retirement());
         drop(admission);
         assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Closed);
         assert!(matches!(
@@ -5562,7 +5758,9 @@ fn arm_concurrent_exit_group_callers_wake_all_and_settle_owner() {
                 tid: 43,
                 visible_tid: 43,
                 thread_serial: 103,
-                execution: carrick_core_abi::entry::EntryGeneration::from_raw(13),
+                birth: carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(13).unwrap(),
+                ),
                 uid_credit: 0,
             },
         )

@@ -342,11 +342,19 @@ impl WaitChannel {
         Arc::as_ptr(this) as u64
     }
 }
+/// One issued execution: a task id at an exact snapshot generation. This is
+/// an execution key, never a process incarnation; a [`TaskKey`] and the birth
+/// receipt the host owes come from the control slot's birth identity.
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+struct IssuedExecution {
+    id: TaskId,
+    generation: carrick_core_abi::SnapshotGeneration,
+}
 /// An unadopted lifecycle member has real guest record custody but no issued
-/// executor generation. Never manufacture a TaskSerial to index that member.
+/// snapshot generation. Never manufacture an execution to index that member.
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum NativeThreadIdentity {
-    Issued(TaskKey),
+    Issued(IssuedExecution),
     Born(TaskId),
 }
 impl NativeThreadIdentity {
@@ -355,20 +363,31 @@ impl NativeThreadIdentity {
             i32::try_from(binding.task.raw()).map_err(|_| NativeProcessError::Invalid)?,
         )
         .map_err(|_| NativeProcessError::Invalid)?;
-        Ok(match TaskSerial::from_raw_u64(binding.generation.raw()) {
-            Some(serial) => Self::Issued(TaskKey { id, serial }),
-            None => Self::Born(id),
+        Ok(if binding.generation.issued() {
+            Self::Issued(IssuedExecution {
+                id,
+                generation: binding.generation,
+            })
+        } else {
+            Self::Born(id)
+        })
+    }
+    /// The first execution of a process the ring itself forked.
+    fn ring_born(id: TaskId) -> Self {
+        Self::Issued(IssuedExecution {
+            id,
+            generation: carrick_core_abi::SnapshotGeneration::INITIAL,
         })
     }
     fn id(self) -> TaskId {
         match self {
-            Self::Issued(key) => key.id,
+            Self::Issued(execution) => execution.id,
             Self::Born(id) => id,
         }
     }
-    fn issued(self) -> Option<TaskKey> {
+    fn issued(self) -> Option<IssuedExecution> {
         match self {
-            Self::Issued(key) => Some(key),
+            Self::Issued(execution) => Some(execution),
             Self::Born(_) => None,
         }
     }
@@ -381,7 +400,8 @@ pub struct NativeMember<'a, C: ProcessContext> {
     zone: &'a ZoneTables<C>,
     record: RecordRef,
     control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
-    expected_host: carrick_core::terminal::HostThreadRetirementReceipt,
+    /// The exact birth receipt host retirement owes for this member.
+    expected_host: carrick_core::terminal::ThreadBirthIdentity,
 }
 impl<C: ProcessContext> ExitMember for NativeMember<'_, C> {
     fn exit_task(&self) -> TaskKey {
@@ -401,43 +421,47 @@ fn retain_member_control(
 fn pool_host_identity(
     page: &ThreadLifecyclePage,
     entry: EntryRef,
-) -> Result<carrick_core::terminal::HostThreadRetirementReceipt, NativeProcessError> {
+) -> Result<carrick_core::terminal::ThreadBirthIdentity, NativeProcessError> {
     let identity = page.identity(entry).ok_or(NativeProcessError::Stale)?;
-    carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+    carrick_core::terminal::ThreadBirthIdentity::from_parts(
         carrick_core_abi::EntryTaskKey::from_raw(u64::from(identity.tid)),
-        identity.execution,
+        identity.birth,
         carrick_core_abi::EntryThreadGeneration::from_raw(identity.thread_serial),
     )
     .ok_or(NativeProcessError::Stale)
 }
 
+/// The exact birth identity a member's control slot records: the pool entry
+/// for an in-zone birth, else the identity the host published when it
+/// allocated the slot. Never an execution binding: its snapshot generation
+/// versions a CPU state and moves on every host settlement.
 fn member_host_identity(
     page: &ThreadLifecyclePage,
     control: &ThreadControlSlot,
-    binding: ExecutionBinding,
-) -> Result<carrick_core::terminal::HostThreadRetirementReceipt, NativeProcessError> {
-    if let Some(entry) = control.entry() {
-        // The pool owns the host process incarnation throughout adoption.
-        // A zone binding's generation versions its CPU snapshot; substituting
-        // it makes a genuine host retirement receipt impossible to satisfy.
-        pool_host_identity(page, entry)
-    } else {
-        Ok(adopted_host_identity(control, binding))
+) -> Result<carrick_core::terminal::ThreadBirthIdentity, NativeProcessError> {
+    match control.entry() {
+        Some(entry) => pool_host_identity(page, entry),
+        None => control
+            .host_birth_identity()
+            .ok_or(NativeProcessError::Stale),
     }
 }
 
-/// The exact receipt host retirement publishes for an entry-less member:
-/// its control slot's birth identity (process generation), which is fixed
-/// for the thread. The execution binding's generation versions each CPU
-/// snapshot and advances on every rehome, so it can never be the expected
-/// receipt (#641). A member with no published birth identity falls back
-/// to its binding.
-fn adopted_host_identity(
+/// The process key of a host-admitted leader: its tid and the process
+/// incarnation the host recorded in the leader's control slot at birth.
+fn host_admitted_process(
+    id: TaskId,
     control: &ThreadControlSlot,
-    binding: ExecutionBinding,
-) -> carrick_core::terminal::HostThreadRetirementReceipt {
-    control.host_birth_identity().unwrap_or_else(|| {
-        carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding)
+) -> Result<TaskKey, NativeProcessError> {
+    let birth = control
+        .host_birth_identity()
+        .ok_or(NativeProcessError::Stale)?;
+    if birth.task().raw() != id.raw() as u64 {
+        return Err(NativeProcessError::Stale);
+    }
+    Ok(TaskKey {
+        id,
+        serial: birth.birth().task_serial(),
     })
 }
 
@@ -525,16 +549,14 @@ enum OutstandingExitReceipt<'a> {
     Pool {
         entry: carrick_el1_abi::EntryRef,
         control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
-        expected_host: carrick_core::terminal::HostThreadRetirementReceipt,
+        expected_host: carrick_core::terminal::ThreadBirthIdentity,
     },
     Adopted {
-        binding: ExecutionBinding,
+        birth: carrick_core::terminal::ThreadBirthIdentity,
         control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
-        /// [`adopted_host_identity`]: stable across rehomes.
-        expected_host: carrick_core::terminal::HostThreadRetirementReceipt,
     },
     HostBorn {
-        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+        identity: carrick_core::terminal::ThreadBirthIdentity,
         index: usize,
     },
 }
@@ -585,13 +607,9 @@ impl PendingExit<'_> {
                     member: control.control(),
                     expected_host: *expected_host,
                 }),
-                OutstandingExitReceipt::Adopted {
-                    control,
-                    expected_host,
-                    ..
-                } => {
+                OutstandingExitReceipt::Adopted { birth, control } => {
                     host.push(carrick_core::terminal::HostMemberObservation::Adopted {
-                        binding: *expected_host,
+                        birth: *birth,
                         member: control.control(),
                     });
                 }
@@ -758,13 +776,16 @@ struct NativeExecutionKey {
 impl NativeExecutionKey {
     fn binding(self) -> ExecutionBinding {
         use carrick_core_abi::entry::{
-            EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration,
+            EntryMmKey, EntryTaskKey, EntryThreadGeneration, SnapshotGeneration,
         };
         ExecutionBinding {
             task: EntryTaskKey::from_raw(self.task.id().raw() as u64),
-            generation: EntryGeneration::from_raw(
-                self.task.issued().map_or(0, |key| key.serial.raw()),
-            ),
+            generation: self
+                .task
+                .issued()
+                .map_or(SnapshotGeneration::UNISSUED, |execution| {
+                    execution.generation
+                }),
             mm: EntryMmKey::from_raw(self.mm),
             thread_generation: EntryThreadGeneration::from_raw(self.thread_generation),
         }
@@ -845,15 +866,37 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let Some((_, keys)) = state.by_process.get(&(carrier, process)) else {
             return;
         };
+        // Only a published receipt can complete a member; the common entry
+        // takes no graph lock.
+        if !keys.iter().any(|key| {
+            state
+                .members
+                .get(key)
+                .is_some_and(|member| member.control.host_retirement().is_some())
+        }) {
+            return;
+        }
+        let Some(page) = runtime
+            .graph
+            .lock()
+            .owner
+            .task(process)
+            .ok()
+            .map(|row| row.native().resources().page)
+        else {
+            return;
+        };
         let completed: Vec<_> = keys
             .iter()
             .filter_map(|key| {
                 let member = state.members.get(key)?;
-                member
-                    .control
-                    .host_retirement()
-                    .is_some_and(|receipt| receipt.matches(key.binding()))
-                    .then_some((*key, member.record, member.control.visible_tid()))
+                let receipt = member.control.host_retirement()?;
+                let birth = member_host_identity(page, member.control.control()).ok()?;
+                receipt.acknowledges(birth).then_some((
+                    *key,
+                    member.record,
+                    member.control.visible_tid(),
+                ))
             })
             .collect();
         if completed.is_empty() {
@@ -887,7 +930,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         runtime: &NativeProcessRuntime<'a, M, C>,
         page: &ThreadLifecyclePage,
         members: &carrick_core::terminal::MemberSet,
-        adopted: &[(ExecutionBinding, &'a ThreadControlSlot, RecordRef)],
+        adopted: &[(
+            carrick_core::terminal::ThreadBirthIdentity,
+            &'a ThreadControlSlot,
+            RecordRef,
+        )],
     ) {
         let wait = NativeBucketWait {
             lifetime: core::marker::PhantomData,
@@ -895,9 +942,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             probe: None,
         };
         for identity in members.host() {
-            if let Some((_, control, record)) = adopted
-                .iter()
-                .find(|(binding, control, _)| *identity == adopted_host_identity(control, *binding))
+            if let Some((_, control, record)) =
+                adopted.iter().find(|(birth, _, _)| identity == birth)
             {
                 if control.host_retirement().is_some()
                     || control.entry().is_some_and(|entry| {
@@ -954,43 +1000,55 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
     }
 
+    /// Entry-less members that owe a host receipt, each with the exact birth
+    /// identity its control slot records. A member whose slot records no
+    /// birth identity cannot be owed an exact receipt: refuse the snapshot.
+    #[allow(clippy::type_complexity)]
     fn adopted_members(
         state: &NativeRegistryState<'a, M, C>,
         runtime: &NativeProcessRuntime<'a, M, C>,
         process: TaskKey,
         caller: ExecutionBinding,
         page: &ThreadLifecyclePage,
-    ) -> Vec<(ExecutionBinding, &'a ThreadControlSlot, RecordRef)> {
+    ) -> Result<
+        Vec<(
+            carrick_core::terminal::ThreadBirthIdentity,
+            &'a ThreadControlSlot,
+            RecordRef,
+        )>,
+        NativeProcessError,
+    > {
         let carrier = core::ptr::from_ref(runtime.zone).addr();
-        state
-            .by_process
-            .get(&(carrier, process))
-            .map_or_else(Vec::new, |(_, keys)| {
-                keys.iter()
-                    .filter_map(|key| {
-                        let binding = key.binding();
-                        (binding != caller && binding.issued())
-                            .then(|| {
-                                state
-                                    .members
-                                    .get(key)
-                                    // Core gives each exact identity one
-                                    // receipt kind. In-zone completion owes
-                                    // neither a pool nor a host receipt.
-                                    .and_then(|member| {
-                                        (member.control.entry().is_none()
-                                            && carrick_el1_abi::Lifecycle::expected_exit_receipt(
-                                            page,
-                                            member.control.control(),
-                                            member.control.entry(),
-                                        ) == carrick_core::lifecycle::ExpectedExitReceipt::Host)
-                                            .then_some((binding, member.control.control(), member.record))
-                                    })
-                            })
-                            .flatten()
-                    })
-                    .collect()
-            })
+        let Some((_, keys)) = state.by_process.get(&(carrier, process)) else {
+            return Ok(Vec::new());
+        };
+        let mut adopted = Vec::new();
+        for key in keys {
+            let binding = key.binding();
+            if binding == caller || !binding.issued() {
+                continue;
+            }
+            let Some(member) = state.members.get(key) else {
+                continue;
+            };
+            let control = member.control.control();
+            // Core gives each exact identity one receipt kind. In-zone
+            // completion owes neither a pool nor a host receipt.
+            if member.control.entry().is_some()
+                || carrick_el1_abi::Lifecycle::expected_exit_receipt(
+                    page,
+                    control,
+                    member.control.entry(),
+                ) != carrick_core::lifecycle::ExpectedExitReceipt::Host
+            {
+                continue;
+            }
+            let birth = control
+                .host_birth_identity()
+                .ok_or(NativeProcessError::Stale)?;
+            adopted.push((birth, control, member.record));
+        }
+        Ok(adopted)
     }
 
     pub const fn new() -> Self {
@@ -1043,7 +1101,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
         let binding = super::common_entry::execution_binding(current);
         let key = NativeExecutionKey::new(source.zone, binding, address)?;
-        let process = key.task.issued().ok_or(NativeProcessError::Invalid)?;
+        let execution = key.task.issued().ok_or(NativeProcessError::Invalid)?;
+        // The admitted root row was keyed by the leader's birth identity.
+        let process = runtime
+            .graph
+            .lock()
+            .owner
+            .tasks()
+            .get(&execution.id)
+            .filter(|row| {
+                core::ptr::from_ref(row.native().resources().control).addr() as u64
+                    == current.metadata.control_slot.load(Ordering::Acquire)
+            })
+            .map(|row| row.key())
+            .ok_or(NativeProcessError::Stale)?;
         let owned = runtime
             .task_binding(process)
             .ok_or(NativeProcessError::Stale)?;
@@ -1102,7 +1173,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         control: &ThreadControlSlot,
     ) -> Result<Option<Arc<NativeProcessRuntime<'a, M, C>>>, NativeProcessError> {
         let binding = super::common_entry::execution_binding(current);
-        let host_identity = member_host_identity(page, control, binding)?;
+        let host_identity = member_host_identity(page, control)?;
         let key = NativeExecutionKey::new(source.zone, binding, address)?;
         let pid = current.visible_pid().ok_or(NativeProcessError::Stale)?;
         let record = source
@@ -1180,15 +1251,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         member.record = reference;
         // Every refusing check precedes publication under both owner guards.
+        // An adopted receipt is the slot's birth identity: renewing the
+        // execution binding leaves the receipt Closing owes unchanged.
         if let Some(pending) = graph.pending_exit.get_mut(&process) {
-            let old_binding = old_key.binding();
             if pending.outstanding.iter().any(|receipt| {
-                matches!(receipt, OutstandingExitReceipt::Adopted { binding, control: expected, .. }
-                    if *binding == old_binding && core::ptr::eq(expected.control(), control))
-            }) && !pending.members.rehome_host(
-                adopted_host_identity(control, old_binding),
-                adopted_host_identity(control, key.binding()),
-            ) {
+                matches!(receipt, OutstandingExitReceipt::Adopted { birth, control: expected }
+                    if core::ptr::eq(expected.control(), control) && *birth != host_identity)
+            }) {
                 return Err(NativeProcessError::Stale);
             }
             for receipt in &mut pending.outstanding {
@@ -1200,17 +1269,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     && core::ptr::eq(expected.control(), control)
                 {
                     *expected_host = host_identity;
-                }
-                if let OutstandingExitReceipt::Adopted {
-                    binding,
-                    control: expected,
-                    expected_host,
-                } = receipt
-                    && *binding == old_binding
-                    && core::ptr::eq(expected.control(), control)
-                {
-                    *binding = key.binding();
-                    *expected_host = adopted_host_identity(control, key.binding());
                 }
             }
         }
@@ -1322,7 +1380,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
         let child_key = NativeExecutionKey {
             carrier: core::ptr::from_ref(parent.zone).addr(),
-            task: NativeThreadIdentity::Issued(child.child),
+            task: NativeThreadIdentity::ring_born(child.child.id),
             mm: child.address.mm.raw().get(),
             thread_generation: child.thread_generation,
             root: child.address.root.address().raw(),
@@ -1441,7 +1499,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         if !state.by_process.contains_key(&(key.carrier, process)) {
             return Err(NativeProcessError::Stale);
         }
-        let host_identity = member_host_identity(page, control, binding)?;
+        let host_identity = member_host_identity(page, control)?;
         let closing = {
             let mut graph = runtime.graph.lock();
             let row = graph
@@ -1580,7 +1638,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
 /// binding and retained control slot for an already-admitted thread group.
 #[derive(Clone, Copy)]
 struct IssuedHostThread {
-    key: TaskKey,
+    key: IssuedExecution,
     visible_pid: u32,
     visible_tid: u32,
     file_table: u64,
@@ -1603,6 +1661,8 @@ impl IssuedHostThread {
             .issued()
             .ok_or(NativeProcessError::Stale)?;
         let visible_tid = control.visible_tid().ok_or(NativeProcessError::Stale)?;
+        // The slot's birth identity names this exact thread and a published
+        // host-birth slot. The binding's snapshot generation is not part of it.
         let birth = control
             .host_birth_identity()
             .ok_or(NativeProcessError::Stale)?;
@@ -1818,7 +1878,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             let visible = NonZeroU32::new(identity.visible_tid).ok_or(NativeProcessError::Stale)?;
             let member_binding = ExecutionBinding {
                 task: carrick_core_abi::EntryTaskKey::from_raw(u64::from(identity.tid)),
-                generation: carrick_core_abi::EntryGeneration::from_raw(retained.generation),
+                generation: carrick_core_abi::SnapshotGeneration::from_raw(retained.generation),
                 mm: carrick_core_abi::EntryMmKey::from_raw(mm),
                 thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(
                     identity.thread_serial,
@@ -1849,7 +1909,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     zone,
                     record,
                     control: retain_member_control(control)?,
-                    expected_host: member_host_identity(page, control, member_binding)?,
+                    expected_host: member_host_identity(page, control)?,
                 },
                 visible,
                 identity.thread_serial,
@@ -1889,11 +1949,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok()
             .and_then(|id| carrick_personality_linux::identity::task_id_from_linux_pid(id).ok())
             .ok_or(NativeProcessError::Invalid)?;
-        let key = TaskKey {
-            id,
-            serial: TaskSerial::from_raw_u64(binding.generation.raw())
-                .ok_or(NativeProcessError::Invalid)?,
-        };
+        let key = host_admitted_process(id, control)?;
+        let execution = NativeThreadIdentity::from_binding(binding)?;
+        if execution.id() != id || execution.issued().is_none() {
+            return Err(NativeProcessError::Invalid);
+        }
         if !words.authenticates(address)
             || address.mm.raw().get() != binding.mm.raw()
             || identity.lifecycle_page != page as *const _ as u64
@@ -1978,8 +2038,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         serials
             .advance_past(
                 NonZeroU64::new(
-                    binding
-                        .generation
+                    key.serial
                         .raw()
                         .max(binding.thread_generation.raw())
                         .max(binding.mm.raw())
@@ -1988,11 +2047,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                             imported
                                 .iter()
                                 .map(|(member, _, serial)| {
-                                    member
-                                        .thread
-                                        .issued()
-                                        .map_or(0, |key| key.serial.raw())
-                                        .max(*serial)
+                                    member.expected_host.birth().raw().max(*serial)
                                 })
                                 .max()
                                 .unwrap_or(0),
@@ -2007,12 +2062,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             1
         };
         let mut members = vec![NativeMember {
-            thread: NativeThreadIdentity::Issued(key),
+            thread: execution,
             process: key,
             zone: source.zone,
             record: source.zone.record_ref(record),
             control: retain_member_control(control)?,
-            expected_host: adopted_host_identity(control, binding),
+            expected_host: member_host_identity(page, control)?,
         }];
         members.extend(imported.iter().map(|(member, _, _)| member.clone()));
         let resources = NativeResources {
@@ -3791,7 +3846,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         self.key,
                         self.binding,
                         page,
-                    );
+                    )?;
                 }
                 let mut outstanding = Vec::with_capacity(MEMBER_SET_CAPACITY);
                 let mut pool = Vec::new();
@@ -3911,11 +3966,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         });
                     }
                 }
-                for (binding, control, _) in &adopted {
+                for (birth, control, _) in &adopted {
                     outstanding.push(OutstandingExitReceipt::Adopted {
-                        binding: *binding,
+                        birth: *birth,
                         control: retain_member_control(control)?,
-                        expected_host: adopted_host_identity(control, *binding),
                     });
                 }
                 for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
@@ -3943,9 +3997,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .iter()
                     .filter_map(|receipt| match receipt {
                         OutstandingExitReceipt::Pool { .. } => None,
-                        OutstandingExitReceipt::Adopted { expected_host, .. } => {
-                            Some(*expected_host)
-                        }
+                        OutstandingExitReceipt::Adopted { birth, .. } => Some(*birth),
                         OutstandingExitReceipt::HostBorn { identity, .. } => Some(*identity),
                     })
                     .collect();
@@ -4017,10 +4069,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .reserve_nonfinal(page)
                     .map_err(|_| NativeProcessError::Quarantined)?;
                 let _ = page.publish(entry);
-                let host_receipt = member_host_identity(page, self.control, self.binding)?;
+                let host_receipt = member_host_identity(page, self.control)?;
                 page.retire_published_host_member(entry, self.control, membership)
                     .map_err(|_| NativeProcessError::Quarantined)?;
-                page.publish_exact_host_retirement(self.control, host_receipt);
+                page.publish_exact_host_retirement(self.control, host_receipt.retirement());
                 if let carrick_core::terminal::RetirementVerdict::RetireThread {
                     notification,
                     ..
@@ -4673,9 +4725,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             tid: child_key.id.raw() as u32,
                             visible_tid: visible.get(),
                             thread_serial: thread_serial.get(),
-                            execution: carrick_core_abi::entry::EntryGeneration::from_raw(
-                                child_key.serial.raw(),
-                            ),
+                            birth: carrick_core_abi::entry::BirthSerial::of_task(child_key.serial),
                             uid_credit: 0,
                         },
                     )
@@ -4751,9 +4801,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let leader = carrick_core::lifecycle::MemberControlCustody::retain(control)
                 .map_err(|_| NativeProcessError::Stale)?;
             let member = retain_member_control(control)?;
-            let expected = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            let expected = carrick_core::terminal::ThreadBirthIdentity::from_parts(
                 carrick_core_abi::EntryTaskKey::from_raw(child_key.id.raw() as u64),
-                carrick_core_abi::EntryGeneration::from_raw(child_key.serial.raw()),
+                carrick_core_abi::entry::BirthSerial::of_task(child_key.serial),
                 carrick_core_abi::EntryThreadGeneration::from_raw(thread_serial.get()),
             )
             .ok_or(NativeProcessError::Stale)?;
@@ -4777,7 +4827,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             serial: thread_serial.get(),
             mm: child_mm.raw().get(),
             file_table: child_file_table,
-            generation: child_key.serial.raw(),
+            // The child's first execution snapshot. Its birth serial travels
+            // only in its pool identity, never in the snapshot word.
+            generation: carrick_core_abi::SnapshotGeneration::INITIAL.raw(),
             affinity: parent_identity.affinity,
             lifecycle_page: page as *const _ as u64,
             control_slot: control as *const _ as u64,
@@ -4818,7 +4870,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             control,
             page,
             members: vec![NativeMember {
-                thread: NativeThreadIdentity::Issued(child_key),
+                thread: NativeThreadIdentity::ring_born(child_key.id),
                 process: child_key,
                 zone: self.source.zone,
                 record: self.source.zone.record_ref(record),
@@ -6812,6 +6864,28 @@ mod tests {
         );
     }
 
+    /// What the host does when it allocates a leader's control slot: record
+    /// its birth identity. Fixtures choose the process serial equal to the
+    /// task's first snapshot generation; production does not depend on that.
+    fn publish_test_birth(control: &ThreadControlSlot, task: &CurrentTask) {
+        control.publish_host_birth_identity(
+            carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                carrick_core_abi::EntryTaskKey::from_raw(
+                    task.execution.task.load(Ordering::Acquire),
+                ),
+                carrick_core_abi::entry::BirthSerial::of_task(
+                    TaskSerial::from_raw_u64(
+                        task.execution.generation.load(Ordering::Acquire).raw(),
+                    )
+                    .unwrap(),
+                ),
+                carrick_core_abi::EntryThreadGeneration::from_raw(
+                    task.mm.thread_generation.load(Ordering::Acquire),
+                ),
+            )
+            .unwrap(),
+        );
+    }
     use super::*;
     use carrick_guest_arch::{ContextGeneration, FrameGpa};
     use carrick_sched_core::ParkedContextWords;
@@ -7006,11 +7080,16 @@ mod tests {
             let child_page = ThreadLifecyclePage::new();
             let child_controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
             let task = CurrentTask::new();
-            task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+            task.set(
+                carrick_el1_abi::El1TaskId::from_linux_tid(41),
+                carrick_el1_abi::SnapshotGeneration::from_raw(11),
+                5,
+            );
             task.mm.key.store(1, Ordering::Release);
             task.mm.thread_generation.store(101, Ordering::Release);
             task.publish_visible_pid(41);
             task.publish_lifecycle(&page as *const _ as u64, &control as *const _ as u64);
+            publish_test_birth(&control, &task);
             let address = AddressContext {
                 root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
                 mm: MmGeneration::new(NonZeroU64::MIN),
@@ -7198,7 +7277,7 @@ mod tests {
             let task = &tasks[index];
             task.set(
                 carrick_el1_abi::El1TaskId::from_linux_tid(tid as i32),
-                11 + index as u64,
+                carrick_el1_abi::SnapshotGeneration::from_raw(11 + index as u64),
                 5,
             );
             task.mm.key.store(mm, Ordering::Release);
@@ -7210,6 +7289,7 @@ mod tests {
                 &pages[index] as *const _ as u64,
                 &controls[index] as *const _ as u64,
             );
+            publish_test_birth(&controls[index], task);
             let address = AddressContext {
                 root: RootGpa::page_aligned(FrameGpa::new(root)).unwrap(),
                 mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
@@ -7347,7 +7427,11 @@ mod tests {
             assert_eq!(result.raw(), 0);
         }
         let foreign = CurrentTask::new();
-        foreign.set(carrick_el1_abi::El1TaskId::from_linux_tid(99), 99, 5);
+        foreign.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(99),
+            carrick_el1_abi::SnapshotGeneration::from_raw(99),
+            5,
+        );
         foreign.mm.key.store(1, Ordering::Release);
         foreign.mm.thread_generation.store(101, Ordering::Release);
         assert!(matches!(
@@ -7381,11 +7465,16 @@ mod tests {
         let child_page = ThreadLifecyclePage::new();
         let child_controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
         let leader = CurrentTask::new();
-        leader.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        leader.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         leader.mm.key.store(1, Ordering::Release);
         leader.mm.thread_generation.store(101, Ordering::Release);
         leader.publish_visible_pid(41);
         leader.publish_lifecycle(&page as *const _ as u64, &leader_control as *const _ as u64);
+        publish_test_birth(&leader_control, &leader);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -7437,7 +7526,9 @@ mod tests {
                     tid: 43,
                     visible_tid: 43,
                     thread_serial: 103,
-                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(12),
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+                    ),
                     uid_credit: 0,
                 },
             )
@@ -7477,11 +7568,16 @@ mod tests {
         thread_control.bind_zone_record(zone.record_ref(record));
         zone.requeue_preempted(slot, record);
         assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
-        thread.set(carrick_el1_abi::El1TaskId::from_linux_tid(43), 13, 5);
+        thread.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(43),
+            carrick_el1_abi::SnapshotGeneration::from_raw(13),
+            5,
+        );
         thread.mm.key.store(1, Ordering::Release);
         thread.mm.thread_generation.store(103, Ordering::Release);
         thread.publish_visible_pid(41);
         thread.publish_lifecycle(&page as *const _ as u64, &thread_control as *const _ as u64);
+        publish_test_birth(&thread_control, &thread);
         assert!(matches!(
             registry.for_entry(source, &thread, address),
             Err(NativeProcessError::Stale)
@@ -7561,11 +7657,16 @@ mod tests {
             let page = Box::new(ThreadLifecyclePage::new());
             let control = Box::new(ThreadControlSlot::new());
             let task = CurrentTask::new();
-            task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+            task.set(
+                carrick_el1_abi::El1TaskId::from_linux_tid(41),
+                carrick_el1_abi::SnapshotGeneration::from_raw(11),
+                5,
+            );
             task.mm.key.store(1, Ordering::Release);
             task.mm.thread_generation.store(101, Ordering::Release);
             task.publish_visible_pid(41);
             task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+            publish_test_birth(&control, &task);
             let address = AddressContext {
                 root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
                 mm: MmGeneration::new(NonZeroU64::MIN),
@@ -7649,11 +7750,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -7995,11 +8101,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -8119,11 +8230,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -8258,11 +8374,16 @@ mod tests {
                 ThreadControlSlot::new()
             }));
             let task = CurrentTask::new();
-            task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+            task.set(
+                carrick_el1_abi::El1TaskId::from_linux_tid(41),
+                carrick_el1_abi::SnapshotGeneration::from_raw(11),
+                5,
+            );
             task.mm.key.store(1, Ordering::Release);
             task.mm.thread_generation.store(101, Ordering::Release);
             task.publish_visible_pid(41);
             task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+            publish_test_birth(&control, &task);
             let address = AddressContext {
                 root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
                 mm: MmGeneration::new(NonZeroU64::MIN),
@@ -8348,7 +8469,9 @@ mod tests {
                     tid: 42,
                     visible_tid: 42,
                     thread_serial: 102,
-                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(12),
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+                    ),
                     uid_credit: 0,
                 },
             )
@@ -8406,7 +8529,7 @@ mod tests {
                 let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
                     carrick_core_abi::ExecutionBinding {
                         task: carrick_core_abi::entry::EntryTaskKey::from_raw(41),
-                        generation: carrick_core_abi::entry::EntryGeneration::from_raw(11),
+                        generation: carrick_core_abi::entry::SnapshotGeneration::from_raw(11),
                         mm: carrick_core_abi::entry::EntryMmKey::from_raw(1),
                         thread_generation: carrick_core_abi::entry::EntryThreadGeneration::from_raw(
                             102,
@@ -8525,11 +8648,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -8608,7 +8736,9 @@ mod tests {
                 tid: 42,
                 visible_tid: 42,
                 thread_serial: 102,
-                execution: carrick_core_abi::entry::EntryGeneration::from_raw(12),
+                birth: carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+                ),
                 uid_credit: 0,
             },
         )
@@ -8725,11 +8855,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -8893,7 +9028,7 @@ mod tests {
         );
         task.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(child.id.raw()),
-            child.serial.raw(),
+            carrick_el1_abi::SnapshotGeneration::from_raw(child_identity.generation),
             child_identity.file_table,
         );
         task.mm
@@ -9021,7 +9156,9 @@ mod tests {
                             tid: 43,
                             visible_tid: 43,
                             thread_serial: 103,
-                            execution: carrick_core_abi::entry::EntryGeneration::from_raw(12),
+                            birth: carrick_core_abi::entry::BirthSerial::of_task(
+                                carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+                            ),
                             uid_credit: 0,
                         },
                     )
@@ -9099,7 +9236,7 @@ mod tests {
         let parent_identity = zone.record(parent_record.id).identity();
         task.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(41),
-            11,
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
             parent_identity.file_table,
         );
         task.mm.key.store(address.mm.raw().get(), Ordering::Release);
@@ -9220,7 +9357,7 @@ mod tests {
         let identity = zone.record(resources.record.id).identity();
         task.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(key.id.raw()),
-            key.serial.raw(),
+            carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
             identity.file_table,
         );
         task.mm
@@ -9259,11 +9396,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -9662,11 +9804,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -9841,11 +9988,16 @@ mod tests {
                 ThreadControlSlot::new()
             }));
             let task = CurrentTask::new();
-            task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+            task.set(
+                carrick_el1_abi::El1TaskId::from_linux_tid(41),
+                carrick_el1_abi::SnapshotGeneration::from_raw(11),
+                5,
+            );
             task.mm.key.store(1, Ordering::Release);
             task.mm.thread_generation.store(101, Ordering::Release);
             task.publish_visible_pid(41);
             task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+            publish_test_birth(&control, &task);
             let address = AddressContext {
                 root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
                 mm: MmGeneration::new(NonZeroU64::MIN),
@@ -10072,11 +10224,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -10255,11 +10412,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -10356,11 +10518,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -10491,11 +10658,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -10588,11 +10760,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -10695,7 +10872,7 @@ mod tests {
         let child_identity = zone.record(child_record.id).identity();
         task.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(child_key.id.raw()),
-            child_key.serial.raw(),
+            carrick_el1_abi::SnapshotGeneration::from_raw(child_identity.generation),
             child_identity.file_table,
         );
         task.mm
@@ -10739,11 +10916,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -10878,7 +11060,9 @@ mod tests {
                     tid: 987,
                     visible_tid: 987,
                     thread_serial: 987,
-                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(12),
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+                    ),
                     uid_credit: 1,
                 },
             )
@@ -11177,11 +11361,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -11323,11 +11512,16 @@ mod tests {
             ThreadControlSlot::new()
         }));
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),
@@ -11741,11 +11935,16 @@ mod tests {
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
         let task = CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
         task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        publish_test_birth(&control, &task);
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::MIN),

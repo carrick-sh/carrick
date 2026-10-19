@@ -81,7 +81,7 @@ where
     let identity = zone.record(record).identity();
     let binding = carrick_core_abi::ExecutionBinding {
         task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid),
-        generation: carrick_core_abi::EntryGeneration::from_raw(identity.generation),
+        generation: carrick_core_abi::SnapshotGeneration::from_raw(identity.generation),
         mm: carrick_core_abi::EntryMmKey::from_raw(identity.mm),
         thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(identity.serial),
     };

@@ -2,8 +2,8 @@
 #![allow(clippy::unwrap_used)]
 
 use carrick_core_abi::{
-    EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
-    NativeRootExit,
+    EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, NativeRootExit,
+    SnapshotGeneration,
 };
 use carrick_sched_core::process::TerminationStatus;
 
@@ -11,7 +11,7 @@ use carrick_sched_core::process::TerminationStatus;
 fn root_exit_record_codec_preserves_full_width_termination() {
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(41),
-        generation: EntryGeneration::from_raw(11),
+        generation: SnapshotGeneration::from_raw(11),
         mm: EntryMmKey::from_raw(301),
         thread_generation: EntryThreadGeneration::from_raw(101),
     };
@@ -29,7 +29,7 @@ fn linux_host_adapter_preserves_exit_and_signal_wait_encodings() {
     use carrick_personality_linux::lifecycle::LinuxWaitStatus;
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(41),
-        generation: EntryGeneration::from_raw(11),
+        generation: SnapshotGeneration::from_raw(11),
         mm: EntryMmKey::from_raw(301),
         thread_generation: EntryThreadGeneration::from_raw(101),
     };

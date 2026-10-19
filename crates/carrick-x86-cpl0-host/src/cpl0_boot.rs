@@ -971,7 +971,7 @@ mod forward_execution_tests {
         (
             carrick_el1_abi::ExecutionBinding {
                 task: carrick_el1_abi::EntryTaskKey::from_raw(42),
-                generation: carrick_el1_abi::EntryGeneration::from_raw(12),
+                generation: carrick_el1_abi::SnapshotGeneration::from_raw(12),
                 mm: carrick_el1_abi::EntryMmKey::from_raw(302),
                 thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(102),
             },
