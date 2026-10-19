@@ -5,7 +5,7 @@
 use super::*;
 
 pub(super) const BANK_NODES: usize = 4096;
-const BANKS: usize = 256;
+pub(super) const BANKS: usize = 256;
 
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
 #[repr(C)]

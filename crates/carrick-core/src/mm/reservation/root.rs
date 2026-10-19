@@ -23,6 +23,51 @@ mod storage;
 pub use prepared::ClaimedPreparedCopy;
 pub use storage::ResolvedReservationNodes;
 
+/// Test-only census of how many activations of each tree walk are live at
+/// once. A walk over an explicit work stack holds one activation however
+/// deep the tree is; a recursive walk holds one per level, which is what
+/// overflowed the 16 KiB EL1 stack (#705).
+#[cfg(test)]
+mod walk_probe {
+    use std::cell::Cell;
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Walk {
+        Copy,
+        SourceInsert,
+        Build,
+        Observe,
+        Release,
+    }
+    std::thread_local! {
+        static LIVE: Cell<[usize; 5]> = const { Cell::new([0; 5]) };
+        static PEAK: Cell<[usize; 5]> = const { Cell::new([0; 5]) };
+    }
+    pub(super) struct Activation(Walk);
+    pub(super) fn enter(walk: Walk) -> Activation {
+        let mut live = LIVE.get();
+        live[walk as usize] += 1;
+        LIVE.set(live);
+        let mut peak = PEAK.get();
+        peak[walk as usize] = peak[walk as usize].max(live[walk as usize]);
+        PEAK.set(peak);
+        Activation(walk)
+    }
+    impl Drop for Activation {
+        fn drop(&mut self) {
+            let mut live = LIVE.get();
+            live[self.0 as usize] -= 1;
+            LIVE.set(live);
+        }
+    }
+    /// The most activations of `walk` live at once since the last reset.
+    pub(super) fn peak(walk: Walk) -> usize {
+        PEAK.get()[walk as usize]
+    }
+    pub(super) fn reset() {
+        PEAK.set([0; 5]);
+    }
+}
+
 #[path = "root_notification.rs"]
 mod notification;
 use carrick_sched_core::spaces::notification::{
@@ -220,6 +265,71 @@ struct CopyList {
     head: u32,
     tail: u32,
     len: usize,
+}
+
+/// Nodes one table's trees can draw on: the bootstrap array plus every bank.
+const TREE_CAPACITY: usize = NODES + storage::BANKS * storage::BANK_NODES;
+/// The tallest AVL tree [`TREE_CAPACITY`] nodes can form. An AVL tree of
+/// height `h` holds at least `N(h) = N(h-1) + N(h-2) + 1` nodes (the
+/// Fibonacci tree), so this bounds every walk of either tree of a root.
+const TREE_HEIGHT: usize = avl_height_bound(TREE_CAPACITY);
+const fn avl_height_bound(nodes: usize) -> usize {
+    let (mut shorter, mut taller, mut height) = (0usize, 1usize, 1usize);
+    while taller <= nodes {
+        (shorter, taller) = (taller, taller + shorter + 1);
+        height += 1;
+    }
+    height - 1
+}
+// 1024 + 256 * 4096 nodes: N(28) = 832039 <= 1049600 < N(29) = 1346268.
+const _: () = assert!(TREE_HEIGHT == 28);
+/// A perfectly balanced build of `n` nodes nests `ceil(log2(n + 1))` levels.
+const BUILD_DEPTH: usize = (usize::BITS - TREE_CAPACITY.leading_zeros()) as usize;
+const _: () = assert!(BUILD_DEPTH <= TREE_HEIGHT);
+
+/// Explicit work stack for one tree walk, bounded by the tree height a valid
+/// tree can reach. Walks never recurse: the 16 KiB EL1 stack holds one small
+/// frame per walk however tall the tree is (#705). Exceeding the bound means
+/// the links are not a valid tree of this table and refuses the walk.
+struct WalkStack<T: Copy, const N: usize> {
+    entries: [MaybeUninit<T>; N],
+    len: usize,
+}
+impl<T: Copy, const N: usize> WalkStack<T, N> {
+    const fn new() -> Self {
+        Self {
+            entries: [const { MaybeUninit::uninit() }; N],
+            len: 0,
+        }
+    }
+    fn push(&mut self, entry: T) -> Result<(), Refusal> {
+        self.entries
+            .get_mut(self.len)
+            .ok_or(Refusal::Invalid)?
+            .write(entry);
+        self.len += 1;
+        Ok(())
+    }
+    fn pop(&mut self) -> Option<T> {
+        self.len = self.len.checked_sub(1)?;
+        // SAFETY: every index below the old `len` was written by `push`.
+        Some(unsafe { self.entries[self.len].assume_init() })
+    }
+    fn top(&mut self) -> Option<&mut T> {
+        let index = self.len.checked_sub(1)?;
+        // SAFETY: every index below `len` was written by `push`.
+        Some(unsafe { self.entries[index].assume_init_mut() })
+    }
+}
+
+/// One pending level of [`Reservations::build_balanced`]: the subtree of
+/// `len` list nodes rooted at `id`, whose left subtree `left` is built once
+/// `id` is set.
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
+struct BuildLevel {
+    len: usize,
+    left: u32,
+    id: u32,
 }
 
 /// Merges adjacent nodes of one Linux mapping (same protection and
@@ -965,19 +1075,34 @@ impl<
         }
         id
     }
-    fn source_insert(&mut self, root: u32, id: u32) -> u32 {
-        if root == 0 {
-            return self.source_fix(id);
-        }
-        let mut node = self.read(root);
+    /// Insert `id` into the source index rooted at `root` and rebalance on
+    /// the way back up, over an explicit path: one frame however tall.
+    fn source_insert(&mut self, root: u32, id: u32) -> Result<u32, Refusal> {
+        #[cfg(test)]
+        let _probe = walk_probe::enter(walk_probe::Walk::SourceInsert);
         let inserted = self.read(id);
-        if (inserted.start, inserted.end) < (node.start, node.end) {
-            node.left = self.source_insert(node.left, id);
-        } else {
-            node.right = self.source_insert(node.right, id);
+        let key = (inserted.start, inserted.end);
+        // Each ancestor and whether the insertion descended to its left.
+        let mut path = WalkStack::<(u32, bool), TREE_HEIGHT>::new();
+        let mut cursor = root;
+        while cursor != 0 {
+            let node = self.read(cursor);
+            let left = key < (node.start, node.end);
+            path.push((cursor, left))?;
+            cursor = if left { node.left } else { node.right };
         }
-        self.write(root, node);
-        self.source_balance(root)
+        let mut subtree = self.source_fix(id);
+        while let Some((ancestor, left)) = path.pop() {
+            let mut node = self.read(ancestor);
+            if left {
+                node.left = subtree;
+            } else {
+                node.right = subtree;
+            }
+            self.write(ancestor, node);
+            subtree = self.source_balance(ancestor);
+        }
+        Ok(subtree)
     }
     fn source_min(&mut self, id: u32) -> (u32, u32) {
         let mut node = self.read(id);
@@ -1036,7 +1161,13 @@ impl<
             },
         );
         let source_tree = self.source_tree();
-        let tree = self.source_insert(source_tree, id);
+        let tree = match self.source_insert(source_tree, id) {
+            Ok(tree) => tree,
+            Err(reason) => {
+                self.free_node(id);
+                return Err(reason);
+            }
+        };
         self.set_source_tree(tree);
         Ok(id)
     }
@@ -1372,14 +1503,41 @@ impl<
         Ok(())
     }
 
+    /// In-order walk reading each node once. A node with a left subtree
+    /// waits on a heap stack (at most [`TREE_HEIGHT`] nodes, allocated on
+    /// first need) until that subtree is visited; nothing recurses on the
+    /// EL1 stack (#705). Allocation failure is the metadata allocator's
+    /// grant request, as for node banks.
     fn observe_tree(&mut self, id: u32, runs: &mut Runs<'_, Policy>) -> Result<(), Refusal> {
-        if id == 0 {
-            return Ok(());
+        #[cfg(test)]
+        let _probe = walk_probe::enter(walk_probe::Walk::Observe);
+        let mut waiting: alloc::vec::Vec<NodeData> = alloc::vec::Vec::new();
+        let mut next = id;
+        loop {
+            while next != 0 {
+                let node = self.read(next);
+                if node.left == 0 {
+                    runs.push(node)?;
+                    next = node.right;
+                    continue;
+                }
+                if waiting.len() == TREE_HEIGHT {
+                    return Err(Refusal::Invalid);
+                }
+                if waiting.capacity() == 0 {
+                    waiting
+                        .try_reserve_exact(TREE_HEIGHT)
+                        .map_err(|_| Refusal::MetadataRequired)?;
+                }
+                next = node.left;
+                waiting.push(node);
+            }
+            let Some(node) = waiting.pop() else {
+                return Ok(());
+            };
+            runs.push(node)?;
+            next = node.right;
         }
-        let node = self.read(id);
-        self.observe_tree(node.left, runs)?;
-        runs.push(node)?;
-        self.observe_tree(node.right, runs)
     }
     /// The committed nodes overlapping `range`, each with its incarnation,
     /// in address order: one bounded descent per node, independent of the
@@ -1572,7 +1730,11 @@ impl<
     }
 
     fn fix(&mut self, id: u32) -> u32 {
-        let mut n = self.read(id);
+        let n = self.read(id);
+        self.fix_node(id, n)
+    }
+    /// [`Self::fix`] of `id` whose current contents the caller holds as `n`.
+    fn fix_node(&mut self, id: u32, mut n: NodeData) -> u32 {
         let l = self.read(n.left);
         let r = self.read(n.right);
         n.height = 1 + l.height.max(r.height);
@@ -2888,54 +3050,126 @@ impl<
         child.mark_admitted();
         Ok(())
     }
+    /// Copy every inherited node of the tree at `id` onto `list` in address
+    /// order, over an explicit stack of (copy, right subtree) per pending
+    /// level: each parent node is read once, copied and its source counted
+    /// at that read, and linked into `list` when the in-order walk reaches
+    /// it. On refusal the copies still waiting on the stack are returned;
+    /// the caller returns those already on `list`.
     fn copy_in_order(
         &mut self,
         id: u32,
         list: &mut CopyList,
         child: &mut Reservations<'_, Policy, Geometry, C>,
     ) -> Result<(), Refusal> {
-        if id == 0 {
-            return Ok(());
-        }
-        let n = self.read(id);
-        self.copy_in_order(n.left, list, child)?;
-        if Policy::inherits(&n) {
-            let copy = self.pool_node()?;
-            let mut data = n;
-            data.left = 0;
-            data.right = 0;
-            self.write(copy, data);
-            if list.tail == 0 {
-                list.head = copy;
-            } else {
-                let mut tail = self.read(list.tail);
-                tail.right = copy;
-                self.write(list.tail, tail);
-            }
-            list.tail = copy;
-            list.len += 1;
-            if let Some(source) = n.host_backing {
-                child.source_reserve(source)?;
-                child.source_add(source, n.end - n.start)?;
+        #[cfg(test)]
+        let _probe = walk_probe::enter(walk_probe::Walk::Copy);
+        let mut waiting = WalkStack::<(u32, u32), TREE_HEIGHT>::new();
+        let copied = self.copy_walk(id, list, child, &mut waiting);
+        if copied.is_err() {
+            while let Some((copy, _)) = waiting.pop() {
+                if copy != 0 {
+                    self.table.release(copy, self.banks);
+                }
             }
         }
-        self.copy_in_order(n.right, list, child)
+        copied
+    }
+    fn copy_walk(
+        &mut self,
+        id: u32,
+        list: &mut CopyList,
+        child: &mut Reservations<'_, Policy, Geometry, C>,
+        waiting: &mut WalkStack<(u32, u32), TREE_HEIGHT>,
+    ) -> Result<(), Refusal> {
+        let mut next = id;
+        loop {
+            while next != 0 {
+                let n = self.read(next);
+                if Policy::inherits(&n) {
+                    let copy = self.pool_node()?;
+                    let mut data = n;
+                    data.left = 0;
+                    data.right = 0;
+                    self.write(copy, data);
+                    if let Err(reason) = waiting.push((copy, n.right)) {
+                        self.table.release(copy, self.banks);
+                        return Err(reason);
+                    }
+                    if let Some(source) = n.host_backing {
+                        child.source_reserve(source)?;
+                        child.source_add(source, n.end - n.start)?;
+                    }
+                } else {
+                    waiting.push((0, n.right))?;
+                }
+                next = n.left;
+            }
+            let Some((copy, right)) = waiting.pop() else {
+                return Ok(());
+            };
+            if copy != 0 {
+                if list.tail == 0 {
+                    list.head = copy;
+                } else {
+                    let mut tail = self.read(list.tail);
+                    tail.right = copy;
+                    self.write(list.tail, tail);
+                }
+                list.tail = copy;
+                list.len += 1;
+            }
+            next = right;
+        }
     }
     /// Consume `len` nodes of a `right`-linked sorted list into a perfectly
-    /// balanced subtree (a valid AVL tree), constant work per node.
+    /// balanced subtree (a valid AVL tree), constant work per node. The
+    /// left-first build runs over an explicit stack of pending levels.
     fn build_balanced(&mut self, len: usize, cursor: &mut u32) -> u32 {
-        if len == 0 {
-            return 0;
+        #[cfg(test)]
+        let _probe = walk_probe::enter(walk_probe::Walk::Build);
+        let mut levels = WalkStack::<BuildLevel, BUILD_DEPTH>::new();
+        let mut request = len;
+        loop {
+            // Descend: each subtree builds its left half first.
+            while request != 0 {
+                if levels
+                    .push(BuildLevel {
+                        len: request,
+                        left: 0,
+                        id: 0,
+                    })
+                    .is_err()
+                {
+                    // Unreachable: a list holds at most TREE_CAPACITY nodes,
+                    // whose balanced build nests BUILD_DEPTH levels.
+                    return 0;
+                }
+                request /= 2;
+            }
+            let mut built = 0;
+            loop {
+                let Some(level) = levels.top() else {
+                    return built;
+                };
+                if level.id == 0 {
+                    // Left subtree done: take this level's node off the list
+                    // and build its right half.
+                    level.left = built;
+                    level.id = *cursor;
+                    *cursor = self.read(level.id).right;
+                    request = level.len - level.len / 2 - 1;
+                    break;
+                }
+                let Some(level) = levels.pop() else {
+                    return built;
+                };
+                let mut n = self.read(level.id);
+                n.left = level.left;
+                n.right = built;
+                built = self.fix_node(level.id, n);
+            }
         }
-        let left = self.build_balanced(len / 2, cursor);
-        let id = *cursor;
-        let mut n = self.read(id);
-        *cursor = n.right;
-        let right = self.build_balanced(len - len / 2 - 1, cursor);
-        n.left = left;
-        n.right = right;
-        self.write(id, n);
-        self.fix(id)
     }
     fn insert_coalescing(&mut self, id: u32) {
         let mut n = self.read(id);
@@ -3066,14 +3300,29 @@ impl<
         self.root.key.store(0, Ordering::Release);
         Ok(())
     }
+    /// Return every node of the tree at `id` to the pool without a stack:
+    /// rotate each left child up over its parent until the head has no left
+    /// subtree, then release the head and continue down its right link. One
+    /// rotation per left edge, one release per node.
     fn release_tree(&mut self, id: u32) {
-        if id == 0 {
-            return;
+        #[cfg(test)]
+        let _probe = walk_probe::enter(walk_probe::Walk::Release);
+        let mut head = id;
+        while head != 0 {
+            let mut n = self.read(head);
+            if n.left == 0 {
+                self.table.release(head, self.banks);
+                head = n.right;
+                continue;
+            }
+            let top = n.left;
+            let mut left = self.read(top);
+            n.left = left.right;
+            self.write(head, n);
+            left.right = head;
+            self.write(top, left);
+            head = top;
         }
-        let n = self.read(id);
-        self.release_tree(n.left);
-        self.release_tree(n.right);
-        self.table.release(id, self.banks);
     }
 }
 
@@ -4586,6 +4835,195 @@ mod tests {
                 assert!(parent.observe_mappings(&mut |_| panic!()).is_ok());
             }
         }
+    }
+
+    /// Nodes in the smallest AVL tree of `height`: N(h) = N(h-1) + N(h-2) + 1.
+    fn minimal_avl_nodes(height: u32) -> usize {
+        let (mut shorter, mut taller) = (0usize, 1usize);
+        if height == 0 {
+            return 0;
+        }
+        for _ in 1..height {
+            (shorter, taller) = (taller, taller + shorter + 1);
+        }
+        taller
+    }
+    fn in_order_ids(g: &mut Reservations<'_>, id: u32, out: &mut Vec<u32>) {
+        if id == 0 {
+            return;
+        }
+        let n = g.read(id);
+        in_order_ids(g, n.left, out);
+        out.push(id);
+        in_order_ids(g, n.right, out);
+    }
+    /// Relink `ids` (already in address order) into the minimal AVL tree of
+    /// `height`, a Fibonacci tree: each left subtree one level taller than
+    /// its right sibling. A valid AVL tree, as tall as `ids.len()` nodes allow.
+    fn fibonacci_shape(g: &mut Reservations<'_>, ids: &[u32], height: u32) -> u32 {
+        assert_eq!(ids.len(), minimal_avl_nodes(height));
+        if height == 0 {
+            return 0;
+        }
+        let left_len = minimal_avl_nodes(height - 1);
+        let left = fibonacci_shape(g, &ids[..left_len], height - 1);
+        let right = fibonacci_shape(g, &ids[left_len + 1..], height.saturating_sub(2));
+        let id = ids[left_len];
+        let mut n = g.read(id);
+        n.left = left;
+        n.right = right;
+        g.write(id, n);
+        g.fix(id)
+    }
+    /// Check AVL balance, stored heights and strictly increasing
+    /// `(start, end)` keys in order; return the height.
+    fn checked_avl_height(g: &mut Reservations<'_>, tree: u32) -> u32 {
+        fn balanced(g: &mut Reservations<'_>, id: u32) -> u32 {
+            if id == 0 {
+                return 0;
+            }
+            let n = g.read(id);
+            let left = balanced(g, n.left);
+            let right = balanced(g, n.right);
+            assert!(
+                left.abs_diff(right) <= 1,
+                "node {id} unbalanced: {left} vs {right}"
+            );
+            assert_eq!(n.height, 1 + left.max(right), "node {id} stale height");
+            n.height
+        }
+        let mut ids = Vec::new();
+        in_order_ids(g, tree, &mut ids);
+        let keys: Vec<(u64, u64)> = ids
+            .iter()
+            .map(|id| {
+                let n = g.read(*id);
+                (n.start, n.end)
+            })
+            .collect();
+        assert!(
+            keys.windows(2).all(|pair| pair[0] < pair[1]),
+            "keys out of order"
+        );
+        balanced(g, tree)
+    }
+
+    /// #705: a fork of an MM whose reservation tree is AVL height 20 (the
+    /// Fibonacci tree of 17710 mappings, each with its own retained host
+    /// source) copies the exact mapping sequence and source references into
+    /// an independent, balanced child. Every walk runs over an explicit work
+    /// stack: one activation of each is ever live, however tall the tree, so
+    /// no fork, observation or retirement recurses on the 16 KiB EL1 stack.
+    #[test]
+    fn reservation_fork_of_a_height_twenty_tree_is_exact_and_never_recurses() {
+        use core::num::NonZeroU64;
+        use walk_probe::Walk;
+        const HEIGHT: u32 = 20;
+        let count = minimal_avl_nodes(HEIGHT);
+        assert_eq!(count, 17710);
+        let rw = ReservationProtection::READ_WRITE;
+        let flags = ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE);
+        let source = |i: usize| {
+            HostBackingIdentity::new(
+                NonZeroU64::new(i as u64 + 1).unwrap(),
+                NonZeroU64::new(7).unwrap(),
+                0,
+            )
+        };
+        let start = |i: usize| 0x100000 + i as u64 * 0x2000;
+        let table = table();
+        let parent_mm = ReservationMm::new(60).unwrap();
+        let child_mm = ReservationMm::new(61).unwrap();
+        table.publish(0, parent_mm, layout()).unwrap();
+        table.publish(1, child_mm, layout()).unwrap();
+        // Parent mappings and sources, child copies and sources.
+        let banks = (4 * count).div_ceil(storage::BANK_NODES);
+        let bank_bytes = storage::BANK_NODES * core::mem::size_of::<Node>();
+        let mut backing = vec![0u8; (banks + 1) * (bank_bytes + 4096)];
+        let allocator = carrick_el1::alloc::MetadataStorage::new();
+        allocator
+            .admit_bootstrap_region(backing.as_mut_ptr() as u64, backing.len())
+            .unwrap();
+        for bank in 0..banks {
+            let provisioned = table
+                .lock_identity_for_test(0, parent_mm)
+                .unwrap()
+                .provision_metadata(&allocator);
+            assert_eq!(
+                provisioned,
+                Ok(()),
+                "bank {bank} of {banks}, {bank_bytes} bytes each"
+            );
+        }
+        let mut parent = table.lock_identity_for_test(0, parent_mm).unwrap();
+        for i in 0..count {
+            parent
+                .import_with_backing(range(start(i), start(i) + 0x1000), rw, flags, source(i))
+                .unwrap();
+        }
+        let mut ids = Vec::new();
+        let tree = parent.state().tree;
+        in_order_ids(&mut parent, tree, &mut ids);
+        assert_eq!(ids.len(), count);
+        let tree = fibonacci_shape(&mut parent, &ids, HEIGHT);
+        parent.state_mut().tree = tree;
+        assert_eq!(checked_avl_height(&mut parent, tree), HEIGHT);
+        parent.finish_import().unwrap();
+
+        walk_probe::reset();
+        let mut parent_rows = Vec::new();
+        parent
+            .observe_mappings(&mut |m| parent_rows.push((m.range, m.protection, m.flags)))
+            .unwrap();
+        assert_eq!(
+            parent_rows,
+            (0..count)
+                .map(|i| (range(start(i), start(i) + 0x1000), rw, flags))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(walk_probe::peak(Walk::Observe), 1, "observation recursed");
+
+        let mut child = table.lock_identity_for_test(1, child_mm).unwrap();
+        walk_probe::reset();
+        parent.clone_into(&mut child).unwrap();
+        for walk in [Walk::Copy, Walk::SourceInsert, Walk::Build] {
+            assert_eq!(walk_probe::peak(walk), 1, "fork {walk:?} recursed");
+        }
+        assert!(child.is_admitted());
+        let mut child_rows = Vec::new();
+        child
+            .observe_mappings(&mut |m| child_rows.push((m.range, m.protection, m.flags)))
+            .unwrap();
+        assert_eq!(child_rows, parent_rows);
+        let child_tree = child.state().tree;
+        let child_height = checked_avl_height(&mut child, child_tree);
+        assert!(
+            child_height <= (count as u32 + 1).next_power_of_two().ilog2(),
+            "child tree height {child_height} is not balanced"
+        );
+        let source_tree = child.source_tree();
+        let source_height = checked_avl_height(&mut child, source_tree);
+        assert!(
+            source_height < HEIGHT,
+            "child source index height {source_height}"
+        );
+        for i in 0..count {
+            let s = source(i);
+            assert_eq!(child.source_ref_count(s.handle(), s.generation()), 0x1000);
+            assert_eq!(parent.source_ref_count(s.handle(), s.generation()), 0x1000);
+        }
+        // Independent generations: the child's unmap leaves the parent whole.
+        let last = count - 1;
+        child
+            .retire_opaque(range(start(last), start(last) + 0x1000))
+            .unwrap();
+        assert!(child.mapping(start(last)).is_none());
+        assert!(parent.mapping(start(last)).is_some());
+
+        walk_probe::reset();
+        child.retire().unwrap();
+        parent.retire().unwrap();
+        assert_eq!(walk_probe::peak(Walk::Release), 1, "retirement recursed");
     }
 
     #[test]
