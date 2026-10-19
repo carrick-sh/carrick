@@ -819,7 +819,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         }
         let binding = carrick_el1_abi::ExecutionBinding {
             task: carrick_el1_abi::EntryTaskKey::from_raw(record.words[1]),
-            generation: carrick_el1_abi::EntryGeneration::from_raw(record.words[2]),
+            generation: carrick_el1_abi::SnapshotGeneration::from_raw(record.words[2]),
             mm: carrick_el1_abi::EntryMmKey::from_raw(record.words[3]),
             thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(record.words[4]),
         };
@@ -1889,7 +1889,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
 mod custody_tests {
     use super::*;
     use carrick_el1_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use carrick_mmu_core::x86::descriptor_txn::Permissions;
     fn execution() -> GrantExecution {
@@ -1897,7 +1897,7 @@ mod custody_tests {
             cpu: carrick_guest_arch::CpuId::new(1),
             binding: ExecutionBinding {
                 task: EntryTaskKey::from_raw(42),
-                generation: EntryGeneration::from_raw(12),
+                generation: SnapshotGeneration::from_raw(12),
                 mm: EntryMmKey::from_raw(302),
                 thread_generation: EntryThreadGeneration::from_raw(102),
             },
@@ -2161,7 +2161,7 @@ mod custody_tests {
         foreign.binding.task = EntryTaskKey::from_raw(43);
         assert!(!admitted.matches(foreign));
         let mut foreign = admitted;
-        foreign.binding.generation = EntryGeneration::from_raw(13);
+        foreign.binding.generation = SnapshotGeneration::from_raw(13);
         assert!(!admitted.matches(foreign));
         let mut foreign = admitted;
         foreign.binding.mm = EntryMmKey::from_raw(303);

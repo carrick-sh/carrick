@@ -48,7 +48,7 @@ pub fn schedule(slot: SlotId) -> ! {
                 carrick_el1_abi::El1TaskId::from_linux_tid(
                     i32::try_from(identity.tid).unwrap_or_else(|_| fatal_boot()),
                 ),
-                identity.generation,
+                carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
                 identity.file_table,
             );
             current

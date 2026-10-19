@@ -57,7 +57,9 @@ impl Venue {
                     tid: 10_000 + tid * THREAD_POOL_ENTRIES as u32 + index as u32,
                     visible_tid: 10_000 + tid * THREAD_POOL_ENTRIES as u32 + index as u32,
                     thread_serial: u64::from(tid) * 100 + index as u64,
-                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+                    ),
                     uid_credit: 1,
                 },
             )
@@ -160,7 +162,11 @@ fn admitted_thread_creation_owns_one_completion_at_1_8_32() {
         let tasks: Vec<_> = (0..n.max(2))
             .map(|i| {
                 let task = CurrentTask::new();
-                task.set(El1TaskId::from_linux_tid(40 + i as i32), 1, 500 + i as u64);
+                task.set(
+                    El1TaskId::from_linux_tid(40 + i as i32),
+                    carrick_el1_abi::SnapshotGeneration::from_raw(1),
+                    500 + i as u64,
+                );
                 task.mm
                     .key
                     .store(if i % 2 == 0 { 71 } else { 83 }, Ordering::Release);

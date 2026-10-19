@@ -973,7 +973,11 @@ mod tests {
         assert!(zone.occupancy.replace(here, 0, MM));
         zone.enter_guest(SLOT);
         let task = CurrentTask::new();
-        task.set(El1TaskId::from_linux_tid(101), 1, 5);
+        task.set(
+            El1TaskId::from_linux_tid(101),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            5,
+        );
         task.mm.key.store(MM, Ordering::Relaxed);
         task.mm.thread_generation.store(1101, Ordering::Relaxed);
         let a_tid = task.execution.task.load(Ordering::Relaxed);
@@ -2112,7 +2116,11 @@ mod tests {
             .map(|_| CurrentTask::new())
             .collect();
         let task = &tasks[SLOT.raw() as usize];
-        task.set(El1TaskId::from_linux_tid(101), 1, 5);
+        task.set(
+            El1TaskId::from_linux_tid(101),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            5,
+        );
         task.mm.key.store(MM, Ordering::Relaxed);
         let venue = w.venue();
         // SAFETY: all-zero is a valid empty name cache.
@@ -2159,10 +2167,13 @@ mod tests {
             (&task.mm.thread_generation, &w.task.mm.thread_generation),
             (&task.linux.file_table, &w.task.linux.file_table),
             (&task.mm.key, &w.task.mm.key),
-            (&task.execution.generation, &w.task.execution.generation),
         ] {
             to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
         }
+        task.execution.generation.store(
+            w.task.execution.generation.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         task.linux.mark_pending_host_work();
         tasks
     }

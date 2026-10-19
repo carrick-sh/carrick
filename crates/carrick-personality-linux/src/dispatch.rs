@@ -1153,7 +1153,7 @@ mod ring_first_tests {
     use super::*;
     use crate::crossing::HostCrossingSet;
     use carrick_core_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -1250,7 +1250,7 @@ mod ring_first_tests {
             }
             Some(ExecutionBinding {
                 task: EntryTaskKey::from_raw(1),
-                generation: EntryGeneration::from_raw(1),
+                generation: SnapshotGeneration::from_raw(1),
                 mm: EntryMmKey::from_raw(1),
                 thread_generation: EntryThreadGeneration::from_raw(1),
             })

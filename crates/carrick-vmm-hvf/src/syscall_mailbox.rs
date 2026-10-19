@@ -1755,8 +1755,12 @@ mod tests {
         // names a thread whose vCPU gave it up without anyone clearing it.
         let first = allocator.allocate().expect("slot 0");
         assert_eq!(first.id().raw(), 0);
-        current_task(&region, 0).set(thread_a, 1, 7);
-        current_task(&region, 1).set(carrick_el1_abi::El1TaskId::from_linux_tid(99), 1, 9);
+        current_task(&region, 0).set(thread_a, carrick_el1_abi::SnapshotGeneration::INITIAL, 7);
+        current_task(&region, 1).set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(99),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            9,
+        );
 
         // Reclaim: A's vCPU gives up slot 0, another vCPU takes it, and A's
         // vCPU resumes on slot 1.

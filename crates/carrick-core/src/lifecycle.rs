@@ -242,7 +242,7 @@ pub struct PoolReadinessBlocker {
     /// `None` when the caller reached no control for this entry.
     pub kind: Option<MemberExitKind>,
     pub host_retirement: Option<crate::terminal::HostThreadRetirementReceipt>,
-    pub expected_host: Option<crate::terminal::HostThreadRetirementReceipt>,
+    pub expected_host: Option<crate::terminal::ThreadBirthIdentity>,
 }
 
 /// Pool half of a Closing readiness census: entries in `claimed_count`
@@ -252,7 +252,7 @@ pub struct PoolReadinessBlocker {
 pub fn pool_readiness_census<'a>(
     page: &impl Lifecycle,
     controls: impl Fn(EntryRef) -> Option<&'a dyn MemberControl>,
-    expected_host: impl Fn(EntryRef) -> Option<crate::terminal::HostThreadRetirementReceipt>,
+    expected_host: impl Fn(EntryRef) -> Option<crate::terminal::ThreadBirthIdentity>,
 ) -> (usize, Option<PoolReadinessBlocker>) {
     let mut exiting = 0;
     let mut first = None;
@@ -285,9 +285,9 @@ pub fn pool_readiness_census<'a>(
         let expected = expected_host(entry);
         let returned = match kind {
             Some(MemberExitKind::InZone) => true,
-            Some(MemberExitKind::HostRetiring) => {
-                host_retirement.is_some() && host_retirement == expected
-            }
+            Some(MemberExitKind::HostRetiring) => host_retirement
+                .zip(expected)
+                .is_some_and(|(receipt, expected)| receipt.acknowledges(expected)),
             _ => false,
         };
         if !returned {
@@ -381,7 +381,7 @@ pub trait Lifecycle {
     fn host_birth_receipt_returned_exact(
         &self,
         index: usize,
-        identity: crate::terminal::HostThreadRetirementReceipt,
+        identity: crate::terminal::ThreadBirthIdentity,
     ) -> bool;
     fn gate_word(&self) -> &AtomicU32;
     fn live_word(&self) -> &AtomicU32;
@@ -978,7 +978,7 @@ mod membership_tests {
         fn host_birth_receipt_returned_exact(
             &self,
             _: usize,
-            _: crate::terminal::HostThreadRetirementReceipt,
+            _: crate::terminal::ThreadBirthIdentity,
         ) -> bool {
             false
         }

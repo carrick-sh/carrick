@@ -19,7 +19,11 @@ fn unmigrated_family_completes_once_through_linux_owner() {
     for scale in [1, 2, 8] {
         let counters = Counters::default();
         let tasks = [CurrentTask::new()];
-        tasks[0].set(carrick_el1_abi::El1TaskId::from_linux_tid(17), 5, 100);
+        tasks[0].set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(17),
+            carrick_el1_abi::SnapshotGeneration::from_raw(5),
+            100,
+        );
         let fd_map = [FdMapSlot::new()];
         fd_map[0].set(100, 3, 1, 42);
         let files = [DelegatedFile::new()];

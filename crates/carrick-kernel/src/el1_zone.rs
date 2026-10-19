@@ -1768,7 +1768,7 @@ mod tests {
             crate::el1_delegation::publish_current_task(
                 slot,
                 carrick_el1_abi::El1TaskId::from_linux_tid(2),
-                2_658,
+                carrick_el1_abi::SnapshotGeneration::from_raw(2_658),
                 1,
                 2,
                 carrick_el1_abi::ContextGeneration::new(std::num::NonZeroU64::MIN),

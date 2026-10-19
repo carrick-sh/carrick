@@ -2,8 +2,8 @@
 //! VM-free native context hooks for the actual Linux clone/exit policy.
 use carrick_core::lifecycle::Lifecycle;
 use carrick_core_abi::{
-    BornInZoneSource, EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration,
-    ExecutionBinding,
+    BornInZoneSource, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    SnapshotGeneration,
 };
 use carrick_el1_abi::TrapFrame;
 use carrick_personality_linux::{
@@ -131,7 +131,7 @@ impl<'a> Turn<'a> {
             handoff: None,
             binding: ExecutionBinding {
                 task: EntryTaskKey::from_raw(40),
-                generation: EntryGeneration::from_raw(1),
+                generation: SnapshotGeneration::from_raw(1),
                 mm: EntryMmKey::from_raw(process.mm),
                 thread_generation: EntryThreadGeneration::from_raw(1000),
             },
@@ -164,7 +164,7 @@ impl<'a> Turn<'a> {
         self.context = context.clone();
         self.binding.task = EntryTaskKey::from_raw(identity.tid);
         self.binding.thread_generation = EntryThreadGeneration::from_raw(identity.serial);
-        self.binding.generation = EntryGeneration::from_raw(0);
+        self.binding.generation = SnapshotGeneration::from_raw(0);
     }
 }
 impl UserCopy for Turn<'_> {
@@ -307,7 +307,7 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
     fn run_next(&mut self, _: SyscallResult) -> (carrick_core::Served, SyscallResult) {
         self.current = None;
         self.binding.task = EntryTaskKey::from_raw(40);
-        self.binding.generation = EntryGeneration::from_raw(1);
+        self.binding.generation = SnapshotGeneration::from_raw(1);
         self.binding.thread_generation = EntryThreadGeneration::from_raw(1000);
         self.context.set_result(0);
         (
@@ -375,7 +375,9 @@ pub fn x5_linux_clone_exit() {
                     tid: 50,
                     visible_tid: 7,
                     thread_serial: 5050,
-                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+                    ),
                     uid_credit: 1,
                 },
             )
@@ -407,7 +409,9 @@ pub fn x5_linux_clone_exit() {
                             tid: 50,
                             visible_tid: 7,
                             thread_serial: 5050,
-                            execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
+                            birth: carrick_core_abi::entry::BirthSerial::of_task(
+                                carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+                            ),
                             uid_credit: 1,
                         },
                     )

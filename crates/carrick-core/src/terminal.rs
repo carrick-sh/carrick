@@ -7,11 +7,11 @@ use core::marker::PhantomData;
 use core::num::{NonZeroI32, NonZeroU64};
 
 use carrick_core_abi::entry::{
-    EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
 };
 use carrick_core_abi::lifecycle::EntryRef;
 use carrick_guest_arch::{AddressContext, RootGpa};
-use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial, TerminationStatus};
+use carrick_sched_core::process::{TaskId, TaskKey, TerminationStatus};
 
 use crate::lifecycle::{
     Lifecycle, MemberControl, MemberExitKind, MembershipFloor, NonfinalExitMembership,
@@ -23,16 +23,17 @@ pub struct PoolMemberObservation<'a> {
     /// entry has since been reaped and reused. Host retirement must publish
     /// its typed receipt on this same slot.
     pub member: &'a dyn MemberControl,
-    pub expected_host: HostThreadRetirementReceipt,
+    pub expected_host: ThreadBirthIdentity,
 }
 
 pub enum HostMemberObservation<'a> {
+    /// An entry-less member owes the exact birth identity its slot records.
     Adopted {
-        binding: HostThreadRetirementReceipt,
+        birth: ThreadBirthIdentity,
         member: &'a dyn MemberControl,
     },
     HostBorn {
-        identity: HostThreadRetirementReceipt,
+        identity: ThreadBirthIdentity,
         index: usize,
     },
 }
@@ -261,14 +262,14 @@ impl ProcessTerminalIdentity {
 pub struct MemberSet {
     process: ProcessTerminalIdentity,
     pool: Box<[EntryRef]>,
-    host: Box<[HostThreadRetirementReceipt]>,
+    host: Box<[ThreadBirthIdentity]>,
 }
 
 impl MemberSet {
     pub(crate) fn new(
         process: ProcessTerminalIdentity,
         mut pool: Vec<EntryRef>,
-        mut host: Vec<HostThreadRetirementReceipt>,
+        mut host: Vec<ThreadBirthIdentity>,
     ) -> Self {
         // One identity has one expected receipt, even if two registry views
         // named it during a handoff. The exact value remains authoritative.
@@ -295,29 +296,13 @@ impl MemberSet {
     pub fn pool(&self) -> &[EntryRef] {
         &self.pool
     }
-    pub fn host(&self) -> &[HostThreadRetirementReceipt] {
+    pub fn host(&self) -> &[ThreadBirthIdentity] {
         &self.host
-    }
-    /// Move one exact expected host receipt with its retained execution
-    /// binding. A duplicate or absent identity cannot mint a new proof.
-    pub fn rehome_host(
-        &mut self,
-        old: HostThreadRetirementReceipt,
-        new: HostThreadRetirementReceipt,
-    ) -> bool {
-        let Some(index) = self.host.iter().position(|receipt| *receipt == old) else {
-            return false;
-        };
-        if old != new && self.host.contains(&new) {
-            return false;
-        }
-        self.host[index] = new;
-        true
     }
     pub(crate) fn completed(
         &self,
         pool: &[EntryRef],
-        host: &[HostThreadRetirementReceipt],
+        host: &[ThreadBirthIdentity],
     ) -> Option<CompletedMemberReceipts> {
         if pool.len() != self.pool.len()
             || host.len() != self.host.len()
@@ -344,48 +329,64 @@ pub struct CompletedMemberReceipts {
     process: ProcessTerminalIdentity,
 }
 
-/// Host retirement's exact acknowledgement of an adopted member. A visible
-/// tid is never sufficient: its execution or thread generation may be reused.
+/// A thread's exact birth identity: tid, owning process incarnation and
+/// thread serial, recorded once when the thread is born. A visible tid is
+/// never sufficient (it is reused), and an execution binding is never one:
+/// its snapshot generation moves on every settlement. There is deliberately
+/// no constructor from an [`ExecutionBinding`]. Closing owes exactly one
+/// [`HostThreadRetirementReceipt`] for each such identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HostThreadRetirementReceipt {
+pub struct ThreadBirthIdentity {
     task: EntryTaskKey,
-    execution: EntryGeneration,
+    birth: BirthSerial,
     thread: EntryThreadGeneration,
 }
 
-impl HostThreadRetirementReceipt {
+impl ThreadBirthIdentity {
     pub fn from_parts(
         task: EntryTaskKey,
-        execution: EntryGeneration,
+        birth: BirthSerial,
         thread: EntryThreadGeneration,
     ) -> Option<Self> {
-        (task.raw() != 0 && execution.raw() != 0 && thread.raw() != 0).then_some(Self {
+        (task.raw() != 0 && thread.raw() != 0).then_some(Self {
             task,
-            execution,
+            birth,
             thread,
         })
     }
 
-    pub fn from_binding(binding: ExecutionBinding) -> Self {
-        Self {
-            task: binding.task,
-            execution: binding.generation,
-            thread: binding.thread_generation,
-        }
-    }
-
-    pub fn matches(self, binding: ExecutionBinding) -> bool {
-        self == Self::from_binding(binding)
+    /// The receipt the host publishes after it has retired exactly this
+    /// thread. Only a retirement path mints one; it is never read back as a
+    /// birth identity.
+    pub fn retirement(self) -> HostThreadRetirementReceipt {
+        HostThreadRetirementReceipt(self)
     }
 
     pub fn task(self) -> EntryTaskKey {
         self.task
     }
-    pub fn execution(self) -> EntryGeneration {
-        self.execution
+    pub fn birth(self) -> BirthSerial {
+        self.birth
     }
     pub fn thread(self) -> EntryThreadGeneration {
         self.thread
+    }
+}
+
+/// Host retirement's exact acknowledgement of one [`ThreadBirthIdentity`].
+/// It lives in storage distinct from the birth identity, so a published
+/// receipt can never stand in for the identity it is checked against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostThreadRetirementReceipt(ThreadBirthIdentity);
+
+impl HostThreadRetirementReceipt {
+    /// Whether this receipt retires exactly `identity`.
+    pub fn acknowledges(self, identity: ThreadBirthIdentity) -> bool {
+        self.0 == identity
+    }
+    /// The identity this receipt retired.
+    pub fn retired(self) -> ThreadBirthIdentity {
+        self.0
     }
 }
 
@@ -418,13 +419,6 @@ impl ThreadTerminalIdentity {
             binding,
             entry,
             status,
-        })
-    }
-
-    pub fn task(&self) -> Option<TaskKey> {
-        Some(TaskKey {
-            id: task_id_from_binding(self.binding)?,
-            serial: TaskSerial::from_raw_u64(self.binding.generation.raw())?,
         })
     }
 
@@ -504,18 +498,18 @@ pub enum ReadinessFailure {
         entry: EntryRef,
         kind: MemberExitKind,
         observed: Option<HostThreadRetirementReceipt>,
-        expected: HostThreadRetirementReceipt,
+        expected: ThreadBirthIdentity,
     },
     /// `position` indexes the owner's host-member observations.
     Adopted {
         position: usize,
         kind: MemberExitKind,
         observed: Option<HostThreadRetirementReceipt>,
-        expected: HostThreadRetirementReceipt,
+        expected: ThreadBirthIdentity,
     },
     HostBorn {
         index: usize,
-        expected: HostThreadRetirementReceipt,
+        expected: ThreadBirthIdentity,
     },
     /// Every observation returned, but the returned set is not the exact
     /// expected member set (a missing or duplicated identity).
@@ -603,7 +597,7 @@ impl TerminalCustody<Process, Closing> {
     pub fn cancel_members(
         &self,
         pool: Vec<EntryRef>,
-        host: Vec<HostThreadRetirementReceipt>,
+        host: Vec<ThreadBirthIdentity>,
     ) -> RetirementVerdict {
         let members = MemberSet::new(self.identity, pool, host);
         RetirementVerdict::CancelMembers {
@@ -615,7 +609,7 @@ impl TerminalCustody<Process, Closing> {
         &self,
         members: &MemberSet,
         pool: &[EntryRef],
-        host: &[HostThreadRetirementReceipt],
+        host: &[ThreadBirthIdentity],
     ) -> Option<CompletedMemberReceipts> {
         (members.process == self.identity)
             .then(|| members.completed(pool, host))
@@ -650,7 +644,9 @@ impl TerminalCustody<Process, Closing> {
             let observed = observation.member.host_retirement();
             let returned = match kind {
                 MemberExitKind::InZone => true,
-                MemberExitKind::HostRetiring => observed == Some(observation.expected_host),
+                MemberExitKind::HostRetiring => {
+                    observed.is_some_and(|receipt| receipt.acknowledges(observation.expected_host))
+                }
                 MemberExitKind::Active | MemberExitKind::Stale => false,
             };
             if !returned {
@@ -666,19 +662,21 @@ impl TerminalCustody<Process, Closing> {
         let mut completed_host = Vec::with_capacity(host.len());
         for (index, observation) in host.iter().enumerate() {
             let identity = match observation {
-                HostMemberObservation::Adopted { binding, member } => {
+                HostMemberObservation::Adopted { birth, member } => {
                     let kind =
                         crate::lifecycle::recorded_member_exit_kind(*member, member.member_entry());
                     let observed = member.host_retirement();
-                    if kind == MemberExitKind::InZone || observed != Some(*binding) {
+                    if kind == MemberExitKind::InZone
+                        || !observed.is_some_and(|receipt| receipt.acknowledges(*birth))
+                    {
                         return Err(ReadinessFailure::Adopted {
                             position: index,
                             kind,
                             observed,
-                            expected: *binding,
+                            expected: *birth,
                         });
                     }
-                    *binding
+                    *birth
                 }
                 HostMemberObservation::HostBorn { identity, index } => {
                     if !page.host_birth_receipt_returned_exact(*index, *identity) {
@@ -834,7 +832,18 @@ const _: () = assert!(core::mem::size_of::<TerminalCustody<Process, Closing>>() 
 mod tests {
     use super::*;
     use crate::lifecycle::AtomicEntry;
+    use carrick_core_abi::entry::SnapshotGeneration;
+    use carrick_sched_core::process::TaskSerial;
     use core::sync::atomic::AtomicU32;
+
+    fn birth_receipt(task: u64, birth: u64, thread: u64) -> ThreadBirthIdentity {
+        ThreadBirthIdentity::from_parts(
+            EntryTaskKey::from_raw(task),
+            BirthSerial::of_task(TaskSerial::from_raw_u64(birth).unwrap()),
+            EntryThreadGeneration::from_raw(thread),
+        )
+        .unwrap()
+    }
 
     struct Page {
         terminal: crate::terminal::ProcessExitCustody,
@@ -845,11 +854,7 @@ mod tests {
         fn process_exit_custody(&self) -> &crate::terminal::ProcessExitCustody {
             &self.terminal
         }
-        fn host_birth_receipt_returned_exact(
-            &self,
-            _: usize,
-            _: HostThreadRetirementReceipt,
-        ) -> bool {
+        fn host_birth_receipt_returned_exact(&self, _: usize, _: ThreadBirthIdentity) -> bool {
             false
         }
 
@@ -899,38 +904,6 @@ mod tests {
         assert!(members.completed(&[], &[]).is_none());
         let receipt = members.completed(&[entry], &[]).unwrap();
         assert!(closing.settle(&page, receipt).is_ok());
-    }
-
-    #[test]
-    fn rehomed_host_receipt_replaces_exact_pending_identity() {
-        let identity = ProcessTerminalIdentity::from_exit(
-            TaskKey {
-                id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
-                serial: TaskSerial::from_raw_u64(11).unwrap(),
-            },
-            AddressContext {
-                root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x10000)).unwrap(),
-                mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(1).unwrap()),
-                generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(1).unwrap()),
-            },
-            TerminationStatus::exited(7),
-        );
-        let old = HostThreadRetirementReceipt::from_binding(ExecutionBinding {
-            task: EntryTaskKey::from_raw(42),
-            generation: EntryGeneration::from_raw(1),
-            mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
-            thread_generation: EntryThreadGeneration::from_raw(2),
-        });
-        let new = HostThreadRetirementReceipt::from_binding(ExecutionBinding {
-            task: EntryTaskKey::from_raw(42),
-            generation: EntryGeneration::from_raw(2),
-            mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
-            thread_generation: EntryThreadGeneration::from_raw(2),
-        });
-        let mut members = MemberSet::new(identity, Vec::new(), alloc::vec![old]);
-        assert!(members.rehome_host(old, new));
-        assert!(members.completed(&[], &[old]).is_none());
-        assert!(members.completed(&[], &[new]).is_some());
     }
 
     #[test]
@@ -1048,7 +1021,7 @@ mod tests {
                     let identity = ThreadTerminalIdentity::from_exit(
                         ExecutionBinding {
                             task: EntryTaskKey::from_raw(41),
-                            generation: EntryGeneration::from_raw(11),
+                            generation: SnapshotGeneration::from_raw(11),
                             mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
                             thread_generation: EntryThreadGeneration::from_raw(2),
                         },
@@ -1081,7 +1054,7 @@ mod tests {
                 ThreadTerminalIdentity::from_exit(
                     ExecutionBinding {
                         task: EntryTaskKey::from_raw(41),
-                        generation: EntryGeneration::from_raw(11),
+                        generation: SnapshotGeneration::from_raw(11),
                         mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
                         thread_generation: EntryThreadGeneration::from_raw(3),
                     },
@@ -1123,7 +1096,7 @@ mod tests {
                 let identity = ThreadTerminalIdentity::from_exit(
                     ExecutionBinding {
                         task: EntryTaskKey::from_raw(42),
-                        generation: EntryGeneration::from_raw(11),
+                        generation: SnapshotGeneration::from_raw(11),
                         mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
                         thread_generation: EntryThreadGeneration::from_raw(2),
                     },
@@ -1172,11 +1145,7 @@ mod tests {
             fn process_exit_custody(&self) -> &ProcessExitCustody {
                 &self.terminal
             }
-            fn host_birth_receipt_returned_exact(
-                &self,
-                _: usize,
-                _: HostThreadRetirementReceipt,
-            ) -> bool {
+            fn host_birth_receipt_returned_exact(&self, _: usize, _: ThreadBirthIdentity) -> bool {
                 false
             }
             fn gate_word(&self) -> &AtomicU32 {
@@ -1250,12 +1219,7 @@ mod tests {
         )
         .unwrap();
         let members = MemberSet::new(closing.identity, alloc::vec![entry], Vec::new());
-        let expected_host = HostThreadRetirementReceipt::from_binding(ExecutionBinding {
-            task: EntryTaskKey::from_raw(42),
-            generation: EntryGeneration::from_raw(11),
-            mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
-            thread_generation: EntryThreadGeneration::from_raw(2),
-        });
+        let expected_host = birth_receipt(42, 11, 2);
         let observation = [PoolMemberObservation {
             entry,
             member: &member,
@@ -1270,7 +1234,7 @@ mod tests {
         let identity = ThreadTerminalIdentity::from_exit(
             ExecutionBinding {
                 task: EntryTaskKey::from_raw(42),
-                generation: EntryGeneration::from_raw(11),
+                generation: SnapshotGeneration::from_raw(11),
                 mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
                 thread_generation: EntryThreadGeneration::from_raw(2),
             },
@@ -1299,7 +1263,7 @@ mod tests {
         struct Member {
             entry: EntryRef,
             exit: crate::lifecycle::MemberExitCustody,
-            host: Option<HostThreadRetirementReceipt>,
+            host: Option<ThreadBirthIdentity>,
         }
         impl MemberControl for Member {
             fn member_entry(&self) -> Option<EntryRef> {
@@ -1309,7 +1273,7 @@ mod tests {
                 &self.exit
             }
             fn host_retirement(&self) -> Option<HostThreadRetirementReceipt> {
-                self.host
+                self.host.map(ThreadBirthIdentity::retirement)
             }
         }
         let page = Page {
@@ -1337,12 +1301,7 @@ mod tests {
             exit: crate::lifecycle::MemberExitCustody::new(),
             host: None,
         };
-        let receipt = HostThreadRetirementReceipt::from_binding(ExecutionBinding {
-            task: EntryTaskKey::from_raw(42),
-            generation: EntryGeneration::from_raw(12),
-            mm: carrick_core_abi::entry::EntryMmKey::from_raw(1),
-            thread_generation: EntryThreadGeneration::from_raw(102),
-        });
+        let receipt = birth_receipt(42, 12, 102);
         let observation = [PoolMemberObservation {
             entry,
             member: &in_zone,
@@ -1384,12 +1343,7 @@ mod tests {
         let wrong_receipt = [PoolMemberObservation {
             entry,
             member: &host,
-            expected_host: HostThreadRetirementReceipt::from_binding(ExecutionBinding {
-                task: EntryTaskKey::from_raw(42),
-                generation: EntryGeneration::from_raw(13),
-                mm: carrick_core_abi::entry::EntryMmKey::from_raw(1),
-                thread_generation: EntryThreadGeneration::from_raw(102),
-            }),
+            expected_host: birth_receipt(42, 13, 102),
         }];
         assert!(
             custody

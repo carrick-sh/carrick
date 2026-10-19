@@ -1474,7 +1474,11 @@ mod tests {
         let page = ThreadLifecyclePage::new();
         let control = ThreadControlSlot::new();
         let task = CurrentTask::new();
-        task.set(El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(
+            El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         let slot = SlotId::new(0);

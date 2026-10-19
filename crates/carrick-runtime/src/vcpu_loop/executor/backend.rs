@@ -848,7 +848,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         )?;
         self.cow_invalidation_observer = Some(cow_invalidation_observer);
         let task_id = carrick_el1_abi::El1TaskId::from_linux_tid(task.thread_key().tid.raw());
-        let generation = task.generation().raw();
+        let generation = carrick_el1_abi::SnapshotGeneration::from_raw(task.generation().raw());
         let file_table = task.lease().file_table_id().map_or(0, |id| id.raw());
         let visible_pid = task.lease().visible_pid().unwrap_or(0);
         let root_generation = carrick_el1_abi::ContextGeneration::new(

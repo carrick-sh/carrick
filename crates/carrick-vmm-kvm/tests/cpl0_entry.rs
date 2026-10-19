@@ -894,7 +894,7 @@ fn two_live_tasks_serve_robust_lists_without_host_forwards() {
 #[test]
 fn x4_linux_common_entry() {
     use carrick_el1_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     for scale in [1_u64, 2, 8] {
         let calls: [Vec<(u64, u64)>; 2] = core::array::from_fn(|task| {
@@ -913,7 +913,7 @@ fn x4_linux_common_entry() {
             .expect("X4 real KVM carrier");
         let bindings = core::array::from_fn::<_, 2, _>(|task| ExecutionBinding {
             task: EntryTaskKey::from_raw(41),
-            generation: EntryGeneration::from_raw(100 + task as u64),
+            generation: SnapshotGeneration::from_raw(100 + task as u64),
             mm: EntryMmKey::from_raw(77 + task as u64),
             thread_generation: EntryThreadGeneration::from_raw(101 + task as u64),
         });
@@ -962,7 +962,7 @@ fn x4_linux_common_entry() {
     // the x86 process lane. Inspect the stopped owner.
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(41),
-        generation: EntryGeneration::from_raw(100),
+        generation: SnapshotGeneration::from_raw(100),
         mm: EntryMmKey::from_raw(77),
         thread_generation: EntryThreadGeneration::from_raw(101),
     };

@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 15;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 16;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
@@ -142,8 +142,8 @@ pub struct EntryIdentity {
     pub visible_tid: u32,
     /// `ThreadKey` serial the child will carry.
     pub thread_serial: u64,
-    /// Execution incarnation issued with this exact pool identity.
-    pub execution: carrick_core_abi::entry::EntryGeneration,
+    /// Process incarnation this exact pool identity is born into.
+    pub birth: carrick_core_abi::entry::BirthSerial,
     /// RLIMIT_NPROC credit held for the owning uid.
     pub uid_credit: u64,
 }
@@ -206,7 +206,7 @@ pub struct PoolEntry {
     clone_flags: AtomicU64,
     clear_child_tid: AtomicU64,
     blocked: AtomicU64,
-    execution: AtomicU64,
+    birth: carrick_core_abi::entry::AtomicBirthSerial,
 }
 
 impl PoolEntry {
@@ -222,7 +222,7 @@ impl PoolEntry {
             clone_flags: AtomicU64::new(0),
             clear_child_tid: AtomicU64::new(0),
             blocked: AtomicU64::new(0),
-            execution: AtomicU64::new(0),
+            birth: carrick_core_abi::entry::AtomicBirthSerial::new(),
         }
     }
 }
@@ -406,16 +406,16 @@ pub struct ThreadControlSlot {
     /// Exit request/receipt bits plus the core-owned exact member exit kind.
     /// The slot's `entry` is the generation key until exclusive reset.
     host_exit_requested: carrick_core::lifecycle::MemberControlAuthority,
-    /// The host writes task/execution first and publishes thread last. A
-    /// Closing owner only credits the complete exact receipt it requested.
+    /// Host retirement's receipt, distinct from the birth identity below:
+    /// task/birth first, thread last. A Closing owner only credits a
+    /// complete receipt that acknowledges the identity it requested.
     retired_task: AtomicU64,
-    retired_execution: AtomicU64,
+    retired_birth: carrick_core_abi::entry::AtomicBirthSerial,
     retired_thread: AtomicU64,
-    /// The host birth identity, written once when the host publishes the
-    /// birth and never by retirement: an exact-receipt check compares the
-    /// retirement receipt above against this, never the receipt with itself.
+    /// The thread's exact birth identity, written once before the thread can
+    /// run (task/birth first, thread last). Retirement never writes it.
     birth_task: AtomicU64,
-    birth_execution: AtomicU64,
+    birth_serial: carrick_core_abi::entry::AtomicBirthSerial,
     birth_thread: AtomicU64,
 }
 
@@ -445,10 +445,10 @@ impl ThreadControlSlot {
             zone_id: AtomicU32::new(0),
             host_exit_requested: carrick_core::lifecycle::MemberControlAuthority::new(),
             retired_task: AtomicU64::new(0),
-            retired_execution: AtomicU64::new(0),
+            retired_birth: carrick_core_abi::entry::AtomicBirthSerial::new(),
             retired_thread: AtomicU64::new(0),
             birth_task: AtomicU64::new(0),
-            birth_execution: AtomicU64::new(0),
+            birth_serial: carrick_core_abi::entry::AtomicBirthSerial::new(),
             birth_thread: AtomicU64::new(0),
         }
     }
@@ -527,14 +527,14 @@ impl ThreadControlSlot {
         self.zone_id.store(0, Ordering::Relaxed);
         self.retired_thread.store(0, Ordering::Relaxed);
         self.retired_task.store(0, Ordering::Relaxed);
-        self.retired_execution.store(0, Ordering::Relaxed);
-        self.birth_thread.store(0, Ordering::Relaxed);
-        self.birth_task.store(0, Ordering::Relaxed);
-        self.birth_execution.store(0, Ordering::Relaxed);
+        self.retired_birth.clear(Ordering::Relaxed);
         self.zone_incarnation.store(0, Ordering::Relaxed);
         self.zone_seq.store(0, Ordering::Relaxed);
         self.pending.clear(PendingSignals(u64::MAX));
         self.blocked.store(blocked.0, Ordering::Relaxed);
+        self.birth_thread.store(0, Ordering::Relaxed);
+        self.birth_task.store(0, Ordering::Relaxed);
+        self.birth_serial.clear(Ordering::Relaxed);
         // Keep the sequence even: a stale odd value would wedge readers.
         let seq = self.alt_seq.load(Ordering::Relaxed);
         self.alt_seq
@@ -714,43 +714,44 @@ impl ThreadControlSlot {
         (self.robust_head.load(Ordering::Relaxed), len)
     }
 
-    /// Publish the host birth identity once, before the thread can run.
-    /// Its storage is separate from the retirement receipt, which never
-    /// overwrites it.
-    pub fn publish_host_birth_identity(&self, binding: carrick_core_abi::entry::ExecutionBinding) {
-        self.birth_task.store(binding.task.raw(), Ordering::Relaxed);
-        self.birth_execution
-            .store(binding.generation.raw(), Ordering::Relaxed);
+    /// Record the exact birth identity of the host thread this slot serves:
+    /// tid, owning process incarnation and thread serial. The host publishes
+    /// it when it allocates the slot, before the thread can run, so every
+    /// entry-less member owes a receipt for this identity.
+    pub fn publish_host_birth_identity(
+        &self,
+        identity: carrick_core::terminal::ThreadBirthIdentity,
+    ) {
+        self.birth_task
+            .store(identity.task().raw(), Ordering::Relaxed);
+        self.birth_serial.store(identity.birth(), Ordering::Relaxed);
         self.birth_thread
-            .store(binding.thread_generation.raw(), Ordering::Release);
+            .store(identity.thread().raw(), Ordering::Release);
     }
 
-    /// The exact identity host retirement must later publish as its receipt.
-    pub fn host_birth_identity(
-        &self,
-    ) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
+    pub fn host_birth_identity(&self) -> Option<carrick_core::terminal::ThreadBirthIdentity> {
         let thread = self.birth_thread.load(Ordering::Acquire);
-        carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
             carrick_core_abi::entry::EntryTaskKey::from_raw(
                 self.birth_task.load(Ordering::Relaxed),
             ),
-            carrick_core_abi::entry::EntryGeneration::from_raw(
-                self.birth_execution.load(Ordering::Relaxed),
-            ),
+            self.birth_serial.load(Ordering::Relaxed)?,
             carrick_core_abi::entry::EntryThreadGeneration::from_raw(thread),
         )
     }
 
+    /// Publish only after the host has retired the exact kernel thread and
+    /// withdrawn its runtime membership. The control lease stays pinned.
     pub fn publish_host_retirement(
         &self,
         receipt: carrick_core::terminal::HostThreadRetirementReceipt,
     ) {
+        let retired = receipt.retired();
         self.retired_task
-            .store(receipt.task().raw(), Ordering::Relaxed);
-        self.retired_execution
-            .store(receipt.execution().raw(), Ordering::Relaxed);
+            .store(retired.task().raw(), Ordering::Relaxed);
+        self.retired_birth.store(retired.birth(), Ordering::Relaxed);
         self.retired_thread
-            .store(receipt.thread().raw(), Ordering::Release);
+            .store(retired.thread().raw(), Ordering::Release);
         self.host_exit_requested.publish_host_receipt();
     }
 
@@ -759,15 +760,14 @@ impl ThreadControlSlot {
             return None;
         }
         let thread = self.retired_thread.load(Ordering::Acquire);
-        carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
             carrick_core_abi::entry::EntryTaskKey::from_raw(
                 self.retired_task.load(Ordering::Relaxed),
             ),
-            carrick_core_abi::entry::EntryGeneration::from_raw(
-                self.retired_execution.load(Ordering::Relaxed),
-            ),
+            self.retired_birth.load(Ordering::Relaxed)?,
             carrick_core_abi::entry::EntryThreadGeneration::from_raw(thread),
         )
+        .map(carrick_core::terminal::ThreadBirthIdentity::retirement)
     }
 
     /// The ring routed a declined raw exit to this exact host-owned slot.
@@ -894,11 +894,11 @@ impl ClosingVerdict {
             MemberExitKind::HostRetiring => 3,
             MemberExitKind::Stale => 4,
         };
-        let receipt = |receipt: Option<carrick_core::terminal::HostThreadRetirementReceipt>| {
+        let receipt = |receipt: Option<carrick_core::terminal::ThreadBirthIdentity>| {
             receipt.map_or([0; 3], |receipt| {
                 [
                     receipt.task().raw(),
-                    receipt.execution().raw(),
+                    receipt.birth().raw(),
                     receipt.thread().raw(),
                 ]
             })
@@ -960,7 +960,7 @@ impl ClosingVerdict {
             | (member_kind << 8)
             | ((index & 0xffff_ffff) << 16)
             | (u64::from(observed.is_some()) << 48);
-        words[2..5].copy_from_slice(&receipt(observed));
+        words[2..5].copy_from_slice(&receipt(observed.map(|receipt| receipt.retired())));
         words[5..8].copy_from_slice(&receipt(expected));
         words[8] = extra;
         Self { words }
@@ -1112,7 +1112,7 @@ pub enum ReadinessBlocker {
     HostBorn {
         index: usize,
         state: u32,
-        identity: Option<carrick_core::terminal::HostThreadRetirementReceipt>,
+        identity: Option<carrick_core::terminal::ThreadBirthIdentity>,
         returned_exact: bool,
     },
 }
@@ -1148,7 +1148,7 @@ const _: () = assert!(core::mem::size_of::<ThreadLifecyclePage>() == THREAD_LIFE
 #[derive(::core::fmt::Debug)]
 struct HostBornMember {
     task: AtomicU64,
-    execution: AtomicU64,
+    birth: carrick_core_abi::entry::AtomicBirthSerial,
     thread: AtomicU64,
     state: AtomicU32,
 }
@@ -1157,21 +1157,19 @@ impl HostBornMember {
     const fn new() -> Self {
         Self {
             task: AtomicU64::new(0),
-            execution: AtomicU64::new(0),
+            birth: carrick_core_abi::entry::AtomicBirthSerial::new(),
             thread: AtomicU64::new(0),
             state: AtomicU32::new(0),
         }
     }
 
-    fn identity(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
+    fn identity(&self) -> Option<carrick_core::terminal::ThreadBirthIdentity> {
         if self.state.load(Ordering::Acquire) < 2 {
             return None;
         }
-        carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
             carrick_core_abi::entry::EntryTaskKey::from_raw(self.task.load(Ordering::Relaxed)),
-            carrick_core_abi::entry::EntryGeneration::from_raw(
-                self.execution.load(Ordering::Relaxed),
-            ),
+            self.birth.load(Ordering::Relaxed)?,
             carrick_core_abi::entry::EntryThreadGeneration::from_raw(
                 self.thread.load(Ordering::Relaxed),
             ),
@@ -1295,7 +1293,7 @@ impl ThreadLifecyclePage {
     pub fn publish_host_birth(
         &self,
         index: usize,
-        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+        identity: carrick_core::terminal::ThreadBirthIdentity,
     ) -> bool {
         let Some(slot) = self.host_born.get(index) else {
             return false;
@@ -1304,8 +1302,7 @@ impl ThreadLifecyclePage {
             return false;
         }
         slot.task.store(identity.task().raw(), Ordering::Relaxed);
-        slot.execution
-            .store(identity.execution().raw(), Ordering::Relaxed);
+        slot.birth.store(identity.birth(), Ordering::Relaxed);
         slot.thread
             .store(identity.thread().raw(), Ordering::Relaxed);
         slot.state
@@ -1329,13 +1326,13 @@ impl ThreadLifecyclePage {
     pub fn host_birth_identity(
         &self,
         index: usize,
-    ) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
+    ) -> Option<carrick_core::terminal::ThreadBirthIdentity> {
         self.host_born.get(index)?.identity()
     }
 
     pub fn host_birth_requested(
         &self,
-        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+        identity: carrick_core::terminal::ThreadBirthIdentity,
     ) -> bool {
         self.host_born.iter().any(|slot| {
             slot.identity() == Some(identity) && slot.state.load(Ordering::Acquire) == 3
@@ -1355,7 +1352,7 @@ impl ThreadLifecyclePage {
 
     pub fn publish_host_birth_receipt(
         &self,
-        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+        identity: carrick_core::terminal::ThreadBirthIdentity,
     ) -> bool {
         self.host_born.iter().any(|slot| {
             if slot.identity() != Some(identity) {
@@ -1378,8 +1375,8 @@ impl ThreadLifecyclePage {
         receipt: carrick_core::terminal::HostThreadRetirementReceipt,
     ) {
         control.publish_host_retirement(receipt);
-        self.publish_host_birth_receipt(receipt);
-        self.release_completed_host_birth(receipt);
+        self.publish_host_birth_receipt(receipt.retired());
+        self.release_completed_host_birth(receipt.retired());
     }
 
     /// Exercise the two publication boundaries through the production
@@ -1393,9 +1390,9 @@ impl ThreadLifecyclePage {
         after_release_claim: impl FnOnce(),
     ) {
         control.publish_host_retirement(receipt);
-        self.publish_host_birth_receipt(receipt);
+        self.publish_host_birth_receipt(receipt.retired());
         after_receipt();
-        self.release_host_birth_with_hook(receipt, 4, after_release_claim);
+        self.release_host_birth_with_hook(receipt.retired(), 4, after_release_claim);
     }
 
     /// Retire the exact published entry and consume its reserved membership.
@@ -1425,9 +1422,9 @@ impl ThreadLifecyclePage {
             },
             |entry| {
                 self.identity(entry).and_then(|identity| {
-                    carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+                    carrick_core::terminal::ThreadBirthIdentity::from_parts(
                         carrick_core_abi::entry::EntryTaskKey::from_raw(u64::from(identity.tid)),
-                        identity.execution,
+                        identity.birth,
                         carrick_core_abi::entry::EntryThreadGeneration::from_raw(
                             identity.thread_serial,
                         ),
@@ -1502,7 +1499,7 @@ impl ThreadLifecyclePage {
 
     fn release_host_birth(
         &self,
-        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+        identity: carrick_core::terminal::ThreadBirthIdentity,
         expected: u32,
     ) -> bool {
         self.release_host_birth_with_hook(identity, expected, || {})
@@ -1510,7 +1507,7 @@ impl ThreadLifecyclePage {
 
     fn release_host_birth_with_hook(
         &self,
-        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+        identity: carrick_core::terminal::ThreadBirthIdentity,
         expected: u32,
         after_claim: impl FnOnce(),
     ) -> bool {
@@ -1543,14 +1540,14 @@ impl ThreadLifecyclePage {
     /// Closing retains every slot until settlement.
     pub fn release_adopted_host_birth(
         &self,
-        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+        identity: carrick_core::terminal::ThreadBirthIdentity,
     ) -> bool {
         self.release_host_birth(identity, 2)
     }
 
     pub fn release_completed_host_birth(
         &self,
-        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+        identity: carrick_core::terminal::ThreadBirthIdentity,
     ) -> bool {
         self.release_host_birth(identity, 4)
     }
@@ -1672,8 +1669,7 @@ impl ThreadLifecyclePage {
         e.thread_serial
             .store(identity.thread_serial, Ordering::Relaxed);
         e.uid_credit.store(identity.uid_credit, Ordering::Relaxed);
-        e.execution
-            .store(identity.execution.raw(), Ordering::Relaxed);
+        e.birth.store(identity.birth, Ordering::Relaxed);
         e.state
             .store(pack(next, EntryState::Reserved), Ordering::Release);
         Ok(reference)
@@ -1715,9 +1711,7 @@ impl ThreadLifecyclePage {
             visible_tid: e.visible_tid.load(Ordering::Relaxed),
             thread_serial: e.thread_serial.load(Ordering::Relaxed),
             uid_credit: e.uid_credit.load(Ordering::Relaxed),
-            execution: carrick_core_abi::entry::EntryGeneration::from_raw(
-                e.execution.load(Ordering::Relaxed),
-            ),
+            birth: e.birth.load(Ordering::Relaxed)?,
         })
     }
 
@@ -1779,7 +1773,7 @@ impl Lifecycle for ThreadLifecyclePage {
     fn host_birth_receipt_returned_exact(
         &self,
         index: usize,
-        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+        identity: carrick_core::terminal::ThreadBirthIdentity,
     ) -> bool {
         self.host_birth_identity(index) == Some(identity) && self.host_birth_receipt_returned(index)
     }
@@ -1811,7 +1805,7 @@ impl Default for ThreadLifecyclePage {
 /// Layout facts folded into the image ABI layout hash.
 pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 40] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
-    core::mem::offset_of!(PoolEntry, execution) as u64,
+    core::mem::offset_of!(PoolEntry, birth) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, terminal) as u64,
     core::mem::size_of::<ThreadLedgerActivity>() as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, ledger_host) as u64,
@@ -1837,8 +1831,11 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 40] = [
     ::core::mem::offset_of!(ThreadControlSlot, zone_id) as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, serving) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, retired_task) as u64,
-    ::core::mem::offset_of!(ThreadControlSlot, retired_execution) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, retired_birth) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, retired_thread) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, birth_task) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, birth_serial) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, birth_thread) as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, exit_wait_mm) as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, exit_wait_address) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, host_exit_requested) as u64,
@@ -1847,9 +1844,6 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 40] = [
     ::core::mem::size_of::<HostBornMember>() as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, closing_verdict) as u64,
     ::core::mem::size_of::<ClosingVerdictRecord>() as u64,
-    ::core::mem::offset_of!(ThreadControlSlot, birth_task) as u64,
-    ::core::mem::offset_of!(ThreadControlSlot, birth_execution) as u64,
-    ::core::mem::offset_of!(ThreadControlSlot, birth_thread) as u64,
 ];
 
 #[cfg(test)]
@@ -1857,15 +1851,17 @@ mod tests {
     #[test]
     fn closing_verdict_renders_the_owners_last_not_ready_observation() {
         use carrick_core::lifecycle::MemberExitKind;
-        use carrick_core::terminal::{HostThreadRetirementReceipt, ReadinessFailure};
-        use carrick_core_abi::entry::{EntryGeneration, EntryTaskKey, EntryThreadGeneration};
+        use carrick_core::terminal::{ReadinessFailure, ThreadBirthIdentity};
+        use carrick_core_abi::entry::{EntryTaskKey, EntryThreadGeneration};
         use std::string::ToString;
         let page = super::ThreadLifecyclePage::new();
         assert_eq!(page.closing_verdict().to_string(), "owner_verdict=none");
         let receipt = |execution| {
-            HostThreadRetirementReceipt::from_parts(
+            ThreadBirthIdentity::from_parts(
                 EntryTaskKey::from_raw(2),
-                EntryGeneration::from_raw(execution),
+                carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(execution).unwrap(),
+                ),
                 EntryThreadGeneration::from_raw(43),
             )
             .unwrap()
@@ -1873,7 +1869,7 @@ mod tests {
         page.record_closing_verdict(Some(ReadinessFailure::Adopted {
             position: 0,
             kind: MemberExitKind::HostRetiring,
-            observed: Some(receipt(5)),
+            observed: Some(receipt(5).retirement()),
             expected: receipt(4263),
         }));
         assert_eq!(
@@ -1911,7 +1907,9 @@ mod tests {
                     tid: 42,
                     visible_tid: 42,
                     thread_serial: 2,
-                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+                    ),
                     uid_credit: 0,
                 },
             )
@@ -1982,15 +1980,19 @@ mod tests {
     #[test]
     fn host_birth_adoption_and_closing_have_one_slot_winner() {
         use super::Lifecycle;
-        let first = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+        let first = carrick_core::terminal::ThreadBirthIdentity::from_parts(
             carrick_core_abi::entry::EntryTaskKey::from_raw(41),
-            carrick_core_abi::entry::EntryGeneration::from_raw(11),
+            carrick_core_abi::entry::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(11).unwrap(),
+            ),
             carrick_core_abi::entry::EntryThreadGeneration::from_raw(101),
         )
         .unwrap();
-        let second = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+        let second = carrick_core::terminal::ThreadBirthIdentity::from_parts(
             carrick_core_abi::entry::EntryTaskKey::from_raw(42),
-            carrick_core_abi::entry::EntryGeneration::from_raw(12),
+            carrick_core_abi::entry::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+            ),
             carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
         )
         .unwrap();
@@ -2022,17 +2024,19 @@ mod tests {
         use super::Lifecycle;
         let page = super::ThreadLifecyclePage::new();
         let control = super::ThreadControlSlot::new();
-        let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+        let receipt = carrick_core::terminal::ThreadBirthIdentity::from_parts(
             carrick_core_abi::entry::EntryTaskKey::from_raw(42),
-            carrick_core_abi::entry::EntryGeneration::from_raw(12),
+            carrick_core_abi::entry::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+            ),
             carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
         )
         .unwrap();
         let slot = page.reserve_host_birth().unwrap();
         assert!(page.publish_host_birth(slot, receipt));
         page.close();
-        page.publish_exact_host_retirement(&control, receipt);
-        assert_eq!(control.host_retirement(), Some(receipt));
+        page.publish_exact_host_retirement(&control, receipt.retirement());
+        assert_eq!(control.host_retirement(), Some(receipt.retirement()));
         assert!(page.host_birth_receipt_returned(slot));
         assert_eq!(page.host_birth_identity(slot), Some(receipt));
     }
@@ -2087,7 +2091,9 @@ mod tests {
             tid: n,
             visible_tid: n + 100,
             thread_serial: n as u64 + 1000,
-            execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
+            birth: carrick_core_abi::entry::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+            ),
             uid_credit: 1,
         }
     }
@@ -2672,7 +2678,7 @@ mod layout_manifest {
                      clone_flags: _,
                      clear_child_tid: _,
                      blocked: _,
-                     execution: _,
+                     birth: _,
                  }: PoolEntry| {};
         field!(PoolEntry, state, AtomicEntry, 0, 8, 8);
         field!(PoolEntry, tid, AtomicU32, 8, 4, 4);
@@ -2684,7 +2690,14 @@ mod layout_manifest {
         field!(PoolEntry, clone_flags, AtomicU64, 48, 8, 8);
         field!(PoolEntry, clear_child_tid, AtomicU64, 56, 8, 8);
         field!(PoolEntry, blocked, AtomicU64, 64, 8, 8);
-        field!(PoolEntry, execution, AtomicU64, 72, 8, 8);
+        field!(
+            PoolEntry,
+            birth,
+            carrick_core_abi::entry::AtomicBirthSerial,
+            72,
+            8,
+            8
+        );
     }
 
     #[test]
@@ -2714,10 +2727,10 @@ mod layout_manifest {
                      zone_id: _,
                      host_exit_requested: _,
                      retired_task: _,
-                     retired_execution: _,
+                     retired_birth: _,
                      retired_thread: _,
                      birth_task: _,
-                     birth_execution: _,
+                     birth_serial: _,
                      birth_thread: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
@@ -2743,10 +2756,24 @@ mod layout_manifest {
             4
         );
         field!(ThreadControlSlot, retired_task, AtomicU64, 104, 8, 8);
-        field!(ThreadControlSlot, retired_execution, AtomicU64, 112, 8, 8);
+        field!(
+            ThreadControlSlot,
+            retired_birth,
+            carrick_core_abi::entry::AtomicBirthSerial,
+            112,
+            8,
+            8
+        );
         field!(ThreadControlSlot, retired_thread, AtomicU64, 120, 8, 8);
         field!(ThreadControlSlot, birth_task, AtomicU64, 128, 8, 8);
-        field!(ThreadControlSlot, birth_execution, AtomicU64, 136, 8, 8);
+        field!(
+            ThreadControlSlot,
+            birth_serial,
+            carrick_core_abi::entry::AtomicBirthSerial,
+            136,
+            8,
+            8
+        );
         field!(ThreadControlSlot, birth_thread, AtomicU64, 144, 8, 8);
     }
 

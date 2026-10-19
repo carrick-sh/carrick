@@ -120,7 +120,11 @@ impl sched::ThreadCpu for NoCpu {
 #[test]
 fn production_x86_family_absences_obey_eight_crossings_without_user_memory() {
     let tasks = [CurrentTask::new()];
-    tasks[0].set(El1TaskId::from_linux_tid(41), 1, 7);
+    tasks[0].set(
+        El1TaskId::from_linux_tid(41),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        7,
+    );
     let counters = Counters::new();
     let names = InotifyNameCache::new();
     let isa_unsupported = AtomicU64::new(0);
@@ -253,7 +257,11 @@ fn x86_context_selects_x86_crossings_without_arm_aperture() {
 #[test]
 fn x86_unported_refusal_counts_native_ordinal_not_canonical_ordinal() {
     let tasks = [CurrentTask::new()];
-    tasks[0].set(El1TaskId::from_linux_tid(41), 1, 7);
+    tasks[0].set(
+        El1TaskId::from_linux_tid(41),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        7,
+    );
     let counters = Counters::new();
     let names = InotifyNameCache::new();
     let isa_unsupported = AtomicU64::new(0);
@@ -447,11 +455,26 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         Box::new(core::array::from_fn(|_| ThreadControlSlot::new()));
     let task = CurrentTask::new();
     let peer_task = CurrentTask::new();
-    task.set(El1TaskId::from_linux_tid(41), 11, 5);
+    task.set(
+        El1TaskId::from_linux_tid(41),
+        carrick_el1_abi::SnapshotGeneration::from_raw(11),
+        5,
+    );
     task.mm.key.store(1, Ordering::Release);
     task.mm.thread_generation.store(101, Ordering::Release);
     task.publish_visible_pid(41);
     task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+    // The host records the leader's birth identity when it allocates the slot.
+    control.publish_host_birth_identity(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_core_abi::EntryTaskKey::from_raw(41),
+            carrick_core_abi::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(11).unwrap(),
+            ),
+            carrick_core_abi::EntryThreadGeneration::from_raw(101),
+        )
+        .unwrap(),
+    );
     let address = AddressContext {
         root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
         mm: MmGeneration::new(NonZeroU64::MIN),
@@ -539,7 +562,7 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         .unwrap();
     peer_task.set(
         El1TaskId::from_linux_tid(i32::try_from(identity.tid).unwrap()),
-        identity.generation,
+        carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
         identity.file_table,
     );
     peer_task
@@ -611,6 +634,10 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         delivered,
         "terminal fd release must reach the host work boundary"
     );
-    peer_task.set(El1TaskId::from_linux_tid(41), 11, 5);
+    peer_task.set(
+        El1TaskId::from_linux_tid(41),
+        carrick_el1_abi::SnapshotGeneration::from_raw(11),
+        5,
+    );
     assert!(!peer_task.linux.has_pending_host_work());
 }

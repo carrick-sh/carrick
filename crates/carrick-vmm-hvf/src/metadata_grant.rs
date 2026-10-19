@@ -1963,7 +1963,11 @@ mod tests {
                 )
                 .cast::<carrick_el1_abi::CurrentTask>()
         };
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 1);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            1,
+        );
         task.mm.key.store(5, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         assert!(task.root_generation().is_none());
@@ -2042,7 +2046,11 @@ mod tests {
         zone.enter_guest(slot);
         zone.install_space(slot, 5).unwrap();
         let task = carrick_el1_abi::CurrentTask::new();
-        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 1);
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            1,
+        );
         task.mm.key.store(5, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         assert!(root_execution(cpu, &task, zone, ttbr).is_none());
@@ -2101,7 +2109,10 @@ mod tests {
         assert!(
             diagnostic_identity(carrick_guest_arch::CpuId::new(2), &task, zone, ttbr).is_none()
         );
-        task.execution.generation.store(0, Ordering::Release);
+        task.execution.generation.store(
+            carrick_el1_abi::SnapshotGeneration::UNISSUED,
+            Ordering::Release,
+        );
         assert!(root_execution(cpu, &task, zone, ttbr).is_none());
         assert!(diagnostic_identity(cpu, &task, zone, ttbr).is_none());
     }

@@ -2,7 +2,7 @@
 fn arm_terminal_native_failure_authenticates_once_and_counts_exactly() {
     let binding = crate::ExecutionBinding {
         task: crate::EntryTaskKey::from_raw(41),
-        generation: crate::EntryGeneration::from_raw(11),
+        generation: crate::SnapshotGeneration::from_raw(11),
         mm: crate::EntryMmKey::from_raw(301),
         thread_generation: crate::EntryThreadGeneration::from_raw(101),
     };
@@ -30,7 +30,7 @@ fn arm_terminal_native_failure_authenticates_once_and_counts_exactly() {
 fn native_run_failure_is_bound_to_the_exact_thread_incarnation() {
     let binding = crate::ExecutionBinding {
         task: crate::EntryTaskKey::from_raw(41),
-        generation: crate::EntryGeneration::from_raw(11),
+        generation: crate::SnapshotGeneration::from_raw(11),
         mm: crate::EntryMmKey::from_raw(301),
         thread_generation: crate::EntryThreadGeneration::from_raw(101),
     };

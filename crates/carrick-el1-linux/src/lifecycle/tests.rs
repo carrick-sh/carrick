@@ -89,7 +89,9 @@ impl Venue {
                     tid,
                     visible_tid: visible,
                     thread_serial: CHILD_SERIAL + index as u64,
-                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+                    ),
                     uid_credit: 1,
                 },
             )
@@ -150,7 +152,11 @@ impl World {
         assert!(zone.occupancy.replace(here, 0, MM));
         let tasks: [CurrentTask; 4] = core::array::from_fn(|_| CurrentTask::new());
         let task = &tasks[SLOT_IDX];
-        task.set(El1TaskId::from_linux_tid(PARENT_TID as i32), 1, 5);
+        task.set(
+            El1TaskId::from_linux_tid(PARENT_TID as i32),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            5,
+        );
         task.mm.key.store(MM, Ordering::Relaxed);
         task.mm
             .thread_generation
@@ -1158,11 +1164,10 @@ fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
     let record = hosted.zone.alloc_record(identity).unwrap();
     hosted.zone.requeue_preempted(SLOT, record);
     assert_eq!(hosted.zone.switch_in(SLOT), Some(record));
-    hosted
-        .task()
-        .execution
-        .generation
-        .store(identity.generation, Ordering::Release);
+    hosted.task().execution.generation.store(
+        carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+        Ordering::Release,
+    );
     assert_eq!(hosted.page().live(), 2);
     assert_eq!(peer.page().live(), 2);
 
@@ -1262,8 +1267,11 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
         .reset_for_birth(BlockedMask(0), addr(&*word), entry)
         .unwrap();
     w.page().thread_born().unwrap();
-    w.task()
-        .set(El1TaskId::from_linux_tid(CHILD_TID as i32), 1, 5);
+    w.task().set(
+        El1TaskId::from_linux_tid(CHILD_TID as i32),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        5,
+    );
     let (action, _) = w.syscall(SYS_EXIT, &[0]);
     assert_eq!(action, Action::Forward);
     assert_eq!(*word, 9);
@@ -1327,7 +1335,7 @@ fn process_native_hooks_require_every_execution_identity_component() {
     assert!(world.venue.leader_slot().publish_visible_tid(41));
     let mut bindings = [expected; 5];
     bindings[1].task = carrick_el1_abi::EntryTaskKey::from_raw(99);
-    bindings[2].generation = carrick_el1_abi::EntryGeneration::from_raw(99);
+    bindings[2].generation = carrick_el1_abi::SnapshotGeneration::from_raw(99);
     bindings[3].mm = carrick_el1_abi::EntryMmKey::from_raw(99);
     bindings[4].thread_generation = carrick_el1_abi::EntryThreadGeneration::from_raw(99);
     for (index, binding) in bindings.into_iter().enumerate() {
@@ -1708,7 +1716,11 @@ fn clone_missing_nonleader_identity_cannot_inherit_leader() {
         .child_slot(1)
         .reset_for_birth(BlockedMask(0), 0, running)
         .unwrap();
-    w.task().set(El1TaskId::from_linux_tid(70), 1, 5);
+    w.task().set(
+        El1TaskId::from_linux_tid(70),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        5,
+    );
     assert_eq!(w.venue.child_slot(1).visible_tid(), None);
     let mut probe = BirthProbe {
         binding: crate::common_entry::execution_binding(w.task()),
@@ -1795,7 +1807,11 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
         .child_slot(1)
         .reset_for_birth(BlockedMask(0), 0, running)
         .unwrap();
-    w.task().set(El1TaskId::from_linux_tid(70), 1, 5);
+    w.task().set(
+        El1TaskId::from_linux_tid(70),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        5,
+    );
     assert!(w.venue.child_slot(1).publish_visible_tid(42));
     let mut probe = BirthProbe {
         binding: crate::common_entry::execution_binding(w.task()),
