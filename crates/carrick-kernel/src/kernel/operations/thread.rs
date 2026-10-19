@@ -1264,6 +1264,20 @@ mod tests {
             "{census}"
         );
         assert!(census.contains("returned_exact=false"), "{census}");
+        assert!(census.contains("owner_verdict=none"), "{census}");
+        page.record_closing_verdict(Some(carrick_core::terminal::ReadinessFailure::HostBorn {
+            index: 0,
+            expected: child
+                .thread()
+                .control_slot()
+                .host_birth_identity()
+                .expect("identity"),
+        }));
+        let census = root.thread().lifecycle_diagnostic();
+        assert!(
+            census.contains("owner_verdict live=2 claimed=0 first=HostBorn index=0"),
+            "{census}"
+        );
         let identity = child
             .thread()
             .control_slot()

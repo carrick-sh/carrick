@@ -1196,7 +1196,7 @@ impl Thread {
         control: &super::ThreadControlLease,
     ) -> String {
         let page = control.lifecycle();
-        match control.birth_controls_observed() {
+        let view = match control.birth_controls_observed() {
             Some(pins) => {
                 let pool: Vec<_> = pins
                     .iter()
@@ -1208,7 +1208,9 @@ impl Thread {
                 "{} (pool controls unavailable: pin table busy)",
                 page.closing_readiness(&[])
             ),
-        }
+        };
+        // The page view beside the owner's own last not-ready verdict.
+        ::std::format!("{view} {}", page.closing_verdict())
     }
 
     fn format_execution(execution: &ThreadExecutionRecord) -> String {
