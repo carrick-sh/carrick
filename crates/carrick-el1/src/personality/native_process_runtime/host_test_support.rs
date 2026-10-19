@@ -231,7 +231,7 @@ impl NativeSignalFixture {
         let slot = SlotId::new(0);
         task.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(tid as i32),
-            binding.generation.raw(),
+            binding.generation,
             5,
         );
         task.mm.key.store(mm, Ordering::Release);
@@ -240,6 +240,17 @@ impl NativeSignalFixture {
             .store(binding.thread_generation.raw(), Ordering::Release);
         task.publish_visible_pid(process.raw() as u32);
         task.publish_lifecycle(page as *const _ as u64, control as *const _ as u64);
+        control.publish_host_birth_identity(
+            carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                binding.task,
+                carrick_core_abi::entry::BirthSerial::of_task(
+                    carrick_sched_core::process::TaskSerial::from_raw_u64(binding.generation.raw())
+                        .unwrap(),
+                ),
+                binding.thread_generation,
+            )
+            .unwrap(),
+        );
         let address = AddressContext {
             root: RootGpa::page_aligned(FrameGpa::new(root)).unwrap(),
             mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
@@ -599,10 +610,10 @@ impl carrick_personality_linux::signal::SignalBackend for HostArmBackend {
 }
 
 pub fn empty_signal_checkpoint_lock_witness() {
-    use carrick_core_abi::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
+    use carrick_core_abi::{EntryMmKey, EntryTaskKey, EntryThreadGeneration, SnapshotGeneration};
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(123_450),
-        generation: EntryGeneration::from_raw(11),
+        generation: SnapshotGeneration::from_raw(11),
         mm: EntryMmKey::from_raw(1),
         thread_generation: EntryThreadGeneration::from_raw(101),
     };

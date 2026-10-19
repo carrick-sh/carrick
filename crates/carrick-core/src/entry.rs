@@ -1,8 +1,8 @@
 //! Neutral one-owner entry completion.
 use carrick_core_abi::{
-    BornEntryCompletion, BornInZoneSource, EntryCompletion, EntryContext, EntryGeneration,
-    EntryMmKey, EntryRecordBinding, EntryRecordGeneration, EntryRecordIncarnation, EntryTaskKey,
-    EntryThreadGeneration, ExecutionBinding, ExecutionIdentity, ExecutionMm,
+    BornEntryCompletion, BornInZoneSource, EntryCompletion, EntryContext, EntryMmKey,
+    EntryRecordBinding, EntryRecordGeneration, EntryRecordIncarnation, EntryTaskKey,
+    EntryThreadGeneration, ExecutionBinding, ExecutionIdentity, ExecutionMm, SnapshotGeneration,
 };
 use core::sync::atomic::Ordering;
 
@@ -12,7 +12,7 @@ pub fn binding(identity: &ExecutionIdentity, mm: &ExecutionMm) -> ExecutionBindi
     let generation = identity.generation.load(Ordering::Acquire);
     let captured = ExecutionBinding {
         task: EntryTaskKey::from_raw(identity.task.load(Ordering::Acquire)),
-        generation: EntryGeneration::from_raw(generation),
+        generation,
         mm: EntryMmKey::from_raw(mm.key.load(Ordering::Acquire)),
         thread_generation: EntryThreadGeneration::from_raw(
             mm.thread_generation.load(Ordering::Acquire),
@@ -23,7 +23,7 @@ pub fn binding(identity: &ExecutionIdentity, mm: &ExecutionMm) -> ExecutionBindi
     } else {
         ExecutionBinding {
             task: EntryTaskKey::from_raw(0),
-            generation: EntryGeneration::from_raw(0),
+            generation: SnapshotGeneration::UNISSUED,
             mm: EntryMmKey::from_raw(0),
             thread_generation: EntryThreadGeneration::from_raw(0),
         }
@@ -394,7 +394,7 @@ mod tests {
     fn wrong_generation_cannot_complete_admitted_entry() {
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(7),
-            generation: EntryGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(11),
             mm: EntryMmKey::from_raw(13),
             thread_generation: EntryThreadGeneration::from_raw(17),
         };
@@ -405,7 +405,7 @@ mod tests {
             complete(
                 completion,
                 ExecutionBinding {
-                    generation: EntryGeneration::from_raw(12),
+                    generation: SnapshotGeneration::from_raw(12),
                     ..binding
                 },
                 None,

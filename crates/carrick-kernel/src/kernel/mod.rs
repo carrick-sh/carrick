@@ -118,7 +118,7 @@ pub use objects::{
     TaskPendingSignals, TaskRef, TaskRusage, TaskShared, TaskSharedCloneError, TaskWaker, Thread,
     ThreadKey, ThreadRef, ThreadResources, ThreadRunner, ThreadSignalState, UnixDgramCred,
     UnixFlow, UnixLedger, UnixStreamCred, Zombie, evaluate_signal_delivery_action,
-    is_default_ignore_signal, is_default_stop_signal,
+    host_birth_identity, is_default_ignore_signal, is_default_stop_signal,
 };
 #[allow(unused_imports)]
 pub(crate) use objects::{

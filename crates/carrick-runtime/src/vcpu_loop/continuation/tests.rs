@@ -462,7 +462,7 @@ fn host_slot_signal_is_reserved_and_cancelled_into_exact_kernel_ownership() {
 fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
     use carrick_abi::LinuxTimespec;
     use carrick_core_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use carrick_el1::personality::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
@@ -498,7 +498,7 @@ fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
     custody.commit_native_signal_owner();
     let leader_binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(leader.thread().key().tid.raw() as u64),
-        generation: EntryGeneration::from_raw(leader.task().key().serial.raw()),
+        generation: SnapshotGeneration::from_raw(leader.task().key().serial.raw()),
         mm: EntryMmKey::from_raw(leader.shared().mm().id().raw()),
         thread_generation: EntryThreadGeneration::from_raw(leader.thread().key().serial.raw()),
     };
@@ -599,7 +599,7 @@ fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
 #[test]
 fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
     use carrick_core_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use carrick_el1::personality::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
@@ -616,7 +616,7 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
         let control = context.thread().control_slot();
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-            generation: EntryGeneration::from_raw(context.task().key().serial.raw()),
+            generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
             mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
             thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
         };
@@ -724,14 +724,14 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
 #[test]
 fn serial_host_empty_native_checkpoint_restarts_forwarded_read() {
     use carrick_core_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use carrick_el1::personality::native_process_runtime::host_test_support::NativeSignalFixture;
 
     let fixture = NativeSignalFixture::new(
         ExecutionBinding {
             task: EntryTaskKey::from_raw(153_830),
-            generation: EntryGeneration::from_raw(1),
+            generation: SnapshotGeneration::from_raw(1),
             mm: EntryMmKey::from_raw(1),
             thread_generation: EntryThreadGeneration::from_raw(1),
         },
@@ -759,7 +759,7 @@ fn serial_host_empty_native_checkpoint_restarts_forwarded_read() {
 #[test]
 fn serial_host_native_owned_write_park_ignores_caught_sigalrm_until_sigkill() {
     use carrick_core_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use carrick_el1::personality::native_process_runtime::host_test_support::NativeSignalFixture;
 
@@ -768,7 +768,7 @@ fn serial_host_native_owned_write_park_ignores_caught_sigalrm_until_sigkill() {
     let control = context.thread().control_slot();
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-        generation: EntryGeneration::from_raw(context.task().key().serial.raw()),
+        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
         mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
         thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
     };
@@ -827,7 +827,7 @@ fn serial_host_native_owned_write_park_ignores_caught_sigalrm_until_sigkill() {
 #[test]
 fn serial_host_ignored_sigint_does_not_interrupt_forwarded_read() {
     use carrick_core_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use carrick_el1::personality::native_process_runtime::host_test_support::NativeSignalFixture;
 
@@ -836,7 +836,7 @@ fn serial_host_ignored_sigint_does_not_interrupt_forwarded_read() {
     let control = context.thread().control_slot();
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-        generation: EntryGeneration::from_raw(context.task().key().serial.raw()),
+        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
         mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
         thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
     };
@@ -878,7 +878,7 @@ fn serial_host_ignored_sigint_does_not_interrupt_forwarded_read() {
 #[test]
 fn serial_host_sibling_stealing_process_sigint_restarts_blocked_read() {
     use carrick_core_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use carrick_el1::personality::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
@@ -889,7 +889,7 @@ fn serial_host_sibling_stealing_process_sigint_restarts_blocked_read() {
     let control = context.thread().control_slot();
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-        generation: EntryGeneration::from_raw(context.task().key().serial.raw()),
+        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
         mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
         thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
     };
@@ -982,7 +982,7 @@ fn serial_host_sibling_stealing_process_sigint_restarts_blocked_read() {
 #[test]
 fn serial_host_pselect_stolen_signal_restores_mask_before_guest_sigprocmask() {
     use carrick_core_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use carrick_el1::personality::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
@@ -996,7 +996,7 @@ fn serial_host_pselect_stolen_signal_restores_mask_before_guest_sigprocmask() {
     context.signal_authority().set_blocked(SigSet::from_raw(2));
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-        generation: EntryGeneration::from_raw(context.task().key().serial.raw()),
+        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
         mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
         thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
     };
@@ -1087,7 +1087,7 @@ fn serial_host_pselect_stolen_signal_restores_mask_before_guest_sigprocmask() {
 #[test]
 fn serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint() {
     use carrick_core_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use carrick_el1::personality::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
@@ -1102,7 +1102,7 @@ fn serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint() {
     context.signal_authority().set_blocked(SigSet::from_raw(2));
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-        generation: EntryGeneration::from_raw(context.task().key().serial.raw()),
+        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
         mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
         thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
     };
@@ -1189,7 +1189,7 @@ fn serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint() {
 #[test]
 fn serial_host_two_live_reads_share_one_process_signal_wake() {
     use carrick_core_abi::{
-        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use carrick_el1::personality::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
@@ -1237,7 +1237,7 @@ fn serial_host_two_live_reads_share_one_process_signal_wake() {
         let generation = publish(context, marker);
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-            generation: EntryGeneration::from_raw(context.task().key().serial.raw()),
+            generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
             mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
             thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
         };

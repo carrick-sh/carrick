@@ -4460,10 +4460,10 @@ mod carrier_vm_custody_tests {
     fn committed_child_in_fork_stock_drops_with_carrier_and_releases_stage2_pins_on_destroy() {
         use carrick_aarch64::fork::ForkCustody;
         use carrick_el1_abi::{
-            EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
-            ForkLifecycleLoan, ForkStockExchange, ForkStockRequest, ForkStockSettlement,
-            PortalForkCompletion, PortalForkCustody, PortalOperation, ReservationGeneration,
-            ReservationMm,
+            EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, ForkLifecycleLoan,
+            ForkStockExchange, ForkStockRequest, ForkStockSettlement, PortalForkCompletion,
+            PortalForkCustody, PortalOperation, ReservationGeneration, ReservationMm,
+            SnapshotGeneration,
         };
         use carrick_guest_arch::{
             AddressContext, ContextGeneration, CpuId, FrameGpa, KernelVa, MmGeneration, RootGpa,
@@ -4515,7 +4515,7 @@ mod carrier_vm_custody_tests {
                     CpuId::new(0),
                     ExecutionBinding {
                         task: EntryTaskKey::from_raw(41),
-                        generation: EntryGeneration::from_raw(11),
+                        generation: SnapshotGeneration::from_raw(11),
                         mm: EntryMmKey::from_raw(301),
                         thread_generation: EntryThreadGeneration::from_raw(101),
                     },

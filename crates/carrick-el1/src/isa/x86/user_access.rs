@@ -119,9 +119,10 @@ impl UserTransfer {
         if !current_task(owner) || !lower_half_range(user.raw(), total.raw()) {
             return Err(ArchError::Unbound);
         }
-        let task_generation = NonZeroU64::new(owner.execution.generation.load(Ordering::Acquire))
-            .map(TaskGeneration)
-            .ok_or(ArchError::Unbound)?;
+        let task_generation =
+            NonZeroU64::new(owner.execution.generation.load(Ordering::Acquire).raw())
+                .map(TaskGeneration)
+                .ok_or(ArchError::Unbound)?;
         let mm = NonZeroU64::new(owner.mm.key.load(Ordering::Acquire))
             .map(MmKey)
             .ok_or(ArchError::Unbound)?;
@@ -149,7 +150,8 @@ impl UserTransfer {
         // transfer, and the current-task check runs before any user access.
         let owner = unsafe { self.owner.as_ref() };
         if !current_task(owner)
-            || owner.execution.generation.load(Ordering::Acquire) != self.task_generation.0.get()
+            || owner.execution.generation.load(Ordering::Acquire).raw()
+                != self.task_generation.0.get()
             || owner.mm.key.load(Ordering::Acquire) != self.mm.0.get()
             || owner.mm.thread_generation.load(Ordering::Acquire) != self.thread_generation.0.get()
             || live_root() != self.root

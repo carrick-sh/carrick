@@ -111,7 +111,11 @@ const SWITCHED: Option<Served> = Some(Served::Returned { switched: true });
 /// The slot's task record naming the host-loaded thread `tid`.
 fn task_for(tid: u64) -> CurrentTask {
     let task = CurrentTask::new();
-    task.set(El1TaskId::from_linux_tid(tid as i32), 1, 5);
+    task.set(
+        El1TaskId::from_linux_tid(tid as i32),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        5,
+    );
     task.mm.key.store(MM, Ordering::Relaxed);
     task.mm
         .thread_generation

@@ -107,7 +107,7 @@ pub struct ExternalSignalRecord {
     source: ExternalSignalSource,
     scope: ExternalSignalScope,
     process_id: carrick_core_abi::EntryTaskKey,
-    process_generation: carrick_core_abi::EntryGeneration,
+    process_generation: carrick_core_abi::SnapshotGeneration,
     timer: ExternalSignalTimerInfo,
 }
 
@@ -181,7 +181,7 @@ impl ExternalSignalRecord {
     pub const fn for_process(
         mut self,
         id: carrick_core_abi::EntryTaskKey,
-        generation: carrick_core_abi::EntryGeneration,
+        generation: carrick_core_abi::SnapshotGeneration,
     ) -> Self {
         self.process_id = id;
         self.process_generation = generation;
@@ -192,7 +192,7 @@ impl ExternalSignalRecord {
         self.process_id
     }
 
-    pub const fn process_generation(self) -> carrick_core_abi::EntryGeneration {
+    pub const fn process_generation(self) -> carrick_core_abi::SnapshotGeneration {
         self.process_generation
     }
 
@@ -453,7 +453,7 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.raw() < second.raw());
     }
-    use carrick_core_abi::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
+    use carrick_core_abi::{EntryMmKey, EntryTaskKey, EntryThreadGeneration, SnapshotGeneration};
     use carrick_sched_core::RecordId;
 
     #[test]
@@ -472,7 +472,7 @@ mod tests {
     fn external_event_rejects_reused_task_binding_and_record() {
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(41),
-            generation: EntryGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(11),
             mm: EntryMmKey::from_raw(301),
             thread_generation: EntryThreadGeneration::from_raw(101),
         };
@@ -494,7 +494,7 @@ mod tests {
             !event.matches_live(
                 EntryEventIdentity::from_parts(
                     binding.task,
-                    EntryGeneration::from_raw(12),
+                    SnapshotGeneration::from_raw(12),
                     binding.thread_generation,
                 )
                 .unwrap(),
@@ -505,7 +505,7 @@ mod tests {
         assert!(!event.matches_live(
             identity,
             ExecutionBinding {
-                generation: EntryGeneration::from_raw(12),
+                generation: SnapshotGeneration::from_raw(12),
                 ..binding
             },
             record
@@ -525,7 +525,7 @@ mod tests {
         let queue = SignalIngressQueue::<2>::new();
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(41),
-            generation: EntryGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(11),
             mm: EntryMmKey::from_raw(301),
             thread_generation: EntryThreadGeneration::from_raw(101),
         };
@@ -559,7 +559,7 @@ mod tests {
         let queue = SignalIngressQueue::<2>::new();
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(41),
-            generation: EntryGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(11),
             mm: EntryMmKey::from_raw(301),
             thread_generation: EntryThreadGeneration::from_raw(101),
         };
@@ -631,7 +631,7 @@ mod tests {
                 scope.spawn(move || {
                     let binding = ExecutionBinding {
                         task: EntryTaskKey::from_raw(41),
-                        generation: EntryGeneration::from_raw(11),
+                        generation: SnapshotGeneration::from_raw(11),
                         mm: EntryMmKey::from_raw(301),
                         thread_generation: EntryThreadGeneration::from_raw(101),
                     };

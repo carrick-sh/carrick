@@ -16,7 +16,7 @@ pub(crate) struct HostIngressTarget {
     record: RecordRef,
     bridge_thread: carrick_hal::ThreadId,
     process_id: carrick_core_abi::EntryTaskKey,
-    process_generation: carrick_core_abi::EntryGeneration,
+    process_generation: carrick_core_abi::SnapshotGeneration,
 }
 
 impl HostIngressTarget {
@@ -28,7 +28,7 @@ impl HostIngressTarget {
         let tid = thread.key().tid;
         let binding = ExecutionBinding {
             task: carrick_core_abi::EntryTaskKey::from_raw(tid.raw() as u64),
-            generation: carrick_core_abi::EntryGeneration::from_raw(
+            generation: carrick_core_abi::SnapshotGeneration::from_raw(
                 context.task().key().serial.raw(),
             ),
             mm: carrick_core_abi::EntryMmKey::from_raw(context.shared().mm().id().raw()),
@@ -50,7 +50,7 @@ impl HostIngressTarget {
             process_id: carrick_core_abi::EntryTaskKey::from_raw(
                 context.task().key().id.raw() as u64
             ),
-            process_generation: carrick_core_abi::EntryGeneration::from_raw(
+            process_generation: carrick_core_abi::SnapshotGeneration::from_raw(
                 context.task().key().serial.raw(),
             ),
         })
@@ -172,8 +172,8 @@ impl HostSignalIngressProducer {
 mod tests {
     use super::*;
     use carrick_core_abi::{
-        EntryEventIdentity, EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration,
-        ExecutionBinding,
+        EntryEventIdentity, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        SnapshotGeneration,
     };
     use carrick_el1_abi::{
         ExternalSignalRecord, ExternalSignalSource, SignalEventGeneration, SignalIngressQueue,
@@ -260,7 +260,7 @@ mod tests {
         let queue = SignalIngressQueue::<2>::new();
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(41),
-            generation: EntryGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(11),
             mm: EntryMmKey::from_raw(301),
             thread_generation: EntryThreadGeneration::from_raw(101),
         };
@@ -285,7 +285,7 @@ mod tests {
             record,
             bridge_thread: carrick_hal::ThreadId::synthetic_for_tests(41),
             process_id: EntryTaskKey::from_raw(41),
-            process_generation: EntryGeneration::from_raw(11),
+            process_generation: SnapshotGeneration::from_raw(11),
         };
         let mut producer = HostSignalIngressProducer::new();
         let mut consumed = 0;
@@ -334,7 +334,7 @@ mod tests {
         let queue = SignalIngressQueue::<2>::new();
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(61),
-            generation: EntryGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(11),
             mm: EntryMmKey::from_raw(301),
             thread_generation: EntryThreadGeneration::from_raw(101),
         };
@@ -346,7 +346,7 @@ mod tests {
             },
             bridge_thread: carrick_hal::ThreadId::synthetic_for_tests(61),
             process_id: EntryTaskKey::from_raw(61),
-            process_generation: EntryGeneration::from_raw(11),
+            process_generation: SnapshotGeneration::from_raw(11),
         };
         carrick_signal_linux::publish_process_signal(2);
         let mut producer = HostSignalIngressProducer::new();

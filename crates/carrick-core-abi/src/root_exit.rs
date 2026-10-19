@@ -83,11 +83,11 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
+    use crate::{EntryMmKey, EntryTaskKey, EntryThreadGeneration, SnapshotGeneration};
     fn binding() -> ExecutionBinding {
         ExecutionBinding {
             task: EntryTaskKey::from_raw(41),
-            generation: EntryGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(11),
             mm: EntryMmKey::from_raw(301),
             thread_generation: EntryThreadGeneration::from_raw(101),
         }
@@ -138,7 +138,7 @@ mod tests {
             words[index] = 0;
             let bad = ExecutionBinding {
                 task: EntryTaskKey::from_raw(words[1]),
-                generation: EntryGeneration::from_raw(words[2]),
+                generation: SnapshotGeneration::from_raw(words[2]),
                 mm: EntryMmKey::from_raw(words[3]),
                 thread_generation: EntryThreadGeneration::from_raw(words[4]),
             };

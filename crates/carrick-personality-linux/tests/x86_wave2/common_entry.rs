@@ -118,12 +118,12 @@ impl World {
         let tasks = [CurrentTask::new(), CurrentTask::new()];
         tasks[0].set(
             carrick_el1_abi::El1TaskId::from_linux_tid(TID_A as i32),
-            1,
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
             5,
         );
         tasks[1].set(
             carrick_el1_abi::El1TaskId::from_linux_tid(TID_B as i32),
-            2,
+            carrick_el1_abi::SnapshotGeneration::from_raw(2),
             5,
         );
         for (index, task) in tasks.iter().enumerate() {
@@ -297,7 +297,7 @@ fn x86_brk_enters_the_common_linux_anonymous_route() {
 
 #[test]
 fn anonymous_result_is_not_installed_after_execution_changes() {
-    struct InvalidatingAnonymous<'a>(&'a AtomicU64);
+    struct InvalidatingAnonymous<'a>(&'a carrick_el1_abi::AtomicSnapshotGeneration);
     impl PendingAnonymousVenue for InvalidatingAnonymous<'_> {
         fn original_argument0(&self) -> u64 {
             0x7000
@@ -306,7 +306,11 @@ fn anonymous_result_is_not_installed_after_execution_changes() {
             None
         }
         fn delegated(&mut self) -> DelegatedStep {
-            self.0.fetch_add(1, Ordering::AcqRel);
+            let generation = self.0.load(Ordering::Acquire);
+            self.0.store(
+                carrick_el1_abi::SnapshotGeneration::from_raw(generation.raw() + 1),
+                Ordering::Release,
+            );
             DelegatedStep::Served(SyscallResult::new(0x403000))
         }
         fn park_prepared(&mut self) -> Option<FamilyCompletion> {
@@ -503,7 +507,10 @@ fn unissued_task_cannot_bypass_crossing_admission() {
 #[test]
 fn cleared_execution_generation_cannot_publish_to_a_retained_slot() {
     let w = World::new(LifecycleHatches::ON);
-    w.tasks[0].execution.generation.store(0, Ordering::Release);
+    w.tasks[0].execution.generation.store(
+        carrick_el1_abi::SnapshotGeneration::UNISSUED,
+        Ordering::Release,
+    );
     assert_eq!(w.robust(0, 0xa000, 24).0, Action::Served);
     assert_eq!(w.heads(), [(0, 0), (0, 0)]);
     assert_eq!(w.publications.load(Ordering::Relaxed), 0);
@@ -619,11 +626,18 @@ pub(super) fn x4_linux_common_entry() {
         snapshot.isa = GuestIsa::X86_64;
         snapshot.abi = carrick_guest_arch::NativeAbi::Aarch64El0;
         assert!(decode_x86_snapshot(snapshot).is_none());
-        for word in [
-            &w.tasks[0].execution.generation,
-            &w.tasks[0].mm.key,
-            &w.tasks[0].mm.thread_generation,
-        ] {
+        let generation = w.tasks[0].execution.generation.load(Ordering::Acquire);
+        w.tasks[0].execution.generation.store(
+            carrick_el1_abi::SnapshotGeneration::from_raw(generation.raw() + 1),
+            Ordering::Release,
+        );
+        assert_eq!(w.robust(0, 0xdead, 24).0, Action::ServedWithWork);
+        assert_eq!(w.heads(), before);
+        w.tasks[0]
+            .execution
+            .generation
+            .store(generation, Ordering::Release);
+        for word in [&w.tasks[0].mm.key, &w.tasks[0].mm.thread_generation] {
             let original = word.load(Ordering::Acquire);
             word.store(original + 1, Ordering::Release);
             assert_eq!(w.robust(0, 0xdead, 24).0, Action::ServedWithWork);
@@ -973,7 +987,7 @@ fn compact_common_entry_suspends_only_after_authenticated_park() {
         assert_eq!(zone.switch_in(slot), Some(record));
         let binding = carrick_core_abi::ExecutionBinding {
             task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid),
-            generation: carrick_core_abi::EntryGeneration::from_raw(identity.generation),
+            generation: carrick_core_abi::SnapshotGeneration::from_raw(identity.generation),
             mm: carrick_core_abi::EntryMmKey::from_raw(identity.mm),
             thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(identity.serial),
         };
@@ -988,7 +1002,7 @@ fn compact_common_entry_suspends_only_after_authenticated_park() {
         let mut world = World::new(LifecycleHatches::ON);
         world.tasks[1].set(
             carrick_el1_abi::El1TaskId::from_linux_tid(identity.tid.try_into().unwrap()),
-            identity.generation,
+            carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
             identity.file_table,
         );
         world.tasks[1].mm.key.store(identity.mm, Ordering::Release);

@@ -12,6 +12,23 @@ use parking_lot::Mutex;
 
 use super::{TaskKey, ThreadKey};
 
+/// The exact birth identity of a host thread: its tid, the process
+/// incarnation it belongs to and its thread serial. The host records it in the
+/// thread's control slot when the slot is allocated and publishes exactly this
+/// receipt when it retires the thread; the ring owes exactly this receipt.
+pub fn host_birth_identity(
+    task: TaskKey,
+    thread: ThreadKey,
+) -> Option<carrick_core::terminal::ThreadBirthIdentity> {
+    carrick_core::terminal::ThreadBirthIdentity::from_parts(
+        carrick_el1_abi::EntryTaskKey::from_raw(
+            carrick_el1_abi::El1TaskId::from_linux_tid(thread.tid.raw()).raw(),
+        ),
+        carrick_el1_abi::BirthSerial::of_task(task.serial),
+        carrick_el1_abi::EntryThreadGeneration::from_raw(thread.serial.raw()),
+    )
+}
+
 const PAGE_BYTES: usize = 16 * 1024;
 const SLAB_BYTES: usize = 512 * 1024;
 const SLAB_GRANULES: usize = SLAB_BYTES / PAGE_BYTES;

@@ -267,7 +267,7 @@ impl ForkStockExchange {
     }
 
     pub fn request(&self) -> Option<ForkStockRequest> {
-        use crate::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
+        use crate::{EntryMmKey, EntryTaskKey, EntryThreadGeneration, SnapshotGeneration};
         use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
         if ForkStockKind::decode(self.tag) != Some(ForkStockKind::Loan) {
             return None;
@@ -279,7 +279,7 @@ impl ForkStockExchange {
         let request = ForkStockRequest {
             binding: ExecutionBinding {
                 task: EntryTaskKey::from_raw(w[0]),
-                generation: EntryGeneration::from_raw(w[1]),
+                generation: SnapshotGeneration::from_raw(w[1]),
                 mm: EntryMmKey::from_raw(w[2]),
                 thread_generation: EntryThreadGeneration::from_raw(w[3]),
             },
@@ -782,7 +782,7 @@ const _: () = {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
+    use crate::{EntryMmKey, EntryTaskKey, EntryThreadGeneration, SnapshotGeneration};
     use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
 
     #[test]
@@ -796,7 +796,7 @@ mod tests {
         assert_eq!(core::mem::offset_of!(NativeRootExit, words), 0);
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(41),
-            generation: EntryGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(11),
             mm: EntryMmKey::from_raw(301),
             thread_generation: EntryThreadGeneration::from_raw(101),
         };
@@ -851,7 +851,7 @@ mod tests {
         ForkStockRequest {
             binding: ExecutionBinding {
                 task: EntryTaskKey::from_raw(41),
-                generation: EntryGeneration::from_raw(11),
+                generation: SnapshotGeneration::from_raw(11),
                 mm: EntryMmKey::from_raw(301),
                 thread_generation: EntryThreadGeneration::from_raw(101),
             },

@@ -3197,7 +3197,7 @@ mod tests {
             carrick_guest_arch::CpuId::new(0),
             carrick_el1_abi::ExecutionBinding {
                 task: carrick_el1_abi::EntryTaskKey::from_raw(task),
-                generation: carrick_el1_abi::EntryGeneration::from_raw(11),
+                generation: carrick_el1_abi::SnapshotGeneration::from_raw(11),
                 mm: carrick_el1_abi::EntryMmKey::from_raw(mm),
                 thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
             },

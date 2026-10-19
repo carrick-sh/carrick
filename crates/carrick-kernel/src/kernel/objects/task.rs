@@ -851,11 +851,17 @@ impl Task {
         }
     }
 
+    /// Every control slot records its thread's exact birth identity before
+    /// the thread can run, so an entry-less member always owes one receipt.
     pub(in crate::kernel) fn allocate_thread_control(
         &self,
         key: ThreadKey,
     ) -> super::ThreadControlLease {
-        self.controls.allocate(key)
+        let control = self.controls.allocate(key);
+        if let Some(identity) = super::host_birth_identity(self.key(), key) {
+            control.publish_host_birth_identity(identity);
+        }
+        control
     }
 
     pub(in crate::kernel) fn owns_thread_control(

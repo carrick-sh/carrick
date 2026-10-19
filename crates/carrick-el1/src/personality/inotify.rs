@@ -321,7 +321,11 @@ mod tests {
         extern crate std;
         let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
         let task = CurrentTask::new();
-        task.set(El1TaskId::from_linux_tid(1), 1, 7);
+        task.set(
+            El1TaskId::from_linux_tid(1),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            7,
+        );
         let instance = std::boxed::Box::new(live_instance(&fd_map, 7, 4));
         for wd in 1..=128 {
             let _ = instance.push_record(wd, 0x8000, 0, None);
@@ -355,7 +359,11 @@ mod tests {
         extern crate std;
         let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
         let task = CurrentTask::new();
-        task.set(El1TaskId::from_linux_tid(1), 1, 7);
+        task.set(
+            El1TaskId::from_linux_tid(1),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            7,
+        );
         let instance = std::boxed::Box::new(live_instance(&fd_map, 7, 4));
         let _ = instance.push_record(1, 0x2, 0, None);
         let _ = instance.push_record(2, 0x2, 0, None);
@@ -373,7 +381,11 @@ mod tests {
         extern crate std;
         let fd_map = [FdMapSlot::new(), FdMapSlot::new()];
         let task = CurrentTask::new();
-        task.set(El1TaskId::from_linux_tid(1), 1, 7);
+        task.set(
+            El1TaskId::from_linux_tid(1),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            7,
+        );
         let instance = std::boxed::Box::new(live_instance(&fd_map, 7, 4));
         instance.spilled.store(1, Ordering::Release);
         let table = core::slice::from_ref(&*instance);
@@ -398,7 +410,11 @@ mod tests {
     #[test]
     fn a_short_read_of_a_non_inotify_fd_forwards() {
         let task = CurrentTask::new();
-        task.set(El1TaskId::from_linux_tid(1), 1, 7);
+        task.set(
+            El1TaskId::from_linux_tid(1),
+            carrick_el1_abi::SnapshotGeneration::from_raw(1),
+            7,
+        );
         for count in [1usize, 4, 15, 16, 64] {
             assert_eq!(
                 el1_inotify_read(3, 0x1000, count, &task, &[], &[], &AllWritable),

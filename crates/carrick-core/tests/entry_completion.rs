@@ -3,8 +3,8 @@
 use carrick_core::entry::{CompletionError, admit, complete, handoff};
 use carrick_core::wait::{notify_object, park_object_record, take_object_operation};
 use carrick_core_abi::{
-    EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
-    ObjectParkRequest,
+    EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, ObjectParkRequest,
+    SnapshotGeneration,
 };
 use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
 use carrick_sched_core::{ExecutionSlot, SlotId, ThreadIdentity, ZoneTables};
@@ -56,7 +56,7 @@ fn suspended_turn_completes_only_through_exact_wait_owner() {
             };
             let binding = ExecutionBinding {
                 task: EntryTaskKey::from_raw(41),
-                generation: EntryGeneration::from_raw(generation),
+                generation: SnapshotGeneration::from_raw(generation),
                 mm: EntryMmKey::from_raw(mm),
                 thread_generation: EntryThreadGeneration::from_raw(identity.serial),
             };
@@ -96,14 +96,14 @@ fn suspended_turn_completes_only_through_exact_wait_owner() {
 fn switched_record_cannot_use_captured_binding_for_ordinary_completion() {
     let original = ExecutionBinding {
         task: EntryTaskKey::from_raw(41),
-        generation: EntryGeneration::from_raw(11),
+        generation: SnapshotGeneration::from_raw(11),
         mm: EntryMmKey::from_raw(7),
         thread_generation: EntryThreadGeneration::from_raw(101),
     };
     // Same visible TID, but a different exact execution/MM/thread owner.
     for current in [
         ExecutionBinding {
-            generation: EntryGeneration::from_raw(12),
+            generation: SnapshotGeneration::from_raw(12),
             ..original
         },
         ExecutionBinding {
@@ -156,7 +156,7 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
     assert_eq!(zone.switch_in(slot), Some(record));
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(id.tid),
-        generation: EntryGeneration::from_raw(0),
+        generation: SnapshotGeneration::from_raw(0),
         mm: EntryMmKey::from_raw(id.mm),
         thread_generation: EntryThreadGeneration::from_raw(id.serial),
     };
@@ -244,7 +244,7 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
     // Adoption publishes a nonzero host generation. The same thread now uses
     // ordinary admission and the Born constructor refuses both representations.
     let adopted = ExecutionBinding {
-        generation: EntryGeneration::from_raw(11),
+        generation: SnapshotGeneration::from_raw(11),
         ..binding
     };
     assert!(admit_born_in_zone(adopted, source).is_none());
@@ -293,7 +293,7 @@ fn ordinary_handoff_rejects_foreign_scheduler_owner() {
     }
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(41),
-        generation: EntryGeneration::from_raw(11),
+        generation: SnapshotGeneration::from_raw(11),
         mm: EntryMmKey::from_raw(7),
         thread_generation: EntryThreadGeneration::from_raw(101),
     };
@@ -372,7 +372,7 @@ fn running_compact(
         record,
         ExecutionBinding {
             task: EntryTaskKey::from_raw(identity.tid),
-            generation: EntryGeneration::from_raw(generation),
+            generation: SnapshotGeneration::from_raw(generation),
             mm: EntryMmKey::from_raw(identity.mm),
             thread_generation: EntryThreadGeneration::from_raw(identity.serial),
         },

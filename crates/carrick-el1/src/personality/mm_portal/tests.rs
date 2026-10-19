@@ -3215,7 +3215,11 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
             ));
             zone.enter_guest(slot);
             let task = CurrentTask::new();
-            task.set(El1TaskId::from_linux_tid(101), 1, 5);
+            task.set(
+                El1TaskId::from_linux_tid(101),
+                carrick_el1_abi::SnapshotGeneration::from_raw(1),
+                5,
+            );
             task.mm.key.store(mm.raw(), Ordering::Release);
             task.mm.thread_generation.store(1101, Ordering::Release);
             task.linux.mark_pending_host_work(); // deterministic leave, no WFI.
@@ -3504,7 +3508,11 @@ fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
     );
     zone.enter_guest(slot);
     let task = CurrentTask::new();
-    task.set(El1TaskId::from_linux_tid(101), 1, 5);
+    task.set(
+        El1TaskId::from_linux_tid(101),
+        carrick_el1_abi::SnapshotGeneration::from_raw(1),
+        5,
+    );
     task.mm.key.store(mm.raw(), Ordering::Release);
     task.mm.thread_generation.store(1101, Ordering::Release);
     task.linux.mark_pending_host_work();
