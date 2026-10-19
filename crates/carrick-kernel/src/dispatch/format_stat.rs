@@ -2,8 +2,8 @@
 
 use carrick_abi::{
     LINUX_AT_EACCESS, LINUX_AT_EMPTY_PATH, LINUX_AT_NO_AUTOMOUNT, LINUX_AT_SYMLINK_NOFOLLOW,
-    LINUX_EFAULT, LINUX_PAGE_SIZE, LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFMT, LINUX_S_IFREG,
-    LinuxStat, LinuxStatx, LinuxStatxTimestamp, LinuxX8664Stat,
+    LINUX_PAGE_SIZE, LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFMT, LINUX_S_IFREG, LinuxStat,
+    LinuxStatx, LinuxStatxTimestamp, LinuxX8664Stat,
 };
 pub(crate) use carrick_abi::{
     LINUX_AT_STATX_DONT_SYNC, LINUX_AT_STATX_FORCE_SYNC, LINUX_STATX_BASIC_STATS,
@@ -11,9 +11,9 @@ pub(crate) use carrick_abi::{
 };
 use carrick_guest_mem::CurrentMmMemory;
 
+use super::copyout::copyout_record;
 use super::{
     DispatchOutcome, RootFsMetadata, StatRecord, blocks_512, linux_dev_major, linux_dev_minor,
-    write_kernel_struct, write_kernel_struct_raw,
 };
 
 pub(crate) fn linux_statx_flags_are_supported(flags: u64) -> bool {
@@ -64,13 +64,12 @@ pub(super) fn write_stat_record(
         __unused5: 0,
     };
 
-    if write_kernel_struct_raw(memory, statbuf, &stat).is_err() {
-        DispatchOutcome::Errno {
-            errno: LINUX_EFAULT,
-        }
-    } else {
-        DispatchOutcome::Returned { value: 0 }
-    }
+    copyout_record(
+        memory,
+        statbuf,
+        &stat,
+        DispatchOutcome::Returned { value: 0 },
+    )
 }
 
 pub(super) fn write_x8664_stat_record(
@@ -104,13 +103,12 @@ pub(super) fn write_x8664_stat_record(
         __reserved: [0; 3],
     };
 
-    if write_kernel_struct_raw(memory, statbuf, &stat).is_err() {
-        DispatchOutcome::Errno {
-            errno: LINUX_EFAULT,
-        }
-    } else {
-        DispatchOutcome::Returned { value: 0 }
-    }
+    copyout_record(
+        memory,
+        statbuf,
+        &stat,
+        DispatchOutcome::Returned { value: 0 },
+    )
 }
 
 /// Build a [`RealStat`](carrick_vfs::fs_backend::RealStat) from a live `libc::stat`
@@ -204,7 +202,12 @@ pub(super) fn write_statx_record(
         __spare2: [0; 1],
         __spare3: [0; 8],
     };
-    write_kernel_struct(memory, statxbuf, &statx)
+    copyout_record(
+        memory,
+        statxbuf,
+        &statx,
+        DispatchOutcome::Returned { value: 0 },
+    )
 }
 
 pub(crate) fn write_synthetic_statx(

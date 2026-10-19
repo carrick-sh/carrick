@@ -1895,6 +1895,74 @@ pub(super) fn host_to_linux_sockaddr(
     }
 }
 
+/// A prepared `(addr, *addrlen)` sockaddr output pair. Linux reads the
+/// caller's `*addrlen`, writes at most that many address bytes, and stores
+/// the full required length back. Both outputs are prepared together before
+/// the caller's side effect (an accept dequeue), then committed.
+///
+/// Linux reports a bad length pointer only at the copyout, after the side
+/// effect, so an unreadable `*addrlen` is held until the commit like any
+/// other invalid output pointer.
+pub(in crate::dispatch) enum PreparedSockaddr<'m, M: CurrentMmMemory> {
+    Ready(crate::dispatch::copyout::PreparedCopyout<'m, M, 2>),
+    Faulted,
+}
+
+pub(in crate::dispatch) fn prepare_linux_sockaddr<M: CurrentMmMemory>(
+    memory: &mut M,
+    addr: u64,
+    addrlen_addr: u64,
+) -> Result<PreparedSockaddr<'_, M>, crate::dispatch::copyout::CopyoutRefusal> {
+    use crate::dispatch::copyout::{UserSlot, prepare};
+    if addrlen_addr == 0 {
+        return Ok(PreparedSockaddr::Faulted);
+    }
+    let Ok(cur_bytes) = memory.read_bytes(addrlen_addr, 4) else {
+        return Ok(PreparedSockaddr::Faulted);
+    };
+    let cur = u32::from_ne_bytes([cur_bytes[0], cur_bytes[1], cur_bytes[2], cur_bytes[3]]) as usize;
+    let capacity = cur.min(LINUX_SOCKADDR_STORAGE_SIZE);
+    Ok(PreparedSockaddr::Ready(prepare(
+        memory,
+        [
+            UserSlot::optional(addr, capacity),
+            Some(UserSlot::new(addrlen_addr, 4)),
+        ],
+    )?))
+}
+
+impl<M: CurrentMmMemory> PreparedSockaddr<'_, M> {
+    pub(in crate::dispatch) fn commit(
+        self,
+        bytes: &[u8],
+    ) -> Result<(), crate::dispatch::copyout::CopyoutFault> {
+        match self {
+            Self::Ready(out) => {
+                let written = out.capacity(0).min(bytes.len());
+                out.commit([&bytes[..written], &(bytes.len() as u32).to_ne_bytes()])
+            }
+            Self::Faulted => Err(crate::dispatch::copyout::CopyoutFault),
+        }
+    }
+}
+
+/// Prepare and commit a sockaddr from a handler with nothing irrevocable
+/// behind it (getsockname, getpeername): a refusal or fault is the answer.
+pub(in crate::dispatch) fn copyout_linux_sockaddr(
+    memory: &mut impl CurrentMmMemory,
+    addr: u64,
+    addrlen_addr: u64,
+    bytes: &[u8],
+) -> DispatchOutcome {
+    match prepare_linux_sockaddr(memory, addr, addrlen_addr) {
+        Ok(out) => match out.commit(bytes) {
+            Ok(()) => DispatchOutcome::Returned { value: 0 },
+            Err(fault) => fault.outcome(),
+        },
+        Err(refusal) => refusal.into_outcome(),
+    }
+}
+
 /// Write a Linux-formatted sockaddr back into guest memory, respecting
 /// the caller's `addrlen` (Linux truncates when the buffer is too small
 /// and writes the full required length into `*addrlen_addr`).
@@ -1935,21 +2003,28 @@ pub(super) fn write_sockopt_value<M: CurrentMmMemory>(
     optlen_addr: u64,
     value: &[u8],
 ) -> Result<DispatchOutcome, DispatchError> {
+    use crate::dispatch::copyout::{UserSlot, prepare};
     let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
         Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
         Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
     };
+    // Option values are fixed-width carrick answers (at most a `tcp_info`),
+    // so the clamped pair always fits one prepared permit.
     let n = (guest_optlen as usize).min(value.len());
-    if optval_addr != 0 && n > 0 && memory.write_bytes(optval_addr, &value[..n]).is_err() {
-        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-    }
-    if memory
-        .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
-        .is_err()
-    {
-        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-    }
-    Ok(DispatchOutcome::Returned { value: 0 })
+    let out = match prepare(
+        memory,
+        [
+            UserSlot::optional(optval_addr, n),
+            Some(UserSlot::new(optlen_addr, 4)),
+        ],
+    ) {
+        Ok(out) => out,
+        Err(refusal) => return Ok(refusal.into_outcome()),
+    };
+    Ok(match out.commit([&value[..n], &(n as u32).to_ne_bytes()]) {
+        Ok(()) => DispatchOutcome::Returned { value: 0 },
+        Err(fault) => fault.outcome(),
+    })
 }
 
 pub(super) fn read_linux_msghdr(

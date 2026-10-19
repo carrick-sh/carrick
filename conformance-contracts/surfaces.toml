@@ -1639,3 +1639,11 @@ contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"
 [[surfaces]]
 path = "crates/carrick-vmm-kvm/src/guest_setup.rs"
 contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/copyout.rs"
+contracts = ["kernel.copyout.owner-refusal"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/copyout_tests.rs"
+contracts = ["kernel.copyout.owner-refusal"]

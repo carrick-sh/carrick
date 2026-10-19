@@ -208,7 +208,7 @@ impl SyscallDispatcher {
             refresh_timerfd_locked(&state.clock, &mut timer);
             let current =
                 timerfd_itimerspec(&state.clock, timer.clock_id, timer.interval, timer.deadline);
-            Ok(write_kernel_struct(memory, current_value, &current))
+            Ok(super::copyout::copyout_record(memory, current_value, &current, DispatchOutcome::Returned { value: 0 }))
         }
 
         fn nanosleep(this, cx, request_address: GuestPtr, rem_ptr: GuestPtr) {
@@ -299,7 +299,12 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             };
             let timespec = linux_timespec_from_duration(duration);
-            Ok(write_kernel_struct(memory, address.0, &timespec))
+            Ok(super::copyout::copyout_record(
+                memory,
+                address.0,
+                &timespec,
+                DispatchOutcome::Returned { value: 0 },
+            ))
         }
 
         fn clock_getres(this, cx, clock_id: u64, address: GuestPtr) {
@@ -311,7 +316,7 @@ impl SyscallDispatcher {
             if address.0 == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            Ok(write_packed(
+            Ok(super::copyout::copyout_record(
                 memory,
                 address.0,
                 // Resolution is host-kernel-dependent and NOT a host-portable
@@ -321,7 +326,8 @@ impl SyscallDispatcher {
                 // 1ms stand-in (LINUX_CLOCK_RESOLUTION_NSEC), which is what the
                 // Docker oracle on these hosts actually returns; the clockgetres
                 // probe asserts only rc==0 + tv_sec==0 (sub-second resolution).
-                LinuxTimespec::new(0, linux_clock_getres_nsec(clock_id)).as_bytes(),
+                &LinuxTimespec::new(0, linux_clock_getres_nsec(clock_id)),
+                DispatchOutcome::Returned { value: 0 },
             ))
         }
 
@@ -385,7 +391,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
             let current = itimerval_from_state(this.proc.lock().itimers[which as usize]);
-            Ok(write_kernel_struct(memory, address.0, &current))
+            Ok(super::copyout::copyout_record(memory, address.0, &current, DispatchOutcome::Returned { value: 0 }))
         }
 
         fn setitimer(this, cx, which: u64, new_address: GuestPtr, old_address: GuestPtr) {
@@ -865,24 +871,22 @@ impl SyscallDispatcher {
         }
 
         fn gettimeofday(this, cx, timeval: GuestPtr, timezone: GuestPtr) {
+            use super::copyout::{UserSlot, prepare};
             let memory = &mut *cx.memory;
             let now = cx.kernel.task().container().clock().realtime_now();
-            if timeval.0 != 0 {
-                let tv = linux_timeval_from_duration(now);
-                if memory
-                    .write_bytes(timeval.0, tv.as_bytes())
-                    .is_err()
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                }
-            }
-            if timezone.0 != 0
-                && memory
-                    .write_bytes(timezone.0, LinuxTimezone::utc().abi_bytes())
-                    .is_err()
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
+            let tv = linux_timeval_from_duration(now);
+            let timezone_value = LinuxTimezone::utc();
+            let out = match prepare(
+                memory,
+                [
+                    UserSlot::optional(timeval.0, tv.as_bytes().len()),
+                    UserSlot::optional(timezone.0, LinuxTimezone::ABI_SIZE),
+                ],
+            ) {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            out.commit([tv.as_bytes(), timezone_value.abi_bytes()])?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -934,10 +938,7 @@ impl SyscallDispatcher {
                 _pad_align: [0; 4],
                 _f: [0; 4],
             };
-            if write_kernel_struct_raw(memory, info_ptr.0, &info).is_err() {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(super::copyout::copyout_record(memory, info_ptr.0, &info, DispatchOutcome::Returned { value: 0 }))
         }
 
         fn times(this, cx, buf: GuestPtr) {
@@ -962,10 +963,15 @@ impl SyscallDispatcher {
                 tms_cutime: to_ticks(child_user_us),
                 tms_cstime: to_ticks(child_system_us),
             };
-            if buf.0 != 0 && memory.write_bytes(buf.0, tms.abi_bytes()).is_err() {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            if buf.0 == 0 {
+                return Ok(DispatchOutcome::Returned { value: clock });
             }
-            Ok(DispatchOutcome::Returned { value: clock })
+            Ok(super::copyout::copyout_record(
+                memory,
+                buf.0,
+                &tms,
+                DispatchOutcome::Returned { value: clock },
+            ))
         }
 
         fn getrusage(this, cx, who: u64, usage: GuestPtr) {
@@ -1001,8 +1007,7 @@ impl SyscallDispatcher {
                     host.majflt,
                 ),
             };
-            memory.write_bytes(usage.0, rusage.abi_bytes())?;
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(super::copyout::copyout_record(memory, usage.0, &rusage, DispatchOutcome::Returned { value: 0 }))
         }
 
         // getrlimit(2) (syscall 163) — the older 2-arg form glibc and Apple
@@ -1013,10 +1018,10 @@ impl SyscallDispatcher {
             }
             let limit = this.effective_resource_limit(resource);
             let memory = &mut *cx.memory;
-            if rlimit.0 != 0 && write_kernel_struct_raw(memory, rlimit.0, &limit).is_err() {
-                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            if rlimit.0 == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(super::copyout::copyout_record(memory, rlimit.0, &limit, DispatchOutcome::Returned { value: 0 }))
         }
 
         fn prlimit64(this, cx, pid: Pid, resource: u64, new_limit: GuestPtr, old_limit: GuestPtr) {
