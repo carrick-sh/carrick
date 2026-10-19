@@ -1914,7 +1914,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
                         " actual_guest_run={} pending_host_work={} served_with_work={}",
                         custody.actual_run[index as usize].load(Ordering::Acquire) != 0,
                         task.linux.has_pending_host_work(),
-                        task.linux.served_with_work.load(Ordering::Acquire),
+                        task.linux.served_word(),
                     ));
                 }
             }

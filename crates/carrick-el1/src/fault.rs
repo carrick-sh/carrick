@@ -3123,7 +3123,7 @@ mod tests {
                 Action::ServedWithWork
             );
             assert_eq!(
-                tasks[0].linux.served_with_work.load(Ordering::Acquire),
+                tasks[0].linux.served_word(),
                 1,
                 "the host must complete, not re-dispatch, the served call"
             );

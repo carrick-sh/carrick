@@ -3354,13 +3354,7 @@ impl Cpl0Carrier {
                     self.custody.record_kick();
                 }
                 WORK_PORT => {
-                    if self
-                        .task(index)
-                        .linux
-                        .served_with_work
-                        .swap(0, Ordering::AcqRel)
-                        == 0
-                    {
+                    if self.task(index).linux.take_served_boundary().is_none() {
                         return Err(fail("work exit without completed syscall"));
                     }
                     // This standalone carrier has no zone or host wake

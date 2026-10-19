@@ -2246,7 +2246,7 @@ mod tests {
                 assert_eq!(frame.x[0], 0xfeed);
                 assert_eq!(tasks[0].linux.orig_arg0.load(Ordering::Relaxed), 77);
                 assert_eq!(counters.served[178].load(Ordering::Relaxed), 0);
-                assert_eq!(tasks[0].linux.served_with_work.load(Ordering::Acquire), 0);
+                assert_eq!(tasks[0].linux.served_word(), 0);
             }
         }
     }
@@ -2432,7 +2432,7 @@ mod tests {
                             "mutation={mutation} switched={switched}"
                         );
                         assert_eq!(counters.served[98].load(Ordering::Relaxed), 0);
-                        assert_eq!(tasks[0].linux.served_with_work.load(Ordering::Acquire), 0);
+                        assert_eq!(tasks[0].linux.served_word(), 0);
                     }
                 }
             }

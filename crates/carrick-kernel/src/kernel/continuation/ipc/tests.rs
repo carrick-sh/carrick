@@ -823,10 +823,7 @@ fn serial_host_el1_ipc_every_slot_boundary_delivers_owed_host_wakes() {
     // A switched-in thread whose write was served with work owed exits;
     // the executor adopts it (the syscall is complete, not dispatched).
     el1_write();
-    task(SLOT)
-        .linux
-        .served_with_work
-        .store(1, Ordering::Release);
+    task(SLOT).linux.record_completed_with_work();
     assert!(crate::el1_delegation::settle_el1_boundary(SLOT, context.kernel()).is_some());
     let adopted = wakes.load(Ordering::Relaxed);
     // The writer then parks and the vCPU idles out for the pending work.
@@ -939,7 +936,6 @@ fn mixed_venue_readv_wakes_on_el1_write(write_before_enroll: bool) {
     };
     use std::future::Future;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use std::task::{Context, Poll, Waker};
     use std::time::{Duration, Instant};
     use zerocopy::IntoBytes;
@@ -1014,10 +1010,7 @@ fn mixed_venue_readv_wakes_on_el1_write(write_before_enroll: bool) {
         if published.host_owed {
             task(SLOT).linux.mark_pending_host_work();
         }
-        task(SLOT)
-            .linux
-            .served_with_work
-            .store(1, Ordering::Release);
+        task(SLOT).linux.record_completed_with_work();
         assert!(crate::el1_delegation::settle_el1_boundary(SLOT, &kernel).is_some());
     };
     if write_before_enroll {

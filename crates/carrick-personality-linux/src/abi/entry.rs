@@ -14,7 +14,11 @@ pub struct LinuxTaskState {
     /// [`Self::take_host_work_doorbell`] clears it, and its token must reach
     /// the host boundary that settles the owed work the doorbell announces.
     pending_host_work: AtomicU32,
-    pub served_with_work: AtomicU32,
+    /// The served-syscall boundary. Private: only
+    /// [`Self::take_served_boundary`] consumes it for its boundary, and
+    /// rebinding retires it into the host-work doorbell
+    /// ([`Self::retire_served_boundary`]) instead of erasing owed work.
+    served_with_work: AtomicU32,
 }
 
 /// Consumed pending-host-work doorbell. EL1 rings the doorbell for owed work
@@ -48,6 +52,32 @@ impl LinuxTaskState {
     /// settles what it announces.
     pub fn take_host_work_doorbell(&self) -> Option<HostWorkDoorbell> {
         (self.pending_host_work.swap(0, Ordering::AcqRel) != 0).then_some(HostWorkDoorbell(()))
+    }
+
+    /// Byte offset of the served-boundary word, for ABI layout checks and
+    /// the EL1 image's direct store.
+    pub const SERVED_WITH_WORK_OFFSET: usize =
+        core::mem::offset_of!(LinuxTaskState, served_with_work);
+
+    /// The raw served-boundary word, for a census or an assertion only.
+    pub fn served_word(&self) -> u32 {
+        self.served_with_work.load(Ordering::Acquire)
+    }
+
+    /// Whether a served boundary is owed, without consuming it.
+    pub fn served_boundary_pending(&self) -> bool {
+        self.served_word() != 0
+    }
+
+    /// The task bound here is changing before its boundary was consumed. Its
+    /// syscall replay belongs to that task and is dropped, but the work the
+    /// boundary announced (owed wakes, a deferred completion) is not this
+    /// task's: it moves to the host-work doorbell, whose only consumer
+    /// settles it (#641).
+    pub fn retire_served_boundary(&self) {
+        if self.served_with_work.swap(0, Ordering::AcqRel) != 0 {
+            self.mark_pending_host_work();
+        }
     }
 
     pub fn has_pending_host_work(&self) -> bool {
