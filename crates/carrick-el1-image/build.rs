@@ -76,7 +76,12 @@ fn check_process_exit_frames(disassembly: &str) {
         ),
         ("::arm_signal::deliver_on_user_return::", 0x1000, true),
         ("::dispatch::arm_signal_user_return::", 0x1000, true),
-        ("Aarch64Backend$GT$::restore_signal_frame::", 0x1300, true),
+        // The Linux codec wraps the neutral ARM backend (#690).
+        (
+            "LinuxAarch64Backend$u20$as$u20$carrick_personality_linux..signal..SignalBackend$GT$::restore_signal_frame::",
+            0x1300,
+            true,
+        ),
     ];
     for (symbol, ceiling, required) in budgets {
         let mut found = false;

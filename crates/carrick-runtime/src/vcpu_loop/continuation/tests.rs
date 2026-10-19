@@ -629,7 +629,7 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
     use carrick_core_abi::{
         EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
-    use carrick_el1::personality::native_process_runtime::host_test_support::{
+    use carrick_el1_linux::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
     };
     use carrick_personality_linux::signal::arm;

@@ -11,7 +11,7 @@ use std::vec::Vec;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 struct ArmSignalMachine {
-    backend: carrick_el1::isa::aarch64::Aarch64Backend,
+    backend: LinuxAarch64Backend,
     user_sp: carrick_guest_arch::UserVa,
 }
 
@@ -19,7 +19,7 @@ struct ArmSignalMachine {
 impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedContext>
     for ArmSignalMachine
 {
-    type Backend = carrick_el1::isa::aarch64::Aarch64Backend;
+    type Backend = LinuxAarch64Backend;
 
     fn backend(&mut self) -> &mut Self::Backend {
         &mut self.backend
@@ -113,7 +113,7 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
         frame,
         fp.as_bytes(),
         &mut ArmSignalMachine {
-            backend: carrick_el1::isa::aarch64::Aarch64Backend,
+            backend: LinuxAarch64Backend,
             user_sp: sp,
         },
     )
@@ -195,7 +195,7 @@ pub(crate) fn restore_live_arm_signal_frame(
     fp.vregs = saved.native.v;
     fp.fpsr = saved.native.fpsr as u32;
     fp.fpcr = saved.native.fpcr as u32;
-    let mask = carrick_el1::isa::aarch64::Aarch64Backend
+    let mask = LinuxAarch64Backend
         .restore_signal_frame(frame, fp.as_mut_bytes(), &mut |dst, src| {
             copy_in.copy_in(dst, src)
         })
