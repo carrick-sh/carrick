@@ -14,6 +14,66 @@ pub const PAGE_SIZE_4K: u64 = PAGE;
 pub const PAGE_OFFSET_MASK_4K: u64 = PAGE_SIZE_4K - 1;
 pub const PAGE_BASE_MASK_4K: u64 = !PAGE_OFFSET_MASK_4K;
 
+/// x86 4 KiB page base for [`GuestVa`].
+#[inline]
+pub const fn page_base_4k(va: GuestVa) -> u64 {
+    va.raw() & PAGE_BASE_MASK_4K
+}
+
+/// x86 4 KiB page offset for [`GuestVa`].
+#[inline]
+pub const fn page_offset_4k(va: GuestVa) -> usize {
+    (va.raw() & PAGE_OFFSET_MASK_4K) as usize
+}
+
+/// Check if a range `[va, va + len)` crosses a 4 KiB page boundary.
+#[inline]
+pub const fn crosses_page_4k(va: GuestVa, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    match page_offset_4k(va).checked_add(len) {
+        Some(end) => end > (PAGE_SIZE_4K as usize),
+        None => true,
+    }
+}
+
+/// Check whether `va` is a canonical 48-bit x86_64 address.
+#[inline]
+pub const fn is_canonical_48bit(va: GuestVa) -> bool {
+    ((va.raw() as i64) << 16 >> 16) as u64 == va.raw()
+}
+
+/// x86 4 KiB page geometry and canonical address helpers for [`GuestVa`].
+pub trait X86Page4K {
+    fn page_base(self) -> u64;
+    fn page_offset(self) -> usize;
+    fn crosses_page(self, len: usize) -> bool;
+    fn is_canonical_48bit(self) -> bool;
+}
+
+impl X86Page4K for GuestVa {
+    #[inline]
+    fn page_base(self) -> u64 {
+        page_base_4k(self)
+    }
+
+    #[inline]
+    fn page_offset(self) -> usize {
+        page_offset_4k(self)
+    }
+
+    #[inline]
+    fn crosses_page(self, len: usize) -> bool {
+        crosses_page_4k(self, len)
+    }
+
+    #[inline]
+    fn is_canonical_48bit(self) -> bool {
+        is_canonical_48bit(self)
+    }
+}
+
 
 /// Unauthenticated stage-1 output guest physical address produced by a page-table walk.
 #[repr(transparent)]

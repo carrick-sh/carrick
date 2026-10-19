@@ -41,11 +41,12 @@ pub use domains::{
     PAGE_OFFSET_MASK_4K, PAGE_SHIFT_4K, PAGE_SIZE_4K, PAT_LARGE, PREPARED, PRESENT, PRIVATE,
     PageFaultClass, PageFaultErrorCode, PageFaultInfo, RETIRED, RootGpa, SoftCpuException,
     SoftFaultClass, SoftTranslationError, Stage1Gpa, TranslatedLeaf, USER, UserVa, WRITE,
-    has_hardware_reserved_bits_when_present, reserved_phyaddr_mask, translate_leaf_hardware,
+    X86Page4K, has_hardware_reserved_bits_when_present, reserved_phyaddr_mask,
+    translate_leaf_hardware,
 };
 pub use placement::{
     HostVa, LAPIC_MMIO_BASE_GPA, LAPIC_MMIO_SIZE_BYTES, LinearPlacement, MAX_MMIO_HOLES, MmioHole,
-    MmioHoles, PlacementError, PlacementGpa,
+    MmioHoles, PlacementError, PlacementGpa, X86HostPage4K,
 };
 pub use tlb::{
     SOFT_TLB_BITS, SOFT_TLB_ENTRIES, SOFT_TLB_INDEX_MASK, SoftTlb, SoftTlbEntry, SoftTlbPlane,

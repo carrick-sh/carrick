@@ -20,7 +20,7 @@ use carrick_softmmu::{
     PageFaultErrorCode, PageFaultInfo, PlacementError, ResolvedAccess, ResolvedSpan, RootGpa,
     SOFT_TLB_ENTRIES, SoftCpuException, SoftMmuMemory, SoftTlb, SoftTlbEntry, SoftTlbPlane,
     SoftTranslationError, SoftWalker, TLB_TAG_AC_BIT, TLB_TAG_CPL3_BIT, TLB_TAG_NXE_OFF_BIT,
-    TLB_TAG_SMAP_OFF_BIT, TLB_TAG_SMEP_OFF_BIT, TLB_TAG_WP_OFF_BIT, WalkOutcome,
+    TLB_TAG_SMAP_OFF_BIT, TLB_TAG_SMEP_OFF_BIT, TLB_TAG_WP_OFF_BIT, WalkOutcome, X86HostPage4K,
 };
 
 const TEST_SPAN_BYTES: u64 = 0x0100_0000;
