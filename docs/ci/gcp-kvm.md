@@ -151,4 +151,3 @@ edit is needed. Going back to Willow also requires its standing controller
 - **Reproduce the VM side** by printing the startup script
   (`scripts/ci/gcp-kvm-run.sh startup-script` with the required environment)
   and running it as root on a nested-KVM Debian 13 VM.
-
