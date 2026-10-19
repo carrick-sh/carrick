@@ -3413,14 +3413,16 @@ where
 
         let outcome = match outcome {
             DispatchOutcome::ZoneFutexWait {
+                queue,
                 uaddr,
                 value,
                 bitset,
                 timeout,
                 index,
             } => {
-                return self
-                    .zone_park(engine, control, frame, uaddr, value, bitset, timeout, index);
+                return self.zone_park(
+                    engine, control, frame, queue, uaddr, value, bitset, timeout, index,
+                );
             }
             DispatchOutcome::ZoneFutexWoken { value, woken } => {
                 zone::publish_zone_handbacks(&self.kernel, &woken);

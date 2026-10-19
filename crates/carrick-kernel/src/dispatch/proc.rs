@@ -2425,6 +2425,26 @@ impl<'a> ProcView<'a> {
                     .unwrap_or(0),
             );
 
+            // The address space's one queue venue decides here exactly as in
+            // `dispatch_threaded_futex` (#685): a zone mm's private futexes
+            // never fall back to the host table.
+            if shared_location.is_none()
+                && let Some(queue) =
+                    crate::el1_zone::FutexQueueAuthority::of_context(cx.kernel).zone()
+            {
+                let clock = Arc::clone(cx.kernel.task().container().clock());
+                return Ok(super::futex::dispatch_zone_futex(
+                    &clock,
+                    SyscallRequest::new(98, args),
+                    memory,
+                    raw_command,
+                    command,
+                    futex_flags,
+                    word,
+                    queue,
+                ));
+            }
+
             Ok(match command {
                 LINUX_FUTEX_WAKE => {
                     if let Some(location) = shared_location {
@@ -2568,7 +2588,7 @@ impl<'a> ProcView<'a> {
                 cx.kernel.kernel().shared_futex(),
                 &mut *cx.memory,
                 cx.thread.map(|t| t.futex),
-                cx.thread.and_then(|t| t.zone),
+                crate::el1_zone::FutexQueueAuthority::of_context(cx.kernel),
                 waiters.0,
                 nr_futexes,
                 flags,

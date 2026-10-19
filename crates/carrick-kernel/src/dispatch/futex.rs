@@ -128,7 +128,7 @@ pub(crate) fn dispatch_threaded_futex(
     registry: &crate::thread::ThreadRegistry,
     hvpatch_linux_tid: Option<u32>,
     work_scope: Option<&carrick_observability::work_meter::WorkScope>,
-    zone: Option<(&'static carrick_el1_abi::ZoneTables, u64)>,
+    queue: crate::el1_zone::FutexQueueAuthority,
 ) -> DispatchOutcome {
     let address = request.arg(0);
     let operation = request.arg(1);
@@ -266,11 +266,13 @@ pub(crate) fn dispatch_threaded_futex(
             .unwrap_or(0),
     );
 
-    // A zone process's in-process futexes live in the in-guest zone's queues,
-    // shared with guest EL1 (`crate::el1_zone`): one queue per process, and
-    // every host operation on it goes there too.
+    // An address space's in-process futexes live in its one queue venue
+    // (#685): the in-guest zone's queues, shared with guest EL1, when the
+    // carrier serves them there (`crate::el1_zone::FutexQueueAuthority`).
+    // The venue belongs to the mm, so every waiter and waker of it, host or
+    // EL1, meets in the same queue.
     if shared_location.is_none()
-        && let Some((zone, mm)) = zone
+        && let Some(queue) = queue.zone()
     {
         return dispatch_zone_futex(
             clock,
@@ -280,8 +282,7 @@ pub(crate) fn dispatch_threaded_futex(
             command,
             futex_flags,
             word,
-            zone,
-            mm,
+            queue,
         );
     }
 
@@ -516,7 +517,7 @@ pub(crate) fn dispatch_threaded_futex(
 /// The zone half of [`dispatch_threaded_futex`]: argument validation already
 /// happened; `word` is the value read at the top (0 if unreadable for a wake).
 #[allow(clippy::too_many_arguments)]
-fn dispatch_zone_futex(
+pub(crate) fn dispatch_zone_futex(
     clock: &crate::kernel::container::ClockDomain,
     request: SyscallRequest,
     memory: &mut impl CurrentMmMemory,
@@ -524,8 +525,7 @@ fn dispatch_zone_futex(
     command: u64,
     futex_flags: LinuxFutexFlags,
     word: u32,
-    zone: &'static carrick_el1_abi::ZoneTables,
-    mm: u64,
+    queue: crate::el1_zone::ZoneFutexQueue,
 ) -> DispatchOutcome {
     let address = request.arg(0);
     let value = request.arg(2) as u32;
@@ -540,7 +540,7 @@ fn dispatch_zone_futex(
     };
     match command {
         LINUX_FUTEX_WAKE => {
-            let woken = crate::el1_zone::wake(zone, mm, address, bitset, value);
+            let woken = queue.wake(address, bitset, value);
             DispatchOutcome::ZoneFutexWoken {
                 value: i64::from(woken.count),
                 woken: woken.handed,
@@ -574,6 +574,7 @@ fn dispatch_zone_futex(
                 }
             };
             DispatchOutcome::ZoneFutexWait {
+                queue,
                 uaddr: address,
                 value,
                 bitset,
@@ -594,26 +595,18 @@ fn dispatch_zone_futex(
                 };
             }
             let val3 = request.arg(5) as u32;
-            let result = crate::el1_zone::requeue(
-                zone,
-                mm,
-                address,
-                uaddr2,
-                value,
-                request.arg(3) as u32,
-                || {
-                    if raw_command != LINUX_FUTEX_CMP_REQUEUE {
-                        return Ok(());
-                    }
-                    // CMP_REQUEUE compares under both bucket locks, so no
-                    // waiter can enqueue between the check and the requeue.
-                    match read_futex_word(memory, address) {
-                        Ok(current) if current == val3 => Ok(()),
-                        Ok(_) => Err(LINUX_EAGAIN),
-                        Err(errno) => Err(errno),
-                    }
-                },
-            );
+            let result = queue.requeue(address, uaddr2, value, request.arg(3) as u32, || {
+                if raw_command != LINUX_FUTEX_CMP_REQUEUE {
+                    return Ok(());
+                }
+                // CMP_REQUEUE compares under both bucket locks, so no
+                // waiter can enqueue between the check and the requeue.
+                match read_futex_word(memory, address) {
+                    Ok(current) if current == val3 => Ok(()),
+                    Ok(_) => Err(LINUX_EAGAIN),
+                    Err(errno) => Err(errno),
+                }
+            });
             match result {
                 Ok((woken, moved)) => DispatchOutcome::ZoneFutexWoken {
                     value: woken.len() as i64 + i64::from(moved),
@@ -641,7 +634,7 @@ pub(crate) fn dispatch_futex_waitv_args(
     shared: &carrick_thread::platform_futex::SharedFutexTable,
     memory: &mut impl CurrentMmMemory,
     futex: Option<&crate::thread::FutexTable>,
-    zone: Option<(&'static carrick_el1_abi::ZoneTables, u64)>,
+    queue: crate::el1_zone::FutexQueueAuthority,
     waiters: u64,
     nr_futexes: u64,
     flags: u64,
@@ -763,8 +756,9 @@ pub(crate) fn dispatch_futex_waitv_args(
             };
         }
         // As on the table path below, the wait parks on the last entry only.
-        if zone.is_some() {
+        if let Some(queue) = queue.zone() {
             return DispatchOutcome::ZoneFutexWait {
+                queue,
                 uaddr: entry.address,
                 value: entry.value,
                 bitset: u32::MAX,

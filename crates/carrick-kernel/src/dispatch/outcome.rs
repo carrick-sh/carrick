@@ -761,6 +761,10 @@ pub enum DispatchOutcome {
     /// suspend on its zone continuation; complete with `index` when woken,
     /// `-ETIMEDOUT` at `timeout`, `-EINTR` for a signal.
     ZoneFutexWait {
+        /// The waiting address space's one queue, resolved by the
+        /// dispatcher from its mm: the backend parks there and nowhere else.
+        #[serde(skip)]
+        queue: crate::el1_zone::ZoneFutexQueue,
         uaddr: u64,
         value: u32,
         bitset: u32,
