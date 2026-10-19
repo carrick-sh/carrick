@@ -133,7 +133,7 @@ done
 default_members="$(cargo metadata --no-deps --format-version 1 | jq -r '.workspace_default_members[]' | sed -E 's#^(path\+file://)?##; s#\#.*$##' | xargs -n1 basename | sort | paste -sd ' ' -)"
 echo "layering: product selection (default-members) = ${default_members}"
 product_feature_rule() {
-  local crate="$1" tree
+  local crate="$1" feature="${2:-test-support}" tree
   if ! tree="$(cargo tree --edges normal,features --invert "$crate" --prefix none 2>&1)"; then
     echo "layering FAIL: cargo tree could not resolve $crate in the product selection:"
     head -5 <<<"$tree"
@@ -145,15 +145,17 @@ product_feature_rule() {
     fail=1
     return
   fi
-  if grep -Eq "^${crate} feature \"test-support\"$" <<<"$tree"; then
-    echo "layering FAIL: the product selection enables $crate feature \"test-support\" (test-only surface in the shipped binary); enabled through:"
-    cargo tree --edges normal,features --invert "$crate" 2>/dev/null | grep -E -A3 "^.*${crate} feature \"test-support\"" | head -12 || true
+  if grep -Eq "^${crate} feature \"${feature}\"$" <<<"$tree"; then
+    echo "layering FAIL: the product selection enables $crate feature \"${feature}\" (test-only surface in the shipped binary); enabled through:"
+    cargo tree --edges normal,features --invert "$crate" 2>/dev/null | grep -E -A3 "^.*${crate} feature \"${feature}\"" | head -12 || true
     fail=1
     return
   fi
-  echo "layering: product selection enables no $crate test-support ok"
+  echo "layering: product selection enables no $crate ${feature} ok"
 }
 product_feature_rule carrick-kernel
+# The #695 signed-witness hold: carrick-embed dev-dependencies only.
+product_feature_rule carrick-kernel deferred-capture-test-control
 product_feature_rule carrick-hal
 product_feature_rule carrick-vfs
 exit $fail

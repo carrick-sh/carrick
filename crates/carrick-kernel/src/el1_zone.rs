@@ -893,6 +893,10 @@ pub fn place_service(
     let Ok(record) = zone.alloc_host_runnable(identity) else {
         return false;
     };
+    #[cfg(all(feature = "test-support", feature = "deferred-capture-test-control"))]
+    if deferred_capture_control::hold(zone, record) {
+        return true;
+    }
     if deliver_placement(zone.place_from_host(record)) {
         return true;
     }
@@ -1073,6 +1077,8 @@ pub fn step_away_from_slot(slot: SlotId, driver: u64) {
     let Some(zone) = zone() else {
         return;
     };
+    #[cfg(all(feature = "test-support", feature = "deferred-capture-test-control"))]
+    deferred_capture_control::release_at_step_away(zone, slot, driver);
     let mut records = Vec::new();
     let mut placements = Vec::new();
     if zone.step_away(
@@ -1172,6 +1178,175 @@ fn settle_vacated(
         } else {
             publish(record);
         }
+    }
+}
+
+/// Signed-witness control for the deferred-capture boundary (#695). Armed,
+/// once any slot has stepped away (past the workload's first run), it holds
+/// the next real service placement (host-owned, unqueued) and
+/// queues it on the first slot that may run it just before that slot's
+/// driver steps away, so the vacate captures exactly that record. It never
+/// creates a record. A hold not released by its deadline goes to the host
+/// run queue like any unplaced service record, and the outcome says so.
+#[cfg(all(feature = "test-support", feature = "deferred-capture-test-control"))]
+pub mod deferred_capture_control {
+    use super::{RecordRef, SlotId, ZoneTables, publish_handback};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// How an armed hold ended.
+    #[derive(
+        ::core::clone::Clone,
+        ::core::marker::Copy,
+        ::core::fmt::Debug,
+        ::core::cmp::Eq,
+        ::core::cmp::PartialEq,
+    )]
+    pub enum HoldOutcome {
+        /// No service placement happened while armed.
+        NotHeld,
+        /// Queued on `slot` immediately before its driver stepped away.
+        ReleasedAtStepAway { record: RecordRef, slot: SlotId },
+        /// The deadline (or disarm) passed first; handed to the host queue.
+        Expired { record: RecordRef },
+    }
+
+    struct Hold {
+        armed: bool,
+        /// A slot stepped away since arming: the workload is past its first
+        /// run, so a held thread cannot be the only one able to progress.
+        stepped_away: bool,
+        held: Option<RecordRef>,
+        outcome: HoldOutcome,
+        epoch: u64,
+    }
+
+    static HOLD: Mutex<Hold> = Mutex::new(Hold {
+        armed: false,
+        stepped_away: false,
+        held: None,
+        outcome: HoldOutcome::NotHeld,
+        epoch: 0,
+    });
+
+    /// One armed hold. Dropping or finishing it disarms and releases any
+    /// record still held, so a hold can never strand a thread.
+    #[must_use = "finish the hold to read its outcome"]
+    pub struct ArmedHold {
+        epoch: u64,
+        finished: bool,
+    }
+
+    /// Arm a hold of the next service placement for at most `deadline`.
+    pub fn arm(deadline: Duration) -> ArmedHold {
+        let epoch = {
+            let mut hold = HOLD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !hold.armed && hold.held.is_none(),
+                "one deferred-capture hold at a time"
+            );
+            hold.epoch = hold.epoch.wrapping_add(1);
+            hold.armed = true;
+            hold.stepped_away = false;
+            hold.outcome = HoldOutcome::NotHeld;
+            hold.epoch
+        };
+        let until = Instant::now() + deadline;
+        let _expiry = std::thread::Builder::new()
+            .name("deferred-capture-hold".into())
+            .spawn(move || {
+                std::thread::sleep(until.saturating_duration_since(Instant::now()));
+                expire(epoch);
+            });
+        ArmedHold {
+            epoch,
+            finished: false,
+        }
+    }
+
+    impl ArmedHold {
+        /// Disarm and report how the hold ended.
+        pub fn finish(mut self) -> HoldOutcome {
+            self.finished = true;
+            expire(self.epoch);
+            let mut hold = HOLD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            hold.armed = false;
+            hold.outcome
+        }
+    }
+
+    impl Drop for ArmedHold {
+        fn drop(&mut self) {
+            if !self.finished {
+                expire(self.epoch);
+                HOLD.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .armed = false;
+            }
+        }
+    }
+
+    pub(super) fn hold(zone: &ZoneTables, record: carrick_el1_abi::RecordId) -> bool {
+        let mut hold = HOLD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !hold.armed
+            || !hold.stepped_away
+            || hold.held.is_some()
+            || hold.outcome != HoldOutcome::NotHeld
+        {
+            return false;
+        }
+        hold.held = Some(zone.record_ref(record));
+        true
+    }
+
+    pub(super) fn release_at_step_away(zone: &ZoneTables, slot: SlotId, driver: u64) {
+        let mut hold = HOLD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if hold.armed {
+            hold.stepped_away = true;
+        }
+        let Some(record) = hold.held else {
+            return;
+        };
+        if zone.record_ref(record.id) != record {
+            // Retired and reused meanwhile: nothing of this hold remains.
+            hold.held = None;
+            return;
+        }
+        if zone.slot(slot).driver() != Some(driver)
+            || !zone.slot(slot).is_live()
+            || !zone.record_allows_slot(record.id, slot)
+            || !zone.requeue_on(slot, record.id)
+        {
+            return;
+        }
+        hold.held = None;
+        hold.outcome = HoldOutcome::ReleasedAtStepAway { record, slot };
+    }
+
+    fn expire(epoch: u64) {
+        let record = {
+            let mut hold = HOLD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hold.epoch != epoch {
+                return;
+            }
+            let Some(record) = hold.held.take() else {
+                return;
+            };
+            hold.outcome = HoldOutcome::Expired { record };
+            record
+        };
+        // The ordinary path of a service record no slot took.
+        publish_handback(record);
     }
 }
 
@@ -1706,6 +1881,152 @@ mod tests {
                 403
             );
             zone.free_record(record);
+        }
+    }
+
+    /// #695: the step-away capture boundary reports exactly the host-owned
+    /// records queued on the vacated slot, once, in one batch.
+    #[test]
+    fn step_away_captures_exactly_the_queued_service_record() {
+        let zone = heap_zone();
+        let slot = SlotId::new(3);
+        zone.drive(slot, 7);
+        let queued = zone.alloc_host_runnable(identity(1)).unwrap();
+        let reference = zone.record_ref(queued);
+        assert!(zone.requeue_on(slot, queued));
+        let mut records = Vec::new();
+        let mut placements = Vec::new();
+        assert!(zone.step_away(
+            slot,
+            7,
+            &mut |record| records.push(record),
+            &mut |placement| placements.push(placement),
+        ));
+        let mut batches = Vec::new();
+        settle_vacated(
+            &zone,
+            Some(slot),
+            records,
+            placements,
+            &mut |_| {},
+            &mut |captured| batches.push(captured.to_vec()),
+        );
+        assert_eq!(batches, [vec![reference]]);
+    }
+
+    #[cfg(all(feature = "test-support", feature = "deferred-capture-test-control"))]
+    mod serial_host_deferred_capture_control {
+        use super::*;
+        use deferred_capture_control::{HoldOutcome, arm};
+        use std::time::Duration;
+
+        fn thread() -> crate::kernel::ThreadKey {
+            crate::kernel::ThreadKey::from_zone_identity(42, std::num::NonZeroU64::new(43).unwrap())
+                .unwrap()
+        }
+
+        fn captures(run: impl FnOnce()) -> Vec<Vec<RecordRef>> {
+            struct Restore(Option<HandbackPublisher>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    *HANDBACK_PUBLISHER.write() = self.0.take();
+                }
+            }
+            let _restore = Restore(HANDBACK_PUBLISHER.write().take());
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = Arc::clone(&seen);
+            register_handback_publisher(Arc::new(move |event| {
+                if let HandbackEvent::DeferredCaptured(records) = event {
+                    sink.lock().unwrap().push(records.to_vec());
+                }
+            }));
+            run();
+            seen.lock().unwrap().clone()
+        }
+
+        #[test]
+        fn hold_is_captured_exactly_once_at_the_next_step_away() {
+            let zone: &'static ZoneTables = Box::leak(heap_zone());
+            let slot = SlotId::new(0);
+            zone.drive(slot, 7);
+            let mut outcome = HoldOutcome::NotHeld;
+            let batches = captures(|| {
+                with_test_zone(zone, || {
+                    let hold = arm(Duration::from_secs(10));
+                    // Before any step-away the workload may still be in its
+                    // first run: nothing is held.
+                    step_away_from_slot(slot, 7);
+                    zone.step_back(slot, 7);
+                    assert!(place_service(
+                        thread(),
+                        crate::kernel::objects::ExecutionGeneration::from_raw(9),
+                        1
+                    ));
+                    // Held: not queued where the guest could run it.
+                    assert_eq!(zone.slot(slot).queued(), 0);
+                    step_away_from_slot(slot, 7);
+                    outcome = hold.finish();
+                });
+            });
+            let HoldOutcome::ReleasedAtStepAway { record, slot: at } = outcome else {
+                panic!("hold was not released at step-away: {outcome:?}");
+            };
+            assert_eq!(at, slot);
+            assert_eq!(batches, [vec![record]]);
+        }
+
+        #[test]
+        fn nothing_is_held_before_the_first_step_away() {
+            let zone: &'static ZoneTables = Box::leak(heap_zone());
+            let slot = SlotId::new(0);
+            zone.drive(slot, 7);
+            let mut outcome = HoldOutcome::NotHeld;
+            let batches = captures(|| {
+                with_test_zone(zone, || {
+                    let hold = arm(Duration::from_secs(10));
+                    assert!(place_service(
+                        thread(),
+                        crate::kernel::objects::ExecutionGeneration::from_raw(9),
+                        1
+                    ));
+                    // Placed normally on the live slot, not held.
+                    assert_eq!(zone.slot(slot).queued(), 1);
+                    outcome = hold.finish();
+                });
+            });
+            assert_eq!(outcome, HoldOutcome::NotHeld);
+            assert!(batches.is_empty());
+        }
+
+        #[test]
+        fn unreleased_hold_expires_to_the_host_queue() {
+            let zone: &'static ZoneTables = Box::leak(heap_zone());
+            let slot = SlotId::new(0);
+            zone.drive(slot, 7);
+            let mut outcome = HoldOutcome::NotHeld;
+            let mut published = 0;
+            let batches = captures(|| {
+                with_test_zone(zone, || {
+                    let hold = arm(Duration::from_secs(10));
+                    // Before any step-away the workload may still be in its
+                    // first run: nothing is held.
+                    step_away_from_slot(slot, 7);
+                    zone.step_back(slot, 7);
+                    assert!(place_service(
+                        thread(),
+                        crate::kernel::objects::ExecutionGeneration::from_raw(9),
+                        1
+                    ));
+                    outcome = hold.finish();
+                    published = 1;
+                });
+            });
+            assert!(
+                matches!(outcome, HoldOutcome::Expired { .. }),
+                "{outcome:?}"
+            );
+            assert!(batches.is_empty());
+            assert_eq!(published, 1);
         }
     }
 

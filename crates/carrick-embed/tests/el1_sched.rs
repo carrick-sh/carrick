@@ -4248,28 +4248,32 @@ fn el1_sched_delayed_notification_survives_parent_reap() {
     );
 }
 
-/// Feasibility witness for the deferred-capture auditor on real guest work.
-/// This does not establish retirement/reuse ordering or close the contract.
+/// Witness for the deferred-capture auditor on real guest work (#695).
 ///
-/// Captures happen when an executor vacates its zone slot (`step_away` for a
-/// blocking host wait, or `leave_slot`) while a host-owned record, such as a
-/// completed host-served read's service record, is still queued there. The
-/// workload is therefore the pinned host-served `sock-pingpong` (both threads
-/// on guest CPU 0, `AF_UNIX` socketpairs): the old `two-process` workload's
-/// blocking is a futex/pipe hand-off served in the guest, so it never
-/// produces a host-owned record to capture.
+/// A capture happens when an executor vacates its zone slot (`step_away` for
+/// a blocking host wait, or `leave_slot`) while a host-owned record, such as
+/// a completed host-served read's service record, is still queued there.
+/// Whether that coincides naturally is a scheduling outcome, so the witness
+/// arms the test-only `deferred-capture-test-control` hold: the first real
+/// service placement of the pinned host-served `sock-pingpong` is held off
+/// the guest's run queue and queued on the first slot that may run it just
+/// before that slot's driver steps away (every host-served socket operation
+/// steps away). The auditor must see that exact record captured exactly
+/// once. The hold never creates a record, and it releases to the host run
+/// queue at its deadline, which fails this test instead of wedging the run.
 #[test]
 fn el1_sched_deferred_handback_capture_observes_guest_records() {
+    use carrick_kernel::el1_zone::deferred_capture_control::{HoldOutcome, arm};
     use carrick_kernel::observe::{AuditVerdict, KernelAuditor};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct Capture {
-        records: Mutex<Vec<carrick_el1_abi::RecordRef>>,
+        batches: Mutex<Vec<Vec<carrick_el1_abi::RecordRef>>>,
     }
     impl KernelAuditor for Capture {
         fn zone_handbacks_captured(&self, records: &[carrick_el1_abi::RecordRef]) -> AuditVerdict {
-            self.records.lock().unwrap().extend_from_slice(records);
+            self.batches.lock().unwrap().push(records.to_vec());
             AuditVerdict::Continue
         }
     }
@@ -4278,6 +4282,7 @@ fn el1_sched_deferred_handback_capture_observes_guest_records() {
     let _watchdog = common::Watchdog::start(Duration::from_secs(30));
     let carrier = carrier_or_fail();
     let capture = Arc::new(Capture::default());
+    let hold = arm(Duration::from_secs(20));
     let result = common::run_or_fail(
         carrier
             .container(common::SMOKE_IMAGE)
@@ -4287,13 +4292,22 @@ fn el1_sched_deferred_handback_capture_observes_guest_records() {
             .auditor(capture.clone())
             .run_blocking(),
     );
+    let outcome = hold.finish();
     assert!(result.success(), "{}", result.stdout_utf8());
     assert!(result.stdout_utf8().contains("sock-pingpong iters=2000"));
-    let records = capture.records.lock().unwrap();
-    println!("deferred handback real guest captures: {records:?}");
-    assert!(
-        !records.is_empty(),
-        "guest workload did not exercise the deferred capture boundary"
+    let batches = capture.batches.lock().unwrap();
+    println!("deferred handback capture: outcome={outcome:?} batches={batches:?}");
+    let HoldOutcome::ReleasedAtStepAway { record, .. } = outcome else {
+        panic!("held service placement was not released at a step-away: {outcome:?}");
+    };
+    let held_captures = batches
+        .iter()
+        .flatten()
+        .filter(|captured| **captured == record)
+        .count();
+    assert_eq!(
+        held_captures, 1,
+        "the held record must be captured exactly once: {batches:?}"
     );
 }
 

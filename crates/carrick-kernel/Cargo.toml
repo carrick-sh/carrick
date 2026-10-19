@@ -42,6 +42,13 @@ conformance-metrics = ["carrick-observability/conformance-metrics"]
 schedule-hooks = []
 # Bounded protocol models; no synchronization substitutions in product code.
 loom = []
+# Signed-witness control (#695): hold one real service placement until a
+# slot that may run it steps away, so the deferred-capture boundary is
+# exercised deterministically. Enabled only from carrick-embed's
+# dev-dependencies; `just check-layering` fails if the product enables it.
+# It implies `test-support`, so every gated item is test-only by the same
+# cfg the authority scanners already recognize.
+deferred-capture-test-control = ["test-support"]
 
 # NOTE: no `platform-*` features. This crate selects no VMM and no host
 # backend: the host-OS glue it needs (the kqueue/epoll readiness multiplexer,

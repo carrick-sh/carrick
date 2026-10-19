@@ -1793,6 +1793,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         transfer.publish()
     }
 
+    /// Whether `record`'s affinity allows the guest CPU `slot` is bound to.
+    pub fn record_allows_slot(&self, record: RecordId, slot: SlotId) -> bool {
+        self.record(record)
+            .allows_cpu(self.slot(slot).cpu.load(Ordering::Relaxed))
+    }
+
     /// Queue the host-owned `record` back on `slot`, whether or not the slot
     /// is live: a service thread no other slot will take waits for this
     /// slot's driver, which is away on the host or about to drive it.
