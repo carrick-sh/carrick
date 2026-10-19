@@ -5810,8 +5810,9 @@ mod ipc_set_tests {
             .lock()
             .attachments
             .insert(addr, shmid);
-        let range = carrick_vfs::GuestMemoryRange::new(GuestVa::new(addr), GuestVa::new(addr + len))
-            .expect("shmat metadata range");
+        let range =
+            carrick_vfs::GuestMemoryRange::new(GuestVa::new(addr), GuestVa::new(addr + len))
+                .expect("shmat metadata range");
         let writable_memfd = kernel_file_description(
             std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
                 base: OpenDescriptionBase::new(0),

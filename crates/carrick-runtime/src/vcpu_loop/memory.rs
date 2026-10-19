@@ -1326,7 +1326,10 @@ mod tests {
         let execution = execution_lease(&root, 75);
         let child = production_composition_cow_fixture(&kernel, &root, 31_076);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
             carrick_kernel::kernel::MmAccessAuthority::new()
@@ -1343,7 +1346,10 @@ mod tests {
         let execution = execution_lease(&root, 77);
         let child = production_composition_cow_fixture(&kernel, &root, 31_078);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
             carrick_kernel::kernel::MmAccessAuthority::new()
@@ -1589,9 +1595,11 @@ mod tests {
             Err(MmAccessError::ReadDenied { .. })
         ));
         assert!(matches!(
-            fixture
-                .child
-                .fetch_instruction_bytes(&execution, GuestVa::new(TEST_VA + OWNER_LEN - 2), 4),
+            fixture.child.fetch_instruction_bytes(
+                &execution,
+                GuestVa::new(TEST_VA + OWNER_LEN - 2),
+                4
+            ),
             Err(MmAccessError::Unmapped { .. })
         ));
         let wrong = execution_lease(&root, 170);
@@ -3039,7 +3047,10 @@ mod tests {
             ThreadId::synthetic_for_tests(31_079),
         );
         let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
-        let range = foreign.write_range(GuestVa::new(TEST_VA), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(TEST_VA), 4)
+            .unwrap()
+            .unwrap();
 
         let write = with_foreign_mutation(&foreign, |mutation| {
             let mut cow = carrick_kernel::kernel::MmAccessAuthority::new()
@@ -3267,7 +3278,10 @@ mod tests {
             "the caller owns the sole vCPU"
         );
         let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
-        let range = foreign.write_range(GuestVa::new(TEST_VA), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(TEST_VA), 4)
+            .unwrap()
+            .unwrap();
 
         with_foreign_mutation(&foreign, |mutation| {
             carrick_kernel::kernel::MmAccessAuthority::new()
@@ -3414,7 +3428,10 @@ mod tests {
         });
         ready_rx.recv().expect("active target is in guest");
         let foreign = foreign_mm(&kernel, &root, &execution, fixture.child.task().key());
-        let range = foreign.write_range(GuestVa::new(TEST_VA), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(TEST_VA), 4)
+            .unwrap()
+            .unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
             carrick_kernel::kernel::MmAccessAuthority::new()
@@ -3495,7 +3512,10 @@ mod tests {
             &shared.shared().mm()
         ));
         let foreign = foreign_mm(&kernel, &root, &execution, shared.task().key());
-        let range = foreign.write_range(GuestVa::new(TEST_VA), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(TEST_VA), 4)
+            .unwrap()
+            .unwrap();
 
         let result = with_foreign_mutation(&foreign, |mutation| {
             carrick_kernel::kernel::MmAccessAuthority::new()
@@ -3632,7 +3652,10 @@ mod tests {
         let (child, _backend, _owner, _bytes, _counters) =
             cow_fixture(&kernel, &root, 31_083, MockCowFault::None);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
         let wrong_mm =
             MmId::from_registry_allocation(NonZeroU64::new(foreign.mm_id().raw() + 1).unwrap());
         with_mm_mutation(wrong_mm, |mutation| {
@@ -3665,7 +3688,10 @@ mod tests {
             let (target, _backend, _owner, _bytes, _counters) =
                 cow_fixture(&kernel, &root, 31_085 + fault as i32, fault);
             let target = foreign_mm(&kernel, &root, &execution, target.task().key());
-            let target_range = target.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+            let target_range = target
+                .write_range(GuestVa::new(0x3000), 4)
+                .unwrap()
+                .unwrap();
             with_foreign_mutation(&target, |mutation| {
                 assert!(matches!(
                     carrick_kernel::kernel::MmAccessAuthority::new().break_foreign_cow(
@@ -4126,7 +4152,10 @@ mod tests {
             })),
         );
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
 
         with_foreign_mutation(&foreign, |mutation| {
             assert!(matches!(

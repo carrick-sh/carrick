@@ -2921,8 +2921,13 @@ fn retained_foreign_lease_rejects_unrelated_or_tampered_successor_snapshot() {
         )));
 
     let second_va = TEST_VA + CowArmedRanges::COMPOUND_SIZE;
-    let tampered_break =
-        lease.break_cow(&mut invalidator, &tampered, GuestVa::new(second_va), 4, deadline);
+    let tampered_break = lease.break_cow(
+        &mut invalidator,
+        &tampered,
+        GuestVa::new(second_va),
+        4,
+        deadline,
+    );
     assert!(
         matches!(
             tampered_break,
@@ -3829,7 +3834,13 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
 
     let mut bytes = [0_u8; 4];
     let receipt = lease
-        .read(&live, &snapshot, GuestVa::new(TEST_VA), &mut bytes, deadline)
+        .read(
+            &live,
+            &snapshot,
+            GuestVa::new(TEST_VA),
+            &mut bytes,
+            deadline,
+        )
         .expect("old retained token must keep exact carrier state readable");
     assert_eq!(&bytes, b"old!");
     assert!(receipt.authenticates(&snapshot));

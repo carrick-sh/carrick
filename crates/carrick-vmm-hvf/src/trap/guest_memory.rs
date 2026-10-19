@@ -312,7 +312,10 @@ impl HvfVmState {
                     if let Some(state) = self.deferred_anonymous_state() {
                         let chunk = &mut dst[copied..copied + chunk_len];
                         if state
-                            .copy_pristine_zero(carrick_guest_mem::GuestVa::new(chunk_address), chunk)
+                            .copy_pristine_zero(
+                                carrick_guest_mem::GuestVa::new(chunk_address),
+                                chunk,
+                            )
                             .map_err(|error| {
                                 MemoryError::HostMap(format!("anonymous zero read: {error}"))
                             })?

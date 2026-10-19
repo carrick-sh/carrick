@@ -2596,7 +2596,11 @@ pub(crate) mod tests {
                     } else {
                         unsafe { editor.rollback_undo(resolver).unwrap() }
                     };
-                    assert_eq!(popped, vec![ext_base.raw()], "rollback popped extension arena");
+                    assert_eq!(
+                        popped,
+                        vec![ext_base.raw()],
+                        "rollback popped extension arena"
+                    );
                     assert_eq!(editor.pool_stats().3, 1, "manager restored to 1 arena");
                     Ok::<(), ()>(())
                 },

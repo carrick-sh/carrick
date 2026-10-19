@@ -32,7 +32,6 @@ impl X86HostPage4K for HostVa {
     }
 }
 
-
 mod sealed {
     use crate::domains::AuthenticatedGpa;
     pub trait Sealed {}

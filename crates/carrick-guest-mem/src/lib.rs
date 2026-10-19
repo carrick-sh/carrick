@@ -174,7 +174,6 @@ pub enum PrivateFileSource {
 /// catch it; only the type can.
 pub use carrick_guest_arch::GuestVa;
 
-
 /// A contiguous range of guest virtual addresses `[start, start + len)`.
 #[derive(
     Clone,
@@ -282,7 +281,6 @@ impl GuestVaRange {
 }
 
 pub use carrick_guest_arch::{Gpa, HostVa};
-
 
 /// Resolved native page profile for a run — how Linux page semantics map
 /// onto the host's page size on the native execution backend.

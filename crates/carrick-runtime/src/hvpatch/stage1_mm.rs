@@ -670,14 +670,14 @@ impl Stage1MmPool {
             .free_root_slots
             .pop_first()
             .ok_or(Stage1MmError::RootSlotExhausted)?;
-        let stage1_root = match Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa::new(root_slot.base()))
-        {
-            Ok(root) => root,
-            Err(error) => {
-                inner.free_root_slots.insert(root_slot);
-                return Err(error.into());
-            }
-        };
+        let stage1_root =
+            match Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa::new(root_slot.base())) {
+                Ok(root) => root,
+                Err(error) => {
+                    inner.free_root_slots.insert(root_slot);
+                    return Err(error.into());
+                }
+            };
         let asid = match inner.asids.allocate() {
             Ok(asid) => asid,
             Err(error) => {

@@ -1939,11 +1939,11 @@ impl HvfVmState {
             // every row -- including displaced ones -- that the exact live global
             // owner still backs.
             let custody = self.custody();
-            let next_local =
-                self.mappings
-                    .first_start_between(GuestVa::new(start), GuestVa::new(end), |mapping| {
-                        global_frame_region_owner_matches_in(custody, mapping)
-                    });
+            let next_local = self.mappings.first_start_between(
+                GuestVa::new(start),
+                GuestVa::new(end),
+                |mapping| global_frame_region_owner_matches_in(custody, mapping),
+            );
             let next_alias_candidates = alias_registry()
                 .lock()
                 .matching_process_alias_starts_between_candidates(

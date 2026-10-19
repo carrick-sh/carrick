@@ -1136,8 +1136,12 @@ mod tests {
     fn full_mmap_arena_sized_region_fits_with_large_leaves() {
         let va = 0x60_0000_0000;
         let len = 32 * 1024 * 1024 * 1024u64;
-        let bytes = pml4_tables(&[user_rw_nx(GuestVa::new(va), Gpa::new(va), len)], BASE, 64 * PT_PAGE)
-            .expect("large leaves keep the table footprint bounded");
+        let bytes = pml4_tables(
+            &[user_rw_nx(GuestVa::new(va), Gpa::new(va), len)],
+            BASE,
+            64 * PT_PAGE,
+        )
+        .expect("large leaves keep the table footprint bounded");
         let mgr = Pml4Manager::new(bytes, BASE);
 
         assert_eq!(mgr.translate(va), Some(va));
@@ -1154,8 +1158,14 @@ mod tests {
         let high_va = 0x0100_0000_0000 + 0x20_0000;
         let alias_gpa = 0xA0_0000_0000;
 
-        mgr.map_aliased(GuestVa::new(high_va), Gpa::new(alias_gpa), 0x2000, true, true)
-            .expect("map high alias");
+        mgr.map_aliased(
+            GuestVa::new(high_va),
+            Gpa::new(alias_gpa),
+            0x2000,
+            true,
+            true,
+        )
+        .expect("map high alias");
 
         assert_eq!(mgr.translate(high_va), Some(alias_gpa));
         assert_eq!(mgr.translate(high_va + 0x1000), Some(alias_gpa + 0x1000));
@@ -1340,15 +1350,27 @@ mod tests {
         let second_va = 0x0180_0000_0000u64;
         let second_gpa = 0x00a0_0200_0000u64;
 
-        mgr.map_aliased(GuestVa::new(first_va), Gpa::new(first_gpa), LARGE_2M, true, true)
-            .expect("first high alias fits");
+        mgr.map_aliased(
+            GuestVa::new(first_va),
+            Gpa::new(first_gpa),
+            LARGE_2M,
+            true,
+            true,
+        )
+        .expect("first high alias fits");
         assert_eq!(mgr.translate(first_va), Some(first_gpa));
 
         assert_eq!(mgr.unmap_alias_range(first_va, LARGE_2M as usize), Ok(true));
         assert_eq!(mgr.translate(first_va), None, "first alias is unmapped");
 
-        mgr.map_aliased(GuestVa::new(second_va), Gpa::new(second_gpa), LARGE_2M, true, true)
-            .expect("second high alias reuses the reclaimed tables");
+        mgr.map_aliased(
+            GuestVa::new(second_va),
+            Gpa::new(second_gpa),
+            LARGE_2M,
+            true,
+            true,
+        )
+        .expect("second high alias reuses the reclaimed tables");
         assert_eq!(mgr.translate(second_va), Some(second_gpa));
     }
 
@@ -1362,8 +1384,14 @@ mod tests {
         let second_va = 0x0180_0000_0000u64;
         let second_gpa = 0x00a0_0200_0000u64;
 
-        mgr.map_aliased(GuestVa::new(first_va), Gpa::new(first_gpa), LARGE_2M, true, true)
-            .expect("first high alias fits");
+        mgr.map_aliased(
+            GuestVa::new(first_va),
+            Gpa::new(first_gpa),
+            LARGE_2M,
+            true,
+            true,
+        )
+        .expect("first high alias fits");
         assert_eq!(mgr.set_prot_none(first_va, LARGE_2M as usize), Ok(true));
         assert_eq!(
             mgr.translate(first_va),
@@ -1372,8 +1400,14 @@ mod tests {
         );
 
         assert_eq!(mgr.unmap_alias_range(first_va, LARGE_2M as usize), Ok(true));
-        mgr.map_aliased(GuestVa::new(second_va), Gpa::new(second_gpa), LARGE_2M, true, true)
-            .expect("PROT_NONE alias unmap reclaims the table pages");
+        mgr.map_aliased(
+            GuestVa::new(second_va),
+            Gpa::new(second_gpa),
+            LARGE_2M,
+            true,
+            true,
+        )
+        .expect("PROT_NONE alias unmap reclaims the table pages");
         assert_eq!(mgr.translate(second_va), Some(second_gpa));
     }
 
@@ -1404,8 +1438,12 @@ mod tests {
     fn whole_large_leaf_edits_preserve_2m_entries() {
         let va = 0x60_0000_0000;
         let len = 512 * 1024 * 1024;
-        let bytes = pml4_tables(&[user_rw_nx(GuestVa::new(va), Gpa::new(va), len)], BASE, 4 * PT_PAGE)
-            .expect("large leaves keep this mapping compact");
+        let bytes = pml4_tables(
+            &[user_rw_nx(GuestVa::new(va), Gpa::new(va), len)],
+            BASE,
+            4 * PT_PAGE,
+        )
+        .expect("large leaves keep this mapping compact");
         let mut mgr = Pml4Manager::new(bytes, BASE);
         let before = walk_descriptors(mgr.bytes(), BASE, va);
         assert_ne!(before[2] & PML4_PS, 0, "mapping starts as a 2 MiB leaf");
@@ -1516,19 +1554,31 @@ mod tests {
         // The canonical hole remains unmapped even with high CPL0 VAs.
         let high = 1u64 << 47;
         assert_eq!(
-            pml4_tables(&[user_rw_nx(GuestVa::new(high), Gpa::new(0x1000), 0x1000)], BASE, CAP),
-            Err(Pml4Error::NonCanonical)
-        );
-        // A range that CROSSES the boundary is rejected too.
-        assert_eq!(
             pml4_tables(
-                &[user_rw_nx(GuestVa::new(high - 0x1000), Gpa::new(0x1000), 0x2000)],
+                &[user_rw_nx(GuestVa::new(high), Gpa::new(0x1000), 0x1000)],
                 BASE,
                 CAP
             ),
             Err(Pml4Error::NonCanonical)
         );
-        let bytes = build(&[user_rw_nx(GuestVa::new(0x40_0000), Gpa::new(0x40_0000), 0x1000)]);
+        // A range that CROSSES the boundary is rejected too.
+        assert_eq!(
+            pml4_tables(
+                &[user_rw_nx(
+                    GuestVa::new(high - 0x1000),
+                    Gpa::new(0x1000),
+                    0x2000
+                )],
+                BASE,
+                CAP
+            ),
+            Err(Pml4Error::NonCanonical)
+        );
+        let bytes = build(&[user_rw_nx(
+            GuestVa::new(0x40_0000),
+            Gpa::new(0x40_0000),
+            0x1000,
+        )]);
         let mut mgr = Pml4Manager::new(bytes, BASE);
         assert_eq!(mgr.translate(high), None);
         assert_eq!(
@@ -1631,7 +1681,11 @@ mod tests {
     fn misaligned_spec_rejected() {
         assert_eq!(
             pml4_tables(
-                &[user_rw_nx(GuestVa::new(0x40_0800), Gpa::new(0x40_0000), 0x1000)],
+                &[user_rw_nx(
+                    GuestVa::new(0x40_0800),
+                    Gpa::new(0x40_0000),
+                    0x1000
+                )],
                 BASE,
                 CAP
             ),
@@ -1640,7 +1694,11 @@ mod tests {
         );
         assert_eq!(
             pml4_tables(
-                &[user_rw_nx(GuestVa::new(0x40_0000), Gpa::new(0x40_0800), 0x1000)],
+                &[user_rw_nx(
+                    GuestVa::new(0x40_0000),
+                    Gpa::new(0x40_0800),
+                    0x1000
+                )],
                 BASE,
                 CAP
             ),
@@ -1649,7 +1707,11 @@ mod tests {
         );
         assert_eq!(
             pml4_tables(
-                &[user_rw_nx(GuestVa::new(0x40_0000), Gpa::new(0x40_0000), 0x800)],
+                &[user_rw_nx(
+                    GuestVa::new(0x40_0000),
+                    Gpa::new(0x40_0000),
+                    0x800
+                )],
                 BASE,
                 CAP
             ),
@@ -1663,7 +1725,11 @@ mod tests {
         // Root + PDPT + PD + PT = 4 pages minimum; 2 pages can't hold a map.
         assert_eq!(
             pml4_tables(
-                &[user_rw_nx(GuestVa::new(0x40_0000), Gpa::new(0x40_0000), 0x1000)],
+                &[user_rw_nx(
+                    GuestVa::new(0x40_0000),
+                    Gpa::new(0x40_0000),
+                    0x1000
+                )],
                 BASE,
                 2 * 0x1000
             ),

@@ -245,7 +245,10 @@ fn sys_writev(engine: &KvmTrapEngine, frame: &Aarch64SyscallFrame) -> Result<i64
     let mut total: i64 = 0;
     for i in 0..iovcnt {
         let ent = engine
-            .read_guest(Gpa::new(iov_base + (i as u64) * IOVEC_SIZE), IOVEC_SIZE as usize)
+            .read_guest(
+                Gpa::new(iov_base + (i as u64) * IOVEC_SIZE),
+                IOVEC_SIZE as usize,
+            )
             .map_err(|e| format!("writev iov[{i}]: {e}"))?;
         let to_u64 = |b: &[u8]| -> Result<u64, String> {
             b.try_into()

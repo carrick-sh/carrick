@@ -863,7 +863,12 @@ pub(crate) fn mapped_overlap_bytes(mem: &MemState, start: u64, len: u64) -> u64 
     }
     project_vma_summaries(mem)
         .iter()
-        .map(|vma| vma.end.raw().min(end).saturating_sub(vma.start.raw().max(start)))
+        .map(|vma| {
+            vma.end
+                .raw()
+                .min(end)
+                .saturating_sub(vma.start.raw().max(start))
+        })
         .sum()
 }
 

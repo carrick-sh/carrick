@@ -241,9 +241,10 @@ impl<'a> MemView<'a> {
         let mut ranges = mem.locked_view().into_owned();
         if let Some(regions) = &mem.address_space_regions {
             for region in regions {
-                if let Some(range) =
-                    carrick_vfs::GuestMemoryRange::new(GuestVa::new(region.start), GuestVa::new(region.end))
-                {
+                if let Some(range) = carrick_vfs::GuestMemoryRange::new(
+                    GuestVa::new(region.start),
+                    GuestVa::new(region.end),
+                ) {
                     locked_ranges_insert(&mut ranges, range);
                 }
             }
@@ -258,7 +259,9 @@ impl<'a> MemView<'a> {
                     .map(|row| (row.start, row.end)),
             )
         {
-            if let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)) {
+            if let Some(range) =
+                carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
+            {
                 locked_ranges_insert(&mut ranges, range);
             }
         }

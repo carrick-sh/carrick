@@ -970,7 +970,8 @@ pub(super) fn locked_ranges_insert(
         end = end.max(existing.end().raw());
         remove_end += 1;
     }
-    let Some(merged) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)) else {
+    let Some(merged) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
+    else {
         return;
     };
     ranges.splice(index..remove_end, [merged]);
@@ -2101,7 +2102,9 @@ impl<'a> MemView<'a> {
                 "shared-anon rollback range overflows at 0x{address:x} for {guest_length} bytes"
             )));
         };
-        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(address), GuestVa::new(end)) else {
+        let Some(range) =
+            carrick_vfs::GuestMemoryRange::new(GuestVa::new(address), GuestVa::new(end))
+        else {
             return Err(MemoryError::HostMap(format!(
                 "shared-anon rollback range is empty at 0x{address:x}"
             )));
@@ -2387,7 +2390,8 @@ impl SyscallDispatcher {
         let Some(end) = page.checked_add(view.linux_page_size()) else {
             return false;
         };
-        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(page), GuestVa::new(end)) else {
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(page), GuestVa::new(end))
+        else {
             return false;
         };
         let mut mem = authority.mem.lock();

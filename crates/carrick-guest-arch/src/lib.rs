@@ -196,7 +196,6 @@ impl core::fmt::Display for HostVa {
     }
 }
 
-
 /// Native address-space register bits, including ARM ASID or x86 control
 /// bits. This is distinct from a physical root and conveys no MM authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

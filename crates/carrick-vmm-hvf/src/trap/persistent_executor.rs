@@ -411,7 +411,9 @@ impl PersistentCarrierMappings {
         address: u64,
         length: usize,
     ) -> Option<std::ptr::NonNull<u8>> {
-        let mapping = self.mappings.mapping_for_range(GuestVa::new(address), length)?;
+        let mapping = self
+            .mappings
+            .mapping_for_range(GuestVa::new(address), length)?;
         let offset = usize::try_from(address.checked_sub(mapping.start)?).ok()?;
         std::ptr::NonNull::new(unsafe { mapping.host_addr.add(offset) })
     }

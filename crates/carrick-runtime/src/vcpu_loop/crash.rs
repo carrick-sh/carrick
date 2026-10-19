@@ -679,8 +679,10 @@ where
                 })?;
                 let subranges: Vec<std::ops::Range<carrick_guest_mem::GuestVa>> =
                     match &deferred_anonymous {
-                        Some(deferred) => deferred
-                            .materialized_subranges(carrick_guest_mem::GuestVa::new(map.start), length),
+                        Some(deferred) => deferred.materialized_subranges(
+                            carrick_guest_mem::GuestVa::new(map.start),
+                            length,
+                        ),
                         None => {
                             vec![
                                 carrick_guest_mem::GuestVa::new(map.start)

@@ -49,7 +49,7 @@ pub trait X86Page4K {
     fn page_base(self) -> u64;
     fn page_offset(self) -> usize;
     fn crosses_page(self, len: usize) -> bool;
-    fn is_canonical_48bit(self) -> bool;
+    fn is_canonical_48bit(&self) -> bool;
 }
 
 impl X86Page4K for GuestVa {
@@ -69,11 +69,10 @@ impl X86Page4K for GuestVa {
     }
 
     #[inline]
-    fn is_canonical_48bit(self) -> bool {
-        is_canonical_48bit(self)
+    fn is_canonical_48bit(&self) -> bool {
+        is_canonical_48bit(*self)
     }
 }
-
 
 /// Unauthenticated stage-1 output guest physical address produced by a page-table walk.
 #[repr(transparent)]
