@@ -489,7 +489,11 @@ _test-unit-workspace *ARGS:
         # is defined as the tests that do NOT need the HVF runtime or Docker;
         # those belong to a guest-capable lane (`just conformance*`,
         # `cargo test -p carrick-cli --test <name>`).
-        {{_admit}} {{_cargo}} test --workspace --exclude carrick-runtime --exclude carrick-kernel --exclude carrick-cli --exclude carrick-host --exclude carrick-vfs --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
+        # `serial_host` tests in this batch (carrick-el1's process-global
+        # signal-checkpoint fast path, for one) read state other tests mutate:
+        # run them in a serial pass after the parallel one, as off-macOS does.
+        {{_admit}} {{_cargo}} test --workspace --exclude carrick-runtime --exclude carrick-kernel --exclude carrick-cli --exclude carrick-host --exclude carrick-vfs --exclude carrick-vmm-hvf --lib --bins {{ARGS}} -- --skip serial_host
+        env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test --workspace --exclude carrick-runtime --exclude carrick-kernel --exclude carrick-cli --exclude carrick-host --exclude carrick-vfs --exclude carrick-vmm-hvf --lib --bins {{ARGS}} serial_host
     else
         # Off-macOS: run the lib tests of THIS host's own crates only (-p list from
         # _platform_crates) under the backend feature set — `--workspace --lib` would
