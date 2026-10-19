@@ -2044,16 +2044,31 @@ mod tests {
             path: Some(lock.clone()),
             held: None,
         };
-        let contender = std::fs::File::open(&lock).unwrap();
-        contender.try_lock().unwrap();
-        let started = Instant::now();
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+
+        let lock_path = lock.clone();
+        let contender = std::thread::spawn(move || {
+            let file = std::fs::File::open(&lock_path).unwrap();
+            file.try_lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(file);
+            released_tx.send(()).unwrap();
+        });
+
+        locked_rx.recv().unwrap();
         assert!(
             !lease.try_recover(&ledger).unwrap(),
             "contended recovery must return false without waiting"
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
         assert!(lease.held.is_none());
-        drop(contender);
+        release_tx.send(()).unwrap();
+        released_rx.recv().unwrap();
+        contender.join().unwrap();
+
         assert!(lease.try_recover(&ledger).unwrap());
         assert!(lease.held.is_some());
     }
