@@ -1,5 +1,13 @@
 //! The host build of the library uses the same Unavailable file authority as
 //! the production CPL0 image. Keep the x86 no-venue routing out of cfg(test).
+//!
+//! This target shares carrick-el1-linux's dev-dependencies, which enable
+//! `carrick-el1/host-test` for the library's unit tests. The claim still
+//! holds: the no-venue routing is chosen by carrick-el1-linux's own
+//! `cfg(any(test, feature = "host-test"))`, which is off for this target, and
+//! carrick-el1's host-test items are test doubles, a bounded wake trace and
+//! an unset copy-fault flag that production routing never selects. The
+//! witnesses pass unchanged with that dev feature removed (#690 review).
 #![allow(clippy::panic)]
 
 use carrick_el1_abi::{Action, Counters, CurrentTask, El1TaskId, InotifyNameCache, TrapFrame};
