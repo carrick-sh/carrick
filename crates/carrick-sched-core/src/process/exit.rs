@@ -146,7 +146,7 @@ pub enum ExitError<E> {
 #[derive(Debug)]
 pub struct PreparedExitTopology<Credit> {
     task_revision: Arc<ExitParticipantRevision>,
-    children: Vec<TaskKey>,
+    children: BTreeSet<TaskKey>,
     reserved_ids: BTreeSet<TaskId>,
     affected_revisions: BTreeMap<TaskId, PreparedExitParticipant<Credit>>,
     adopter: Option<TaskKey>,
@@ -259,8 +259,13 @@ impl<
             .get(&task.exit_container())
             .copied()
             .filter(|key| *key == task_key || exact_live(*key).is_some());
-        let mut children: Vec<_> = task.exit_children().into_iter().collect();
-        children.sort_by_key(|child| child.serial);
+        // Every use of the children is per child: reservation and
+        // validation are all-or-nothing, reparenting writes each child's own
+        // record and the adopter receives a set. No guest-visible order
+        // depends on this one, so it is the set's own exact-key order;
+        // sorting it on the EL1 exit path cost a 4 KiB `driftsort` frame
+        // plus quicksort recursion (#705).
+        let children = task.exit_children();
         let adopter = adopter.filter(|_| !children.is_empty());
         let mut reserved_ids = BTreeSet::from([task_key.id]);
         let mut affected_revisions = BTreeMap::new();

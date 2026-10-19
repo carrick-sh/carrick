@@ -64,20 +64,20 @@ fn dropping_membership_admission_preserves_reserved_exit_revision() {
     );
 }
 
-#[test]
-fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
-    use super::exit::{
-        ExitError, ExitLive, ExitLivePublication, ExitZombie, ExitZombiePublication,
-    };
-    use super::registry::{ProcessRegistry, RegistryFailure, RegistryInvariant};
-    use super::wait::{WaitIdentity, WaitIdentitySource};
-    use super::{ChildExitSignal, ProcessGroupId, TaskLifecycle};
-    use alloc::collections::{BTreeMap, BTreeSet};
-    use core::marker::PhantomData;
-    struct Live {
-        key: TaskKey,
-        parent: Option<TaskKey>,
-        children: BTreeSet<TaskKey>,
+/// A process graph whose live and dead rows are plain keyed records, shared
+/// by the exit topology tests.
+mod topology {
+    use super::super::exit::TaskRevision;
+    use super::super::exit::{ExitLive, ExitLivePublication, ExitZombie, ExitZombiePublication};
+    use super::super::registry::{ProcessRegistry, RegistryFailure, RegistryInvariant};
+    use super::super::wait::{WaitIdentity, WaitIdentitySource};
+    use super::super::{ChildExitSignal, ProcessGroupId, TaskLifecycle};
+    use super::TaskKey;
+    use alloc::collections::BTreeSet;
+    pub(super) struct Live {
+        pub(super) key: TaskKey,
+        pub(super) parent: Option<TaskKey>,
+        pub(super) children: BTreeSet<TaskKey>,
     }
     impl WaitIdentitySource for Live {
         fn wait_identity(&self) -> WaitIdentity {
@@ -112,7 +112,7 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
             Ok(())
         }
     }
-    impl super::exit::ExitEffectSource<u32> for Live {
+    impl super::super::exit::ExitEffectSource<u32> for Live {
         type Member = TaskKey;
         type Resources = ();
         fn exit_members(&self) -> (alloc::vec::Vec<TaskKey>, ()) {
@@ -122,17 +122,20 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
             true
         }
     }
-    struct ParentSignals;
-    impl super::exit::ExitSignalSource for ParentSignals {
-        fn exit_signal_state(&self, _: super::LinuxSignal) -> super::exit::ExitSignalState {
-            super::exit::ExitSignalState {
-                disposition: super::exit::ExitSignalDisposition::Default,
-                default_disposition: super::exit::DefaultSignalDisposition::Ignore,
+    pub(super) struct ParentSignals;
+    impl super::super::exit::ExitSignalSource for ParentSignals {
+        fn exit_signal_state(
+            &self,
+            _: super::super::LinuxSignal,
+        ) -> super::super::exit::ExitSignalState {
+            super::super::exit::ExitSignalState {
+                disposition: super::super::exit::ExitSignalDisposition::Default,
+                default_disposition: super::super::exit::DefaultSignalDisposition::Ignore,
                 blocked: false,
             }
         }
     }
-    impl super::exit::ExitNotificationSource for Live {
+    impl super::super::exit::ExitNotificationSource for Live {
         type Target = ParentSignals;
         fn exit_notification_target(&self) -> ParentSignals {
             ParentSignals
@@ -148,14 +151,17 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
         fn exit_forget_child(&mut self, child: TaskKey) {
             self.children.remove(&child);
         }
-        fn exit_publish_credit(&mut self, participant: super::exit::PreparedExitParticipant<()>) {
+        fn exit_publish_credit(
+            &mut self,
+            participant: super::super::exit::PreparedExitParticipant<()>,
+        ) {
             participant.publish(TaskRevision::INITIAL, |_, current| current.next().unwrap());
         }
     }
-    struct Dead {
-        key: TaskKey,
-        parent: Option<TaskKey>,
-        autoreap: Option<super::exit::DeferredAutoreap<()>>,
+    pub(super) struct Dead {
+        pub(super) key: TaskKey,
+        pub(super) parent: Option<TaskKey>,
+        pub(super) autoreap: Option<super::super::exit::DeferredAutoreap<()>>,
     }
     impl ExitZombie for Dead {
         fn exit_parent(&self) -> Option<TaskKey> {
@@ -172,40 +178,186 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
         fn exit_reparent(&mut self, parent: Option<TaskKey>) {
             self.parent = parent;
         }
-        fn exit_publish_autoreap(&mut self, accounting: super::exit::DeferredAutoreap<()>) {
+        fn exit_publish_autoreap(&mut self, accounting: super::super::exit::DeferredAutoreap<()>) {
             self.autoreap = Some(accounting);
         }
-        fn exit_reparent_autoreap(&mut self, parent: super::exit::AutoreapParent<()>) {
+        fn exit_reparent_autoreap(&mut self, parent: super::super::exit::AutoreapParent<()>) {
             self.autoreap.as_mut().unwrap().reparent(parent);
         }
-        fn exit_take_autoreap(&mut self) -> Option<super::exit::DeferredAutoreap<()>> {
+        fn exit_take_autoreap(&mut self) -> Option<super::super::exit::DeferredAutoreap<()>> {
             self.autoreap.take()
         }
     }
-    struct Failure;
+    pub(super) struct Failure;
     impl RegistryFailure for Failure {
         fn fail(_: RegistryInvariant) -> ! {
             panic!("invariant")
         }
     }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct Transaction(pub(super) u32);
+    pub(super) type Owner = ProcessRegistry<
+        u32,
+        Live,
+        Dead,
+        TaskKey,
+        super::super::exit::TaskGraphReservation<Transaction>,
+        (),
+        (),
+        (),
+        Failure,
+    >;
+    /// One container whose init is `init`, holding `tasks` and `zombies`.
+    pub(super) fn owner(
+        init: TaskKey,
+        tasks: impl IntoIterator<Item = Live>,
+        zombies: impl IntoIterator<Item = Dead>,
+    ) -> Owner {
+        use alloc::collections::BTreeMap;
+        ProcessRegistry {
+            epoch: 1,
+            container_inits: BTreeMap::from([(1, init)]),
+            tasks: tasks.into_iter().map(|live| (live.key.id, live)).collect(),
+            zombies: zombies
+                .into_iter()
+                .map(|dead| (dead.key.id, dead))
+                .collect(),
+            retiring_tasks: BTreeMap::new(),
+            reservations: BTreeMap::new(),
+            retired_threads: (),
+            process_groups: BTreeMap::new(),
+            process_group_by_namespace: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            session_by_namespace: BTreeMap::new(),
+            failure: core::marker::PhantomData,
+        }
+    }
+}
+
+/// #705: exit no longer sorts its children by serial on the EL1 stack. With
+/// 96 children (every third already a zombie) whose serials run against
+/// their key order, as adopted children's do, and again with serials in key
+/// order, exit reserves exactly the task, every child and the adopter, and
+/// publishes the same graph: each child, live or dead, reparented to the
+/// namespace init, which holds its own children plus all of them.
+#[test]
+fn exit_reparents_many_children_identically_whatever_their_serial_order() {
+    use super::exit::ExitZombie;
+    use alloc::collections::{BTreeMap, BTreeSet};
+    use alloc::vec::Vec;
+    use topology::{Dead, Live};
+    const CHILDREN: i32 = 96;
+    let id = |raw: i32| TaskId::from_registry_allocation(core::num::NonZeroI32::new(raw).unwrap());
+    let serial = |raw: u64| TaskSerial::from_raw_u64(raw).unwrap();
+    let published = |against_key_order: bool| {
+        let init = TaskKey {
+            id: id(1),
+            serial: serial(1),
+        };
+        let sibling = TaskKey {
+            id: id(500),
+            serial: serial(2),
+        };
+        let task = TaskKey {
+            id: id(2),
+            serial: serial(3),
+        };
+        let children: Vec<TaskKey> = (0..CHILDREN)
+            .map(|index| TaskKey {
+                id: id(10 + index),
+                serial: serial(if against_key_order {
+                    1000 - index as u64
+                } else {
+                    100 + index as u64
+                }),
+            })
+            .collect();
+        let zombie = |index: usize| index.is_multiple_of(3);
+        let mut tasks = alloc::vec![
+            Live {
+                key: init,
+                parent: None,
+                children: BTreeSet::from([task, sibling]),
+            },
+            Live {
+                key: sibling,
+                parent: Some(init),
+                children: BTreeSet::new(),
+            },
+            Live {
+                key: task,
+                parent: Some(init),
+                children: children.iter().copied().collect(),
+            },
+        ];
+        let mut zombies = Vec::new();
+        for (index, child) in children.iter().enumerate() {
+            if zombie(index) {
+                zombies.push(Dead {
+                    key: *child,
+                    parent: Some(task),
+                    autoreap: None,
+                });
+            } else {
+                tasks.push(Live {
+                    key: *child,
+                    parent: Some(task),
+                    children: BTreeSet::new(),
+                });
+            }
+        }
+        let mut owner = topology::owner(init, tasks, zombies);
+        let mut plan = owner.prepare_exit_topology(task, None).unwrap();
+        assert_eq!(plan.adopter(), Some(init));
+        let mut reserved: BTreeSet<TaskId> = children.iter().map(|child| child.id).collect();
+        reserved.extend([task.id, init.id]);
+        assert_eq!(plan.reserved_ids(), &reserved);
+        owner.validate_exit_topology(task, &plan).unwrap();
+        owner.publish_exit_topology(&mut plan);
+        let mut adopted = BTreeSet::from([task, sibling]);
+        adopted.extend(children.iter().copied());
+        assert_eq!(owner.tasks[&init.id].children, adopted);
+        for (index, child) in children.iter().enumerate() {
+            let parent = if zombie(index) {
+                assert_eq!(owner.zombies[&child.id].exit_key(), *child);
+                owner.zombies[&child.id].exit_parent()
+            } else {
+                owner.tasks[&child.id].parent
+            };
+            assert_eq!(parent, Some(init), "child {index} not reparented");
+        }
+        // The graph, with serials normalized away, for comparison.
+        let parents: BTreeMap<TaskId, Option<TaskId>> = owner
+            .tasks
+            .values()
+            .map(|live| (live.key.id, live.parent.map(|key| key.id)))
+            .chain(
+                owner
+                    .zombies
+                    .values()
+                    .map(|dead| (dead.key.id, dead.parent.map(|key| key.id))),
+            )
+            .collect();
+        let adopted: BTreeSet<TaskId> = adopted.iter().map(|key| key.id).collect();
+        (parents, adopted, plan.reserved_ids().clone())
+    };
+    assert_eq!(published(true), published(false));
+}
+
+#[test]
+fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
+    use super::ProcessGroupId;
+    use super::exit::{ExitError, ExitZombie};
+    use super::registry::ProcessRegistry;
+    use alloc::collections::{BTreeMap, BTreeSet};
+    use core::marker::PhantomData;
+    use topology::{Dead, Live, Owner, Transaction};
     let parent = TaskKey {
         id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(1).unwrap()),
         ..key(1)
     };
     let task = key(2);
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct Transaction(u32);
-    let mut owner: ProcessRegistry<
-        u32,
-        Live,
-        Dead,
-        TaskKey,
-        super::exit::TaskGraphReservation<Transaction>,
-        (),
-        (),
-        (),
-        Failure,
-    > = ProcessRegistry {
+    let mut owner: Owner = ProcessRegistry {
         epoch: 1,
         container_inits: BTreeMap::from([(1, parent)]),
         tasks: BTreeMap::from([
