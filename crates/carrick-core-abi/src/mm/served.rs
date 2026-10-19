@@ -347,16 +347,27 @@ pub struct GenerationLine<W: ServedWord = AtomicU64> {
 
 /// One invalidation domain of `N` members.
 ///
-/// A domain cannot be duplicated in safe code:
+/// A domain cannot be duplicated in safe code because `DomainNonce` is move-only.
+/// Dereferencing `domain()` fails because `DomainNonce` is not `Copy`:
 /// ```compile_fail
 /// use carrick_core_abi::mm::served::{DomainNonce, ServedTable};
 /// use core::num::NonZeroU64;
 ///
 /// let nonce = unsafe { DomainNonce::from_issued(NonZeroU64::new(1).unwrap()) };
 /// let t1 = ServedTable::<1>::new(nonce);
-/// // Cannot duplicate t1's domain: domain() returns &DomainNonce which is move-only,
-/// // and ServedTable::new consumes an owned DomainNonce.
-/// let _t2 = ServedTable::<1>::new(t1.domain());
+/// let _n: DomainNonce = *t1.domain();
+/// ```
+///
+/// Cloning `domain()` fails to produce an owned `DomainNonce` for a new table
+/// because `DomainNonce` is not `Clone`:
+/// ```compile_fail
+/// use carrick_core_abi::mm::served::{DomainNonce, ServedTable};
+/// use core::num::NonZeroU64;
+///
+/// let nonce = unsafe { DomainNonce::from_issued(NonZeroU64::new(1).unwrap()) };
+/// let t1 = ServedTable::<1>::new(nonce);
+/// let n = t1.domain().clone();
+/// ServedTable::<1>::new(n);
 /// ```
 #[repr(C)]
 #[derive(Debug)]
