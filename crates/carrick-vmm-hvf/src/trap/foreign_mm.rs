@@ -1029,7 +1029,7 @@ impl MmAccessState {
         let exact = pending.is_some_and(|handle| {
             self.identity.read().as_ref().is_some_and(|(mm, binding)| {
                 mm.raw_for_probe() == handle.mm().raw()
-                    && authority.root_base() == Some(binding.stage1_root.0)
+                    && authority.root_base() == Some(binding.stage1_root.raw())
             })
         });
         if let Some(handle) = pending.filter(|_| exact) {
@@ -4604,14 +4604,14 @@ pub mod foreign_cow_test_support {
             }
             let table_bytes = tables.as_bytes().to_vec();
             let (table_generation, table_host) =
-                install_owner(&custody.custody, shape.stage1_root.0, &table_bytes)?;
+                install_owner(&custody.custody, shape.stage1_root.raw(), &table_bytes)?;
             let mut data_bytes = vec![0_u8; shape.data_len as usize];
             data_bytes[..initial_bytes.len()].copy_from_slice(&initial_bytes);
             let (data_generation, data_host) =
-                install_owner(&custody.custody, shape.data_ipa.0, &data_bytes)?;
+                install_owner(&custody.custody, shape.data_ipa.raw(), &data_bytes)?;
 
-            let root_key = (shape.stage1_root.0, shape.page_table_len);
-            let data_key = (shape.data_ipa.0, shape.data_len);
+            let root_key = (shape.stage1_root.raw(), shape.page_table_len);
+            let data_key = (shape.data_ipa.raw(), shape.data_len);
             let root_backing = InventoryBackingIdentity::Private(
                 ordinal
                     .checked_mul(2)
@@ -5040,7 +5040,7 @@ pub mod foreign_cow_test_support {
             carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
         tables
-            .rebase(stage1_root.0, None)
+            .rebase(stage1_root.raw(), None)
             .map_err(|error| format!("rebase carrier fixture page tables: {error:?}"))?;
         // Keep this fixture at leaf granularity even when the aperture reaches
         // 2 MiB. Its COW setup tests independent 16 KiB compounds, not blocks.
@@ -5048,7 +5048,7 @@ pub mod foreign_cow_test_support {
             tables
                 .map_aliased(
                     data_va + offset,
-                    data_ipa.0 + offset,
+                    data_ipa.raw() + offset,
                     OWNER_LEN,
                     carrick_mmu_core::aarch64::UserLeafAccess {
                         writable: false,

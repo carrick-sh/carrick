@@ -1227,7 +1227,7 @@ mod tests {
             InitialInventoryIdentity, ProductionCarrierForeignCowCustody,
             ProductionCarrierForeignCowHarness, ProductionCarrierForeignCowInstallArgs,
         };
-        let stage1_root = shape.stage1_root.0;
+        let stage1_root = shape.stage1_root.raw();
 
         let (_stage1_pool, stage1) =
             crate::hvpatch::Stage1MmPool::new_root_for_tests(stage1_root, 4)

@@ -331,9 +331,9 @@ impl TaskMappingIndex {
         let next = self.live.range(key..).next();
         if let Some((prev_va, prev_row)) = prev {
             debug_assert_eq!(
-                prev_va.0, prev_row.start,
+                prev_va.raw(), prev_row.start,
                 "TaskMappingIndex key must be the row start: key=0x{:x} start=0x{:x}",
-                prev_va.0, prev_row.start
+                prev_va.raw(), prev_row.start
             );
             debug_assert!(
                 prev_row.start < prev_row.end,
@@ -343,9 +343,9 @@ impl TaskMappingIndex {
             );
             if let Some((next_va, next_row)) = next {
                 debug_assert_eq!(
-                    next_va.0, next_row.start,
+                    next_va.raw(), next_row.start,
                     "TaskMappingIndex key must be the row start: key=0x{:x} start=0x{:x}",
-                    next_va.0, next_row.start
+                    next_va.raw(), next_row.start
                 );
                 debug_assert!(
                     next_row.start < next_row.end,
@@ -365,9 +365,9 @@ impl TaskMappingIndex {
             }
         } else if let Some((next_va, next_row)) = next {
             debug_assert_eq!(
-                next_va.0, next_row.start,
+                next_va.raw(), next_row.start,
                 "TaskMappingIndex key must be the row start: key=0x{:x} start=0x{:x}",
-                next_va.0, next_row.start
+                next_va.raw(), next_row.start
             );
             debug_assert!(
                 next_row.start < next_row.end,
@@ -783,7 +783,7 @@ impl TaskMappingIndex {
         let displaced = self
             .shadowed
             .iter()
-            .filter(|row| row.start > after.0 && row.start < before.0 && accept(row))
+            .filter(|row| row.start > after.raw() && row.start < before.raw() && accept(row))
             .map(|row| row.start)
             .min();
         live.into_iter().chain(displaced).min()
@@ -808,7 +808,7 @@ impl TaskMappingIndex {
         note_hot_path_rows(HotPathScan::TaskMappings, self.shadowed.len());
         self.shadowed
             .iter()
-            .any(|row| row.start < current.0 && row.end > floor)
+            .any(|row| row.start < current.raw() && row.end > floor)
     }
 
     /// Rows that can cover `[ipa, ipa + length)` in the stage-2 IPA domain,

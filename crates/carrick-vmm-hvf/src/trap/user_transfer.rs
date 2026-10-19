@@ -26,11 +26,11 @@ impl UserTransferCustody {
             .custody
             .global_frame_host_owners
             .lock()
-            .range(..=(physical.0, u64::MAX))
+            .range(..=(physical.raw(), u64::MAX))
             .next_back()
             .filter(|((base, size), _)| {
                 physical
-                    .0
+                    .raw()
                     .checked_add(len as u64)
                     .is_some_and(|end| end <= base.saturating_add(*size))
             })
@@ -50,7 +50,7 @@ impl UserTransferCustody {
             return Err(invalid());
         }
         let base = owner.snapshot().ok_or_else(invalid)?.ipa;
-        let offset = usize::try_from(physical.0.checked_sub(base).ok_or_else(invalid)?)
+        let offset = usize::try_from(physical.raw().checked_sub(base).ok_or_else(invalid)?)
             .map_err(|_| invalid())?;
         let pin = owner.pin().map_err(|_| invalid())?;
         sparse_materialization::RetainedImportSource::from_pin(pin, identity, offset, len)
