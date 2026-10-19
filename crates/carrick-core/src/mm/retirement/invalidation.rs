@@ -106,6 +106,7 @@ impl ResidencyTag for RootGpa {
 ///   TLB, or one soft TLB), and that cache is served only through that seat.
 ///   A cache moving to another member index re-enters through
 ///   [`MemberSeat::claim`], which flushes it.
+/// - A [`MemberSeat`] is dropped only once its cache is stopped.
 /// - `invalidate_local(kind, scope)` returns `Ok` only after every
 ///   translation this cache could hold that is stale for `kind` has been
 ///   architecturally invalidated, **for every tag the cache holds** (not only
@@ -213,10 +214,12 @@ impl<'t, const N: usize, W: ServedWord> MemberSeat<'t, N, W> {
                 .invalidate_local(kind, V::SCOPE)
                 .map_err(SeatError::Venue)?;
         }
-        for kind in InvalidationKind::ALL {
-            let served = &seat.words().served[kind.index()];
-            if served.load(Ordering::Relaxed) < latest {
-                served.store(latest, Ordering::Release);
+        if let Some(latest) = latest {
+            for kind in InvalidationKind::ALL {
+                let served = &seat.words().served[kind.index()];
+                if served.load(Ordering::Relaxed) < latest.value().get() {
+                    served.store(latest.value().get(), Ordering::Release);
+                }
             }
         }
         Ok(seat)
@@ -257,9 +260,11 @@ impl<'t, const N: usize, W: ServedWord> MemberSeat<'t, N, W> {
         // Install Dekker: publication before reading the issue counter.
         W::fence(Ordering::SeqCst);
         let latest = self.table.counter().latest(Ordering::Acquire);
-        for kind in InvalidationKind::ALL {
-            if words.served[kind.index()].load(Ordering::Relaxed) < latest {
-                words.owed[kind.index()].fetch_max(latest, Ordering::AcqRel);
+        if let Some(latest) = latest {
+            for kind in InvalidationKind::ALL {
+                if words.served[kind.index()].load(Ordering::Relaxed) < latest.value().get() {
+                    words.owed[kind.index()].fetch_max(latest.value().get(), Ordering::AcqRel);
+                }
             }
         }
         self.serve(venue)
@@ -483,10 +488,7 @@ impl<'t, const N: usize, W: ServedWord> PendingInvalidation<'t, N, W> {
                 continue;
             }
             let words = words(member);
-            if self
-                .generation
-                .served_by(words.served[self.kind.index()].load(Ordering::Acquire))
-            {
+            if self.generation.served_by(member.served(self.kind)) {
                 continue;
             }
             if words.running.load(Ordering::Acquire) == 0 {

@@ -61,6 +61,7 @@ fn context(root: u64, mm: u64) -> AddressContext<Tag> {
 #[derive(Default)]
 struct LoomVenue {
     kicked: core::cell::Cell<bool>,
+    flushes: core::cell::Cell<usize>,
 }
 
 // SAFETY: loom threads cache no translations; served words are the model.
@@ -76,6 +77,7 @@ unsafe impl InvalidationVenue for LoomVenue {
         _kind: InvalidationKind,
         _scope: InvalidationScope,
     ) -> Result<(), ()> {
+        self.flushes.set(self.flushes.get() + 1);
         Ok(())
     }
     fn relax(&mut self) -> Result<(), ()> {
@@ -128,7 +130,9 @@ fn assert_verdict_safe(table: &'static Table, pending: PendingInvalidation<'stat
     if pending.try_complete().is_ok() {
         let served = generation.served_by(member.served(InvalidationKind::Unmap));
         let durable = !member.is_running()
-            && member.owed(InvalidationKind::Unmap) >= generation.value().get();
+            && member
+                .owed(InvalidationKind::Unmap)
+                .is_some_and(|o| o.value() >= generation.value());
         assert!(served || durable, "completed while member 1 is stale");
     }
 }
@@ -159,7 +163,11 @@ fn loom_models_install_races_request_serves_or_counts() {
             "member neither counted nor served"
         );
         if counted {
-            assert!(table.members()[1].owed(InvalidationKind::Unmap) >= generation.value().get());
+            assert!(
+                table.members()[1]
+                    .owed(InvalidationKind::Unmap)
+                    .is_some_and(|o| o.value() >= generation.value())
+            );
         }
         assert_verdict_safe(table, pending);
         drop(member_seat);
@@ -231,5 +239,81 @@ fn loom_models_requester_member_completer_with_stop_enter_aba() {
             "completed, then the member executed stale after its enter"
         );
         drop(member_seat);
+    });
+}
+
+/// Two concurrent requesters for the same context: both generations are
+/// issued, both count the running member, and the member's owed debt
+/// reflects both generations without either overwriting the other.
+#[test]
+fn loom_models_two_concurrent_requesters() {
+    model(|| {
+        let table = leaked_table();
+        let mut member_seat = seat(table, 1);
+        member_seat
+            .install(context(0x1000, 1), &mut LoomVenue::default())
+            .expect("install A");
+        member_seat.enter(&mut LoomVenue::default()).expect("enter");
+
+        let req1 = loom::thread::spawn(move || commit(table, &mut LoomVenue::default()));
+        let req2 = loom::thread::spawn(move || commit(table, &mut LoomVenue::default()));
+
+        let pending1 = req1.join().expect("req1");
+        let pending2 = req2.join().expect("req2");
+
+        let gen1 = pending1.generation();
+        let gen2 = pending2.generation();
+
+        assert_ne!(gen1, gen2, "distinct requests have distinct generations");
+        assert!(pending1.counts(CpuId::new(1)));
+        assert!(pending2.counts(CpuId::new(1)));
+
+        let owed = table.members()[1].owed(InvalidationKind::Unmap);
+        assert!(owed.is_some_and(|o| o.value() >= gen1.value() && o.value() >= gen2.value()));
+
+        member_seat.serve(&mut LoomVenue::default()).expect("serve");
+        let served = table.members()[1].served(InvalidationKind::Unmap);
+        assert!(gen1.served_by(served));
+        assert!(gen2.served_by(served));
+
+        assert!(pending1.try_complete().is_ok());
+        assert!(pending2.try_complete().is_ok());
+
+        drop(member_seat);
+    });
+}
+
+/// A member seat claim racing with a request: either the claim observes the
+/// request and serves it via admission flush, or the request sees the member's
+/// initial unclaimed/uninstalled state and the member's later install serves it.
+#[test]
+fn loom_models_claim_races_request() {
+    model(|| {
+        let table = leaked_table();
+        let claim_thread = loom::thread::spawn(move || {
+            let mut venue = LoomVenue::default();
+            let seat = MemberSeat::claim(table, CpuId::new(1), &mut venue).expect("claim");
+            (seat, venue)
+        });
+        let mut venue = LoomVenue::default();
+        let pending = commit(table, &mut venue);
+        let generation = pending.generation();
+        let (mut seat, claim_venue) = claim_thread.join().expect("claim thread");
+        let served = table.members()[1].served(InvalidationKind::Unmap);
+        let served_by_claim = generation.served_by(served);
+
+        if served_by_claim {
+            assert!(claim_venue.flushes.get() >= INVALIDATION_KINDS);
+        } else {
+            // Claim completed its latest read before the request issued;
+            // a subsequent install must owe and serve this generation.
+            seat.install(context(0x1000, 1), &mut LoomVenue::default())
+                .expect("install A");
+            let served_after_install = table.members()[1].served(InvalidationKind::Unmap);
+            assert!(generation.served_by(served_after_install));
+        }
+
+        assert_verdict_safe(table, pending);
+        drop(seat);
     });
 }

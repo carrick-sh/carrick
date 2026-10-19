@@ -105,7 +105,10 @@ impl ServedWord for AtomicU64 {
 /// carrier-wide refusing retirement-nonce counter, so two tables (including
 /// a table reallocated at a freed table's address) never share a nonce, and
 /// a generation or completion from one domain never satisfies another.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+///
+/// `DomainNonce` is move-only (no `Copy` or `Clone`) so it cannot be duplicated
+/// in safe code.
+#[derive(Debug, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct DomainNonce(NonZeroU64);
 
@@ -117,7 +120,7 @@ impl DomainNonce {
     pub const unsafe fn from_issued(raw: NonZeroU64) -> Self {
         Self(raw)
     }
-    pub const fn get(self) -> NonZeroU64 {
+    pub const fn get(&self) -> NonZeroU64 {
         self.0
     }
 }
@@ -127,21 +130,39 @@ impl DomainNonce {
 /// domain; values of different domains are not ordered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct InvalidationGeneration {
-    domain: DomainNonce,
+    domain: NonZeroU64,
     value: NonZeroU64,
 }
 
 impl InvalidationGeneration {
-    pub const fn domain(self) -> DomainNonce {
+    /// The raw domain identity this generation was issued for.
+    pub const fn raw_domain(self) -> NonZeroU64 {
         self.domain
     }
     /// The value stored in `owed`/`served` words of this generation's domain.
     pub const fn value(self) -> NonZeroU64 {
         self.value
     }
-    /// Whether a `served` word of this generation's domain records completion.
-    pub const fn served_by(self, word: u64) -> bool {
-        word >= self.value.get()
+    /// Whether an issued generation records completion of this generation.
+    pub const fn served_by(self, served: Option<InvalidationGeneration>) -> bool {
+        match served {
+            Some(s) => s.domain.get() == self.domain.get() && s.value.get() >= self.value.get(),
+            None => false,
+        }
+    }
+    /// Whether `served` records completion of this generation.
+    pub const fn served_by_generation(self, served: InvalidationGeneration) -> bool {
+        served.domain.get() == self.domain.get() && served.value.get() >= self.value.get()
+    }
+}
+
+impl PartialOrd for InvalidationGeneration {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        if self.domain.get() == other.domain.get() {
+            self.value.partial_cmp(&other.value)
+        } else {
+            None
+        }
     }
 }
 
@@ -185,8 +206,8 @@ impl<W: ServedWord> GenerationCounter<W> {
         }
     }
 
-    pub const fn domain(&self) -> DomainNonce {
-        self.domain
+    pub const fn domain(&self) -> &DomainNonce {
+        &self.domain
     }
 
     /// Issue the next generation. Mirrors `RootQuarantine::reserve_with_counter`:
@@ -202,15 +223,18 @@ impl<W: ServedWord> GenerationCounter<W> {
             .checked_add(1)
             .and_then(NonZeroU64::new)
             .map(|value| InvalidationGeneration {
-                domain: self.domain,
+                domain: self.domain.get(),
                 value,
             })
             .ok_or(GenerationExhausted)
     }
 
-    /// The latest issued value (zero before the first issue).
-    pub fn latest(&self, order: Ordering) -> u64 {
-        self.latest.load(order)
+    /// The latest issued generation (`None` before the first issue).
+    pub fn latest(&self, order: Ordering) -> Option<InvalidationGeneration> {
+        NonZeroU64::new(self.latest.load(order)).map(|value| InvalidationGeneration {
+            domain: self.domain.get(),
+            value,
+        })
     }
 }
 
@@ -240,13 +264,14 @@ pub struct MemberWords<W: ServedWord = AtomicU64> {
 /// the steady-state check is own-line loads only and no member shares a line
 /// with another member or the issue counter.
 #[repr(C, align(128))]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ResidencyMember<W: ServedWord = AtomicU64> {
     words: MemberWords<W>,
+    domain: NonZeroU64,
 }
 
 impl ResidencyMember<AtomicU64> {
-    pub const fn new() -> Self {
+    pub const fn new(domain: NonZeroU64) -> Self {
         Self {
             words: MemberWords {
                 owed: [const { AtomicU64::new(0) }; INVALIDATION_KINDS],
@@ -258,16 +283,34 @@ impl ResidencyMember<AtomicU64> {
                 context: AtomicU64::new(0),
                 seat: AtomicU64::new(0),
             },
+            domain,
         }
     }
 }
 
 impl<W: ServedWord> ResidencyMember<W> {
-    pub fn owed(&self, kind: InvalidationKind) -> u64 {
-        self.words.owed[kind.index()].load(Ordering::Acquire)
+    pub fn with_domain(domain: NonZeroU64) -> Self {
+        Self {
+            words: MemberWords::default(),
+            domain,
+        }
     }
-    pub fn served(&self, kind: InvalidationKind) -> u64 {
-        self.words.served[kind.index()].load(Ordering::Acquire)
+
+    pub fn owed(&self, kind: InvalidationKind) -> Option<InvalidationGeneration> {
+        NonZeroU64::new(self.words.owed[kind.index()].load(Ordering::Acquire)).map(|value| {
+            InvalidationGeneration {
+                domain: self.domain,
+                value,
+            }
+        })
+    }
+    pub fn served(&self, kind: InvalidationKind) -> Option<InvalidationGeneration> {
+        NonZeroU64::new(self.words.served[kind.index()].load(Ordering::Acquire)).map(|value| {
+            InvalidationGeneration {
+                domain: self.domain,
+                value,
+            }
+        })
     }
     pub fn is_running(&self) -> bool {
         self.words.running.load(Ordering::Acquire) != 0
@@ -303,6 +346,18 @@ pub struct GenerationLine<W: ServedWord = AtomicU64> {
 }
 
 /// One invalidation domain of `N` members.
+///
+/// A domain cannot be duplicated in safe code:
+/// ```compile_fail
+/// use carrick_core_abi::mm::served::{DomainNonce, ServedTable};
+/// use core::num::NonZeroU64;
+///
+/// let nonce = unsafe { DomainNonce::from_issued(NonZeroU64::new(1).unwrap()) };
+/// let t1 = ServedTable::<1>::new(nonce);
+/// // Cannot duplicate t1's domain: domain() returns &DomainNonce which is move-only,
+/// // and ServedTable::new consumes an owned DomainNonce.
+/// let _t2 = ServedTable::<1>::new(t1.domain());
+/// ```
 #[repr(C)]
 #[derive(Debug)]
 pub struct ServedTable<const N: usize, W: ServedWord = AtomicU64> {
@@ -321,19 +376,20 @@ impl<const N: usize, W: ServedWord> ServedTable<N, W> {
 
     pub fn with_domain(domain: DomainNonce) -> Self {
         let () = Self::MEMBERS_FIT;
+        let domain_raw = domain.get();
         Self {
             issue: GenerationLine {
                 counter: GenerationCounter::with_domain(domain),
             },
-            members: core::array::from_fn(|_| ResidencyMember::default()),
+            members: core::array::from_fn(|_| ResidencyMember::with_domain(domain_raw)),
         }
     }
 
     pub const fn counter(&self) -> &GenerationCounter<W> {
         &self.issue.counter
     }
-    pub const fn domain(&self) -> DomainNonce {
-        self.issue.counter.domain
+    pub const fn domain(&self) -> &DomainNonce {
+        self.issue.counter.domain()
     }
     pub const fn members(&self) -> &[ResidencyMember<W>; N] {
         &self.members
@@ -341,13 +397,14 @@ impl<const N: usize, W: ServedWord> ServedTable<N, W> {
 }
 
 impl<const N: usize> ServedTable<N, AtomicU64> {
-    pub const fn new(domain: DomainNonce) -> Self {
+    pub fn new(domain: DomainNonce) -> Self {
         let () = Self::MEMBERS_FIT;
+        let domain_raw = domain.get();
         Self {
             issue: GenerationLine {
                 counter: GenerationCounter::new(domain),
             },
-            members: [const { ResidencyMember::new() }; N],
+            members: core::array::from_fn(|_| ResidencyMember::new(domain_raw)),
         }
     }
 }
@@ -361,6 +418,7 @@ const _: () = {
     assert!(size_of::<ResidencyMember>() == SERVED_LINE);
     assert!(size_of::<MemberWords>() <= SERVED_LINE);
     assert!(offset_of!(ResidencyMember, words) == 0);
+    assert!(offset_of!(ResidencyMember, domain) == 80);
     assert!(offset_of!(MemberWords, owed) == 0);
     assert!(offset_of!(MemberWords, served) == 16);
     assert!(offset_of!(MemberWords, running) == 32);
@@ -396,7 +454,7 @@ mod tests {
         assert_eq!(last.value().get(), u64::MAX);
         for _ in 0..3 {
             assert_eq!(counter.issue(), Err(GenerationExhausted));
-            assert_eq!(counter.latest(Ordering::Relaxed), u64::MAX);
+            assert_eq!(counter.latest(Ordering::Relaxed), Some(last));
         }
     }
 
@@ -409,8 +467,12 @@ mod tests {
         let foreign = other.issue().expect("fresh counter issues");
         assert_eq!(first.value().get(), 1);
         assert!(second.value() > first.value());
-        assert!(first.served_by(1) && !second.served_by(1));
+        assert!(first.served_by(Some(first)) && !second.served_by(Some(first)));
         assert_eq!(foreign.value(), first.value());
         assert_ne!(foreign, first, "equal values of different domains differ");
+        assert!(
+            !first.served_by(Some(foreign)),
+            "foreign domain cannot serve first"
+        );
     }
 }
