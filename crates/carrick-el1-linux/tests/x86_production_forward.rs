@@ -334,10 +334,14 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
 
         fn prepare_mm(
             &mut self,
-            _: &Self::Mm,
+            parent: &Self::Mm,
             _: &ParkedContextWords,
             child: MmGeneration,
         ) -> Result<Self::PreparedMm, NativeProcessError> {
+            assert_ne!(
+                child, parent.mm,
+                "fork child MM must differ from its live parent"
+            );
             let address = AddressContext {
                 root: RootGpa::page_aligned(FrameGpa::new(0x2000)).unwrap(),
                 mm: child,
@@ -518,6 +522,9 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         retired_count: 0,
         retired_fd_tables: Vec::new(),
     };
+    // This fixture published its root MM by hand rather than issuing it from
+    // the production host registry. Import it before actual native admission.
+    zone.mm_issuer().observe_existing(address.mm);
     let runtime = Arc::new(
         NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
             source,

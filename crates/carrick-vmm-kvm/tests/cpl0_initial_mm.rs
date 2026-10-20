@@ -49,6 +49,14 @@ fn try_run_pool_fixture_with_loaded_pre_entry_hook(
         Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     let root = dispatcher.capture_one_task_context().expect("issued root");
+    root.kernel()
+        .object_ids()
+        .bind_initial_birth_source(
+            carrier
+                .birth_serial_source()
+                .expect("stopped carrier source"),
+        )
+        .expect("bind initial carrier birth and MM source");
     carrier
         .bind_initial_task_identity(InitialTaskBinding {
             task: root.task().key(),
@@ -166,6 +174,15 @@ fn native_exit_workers(
     let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent).expect("real KVM");
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     let issued = dispatcher.capture_one_task_context().expect("issued root");
+    issued
+        .kernel()
+        .object_ids()
+        .bind_initial_birth_source(
+            carrier
+                .birth_serial_source()
+                .expect("stopped carrier source"),
+        )
+        .expect("bind initial carrier birth and MM source");
     carrier
         .bind_initial_task_identity(InitialTaskBinding {
             task: issued.task().key(),
@@ -840,6 +857,8 @@ fn initial_root_uses_issued_thread_and_file_table_identity() {
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
     let mut carrier =
         Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM boot");
+    // These identities are fixture-supplied, with no host registry issuing
+    // later MMs. The dispatcher-backed fixtures above bind the stopped source.
     carrier
         .bind_initial_task_identity(InitialTaskBinding {
             mm: carrick_guest_arch::MmGeneration::new(
