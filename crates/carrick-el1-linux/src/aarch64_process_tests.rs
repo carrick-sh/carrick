@@ -6183,3 +6183,352 @@ fn arm_unadopted_exit_wakes_unplaceable_closing_owner_without_process_venue() {
         "venue-absent unplaceable wake must hand the closing owner back to host"
     );
 }
+
+struct ArmWaitSignalMachine {
+    user_sp: UserVa,
+    backend: ArmWaitSignalBackend,
+}
+
+impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSignalMachine {
+    type Backend = ArmWaitSignalBackend;
+
+    fn backend(&mut self) -> &mut Self::Backend {
+        &mut self.backend
+    }
+
+    fn user_sp(&self, _frame: &carrick_el1_abi::TrapFrame) -> UserVa {
+        self.user_sp
+    }
+
+    fn restart(
+        &self,
+        frame: &mut carrick_el1_abi::TrapFrame,
+        original: Aarch64ParkedContext,
+    ) -> bool {
+        frame.x[0] = original.syscall_return();
+        if let Some(pc) = frame.elr.checked_sub(4) {
+            frame.elr = pc;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn restart_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
+        crate::arm_signal::restart_forwarded_frame(frame)
+    }
+
+    fn group_exit_custody(
+        &self,
+        _task: &CurrentTask,
+    ) -> carrick_personality_linux::dispatch::CompletionRoute {
+        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+    }
+}
+
+struct ArmWaitSignalBackend;
+
+impl carrick_guest_arch::ArchTypes for ArmWaitSignalBackend {
+    type Error = carrick_el1::isa::ArchError;
+    type NativeFrame = carrick_el1_abi::TrapFrame;
+    type SavedContext = carrick_el1_abi::ThreadCtx;
+    type Context = carrick_el1_abi::ThreadCtx;
+    type Root = RootGpa;
+    type MmOwner = CurrentTask;
+    type DrainTicket = ();
+    type DrainReceipt = ();
+    type UserTransfer = ();
+    type HardwareInterrupt = ();
+    type InterruptMask = ();
+}
+
+impl carrick_personality_linux::signal::SignalBackend for ArmWaitSignalBackend {
+    fn setup_signal_frame(
+        &mut self,
+        frame: &mut carrick_el1_abi::TrapFrame,
+        params: carrick_personality_linux::signal::SignalFrameParams,
+        siginfo: Option<&[u8]>,
+        fpstate: &[u8],
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+    ) -> Result<UserVa, Self::Error> {
+        crate::arm_signal::setup_arm_signal_frame(frame, params, siginfo, fpstate, copy_out)
+    }
+
+    fn restore_signal_frame(
+        &mut self,
+        _frame: &mut carrick_el1_abi::TrapFrame,
+        _fpstate: &mut [u8],
+        _copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
+    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
+        Err(carrick_el1::isa::ArchError::Unbound)
+    }
+}
+
+// VM-free binding for kernel.el1.signal-delivery-owner: the scheduler must
+// preserve the original wait4 context across a fresh signal-delivery entry.
+// No guest instructions or hardware user-memory translation execute here.
+#[repr(C, align(16))]
+struct ArmWaitSignalStack([u8; 16384]);
+
+#[test]
+fn arm_parked_wait4_signal_wake_sa_restart_saves_original_context_across_fresh_checkpoint() {
+    use carrick_personality_linux::signal::{
+        ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
+    };
+    use carrick_signal_core::policy::{Action, ActionFlags, Disposition, HandlerAddress, Signal};
+    use zerocopy::IntoBytes;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let words = fixture.tables.live(&fixture.maintenance);
+    let child_task = CurrentTask::new();
+    let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
+    let stack_base = stack.0.as_mut_ptr() as u64;
+    let user_sp = UserVa::new(stack_base + stack.0.len() as u64);
+    assert_eq!(user_sp.raw() & 15, 0);
+    let initial = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    // Match arm_child_wait_wake's supported ownership setup. Fixture::enter
+    // scopes an unpublished admission home to its callback; a fork alone
+    // does not publish that home, so its Drop retires the parent's record.
+    let runtime = std::sync::Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            initial,
+        )
+        .unwrap(),
+    );
+    let owner_registry = Box::leak(Box::new(NativeProcessRegistry::new()));
+    owner_registry
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[
+            0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+        ]),
+    )
+    .with_words(&words);
+    let usr1 = Signal::from_number(10).unwrap();
+    let action = Action {
+        disposition: Disposition::Handler(HandlerAddress(0x700000)),
+        flags: ActionFlags {
+            restart: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let child_pid = {
+        let mut process = runtime
+            .enter_registered(
+                owner_registry,
+                source,
+                &fixture.task,
+                fixture.address,
+                &initial,
+                &mut service,
+            )
+            .unwrap();
+        process.rt_sigaction(usr1, Some(action)).unwrap();
+        let LifecycleOutcome::Returned { result, .. } = process.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("expected fork return");
+        };
+        result.raw() as u32
+    };
+    assert_eq!(child_pid, 42);
+    let parent_key = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let parent_binding = runtime.task_binding(parent_key).unwrap();
+    assert_eq!(
+        fixture.zone.record_ref(parent_binding.record.id),
+        parent_binding.record,
+        "fork must retain the exact admitted parent record",
+    );
+    let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
+    let child_binding = runtime.task_binding(child_key).unwrap();
+
+    let mut wait_native = ThreadCtx::ZERO;
+    wait_native.x[0] = u64::from(child_pid);
+    wait_native.x[8] = 260;
+    wait_native.pc = 0x500004;
+    wait_native.sp_el0 = user_sp.raw();
+    let wait_context = Aarch64ParkedContext::from_parts(wait_native, fixture.address);
+    {
+        let mut parent_entry = runtime
+            .enter_registered(
+                owner_registry,
+                source,
+                &fixture.task,
+                fixture.address,
+                &wait_context,
+                &mut service,
+            )
+            .unwrap();
+        assert_eq!(parent_entry.rt_sigaction(usr1, None).unwrap(), action);
+        assert!(matches!(
+            parent_entry.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::from(child_pid)),
+                UserVa::new(0),
+                LinuxWaitOptions::empty(),
+                UserVa::new(0),
+            ),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(parent_entry.take_handoff_receipt().is_some());
+    }
+
+    activate(source, &child_task, &child_binding);
+    let mut child_service = Aarch64NativeProcessService::with_crossing(
+        &child_task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[0x28000, 0x29000]),
+    )
+    .with_words(&words);
+    {
+        let mut child_entry = runtime
+            .enter_registered(
+                owner_registry,
+                source,
+                &child_task,
+                child_binding.address,
+                &child_binding.words,
+                &mut child_service,
+            )
+            .unwrap();
+        child_entry
+            .kill(
+                SignalProcessSelector::from_abi(41),
+                SignalRequest::from_abi(10).unwrap(),
+                SignalInfo::Generated(None),
+            )
+            .unwrap();
+    }
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, child_binding.record.id);
+
+    // Production scheduler -> resume_selected -> NativeProcessEntry::resume_checkpoint.
+    // resume_selected drops its temporary entry before returning -EINTR.
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let mut cpu = ResumeCpu {
+        inner: crate::sched::FakeCpu::default(),
+        runtime: &runtime,
+        registry: owner_registry,
+        source,
+        task: &fixture.task,
+        service: &mut service,
+    };
+    let counters = carrick_el1_abi::Counters::new();
+    assert_eq!(
+        (crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot: fixture.slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .run_next(&mut frame, 0),
+        crate::sched::Served::Returned { switched: true }
+    );
+    assert_eq!(
+        frame.x[0],
+        carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+    );
+    assert_eq!(frame.elr, 0x500004);
+    assert_eq!(frame.esr, 0);
+    assert_eq!(fixture.task.visible_pid(), Some(41));
+    assert_eq!(
+        fixture.zone.record_ref(parent_binding.record.id),
+        parent_binding.record
+    );
+
+    // Fresh registered entry, as at the ARM user-return checkpoint, using the
+    // same exact owner throughout; no fabricated sibling or signal consumption.
+    // FakeCpu::save saves registers only. Preserve the admitted address just
+    // as with_process_entry reconstructs it around the saved native words.
+    let mut saved = Box::new(Aarch64ParkedContext::from_parts(
+        ThreadCtx::ZERO,
+        fixture.address,
+    ));
+    crate::sched::ThreadCpu::save(&mut cpu.inner, &frame, &mut saved);
+    assert_eq!(saved.native.sp_el0, user_sp.raw());
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let delivered = {
+        let mut process = runtime
+            .enter_registered(
+                owner_registry,
+                source,
+                &fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(
+            process.signal_checkpoint_needed(),
+            "SIGUSR1 must remain deliverable after scheduler resume"
+        );
+        assert_eq!(process.rt_sigaction(usr1, None).unwrap(), action);
+        // Host allocations are outside lifecycle_refs' fixed EL1 metadata
+        // window. Use the same explicit-control production entry point as
+        // native_process_runtime::host_test_support, with this exact member.
+        assert_eq!(
+            fixture.task.metadata.control_slot.load(Ordering::Acquire),
+            fixture.control as *const _ as u64,
+        );
+        super::signal_delivery::deliver_signal_with_control(
+            &fixture.task,
+            fixture.control,
+            &mut process,
+            &mut frame,
+            fp.as_bytes(),
+            &mut ArmWaitSignalMachine {
+                user_sp: UserVa::new(saved.native.sp_el0),
+                backend: ArmWaitSignalBackend,
+            },
+        )
+    };
+    assert_eq!(delivered, None);
+    assert_eq!(
+        frame.elr, 0x700000,
+        "must reach real handler delivery before judging restart semantics"
+    );
+    assert_eq!(frame.x[0], 10);
+    assert_eq!(
+        frame.x[2],
+        frame.x[1] + carrick_personality_linux::signal::arm::UCONTEXT_OFFSET as u64
+    );
+    let offset = usize::try_from(frame.x[1].checked_sub(stack_base).unwrap()).unwrap();
+    let decoded = carrick_personality_linux::signal::arm::decode(
+        &stack.0[offset..],
+        UserVa::new(frame.x[1]),
+        true,
+    )
+    .unwrap();
+    assert_eq!(decoded.sp, user_sp);
+    assert_eq!(
+        (decoded.pc.raw(), decoded.regs[0]),
+        (0x500000, u64::from(child_pid)),
+        "SA_RESTART handler frame must save rewound PC and original wait4 pid across fresh NativeProcessEntry"
+    );
+}
