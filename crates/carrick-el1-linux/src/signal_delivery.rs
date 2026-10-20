@@ -18,7 +18,7 @@ pub trait SignalMachine<C> {
     fn restart(
         &self,
         frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
-        original: C,
+        original: &C,
     ) -> bool;
     fn restart_forwarded(
         &self,
@@ -71,12 +71,15 @@ where
         SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(slot.blocked().0));
     let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
     slot.init_blocked(BlockedMask(saved_mask.signals().bits()));
-    let rewind_interrupted_wait =
-        |process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
+    // Every completed checkpoint consumes this exact member's interrupted wait,
+    // including a handler without SA_RESTART. It cannot leak into a later SVC.
+    let mut interrupted_child_wait = process.take_interrupted_child_wait();
+    let mut rewind_interrupted_wait =
+        |_process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
          frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
          machine: &mut A| {
-            if let Some(original) = process.take_interrupted_child_wait() {
-                Some(machine.restart(frame, original))
+            if let Some(original) = interrupted_child_wait.take() {
+                Some(machine.restart(frame, original.as_ref()))
             } else {
                 machine.restart_forwarded(frame)
             }

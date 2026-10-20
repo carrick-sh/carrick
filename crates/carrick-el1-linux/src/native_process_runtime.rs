@@ -61,7 +61,8 @@ pub enum NativeResume {
     Left(Option<LinuxWaitStatus>),
     Invalid,
 }
-static NATIVE_SUSPEND_MASKS: AtomicUsize = AtomicUsize::new(0);
+// Empty-checkpoint hint only; masks and contexts remain in their exact owners.
+static NATIVE_SIGNAL_CONTINUATIONS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 const LOCK_SPINS: u32 = 100_000;
 
@@ -536,6 +537,18 @@ fn host_admitted_process(
     })
 }
 
+/// Retained by the process resources, indexed by the exact member record.
+/// The summary counts only custody that still needs a return checkpoint.
+struct InterruptedChildWait<C: ProcessContext> {
+    thread: NativeThreadIdentity,
+    words: Option<Box<C>>,
+}
+impl<C: ProcessContext> Drop for InterruptedChildWait<C> {
+    fn drop(&mut self) {
+        NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(1, Ordering::Release);
+    }
+}
+
 pub struct NativeResources<'a, M, C: ProcessContext> {
     _control_custody: carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>,
     zone: &'a ZoneTables<C>,
@@ -545,6 +558,7 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     members: Vec<NativeMember<'a, C>>,
     mm: M,
     address: AddressContext<RootGpa>,
+    interrupted_child_waits: BTreeMap<RecordRef, InterruptedChildWait<C>>,
     /// Consumed on the child's first return to user mode, after its MM split.
     pending_child_tid: Option<UserVa>,
     signals: NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo>,
@@ -808,7 +822,7 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
 }
 impl<'a, M: Clone, C: ProcessContext> Drop for Graph<'a, M, C> {
     fn drop(&mut self) {
-        NATIVE_SUSPEND_MASKS.fetch_sub(self.suspend_masks.len(), Ordering::Release);
+        NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(self.suspend_masks.len(), Ordering::Release);
     }
 }
 pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
@@ -988,6 +1002,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     }
                 }
                 carrick_signal_core::wait::clear_non_interrupting_for(key.task.id().raw());
+                row.native_mut()
+                    .resources_mut()
+                    .interrupted_child_waits
+                    .remove(record);
                 row.native_mut().resources_mut().members.retain(|member| {
                     member.record != *record && member.thread.id() != key.task.id()
                 });
@@ -1372,6 +1390,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         if core::ptr::eq(resources.control, control) {
             resources.record = reference;
         }
+        if old_record != reference || old_key != key {
+            resources.interrupted_child_waits.remove(&old_record);
+        }
         resources.members[member_index].record = reference;
         resources.members[member_index].thread = key.task;
         resources.members[member_index].expected_host = host_identity;
@@ -1419,7 +1440,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
     /// authority used by the delivery owner; a stale record is never treated
     /// as an empty signal set.
     pub fn signal_checkpoint_needed(&self, zone: &ZoneTables<C>, record: RecordRef) -> bool {
-        if NATIVE_SUSPEND_MASKS.load(Ordering::Acquire) == 0 && signal_record_exists(zone, record) {
+        if NATIVE_SIGNAL_CONTINUATIONS.load(Ordering::Acquire) == 0
+            && signal_record_exists(zone, record)
+        {
             let control_address = zone.record(record.id).identity().control_slot;
             if control_address != 0 {
                 // SAFETY: an authenticated live or host-owned zone record
@@ -1450,7 +1473,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let Ok(row) = graph.owner.task(member.process) else {
             return true;
         };
-        if graph.suspend_masks.contains_key(&record) || member.control.forwarded_wait_mask_armed() {
+        if graph.suspend_masks.contains_key(&record)
+            || row
+                .native()
+                .resources()
+                .interrupted_child_waits
+                .contains_key(&record)
+            || member.control.forwarded_wait_mask_armed()
+        {
             return true;
         }
         let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
@@ -1929,9 +1959,18 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     .iter_mut()
                     .find(|member| member.thread.id() == key.task.id())
                     .ok_or(NativeProcessError::Stale)?;
+                let old_record = member.record;
+                let replaced =
+                    member.thread != key.task || old_record != source.zone.record_ref(record);
                 member.thread = key.task;
                 member.record = source.zone.record_ref(record);
                 member.expected_host = host_identity;
+                if replaced {
+                    row.native_mut()
+                        .resources_mut()
+                        .interrupted_child_waits
+                        .remove(&old_record);
+                }
             } else {
                 let retained = retain_member_control(control)?;
                 retained.commit_registration();
@@ -2499,6 +2538,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             members,
             mm,
             address,
+            interrupted_child_waits: BTreeMap::new(),
             pending_child_tid: None,
             signals: NativeProcessSignals::fresh_root(key),
             _thread_claim: thread_claim,
@@ -2675,7 +2715,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             exit_notification_probe: None,
             calling_tid,
             slot,
-            interrupted_child_wait: None,
             owner_continuation,
         })
     }
@@ -2718,7 +2757,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             exit_notification_probe: None,
             calling_tid,
             slot: Some(member_control),
-            interrupted_child_wait: None,
             owner_continuation,
         }))
     }
@@ -2946,7 +2984,6 @@ pub struct NativeProcessEntry<
     exit_notification_probe: Option<&'r (dyn Fn() + Sync)>,
     calling_tid: u32,
     slot: Option<&'a ThreadControlSlot>,
-    interrupted_child_wait: Option<Box<C>>,
     // Captured by native admission under its existing graph guard. Ordinary
     // syscall dispatch does not acquire another graph lock for this checkpoint.
     owner_continuation: bool,
@@ -2965,7 +3002,13 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         let Ok(row) = graph.owner.task(self.key) else {
             return true;
         };
-        if graph.suspend_masks.contains_key(&self.record) {
+        if graph.suspend_masks.contains_key(&self.record)
+            || row
+                .native()
+                .resources()
+                .interrupted_child_waits
+                .contains_key(&self.record)
+        {
             return true;
         }
         let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
@@ -3572,7 +3615,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
         if self.signal_interrupts_current() {
-            self.interrupted_child_wait = Some(Box::new(*self.words));
+            let thread = NativeThreadIdentity::from_binding(self.binding)?;
+            let mut graph = self.runtime.graph.lock();
+            let resources = graph
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| NativeProcessError::Stale)?
+                .native_mut()
+                .resources_mut();
+            if !resources.members.iter().any(|member| {
+                member.thread == thread
+                    && member.record == self.record
+                    && core::ptr::eq(member.control.control(), self.control)
+            }) || !signal_record_exists(zone, self.record)
+            {
+                return Err(NativeProcessError::Stale);
+            }
+            NATIVE_SIGNAL_CONTINUATIONS.fetch_add(1, Ordering::Release);
+            resources.interrupted_child_waits.insert(
+                self.record,
+                InterruptedChildWait {
+                    thread,
+                    words: Some(Box::new(*self.words)),
+                },
+            );
             return Ok(ContinuationPark::Interrupted);
         }
         let sequence = zone.next_seq(record);
@@ -3940,8 +4006,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
     /// Original context of an interrupted, unconsumed child-wait query.
     /// Only this owned operation may be restarted after a caught handler.
-    pub fn take_interrupted_child_wait(&mut self) -> Option<C> {
-        self.interrupted_child_wait.take().map(|words| *words)
+    pub fn take_interrupted_child_wait(&mut self) -> Option<Box<C>> {
+        let thread = NativeThreadIdentity::from_binding(self.binding).ok()?;
+        let mut graph = self.runtime.graph.lock();
+        let resources = graph
+            .owner
+            .task_mut(self.key)
+            .ok()?
+            .native_mut()
+            .resources_mut();
+        let mut interrupted = resources.interrupted_child_waits.remove(&self.record)?;
+        if interrupted.thread == thread
+            && signal_record_exists(self.source.zone, self.record)
+            && resources.members.iter().any(|member| {
+                member.thread == thread
+                    && member.record == self.record
+                    && core::ptr::eq(member.control.control(), self.control)
+            })
+        {
+            interrupted.words.take()
+        } else {
+            None
+        }
     }
     fn publish_channel(&mut self, channel: &Arc<WaitChannel>) -> Result<(), NativeProcessError> {
         publish_signal_channel(
@@ -4229,6 +4315,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             let page = row.native().resources().page;
             if first_close {
+                row.native_mut()
+                    .resources_mut()
+                    .interrupted_child_waits
+                    .clear();
                 let admission = carrick_core::terminal::TerminalCustody::<
                     carrick_core::terminal::Process,
                     carrick_core::terminal::Live,
@@ -5291,6 +5381,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }],
             mm: self.service.prepared_mm(&prepared),
             address,
+            interrupted_child_waits: BTreeMap::new(),
             pending_child_tid: child_tid.set.then_some(child_tid.address),
             signals,
             _thread_claim: thread_claim,
@@ -5698,6 +5789,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     true
                 }
             });
+            for record in &retired {
+                task.native_mut()
+                    .resources_mut()
+                    .interrupted_child_waits
+                    .remove(record);
+            }
         }
         drop(graph);
         if let Some(registry) = *self.runtime.registry.lock() {
@@ -7187,7 +7284,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .insert(self.record, original)
             .is_none()
         {
-            NATIVE_SUSPEND_MASKS.fetch_add(1, Ordering::Release);
+            NATIVE_SIGNAL_CONTINUATIONS.fetch_add(1, Ordering::Release);
         }
         loop {
             let graph = self.runtime.graph.lock();
@@ -7224,7 +7321,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .remove(&self.record)
                         .is_some()
                     {
-                        NATIVE_SUSPEND_MASKS.fetch_sub(1, Ordering::Release);
+                        NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(1, Ordering::Release);
                     }
                     return Err(carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32));
                 }
@@ -7234,7 +7331,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn take_suspend_mask(&mut self) -> Option<carrick_signal_core::policy::SigBlockMask> {
         let old = self.runtime.graph.lock().suspend_masks.remove(&self.record);
         if old.is_some() {
-            NATIVE_SUSPEND_MASKS.fetch_sub(1, Ordering::Release);
+            NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(1, Ordering::Release);
         }
         old.or_else(|| {
             self.control.take_forwarded_wait_mask().map(|saved| {
@@ -9316,23 +9413,23 @@ mod tests {
     }
     #[test]
     fn actual_compact_root_forks_a_shared_owner_child_with_distinct_visible_identity() {
-        compact_root_fork_wait_contract(false, false, false, false, None);
+        compact_root_fork_wait_contract(false, false, false, false, None, false);
     }
     #[test]
     fn caught_signal_interrupts_an_already_parked_owned_child_wait() {
-        compact_root_fork_wait_contract(true, false, false, false, None);
+        compact_root_fork_wait_contract(true, false, false, false, None, false);
     }
     #[test]
     fn reapable_child_wins_over_its_caught_sigchld() {
-        compact_root_fork_wait_contract(false, true, false, false, None);
+        compact_root_fork_wait_contract(false, true, false, false, None, false);
     }
     #[test]
     fn pending_default_stop_does_not_interrupt_wait4() {
-        compact_root_fork_wait_contract(false, false, true, false, None);
+        compact_root_fork_wait_contract(false, false, true, false, None, false);
     }
     #[test]
     fn child_signal_exit_preserves_status_across_birth_claim_settlement() {
-        compact_root_fork_wait_contract(false, true, false, true, None);
+        compact_root_fork_wait_contract(false, true, false, true, None, false);
     }
     #[test]
     fn child_exit_retains_wake_custody_across_parent_bucket_contention() {
@@ -9342,6 +9439,7 @@ mod tests {
             false,
             false,
             Some(LinuxWaitStatus::exited(7)),
+            false,
         );
     }
     #[test]
@@ -9352,7 +9450,12 @@ mod tests {
             false,
             false,
             Some(LinuxWaitStatus::signaled(15, false)),
+            false,
         );
+    }
+    #[test]
+    fn interrupted_child_wait_custody_is_cleared_when_process_closes() {
+        compact_root_fork_wait_contract(true, false, false, false, None, true);
     }
     fn compact_root_fork_wait_contract(
         interrupt_wait: bool,
@@ -9360,6 +9463,7 @@ mod tests {
         default_stop: bool,
         signal_exit_continuation: bool,
         exit_wake_contended: Option<LinuxWaitStatus>,
+        cleanup_on_exit: bool,
     ) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
@@ -9653,8 +9757,43 @@ mod tests {
                     result.raw(),
                     carrick_syscall_abi::LINUX_EINTR.guest_retval()
                 );
+                if cleanup_on_exit {
+                    assert!(
+                        runtime
+                            .graph
+                            .lock()
+                            .owner
+                            .task(parent)
+                            .unwrap()
+                            .native()
+                            .resources()
+                            .interrupted_child_waits
+                            .contains_key(&parent_entry.record)
+                    );
+                    parent_entry
+                        .begin_closing(LinuxWaitStatus::exited(7), OwnerEntry::Syscall)
+                        .unwrap();
+                    assert!(
+                        runtime
+                            .graph
+                            .lock()
+                            .owner
+                            .task(parent)
+                            .unwrap()
+                            .native()
+                            .resources()
+                            .interrupted_child_waits
+                            .is_empty(),
+                        "process cancellation must drop unconsumed interrupted waits"
+                    );
+                    assert!(parent_entry.take_interrupted_child_wait().is_none());
+                    return;
+                }
                 assert_eq!(
-                    parent_entry.take_interrupted_child_wait(),
+                    parent_entry
+                        .take_interrupted_child_wait()
+                        .as_deref()
+                        .copied(),
                     Some(words(address))
                 );
                 assert!(

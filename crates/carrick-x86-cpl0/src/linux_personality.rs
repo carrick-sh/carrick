@@ -344,7 +344,7 @@ impl carrick_el1_linux::signal_delivery::SignalMachine<carrick_sched_core::Parke
     fn restart(
         &self,
         frame: &mut NativeFrame,
-        original: carrick_sched_core::ParkedContextWords,
+        original: &carrick_sched_core::ParkedContextWords,
     ) -> bool {
         frame.rax = original.syscall_return();
         if let Some(pc) = frame.rcx.checked_sub(2) {

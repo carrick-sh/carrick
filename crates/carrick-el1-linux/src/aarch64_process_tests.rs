@@ -6203,7 +6203,7 @@ impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSign
     fn restart(
         &self,
         frame: &mut carrick_el1_abi::TrapFrame,
-        original: Aarch64ParkedContext,
+        original: &Aarch64ParkedContext,
     ) -> bool {
         frame.x[0] = original.syscall_return();
         if let Some(pc) = frame.elr.checked_sub(4) {
@@ -6272,6 +6272,20 @@ struct ArmWaitSignalStack([u8; 16384]);
 
 #[test]
 fn arm_parked_wait4_signal_wake_sa_restart_saves_original_context_across_fresh_checkpoint() {
+    arm_parked_wait4_signal_wake_case(true, false, true);
+}
+
+#[test]
+fn arm_parked_wait4_signal_wake_without_sa_restart_retains_eintr() {
+    arm_parked_wait4_signal_wake_case(false, false, false);
+}
+
+#[test]
+fn arm_parked_wait4_signal_wake_replaced_record_discards_restart_context() {
+    arm_parked_wait4_signal_wake_case(true, true, false);
+}
+
+fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member: bool) {
     use carrick_personality_linux::signal::{
         ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
     };
@@ -6286,6 +6300,7 @@ fn arm_parked_wait4_signal_wake_sa_restart_saves_original_context_across_fresh_c
     };
     let words = fixture.tables.live(&fixture.maintenance);
     let child_task = CurrentTask::new();
+    let sibling_task = CurrentTask::new();
     let mut stack = Box::new(ArmWaitSignalStack([0; 16384]));
     let stack_base = stack.0.as_mut_ptr() as u64;
     let user_sp = UserVa::new(stack_base + stack.0.len() as u64);
@@ -6325,7 +6340,7 @@ fn arm_parked_wait4_signal_wake_sa_restart_saves_original_context_across_fresh_c
     let action = Action {
         disposition: Disposition::Handler(HandlerAddress(0x700000)),
         flags: ActionFlags {
-            restart: true,
+            restart,
             ..Default::default()
         },
         ..Default::default()
@@ -6472,6 +6487,134 @@ fn arm_parked_wait4_signal_wake_sa_restart_saves_original_context_across_fresh_c
     ));
     crate::sched::ThreadCpu::save(&mut cpu.inner, &frame, &mut saved);
     assert_eq!(saved.native.sp_el0, user_sp.raw());
+    if check_member {
+        // A real host-born member of this same process cannot take the
+        // leader's interrupted wait. No fabricated RecordRef selects custody.
+        let control = host_born_sibling(fixture, 43);
+        run_as_leader(fixture);
+        sibling_task.set(
+            El1TaskId::from_linux_tid(43),
+            carrick_el1_abi::SnapshotGeneration::from_raw(13),
+            5,
+        );
+        sibling_task.mm.key.store(1, Ordering::Release);
+        sibling_task
+            .mm
+            .thread_generation
+            .store(103, Ordering::Release);
+        sibling_task.publish_visible_pid(41);
+        sibling_task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+        sibling_task.publish_root_generation(fixture.address.generation);
+        let sibling_slot = SlotId::new(1);
+        fixture.zone.drive(sibling_slot, 1);
+        fixture.zone.publish_slot(sibling_slot, 1, Some(1), 1);
+        fixture.zone.enter_guest(sibling_slot);
+        fixture.zone.install_space(sibling_slot, 1).unwrap();
+        let record = fixture
+            .zone
+            .current_or_new(
+                sibling_slot,
+                ThreadIdentity {
+                    tid: 43,
+                    serial: 103,
+                    mm: 1,
+                    file_table: 5,
+                    generation: 13,
+                    affinity: 1,
+                    lifecycle_page: fixture.page as *const _ as u64,
+                    control_slot: control as *const _ as u64,
+                },
+            )
+            .unwrap();
+        let sibling_words = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+        // SAFETY: this fixture exclusively owns the new unpublished home.
+        unsafe {
+            *fixture.zone.record(record).ctx_mut() = sibling_words;
+        }
+        control.bind_zone_record(fixture.zone.record_ref(record));
+        let sibling_source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: sibling_slot,
+        };
+        let registered = owner_registry
+            .register_thread(
+                sibling_source,
+                &sibling_task,
+                fixture.address,
+                fixture.page,
+                control,
+            )
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&registered, &runtime));
+        let mut sibling_service = Aarch64NativeProcessService::with_crossing(
+            &sibling_task,
+            sibling_slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            TestStockCrossing::new(&[]),
+        )
+        .with_words(&words);
+        let mut sibling = runtime
+            .enter_registered(
+                owner_registry,
+                sibling_source,
+                &sibling_task,
+                fixture.address,
+                &sibling_words,
+                &mut sibling_service,
+            )
+            .unwrap();
+        assert!(
+            sibling.take_interrupted_child_wait().is_none(),
+            "same-process sibling must not consume the leader's wait context"
+        );
+    }
+    if replace {
+        // Retire the actual OnCpu record through the scheduler, then rehome
+        // the live member through the production registry onto a fresh record.
+        assert_eq!(
+            fixture.zone.release_current(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::ShortLockSpin,
+            ),
+            carrick_sched_core::CurrentRelease::Released
+        );
+        let record = process_record_for_call(
+            source,
+            &fixture.task,
+            &saved.native,
+            fixture_ttbr0(fixture),
+            fixture.control,
+        )
+        .unwrap();
+        assert_ne!(fixture.zone.record_ref(record), parent_binding.record);
+        owner_registry
+            .rehome_entry(
+                source,
+                &fixture.task,
+                fixture.address,
+                fixture.page,
+                fixture.control,
+            )
+            .unwrap()
+            .unwrap();
+        let mut entry = runtime
+            .enter_registered(
+                owner_registry,
+                source,
+                &fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(
+            entry.take_interrupted_child_wait().is_none(),
+            "a replacement record cannot inherit the retired record's restart"
+        );
+    }
     let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
     let delivered = {
         let mut process = runtime
@@ -6526,9 +6669,59 @@ fn arm_parked_wait4_signal_wake_sa_restart_saves_original_context_across_fresh_c
     )
     .unwrap();
     assert_eq!(decoded.sp, user_sp);
+    let expected = if restart && !replace {
+        (0x500000, u64::from(child_pid))
+    } else {
+        (
+            0x500004,
+            carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
+        )
+    };
     assert_eq!(
         (decoded.pc.raw(), decoded.regs[0]),
-        (0x500000, u64::from(child_pid)),
-        "SA_RESTART handler frame must save rewound PC and original wait4 pid across fresh NativeProcessEntry"
+        expected,
+        "handler restart must use only this exact member's unconsumed wait context"
     );
+
+    // A subsequent fresh checkpoint on an unrelated syscall neither finds
+    // retained custody nor rewinds the frame, even after a non-restart handler.
+    let mut later = carrick_el1_abi::TrapFrame::default();
+    later.elr = 0x600004;
+    later.x[0] = 99;
+    later.x[8] = 172;
+    let mut later_words = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    crate::sched::ThreadCpu::save(
+        &mut crate::sched::FakeCpu::default(),
+        &later,
+        &mut later_words,
+    );
+    let mut later_entry = runtime
+        .enter_registered(
+            owner_registry,
+            source,
+            &fixture.task,
+            fixture.address,
+            &later_words,
+            &mut service,
+        )
+        .unwrap();
+    assert!(
+        later_entry.take_interrupted_child_wait().is_none(),
+        "handler delivery must consume restart custody exactly once, with or without SA_RESTART"
+    );
+    assert_eq!(
+        super::signal_delivery::deliver_signal_with_control(
+            &fixture.task,
+            fixture.control,
+            &mut later_entry,
+            &mut later,
+            fp.as_bytes(),
+            &mut ArmWaitSignalMachine {
+                user_sp,
+                backend: ArmWaitSignalBackend
+            },
+        ),
+        None
+    );
+    assert_eq!((later.elr, later.x[0]), (0x600004, 99));
 }
