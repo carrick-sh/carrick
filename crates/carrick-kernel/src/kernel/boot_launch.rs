@@ -90,6 +90,7 @@ pub struct BootLaunchExport<V> {
     pub identity: BootIdentity<V>,
     pub namespaces: TransferredNamespaceState,
     pub serials: VmLocal<V, TransferredSerialAllocator>,
+    pub birth_source: Option<Arc<dyn carrick_hal::birth_serial::BirthSerialSource>>,
     pub resources: BootLaunchResources,
 }
 

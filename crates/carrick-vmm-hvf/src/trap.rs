@@ -2522,6 +2522,40 @@ pub(crate) fn replace_destroyed_vm(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) enum RegionHostOwner {
+    Exclusive(crate::host_mapping::OwnedHostMapping),
+    BirthZone(std::sync::Arc<crate::metadata_grant::BirthZoneBacking>),
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl From<crate::host_mapping::OwnedHostMapping> for RegionHostOwner {
+    fn from(owner: crate::host_mapping::OwnedHostMapping) -> Self {
+        Self::Exclusive(owner)
+    }
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl core::ops::Deref for RegionHostOwner {
+    type Target = crate::host_mapping::OwnedHostMapping;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Exclusive(owner) => owner,
+            Self::BirthZone(owner) => &owner.mapping,
+        }
+    }
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl RegionHostOwner {
+    pub(crate) fn into_exclusive(self) -> Result<crate::host_mapping::OwnedHostMapping, TrapError> {
+        match self {
+            Self::Exclusive(owner) => Ok(owner),
+            Self::BirthZone(_) => Err(TrapError::Hypervisor(
+                "carrier birth zone cannot become private exec backing".into(),
+            )),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
 pub(crate) struct HvfMappedRegion {
     /// Guest VIRTUAL start (the syscall-path lookup key). Differs from `ipa`
@@ -2564,7 +2598,7 @@ pub(crate) struct HvfMappedRegion {
     #[allow(dead_code)]
     pub(crate) memory: Option<applevisor::memory::Memory>,
     #[allow(dead_code)]
-    pub(crate) host_mapping: Option<crate::host_mapping::OwnedHostMapping>,
+    pub(crate) host_mapping: Option<RegionHostOwner>,
     #[allow(dead_code)]
     pub(crate) structural_owner: Option<std::sync::Arc<StructuralBackingOwner>>,
     /// Owning rollback/retirement handle for a fresh HVPatch stage-2 extent.
@@ -2612,6 +2646,11 @@ impl HvfMappedRegion {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for HvfMappedRegion {
     fn drop(&mut self) {
+        if let Some(RegionHostOwner::BirthZone(backing)) = &self.host_mapping {
+            backing
+                .live
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         if self.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE && self.host_mapping.is_some() {
             stage2_backend::clear_el1_region_host_ptr_if(self.host_addr as usize);
         }

@@ -323,6 +323,7 @@ enum KernelPopulationOrigin {
 }
 
 pub struct RootBootstrap {
+    birth_source: Option<Arc<dyn carrick_hal::birth_serial::BirthSerialSource>>,
     population_origin: KernelPopulationOrigin,
     task_id: TaskId,
     shared_futex: carrick_thread::platform_futex::SharedFutexTable,
@@ -349,6 +350,7 @@ impl RootBootstrap {
         host_signal: Arc<dyn HostSignalBridge>,
     ) -> Result<Self, KernelError> {
         Ok(Self {
+            birth_source: None,
             population_origin: KernelPopulationOrigin::PreparedNativeLaunch,
             task_id: carrick_personality_linux::identity::task_id_from_linux_pid(observed_pid)?,
             shared_futex: carrick_thread::platform_futex::SharedFutexTable::new(),
@@ -423,6 +425,7 @@ impl RootBootstrap {
         // A reference-model kernel boots into the reference-model container.
         // Product bootstraps override this with `with_container`.
         Ok(Self {
+            birth_source: None,
             population_origin: KernelPopulationOrigin::Host,
             task_id: carrick_personality_linux::identity::task_id_from_linux_pid(observed_pid)?,
             shared_futex: carrick_thread::platform_futex::SharedFutexTable::new(),
@@ -436,6 +439,18 @@ impl RootBootstrap {
 
     /// Boot the root task inside `container` (the `Arc` `Runtime::execute`
     /// built from the CLI's `LaunchContext` and installed on the dispatcher).
+    pub fn with_birth_source(
+        mut self,
+        source: Arc<dyn carrick_hal::birth_serial::BirthSerialSource>,
+    ) -> Self {
+        self.birth_source = Some(source);
+        self
+    }
+
+    pub fn birth_source(&self) -> Option<&Arc<dyn carrick_hal::birth_serial::BirthSerialSource>> {
+        self.birth_source.as_ref()
+    }
+
     pub fn with_container(mut self, container: Arc<Container>) -> Self {
         self.container = container;
         self
@@ -1381,7 +1396,10 @@ impl Kernel {
         let session_id = SessionId::from_leader(bootstrap.task_id);
         let process_group_claim = ids.claim_process_group(process_group_id)?;
         let session_claim = ids.claim_session(session_id)?;
-        let object_ids = ObjectIdRegistry::new();
+        let object_ids = match bootstrap.birth_source {
+            Some(source) => ObjectIdRegistry::with_birth_source(source),
+            None => ObjectIdRegistry::new(),
+        };
         let fd_ceiling = Arc::new(super::FdCeilingAuthority::new());
         let mm_id = object_ids.mm_id()?;
         let mm = match bootstrap.mm_backend {
@@ -1775,9 +1793,9 @@ impl Kernel {
             .pending_signals()
             .lifecycle_lease()
             .close();
-        let serials = self
+        let (serials, birth_source) = self
             .object_ids
-            .transfer_local_serials()
+            .transfer_serials_and_births()
             .ok_or(BootExportError::AllocatorTransferred)?;
         let BootLaunchState::Adopted(resources) =
             std::mem::replace(&mut launch.state, BootLaunchState::Exported)
@@ -1803,6 +1821,7 @@ impl Kernel {
             identity,
             namespaces,
             serials: VmLocal { vm, local: serials },
+            birth_source,
             resources,
         })
     }

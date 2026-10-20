@@ -2640,3 +2640,225 @@ mod tests {
         assert_eq!(invalid.load(Ordering::Relaxed), 0);
     }
 }
+
+/// Only the existing EL1 mapping can become shared birth backing. Mapping
+/// metadata and stage-2 retirement stay with their existing owner; this Arc
+/// retains mmap lifetime for outstanding host issuance handles.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+pub(crate) struct BirthZoneBacking {
+    pub(crate) mapping: OwnedHostMapping,
+    pub(crate) live: AtomicBool,
+}
+// SAFETY: this is the fixed initialized EL1 MAP_SHARED region, which cannot
+// become exclusive exec backing after promotion. Cross-thread byte access uses
+// the existing zone ABI's atomics/claim protocol; the final Arc owns munmap.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for BirthZoneBacking {}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Sync for BirthZoneBacking {}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct CarrierBirthSource {
+    backing: Arc<BirthZoneBacking>,
+    custody: Arc<crate::trap::CarrierVmCustody>,
+    generation: crate::trap::CarrierVmGeneration,
+    identity: carrick_hal::birth_serial::BirthSourceIdentity,
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl core::fmt::Debug for CarrierBirthSource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("CarrierBirthSource")
+            .field(&self.identity)
+            .finish()
+    }
+}
+// SAFETY: retained MAP_SHARED backing is immutable except for the zone ABI's
+// atomics/claim-protected records. This source accesses only its atomic word.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for CarrierBirthSource {}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Sync for CarrierBirthSource {}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CarrierBirthSource {
+    fn with_issuer<T>(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+        op: impl FnOnce(carrick_sched_core::process::identity_allocator::SerialIssuer<'_>) -> T,
+    ) -> Result<T, carrick_hal::birth_serial::BirthSourceError> {
+        let state = self.custody.state.lock();
+        if expected != &self.identity
+            || !matches!(state.lifecycle, crate::trap::CarrierVmLifecycle::Live(g) if g == self.generation)
+            || !self.backing.live.load(Ordering::Acquire)
+        {
+            return Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner);
+        }
+        // SAFETY: this exact carrier's initialized EL1 mapping is retained by
+        // backing; its size/alignment were checked before source publication.
+        let zone = unsafe {
+            &*self
+                .backing
+                .mapping
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .cast::<carrick_el1_abi::ZoneTables>()
+        };
+        Ok(op(zone.serial_issuer()))
+    }
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_hal::birth_serial::BirthSerialSource for CarrierBirthSource {
+    fn identity(&self) -> &carrick_hal::birth_serial::BirthSourceIdentity {
+        &self.identity
+    }
+    fn allocate(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+    ) -> Result<core::num::NonZeroU64, carrick_hal::birth_serial::BirthSourceError> {
+        self.with_issuer(expected, |issuer| issuer.allocate())?
+            .ok_or(carrick_hal::birth_serial::BirthSourceError::Exhausted)
+    }
+    fn adopt_initial(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+        high_water: core::num::NonZeroU64,
+    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
+        if self.with_issuer(expected, |issuer| issuer.adopt_initial(high_water))? {
+            Ok(())
+        } else {
+            Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner)
+        }
+    }
+    fn advance_past(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+        issued: core::num::NonZeroU64,
+    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
+        self.with_issuer(expected, |issuer| issuer.advance_past(issued))
+    }
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl crate::trap::HvfVmState {
+    pub(crate) fn birth_serial_source(
+        &mut self,
+    ) -> Result<Arc<dyn carrick_hal::birth_serial::BirthSerialSource>, TrapError> {
+        use crate::trap::RegionHostOwner;
+        let custody = self.carrier_vm_custody().clone();
+        let generation = custody
+            .live_generation()
+            .ok_or_else(|| TrapError::Hypervisor("birth source requires live carrier VM".into()))?;
+        let backing = if let Some(carrier) = &self.carrier_mappings {
+            let owner = carrier
+                .mappings
+                .iter()
+                .find(|row| row.start == carrick_el1_abi::EL1_REGION_BASE)
+                .and_then(|row| row.host_mapping.as_ref());
+            match owner {
+                Some(RegionHostOwner::BirthZone(backing)) => backing.clone(),
+                _ => {
+                    return Err(TrapError::Hypervisor(
+                        "persistent carrier has no pre-bootstrap birth source".into(),
+                    ));
+                }
+            }
+        } else {
+            let row = self
+                .mappings
+                .iter_mut()
+                .find(|row| row.start == carrick_el1_abi::EL1_REGION_BASE)
+                .ok_or_else(|| TrapError::Hypervisor("carrier EL1 zone absent".into()))?;
+            if row.size < carrick_el1_abi::EL1_REGION_SIZE as usize
+                || !(row.host_addr as usize)
+                    .is_multiple_of(core::mem::align_of::<carrick_el1_abi::ZoneTables>())
+            {
+                return Err(TrapError::Hypervisor(
+                    "invalid carrier EL1 zone backing".into(),
+                ));
+            }
+            let owner = row
+                .host_mapping
+                .take()
+                .ok_or_else(|| TrapError::Hypervisor("carrier zone host custody absent".into()))?;
+            let backing = match owner {
+                RegionHostOwner::BirthZone(backing) => backing,
+                RegionHostOwner::Exclusive(mapping) => Arc::new(BirthZoneBacking {
+                    mapping,
+                    live: AtomicBool::new(true),
+                }),
+            };
+            row.host_mapping = Some(RegionHostOwner::BirthZone(backing.clone()));
+            backing
+        };
+        let identity = carrick_hal::birth_serial::BirthSourceIdentity::from_backend_identity(
+            custody.clone(),
+            custody.transfer_carrier,
+            core::num::NonZeroU64::new(generation.0)
+                .ok_or_else(|| TrapError::Hypervisor("zero VM generation".into()))?,
+        );
+        Ok(Arc::new(CarrierBirthSource {
+            backing,
+            custody,
+            generation,
+            identity,
+        }))
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod birth_source_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use carrick_hal::birth_serial::{BirthSerialSource, BirthSourceError, BirthSourceIdentity};
+    fn source() -> CarrierBirthSource {
+        let custody = Arc::new(crate::trap::CarrierVmCustody::new());
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let mapping = OwnedHostMapping::map_shared_anon(
+            carrick_el1_abi::EL1_REGION_SIZE as usize,
+            HostMappingKind::PerMmKernelState,
+        )
+        .unwrap();
+        let identity = BirthSourceIdentity::from_backend_identity(
+            custody.clone(),
+            custody.transfer_carrier,
+            core::num::NonZeroU64::new(generation.0).unwrap(),
+        );
+        CarrierBirthSource {
+            custody,
+            generation,
+            identity,
+            backing: Arc::new(BirthZoneBacking {
+                mapping,
+                live: AtomicBool::new(true),
+            }),
+        }
+    }
+    #[test]
+    fn birth_source_authenticates_exact_custody_and_refuses_retired_generation() {
+        let first = source();
+        let second = source();
+        assert_eq!(first.generation, second.generation);
+        assert_ne!(first.identity(), second.identity());
+        assert_eq!(
+            first.allocate(second.identity()),
+            Err(BirthSourceError::StaleOwner)
+        );
+        first
+            .adopt_initial(first.identity(), core::num::NonZeroU64::new(103).unwrap())
+            .unwrap();
+        assert_eq!(first.allocate(first.identity()).unwrap().get(), 104);
+        first.custody.begin_destroy(first.generation).unwrap();
+        first.custody.commit_destroy(first.generation).unwrap();
+        assert_eq!(
+            first.allocate(first.identity()),
+            Err(BirthSourceError::StaleOwner)
+        );
+        let replacement = first.custody.begin_create().unwrap();
+        first.custody.commit_create(replacement).unwrap();
+        assert_ne!(first.generation, replacement);
+        assert_eq!(
+            first.allocate(first.identity()),
+            Err(BirthSourceError::StaleOwner)
+        );
+        assert_eq!(second.allocate(second.identity()).unwrap().get(), 1);
+    }
+}

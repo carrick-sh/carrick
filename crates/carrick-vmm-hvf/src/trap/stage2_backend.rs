@@ -589,7 +589,7 @@ pub(crate) fn prepare_exec_region_raw_in_sized(
         physical_size: size,
         perms: exec_mapping_stage2_perms(mapping),
         memory: None,
-        host_mapping: Some(host_mapping),
+        host_mapping: Some(host_mapping.into()),
         structural_owner: None,
         stage2_lease: None,
         is_dynamic_alias: false,
@@ -832,7 +832,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
         physical_size: size,
         perms,
         memory: None,
-        host_mapping: Some(host_mapping),
+        host_mapping: Some(host_mapping.into()),
         structural_owner: None,
         stage2_lease: None,
         is_dynamic_alias: false,
@@ -857,6 +857,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
                 region.physical_ipa
             ))
         })?;
+        let host_mapping = host_mapping.into_exclusive()?;
         let epoch = structural_epoch.ok_or_else(|| {
             TrapError::Hypervisor(format!(
                 "initial fixed mapping at IPA 0x{:x} has no structural epoch",

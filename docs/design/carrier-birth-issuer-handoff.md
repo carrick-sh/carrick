@@ -1,144 +1,124 @@
-# Carrier birth issuer: bounded implementation handoff (#489)
+# Carrier birth issuer: production connection (#489)
 
-Status: **neutral storage prerequisite implemented; receiver repair incomplete**.
-`ZoneTables<C>` now contains one zero-valid `SerialIssuerWord`, exposed only
-through a lifetime-bound `SerialIssuer` borrow. Production host/native
-allocation and receiver authentication are unchanged. The canonical receiver
-witness remains RED. This foundation must not be promoted as receiver closure.
+Status: production task/thread allocation is connected; Linux verification is
+recorded in the worker receipt. Signed execution, Mac compilation and final
+portable/runtime acceptance remain director gates. The neutral word by itself
+was a prerequisite; this change connects actual producers and retains exact
+receiver authentication.
 
-Applicable contracts are `kernel.el1.signal-delivery-owner`,
-`kernel.el1.thread-lifecycle`, `core.lifecycle.publication`, and
-`process.native.arm-admission`. Their Linux authorities include signal(7),
-kill(2), tgkill(2), clone(2), and exit(2). The additional structural obligation
-is non-reuse across reserved and unpublished births without expanding the
-receiver's indexed lookup or serializing guest execution.
+Contracts: `kernel.el1.signal-delivery-owner`, `kernel.el1.thread-lifecycle`,
+`core.lifecycle.publication`, and `process.native.arm-admission`. Linux
+semantic authority remains signal(7), kill(2), tgkill(2), clone(2), and exit(2).
+The structural obligation is non-reuse across reserved, retired, unpublished
+and rolled-back births, without a receiver scan or a graph lock across MM
+preparation.
 
-## Reproduced failure
+## One source, before publication
 
-The canonical observer uses internal TID 42, snapshot 1, thread serial 103.
-After its retirement the native fork allocates task 102, thread 103, MM 104,
-and transaction 105. The queued process event still targets P1, but the
-unrelated P2 occupies its observing prefix. The test fails at
-`valid P1 event must survive observer TaskId reuse by P2`.
+`ZoneTables<C>::serial_issuer()` is the only task/thread birth source for an
+admitted carrier. Its zero-valid atomic word stores last-issued, starts at
+zero, issues one first, and issues MAX once before terminal refusal. Neither
+rollback nor handle transfer resets it. Protocol two authenticates production
+shared issuance, distinct from the earlier inert-storage prerequisite. The
+ARM ABI hash and x86 initial-boot version reject incompatible old images.
 
-The four-line diagnostic retains the final pending-signal consumption. It
-does not reset counters, weaken a receiver comparison, or keep the obsolete
-record alive. The focused run has 0 passed / 1 failed / 442 filtered; the
-native runtime module has 46 passed / 1 failed / 396 filtered, with the same
-sole failure. These are RED evidence, not acceptance.
+The HAL `BirthSerialSource` exposes owned operations rather than a raw pointer
+or an unchecked static borrow. `BirthSourceIdentity` retains the actual backend
+owner and compares its Arc identity, backend carrier identity and generation.
+Two independent custody objects both numbered generation one do not match.
+The identity itself cannot publish or allocate a birth without the source.
 
-## Existing zone storage and missing host ownership connection
+ARM's engine exports the source before `Kernel::bootstrap_root`. Only the
+existing fixed EL1 region can promote its exclusive host mmap to retained
+`BirthZoneBacking`; other mappings stay exclusive. Existing stage-2 retirement
+remains with the mapping owner. Host issuance retains the mmap and custody,
+checks the exact live VM generation under `custody.state`, and borrows only
+that mapping's zone word. Mapping retirement invalidates the backing handle;
+VM destruction/recreation rejects the old generation. No global zone lookup,
+new metadata page or `GuestMetadataPin` participates.
 
-The issuer is appended to the existing `ZoneTables<C>`, already mapped in
-the carrier. It needs no new metadata page, mapping, `GuestMetadataPin`, or
-guest pointer transport. `SerialIssuerWord` is exactly one `AtomicU64`:
-zero means no serial issued, allocation atomically advances the last-issued
-value, and MAX is terminal. The last successful allocation may issue MAX;
-all subsequent allocations refuse. Dropping a borrow never resets storage.
-There is deliberately no shared-word transfer/reset operation.
+`RootBootstrap::with_birth_source` installs that source before the root's first
+task/thread issuance. Later ARM containers authenticate their engine's source
+against the already-bound registry before preparing their root. A missing or
+foreign source cannot silently fall back to local issuance in an active carrier.
+The later factory extraction retains the same promoted EL1 backing, including
+persistent launches; it does not reconstruct or reseed the issuer.
 
-`ZoneTables::serial_issuer()` borrows the actual zone. The private fields
-prevent safe construction from an unchecked raw address or a copied counter;
-the compile-fail binding proves the borrow cannot escape its storage owner.
-This is a storage-lifetime prerequisite, **not** carrier authentication or a
-retained host owner. The ARM image layout hash includes the issuer protocol,
-size, alignment and zone offset even if append-only storage fits old padding.
+The x86 physical source retains the actual VM Arc and owning `Arc<GuestRam>`,
+not `SharedWindows` descriptors. Acquisition validates the complete initialized
+zone span and caches a typed pointer inside this owner. A separate revocation
+owner belongs to `Cpl0HostCustody`; teardown takes its write guard and revokes
+all retained source handles before inventory, mappings or VM custody retire.
+Each source operation holds the corresponding read guard through its atomic
+operation. Retained bytes after teardown therefore cannot authorize issuance.
 
-Verified production ownership starting points:
+The Linux x86 launch's private host kernel precedes the physical VM. Its stopped
+initial handoff holds the registry's existing issuance write authority across
+complete local high-water capture, zero-only zone adoption, and permanent source
+replacement. The capture burns a ticket from the actual allocator, including all
+previous reserved, retired and unpublished values. Zero-only CAS refuses a live
+source: an independent local registry cannot join after any allocation escaped.
+The root identity is then bound and its guest MM loaded. Native admission and
+EL0 execution follow this handoff. Other x86 host product launch lanes remain
+explicitly unsupported by the existing runtime rather than receiving a local
+birth fallback.
 
-- ARM `CarrierMetadataAccess` retains `Arc<PersistentCarrierMappings>` and
-  checks its exact custody's live generation in `region()`. The mapping
-  owner's drop path retires stage-2 before releasing host backing. Its safe
-  acquisition currently follows root preparation: `binding.rs` extracts the
-  persistent executor authority only after preparing the root and registering
-  its authoritative IPC window. The API comment on `fd_ceiling_publisher`
-  explicitly identifies extraction as the fixed mappings' Arc-ownership point.
-- x86 `ProductionCpuFactory::capture_physical_state` reads the initialized
-  `X86Cpl0Zone` through `custody.ram.host_ptr` while holding physical custody.
-  `GuestRam`'s owning drop unmaps the windows. `SharedWindows` alone is an Arc
-  to descriptors, not a retained mmap owner; cloning it cannot prove lifetime.
+## Producers and handle transfer
 
-Neither starting point is connected to host birth issuance yet:
+`ObjectIdRegistry::{task_serial,thread_serial}` use the bound source, including
+`ThreadIdentity::reserve` and subsequent host pool replenishment. A singleton
+binding still does not imply stocked siblings: `prepare_executable_thread_births`
+returns before replenishment when `live() == 1`, and default pool depth is four.
+Eight control slots are not evidence of eight issued identities.
 
-- `Kernel::bootstrap_root` constructs `ObjectIdRegistry` and issues the root
-  identities before `CarrierRuntime::boot_kernel_root_prepared` calls its
-  initialization callback. The new source must be owned on the host before
-  that issuance, rather than installed by a later binding callback.
-- Prefer supplying the actual retained carrier source through `RootBootstrap`
-  before those births. If the first root needs a local-to-zone handoff, it
-  must precede every native allocation/publication and hold the actual
-  registry's issuance write authority through complete high-water capture and
-  permanent source replacement. That includes reserved, retired and
-  unpublished values. Every later root must use the existing carrier source
-  before bootstrap; an independently seeded source cannot join a live carrier.
-- `CarrierMetadataAccess` and the runtime lifecycle mapper are compiled only
-  for macOS/AArch64. A neutral issuer cannot depend on those concrete types.
-  Other active launch adapters need a binding or a demonstrated reason they
-  cannot import host-issued births. An optional local allocator preserves the
-  defect.
+Every native graph obtains task/thread fork tickets directly from its actual
+zone before unlocking for MM preparation. Its previous cursor remains only for
+non-birth MM/transaction accounting. Host MM IDs keep their existing carrier
+owner; file, transaction and snapshot domains are not substituted for births.
+Cold admission may idempotently observe authenticated roots, Reserved, Claimed,
+Born, Published and host-birth records. Those observations are supplementary
+accounting; source custody before issuance is the concurrency proof.
 
-The unresolved work is a typed connection between the pre-bootstrap source
-owner, the exact receiving VM, and the guest borrower. VM generation alone
-is insufficient: independent custody objects both begin at generation one.
-HVF already distinguishes this case with `CarrierVmCustody::transfer_carrier`
-and `MmPortalSlots::bind_carrier`; those domains must be authenticated, not
-replaced with a zone address, MM identity, or arbitrary integer. The
-implementation establishes only the neutral borrowed source, and does not
-introduce an unchecked pointer, independent host source, or guest-only switch.
+Boot export captures the shared birth handle and revokes old host issuance under
+the same registry write authority. The exported local `serials` cursor is for
+non-birth objects when a shared `birth_source` is present. Existing births and
+other graphs keep the unchanged shared word; the old registry refuses further
+task/thread and MM admission. Exclusive pre-carrier export retains its original
+one-way local-cursor contract. Neither case transfers or zeroes a zone word.
 
-The architecture review's blanket eight-Reserved-entry assertion does not hold
-on this base. `ThreadControlArena::with_lifecycle` creates empty free/deferred
-and birth bookkeeping. `thread_ledger::replenish` issues identities according
-to actual pool depth, admission and publication state; storage for eight
-control slots does not prove eight issued identities for a singleton root.
+## Authentication, work and evidence
 
-## Required integration after resolving that boundary
+Receiver record, exact identity, process birth, thread prefix and rehome checks
+are unchanged. Indexed lookup cost remains
+`O(log N + matching incarnation + target members)`. No retired observer record
+is kept alive and no wait4, origin or noninterrupting signal policy changes.
 
-`ObjectIdRegistry::{task_serial,thread_serial}` must use the same source as
-every admitted native graph, from before any root or pool reservation.
-Other object IDs retain their existing domain. A lifecycle lease must retain
-the source through host replenishment, fork, exec/rehome, and mapped guest
-access; retaining a raw zone pointer or descriptor array is insufficient.
+Guest issuance is one successful checked atomic RMW, with contention-dependent
+CAS retries and no trap callback. Host births additionally take the registry's
+existing issuance read lock and dispatch through the retained source. ARM takes
+the custody-state mutex; x86 takes its revocation read guard. Zone address
+resolution is constant on ARM and cached at x86 acquisition. No per-birth page
+allocation or receiver scan is added. Relaxed atomic ordering proves uniqueness;
+existing publication protocols still publish birth records. No latency or native
+runtime-ratio claim follows from these checks.
 
-`ThreadIdentity::reserve` already reserves the serial before publishing a
-Reserved entry. That custody must continue through `page.claim_any()` and
-registration. `admit_fresh_root` must stop reconstructing birth issuance from
-visible members. `register_thread` imports an already-issued identity, never
-advances a private cursor. `ForkReservation` must own task/thread identities
-before unlocked preparation. MM and transaction allocation need separate
-domain accounting when the existing graph cursor is split; this is not a
-license to redesign them.
+The canonical receiver witness now obtains the observer serial from the actual
+host `ObjectIdRegistry`, retires that observer, reuses its internal TID and
+snapshot, and requires a distinct native child birth before draining P1's durable
+event. A second schedule reserves before native admission, allocates an
+unpublished native fork before later host supply, and checks rollback burning and
+partial exhaustion without child publication. The two-root real fork witness
+also checks distinct shared-source births.
 
-`BootLaunchExport` currently transfers an exclusive local cursor and revokes
-the host registry. Its source refusal behavior must remain explicit when
-births move to shared storage. Moving its cursor into a new allocator cannot
-duplicate an issuer still used by live pools. Any deliberately shared handle
-must reach the same retained source; an exclusively transferred handle must
-refuse further issuance while preserving already-owned births.
+Kernel tests exercise pre-bootstrap roots, host/native issuance orders, repeated
+host supply, complete initial handoff, refusal of an active-source join, two
+retained owners both generation one, revocation, exhaustion and shared transfer.
+Full boot-export resource checks exercise both exclusive and shared modes. x86
+source tests exercise the production retained source and revocation owner without
+VM execution; ARM custody-generation tests are registered for the Mac gate.
+The private-cursor negative control and original canonical RED remain durable
+worker evidence. Higher-layer acceptance must use the exact final top artifact.
 
-The intended issuance cost is one checked atomic RMW per birth, with
-contention-dependent retries and no latency claim. Relaxed counter ordering
-can establish uniqueness only after safe initialization and capability
-publication; it does not publish the surrounding birth record. No graph lock
-may span backend preparation. Registration must add only constant work;
-receiver lookup remains `O(log N + matching incarnation + target members)`.
-No timing measurement was made.
-
-`SerialIssuer::advance_past` monotonically observes an already-issued value,
-including MAX. It is useful for idempotent admission accounting, not live
-source convergence. The negative control
-`late_observation_cannot_repair_independently_issued_tickets` retains two
-colliding prepared tickets even after advancing the private cursor. The word
-tests cover zero initialization, unpublished/abandoned allocations, concurrent
-borrowers, terminal imports and exhaustion; the zone test covers shared borrows
-and independent storage. These do not substitute for production-bound root,
-pool, registration/fork, rehome, cross-carrier or boot-transfer witnesses.
-
-Before promotion, prove production-bound reserved-before-admission and
-birth-after-admission cases, both registration/fork orders with prepared
-children, two independent graphs sharing one carrier source, independent
-carriers, rollback, partial exhaustion, transfer, and real rehome/foreign
-ownership controls. Preserve all event, process-birth, live-record and exact
-thread-prefix authentication. Then run changed-crate checks, contract/ABI and
-stack gates, independent review, and director-owned portable and signed
-acceptance. No GREEN identity-custody or runtime claim is made here.
+Necessary layout consequences are confined to the source protocol/hash, x86 boot
+version and the EL1 host-mapping custody enum. Existing HVF mapping tests wrap
+exclusive owners in that enum; their mapping expectations are unchanged.

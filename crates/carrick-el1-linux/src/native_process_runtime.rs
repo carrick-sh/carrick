@@ -869,6 +869,46 @@ struct PendingSignalWait {
     channel: Arc<WaitChannel>,
     deadline: Option<carrick_guest_arch::Deadline>,
 }
+// Supplementary monotone observation, never membership authentication. A peer
+// may claim/retire a pool entry during this bounded scan; the real shared source
+// already burned that identity before publication, so a vanished snapshot is
+// neither an allocation gap nor a reason to reject a legitimate registration.
+fn observe_page_births<C: ProcessContext>(zone: &ZoneTables<C>, page: &ThreadLifecyclePage) {
+    let issuer = zone.serial_issuer();
+    for index in 0..page.entry_count() {
+        let Some((generation, state)) = page.state(index) else {
+            continue;
+        };
+        if matches!(
+            state,
+            carrick_el1_abi::EntryState::Reserved
+                | carrick_el1_abi::EntryState::Claimed
+                | carrick_el1_abi::EntryState::Born
+                | carrick_el1_abi::EntryState::Published
+        ) {
+            let Some(identity) = page.identity(EntryRef::new(index as u32, generation)) else {
+                continue;
+            };
+            if let Some(serial) = NonZeroU64::new(identity.thread_serial) {
+                issuer.advance_past(serial);
+            }
+            if let Some(birth) = NonZeroU64::new(identity.birth.raw()) {
+                issuer.advance_past(birth);
+            }
+        }
+    }
+    for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
+        if let Some(identity) = page.host_birth_identity(index) {
+            if let Some(serial) = NonZeroU64::new(identity.thread().raw()) {
+                issuer.advance_past(serial);
+            }
+            if let Some(birth) = NonZeroU64::new(identity.birth().raw()) {
+                issuer.advance_past(birth);
+            }
+        }
+    }
+}
+
 struct Graph<'a, M: Clone, C: ProcessContext> {
     owner: Owner<'a, M, C>,
     root_key: TaskKey,
@@ -1962,6 +2002,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             )?;
             (issued.visible_tid, Some(issued))
         };
+        source.zone.serial_issuer().advance_past(
+            NonZeroU64::new(binding.thread_generation.raw()).ok_or(NativeProcessError::Invalid)?,
+        );
+        observe_page_births(source.zone, page);
         let group_key = Self::group_key(source.zone, address, page, visible_pid);
         let mut state = self.state.lock();
         if !page.gate().serves_ring() {
@@ -2556,6 +2600,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 thread_claim.claims.push((number, ClaimKind::Thread));
             }
         }
+        source
+            .zone
+            .serial_issuer()
+            .advance_past(NonZeroU64::new(key.serial.raw()).ok_or(NativeProcessError::Invalid)?);
+        source.zone.serial_issuer().advance_past(
+            NonZeroU64::new(binding.thread_generation.raw()).ok_or(NativeProcessError::Invalid)?,
+        );
+        observe_page_births(source.zone, page);
         let serials = SerialAllocator::new();
         serials
             .advance_past(
@@ -5094,12 +5146,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .owner
                 .capture_parent(self.key)
                 .map_err(|_| NativeProcessError::Stale)?;
-            let serial = graph
-                .serials
+            let serial = self
+                .runtime
+                .zone
+                .serial_issuer()
                 .allocate()
                 .ok_or(NativeProcessError::Exhausted)?;
-            let thread_serial = graph
-                .serials
+            let thread_serial = self
+                .runtime
+                .zone
+                .serial_issuer()
                 .allocate()
                 .ok_or(NativeProcessError::Exhausted)?;
             let child_mm = MmGeneration::new(
@@ -8045,6 +8101,7 @@ mod tests {
             carrick_signal_core::policy::SigBlockMask::NONE,
         );
         let mut children = Vec::new();
+        let mut child_births = Vec::new();
         for index in 0..2 {
             let task = &tasks[index];
             let source = BornInZoneSource {
@@ -8071,7 +8128,18 @@ mod tests {
             };
             assert_eq!(result.raw(), 42 + index as i64 * 10);
             children.push(42 + index as u32 * 10);
+            let root_key = runtime.graph.lock().root_key;
+            child_births.push(
+                runtime
+                    .namespace_child_key(root_key, 42 + index as u32 * 10)
+                    .unwrap()
+                    .serial,
+            );
         }
+        assert_ne!(
+            child_births[0], child_births[1],
+            "two native graphs share carrier birth issuance"
+        );
         for index in 0..2 {
             let task = &tasks[index];
             let source = BornInZoneSource {
@@ -8132,12 +8200,21 @@ mod tests {
     }
     #[test]
     fn process_receiver_survives_internal_task_id_reuse() {
+        receiver_reuse_case(false);
+    }
+
+    #[test]
+    fn process_receiver_reserved_before_admission_and_native_unpublished_before_host_supply() {
+        receiver_reuse_case(true);
+    }
+
+    fn receiver_reuse_case(reserved_before_admission: bool) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
-        let zone = unsafe {
+        let zone: Arc<ZoneTables<ParkedContextWords>> = unsafe {
             let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
             assert!(!ptr.is_null());
-            Box::from_raw(ptr)
+            Arc::from(Box::from_raw(ptr))
         };
         let registry = Box::leak(Box::new(NativeProcessRegistry::<
             AddressContext<RootGpa>,
@@ -8187,6 +8264,40 @@ mod tests {
         .unwrap();
         let source = BornInZoneSource { zone: &zone, slot };
         let thread = CurrentTask::new();
+        // Import the already-established fixture root; subsequent host births
+        // are issued by the production registry bound to this exact retained zone.
+        zone.serial_issuer().advance_past(
+            NonZeroU64::new(leader.mm.thread_generation.load(Ordering::Acquire)).unwrap(),
+        );
+        let host_source =
+            Arc::new(carrick_hal::birth_serial::test_support::OwnedBirthZone::new(zone.clone()));
+        let host_ids = carrick_kernel::kernel::ObjectIdRegistry::with_birth_source(host_source);
+        let reserve_observer = || {
+            let _reserved_before_observer = host_ids.thread_serial().unwrap();
+            let observer_serial = host_ids.thread_serial().unwrap().raw();
+            let entry = page
+                .stock(
+                    0,
+                    carrick_el1_abi::EntryIdentity {
+                        tid: 42,
+                        visible_tid: 42,
+                        thread_serial: observer_serial,
+                        birth: carrick_core_abi::entry::BirthSerial::of_task(
+                            carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+                        ),
+                        uid_credit: 0,
+                    },
+                )
+                .unwrap();
+            page.bind_control_address(entry, &thread_control as *const _ as u64)
+                .unwrap();
+            thread_control
+                .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+                .unwrap();
+            assert!(thread_control.publish_visible_tid(42));
+            (observer_serial, entry)
+        };
+        let reserved = reserved_before_admission.then(reserve_observer);
         let runtime = Arc::new(
             NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
@@ -8214,26 +8325,7 @@ mod tests {
             namespace,
             claims: vec![(number, ClaimKind::Thread)],
         };
-        let entry = page
-            .stock(
-                0,
-                carrick_el1_abi::EntryIdentity {
-                    tid: 42,
-                    visible_tid: 42,
-                    thread_serial: 103,
-                    birth: carrick_core_abi::entry::BirthSerial::of_task(
-                        carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
-                    ),
-                    uid_credit: 0,
-                },
-            )
-            .unwrap();
-        page.bind_control_address(entry, &thread_control as *const _ as u64)
-            .unwrap();
-        thread_control
-            .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
-            .unwrap();
-        assert!(thread_control.publish_visible_tid(42));
+        let (observer_serial, entry) = reserved.unwrap_or_else(reserve_observer);
         let claim = page.claim(entry).unwrap();
         page.record_born(
             claim,
@@ -8251,7 +8343,7 @@ mod tests {
         let record = zone
             .alloc_record(ThreadIdentity {
                 tid: 42,
-                serial: 103,
+                serial: observer_serial,
                 mm: 1,
                 file_table: 5,
                 generation: carrick_core_abi::SnapshotGeneration::INITIAL.raw(),
@@ -8269,7 +8361,10 @@ mod tests {
             5,
         );
         thread.mm.key.store(1, Ordering::Release);
-        thread.mm.thread_generation.store(103, Ordering::Release);
+        thread
+            .mm
+            .thread_generation
+            .store(observer_serial, Ordering::Release);
         thread.publish_visible_pid(41);
         thread.publish_lifecycle(&page as *const _ as u64, &thread_control as *const _ as u64);
         publish_test_birth(&thread_control, &thread);
@@ -8344,12 +8439,35 @@ mod tests {
                 &mut service,
             )
             .unwrap();
-        let LifecycleOutcome::Returned { result, .. } =
-            leader_entry.fork(ProcessForkChildTid::NONE)
-        else {
-            panic!("surviving leader fork refused");
-        };
-        assert_eq!(result.raw(), 42);
+        if reserved_before_admission {
+            let reservation = leader_entry.fork_reserve().unwrap();
+            // The native ticket has escaped the graph lock but is unpublished.
+            // Later host pool supply must already observe its burned identities.
+            let host_after_native = host_ids.thread_serial().unwrap();
+            assert!(host_after_native.raw() > reservation.child_key.serial.raw());
+            assert!(host_after_native.raw() > reservation.thread_serial.get());
+            let prepared = leader_entry
+                .service
+                .prepare_mm(
+                    &reservation.parent_mm,
+                    &leader_entry.words,
+                    reservation.child_mm,
+                )
+                .unwrap();
+            assert_eq!(
+                leader_entry
+                    .fork_publish(ProcessForkChildTid::NONE, reservation, prepared)
+                    .unwrap(),
+                42
+            );
+        } else {
+            let LifecycleOutcome::Returned { result, .. } =
+                leader_entry.fork(ProcessForkChildTid::NONE)
+            else {
+                panic!("surviving leader fork refused");
+            };
+            assert_eq!(result.raw(), 42);
+        }
         let child = runtime.namespace_child_key(process_key, 42).unwrap();
         let state = registry.state.lock();
         let reused_key = state
@@ -8364,7 +8482,7 @@ mod tests {
             "internal TaskId must be reused"
         );
         assert_eq!(reused_key.binding().generation, observed.generation);
-        assert_eq!(
+        assert_ne!(
             reused_key.binding().thread_generation,
             observed.thread_generation
         );
@@ -8401,6 +8519,36 @@ mod tests {
             .unwrap();
         assert_eq!(delivered.0, event.signal());
         assert_eq!(signals.pending_count(), 0);
+        if reserved_before_admission {
+            let population = runtime.graph.lock().owner.tasks().len();
+            let aborted = leader_entry.fork_reserve().unwrap();
+            let aborted_key = aborted.child_key;
+            let aborted_thread = aborted.thread_serial;
+            runtime.graph.lock().owner.rollback_birth(&aborted.permit);
+            drop(aborted);
+            let host_after_rollback = host_ids.thread_serial().unwrap();
+            assert!(host_after_rollback.raw() > aborted_thread.get());
+            let successor = leader_entry.fork_reserve().unwrap();
+            assert!(runtime.graph.lock().owner.task(aborted_key).is_err());
+            assert!(successor.child_key.serial.raw() > aborted_key.serial.raw());
+            assert!(successor.thread_serial.get() > host_after_rollback.raw());
+            runtime.graph.lock().owner.rollback_birth(&successor.permit);
+            drop(successor);
+            assert_eq!(runtime.graph.lock().owner.tasks().len(), population);
+            zone.serial_issuer()
+                .advance_past(NonZeroU64::new(u64::MAX - 1).unwrap());
+            // Task MAX is burned, then thread allocation refuses. No child,
+            // namespace claim or prepared MM may escape partial allocation.
+            assert!(matches!(
+                leader_entry.fork_reserve(),
+                Err(NativeProcessError::Exhausted)
+            ));
+            assert_eq!(runtime.graph.lock().owner.tasks().len(), population);
+            assert_eq!(
+                host_ids.thread_serial(),
+                Err(carrick_kernel::kernel::ObjectIdError::Exhausted)
+            );
+        }
     }
     #[test]
     fn nonleader_thread_forks_through_its_authenticated_process_owner() {

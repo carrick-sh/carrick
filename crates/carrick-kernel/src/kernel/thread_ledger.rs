@@ -3195,6 +3195,79 @@ mod tests {
         drop((sibling, child));
     }
 
+    #[test]
+    fn carrier_zone_source_covers_actual_thread_pool_replenishment() {
+        let layout = std::alloc::Layout::new::<carrick_sched_core::ZoneTables>();
+        // SAFETY: aligned complete zero-valid zone, retained by the source.
+        let zone: Arc<carrick_sched_core::ZoneTables> = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<carrick_sched_core::ZoneTables>();
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            Arc::from(Box::from_raw(ptr))
+        };
+        let source =
+            Arc::new(carrick_hal::birth_serial::test_support::OwnedBirthZone::new(zone.clone()));
+        let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+            9560,
+            ThreadId::synthetic_for_tests(9560),
+            "zone-pool".into(),
+        )
+        .unwrap()
+        .with_birth_source(source);
+        let (kernel, root) = crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        kernel.registry().thread_ledger().set_pool_depth_for_test(4);
+        let first = kernel
+            .clone_thread(
+                &root,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9561),
+                None,
+            )
+            .unwrap();
+        let page = root.thread().control_lease().lifecycle();
+        let reserved_serials = || {
+            (0..page.entry_count())
+                .filter_map(|index| {
+                    let (generation, state) = page.state(index)?;
+                    (state == carrick_el1_abi::EntryState::Reserved).then(|| {
+                        page.identity(carrick_el1_abi::EntryRef::new(index as u32, generation))
+                            .unwrap()
+                            .thread_serial
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = reserved_serials();
+        assert_eq!(before.len(), 4);
+        let native_unpublished = zone.serial_issuer().allocate().unwrap();
+        assert!(
+            before
+                .iter()
+                .all(|serial| *serial < native_unpublished.get())
+        );
+        let second = kernel
+            .clone_thread(
+                &root,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9562),
+                None,
+            )
+            .unwrap();
+        let after = reserved_serials();
+        assert_eq!(after.len(), 4);
+        assert!(
+            after
+                .iter()
+                .any(|serial| *serial > native_unpublished.get())
+        );
+        assert!(!after.contains(&native_unpublished.get()));
+        assert_ne!(first.thread().key().serial, second.thread().key().serial);
+        assert_ne!(second.thread().key().serial.raw(), native_unpublished.get());
+        let later_native = zone.serial_issuer().allocate().unwrap();
+        assert!(after.iter().all(|serial| *serial < later_native.get()));
+    }
+
     /// `CARRICK_THREAD_POOL=0`: no standing entries; each clone reserves its
     /// one entry at clone time through the same claim.
     #[test]
