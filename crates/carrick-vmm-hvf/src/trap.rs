@@ -2522,7 +2522,7 @@ pub(crate) fn replace_destroyed_vm(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) enum RegionHostOwner {
     Exclusive(crate::host_mapping::OwnedHostMapping),
     BirthZone(std::sync::Arc<crate::metadata_grant::BirthZoneBacking>),
