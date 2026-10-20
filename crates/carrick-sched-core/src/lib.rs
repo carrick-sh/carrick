@@ -1164,6 +1164,10 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     /// Indexed owner-only delegated inode callbacks; no guest record is needed.
     delegated_host_pending: [AtomicU64; object_wait::DELEGATED_FILE_WAIT_QUEUES.div_ceil(64)],
     timers: timer_index::Index,
+    /// One source for all task/thread births in this carrier. Appended so
+    /// previously published tables keep their offsets. Source custody must be
+    /// installed before the first host or guest birth, not during admission.
+    serial_issuer: process::identity_allocator::SerialIssuerWord,
 }
 
 /// A fallible acquisition policy for callers that retain work on refusal.
@@ -1615,6 +1619,18 @@ impl ZoneTables<ThreadCtx> {
 }
 
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
+    /// Borrow the carrier's birth source for no longer than this actual zone.
+    /// This does not authenticate a host mapping or bind a kernel to a carrier.
+    pub const fn serial_issuer(&self) -> process::identity_allocator::SerialIssuer<'_> {
+        self.serial_issuer.issuer()
+    }
+
+    /// ABI fact for image/host layout authentication, without exposing mutable
+    /// issuer storage or a raw-pointer construction path.
+    pub const fn serial_issuer_offset() -> usize {
+        core::mem::offset_of!(Self, serial_issuer)
+    }
+
     /// Context-independent hashing for an owner's actual saved-context ABI.
     pub fn bucket_of_with_context(mm: u64, uaddr: u64) -> usize {
         mix(mm, uaddr)

@@ -45,6 +45,30 @@ fn zone() -> Box<ZoneTables> {
     }
 }
 
+#[test]
+fn zone_birth_issuer_is_shared_by_borrows_and_isolated_between_carriers() {
+    let first = zone();
+    let second = zone();
+    let host = first.serial_issuer();
+    let native_graph = first.serial_issuer();
+    let another_graph = first.serial_issuer();
+    assert_eq!(host.allocate(), core::num::NonZeroU64::new(1));
+    let reserved = host.allocate().unwrap();
+    assert_eq!(native_graph.allocate(), core::num::NonZeroU64::new(3));
+    native_graph.advance_past(reserved);
+    assert_eq!(another_graph.allocate(), core::num::NonZeroU64::new(4));
+    assert_eq!(host.allocate(), core::num::NonZeroU64::new(5));
+    assert_eq!(
+        second.serial_issuer().allocate(),
+        core::num::NonZeroU64::new(1)
+    );
+    assert!(
+        ZoneTables::<ThreadCtx>::serial_issuer_offset().is_multiple_of(core::mem::align_of::<
+            process::identity_allocator::SerialIssuerWord,
+        >())
+    );
+}
+
 const MM: u64 = 7;
 const SLOT: SlotId = SlotId::new(3);
 

@@ -1554,6 +1554,25 @@ end across both fd-ceiling settings, EL1 settings and IRQ modes, and checks
 handler classification boundaries. Emission and guest instruction placement
 are unchanged. The signed EL1 suite remains the integration acceptance gate.
 
+## Carrier birth source prerequisite
+
+The birth-identity prerequisite of `kernel.el1.signal-delivery-owner`,
+`kernel.el1.thread-lifecycle`, `core.lifecycle.publication` and
+`process.native.arm-admission` also has VM-free word bindings in
+`carrick-sched-core`: `zero_valid_issuer_burns_unpublished_births_and_never_wraps`,
+`issuer_imports_reserved_births_idempotently_including_terminal_value`,
+`shared_issuer_reserves_before_publication`,
+`shared_issuer_concurrent_borrowers_have_one_complete_population`, and
+`zone_birth_issuer_is_shared_by_borrows_and_isolated_between_carriers`.
+One checked atomic RMW issues a birth, with contention-dependent retries;
+rollback never returns a serial. The negative control
+`late_observation_cannot_repair_independently_issued_tickets` proves that
+post-allocation cursor advancement cannot merge independent live sources.
+These tests prove only the zero-valid source and its borrowed lifetime, not
+production source custody. The canonical receiver reuse test remains RED
+until every host/native launch path binds the retained carrier zone before
+issuance. See [the integration handoff](design/carrier-birth-issuer-handoff.md).
+
 ## ARM entry stack composition
 
 `kernel.el1.signal-delivery-owner` and `kernel.el1.thread-lifecycle` also bind
