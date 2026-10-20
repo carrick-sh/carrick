@@ -8199,6 +8199,160 @@ mod tests {
         ));
     }
     #[test]
+    fn two_live_roots_keep_native_and_later_host_mm_keys_distinct() {
+        // Root identities come from the actual host registry, bound before
+        // births to the same retained zone used by both native graphs.
+        let zone: Arc<ZoneTables<ParkedContextWords>> = Arc::from(unsafe {
+            let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        });
+        let host_source =
+            Arc::new(carrick_hal::birth_serial::test_support::OwnedBirthZone::new(zone.clone()));
+        let host_ids = carrick_kernel::kernel::ObjectIdRegistry::with_birth_source(host_source);
+        let pages = [ThreadLifecyclePage::new(), ThreadLifecyclePage::new()];
+        let controls = [ThreadControlSlot::new(), ThreadControlSlot::new()];
+        let child_pages = [ThreadLifecyclePage::new(), ThreadLifecyclePage::new()];
+        let child_controls = [
+            core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new()),
+            core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new()),
+        ];
+        let tasks = [CurrentTask::new(), CurrentTask::new()];
+        let mut runtimes = Vec::new();
+        let mut addresses = Vec::new();
+        for index in 0..2 {
+            let tid = 41 + index as u64 * 10;
+            let birth = host_ids.task_serial().unwrap();
+            let thread = host_ids.thread_serial().unwrap();
+            let mm = MmGeneration::new(host_ids.mm_id().unwrap().nonzero());
+            let file = host_ids.file_table_id().unwrap();
+            let root = 0x1000 + index as u64 * 0x2000;
+            let slot = carrick_sched_core::SlotId::new(index as u8);
+            let task = &tasks[index];
+            task.set(
+                carrick_el1_abi::El1TaskId::from_linux_tid(tid as i32),
+                carrick_el1_abi::SnapshotGeneration::INITIAL,
+                file.raw(),
+            );
+            task.mm.key.store(mm.raw().get(), Ordering::Release);
+            task.mm
+                .thread_generation
+                .store(thread.raw(), Ordering::Release);
+            task.publish_visible_pid(tid as u32);
+            task.publish_lifecycle(
+                &pages[index] as *const _ as u64,
+                &controls[index] as *const _ as u64,
+            );
+            controls[index].publish_host_birth_identity(
+                carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                    carrick_core_abi::EntryTaskKey::from_raw(tid),
+                    carrick_core_abi::entry::BirthSerial::of_task(birth),
+                    carrick_core_abi::EntryThreadGeneration::from_raw(thread.raw()),
+                )
+                .unwrap(),
+            );
+            let address = AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(root)).unwrap(),
+                mm,
+                generation: ContextGeneration::new(NonZeroU64::MIN),
+            };
+            let space = zone.spaces.publish_closed(mm.raw().get(), root, 0).unwrap();
+            zone.spaces.open(space);
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, 1, Some(index as u32), 1);
+            zone.enter_guest(slot);
+            zone.install_space(slot, mm.raw().get()).unwrap();
+            zone.current_or_new(
+                slot,
+                ThreadIdentity {
+                    tid,
+                    serial: thread.raw(),
+                    mm: mm.raw().get(),
+                    file_table: file.raw(),
+                    generation: carrick_el1_abi::SnapshotGeneration::INITIAL.raw(),
+                    affinity: 1,
+                    lifecycle_page: &pages[index] as *const _ as u64,
+                    control_slot: &controls[index] as *const _ as u64,
+                },
+            )
+            .unwrap();
+            let source = BornInZoneSource { zone: &zone, slot };
+            runtimes.push(
+                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                    source,
+                    task,
+                    &pages[index],
+                    &controls[index],
+                    address,
+                    address,
+                    words(address),
+                )
+                .unwrap(),
+            );
+            addresses.push(address);
+        }
+        let mut active_mms: Vec<_> = addresses.iter().map(|a| a.mm).collect();
+        let mut later_host_mms = Vec::new();
+        let mut child_births = Vec::new();
+        for index in 0..2 {
+            // Real host supply interleaves with native fork publication. These
+            // births must affect the shared birth word, not either MM cursor.
+            let reserved_host_thread = host_ids.thread_serial().unwrap();
+            let source = BornInZoneSource {
+                zone: &zone,
+                slot: carrick_sched_core::SlotId::new(index as u8),
+            };
+            let runtime = &runtimes[index];
+            let mut service = Physical {
+                zone: &zone,
+                page: &child_pages[index],
+                controls: &child_controls[index],
+                copies: Vec::new(),
+                tid_words: BTreeMap::new(),
+                tid_wakes: 0,
+                tid_writes: Vec::new(),
+                refuse_copy: false,
+                child_copy_error: None,
+                on_signal_clock: None,
+            };
+            let mut entry = runtime
+                .enter(source, &tasks[index], words(addresses[index]), &mut service)
+                .unwrap();
+            let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+            else {
+                panic!("native fork must return");
+            };
+            assert!(result.raw() > 0, "native fork failed: {:?}", result);
+            let root_key = runtime.graph.lock().root_key;
+            let child_key = runtime
+                .namespace_child_key(root_key, result.raw() as u32)
+                .unwrap();
+            let child = runtime.task_binding(child_key).unwrap();
+            assert!(child_key.serial.raw() > reserved_host_thread.raw());
+            assert!(zone.spaces.find(child.address.mm.raw().get()).is_some());
+            active_mms.push(child.address.mm);
+            child_births.push(child_key.serial);
+            let subsequent_host_thread = host_ids.thread_serial().unwrap();
+            assert!(subsequent_host_thread.raw() > child_key.serial.raw());
+            later_host_mms.push(MmGeneration::new(host_ids.mm_id().unwrap().nonzero()));
+        }
+        assert_ne!(child_births[0], child_births[1]);
+        for (index, mm) in active_mms.iter().enumerate() {
+            assert!(
+                !active_mms[..index].contains(mm),
+                "two live roots/native children alias MM keys: {active_mms:?}"
+            );
+        }
+        for mm in &later_host_mms {
+            assert!(
+                !active_mms.contains(mm),
+                "later host MM {mm:?} aliases a live root/native child; active={active_mms:?}, later_host={later_host_mms:?}"
+            );
+        }
+    }
+
+    #[test]
     fn process_receiver_survives_internal_task_id_reuse() {
         receiver_reuse_case(false);
     }
