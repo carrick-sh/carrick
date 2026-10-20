@@ -5230,6 +5230,94 @@ mod kernel_process_dispatch_tests {
     }
 
     #[test]
+    fn wait4_commits_valid_status_when_rusage_faults_and_consumes_child() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        const STATUS: u64 = INFO_ADDR;
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_410);
+        let child = fork_child(&root, 61_411);
+        let child_id = child.task().key().id;
+        root.kernel()
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(7 << 8), None)
+            .unwrap();
+        let root = refreshed(&root);
+        let mut memory = OwnerRefusingMemory::new(INFO_ADDR, 0x400, 0xa5);
+        let mut call = |memory: &mut OwnerRefusingMemory, args: [u64; 6]| {
+            dispatcher
+                .dispatch_with_lease(
+                    &root,
+                    SyscallRequest::new(SYS_WAIT4, SyscallArgs::from(args)),
+                    memory,
+                    &CompatReporter::default(),
+                    Some(&lease),
+                )
+                .expect("dispatch")
+        };
+
+        assert_eq!(
+            call(&mut memory, [child_id.raw() as u64, STATUS, 0, 1, 0, 0]),
+            DispatchOutcome::errno(carrick_abi::LINUX_EFAULT),
+            "invalid rusage pointer=1 must return EFAULT after reaping",
+        );
+        assert_eq!(
+            memory.read_bytes(STATUS, 4).unwrap(),
+            (7i32 << 8).to_ne_bytes(),
+            "valid wstatus pointer must be written before rusage faults",
+        );
+        assert_eq!(
+            call(
+                &mut memory,
+                [
+                    child_id.raw() as u64,
+                    STATUS,
+                    carrick_abi::LINUX_WNOHANG as u64,
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            DispatchOutcome::errno(carrick_abi::LINUX_ECHILD),
+            "second WNOHANG wait4 must return ECHILD because the child was consumed",
+        );
+    }
+
+    #[test]
+    fn wait4_with_no_outputs_makes_zero_owner_prepares() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_420);
+        let child = fork_child(&root, 61_421);
+        let child_id = child.task().key().id;
+        root.kernel()
+            .exit_task(child_id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .unwrap();
+        let root = refreshed(&root);
+        let mut memory = OwnerRefusingMemory::new(INFO_ADDR, 0x400, 0xa5);
+        let _wait = memory.refuse_next();
+        let outcome = dispatcher
+            .dispatch_with_lease(
+                &root,
+                SyscallRequest::new(
+                    SYS_WAIT4,
+                    SyscallArgs::from([child_id.raw() as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+                Some(&lease),
+            )
+            .expect("dispatch");
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: i64::from(child_id.raw())
+            },
+            "wait4(pid, NULL, 0, NULL) must not suspend on an armed owner refusal",
+        );
+        assert_eq!(
+            memory.prepares, 0,
+            "wait4(pid, NULL, 0, NULL) must make zero prepare_write calls"
+        );
+    }
+
+    #[test]
     fn wait4_preserves_subtree_usage_and_charges_children_once() {
         let (_lane, mut dispatcher, _process, root, _lease) = bound_dispatcher(61_180);
         let kernel = root.kernel();

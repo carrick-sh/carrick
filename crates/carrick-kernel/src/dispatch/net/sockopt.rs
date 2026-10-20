@@ -386,8 +386,18 @@ fn getsockopt_in_memory<M: CurrentMmMemory>(
                 write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
             }
             LINUX_SO_ERROR => {
+                let prepared = match super::support::prepare_sockopt_value(
+                    memory,
+                    optval_addr,
+                    optlen_addr,
+                    4,
+                ) {
+                    Ok(Ok(prepared)) => prepared,
+                    Ok(Err(fault)) => return Ok(fault.outcome()),
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
                 let val: i32 = socket.take_so_error().unwrap_or(0);
-                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
+                Ok(prepared.commit(&val.to_ne_bytes()))
             }
             LINUX_SO_KEEPALIVE => {
                 let val: i32 = if socket.so_keepalive() { 1 } else { 0 };
@@ -1154,13 +1164,18 @@ impl<'a> NetView<'a> {
             // table the rest of the ABI uses. (getsockopt itself still
             // succeeds; only the value is mapped.)
             if level == LINUX_SOL_SOCKET && optname == LINUX_SO_ERROR {
+                let prepared = match super::support::prepare_sockopt_value(
+                    memory,
+                    optval_addr,
+                    optlen_addr,
+                    4,
+                ) {
+                    Ok(Ok(prepared)) => prepared,
+                    Ok(Err(fault)) => return Ok(fault.outcome()),
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
                 if let Some(linux_err) = this.take_socket_pending_error(fd) {
-                    return write_sockopt_value(
-                        memory,
-                        optval_addr,
-                        optlen_addr,
-                        &linux_err.get().to_ne_bytes(),
-                    );
+                    return Ok(prepared.commit(&linux_err.get().to_ne_bytes()));
                 }
                 let mut host_err: i32 = 0;
                 let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
@@ -1185,12 +1200,7 @@ impl<'a> NetView<'a> {
                     crate::host_to_linux_errno(host_err).get()
                 };
                 // Honor the guest's optlen (it may pass <4); clamp like Linux.
-                return write_sockopt_value(
-                    memory,
-                    optval_addr,
-                    optlen_addr,
-                    &linux_err.to_ne_bytes(),
-                );
+                return Ok(prepared.commit(&linux_err.to_ne_bytes()));
             }
             let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
                 Some(t) => t,

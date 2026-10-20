@@ -237,7 +237,6 @@ fn getdents64_waits_for_an_owner_refused_copyout_without_consuming_entries() {
     assert_eq!(&first[19..21], b".\0");
 }
 
-#[cfg(target_os = "macos")]
 fn socketpair(g: &mut Guest) -> (i32, i32) {
     assert_eq!(
         g.ok(
@@ -266,7 +265,6 @@ fn socketpair(g: &mut Guest) -> (i32, i32) {
 /// stack array while a sibling thread of the same MM ran host-served socket
 /// operations. It must prepare its output before creating anything, report
 /// the wait, and install nothing until the retry.
-#[cfg(target_os = "macos")]
 #[test]
 fn socketpair_waits_for_an_owner_refused_copyout_instead_of_efault() {
     let mut g = Guest::new();
@@ -289,7 +287,6 @@ fn socketpair_waits_for_an_owner_refused_copyout_instead_of_efault() {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn getsockname_and_getpeername_wait_for_an_owner_refused_copyout() {
     let mut g = Guest::new();
@@ -305,7 +302,6 @@ fn getsockname_and_getpeername_wait_for_an_owner_refused_copyout() {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn getsockopt_waits_for_an_owner_refused_copyout_instead_of_efault() {
     let mut g = Guest::new();
@@ -488,5 +484,435 @@ fn getdents64_with_a_guest_sized_count_never_reaches_the_permit_fatal() {
     assert!(
         owner_batch > 0 && owner_batch <= super::copyout::COPYOUT_MAX_BYTES,
         "owner returns a short batch: {owner_batch}"
+    );
+}
+
+#[test]
+fn later_invalid_output_retains_valid_prefix_in_gettimeofday_sockaddr_and_getsockopt() {
+    let mut g = Guest::new();
+    let unmapped = BASE + (LEN as u64) + 0x100;
+
+    // 1. gettimeofday(valid tv, invalid tz) -> EFAULT after writing tv.
+    g.memory.seed(OUT, &[FILL; 16]);
+    assert_eq!(
+        g.call(nr::GETTIMEOFDAY.raw(), [OUT, unmapped, 0, 0, 0, 0]),
+        DispatchOutcome::errno(carrick_abi::LINUX_EFAULT),
+    );
+    assert_ne!(
+        g.memory.read_bytes(OUT, 16).unwrap(),
+        [FILL; 16],
+        "gettimeofday must commit valid tv before reporting EFAULT on tz",
+    );
+
+    // 2. getsockname(valid addr, readonly addrlen) -> EFAULT after writing addr.
+    let (left, _) = socketpair(&mut g);
+    let ro_len_addr = BASE + 0x900;
+    g.memory.seed(ro_len_addr, &16u32.to_ne_bytes());
+    g.memory.protect_readonly(ro_len_addr, 4);
+    g.memory.seed(OUT, &[FILL; 16]);
+    assert_eq!(
+        g.call(
+            nr::GETSOCKNAME.raw(),
+            [left as u64, OUT, ro_len_addr, 0, 0, 0]
+        ),
+        DispatchOutcome::errno(carrick_abi::LINUX_EFAULT),
+    );
+    let family = u16::from_ne_bytes(g.memory.read_bytes(OUT, 2).unwrap().try_into().unwrap());
+    assert_eq!(
+        family, LINUX_AF_UNIX as u16,
+        "getsockname must commit valid addr before reporting EFAULT on readonly addrlen",
+    );
+
+    // 3. getsockopt(valid optval, readonly optlen) -> EFAULT after writing optval
+    // via `support::write_sockopt_value` (`SO_DOMAIN`), and also retains the
+    // prefix write on `copyout_fixed_sockopt` (`SO_TYPE`).
+    let ro_optlen_addr = BASE + 0x910;
+    g.memory.seed(ro_optlen_addr, &4u32.to_ne_bytes());
+    g.memory.protect_readonly(ro_optlen_addr, 4);
+    g.memory.seed(OUT, &[FILL; 4]);
+    assert_eq!(
+        g.call(
+            nr::GETSOCKOPT.raw(),
+            [
+                left as u64,
+                LINUX_SOL_SOCKET as u64,
+                carrick_abi::LINUX_SO_DOMAIN as u64,
+                OUT,
+                ro_optlen_addr,
+                0,
+            ],
+        ),
+        DispatchOutcome::errno(carrick_abi::LINUX_EFAULT),
+    );
+    assert_eq!(
+        g.memory.read_bytes(OUT, 4).unwrap(),
+        (LINUX_AF_UNIX as i32).to_ne_bytes(),
+        "getsockopt(SO_DOMAIN) must commit valid optval before reporting EFAULT on readonly optlen",
+    );
+    g.memory.seed(OUT, &[FILL; 4]);
+    assert_eq!(
+        g.call(
+            nr::GETSOCKOPT.raw(),
+            [
+                left as u64,
+                LINUX_SOL_SOCKET as u64,
+                LINUX_SO_TYPE as u64,
+                OUT,
+                ro_optlen_addr,
+                0,
+            ],
+        ),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(
+        g.memory.read_bytes(OUT, 4).unwrap(),
+        (LINUX_SOCK_STREAM as i32).to_ne_bytes(),
+        "getsockopt(SO_TYPE) must still commit valid optval when optlen faults",
+    );
+}
+
+#[test]
+fn sockaddr_at_page_end_with_storage_addrlen_prepares_only_actual_bytes() {
+    let mut g = Guest::new();
+    let v4_sock = g.ok(
+        nr::SOCKET.raw(),
+        [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    );
+    let sockaddr_v4 = |port: u16| {
+        let mut sa = Vec::with_capacity(16);
+        sa.extend_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+        sa.extend_from_slice(&port.to_be_bytes());
+        sa.extend_from_slice(&[127, 0, 0, 1]);
+        sa.extend_from_slice(&[0u8; 8]);
+        sa
+    };
+    g.memory.seed(OUT, &sockaddr_v4(0));
+    assert_eq!(g.ok(nr::BIND.raw(), [v4_sock as u64, OUT, 16, 0, 0, 0]), 0);
+    assert_eq!(g.ok(nr::LISTEN.raw(), [v4_sock as u64, 16, 0, 0, 0, 0]), 0);
+
+    // Final 16 writable bytes before the unmapped boundary at `BASE + LEN`,
+    // with supplied `*addrlen = 128` (`sizeof(sockaddr_storage)`).
+    let tail_v4 = BASE + (LEN as u64) - 16;
+    g.memory.seed(tail_v4, &[FILL; 16]);
+    g.memory.seed(LEN_ADDR, &128u32.to_ne_bytes());
+    assert_eq!(
+        g.call(
+            nr::GETSOCKNAME.raw(),
+            [v4_sock as u64, tail_v4, LEN_ADDR, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 },
+        "getsockname must prepare only the 16 actual AF_INET bytes, not 128",
+    );
+    assert_eq!(
+        g.memory.read_bytes(LEN_ADDR, 4).unwrap(),
+        16u32.to_ne_bytes()
+    );
+    let port = u16::from_be_bytes(
+        g.memory
+            .read_bytes(tail_v4 + 2, 2)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+
+    // Connect and accept with the destination at the final 16 writable bytes
+    // and `*addrlen = 128`.
+    let client = g.ok(
+        nr::SOCKET.raw(),
+        [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    );
+    g.memory.seed(OUT, &sockaddr_v4(port));
+    assert_eq!(
+        g.ok(nr::CONNECT.raw(), [client as u64, OUT, 16, 0, 0, 0]),
+        0
+    );
+    g.memory.seed(tail_v4, &[FILL; 16]);
+    g.memory.seed(LEN_ADDR, &128u32.to_ne_bytes());
+    let accepted = g.ok(
+        nr::ACCEPT.raw(),
+        [v4_sock as u64, tail_v4, LEN_ADDR, 0, 0, 0],
+    );
+    assert!(accepted > client);
+    assert_eq!(
+        g.memory.read_bytes(LEN_ADDR, 4).unwrap(),
+        16u32.to_ne_bytes()
+    );
+    let family = u16::from_ne_bytes(g.memory.read_bytes(tail_v4, 2).unwrap().try_into().unwrap());
+    assert_eq!(family, LINUX_AF_INET as u16);
+
+    // Final 28 writable bytes for AF_INET6 with `*addrlen = 128`.
+    let v6_sock = g.ok(
+        nr::SOCKET.raw(),
+        [
+            carrick_abi::LINUX_AF_INET6 as u64,
+            LINUX_SOCK_STREAM as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    let mut sa6 = vec![0u8; 28];
+    sa6[0..2].copy_from_slice(&(carrick_abi::LINUX_AF_INET6 as u16).to_ne_bytes());
+    sa6[23] = 1; // ::1
+    g.memory.seed(OUT, &sa6);
+    assert_eq!(g.ok(nr::BIND.raw(), [v6_sock as u64, OUT, 28, 0, 0, 0]), 0);
+    let tail_v6 = BASE + (LEN as u64) - 28;
+    g.memory.seed(tail_v6, &[FILL; 28]);
+    g.memory.seed(LEN_ADDR, &128u32.to_ne_bytes());
+    assert_eq!(
+        g.call(
+            nr::GETSOCKNAME.raw(),
+            [v6_sock as u64, tail_v6, LEN_ADDR, 0, 0, 0]
+        ),
+        DispatchOutcome::Returned { value: 0 },
+        "getsockname must prepare only the 28 actual AF_INET6 bytes, not 128",
+    );
+    assert_eq!(
+        g.memory.read_bytes(LEN_ADDR, 4).unwrap(),
+        28u32.to_ne_bytes()
+    );
+}
+
+#[test]
+fn accept_and_getsockopt_preserve_read_suspension_on_length_pointer() {
+    let mut g = Guest::new();
+    let socket = |g: &mut Guest| {
+        g.ok(
+            nr::SOCKET.raw(),
+            [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+        )
+    };
+    let sockaddr = |port: u16| {
+        let mut sa = Vec::with_capacity(16);
+        sa.extend_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+        sa.extend_from_slice(&port.to_be_bytes());
+        sa.extend_from_slice(&[127, 0, 0, 1]);
+        sa.extend_from_slice(&[0u8; 8]);
+        sa
+    };
+    let listener = socket(&mut g);
+    g.memory.seed(OUT, &sockaddr(0));
+    assert_eq!(g.ok(nr::BIND.raw(), [listener as u64, OUT, 16, 0, 0, 0]), 0);
+    assert_eq!(g.ok(nr::LISTEN.raw(), [listener as u64, 16, 0, 0, 0, 0]), 0);
+    g.memory.seed(LEN_ADDR, &16u32.to_ne_bytes());
+    assert_eq!(
+        g.ok(
+            nr::GETSOCKNAME.raw(),
+            [listener as u64, OUT, LEN_ADDR, 0, 0, 0]
+        ),
+        0
+    );
+    let port = u16::from_be_bytes(g.memory.read_bytes(OUT + 2, 2).unwrap().try_into().unwrap());
+    let client = socket(&mut g);
+    g.memory.seed(OUT, &sockaddr(port));
+    assert_eq!(
+        g.ok(nr::CONNECT.raw(), [client as u64, OUT, 16, 0, 0, 0]),
+        0
+    );
+
+    // 1. Read suspension on `addrlen` before `accept` must park without dequeuing.
+    g.memory.seed(OUT, &[FILL; 16]);
+    g.memory.seed(LEN_ADDR, &16u32.to_ne_bytes());
+    let next_fd = client + 1;
+    let wait = g.memory.refuse_next_read();
+    assert_eq!(
+        g.call(nr::ACCEPT.raw(), [listener as u64, OUT, LEN_ADDR, 0, 0, 0]),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        "read suspension on addrlen must return OwnerMemoryWait, not EFAULT",
+    );
+    assert!(
+        g.dispatcher.open_file(next_fd as i32).is_none(),
+        "read-suspended accept must not dequeue or install an fd",
+    );
+    let accepted = g.ok(nr::ACCEPT.raw(), [listener as u64, OUT, LEN_ADDR, 0, 0, 0]);
+    assert_eq!(accepted, next_fd);
+
+    // 2. Read suspension on `optlen` in `getsockopt` (`write_sockopt_value`) must park and retry cleanly.
+    g.memory.seed(OUT, &[FILL; 4]);
+    g.memory.seed(LEN_ADDR, &4u32.to_ne_bytes());
+    let wait = g.memory.refuse_next_read();
+    assert_eq!(
+        g.call(
+            nr::GETSOCKOPT.raw(),
+            [
+                listener as u64,
+                LINUX_SOL_SOCKET as u64,
+                carrick_abi::LINUX_SO_DOMAIN as u64,
+                OUT,
+                LEN_ADDR,
+                0,
+            ],
+        ),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        "read suspension on optlen must return OwnerMemoryWait, not EFAULT",
+    );
+    assert_eq!(
+        g.ok(
+            nr::GETSOCKOPT.raw(),
+            [
+                listener as u64,
+                LINUX_SOL_SOCKET as u64,
+                carrick_abi::LINUX_SO_DOMAIN as u64,
+                OUT,
+                LEN_ADDR,
+                0,
+            ],
+        ),
+        0
+    );
+    assert_eq!(
+        g.memory.read_bytes(OUT, 4).unwrap(),
+        (LINUX_AF_INET as i32).to_ne_bytes()
+    );
+}
+
+#[test]
+fn getsockopt_so_error_retains_pending_error_across_owner_refusal() {
+    let mut g = Guest::new();
+    let (host_sock, _) = socketpair(&mut g);
+
+    // 1. HostSocket pending error (`take_socket_pending_error`) survives both
+    //    read refusal on `optlen` and write refusal on `optval`/`optlen`.
+    {
+        let open_file = g.dispatcher.open_file(host_sock).unwrap();
+        let mut desc =
+            crate::kernel::FileDescription::write_for_io(&open_file.description).unwrap();
+        let crate::dispatch::fd_table::OpenDescription::HostSocket { base, .. } = &mut *desc else {
+            panic!("expected HostSocket");
+        };
+        base.set_pending_socket_error(carrick_abi::LINUX_ECONNREFUSED.get());
+    }
+    g.memory.seed(OUT, &[FILL; 4]);
+    g.memory.seed(LEN_ADDR, &4u32.to_ne_bytes());
+    let args = [
+        host_sock as u64,
+        LINUX_SOL_SOCKET as u64,
+        carrick_abi::LINUX_SO_ERROR as u64,
+        OUT,
+        LEN_ADDR,
+        0,
+    ];
+    let wait = g.memory.refuse_next();
+    assert_eq!(
+        g.call(nr::GETSOCKOPT.raw(), args),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert_eq!(g.memory.read_bytes(OUT, 4).unwrap(), [FILL; 4]);
+    assert_eq!(g.ok(nr::GETSOCKOPT.raw(), args), 0);
+    assert_eq!(
+        i32::from_ne_bytes(g.memory.read_bytes(OUT, 4).unwrap().try_into().unwrap()),
+        carrick_abi::LINUX_ECONNREFUSED.get(),
+        "SO_ERROR must survive transient refusals and be returned on the retry",
+    );
+    // Re-seed and also verify read suspension on `optlen` preserves SO_ERROR.
+    {
+        let open_file = g.dispatcher.open_file(host_sock).unwrap();
+        let mut desc =
+            crate::kernel::FileDescription::write_for_io(&open_file.description).unwrap();
+        let crate::dispatch::fd_table::OpenDescription::HostSocket { base, .. } = &mut *desc else {
+            panic!("expected HostSocket");
+        };
+        base.set_pending_socket_error(carrick_abi::LINUX_ECONNREFUSED.get());
+    }
+    g.memory.seed(OUT, &[FILL; 4]);
+    let wait = g.memory.refuse_next_read();
+    assert_eq!(
+        g.call(nr::GETSOCKOPT.raw(), args),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert_eq!(g.ok(nr::GETSOCKOPT.raw(), args), 0);
+    assert_eq!(
+        i32::from_ne_bytes(g.memory.read_bytes(OUT, 4).unwrap().try_into().unwrap()),
+        carrick_abi::LINUX_ECONNREFUSED.get(),
+        "SO_ERROR must survive read suspension on optlen and be returned on the retry",
+    );
+    // Consumed once on completion: a subsequent read reports 0.
+    assert_eq!(g.ok(nr::GETSOCKOPT.raw(), args), 0);
+    assert_eq!(
+        i32::from_ne_bytes(g.memory.read_bytes(OUT, 4).unwrap().try_into().unwrap()),
+        0,
+    );
+
+    // 2. InMemorySocket pending error (`socket.take_so_error()`) survives refusal too.
+    let listener = g.ok(
+        nr::SOCKET.raw(),
+        [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    );
+    let mut sa = vec![0u8; 16];
+    sa[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+    sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    g.memory.seed(OUT, &sa);
+    assert_eq!(g.ok(nr::BIND.raw(), [listener as u64, OUT, 16, 0, 0, 0]), 0);
+    assert_eq!(g.ok(nr::LISTEN.raw(), [listener as u64, 16, 0, 0, 0, 0]), 0);
+    g.memory.seed(LEN_ADDR, &16u32.to_ne_bytes());
+    assert_eq!(
+        g.ok(
+            nr::GETSOCKNAME.raw(),
+            [listener as u64, OUT, LEN_ADDR, 0, 0, 0]
+        ),
+        0
+    );
+    let port = u16::from_be_bytes(g.memory.read_bytes(OUT + 2, 2).unwrap().try_into().unwrap());
+    let inmem_client = g.ok(
+        nr::SOCKET.raw(),
+        [LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    );
+    sa[2..4].copy_from_slice(&port.to_be_bytes());
+    g.memory.seed(OUT, &sa);
+    assert_eq!(
+        g.ok(nr::CONNECT.raw(), [inmem_client as u64, OUT, 16, 0, 0, 0]),
+        0
+    );
+    {
+        let open_file = g.dispatcher.open_file(inmem_client as i32).unwrap();
+        let desc = crate::kernel::FileDescription::inspect(&open_file.description).unwrap();
+        let crate::dispatch::fd_table::OpenDescription::InMemorySocket { socket, .. } = &*desc
+        else {
+            panic!("expected InMemorySocket");
+        };
+        socket.set_so_error(carrick_abi::LINUX_EPIPE.get());
+    }
+    g.memory.seed(OUT, &[FILL; 4]);
+    g.memory.seed(LEN_ADDR, &4u32.to_ne_bytes());
+    let inmem_args = [
+        inmem_client as u64,
+        LINUX_SOL_SOCKET as u64,
+        carrick_abi::LINUX_SO_ERROR as u64,
+        OUT,
+        LEN_ADDR,
+        0,
+    ];
+    let wait = g.memory.refuse_next();
+    assert_eq!(
+        g.call(nr::GETSOCKOPT.raw(), inmem_args),
+        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+    );
+    assert_eq!(g.ok(nr::GETSOCKOPT.raw(), inmem_args), 0);
+    assert_eq!(
+        i32::from_ne_bytes(g.memory.read_bytes(OUT, 4).unwrap().try_into().unwrap()),
+        carrick_abi::LINUX_EPIPE.get(),
+        "in-memory SO_ERROR must survive owner refusal and be returned on retry",
+    );
+    assert_eq!(g.ok(nr::GETSOCKOPT.raw(), inmem_args), 0);
+    assert_eq!(
+        i32::from_ne_bytes(g.memory.read_bytes(OUT, 4).unwrap().try_into().unwrap()),
+        0,
+    );
+}
+
+#[test]
+fn zero_output_gettimeofday_makes_zero_owner_prepares() {
+    let mut g = Guest::new();
+    let before = g.memory.prepares;
+    let _wait = g.memory.refuse_next();
+    assert_eq!(
+        g.call(nr::GETTIMEOFDAY.raw(), [0, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 },
+        "gettimeofday(NULL, NULL) must not suspend on an armed owner refusal",
+    );
+    assert_eq!(
+        g.memory.prepares, before,
+        "gettimeofday(NULL, NULL) must make zero prepare_write calls",
     );
 }

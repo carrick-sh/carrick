@@ -1511,6 +1511,7 @@ fn nul_trimmed_slice(path: &[u8]) -> &[u8] {
 struct PendingUnixClient {
     cred: SocketPeerCred,
     flows: Option<crate::kernel::SocketFlows>,
+    peer_addr_len: usize,
 }
 
 #[derive(::core::default::Default)]
@@ -1559,6 +1560,7 @@ pub(super) fn lookup_and_queue_unix_connect(
     host_path: &[u8],
     client_cred: SocketPeerCred,
     client_flows: Option<crate::kernel::SocketFlows>,
+    peer_addr_len: usize,
 ) -> Option<SocketPeerCred> {
     let path = nul_trimmed_slice(host_path);
     use std::os::unix::ffi::OsStrExt;
@@ -1576,8 +1578,15 @@ pub(super) fn lookup_and_queue_unix_connect(
     q.push_back(PendingUnixClient {
         cred: client_cred,
         flows: client_flows,
+        peer_addr_len,
     });
     Some(server_cred)
+}
+
+pub(super) fn peek_pending_unix_client_addr_len(listener_host_fd: i32) -> Option<usize> {
+    let reg = unix_path_registry().lock().ok()?;
+    let q = reg.pending_clients.get(&listener_host_fd)?;
+    Some(q.front()?.peer_addr_len)
 }
 
 pub(super) fn pop_pending_unix_client(
@@ -1912,16 +1921,14 @@ pub(in crate::dispatch) fn prepare_linux_sockaddr<M: CurrentMmMemory>(
     memory: &mut M,
     addr: u64,
     addrlen_addr: u64,
+    actual_len: usize,
 ) -> Result<PreparedSockaddr<'_, M>, crate::dispatch::copyout::CopyoutRefusal> {
-    use crate::dispatch::copyout::{UserSlot, prepare};
-    if addrlen_addr == 0 {
-        return Ok(PreparedSockaddr::Faulted);
-    }
-    let Ok(cur_bytes) = memory.read_bytes(addrlen_addr, 4) else {
-        return Ok(PreparedSockaddr::Faulted);
+    use crate::dispatch::copyout::{UserSlot, prepare, read_u32_before_effects};
+    let cur = match read_u32_before_effects(memory, addrlen_addr)? {
+        Ok(cur) => cur as usize,
+        Err(_) => return Ok(PreparedSockaddr::Faulted),
     };
-    let cur = u32::from_ne_bytes([cur_bytes[0], cur_bytes[1], cur_bytes[2], cur_bytes[3]]) as usize;
-    let capacity = cur.min(LINUX_SOCKADDR_STORAGE_SIZE);
+    let capacity = cur.min(actual_len);
     Ok(PreparedSockaddr::Ready(prepare(
         memory,
         [
@@ -1954,7 +1961,7 @@ pub(in crate::dispatch) fn copyout_linux_sockaddr(
     addrlen_addr: u64,
     bytes: &[u8],
 ) -> DispatchOutcome {
-    match prepare_linux_sockaddr(memory, addr, addrlen_addr) {
+    match prepare_linux_sockaddr(memory, addr, addrlen_addr, bytes.len()) {
         Ok(out) => match out.commit(bytes) {
             Ok(()) => DispatchOutcome::Returned { value: 0 },
             Err(fault) => fault.outcome(),
@@ -1988,6 +1995,48 @@ pub(super) fn write_linux_sockaddr(
         .map_err(|_| ())
 }
 
+pub(in crate::dispatch) struct PreparedSockopt<'m, M: CurrentMmMemory> {
+    out: crate::dispatch::copyout::PreparedCopyout<'m, M, 2>,
+    n: usize,
+}
+
+pub(in crate::dispatch) fn prepare_sockopt_value<M: CurrentMmMemory>(
+    memory: &mut M,
+    optval_addr: u64,
+    optlen_addr: u64,
+    value_len: usize,
+) -> Result<
+    Result<PreparedSockopt<'_, M>, crate::dispatch::copyout::CopyoutFault>,
+    crate::dispatch::copyout::CopyoutRefusal,
+> {
+    use crate::dispatch::copyout::{UserSlot, prepare, read_u32_before_effects};
+    let guest_optlen = match read_u32_before_effects(memory, optlen_addr)? {
+        Ok(len) => len,
+        Err(fault) => return Ok(Err(fault)),
+    };
+    // Option values are fixed-width carrick answers (at most a `tcp_info`),
+    // so the clamped pair always fits one prepared permit.
+    let n = (guest_optlen as usize).min(value_len);
+    let out = prepare(
+        memory,
+        [
+            UserSlot::optional(optval_addr, n),
+            Some(UserSlot::new(optlen_addr, 4)),
+        ],
+    )?;
+    Ok(Ok(PreparedSockopt { out, n }))
+}
+
+impl<M: CurrentMmMemory> PreparedSockopt<'_, M> {
+    pub(in crate::dispatch) fn commit(self, value: &[u8]) -> DispatchOutcome {
+        let n = self.n.min(value.len());
+        match self.out.commit([&value[..n], &(n as u32).to_ne_bytes()]) {
+            Ok(()) => DispatchOutcome::Returned { value: 0 },
+            Err(fault) => fault.outcome(),
+        }
+    }
+}
+
 /// Clamp-and-write a scalar `getsockopt` value back to the guest: read the
 /// guest's `optlen`, write at most that many bytes of `value` to `optval`, and
 /// report the number actually written back in `optlen` (Linux truncation
@@ -2003,28 +2052,11 @@ pub(super) fn write_sockopt_value<M: CurrentMmMemory>(
     optlen_addr: u64,
     value: &[u8],
 ) -> Result<DispatchOutcome, DispatchError> {
-    use crate::dispatch::copyout::{UserSlot, prepare};
-    let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
-        Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
-        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-    };
-    // Option values are fixed-width carrick answers (at most a `tcp_info`),
-    // so the clamped pair always fits one prepared permit.
-    let n = (guest_optlen as usize).min(value.len());
-    let out = match prepare(
-        memory,
-        [
-            UserSlot::optional(optval_addr, n),
-            Some(UserSlot::new(optlen_addr, 4)),
-        ],
-    ) {
-        Ok(out) => out,
-        Err(refusal) => return Ok(refusal.into_outcome()),
-    };
-    Ok(match out.commit([&value[..n], &(n as u32).to_ne_bytes()]) {
-        Ok(()) => DispatchOutcome::Returned { value: 0 },
-        Err(fault) => fault.outcome(),
-    })
+    match prepare_sockopt_value(memory, optval_addr, optlen_addr, value.len()) {
+        Ok(Ok(prepared)) => Ok(prepared.commit(value)),
+        Ok(Err(fault)) => Ok(fault.outcome()),
+        Err(refusal) => Ok(refusal.into_outcome()),
+    }
 }
 
 pub(super) fn read_linux_msghdr(
