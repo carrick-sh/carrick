@@ -950,14 +950,17 @@ storage return EINVAL (-22); undersized storage alone returns ENOMEM (-12);
 SS_DISABLE ignores size. Input and output may alias: the entire new stack is
 read before the old stack is written, and the old value is returned while the
 new value is installed. Bad input and output pointers return EFAULT (-14).
+A valid replacement (including SS_DISABLE) is committed before writing old_ss,
+so an old_ss fault returns EFAULT with the new stack state retained.
 Bad flags beat a bad output pointer with EINVAL, and output remains untouched
-on validation errors. While executing on the alternate stack, *every* change
-(valid, bad flags, undersized, or disable) returns EPERM (-1), even with a bad
-output pointer; no output is written. An on-stack query reports SS_ONSTACK.
-SS_AUTODISARM is accepted and is returned in the old flags at bit 31. The
-structural budget is one fixed-size input read, one fixed-size output write,
-and one slot publication after validation; active-stack refusal performs no
-user copy, carrier handback, task scan, allocation, or wait.
+on validation errors. While executing on the alternate stack, input copy-in
+runs first (so an invalid ss pointer returns EFAULT (-14)), and any readable
+change (valid, bad flags, undersized, or disable) returns EPERM (-1), even with
+a bad output pointer; no output is written. An on-stack query reports
+SS_ONSTACK. SS_AUTODISARM is accepted and is returned in the old flags at bit
+31. The structural budget is one fixed-size input read, one fixed-size output
+write, and one slot publication after validation, with no carrier handback,
+task scan, allocation, or wait.
 
 ## Signal return result ownership
 
