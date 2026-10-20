@@ -94,11 +94,74 @@ impl CopyoutRefusal {
     pub(crate) fn into_outcome(self) -> DispatchOutcome {
         *self.0
     }
+
+    pub(crate) fn from_read_error(error: carrick_guest_mem::MemoryError) -> Option<Self> {
+        use carrick_guest_mem::{MemoryError, MemoryReadWait, MemorySupplyRequest};
+        let outcome = match error {
+            MemoryError::ReadSuspended(suspension) => match suspension.wait {
+                MemoryReadWait::Owner(wait) => {
+                    DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+                }
+                MemoryReadWait::Physical(wait) => {
+                    DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
+                }
+                MemoryReadWait::Supply(MemorySupplyRequest::Metadata { observed, .. }) => {
+                    DispatchOutcome::OwnerMemoryWait {
+                        wait: observed,
+                        committed: 0,
+                    }
+                }
+                MemoryReadWait::Supply(request) => DispatchOutcome::OwnerMemorySupply {
+                    request,
+                    committed: 0,
+                },
+            },
+            MemoryError::OwnerWait(wait) => DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            MemoryError::Physical(wait) => {
+                DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
+            }
+            MemoryError::Supply(request) => match *request {
+                MemorySupplyRequest::Metadata { observed, .. } => {
+                    DispatchOutcome::OwnerMemoryWait {
+                        wait: observed,
+                        committed: 0,
+                    }
+                }
+                request => DispatchOutcome::OwnerMemorySupply {
+                    request,
+                    committed: 0,
+                },
+            },
+            _ => return None,
+        };
+        Some(Self(Box::new(outcome)))
+    }
 }
 
 impl From<CopyoutRefusal> for DispatchOutcome {
     fn from(refusal: CopyoutRefusal) -> Self {
         refusal.into_outcome()
+    }
+}
+
+/// Read a 4-byte guest length (`socklen_t`) before any side effect: a
+/// transient owner read suspension returns [`CopyoutRefusal`] so the runtime
+/// parks and retries, while an invalid pointer returns [`CopyoutFault`].
+pub(crate) fn read_u32_before_effects(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+) -> Result<Result<u32, CopyoutFault>, CopyoutRefusal> {
+    if address == 0 {
+        return Ok(Err(CopyoutFault));
+    }
+    match memory.read_bytes(address, 4) {
+        Ok(bytes) => Ok(Ok(u32::from_ne_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        Err(error) => match CopyoutRefusal::from_read_error(error) {
+            Some(refusal) => Err(refusal),
+            None => Ok(Err(CopyoutFault)),
+        },
     }
 }
 
@@ -119,10 +182,12 @@ impl From<CopyoutFault> for DispatchError {
 }
 
 enum Venue<'m, M: CurrentMmMemory> {
-    Owner(Box<dyn PreparedGuestWrite + 'm>),
+    Owner {
+        permit: Option<Box<dyn PreparedGuestWrite + 'm>>,
+        valid_present: usize,
+        faulted: bool,
+    },
     Legacy(&'m mut M),
-    /// The owner rejected an output range as invalid; the commit reports it.
-    Faulted,
 }
 
 /// Destination authority for up to `N` outputs, obtained before any side
@@ -150,47 +215,98 @@ pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
             venue: Venue::Legacy(memory),
         });
     }
-    let faulted = PreparedCopyout {
-        slots,
-        venue: Venue::Faulted,
-    };
-    let total = slots
-        .iter()
-        .flatten()
-        .try_fold(0usize, |total, slot| total.checked_add(slot.capacity));
-    if total.is_none_or(|total| total > COPYOUT_MAX_BYTES) {
-        // Owner capacities are fixed records (checked at compile time),
-        // carrick-sized values, or `bounded_capacity` results, so no guest
-        // length reaches this. A larger permit would be refused as a Limit,
-        // which the owner refusal path treats as fatal; report EFAULT at the
-        // commit instead and never abort the carrier.
-        debug_assert!(false, "owner copyout exceeds one permit: {total:?} bytes");
-        return Ok(faulted);
-    }
     let Some(empty) = GuestWriteRange::new(GuestVa::new(0), 0) else {
-        return Ok(faulted);
+        return Ok(PreparedCopyout {
+            slots,
+            venue: Venue::Owner {
+                permit: None,
+                valid_present: 0,
+                faulted: true,
+            },
+        });
     };
     let mut ranges = [empty; N];
-    let mut count = 0;
+    let mut count = 0usize;
+    let mut total = 0usize;
+    let mut faulted = false;
     for slot in slots.iter().flatten() {
+        let Some(next_total) = total.checked_add(slot.capacity) else {
+            debug_assert!(false, "owner copyout overflows permit size");
+            faulted = true;
+            break;
+        };
+        if next_total > COPYOUT_MAX_BYTES {
+            // Owner capacities are fixed records (checked at compile time),
+            // carrick-sized values, or `bounded_capacity` results, so no guest
+            // length reaches this. A larger permit would be refused as a Limit,
+            // which the owner refusal path treats as fatal; report EFAULT at
+            // the commit instead and never abort the carrier.
+            debug_assert!(
+                false,
+                "owner copyout exceeds one permit: {next_total} bytes"
+            );
+            faulted = true;
+            break;
+        }
         let Some(range) = GuestWriteRange::new(GuestVa::new(slot.address), slot.capacity) else {
-            return Ok(faulted);
+            faulted = true;
+            break;
         };
         ranges[count] = range;
         count += 1;
+        total = next_total;
     }
-    match memory.prepare_write(&ranges[..count]) {
-        Ok(permit) => Ok(PreparedCopyout {
+    if count == 0 {
+        return Ok(PreparedCopyout {
             slots,
-            venue: Venue::Owner(permit),
-        }),
-        Err(error) => match crate::el1_delegation::owner_prepare_refusal(error) {
-            // `owner_prepare_refusal` has recorded the fault probe; the
-            // commit reports EFAULT at Linux's point.
-            outcome if outcome == DispatchOutcome::errno(LINUX_EFAULT) => Ok(faulted),
-            outcome => Err(CopyoutRefusal(Box::new(outcome))),
-        },
+            venue: Venue::Owner {
+                permit: None,
+                valid_present: 0,
+                faulted,
+            },
+        });
     }
+    // Preserve sequential valid-prefix writes when a later slot is invalid:
+    // if preparing the full prefix faults (`EFAULT`), step back to the longest
+    // valid prefix so earlier slots still commit before reporting `EFAULT`,
+    // matching the legacy venue and Linux (`wait4`, `gettimeofday`, `sockaddr`,
+    // `getsockopt`). Any transient refusal returns immediately before effects.
+    let memory_ptr: *mut M = memory;
+    let mut prefix = count;
+    while prefix > 0 {
+        // SAFETY: NLL Problem Case #3 workaround: on `Err`, `prepare_write`
+        // drops its borrow of `*memory` before returning `Err`, so no borrow
+        // escapes a failed iteration; on `Ok`, the function returns immediately
+        // with the single active `PreparedGuestWrite` tied to `'m`.
+        let attempt = unsafe { &mut *memory_ptr }.prepare_write(&ranges[..prefix]);
+        match attempt {
+            Ok(permit) => {
+                return Ok(PreparedCopyout {
+                    slots,
+                    venue: Venue::Owner {
+                        permit: Some(permit),
+                        valid_present: prefix,
+                        faulted,
+                    },
+                });
+            }
+            Err(error) => match crate::el1_delegation::owner_prepare_refusal(error) {
+                outcome if outcome == DispatchOutcome::errno(LINUX_EFAULT) => {
+                    faulted = true;
+                    prefix -= 1;
+                }
+                outcome => return Err(CopyoutRefusal(Box::new(outcome))),
+            },
+        }
+    }
+    Ok(PreparedCopyout {
+        slots,
+        venue: Venue::Owner {
+            permit: None,
+            valid_present: 0,
+            faulted: true,
+        },
+    })
 }
 
 impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
@@ -204,11 +320,9 @@ impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
     }
 
     /// Write one prefix per slot; the output for an absent slot (a NULL
-    /// optional pointer) is ignored. An owner permit cannot fail here; an
-    /// output the owner rejected reports [`CopyoutFault`]. On the legacy
-    /// venue the first invalid pointer stops the commit with [`CopyoutFault`]
-    /// after any earlier slots were written, as the sequential direct writes
-    /// did.
+    /// optional pointer) is ignored. On both venues the first invalid pointer
+    /// stops the commit with [`CopyoutFault`] after any earlier valid slots
+    /// were written.
     pub(crate) fn commit(self, outputs: [&[u8]; N]) -> Result<(), CopyoutFault> {
         for (slot, output) in self.slots.iter().zip(outputs) {
             let Some(capacity) = slot.map(UserSlot::capacity) else {
@@ -226,19 +340,27 @@ impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
             }
         }
         match self.venue {
-            Venue::Owner(permit) => {
-                let mut present: [&[u8]; N] = [&[]; N];
-                let mut count = 0;
-                for (slot, output) in self.slots.iter().zip(outputs) {
-                    if slot.is_some() {
-                        present[count] = output;
-                        count += 1;
+            Venue::Owner {
+                permit,
+                valid_present,
+                faulted,
+            } => {
+                if let Some(permit) = permit {
+                    let mut present: [&[u8]; N] = [&[]; N];
+                    let mut count = 0;
+                    for (slot, output) in self.slots.iter().zip(outputs) {
+                        if slot.is_some() {
+                            if count == valid_present {
+                                break;
+                            }
+                            present[count] = output;
+                            count += 1;
+                        }
                     }
+                    permit.commit(&present[..count]);
                 }
-                permit.commit(&present[..count]);
-                Ok(())
+                if faulted { Err(CopyoutFault) } else { Ok(()) }
             }
-            Venue::Faulted => Err(CopyoutFault),
             Venue::Legacy(memory) => {
                 for (slot, output) in self.slots.iter().zip(outputs) {
                     if let Some(slot) = slot
@@ -352,6 +474,8 @@ pub(crate) mod owner_fixture {
     pub(crate) struct OwnerRefusingMemory {
         pub(crate) inner: LinearMemory,
         refuse: Option<PortalOwnerWait>,
+        refuse_read: std::cell::Cell<Option<PortalOwnerWait>>,
+        readonly: Vec<(u64, usize)>,
         pub(crate) prepares: usize,
     }
 
@@ -361,6 +485,8 @@ pub(crate) mod owner_fixture {
             Self {
                 inner: LinearMemory::new(base, vec![fill; len]),
                 refuse: None,
+                refuse_read: std::cell::Cell::new(None),
+                readonly: Vec::new(),
                 prepares: 0,
             }
         }
@@ -370,6 +496,18 @@ pub(crate) mod owner_fixture {
             let wait = editor_wait();
             self.refuse = Some(wait);
             wait
+        }
+
+        /// Refuse the next read with a `MemoryError::ReadSuspended` Editor wait.
+        pub(crate) fn refuse_next_read(&mut self) -> PortalOwnerWait {
+            let wait = editor_wait();
+            self.refuse_read.set(Some(wait));
+            wait
+        }
+
+        /// Mark `[address, address + len)` readable but not writable (`PROT_READ`).
+        pub(crate) fn protect_readonly(&mut self, address: u64, len: usize) {
+            self.readonly.push((address, len));
         }
 
         /// Write fixture input without consuming a refusal.
@@ -409,10 +547,7 @@ pub(crate) mod owner_fixture {
                 return Err(MemoryPrepareError::OwnerWait(wait));
             }
             for range in ranges {
-                if !self
-                    .inner
-                    .guest_range_is_writable(range.address().raw(), range.len())
-                {
+                if !self.guest_range_is_writable(range.address().raw(), range.len()) {
                     return Err(MemoryPrepareError::Fault(MemoryError::OutOfBounds {
                         address: range.address().raw(),
                         length: range.len(),
@@ -426,10 +561,27 @@ pub(crate) mod owner_fixture {
         }
 
         fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
-            self.inner.guest_range_is_writable(address, length)
+            if !self.inner.guest_range_is_writable(address, length) {
+                return false;
+            }
+            let Some(end) = address.checked_add(length as u64) else {
+                return false;
+            };
+            !self.readonly.iter().any(|&(ro_addr, ro_len)| {
+                let ro_end = ro_addr.saturating_add(ro_len as u64);
+                address < ro_end && ro_addr < end
+            })
         }
 
         fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            if let Some(wait) = self.refuse_read.take() {
+                return Err(MemoryError::ReadSuspended(Box::new(
+                    carrick_guest_mem::MemoryReadSuspension {
+                        wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
+                        continuation: carrick_guest_mem::OwnedReadContinuation::new(()),
+                    },
+                )));
+            }
             self.inner.read_bytes_raw(address, length)
         }
 
@@ -545,5 +697,53 @@ mod tests {
         assert_eq!(bounded_capacity(&owner, 1 << 20), COPYOUT_MAX_BYTES);
         assert_eq!(bounded_capacity(&owner, 12), 12);
         assert_eq!(bounded_capacity(&legacy, 1 << 20), 1 << 20);
+    }
+
+    #[test]
+    fn zero_outputs_make_zero_owner_prepares_and_never_suspend() {
+        let mut owner = OwnerRefusingMemory::new(BASE, 0x1000, 0xa5);
+        let _wait = owner.refuse_next();
+        prepare(
+            &mut owner,
+            [UserSlot::optional(0, 8), Some(UserSlot::new(BASE, 0))],
+        )
+        .expect("no-output preparation must not touch the owner or suspend")
+        .commit([&[], &[]])
+        .unwrap();
+        assert_eq!(
+            owner.prepares, 0,
+            "all-None / zero-capacity copyout must issue zero prepare_write calls"
+        );
+    }
+
+    #[test]
+    fn later_invalid_slot_commits_valid_prefix_on_both_venues() {
+        let mut owner = OwnerRefusingMemory::new(BASE, 0x1000, 0xa5);
+        let prepared = prepare(
+            &mut owner,
+            [
+                Some(UserSlot::new(BASE + 0x10, 4)),
+                Some(UserSlot::new(BASE + 0x2000, 8)),
+            ],
+        )
+        .expect("invalid second slot is reported at commit, not as a retry");
+        assert_eq!(prepared.commit([&[1, 2, 3, 4], &[5; 8]]), Err(CopyoutFault));
+        assert_eq!(
+            owner.read_bytes(BASE + 0x10, 4).unwrap(),
+            [1, 2, 3, 4],
+            "owner venue must commit the valid prefix before reporting EFAULT on the later slot",
+        );
+
+        let mut legacy = LinearMemory::new(BASE, vec![0xa5; 0x1000]);
+        let prepared = prepare(
+            &mut legacy,
+            [
+                Some(UserSlot::new(BASE + 0x10, 4)),
+                Some(UserSlot::new(BASE + 0x2000, 8)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(prepared.commit([&[1, 2, 3, 4], &[5; 8]]), Err(CopyoutFault));
+        assert_eq!(legacy.read_bytes(BASE + 0x10, 4).unwrap(), [1, 2, 3, 4]);
     }
 }
