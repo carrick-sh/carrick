@@ -496,15 +496,17 @@ fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
     let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
     custody.commit_registration();
     custody.commit_native_signal_owner();
+    let leader_generation = publish(&leader, 0x718);
     let leader_binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(leader.thread().key().tid.raw() as u64),
-        generation: SnapshotGeneration::from_raw(leader.task().key().serial.raw()),
+        generation: SnapshotGeneration::from_raw(leader_generation.raw()),
         mm: EntryMmKey::from_raw(leader.shared().mm().id().raw()),
         thread_generation: EntryThreadGeneration::from_raw(leader.thread().key().serial.raw()),
     };
     let leader_fixture = NativeSignalFixture::new(
         leader_binding,
         EntryTaskKey::from_raw(leader.task().key().id.raw() as u64),
+        carrick_core_abi::BirthSerial::of_task(leader.task().key().serial),
     );
     let leader_control = leader.thread().control_slot();
     leader_control.bind_zone_record(leader_fixture.record());
@@ -677,7 +679,8 @@ fn serial_host_native_forwarded_read_publishes_distinct_ingress_domains() {
 #[test]
 fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
     use carrick_core_abi::{
-        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+        BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        SnapshotGeneration,
     };
     use carrick_el1_linux::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
@@ -691,16 +694,21 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
     ] {
         let (_kernel, context) = bootstrap(tid_number);
         let generation = publish(&context, 0x709);
+        let process_birth = BirthSerial::of_task(context.task().key().serial);
+        assert_eq!(generation.raw(), 1);
+        assert_eq!(process_birth.raw(), 5);
+        assert_ne!(generation.raw(), process_birth.raw());
         let control = context.thread().control_slot();
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-            generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
+            generation: SnapshotGeneration::from_raw(generation.raw()),
             mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
             thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
         };
         let fixture = NativeSignalFixture::new(
             binding,
             EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+            process_birth,
         );
         control.bind_zone_record(fixture.record());
         let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
@@ -802,9 +810,11 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
 #[test]
 fn serial_host_empty_native_checkpoint_restarts_forwarded_read() {
     use carrick_core_abi::{
-        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+        BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        SnapshotGeneration,
     };
     use carrick_el1_linux::native_process_runtime::host_test_support::NativeSignalFixture;
+    use carrick_sched_core::process::TaskSerial;
 
     let fixture = NativeSignalFixture::new(
         ExecutionBinding {
@@ -814,6 +824,7 @@ fn serial_host_empty_native_checkpoint_restarts_forwarded_read() {
             thread_generation: EntryThreadGeneration::from_raw(1),
         },
         EntryTaskKey::from_raw(153_830),
+        BirthSerial::of_task(TaskSerial::from_raw_u64(5).unwrap()),
     );
     fixture.install_sigint_handler(true);
     let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
@@ -837,7 +848,8 @@ fn serial_host_empty_native_checkpoint_restarts_forwarded_read() {
 #[test]
 fn serial_host_native_owned_write_park_ignores_caught_sigalrm_until_sigkill() {
     use carrick_core_abi::{
-        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+        BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        SnapshotGeneration,
     };
     use carrick_el1_linux::native_process_runtime::host_test_support::NativeSignalFixture;
 
@@ -846,13 +858,14 @@ fn serial_host_native_owned_write_park_ignores_caught_sigalrm_until_sigkill() {
     let control = context.thread().control_slot();
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
+        generation: SnapshotGeneration::from_raw(generation.raw()),
         mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
         thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
     };
     let fixture = NativeSignalFixture::new(
         binding,
         EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+        BirthSerial::of_task(context.task().key().serial),
     );
     control.bind_zone_record(fixture.record());
     let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
@@ -905,7 +918,8 @@ fn serial_host_native_owned_write_park_ignores_caught_sigalrm_until_sigkill() {
 #[test]
 fn serial_host_ignored_sigint_does_not_interrupt_forwarded_read() {
     use carrick_core_abi::{
-        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+        BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        SnapshotGeneration,
     };
     use carrick_el1_linux::native_process_runtime::host_test_support::NativeSignalFixture;
 
@@ -914,13 +928,14 @@ fn serial_host_ignored_sigint_does_not_interrupt_forwarded_read() {
     let control = context.thread().control_slot();
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
+        generation: SnapshotGeneration::from_raw(generation.raw()),
         mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
         thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
     };
     let fixture = NativeSignalFixture::new(
         binding,
         EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+        BirthSerial::of_task(context.task().key().serial),
     );
     control.bind_zone_record(fixture.record());
     let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
@@ -956,7 +971,8 @@ fn serial_host_ignored_sigint_does_not_interrupt_forwarded_read() {
 #[test]
 fn serial_host_sibling_stealing_process_sigint_restarts_blocked_read() {
     use carrick_core_abi::{
-        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+        BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        SnapshotGeneration,
     };
     use carrick_el1_linux::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
@@ -967,13 +983,14 @@ fn serial_host_sibling_stealing_process_sigint_restarts_blocked_read() {
     let control = context.thread().control_slot();
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
+        generation: SnapshotGeneration::from_raw(generation.raw()),
         mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
         thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
     };
     let fixture = NativeSignalFixture::new(
         binding,
         EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+        BirthSerial::of_task(context.task().key().serial),
     );
     control.bind_zone_record(fixture.record());
     let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
@@ -1060,7 +1077,8 @@ fn serial_host_sibling_stealing_process_sigint_restarts_blocked_read() {
 #[test]
 fn serial_host_pselect_stolen_signal_restores_mask_before_guest_sigprocmask() {
     use carrick_core_abi::{
-        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+        BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        SnapshotGeneration,
     };
     use carrick_el1_linux::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
@@ -1069,18 +1087,20 @@ fn serial_host_pselect_stolen_signal_restores_mask_before_guest_sigprocmask() {
     use carrick_personality_linux::abi::thread::BlockedMask;
 
     let (_kernel, context) = bootstrap(153_834);
+    let generation = publish(&context, 0x744);
     let control = context.thread().control_slot();
     control.init_blocked(BlockedMask(2)); // persistent SIGINT block
     context.signal_authority().set_blocked(SigSet::from_raw(2));
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
+        generation: SnapshotGeneration::from_raw(generation.raw()),
         mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
         thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
     };
     let fixture = NativeSignalFixture::new(
         binding,
         EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+        BirthSerial::of_task(context.task().key().serial),
     );
     fixture.install_sigint_handler(false);
     fixture.control_slot().init_blocked(BlockedMask(2));
@@ -1101,13 +1121,7 @@ fn serial_host_pselect_stolen_signal_restores_mask_before_guest_sigprocmask() {
         .unwrap();
     let continuation = BlockedContinuation::from_dispatch_outcome(
         outcome,
-        ContinuationCapture::new(
-            &context,
-            publish(&context, 0x744),
-            request,
-            RestartClass::Never,
-        )
-        .unwrap(),
+        ContinuationCapture::new(&context, generation, request, RestartClass::Never).unwrap(),
     )
     .unwrap();
     let masks = continuation.signal_masks();
@@ -1165,7 +1179,8 @@ fn serial_host_pselect_stolen_signal_restores_mask_before_guest_sigprocmask() {
 #[test]
 fn serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint() {
     use carrick_core_abi::{
-        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+        BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        SnapshotGeneration,
     };
     use carrick_el1_linux::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
@@ -1175,18 +1190,20 @@ fn serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint() {
     use carrick_personality_linux::signal::arm;
 
     let (_kernel, context) = bootstrap(153_801);
+    let generation = publish(&context, 0x720);
     let control = context.thread().control_slot();
     control.init_blocked(BlockedMask(2)); // persistent SIGINT block
     context.signal_authority().set_blocked(SigSet::from_raw(2));
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
+        generation: SnapshotGeneration::from_raw(generation.raw()),
         mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
         thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
     };
     let fixture = NativeSignalFixture::new(
         binding,
         EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+        BirthSerial::of_task(context.task().key().serial),
     );
     fixture.install_sigint_handler(false);
     fixture.control_slot().init_blocked(BlockedMask(2));
@@ -1208,13 +1225,7 @@ fn serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint() {
     assert!(matches!(outcome, DispatchOutcome::WaitOnFds { .. }));
     let continuation = BlockedContinuation::from_dispatch_outcome(
         outcome,
-        ContinuationCapture::new(
-            &context,
-            publish(&context, 0x720),
-            request,
-            RestartClass::Never,
-        )
-        .unwrap(),
+        ContinuationCapture::new(&context, generation, request, RestartClass::Never).unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -1267,7 +1278,8 @@ fn serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint() {
 #[test]
 fn serial_host_two_live_reads_share_one_process_signal_wake() {
     use carrick_core_abi::{
-        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+        BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        SnapshotGeneration,
     };
     use carrick_el1_linux::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
@@ -1315,13 +1327,14 @@ fn serial_host_two_live_reads_share_one_process_signal_wake() {
         let generation = publish(context, marker);
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
-            generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
+            generation: SnapshotGeneration::from_raw(generation.raw()),
             mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
             thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
         };
         let fixture = NativeSignalFixture::new(
             binding,
             EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+            BirthSerial::of_task(context.task().key().serial),
         );
         let control = context.thread().control_slot();
         control.bind_zone_record(fixture.record());

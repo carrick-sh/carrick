@@ -308,7 +308,13 @@ mod altstack_tests {
             mm: EntryMmKey::from_raw(1),
             thread_generation: EntryThreadGeneration::from_raw(1),
         };
-        let fixture = NativeSignalFixture::new(binding, EntryTaskKey::from_raw(777));
+        let fixture = NativeSignalFixture::new(
+            binding,
+            EntryTaskKey::from_raw(777),
+            carrick_core_abi::BirthSerial::of_task(
+                carrick_sched_core::process::TaskSerial::from_raw_u64(5).unwrap(),
+            ),
+        );
         fixture.install_sigint_handler(false);
 
         let _ = take_signal_copies();
