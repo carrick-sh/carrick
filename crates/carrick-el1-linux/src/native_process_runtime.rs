@@ -11946,7 +11946,7 @@ mod tests {
         let mut entry = if external {
             runtime
                 .enter_registered(
-                    &registry,
+                    registry,
                     source,
                     &task,
                     address,
