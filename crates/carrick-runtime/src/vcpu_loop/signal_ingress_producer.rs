@@ -25,12 +25,11 @@ impl HostIngressTarget {
             return None;
         }
         let thread = context.thread();
+        let execution_generation = thread.execution_state().generation()?;
         let tid = thread.key().tid;
         let binding = ExecutionBinding {
             task: carrick_core_abi::EntryTaskKey::from_raw(tid.raw() as u64),
-            generation: carrick_core_abi::SnapshotGeneration::from_raw(
-                context.task().key().serial.raw(),
-            ),
+            generation: carrick_core_abi::SnapshotGeneration::from_raw(execution_generation.raw()),
             mm: carrick_core_abi::EntryMmKey::from_raw(context.shared().mm().id().raw()),
             thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(
                 thread.key().serial.raw(),
@@ -184,6 +183,8 @@ mod tests {
 
     #[test]
     fn host_target_requires_native_signal_domain_after_zone_binding() {
+        use carrick_kernel::kernel::continuation::test_support::publish;
+
         let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             100,
             carrick_hal::ThreadId::synthetic_for_tests(217),
@@ -191,6 +192,7 @@ mod tests {
         )
         .unwrap();
         let (_kernel, context) = carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        assert_eq!(publish(&context, 0x700).raw(), 1);
         let control = context.thread().control_slot();
         control.bind_zone_record(RecordRef {
             id: RecordId::from_raw(4).unwrap(),
@@ -203,11 +205,14 @@ mod tests {
         custody.commit_native_signal_owner();
         let target = HostIngressTarget::from_context(&context).unwrap();
         assert_eq!(target.binding.task.raw(), 100);
+        assert_eq!(target.binding.generation.raw(), 1);
         assert_eq!(target.bridge_thread.raw(), 217);
     }
 
     #[test]
     fn serial_host_process_event_queued_across_exec_keeps_task_serial() {
+        use carrick_kernel::kernel::continuation::test_support::publish;
+
         let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             101,
             carrick_hal::ThreadId::synthetic_for_tests(218),
@@ -215,6 +220,7 @@ mod tests {
         )
         .unwrap();
         let (kernel, context) = carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        assert_eq!(publish(&context, 0x701).raw(), 1);
         let control = context.thread().control_slot();
         control.bind_zone_record(RecordRef {
             id: RecordId::from_raw(4).unwrap(),
@@ -252,6 +258,169 @@ mod tests {
         assert_eq!(
             queued.scope(),
             carrick_el1_abi::ExternalSignalScope::Process
+        );
+    }
+
+    #[test]
+    fn serial_host_ingress_target_tracks_two_members_across_successive_execution_generations() {
+        use carrick_abi::LinuxCloneFlags;
+        use carrick_kernel::kernel::ClonePlan;
+        use carrick_kernel::kernel::continuation::test_support::publish;
+        use carrick_kernel::kernel::objects::ExecutorId;
+
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
+            102,
+            carrick_hal::ThreadId::synthetic_for_tests(219),
+            "ingress-generations".to_owned(),
+        )
+        .unwrap();
+        let (kernel, first) = carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        let second = kernel
+            .reserve_thread_clone(
+                &first,
+                ClonePlan::from_flags(
+                    LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(carrick_hal::ThreadId::synthetic_for_tests(220))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_context()
+            .unwrap();
+        let child = kernel
+            .reserve_fork(
+                &first,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).unwrap(),
+                "ingress-child".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(221))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0;
+
+        let bind_native = |context: &carrick_kernel::kernel::KernelContext,
+                           raw_id: u32,
+                           incarnation: u64| {
+            let record = RecordRef {
+                id: RecordId::from_raw(raw_id).unwrap(),
+                incarnation,
+            };
+            let control = context.thread().control_slot();
+            control.bind_zone_record(record);
+            let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+            custody.commit_registration();
+            custody.commit_native_signal_owner();
+            record
+        };
+        let first_record = bind_native(&first, 4, 9);
+        let second_record = bind_native(&second, 5, 11);
+        let child_record = bind_native(&child, 6, 13);
+
+        assert!(
+            HostIngressTarget::from_context(&first).is_none(),
+            "uninitialized thread has no live execution snapshot generation"
+        );
+
+        assert_eq!(publish(&first, 0x701).raw(), 1);
+        assert_eq!(publish(&second, 0x702).raw(), 1);
+        assert_eq!(publish(&child, 0x703).raw(), 1);
+
+        let advance_generation = |context: &carrick_kernel::kernel::KernelContext| {
+            let thread = context.thread();
+            let executor = ExecutorId::for_transitional_thread(thread.registry_id()).unwrap();
+            let lease = thread.claim_runnable(executor).unwrap();
+            thread.begin_switch_out(&lease).unwrap();
+            thread.yield_from_executor(lease).unwrap();
+            thread.execution_state().generation().unwrap()
+        };
+
+        // Advance first member to generation 2 and second member to generation 3
+        // while both share the parent's durable task serial; forked child is at
+        // generation 1 with a distinct durable task serial.
+        assert_eq!(advance_generation(&first).raw(), 2);
+        assert_eq!(advance_generation(&second).raw(), 2);
+        assert_eq!(advance_generation(&second).raw(), 3);
+        assert_eq!(second.task().key().serial, first.task().key().serial);
+        assert_ne!(child.task().key().serial, first.task().key().serial);
+        assert_ne!(first.task().key().serial.raw(), 2);
+        assert_ne!(second.task().key().serial.raw(), 3);
+        assert_ne!(child.task().key().serial.raw(), 1);
+
+        let queue = SignalIngressQueue::<4>::new();
+        let mut producer = HostSignalIngressProducer::new();
+
+        for (context, record, expected_gen) in [
+            (&first, first_record, 2u64),
+            (&second, second_record, 3u64),
+            (&child, child_record, 1u64),
+        ] {
+            let tid = context.thread().key().tid.raw();
+            carrick_signal_linux::publish_pending_for(context.thread().registry_id().raw(), 10);
+            assert_eq!(
+                producer
+                    .publish(
+                        &queue,
+                        HostIngressTarget::from_context(context),
+                        carrick_signal_linux::take_pending_event_for,
+                    )
+                    .unwrap(),
+                HostIngressStep::Published
+            );
+            let event = queue.take().unwrap();
+            let live_binding = ExecutionBinding {
+                task: EntryTaskKey::from_raw(tid as u64),
+                generation: SnapshotGeneration::from_raw(expected_gen),
+                mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
+                thread_generation: EntryThreadGeneration::from_raw(
+                    context.thread().key().serial.raw(),
+                ),
+            };
+            assert_eq!(event.binding(), live_binding);
+            assert!(event.matches_live(
+                EntryEventIdentity::from_binding(live_binding),
+                live_binding,
+                record,
+            ));
+            let stale_binding = ExecutionBinding {
+                generation: SnapshotGeneration::from_raw(expected_gen.saturating_sub(1).max(99)),
+                ..live_binding
+            };
+            assert!(!event.matches_live(
+                EntryEventIdentity::from_binding(stale_binding),
+                stale_binding,
+                record,
+            ));
+        }
+
+        carrick_signal_linux::publish_process_signal(2);
+        assert_eq!(
+            producer
+                .publish(
+                    &queue,
+                    HostIngressTarget::from_context(&second),
+                    carrick_signal_linux::take_pending_event_for,
+                )
+                .unwrap(),
+            HostIngressStep::Published
+        );
+        let proc_event = queue.take().unwrap();
+        assert_eq!(
+            proc_event.scope(),
+            carrick_el1_abi::ExternalSignalScope::Process
+        );
+        assert_eq!(proc_event.binding().generation.raw(), 3);
+        assert_eq!(
+            proc_event.process_generation().raw(),
+            second.task().key().serial.raw()
         );
     }
 
