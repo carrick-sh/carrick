@@ -302,6 +302,15 @@ struct Measured {
 }
 
 fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured {
+    run_fixture_in_image(carrier, common::SMOKE_IMAGE, args, timeout)
+}
+
+fn run_fixture_in_image(
+    carrier: &Carrier,
+    image: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Measured {
     let mut command = vec![FIXTURE.to_owned()];
     command.extend(args.iter().map(|arg| (*arg).to_owned()));
     let watchdog = common::Watchdog::start(timeout);
@@ -337,7 +346,7 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
     let cpu_before = carrier_cpu_ns();
     let start = std::time::Instant::now();
     let mut builder = carrier
-        .container(common::SMOKE_IMAGE)
+        .container(image)
         .pull_policy(PullPolicy::Missing)
         .command(command)
         .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()));
@@ -1051,6 +1060,58 @@ fn el1_sched_signal_reaches_a_wfi_parked_vcpu() {
         "the signals did not reach vCPUs parked in WFI: {:?}",
         measured.zone
     );
+}
+
+/// One release timing sample for the paired signal-delivery runtime driver.
+/// The existing semantic tests retain their smoke-image path.
+#[test]
+#[ignore = "requires explicit pinned image and signed release runtime driver"]
+fn el1_sched_signal_delivery_contract_sample() {
+    assert!(
+        !cfg!(debug_assertions),
+        "timing requires a release executable"
+    );
+    assert!(
+        !cfg!(feature = "conformance-metrics"),
+        "timing requires an uninstrumented executable"
+    );
+    let image = std::env::var("CARRICK_SIGNAL_CONTRACT_IMAGE")
+        .expect("CARRICK_SIGNAL_CONTRACT_IMAGE must name image@sha256:digest");
+    let (name, digest) = image
+        .rsplit_once("@sha256:")
+        .expect("timing image must be digest-pinned");
+    assert!(!name.is_empty() && !name.chars().any(char::is_whitespace));
+    assert!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()));
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture_in_image(
+        &carrier,
+        &image,
+        &["wfi-signal", "200"],
+        Duration::from_secs(120),
+    );
+    // Preserve both complete guest streams, including on assertion failure.
+    println!(
+        "signal-contract-result {}",
+        serde_json::json!({
+            "image": image,
+            "exit_code": measured.result.exit_code,
+            "signal": measured.result.signal.map(|signal| format!("{signal:?}")),
+            "stdout": measured.result.stdout_utf8(),
+            "stderr": measured.result.stderr_utf8(),
+            "idle_exits": measured.zone.idle_exits,
+            "wfi_entries": measured.zone.wfi_entries,
+        })
+    );
+    assert!(measured.result.success(), "{}", describe(&measured));
+    let stdout = measured.result.stdout_utf8();
+    for key in ["rounds", "eintr", "handled"] {
+        assert_eq!(field(&stdout, key), 200.0, "{stdout:?}");
+    }
+    let p50 = field(&stdout, "wake_p50_us");
+    assert!(p50.is_finite() && p50 > 0.0, "{stdout:?}");
+    assert!(measured.zone.idle_exits >= 200 && measured.zone.wfi_entries >= 200);
 }
 
 /// The PSTATE a guest signal handler reads from its `ucontext` is unchanged
