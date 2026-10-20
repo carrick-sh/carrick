@@ -341,9 +341,10 @@ fn notify_published_thread_signal(tid: i32, wake: PublicationWake) {
 /// The four stores are only ever locked transiently and non-nested, so the
 /// bundle acquisition cannot deadlock against their users.
 pub struct SignalForkLocks {
-    // Declared first so its child-side reset runs before the other guards drop.
-    _waiters: ThreadWaitersForkGuard,
+    // Release origin custody before another guard frees its unused replacement
+    // in the parent. In the child both clean backings publish before reinit.
     _process_pending: carrick_signal_linux::ProcessPendingForkGuard,
+    _waiters: ThreadWaitersForkGuard,
     _child_watch: carrick_signal_linux::child_watch::ChildWatchForkGuard,
     _thread_pending: carrick_signal_linux::ThreadPendingForkGuard,
 }
@@ -361,8 +362,8 @@ pub fn hold_signal_locks_for_fork() -> SignalForkLocks {
     let process_pending = process_pending.hold();
     let waiters = waiters.hold(|lock| lock.lock());
     SignalForkLocks {
-        _waiters: waiters,
         _process_pending: process_pending,
+        _waiters: waiters,
         _child_watch: child_watch,
         _thread_pending: thread_pending,
     }
