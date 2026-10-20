@@ -263,24 +263,40 @@ const _: () = {
 
 /// A host-side guest access admitted for one CPU through a memory whose
 /// inventory it is seated in. It borrows that CPU's context (so it cannot
-/// be handed to another context) and dereferences to it; every TLB-using
-/// helper in [`crate::mmu`] requires one. Dropping it ends the access: a CPU
-/// that was parked parks again.
+/// be handed to another context) and dereferences read-only to it; every
+/// TLB-using helper in [`crate::mmu`] requires one. Dropping it ends the
+/// access: a CPU that was parked parks again.
+///
+/// It never exposes `&mut SoftCpuContext` publicly, so safe code cannot
+/// swap or move the admitted context out of the guard and leave the
+/// original seat running after drop:
+///
+/// ```compile_fail
+/// use carrick_softcpu_x86::SoftCpuContext;
+/// use carrick_softmmu::ExtentTable;
+///
+/// let inventory_a = ExtentTable::new().unwrap();
+/// let inventory_b = ExtentTable::new().unwrap();
+/// let mut context_a = SoftCpuContext::new(&inventory_a).unwrap();
+/// let mut context_b = SoftCpuContext::new(&inventory_b).unwrap();
+/// let mut access = context_a.admit_host_access(&inventory_a).unwrap();
+/// std::mem::swap(&mut *access, &mut context_b);
+/// ```
 #[must_use = "the access ends when this is dropped"]
 pub struct HostAccess<'c> {
     ctx: &'c mut SoftCpuContext,
     admission: Option<crate::mmu::LookupAdmission>,
 }
 
-impl std::ops::Deref for HostAccess<'_> {
-    type Target = SoftCpuContext;
-    fn deref(&self) -> &SoftCpuContext {
+impl HostAccess<'_> {
+    pub(crate) fn context_mut(&mut self) -> &mut SoftCpuContext {
         self.ctx
     }
 }
 
-impl std::ops::DerefMut for HostAccess<'_> {
-    fn deref_mut(&mut self) -> &mut SoftCpuContext {
+impl std::ops::Deref for HostAccess<'_> {
+    type Target = SoftCpuContext;
+    fn deref(&self) -> &SoftCpuContext {
         self.ctx
     }
 }
@@ -308,7 +324,9 @@ impl SoftCpuContext {
     /// empty and the CPU starts parked.
     pub fn new(extents: &ExtentTable) -> Result<Self, SoftSeatError> {
         let mut tlb = SoftTlb::new();
-        let seat = extents.register_vcpu(&mut tlb)?;
+        // SAFETY: `SoftCpuContext` owns `tlb` and `seat` in private fields and
+        // never replaces either, preserving their 1:1 pairing.
+        let seat = unsafe { extents.register_vcpu_unguarded(&mut tlb) }?;
         let gw = gateway_trampolines().ok();
         let mut ctx = Self {
             gpr: [0; 16],
@@ -405,7 +423,8 @@ impl SoftCpuContext {
     /// This CPU as the requester of a retirement it issues itself: served
     /// inline, never kicked, so it cannot wait on its own safe point.
     pub fn requester(&mut self) -> crate::mmu::SoftRequester<'_> {
-        crate::mmu::SoftRequester::new(&mut self.seat, &mut self.tlb)
+        // SAFETY: `self.seat` and `self.tlb` are this context's 1:1 pair.
+        unsafe { crate::mmu::SoftRequester::new_unguarded(&mut self.seat, &mut self.tlb) }
     }
 
     pub(crate) fn prepare_block(

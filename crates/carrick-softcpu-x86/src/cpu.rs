@@ -174,7 +174,82 @@ pub struct SoftCpu {
     pub max_block_span: usize,
 }
 
+/// Scoped mutable view of architectural state on a [`RunningCpu`] that
+/// never exposes `&mut SoftCpuContext`, so the running context and its
+/// seat cannot be moved or swapped out of the active run guard.
+pub struct RunningContext<'c> {
+    ctx: &'c mut SoftCpuContext,
+}
+
+impl std::ops::Deref for RunningContext<'_> {
+    type Target = SoftCpuContext;
+    fn deref(&self) -> &SoftCpuContext {
+        self.ctx
+    }
+}
+
+impl RunningContext<'_> {
+    pub fn set_rip(&mut self, rip: u64) {
+        self.ctx.rip = rip;
+    }
+
+    pub fn gpr_mut(&mut self) -> &mut [u64; 16] {
+        &mut self.ctx.gpr
+    }
+
+    pub fn set_rflags(&mut self, rflags: u64) {
+        self.ctx.rflags = rflags;
+    }
+
+    pub fn set_fs_base(&mut self, fs_base: u64) {
+        self.ctx.fs_base = fs_base;
+    }
+
+    pub fn set_gs_base(&mut self, gs_base: u64) {
+        self.ctx.gs_base = gs_base;
+    }
+
+    pub fn set_kernel_gs_base(&mut self, kernel_gs_base: u64) {
+        self.ctx.kernel_gs_base = kernel_gs_base;
+    }
+
+    pub fn set_cpl(&mut self, cpl: u8) {
+        self.ctx.set_cpl(cpl);
+    }
+
+    pub fn set_smap_enabled(&mut self, enabled: bool) {
+        self.ctx.set_smap_enabled(enabled);
+    }
+
+    pub fn set_cr3(&mut self, cr3: u64) {
+        self.ctx.cr3 = cr3;
+    }
+
+    pub fn flush_tlb(&mut self) {
+        self.ctx.flush_tlb();
+    }
+
+    pub fn reset_tlb_stats(&mut self) {
+        self.ctx.reset_tlb_stats();
+    }
+}
+
 /// A run of blocks on one [`SoftCpu`]; the CPU parks when this drops.
+///
+/// Never exposes `&mut SoftCpuContext`, so safe code cannot swap the
+/// running context out of the guard and leave the original seat running
+/// after drop:
+///
+/// ```compile_fail
+/// use carrick_softcpu_x86::{SoftCpu, SoftCpuContext};
+/// use carrick_softmmu::ExtentTable;
+///
+/// let inventory = ExtentTable::new().unwrap();
+/// let mut cpu = SoftCpu::new(&inventory).unwrap();
+/// let mut other = SoftCpuContext::new(&inventory).unwrap();
+/// let mut run = cpu.run();
+/// std::mem::swap(&mut *run.context_mut(), &mut other);
+/// ```
 pub struct RunningCpu<'c> {
     cpu: &'c mut SoftCpu,
 }
@@ -190,9 +265,12 @@ impl RunningCpu<'_> {
         &self.cpu.ctx
     }
 
-    /// Mutate architectural state between blocks of the run.
-    pub fn context_mut(&mut self) -> &mut SoftCpuContext {
-        &mut self.cpu.ctx
+    /// Scoped mutable architectural access between blocks of the run
+    /// without exposing `&mut SoftCpuContext`.
+    pub fn context_mut(&mut self) -> RunningContext<'_> {
+        RunningContext {
+            ctx: &mut self.cpu.ctx,
+        }
     }
 
     /// Whether a retirement asked this CPU to reach block entry.

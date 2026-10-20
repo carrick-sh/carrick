@@ -454,8 +454,8 @@ fn running_peer_that_hits_through_step_block_misses_after_retirement() {
             let mut run = cpu.run();
             assert_eq!(run.step_block(&mut *mem.lock().unwrap()).unwrap(), expect);
             let misses = run.context().tlb_stats().misses;
-            run.context_mut().rip = code_va;
-            run.context_mut().gpr[reg::RAX] = 0;
+            run.context_mut().set_rip(code_va);
+            run.context_mut().gpr_mut()[reg::RAX] = 0;
             assert_eq!(run.step_block(&mut *mem.lock().unwrap()).unwrap(), expect);
             assert_eq!(run.context().gpr[reg::RAX], RETIRE_VALUE);
             assert_eq!(
@@ -470,8 +470,8 @@ fn running_peer_that_hits_through_step_block_misses_after_retirement() {
                 assert!(std::time::Instant::now() < deadline, "no kick");
                 std::thread::yield_now();
             }
-            run.context_mut().rip = code_va;
-            run.context_mut().gpr[reg::RAX] = 0;
+            run.context_mut().set_rip(code_va);
+            run.context_mut().gpr_mut()[reg::RAX] = 0;
             let exit = run.step_block(&mut *mem.lock().unwrap()).unwrap();
             let rax = run.context().gpr[reg::RAX];
             drop(run);
@@ -626,7 +626,7 @@ fn every_run_and_host_access_parks_when_it_ends() {
     );
     {
         let mut run = cpu.run();
-        run.context_mut().rip = code_va;
+        run.context_mut().set_rip(code_va);
         assert_eq!(run.step_block(&mut mem).unwrap(), expect);
         assert!(run.context().seat().is_running());
     }
@@ -681,7 +681,7 @@ fn retirement_issued_by_a_running_cpu_completes_without_waiting_on_itself() {
         .map_err(|(_, error)| error)
         .unwrap();
     mem.extents_mut().reclaim(&completion);
-    run.context_mut().rip = code_va;
+    run.context_mut().set_rip(code_va);
     assert_eq!(
         run.step_block(&mut mem).unwrap(),
         pf(code_va, PF_ERR_USER, RETIRE_DATA_VA)

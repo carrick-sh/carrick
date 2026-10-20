@@ -35,11 +35,11 @@ pub use carrick_softmmu::{
     PAGE_SIZE_4K as SOFT_TLB_PAGE_SIZE, PageFaultErrorCode, PageFaultInfo, PendingRetirement,
     PlacementError, Reclaimed, ResolvedAccess, ResolvedSpan, RetiredIdentity, Retirement,
     RetirementWaitError, RootGpa, RunningSeat, SOFT_TLB_BITS, SOFT_TLB_ENTRIES,
-    SOFT_TLB_INDEX_MASK, SoftCpuException, SoftFaultClass, SoftMmuMemory, SoftRequester,
-    SoftSeatError, SoftTlb, SoftTlbEntry, SoftTlbPlane, SoftTlbStats, SoftTranslationError,
-    SoftVcpuSeat, SoftWalker, Stage1Gpa, TLB_TAG_AC_BIT as SOFT_TLB_TAG_AC_BIT,
-    TLB_TAG_CPL3_BIT as SOFT_TLB_TAG_CPL3_BIT, TLB_TAG_INVALID as SOFT_TLB_INVALID_TAG,
-    WalkOutcome,
+    SOFT_TLB_INDEX_MASK, SoftAdmitError, SoftCpuException, SoftFaultClass, SoftMmuMemory,
+    SoftRequester, SoftSeatError, SoftTlb, SoftTlbEntry, SoftTlbPlane, SoftTlbStats,
+    SoftTranslationError, SoftVcpu, SoftVcpuSeat, SoftWalker, Stage1Gpa,
+    TLB_TAG_AC_BIT as SOFT_TLB_TAG_AC_BIT, TLB_TAG_CPL3_BIT as SOFT_TLB_TAG_CPL3_BIT,
+    TLB_TAG_INVALID as SOFT_TLB_INVALID_TAG, WalkOutcome,
 };
 
 /// Hardware x86 `#PF` error-code bits.
@@ -131,7 +131,7 @@ fn walk_with_frame<M: SoftMmuMemory>(
     va: u64,
     kind: SoftAccessKind,
 ) -> Result<(*mut u8, AuthenticatedGpa), SoftPageFault> {
-    let ctx: &mut SoftCpuContext = access;
+    let ctx = access.context_mut();
     let root = ctx.root_gpa().ok_or(SoftPageFault::new(va, 0))?;
     let mode = ctx.access_mode();
     match ctx
@@ -180,7 +180,11 @@ fn probe_or_walk<M: SoftMmuMemory>(
     kind: SoftAccessKind,
 ) -> Result<*mut u8, SoftPageFault> {
     let mode = access.access_mode();
-    if let Some(host_addr) = access.tlb.probe(GuestVa::new(va), 1, kind, mode) {
+    if let Some(host_addr) = access
+        .context_mut()
+        .tlb
+        .probe(GuestVa::new(va), 1, kind, mode)
+    {
         return Ok(host_addr as *mut u8);
     }
     walk_with_frame(access, mem, va, kind).map(|(ptr, _)| ptr)

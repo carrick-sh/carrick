@@ -102,8 +102,9 @@ pub struct SoftTlbStats {
 }
 
 /// Per-CPU software TLB with separate `read`, `write`, and `exec` planes.
+/// Not `Clone`: cached translations belong to the one seat serving this TLB.
 #[repr(C, align(64))]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SoftTlb {
     pub(crate) read: SoftTlbPlane,
     pub(crate) write: SoftTlbPlane,
