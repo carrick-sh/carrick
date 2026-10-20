@@ -491,7 +491,11 @@ fn work_port_services_bound_tasks_on_loaded_and_idle_peer_lanes() {
         }
     }
     assert_eq!(loaded_deliveries.len(), 1);
-    assert!(loaded_deliveries[0].1, "loaded task's host work delivered");
+    loaded_deliveries[0]
+        .1
+        .take()
+        .expect("loaded task's host work delivered")
+        .settled();
 
     factory
         .fixture_place_native_thread(child_tid, carrick_guest_arch::CpuId::new(1))
@@ -500,8 +504,10 @@ fn work_port_services_bound_tasks_on_loaded_and_idle_peer_lanes() {
     // exact task while the vCPU is stopped at a real physical doorbell.
     let first = peer.fixture_run_idle_peer().expect("bind idle peer child");
     assert!(matches!(first, CarrierRunExit::PhysicalDoorbell { .. }));
-    peer.service_idle_peer_doorbell(&first, |_, _| {})
-        .expect("first peer service");
+    peer.service_idle_peer_doorbell(&first, |_, pending| {
+        assert!(pending.is_none(), "no pending host work on first peer bind");
+    })
+    .expect("first peer service");
     factory
         .fixture_mark_current_host_work(carrick_guest_arch::CpuId::new(1))
         .expect("publish peer work");
@@ -519,7 +525,11 @@ fn work_port_services_bound_tasks_on_loaded_and_idle_peer_lanes() {
         }
     }
     assert_eq!(idle_deliveries.len(), 1);
-    assert!(idle_deliveries[0].1, "idle peer's host work delivered");
+    idle_deliveries[0]
+        .1
+        .take()
+        .expect("idle peer's host work delivered")
+        .settled();
 }
 
 fn peer_retirement(
