@@ -5731,7 +5731,7 @@ impl HvfVmState {
             physical_size,
             perms,
             memory: None,
-            host_mapping,
+            host_mapping: host_mapping.map(RegionHostOwner::Exclusive),
             structural_owner: None,
             stage2_lease: None,
             is_dynamic_alias: true,
