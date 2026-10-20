@@ -1468,6 +1468,15 @@ impl PreparedRun {
             let root_context = dispatcher.capture_one_task_context().map_err(|error| {
                 RuntimeError::Unsupported(format!("capture x86 root identity: {error}"))
             })?;
+            root_context
+                .kernel()
+                .object_ids()
+                .bind_initial_birth_source(machine.birth_serial_source()?)
+                .map_err(|error| {
+                    RuntimeError::Unsupported(format!(
+                        "bind initial x86 carrier birth source: {error}"
+                    ))
+                })?;
             machine.bind_initial_task_identity(carrick_vmm_kvm::cpl0_boot::InitialTaskBinding {
                 task: root_context.task().key(),
                 mm: carrick_hal::MmGeneration::new(root_context.shared().mm().id().nonzero()),

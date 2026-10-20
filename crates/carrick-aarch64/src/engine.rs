@@ -5295,6 +5295,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vcpu.borrow_mut().el1_switchable_roots()
     }
 
+    fn birth_serial_source(
+        &mut self,
+    ) -> Result<std::sync::Arc<dyn carrick_hal::birth_serial::BirthSerialSource>, TrapError> {
+        self.vm.birth_serial_source()
+    }
+
     fn fd_ceiling_publisher(&self) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
         self.vm.fd_ceiling_publisher()
     }

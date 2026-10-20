@@ -2084,6 +2084,7 @@ pub(crate) fn publish_exec_region_host_owner_in(
             key.0
         ))
     })?;
+    let host_mapping = host_mapping.into_exclusive()?;
     let is_structural = !is_reusable_global_frame_extent(key.0, key.1);
     let owner_generation = if is_structural {
         if let Some(root_slot) = mm_root_slot.filter(|slot| slot.0 == key.0) {

@@ -1421,7 +1421,7 @@ fn serial_host_exec_predecessor_backing_stays_live_until_detached_cleanup() {
     lease.drop_backing_audit = Some((host_addr as usize, std::sync::Arc::clone(&observed)));
     let mut mapping = thread_sibling_tests::mapped_region(0x1234_0000, 0x1234_4000, 0x1234_0000);
     mapping.host_addr = host_addr;
-    mapping.host_mapping = Some(host);
+    mapping.host_mapping = Some(host.into());
     mapping.stage2_lease = Some(lease);
     let mut task = hvpatch_task_state_test_fixture(7, 0x4000, 7);
     let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&task);
@@ -1514,7 +1514,7 @@ fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
         lease_key.0,
     );
     mapping.host_addr = host_addr;
-    mapping.host_mapping = Some(host);
+    mapping.host_mapping = Some(host.into());
     mapping.stage2_lease = Some(lease);
 
     // Exec selected this extent while it was unreferenced. Before deferred
@@ -2525,7 +2525,7 @@ fn child_local_mapping_authenticates_through_its_own_raii_lease() {
         physical_size: size,
         perms: applevisor::memory::MemPerms::ReadWriteExec,
         memory: None,
-        host_mapping: Some(host_mapping),
+        host_mapping: Some(host_mapping.into()),
         structural_owner: None,
         stage2_lease: Some(lease),
         is_dynamic_alias: false,

@@ -2442,6 +2442,7 @@ unsafe impl Send for RetainedFileRegion {}
 pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     pub(crate) _vm: CarrierMemory<M>,
     pub(crate) ram: Arc<GuestRam>,
+    birth_live: BirthSourceRevocation,
     initial_extent: Option<(BackingHandle, usize)>,
     _kernel_region: Option<BackingHandle>,
     files: RetainedFileRegion,
@@ -2476,6 +2477,7 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
 
 impl<M: CarrierMemoryIo> Drop for Cpl0HostCustody<M> {
     fn drop(&mut self) {
+        self.birth_live.retire();
         // Unwind the inventory first. Its destructor only records a refused
         // retirement; this carrier observer chooses the existing fail-stop.
         drop(self.initial_inventory.take());
@@ -3592,6 +3594,114 @@ impl BootstrapFileRegion {
     }
 }
 
+/// Linearizes physical teardown against all retained host issuance handles.
+struct BirthSourceRevocation(Arc<std::sync::RwLock<bool>>);
+impl BirthSourceRevocation {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::RwLock::new(true)))
+    }
+    fn retire(&self) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+    }
+}
+impl Drop for BirthSourceRevocation {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
+#[derive(Clone)]
+struct PhysicalBirthSource {
+    live: Arc<std::sync::RwLock<bool>>,
+    _ram: Arc<GuestRam>,
+    zone: NonNull<X86Cpl0Zone>,
+    identity: carrick_hal::birth_serial::BirthSourceIdentity,
+}
+impl core::fmt::Debug for PhysicalBirthSource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("PhysicalBirthSource")
+            .field(&self.identity)
+            .finish()
+    }
+}
+impl PhysicalBirthSource {
+    fn new(
+        ram: Arc<GuestRam>,
+        identity: carrick_hal::birth_serial::BirthSourceIdentity,
+        live: Arc<std::sync::RwLock<bool>>,
+    ) -> Result<Self, carrick_hal::birth_serial::BirthSourceError> {
+        use carrick_hal::birth_serial::BirthSourceError;
+        let pointer = ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or(BirthSourceError::StaleOwner)?;
+        if !(pointer as usize).is_multiple_of(core::mem::align_of::<X86Cpl0Zone>()) {
+            return Err(BirthSourceError::StaleOwner);
+        }
+        let zone =
+            NonNull::new(pointer.cast::<X86Cpl0Zone>()).ok_or(BirthSourceError::StaleOwner)?;
+        Ok(Self {
+            _ram: ram,
+            zone,
+            identity,
+            live,
+        })
+    }
+    fn with_issuer<T>(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+        op: impl FnOnce(carrick_sched_core::process::identity_allocator::SerialIssuer<'_>) -> T,
+    ) -> Result<T, carrick_hal::birth_serial::BirthSourceError> {
+        use carrick_hal::birth_serial::BirthSourceError;
+        let live = self.live.read().map_err(|_| BirthSourceError::StaleOwner)?;
+        if expected != &self.identity || !*live {
+            return Err(BirthSourceError::StaleOwner);
+        }
+        // SAFETY: physical bootstrap initialized this zone in immutable windows;
+        // the owning Arc<GuestRam> retains every mapped byte through this borrow.
+        Ok(op(unsafe { self.zone.as_ref() }.serial_issuer()))
+    }
+}
+// SAFETY: zone is derived once from the retained initialized GuestRam. Only
+// its atomic issuer is accessed, under the physical-custody revocation guard.
+unsafe impl Send for PhysicalBirthSource {}
+unsafe impl Sync for PhysicalBirthSource {}
+impl carrick_hal::birth_serial::BirthSerialSource for PhysicalBirthSource {
+    fn identity(&self) -> &carrick_hal::birth_serial::BirthSourceIdentity {
+        &self.identity
+    }
+    fn allocate(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+    ) -> Result<NonZeroU64, carrick_hal::birth_serial::BirthSourceError> {
+        self.with_issuer(expected, |issuer| issuer.allocate())?
+            .ok_or(carrick_hal::birth_serial::BirthSourceError::Exhausted)
+    }
+    fn adopt_initial(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+        high_water: NonZeroU64,
+    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
+        if self.with_issuer(expected, |issuer| issuer.adopt_initial(high_water))? {
+            Ok(())
+        } else {
+            Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner)
+        }
+    }
+    fn advance_past(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+        issued: NonZeroU64,
+    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
+        self.with_issuer(expected, |issuer| issuer.advance_past(issued))
+    }
+}
+
 pub struct BootstrapCustody<M: CarrierMemoryIo>(Cpl0HostCustody<M>);
 
 impl<M: CarrierMemoryIo> BootstrapCustody<M> {
@@ -3619,6 +3729,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
         Ok(Self(Cpl0HostCustody {
             _vm: memory,
             ram,
+            birth_live: BirthSourceRevocation::new(),
             initial_extent,
             _kernel_region: kernel_region,
             files: files.0,
@@ -3659,6 +3770,20 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     }
     pub fn frame_inventory(&self) -> &Arc<dyn PhysicalFrameInventory> {
         &self.0.frame_inventory
+    }
+    /// Available only while this stopped bootstrap owns the initialized zone.
+    pub fn birth_serial_source(
+        &self,
+    ) -> Result<Arc<dyn carrick_hal::birth_serial::BirthSerialSource>, TrapError> {
+        let identity = carrick_hal::birth_serial::BirthSourceIdentity::from_backend_identity(
+            self.0._vm.clone_vm(),
+            self.0._vm.identity().nonzero(),
+            NonZeroU64::MIN,
+        );
+        let source =
+            PhysicalBirthSource::new(self.0.ram.clone(), identity, self.0.birth_live.0.clone())
+                .map_err(|error| fail(format!("physical birth source: {error}")))?;
+        Ok(Arc::new(source))
     }
     pub fn initial_task(&self) -> Option<InitialTaskBinding> {
         self.0.initial_task
@@ -3822,3 +3947,73 @@ static_assertions::assert_not_impl_any!(RetainedMetadataPtr: Clone, Sync);
 static_assertions::assert_impl_all!(Cpl0HostCustody<crate::carrier_memory::test_support::MemoryTestIo>: Send);
 #[cfg(test)]
 static_assertions::assert_not_impl_any!(Cpl0HostCustody<crate::carrier_memory::test_support::MemoryTestIo>: Clone, Sync);
+
+#[cfg(test)]
+mod birth_source_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use carrick_hal::birth_serial::{BirthSerialSource, BirthSourceError, BirthSourceIdentity};
+    fn source() -> (BirthSourceRevocation, PhysicalBirthSource) {
+        let mut ram = GuestRam::new();
+        ram.add_window(
+            META_GPA,
+            (carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize + size_of::<X86Cpl0Zone>() + 4095)
+                & !4095,
+            crate::guest_ram::WindowKind::Shared,
+        )
+        .unwrap();
+        let ram = Arc::new(ram);
+        let revocation = BirthSourceRevocation::new();
+        let identity = BirthSourceIdentity::from_backend_identity(
+            ram.clone(),
+            NonZeroU64::MIN,
+            NonZeroU64::MIN,
+        );
+        let source = PhysicalBirthSource::new(ram, identity, revocation.0.clone()).unwrap();
+        (revocation, source)
+    }
+    #[test]
+    fn physical_birth_source_retains_bytes_but_refuses_retired_custody() {
+        let (custody, source) = source();
+        let weak_backing = Arc::downgrade(&source._ram);
+        assert_eq!(source.allocate(source.identity()).unwrap().get(), 1);
+        let peer = source.clone();
+        drop(custody); // Same revocation owner as Cpl0HostCustody::drop.
+        assert!(weak_backing.upgrade().is_some());
+        assert_eq!(
+            source.allocate(source.identity()),
+            Err(BirthSourceError::StaleOwner)
+        );
+        assert_eq!(
+            peer.advance_past(peer.identity(), NonZeroU64::MAX),
+            Err(BirthSourceError::StaleOwner)
+        );
+        assert_eq!(
+            peer.adopt_initial(peer.identity(), NonZeroU64::MIN),
+            Err(BirthSourceError::StaleOwner)
+        );
+        drop(peer);
+        drop(source);
+        assert!(weak_backing.upgrade().is_none());
+    }
+    #[test]
+    fn physical_birth_source_rejects_another_generation_one_and_live_handoff() {
+        let (_first_custody, first) = source();
+        let (_second_custody, second) = source();
+        assert_ne!(first.identity(), second.identity());
+        assert_eq!(
+            first.allocate(second.identity()),
+            Err(BirthSourceError::StaleOwner)
+        );
+        first
+            .adopt_initial(first.identity(), NonZeroU64::new(103).unwrap())
+            .unwrap();
+        assert_eq!(first.allocate(first.identity()).unwrap().get(), 104);
+        assert_eq!(
+            first.adopt_initial(first.identity(), NonZeroU64::new(500).unwrap()),
+            Err(BirthSourceError::StaleOwner)
+        );
+        assert_eq!(first.allocate(first.identity()).unwrap().get(), 105);
+        assert_eq!(second.allocate(second.identity()).unwrap().get(), 1);
+    }
+}

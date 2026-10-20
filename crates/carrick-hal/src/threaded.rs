@@ -3261,6 +3261,14 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
 
     /// Optional backend-owned sink for the carrier-global descriptor ceiling.
     /// Unsupported execution lanes leave the optimization disabled.
+    fn birth_serial_source(
+        &mut self,
+    ) -> Result<Arc<dyn crate::birth_serial::BirthSerialSource>, crate::TrapError> {
+        Err(crate::TrapError::Hypervisor(
+            "carrier birth source unavailable on this lane".into(),
+        ))
+    }
+
     fn fd_ceiling_publisher(&self) -> Option<Arc<dyn crate::FdCeilingPublisher>> {
         None
     }

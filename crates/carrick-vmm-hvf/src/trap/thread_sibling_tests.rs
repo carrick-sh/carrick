@@ -754,7 +754,7 @@ fn serial_host_persistent_carrier_authority_outlives_terminal_task_cleanup_and_d
         lease.drop_backing_audit = Some((host_addr as usize, std::sync::Arc::clone(&observed)));
         let mut region = mapped_region(start, start + size as u64, start);
         region.host_addr = host_addr;
-        region.host_mapping = Some(host);
+        region.host_mapping = Some(host.into());
         region.stage2_lease = Some(lease);
         if start == crate::memory::LINUX_FD_CEILING_CONTROL_BASE {
             region.perms = applevisor::memory::MemPerms::Read;
@@ -940,7 +940,7 @@ fn reservation_metadata_access_retains_exact_carrier_and_rejects_retirement() {
     let address = host.as_ptr();
     let mut mapping = mapped_region(start, start + size as u64, start);
     mapping.host_addr = address;
-    mapping.host_mapping = Some(host);
+    mapping.host_mapping = Some(host.into());
     // Host-only fixture: this lease has never been mapped into a real VM.
     mapping.stage2_lease = Some(GlobalFrameStage2Lease::fixed(start, size as u64));
     let carrier = std::sync::Arc::new(PersistentCarrierMappings {

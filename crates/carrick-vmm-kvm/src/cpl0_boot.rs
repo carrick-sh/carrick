@@ -686,6 +686,12 @@ impl Cpl0Carrier {
         )
     }
 
+    pub fn birth_serial_source(
+        &self,
+    ) -> Result<Arc<dyn carrick_hal::birth_serial::BirthSerialSource>, TrapError> {
+        self.custody.birth_serial_source()
+    }
+
     /// Replace the bootstrap's provisional identity with the exact root
     /// issued by the shared kernel, before the initial MM is admitted.
     pub fn bind_initial_task_identity(

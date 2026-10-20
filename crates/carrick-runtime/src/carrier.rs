@@ -686,6 +686,15 @@ impl CarrierRuntime {
                 CarrierKernelRuntimeSlot::Ready(runtime) => {
                     let runtime = Arc::clone(runtime);
                     drop(slot);
+                    runtime
+                        .kernel
+                        .object_ids()
+                        .authenticate_birth_source(bootstrap.birth_source())
+                        .map_err(|error| {
+                            RuntimeError::Configuration(format!(
+                                "carrier birth source mismatch: {error}"
+                            ))
+                        })?;
                     let (registry_id, mm_backend, diagnostic_name, container) =
                         bootstrap.into_container_root_parts();
                     let prepared = runtime

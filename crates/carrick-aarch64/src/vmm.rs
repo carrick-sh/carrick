@@ -592,6 +592,14 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     type SiblingBuilder: Send;
     type ProcessBuilder: Send;
 
+    fn birth_serial_source(
+        &mut self,
+    ) -> Result<Arc<dyn carrick_hal::birth_serial::BirthSerialSource>, carrick_hal::TrapError> {
+        Err(carrick_hal::TrapError::Hypervisor(
+            "carrier birth source unavailable on this lane".into(),
+        ))
+    }
+
     fn fd_ceiling_publisher(&self) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
         None
     }

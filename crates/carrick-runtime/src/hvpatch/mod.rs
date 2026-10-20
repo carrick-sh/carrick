@@ -1091,6 +1091,7 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
             container
         }
     };
+    let birth_source = engine.birth_serial_source()?;
     let bootstrap = carrick_kernel::kernel::RootBootstrap::with_mm_backend(
         pid,
         root_tid,
@@ -1099,7 +1100,8 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
         Arc::clone(&dispatcher.host_signal),
     )
     .map_err(|error| RuntimeError::Configuration(error.to_string()))?
-    .with_container(container);
+    .with_container(container)
+    .with_birth_source(birth_source);
     let launch_fs_context = dispatcher
         .launch_fs_context_for_hvpatch_bind()
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;

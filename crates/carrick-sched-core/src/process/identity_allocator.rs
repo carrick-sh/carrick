@@ -401,7 +401,7 @@ impl core::error::Error for IdError {}
 
 /// Shared birth-issuer protocol: one atomic last-issued word, initially zero.
 /// Included in the image ABI hash independently of the word's layout.
-pub const SERIAL_ISSUER_PROTOCOL: u64 = 1;
+pub const SERIAL_ISSUER_PROTOCOL: u64 = 2;
 
 /// Carrier-owned birth serial storage. All-zero bytes are a valid initial
 /// state; MAX is terminal. Unlike [`SerialAllocator`], this shared word cannot
@@ -454,6 +454,15 @@ impl SerialIssuer<'_> {
             })
             .ok()
             .and_then(|last| NonZeroU64::new(last + 1))
+    }
+
+    /// Exclusive first-host handoff. An active source can never admit another
+    /// independently seeded local registry, even if its visible population is empty.
+    pub fn adopt_initial(self, issued: NonZeroU64) -> bool {
+        self.word
+            .last_issued
+            .compare_exchange(0, issued.get(), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// Observe an already-issued serial, including MAX, without reopening an

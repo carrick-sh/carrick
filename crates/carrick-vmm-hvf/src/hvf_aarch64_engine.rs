@@ -2269,6 +2269,12 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         )
     }
 
+    fn birth_serial_source(
+        &mut self,
+    ) -> Result<std::sync::Arc<dyn carrick_hal::birth_serial::BirthSerialSource>, TrapError> {
+        self.state.birth_serial_source()
+    }
+
     fn fd_ceiling_publisher(&self) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
         self.state.fd_ceiling_publisher()
     }

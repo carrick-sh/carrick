@@ -94,7 +94,8 @@ pub struct ObjectIdRegistry {
 
 #[derive(Debug)]
 enum HostMmIdentityAuthority {
-    Available,
+    Local,
+    Zone(std::sync::Arc<dyn carrick_hal::birth_serial::BirthSerialSource>),
     Transferred,
 }
 
@@ -108,16 +109,32 @@ impl ObjectIdRegistry {
     pub const fn new() -> Self {
         Self {
             allocator: SerialAllocator::new(),
-            host_mm: parking_lot::RwLock::new(HostMmIdentityAuthority::Available),
+            host_mm: parking_lot::RwLock::new(HostMmIdentityAuthority::Local),
         }
     }
 
     /// Revoke this kernel's MM admission and move only its local serial cursor.
     /// The carrier MM source and file-description source are separate owners.
+    #[cfg(test)]
     pub(in crate::kernel) fn transfer_local_serials(&self) -> Option<TransferredSerialAllocator> {
+        self.transfer_serials_and_births()
+            .map(|(serials, _)| serials)
+    }
+
+    pub(in crate::kernel) fn transfer_serials_and_births(
+        &self,
+    ) -> Option<(
+        TransferredSerialAllocator,
+        Option<std::sync::Arc<dyn carrick_hal::birth_serial::BirthSerialSource>>,
+    )> {
         let mut authority = self.host_mm.write();
+        let source = match &*authority {
+            HostMmIdentityAuthority::Zone(source) => Some(source.clone()),
+            _ => None,
+        };
+        let serials = self.allocator.transfer()?;
         *authority = HostMmIdentityAuthority::Transferred;
-        self.allocator.transfer()
+        Some((serials, source))
     }
 
     pub(in crate::kernel) fn local_transfer_available(&self) -> bool {
@@ -143,12 +160,91 @@ impl ObjectIdRegistry {
         })
     }
 
+    /// Install the actual carrier source before this registry issues births.
+    pub fn with_birth_source(
+        source: std::sync::Arc<dyn carrick_hal::birth_serial::BirthSerialSource>,
+    ) -> Self {
+        let registry = Self::new();
+        *registry.host_mm.write() = HostMmIdentityAuthority::Zone(source);
+        registry
+    }
+
+    /// Exclusive initial handoff. Caller must exclude native entry until this
+    /// commits. The write authority spans all earlier host-issued births,
+    /// including retired/reserved/unpublished identities, not a member scan.
+    pub fn bind_initial_birth_source(
+        &self,
+        source: std::sync::Arc<dyn carrick_hal::birth_serial::BirthSerialSource>,
+    ) -> Result<(), ObjectIdError> {
+        let mut births = self.host_mm.write();
+        match &*births {
+            HostMmIdentityAuthority::Zone(old) => {
+                if old.identity() != source.identity() {
+                    return Err(ObjectIdError::ForeignBirthSource);
+                }
+                return Ok(());
+            }
+            HostMmIdentityAuthority::Transferred => {
+                return Err(ObjectIdError::AuthorityTransferred);
+            }
+            HostMmIdentityAuthority::Local => {}
+        }
+        let high_water = self.allocate()?;
+        source
+            .adopt_initial(source.identity(), high_water)
+            .map_err(|_| ObjectIdError::ForeignBirthSource)?;
+        *births = HostMmIdentityAuthority::Zone(source);
+        Ok(())
+    }
+
+    /// A later root cannot silently join an active native carrier without its
+    /// actual engine source, or bind an independent local registry after entry.
+    pub fn authenticate_birth_source(
+        &self,
+        source: Option<&std::sync::Arc<dyn carrick_hal::birth_serial::BirthSerialSource>>,
+    ) -> Result<(), ObjectIdError> {
+        match (&*self.host_mm.read(), source) {
+            (HostMmIdentityAuthority::Local, None) => Ok(()),
+            (HostMmIdentityAuthority::Zone(old), Some(source))
+                if old.identity() == source.identity() =>
+            {
+                Ok(())
+            }
+            (HostMmIdentityAuthority::Transferred, _) => Err(ObjectIdError::AuthorityTransferred),
+            _ => Err(ObjectIdError::ForeignBirthSource),
+        }
+    }
+
+    fn allocate_birth(&self) -> Result<NonZeroU64, ObjectIdError> {
+        match &*self.host_mm.read() {
+            HostMmIdentityAuthority::Local => self.allocate(),
+            HostMmIdentityAuthority::Zone(source) => {
+                source
+                    .allocate(source.identity())
+                    .map_err(|error| match error {
+                        carrick_hal::birth_serial::BirthSourceError::Exhausted => {
+                            ObjectIdError::Exhausted
+                        }
+                        carrick_hal::birth_serial::BirthSourceError::StaleOwner => {
+                            ObjectIdError::ForeignBirthSource
+                        }
+                    })
+            }
+            HostMmIdentityAuthority::Transferred => {
+                let _ = self.allocator.allocate();
+                Err(ObjectIdError::AuthorityTransferred)
+            }
+        }
+    }
+
     pub fn task_serial(&self) -> Result<TaskSerial, ObjectIdError> {
-        self.allocate().map(TaskSerial::from_registry_allocation)
+        self.allocate_birth()
+            .map(TaskSerial::from_registry_allocation)
     }
 
     pub fn thread_serial(&self) -> Result<ThreadSerial, ObjectIdError> {
-        self.allocate().map(ThreadSerial::from_registry_allocation)
+        self.allocate_birth()
+            .map(ThreadSerial::from_registry_allocation)
     }
 
     /// MM identities are unique across every kernel in the carrier process,
@@ -206,6 +302,8 @@ impl ObjectIdRegistry {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ObjectIdError {
+    #[error("birth source belongs to another or retired carrier VM")]
+    ForeignBirthSource,
     #[error("kernel object identity space exhausted")]
     Exhausted,
     #[error("kernel identity authority was transferred to the native owner")]
@@ -231,6 +329,122 @@ pub(crate) fn allocate_file_description_id() -> Result<FileDescriptionId, Object
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn birth_zone() -> std::sync::Arc<
+        carrick_hal::birth_serial::test_support::OwnedBirthZone<carrick_sched_core::ThreadCtx>,
+    > {
+        let layout = std::alloc::Layout::new::<carrick_sched_core::ZoneTables>();
+        // SAFETY: correctly aligned complete allocation; zero is the valid zone ABI.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<carrick_sched_core::ZoneTables>();
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            std::sync::Arc::from(Box::from_raw(ptr))
+        };
+        std::sync::Arc::new(carrick_hal::birth_serial::test_support::OwnedBirthZone::new(zone))
+    }
+
+    #[test]
+    fn carrier_births_cover_reserved_unpublished_replenished_and_two_roots() {
+        use carrick_hal::birth_serial::BirthSerialSource;
+        let source = birth_zone();
+        let make_root = || {
+            let bootstrap = crate::kernel::RootBootstrap::for_reference_model(
+                41,
+                carrick_hal::ThreadId::from_guest_supplied_tid(41),
+                "shared-birth-root".into(),
+            )
+            .unwrap()
+            .with_birth_source(source.clone());
+            crate::kernel::Kernel::bootstrap_root(bootstrap).unwrap()
+        };
+        let (kernel, first) = make_root();
+        let reserved = kernel.object_ids().thread_serial().unwrap();
+        let unpublished_native = source.zone.serial_issuer().allocate().unwrap();
+        let after_native = kernel.object_ids().thread_serial().unwrap();
+        assert!(reserved.raw() < unpublished_native.get());
+        assert!(after_native.raw() > unpublished_native.get());
+        // Later host/pool supply and another root both use the same word.
+        let (other_kernel, other) = make_root();
+        assert_ne!(first.task().key().serial, other.task().key().serial);
+        assert_ne!(first.thread().key().serial, other.thread().key().serial);
+        for _ in 0..16 {
+            let pool = other_kernel.object_ids().thread_serial().unwrap();
+            let native = source.zone.serial_issuer().allocate().unwrap();
+            assert!(native.get() > pool.raw());
+        }
+        let before = source.allocate(source.identity()).unwrap();
+        assert!(kernel.object_ids().thread_serial().unwrap().raw() > before.get());
+    }
+
+    #[test]
+    fn initial_birth_handoff_captures_burned_values_and_refuses_live_join() {
+        let source = birth_zone();
+        let ids = ObjectIdRegistry::new();
+        let burned = ids.thread_serial().unwrap();
+        let reserved = ids.thread_serial().unwrap();
+        // Neither identity is in a visible-member inventory.
+        ids.bind_initial_birth_source(source.clone()).unwrap();
+        let native = source.zone.serial_issuer().allocate().unwrap();
+        assert!(native.get() > reserved.raw());
+        assert!(native.get() > burned.raw());
+        assert!(ids.thread_serial().unwrap().raw() > native.get());
+        let late = ObjectIdRegistry::new();
+        let _escaped = late.thread_serial().unwrap();
+        assert_eq!(
+            late.bind_initial_birth_source(source.clone()),
+            Err(ObjectIdError::ForeignBirthSource)
+        );
+    }
+
+    #[test]
+    fn carrier_birth_owner_rejects_another_generation_one_and_retired_owner() {
+        use carrick_hal::birth_serial::{BirthSerialSource, BirthSourceError};
+        let first = birth_zone();
+        let second = birth_zone();
+        // Both fixture backend carrier numbers AND generations are one. Only
+        // their retained custody objects differ, as in independently created VMs.
+        assert_ne!(first.identity(), second.identity());
+        assert_eq!(
+            first.allocate(second.identity()),
+            Err(BirthSourceError::StaleOwner)
+        );
+        let ids = ObjectIdRegistry::with_birth_source(first.clone());
+        assert_eq!(
+            ids.bind_initial_birth_source(second),
+            Err(ObjectIdError::ForeignBirthSource)
+        );
+        first.retire();
+        assert_eq!(ids.thread_serial(), Err(ObjectIdError::ForeignBirthSource));
+    }
+
+    #[test]
+    fn shared_birth_transfer_revokes_only_old_handle_and_partial_exhaustion_burns() {
+        let source = birth_zone();
+        let old = ObjectIdRegistry::with_birth_source(source.clone());
+        let peer = ObjectIdRegistry::with_birth_source(source.clone());
+        let before = old.thread_serial().unwrap();
+        let (_objects, exported) = old.transfer_serials_and_births().unwrap();
+        let exported = ObjectIdRegistry::with_birth_source(exported.unwrap());
+        assert_eq!(
+            old.thread_serial(),
+            Err(ObjectIdError::AuthorityTransferred)
+        );
+        assert!(peer.thread_serial().unwrap().raw() > before.raw());
+        let next = exported.thread_serial().unwrap();
+        assert!(peer.thread_serial().unwrap().raw() > next.raw());
+        source
+            .zone
+            .serial_issuer()
+            .advance_past(NonZeroU64::new(u64::MAX - 1).unwrap());
+        assert_eq!(peer.task_serial().unwrap().raw(), u64::MAX);
+        assert_eq!(exported.thread_serial(), Err(ObjectIdError::Exhausted));
+        assert_eq!(peer.task_serial(), Err(ObjectIdError::Exhausted));
+        // No reset from old-handle transfer or a low admission observation.
+        source.zone.serial_issuer().advance_past(NonZeroU64::MIN);
+        assert_eq!(peer.thread_serial(), Err(ObjectIdError::Exhausted));
+    }
 
     #[test]
     fn linux_ids_reject_zero_and_negative_values() {

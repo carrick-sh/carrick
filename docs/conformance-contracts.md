@@ -1568,10 +1568,18 @@ One checked atomic RMW issues a birth, with contention-dependent retries;
 rollback never returns a serial. The negative control
 `late_observation_cannot_repair_independently_issued_tickets` proves that
 post-allocation cursor advancement cannot merge independent live sources.
-These tests prove only the zero-valid source and its borrowed lifetime, not
-production source custody. The canonical receiver reuse test remains RED
-until every host/native launch path binds the retained carrier zone before
-issuance. See [the integration handoff](design/carrier-birth-issuer-handoff.md).
+Production source bindings additionally exercise the actual host registry and
+native fork paths: `process_receiver_survives_internal_task_id_reuse`,
+`process_receiver_reserved_before_admission_and_native_unpublished_before_host_supply`,
+`carrier_births_cover_reserved_unpublished_replenished_and_two_roots`,
+`initial_birth_handoff_captures_burned_values_and_refuses_live_join`, and
+`shared_birth_transfer_revokes_only_old_handle_and_partial_exhaustion_burns`.
+The two-root native fork witness checks distinct carrier births. Full boot
+export controls cover exclusive and shared sources; physical source controls
+cover retained bytes with revoked custody and independent generation-one owners.
+Host issuance costs also include its registry read lock and the backend custody
+mutex or revocation read guard. Signed, cross-host and final runtime acceptance
+remain required. See [the integration handoff](design/carrier-birth-issuer-handoff.md).
 
 ## ARM entry stack composition
 

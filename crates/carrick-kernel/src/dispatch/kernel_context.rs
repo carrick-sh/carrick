@@ -583,6 +583,15 @@ mod tests {
 
     #[test]
     fn prepared_cpl0_dispatcher_boots_in_exact_launch_container() {
+        prepared_cpl0_export_case(false);
+    }
+
+    #[test]
+    fn prepared_cpl0_shared_birth_export_revokes_only_old_kernel() {
+        prepared_cpl0_export_case(true);
+    }
+
+    fn prepared_cpl0_export_case(shared_births: bool) {
         let network = Arc::new(crate::network::RuntimeNetwork::host_default());
         let container = Arc::new(crate::kernel::Container::new_with_namespaces(
             crate::kernel::LaunchContext::unmanaged(crate::kernel::RunId::new("cpl0-launch-test")),
@@ -659,7 +668,38 @@ mod tests {
             .adopt_cpl0_boot_launch(argv.clone(), env.clone())
             .unwrap();
         let binding = context.task_binding();
+        let zone_layout = std::alloc::Layout::new::<carrick_sched_core::ZoneTables>();
+        // SAFETY: aligned zero-valid complete zone, retained through export.
+        let zone = unsafe {
+            let ptr =
+                std::alloc::alloc_zeroed(zone_layout).cast::<carrick_sched_core::ZoneTables>();
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(zone_layout);
+            }
+            Arc::from(Box::from_raw(ptr))
+        };
+        let birth_source =
+            Arc::new(carrick_hal::birth_serial::test_support::OwnedBirthZone::new(zone));
+        if shared_births {
+            context
+                .kernel()
+                .object_ids()
+                .bind_initial_birth_source(birth_source.clone())
+                .unwrap();
+        }
+        let surviving_graph = crate::kernel::ObjectIdRegistry::with_birth_source(birth_source);
+        let peer_before = surviving_graph.thread_serial().unwrap();
         let export = context.kernel().export_boot_launch(&binding, vm).unwrap();
+        if shared_births {
+            let exported_births = crate::kernel::ObjectIdRegistry::with_birth_source(
+                export.birth_source.clone().expect("retained shared source"),
+            );
+            let native = exported_births.thread_serial().unwrap();
+            assert!(native.raw() > peer_before.raw());
+            assert!(surviving_graph.thread_serial().unwrap().raw() > native.raw());
+        } else {
+            assert!(export.birth_source.is_none());
+        }
         assert_eq!(export.identity.task.local, task);
         assert_eq!(export.identity.task.vm, vm);
         assert_eq!(export.identity.thread.local, thread);
