@@ -5,7 +5,12 @@
 //! old backing; each parent/failed fork frees its unused prepared replacement.
 //! There is no per-event allocation. Active carrier launch uses re-exec and
 //! guest HVPatch fork does not use this host-fork transfer.
+//!
+//! Ordinary backing access is shared by all hosts. The prepare/hold capability
+//! serves the macOS/HVF host-fork bundle only; unit tests retain it on every
+//! host to exercise both transfer branches without a VM or an OS fork.
 
+#[cfg(any(target_os = "macos", test))]
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -30,6 +35,7 @@ impl<T: Send + Sync + 'static> ForkResetBacking<T> {
     }
 
     /// Allocate before acquiring ANY locks in the caller's fork bundle.
+    #[cfg(any(target_os = "macos", test))]
     pub fn prepare(&'static self, fresh: T) -> PreparedForkBacking<T> {
         PreparedForkBacking {
             backing: self,
@@ -39,11 +45,13 @@ impl<T: Send + Sync + 'static> ForkResetBacking<T> {
 }
 
 /// A clean allocation not yet holding the current backing's lock.
+#[cfg(any(target_os = "macos", test))]
 pub struct PreparedForkBacking<T: Send + Sync + 'static> {
     backing: &'static ForkResetBacking<T>,
     fresh: Box<T>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl<T: Send + Sync + 'static> PreparedForkBacking<T> {
     /// Acquire the current backing. The guard must be dropped immediately in
     /// both fork branches, before any child-side use of this authority.
@@ -61,6 +69,7 @@ impl<T: Send + Sync + 'static> PreparedForkBacking<T> {
 
 /// Parent unlocks normally; child abandons the copied held lock AND its queue.
 /// No allocator, destructor or mutex operation runs in the child branch.
+#[cfg(any(target_os = "macos", test))]
 pub struct ForkBackingGuard<T: Send + Sync + 'static, G> {
     backing: &'static ForkResetBacking<T>,
     owner_pid: libc::pid_t,
@@ -68,12 +77,14 @@ pub struct ForkBackingGuard<T: Send + Sync + 'static, G> {
     fresh: ManuallyDrop<Box<T>>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl<T: Send + Sync + 'static, G> ForkBackingGuard<T, G> {
     pub fn guard_mut(&mut self) -> &mut G {
         &mut self.guard
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl<T: Send + Sync + 'static, G> Drop for ForkBackingGuard<T, G> {
     fn drop(&mut self) {
         // SAFETY: getpid has no pointer or initialization preconditions.

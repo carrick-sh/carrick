@@ -152,16 +152,20 @@ fn lock_process_custody() -> MutexGuard<'static, ProcessOrigins> {
 }
 
 /// Preallocated replacement for the normal process-pending custodian.
+#[cfg(any(target_os = "macos", test))]
 pub struct ProcessPendingForkPreparation(fork_reset::PreparedForkBacking<Mutex<ProcessOrigins>>);
 /// Host-fork hold; drop before child reset. PendingSet itself is never replaced.
+#[cfg(any(target_os = "macos", test))]
 pub struct ProcessPendingForkGuard(
     fork_reset::ForkBackingGuard<Mutex<ProcessOrigins>, MutexGuard<'static, ProcessOrigins>>,
 );
 
+#[cfg(any(target_os = "macos", test))]
 pub fn prepare_process_pending_for_fork() -> ProcessPendingForkPreparation {
     ProcessPendingForkPreparation(PROC_CUSTODY.prepare(Mutex::new([PendingSignalOrigin::Host; 64])))
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl ProcessPendingForkPreparation {
     pub fn hold(self) -> ProcessPendingForkGuard {
         ProcessPendingForkGuard(self.0.hold(|lock| {
@@ -171,6 +175,7 @@ impl ProcessPendingForkPreparation {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl ProcessPendingForkGuard {
     /// Already-held reset borrows custody; it must not reacquire the lock.
     pub fn clear(&mut self) {

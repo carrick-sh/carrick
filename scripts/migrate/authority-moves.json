@@ -1,5 +1,16 @@
 {
   "schema": 1,
-  "authority_debt": [],
+  "authority_debt": [
+    {
+      "from": "carrick_vmm_hvf::host_signal::<ThreadWaitersForkGuard as Drop>::drop",
+      "to": "carrick_signal_linux::fork_reset::<ForkBackingGuard<T,G> as Drop>::drop",
+      "issue": 488
+    },
+    {
+      "from": "carrick_vmm_hvf::host_signal::ForkResetWaiterRegistry::hold_for_fork",
+      "to": "carrick_signal_linux::fork_reset::PreparedForkBacking<T>::hold",
+      "issue": 488
+    }
+  ],
   "terminal_custody": []
 }
