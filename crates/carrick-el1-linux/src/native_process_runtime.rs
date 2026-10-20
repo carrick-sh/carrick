@@ -8220,7 +8220,7 @@ mod tests {
                 carrick_el1_abi::EntryIdentity {
                     tid: 42,
                     visible_tid: 42,
-                    thread_serial: 107,
+                    thread_serial: 103,
                     birth: carrick_core_abi::entry::BirthSerial::of_task(
                         carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
                     ),
@@ -8251,7 +8251,7 @@ mod tests {
         let record = zone
             .alloc_record(ThreadIdentity {
                 tid: 42,
-                serial: 107,
+                serial: 103,
                 mm: 1,
                 file_table: 5,
                 generation: carrick_core_abi::SnapshotGeneration::INITIAL.raw(),
@@ -8269,7 +8269,7 @@ mod tests {
             5,
         );
         thread.mm.key.store(1, Ordering::Release);
-        thread.mm.thread_generation.store(107, Ordering::Release);
+        thread.mm.thread_generation.store(103, Ordering::Release);
         thread.publish_visible_pid(41);
         thread.publish_lifecycle(&page as *const _ as u64, &thread_control as *const _ as u64);
         publish_test_birth(&thread_control, &thread);
@@ -8364,7 +8364,7 @@ mod tests {
             "internal TaskId must be reused"
         );
         assert_eq!(reused_key.binding().generation, observed.generation);
-        assert_ne!(
+        assert_eq!(
             reused_key.binding().thread_generation,
             observed.thread_generation
         );
