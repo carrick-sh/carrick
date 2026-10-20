@@ -2909,7 +2909,7 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
         None,
         Some(&*fixture),
         fixture.page,
-        &control,
+        control,
         &ThreadCtx::ZERO,
         ttbr0,
         &mut service,
