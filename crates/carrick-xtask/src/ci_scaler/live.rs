@@ -2214,27 +2214,46 @@ mod tests {
         let contender = std::thread::spawn(move || {
             let file = std::fs::File::open(&lock_path).unwrap();
             file.try_lock().unwrap();
+            let file = crate::lock_file::OwnedFileLock::from_locked(file);
             locked_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            // Other tests may fork while this descriptor is live. Explicit
-            // unlock releases the shared open-file description in those children.
-            file.unlock().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             drop(file);
             released_tx.send(()).unwrap();
         });
 
-        locked_rx.recv().unwrap();
+        locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
             !lease.try_recover(&ledger).unwrap(),
             "contended recovery must return false without waiting"
         );
         assert!(lease.held.is_none());
-        release_tx.send(()).unwrap();
-        released_rx.recv().unwrap();
-        contender.join().unwrap();
-
-        assert!(lease.try_recover(&ledger).unwrap());
-        assert!(lease.held.is_some());
+        let (recovered, held) = crate::lock_file::tests::with_unrelated_fork_exec(
+            || {
+                // Keep an inherited fd alive across the contender's release:
+                // closing a raw File alone cannot release the shared flock.
+                release_tx.send(()).unwrap();
+                released_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                contender.join().unwrap();
+                let recovered = lease.try_recover(&ledger).unwrap();
+                let held = lease.held.is_some();
+                drop(lease);
+                (recovered, held)
+            },
+            || {
+                let mut lease = CloneLease {
+                    path: Some(lock.clone()),
+                    held: None,
+                };
+                assert!(lease.try_recover(&ledger).unwrap());
+                assert!(lease.held.is_some());
+            },
+        );
+        // Assert after the helper has allowed exec and reaped its child.
+        assert!(
+            recovered,
+            "free recovery must succeed before unrelated exec"
+        );
+        assert!(held);
     }
 
     #[test]
