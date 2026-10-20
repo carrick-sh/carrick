@@ -946,9 +946,11 @@ on the alternate stack (matching native arm64 Linux oracle
 `sa_onstack frame_on_alt=1 saved_sp_on_alt=0 pstate=0x60000000`). On `rt_sigreturn`,
 `arm::decode` rejects any non-EL0-user `pstate` bit before register or FPSIMD
 publication, and `arm_signal::restore` / `apply_restored_context` re-apply the
-canonical internal EL0 return mask (`0x3c0`, `AARCH64_EL0_VISIBLE_DAIF`; cleared
-of `PSTATE.I` at the `write_el1_hook` `eret` boundary when `El1IrqMode::Gic` is
-active) while preserving legal guest EL0 flags (`arm_signal_delivery_masks_internal_daif_and_preserves_el0_user_pstate_flags`,
+canonical internal EL0 DAIF mask (`0x3c0` on bits `[9:6]`, `AARCH64_EL0_VISIBLE_DAIF`;
+cleared of `PSTATE.I` at the `write_el1_hook` `eret` boundary when `El1IrqMode::Gic`
+is active so `(spsr & 0x3c0) | PSTATE_I == 0x3c0` holds across both modes) while
+preserving legal guest EL0 flags in `AARCH64_EL0_USER_PSTATE_MASK`
+(`arm_signal_delivery_masks_internal_daif_and_preserves_el0_user_pstate_flags`,
 `arm_public_return_restores_internal_daif_and_preserves_el0_user_flags`,
 `arm_signal_delivery_separates_interrupted_sp_from_altstack_placement`, and
 `production_deliver_signal_with_control_preserves_interrupted_sp_and_masks_daif`).

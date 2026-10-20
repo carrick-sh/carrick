@@ -5069,8 +5069,9 @@ fn write_el1_hook(
     // the check writes SPSR_EL1): an interrupt pending now or later, the
     // virtual timer, a reschedule SGI or the owed kick SGI, is taken at EL0
     // through the EL0 IRQ hook. EL1 itself never unmasks IRQs. The guest
-    // never sees the bit: signal frames and core notes show EL0 PSTATE with
-    // DAIF set, as Carrick always has (`carrick_hal::el0_visible_pstate`).
+    // never sees the internal DAIF mode: public signal frames mask DAIF out via
+    // `AARCH64_EL0_USER_PSTATE_MASK` (and `rt_sigreturn` re-applies `0x3c0`
+    // internally), while core notes normalize via `carrick_hal::el0_visible_pstate`.
     emit(bytes, &mut cursor, 0x9100_03F0); // mov x16, sp (TrapFrame pointer)
     emit(bytes, &mut cursor, enc_ldr_xt_xn(17, 16, 272)); // ldr x17, [x16, #272] (slot)
     emit(bytes, &mut cursor, enc_ldr_xt_xn(1, 16, 248)); // elr
