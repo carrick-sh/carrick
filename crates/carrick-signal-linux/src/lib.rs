@@ -27,6 +27,7 @@
 pub mod backend;
 pub mod child_watch;
 pub mod fasync;
+pub mod fork_reset;
 pub mod host_disposition;
 pub mod host_glue;
 pub mod xsig;
@@ -37,8 +38,27 @@ use carrick_abi::{LINUX_SIGKILL, LINUX_SIGSTOP, SigBlockMask, SigSet};
 pub use carrick_signal_core::pending_bit;
 use carrick_signal_core::{PendingSet, SignalSet};
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
+#[cfg(test)]
+type TestBoundary = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(test)]
+std::thread_local! {
+    static PROCESS_BOUNDARY: TestBoundary = const { std::cell::RefCell::new(None) };
+    static AFTER_MASK_TAKE_HOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static AFTER_MASK_CLEAR_HOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TIMER_PREPARED: TestBoundary = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_test_boundary(slot: &'static std::thread::LocalKey<TestBoundary>) {
+    let hook = slot.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 /// "No signal pending" sentinel. Chosen as `0` because Linux's
 /// `kill(pid, 0)` is documented as the null-signal probe; no real
@@ -115,32 +135,49 @@ fn unmaskable() -> SignalSet {
 /// Same-signum repeats still coalesce (standard-signal semantics); RT-signal
 /// queue depth lives in the dispatcher's `rt_pending_counts`.
 static PROC_PENDING: PendingSet = PendingSet::new();
-// One atomic origin per standard signal. A 0 -> origin CAS selects the first
-// publisher; the bitmask remains the async-signal-safe wake/selection index.
-// The consumer clears the bit before clearing the origin. A host publisher
-// that finds an old origin after the bit was taken republishes the bit, so a
-// new signal cannot disappear in that dequeue window.
-const ORIGIN_EMPTY: u8 = 0;
-const ORIGIN_HOST: u8 = 1;
-const ORIGIN_ITIMER: u8 = 2;
-const ORIGIN_POSIX: u8 = 3;
-const ORIGIN_WRITING: u8 = 4;
-static PROC_ORIGIN: [AtomicU8; 64] = [const { AtomicU8::new(ORIGIN_EMPTY) }; 64];
-struct AtomicTimerInfo {
-    id: AtomicI32,
-    overrun: AtomicI32,
-    value: AtomicI64,
+// Only this normal-context custodian touches origins. PROC_PENDING remains
+// the single authoritative mask, including while a timer prepares its payload.
+// Async handlers only OR that word and never enter the custodian.
+type ProcessOrigins = [PendingSignalOrigin; 64];
+static PROC_CUSTODY: LazyLock<fork_reset::ForkResetBacking<Mutex<ProcessOrigins>>> =
+    LazyLock::new(|| {
+        fork_reset::ForkResetBacking::new(Mutex::new([PendingSignalOrigin::Host; 64]))
+    });
+
+fn lock_process_custody() -> MutexGuard<'static, ProcessOrigins> {
+    PROC_CUSTODY
+        .get()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
-impl AtomicTimerInfo {
-    const fn new() -> Self {
-        Self {
-            id: AtomicI32::new(0),
-            overrun: AtomicI32::new(0),
-            value: AtomicI64::new(0),
-        }
+
+/// Preallocated replacement for the normal process-pending custodian.
+pub struct ProcessPendingForkPreparation(fork_reset::PreparedForkBacking<Mutex<ProcessOrigins>>);
+/// Host-fork hold; drop before child reset. PendingSet itself is never replaced.
+pub struct ProcessPendingForkGuard(
+    fork_reset::ForkBackingGuard<Mutex<ProcessOrigins>, MutexGuard<'static, ProcessOrigins>>,
+);
+
+pub fn prepare_process_pending_for_fork() -> ProcessPendingForkPreparation {
+    ProcessPendingForkPreparation(PROC_CUSTODY.prepare(Mutex::new([PendingSignalOrigin::Host; 64])))
+}
+
+impl ProcessPendingForkPreparation {
+    pub fn hold(self) -> ProcessPendingForkGuard {
+        ProcessPendingForkGuard(self.0.hold(|lock| {
+            lock.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }))
     }
 }
-static PROC_TIMER_INFO: [AtomicTimerInfo; 64] = [const { AtomicTimerInfo::new() }; 64];
+
+impl ProcessPendingForkGuard {
+    /// Already-held reset borrows custody; it must not reacquire the lock.
+    pub fn clear(&mut self) {
+        clear_proc_pending_guarded(self.0.guard_mut());
+    }
+}
+
 /// One process-directed bridge event interrupts one host waiter. Publication
 /// still broadcasts a wake hint; the first unblocked waiter claims delivery.
 static PROC_WAKE_OWNER: AtomicI32 = AtomicI32::new(0);
@@ -291,34 +328,59 @@ pub fn publish_pending_timer_for(tid: i32, signum: i32, info: PendingTimerInfo) 
 /// raw `AtomicU64` in wire form (bit `signum-1`); the typed set converts at the
 /// atomic load/CAS boundary.
 fn take_proc_pending_event_in(wait_set: SigSet) -> Option<PendingSignalEvent> {
-    take_proc_pending_event_in_after_take(wait_set, || {})
+    take_proc_pending_event_in_for(wait_set, None)
 }
 
-fn take_proc_pending_event_in_after_take(
+fn take_proc_pending_event_in_for(
     wait_set: SigSet,
-    after_take: impl FnOnce(),
+    consumer: Option<i32>,
 ) -> Option<PendingSignalEvent> {
+    // Empty observations may linearize before an arrival; publication wakes the
+    // delivery path again. No normal mutex on the overwhelmingly empty path.
+    if PROC_PENDING.load().bits() & wait_set.raw() == 0 {
+        return None;
+    }
+    #[cfg(test)]
+    run_test_boundary(&PROCESS_BOUNDARY);
+    let mut origins = lock_process_custody();
+    let owner = PROC_WAKE_OWNER.load(Ordering::SeqCst);
+    if consumer.is_some_and(|tid| owner != 0 && owner != tid) {
+        return None;
+    }
+    take_proc_pending_guarded(wait_set, &mut origins)
+}
+
+fn take_proc_pending_guarded(
+    wait_set: SigSet,
+    origins: &mut MutexGuard<'_, ProcessOrigins>,
+) -> Option<PendingSignalEvent> {
+    // PendingSet uses a whole-word strong CAS and recomputes lowest eligibility
+    // after any interfering async OR; it never selects from per-slot summaries.
     let signum = PROC_PENDING.take(SignalSet::from_bits(wait_set.raw()))?;
     PROC_WAKE_OWNER.store(0, Ordering::SeqCst);
-    after_take();
+    #[cfg(test)]
+    AFTER_MASK_TAKE_HOST.with(|bits| proc_pending_fetch_or(bits.replace(0)));
     let index = (signum - 1) as usize;
-    let origin = PROC_ORIGIN[index].load(Ordering::SeqCst);
-    let payload = PendingTimerInfo {
-        id: PROC_TIMER_INFO[index].id.load(Ordering::SeqCst),
-        overrun: PROC_TIMER_INFO[index].overrun.load(Ordering::SeqCst),
-        value: PROC_TIMER_INFO[index].value.load(Ordering::SeqCst),
-    };
-    PROC_ORIGIN[index].store(ORIGIN_EMPTY, Ordering::SeqCst);
-    let origin = match origin {
-        ORIGIN_ITIMER => PendingSignalOrigin::IntervalTimer,
-        ORIGIN_POSIX => PendingSignalOrigin::PosixTimer(payload),
-        _ => PendingSignalOrigin::Host,
-    };
+    let origin = std::mem::replace(&mut origins[index], PendingSignalOrigin::Host);
     Some(PendingSignalEvent {
         signum,
         scope: PendingSignalScope::Process,
         origin,
     })
+}
+
+// A caller may pause an already owned result without retaining custody. This
+// seam is test-only; production has no callback inside or around the guard.
+#[cfg(test)]
+fn take_proc_pending_event_in_after_take(
+    wait_set: SigSet,
+    after_take: impl FnOnce(),
+) -> Option<PendingSignalEvent> {
+    let event = take_proc_pending_event_in(wait_set);
+    if event.is_some() {
+        after_take();
+    }
+    event
 }
 
 fn take_proc_pending_in(wait_set: SigSet) -> i32 {
@@ -364,11 +426,7 @@ pub fn take_pending_event_for(tid: i32) -> Option<PendingSignalEvent> {
             });
         }
     }
-    let owner = PROC_WAKE_OWNER.load(Ordering::SeqCst);
-    if owner != 0 && owner != tid {
-        return None;
-    }
-    take_proc_pending_event_in(SigSet::EMPTY.complement())
+    take_proc_pending_event_in_for(SigSet::EMPTY.complement(), Some(tid))
 }
 
 /// Drain a signal pending for `tid` only if it intersects `wait_set`. Used by
@@ -466,12 +524,19 @@ pub fn claim_unblocked_pending_for(tid: i32, block_mask: SigBlockMask) -> bool {
     if !set_is_deliverable(PROC_PENDING.load().bits(), block_mask) {
         return false;
     }
+    #[cfg(test)]
+    run_test_boundary(&PROCESS_BOUNDARY);
+    let _custody = lock_process_custody();
+    // Both eligibility and owner are read under the same normal transaction as
+    // consumption/clear/retirement. The pre-lock check is only an empty hint.
+    if !set_is_deliverable(PROC_PENDING.load().bits(), block_mask) {
+        return false;
+    }
     let owner = PROC_WAKE_OWNER.load(Ordering::SeqCst);
-    owner == tid
-        || (owner == 0
-            && PROC_WAKE_OWNER
-                .compare_exchange(0, tid, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok())
+    if owner == 0 {
+        PROC_WAKE_OWNER.store(tid, Ordering::SeqCst);
+    }
+    owner == 0 || owner == tid
 }
 
 /// True iff any process-directed signal is pending.
@@ -487,32 +552,10 @@ pub fn proc_pending_mask() -> SigSet {
 /// Atomically OR `bit` into the process-directed pending mask. Lock-free, so
 /// callable from an async host signal handler. Deliberately kept in raw wire
 /// form (bit `signum-1`, from [`pending_bit`]/[`thread_pending_bit`]): this is
-/// the async-signal-safe single-bit store op at the atomic boundary.
+/// the async-signal-safe whole-word OR at the atomic boundary (zero and
+/// multi-bit inputs are valid). No origin metadata is touched.
 pub fn proc_pending_fetch_or(bit: u64) {
-    let mut remaining = bit;
-    while remaining != 0 {
-        let lowest = remaining & remaining.wrapping_neg();
-        let index = lowest.trailing_zeros() as usize;
-        let claimed = PROC_ORIGIN[index]
-            .compare_exchange(
-                ORIGIN_EMPTY,
-                ORIGIN_HOST,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok();
-        if claimed
-            || (PROC_ORIGIN[index].load(Ordering::SeqCst) != ORIGIN_WRITING
-                && PROC_PENDING.load().bits() & lowest == 0)
-        {
-            // A failed claim with no pending bit raced a consumer that has
-            // taken the old bit but has not cleared its origin yet. The new
-            // bit survives that consumer's origin cleanup; it defaults to a
-            // host origin if the old event owned timer metadata.
-            PROC_PENDING.publish(SignalSet::from_bits(lowest));
-        }
-        remaining &= !lowest;
-    }
+    PROC_PENDING.publish(SignalSet::from_bits(bit));
 }
 
 /// Publish a process-directed `signum` into the pending mask (the pure store
@@ -533,43 +576,18 @@ pub fn publish_process_timer_signal(signum: i32, info: Option<PendingTimerInfo>)
     if bit == 0 {
         return;
     }
-    let index = (signum - 1) as usize;
-    loop {
-        if PROC_ORIGIN[index]
-            .compare_exchange(
-                ORIGIN_EMPTY,
-                ORIGIN_WRITING,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok()
-        {
-            break;
-        }
-        if PROC_PENDING.load().bits() & bit != 0 {
-            return;
-        }
-        // The prior dequeue owns its timer payload until origin cleanup.
-        // Timer callbacks run in normal host context and may wait for that
-        // small critical section; the async host signal path never waits.
-        std::hint::spin_loop();
+    let mut origins = lock_process_custody();
+    if PROC_PENDING.load().bits() & bit != 0 {
+        return;
     }
-    if let Some(info) = info {
-        PROC_TIMER_INFO[index].id.store(info.id, Ordering::SeqCst);
-        PROC_TIMER_INFO[index]
-            .overrun
-            .store(info.overrun, Ordering::SeqCst);
-        PROC_TIMER_INFO[index]
-            .value
-            .store(info.value, Ordering::SeqCst);
-    }
-    let origin = if info.is_some() {
-        ORIGIN_POSIX
-    } else {
-        ORIGIN_ITIMER
-    };
-    PROC_ORIGIN[index].store(origin, Ordering::SeqCst);
+    origins[(signum - 1) as usize] = info.map_or(
+        PendingSignalOrigin::IntervalTimer,
+        PendingSignalOrigin::PosixTimer,
+    );
+    #[cfg(test)]
+    run_test_boundary(&TIMER_PREPARED);
     PROC_PENDING.publish(SignalSet::from_bits(bit));
+    // Caller wake/backend/graph work happens after this guard drops.
 }
 
 /// Take (drain) the lowest process-directed pending signum, or `0` if none.
@@ -579,18 +597,25 @@ pub fn take_process_pending() -> i32 {
 
 /// Clear the process-directed pending mask (fork / supervisor-fork reinit).
 pub fn clear_proc_pending() {
+    clear_proc_pending_guarded(&mut lock_process_custody());
+}
+
+fn clear_proc_pending_guarded(origins: &mut MutexGuard<'_, ProcessOrigins>) {
     PROC_PENDING.clear();
     PROC_WAKE_OWNER.store(0, Ordering::SeqCst);
-    for origin in &PROC_ORIGIN {
-        origin.store(ORIGIN_EMPTY, Ordering::SeqCst);
-    }
+    #[cfg(test)]
+    AFTER_MASK_CLEAR_HOST.with(|bits| proc_pending_fetch_or(bits.replace(0)));
+    origins.fill(PendingSignalOrigin::Host);
 }
 
 /// Drop any thread-directed pending entry for `tid` (called when a guest thread
 /// exits so a recycled tid never inherits a stale signal). A forked child also
 /// clears the whole table via [`clear_thread_pending`].
 pub fn forget_thread(tid: i32) {
-    let _ = PROC_WAKE_OWNER.compare_exchange(tid, 0, Ordering::SeqCst, Ordering::SeqCst);
+    {
+        let _custody = lock_process_custody();
+        let _ = PROC_WAKE_OWNER.compare_exchange(tid, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
     let mut guard = lock_thread_pending();
     if let Some(map) = guard.as_mut() {
         map.remove(&tid);
@@ -723,6 +748,366 @@ mod tests {
     }
 
     #[test]
+    fn single_mask_claim_rechecks_after_drain() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        publish_process_signal(14);
+        PROCESS_BOUNDARY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                assert_eq!(take_process_pending(), 14);
+            }))
+        });
+        let claimed = claim_unblocked_pending_for(991, SigBlockMask::NONE);
+        let owner = PROC_WAKE_OWNER.load(Ordering::SeqCst);
+        let empty = take_pending_event_for(991);
+        publish_process_signal(12);
+        let peer = take_pending_event_for(992);
+        clear_proc_pending();
+        assert!(!claimed, "a completed drain leaves nothing to claim");
+        assert_eq!(owner, 0, "empty claim cannot hide future events");
+        assert_eq!(empty, None);
+        assert_eq!(peer.map(|event| event.signum), Some(12));
+    }
+
+    #[test]
+    fn single_mask_take_rechecks_late_owner() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        publish_process_signal(14);
+        PROCESS_BOUNDARY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                assert!(claim_unblocked_pending_for(992, SigBlockMask::NONE));
+            }))
+        });
+        let stolen = take_pending_event_for(991);
+        let owned = take_pending_event_for(992);
+        clear_proc_pending();
+        assert_eq!(stolen, None, "late claimant keeps its continuation custody");
+        assert_eq!(owned.map(|event| event.signum), Some(14));
+    }
+
+    #[test]
+    fn single_mask_async_publication_during_timer_prepare_is_visible() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        TIMER_PREPARED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                proc_pending_fetch_or(thread_pending_bit(14) | thread_pending_bit(12));
+                assert!(has_process_pending());
+                assert!(has_unblocked_pending_for(
+                    991,
+                    SigBlockMask::blocking_all_of(SigSet::EMPTY.with(14).complement())
+                ));
+                assert!(
+                    proc_pending_mask().raw() & thread_pending_bit(14) != 0,
+                    "filtered query must see completed async OR even during timer preparation"
+                );
+            }))
+        });
+        publish_process_timer_signal(14, None);
+        assert_eq!(take_process_pending(), 12);
+        assert_eq!(take_process_pending(), 14);
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn single_mask_global_query_sees_async_publish_during_timer_prepare() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        TIMER_PREPARED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                publish_process_signal(14);
+                assert!(
+                    has_process_pending(),
+                    "completed async event cannot appear globally empty"
+                );
+                assert_eq!(proc_pending_mask(), SigSet::EMPTY.with(14));
+            }))
+        });
+        publish_process_timer_signal(14, None);
+        assert_eq!(take_process_pending(), 14);
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn single_mask_two_consumers_keep_full_payload_in_both_completion_orders() {
+        let _lock = lock_test();
+        let info = PendingTimerInfo {
+            id: i32::MIN,
+            overrun: i32::MAX,
+            value: i64::MIN + 0x12345678,
+        };
+        let later = PendingTimerInfo {
+            id: i32::MAX,
+            overrun: i32::MIN,
+            value: i64::MAX - 0x23456789,
+        };
+        for second_first in [false, true] {
+            clear_proc_pending();
+            publish_process_timer_signal(14, Some(info));
+            let mut second = None;
+            let first = take_proc_pending_event_in_after_take(SigSet::EMPTY.complement(), || {
+                publish_process_signal(14);
+                // Coalescence with the NEW Host retains Host custody.
+                publish_process_timer_signal(14, Some(later));
+                if second_first {
+                    second = take_pending_event_for(992);
+                }
+            })
+            .unwrap();
+            if !second_first {
+                second = take_pending_event_for(992);
+            }
+            assert_eq!(first.origin, PendingSignalOrigin::PosixTimer(info));
+            assert_eq!(second.unwrap().origin, PendingSignalOrigin::Host);
+            publish_process_timer_signal(14, Some(later));
+            let third = take_pending_event_for(993).unwrap();
+            assert_eq!(third.signum, 14);
+            assert_eq!(third.origin, PendingSignalOrigin::PosixTimer(later));
+            assert_eq!(take_process_pending(), 0);
+        }
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn single_mask_prior_14_12_order_and_masked_lowest() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        publish_process_timer_signal(14, None);
+        PROCESS_BOUNDARY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                assert_eq!(proc_pending_mask(), SigSet::EMPTY.with(14));
+                publish_process_signal(12);
+                assert!(has_unblocked_pending_for(
+                    991,
+                    SigBlockMask::blocking_all_of(SigSet::EMPTY.with(14).complement())
+                ));
+            }))
+        });
+        assert_eq!(take_pending_event_for(991).unwrap().signum, 12);
+        publish_process_signal(10);
+        assert_eq!(take_pending_in_for(992, SigSet::EMPTY.with(14)), 14);
+        assert_eq!(take_process_pending(), 10);
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn single_mask_host_survives_clear_and_full_storage_reuse() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        for signum in 1..=64 {
+            let info = PendingTimerInfo {
+                id: i32::MIN + signum,
+                overrun: i32::MAX - signum,
+                value: i64::MIN + i64::from(signum),
+            };
+            publish_process_timer_signal(signum, Some(info));
+            publish_process_timer_signal(signum, None); // first payload wins
+        }
+        assert_eq!(proc_pending_mask(), SigSet::EMPTY.complement());
+        for signum in 1..=64 {
+            let event = take_pending_event_for(991).unwrap();
+            assert_eq!(event.signum, signum);
+            assert_eq!(
+                event.origin,
+                PendingSignalOrigin::PosixTimer(PendingTimerInfo {
+                    id: i32::MIN + signum,
+                    overrun: i32::MAX - signum,
+                    value: i64::MIN + i64::from(signum),
+                })
+            );
+        }
+        proc_pending_fetch_or(u64::MAX);
+        for signum in 1..=64 {
+            let event = take_pending_event_for(992).unwrap();
+            assert_eq!(event.signum, signum);
+            assert_eq!(event.origin, PendingSignalOrigin::Host);
+        }
+        publish_process_timer_signal(14, None);
+        AFTER_MASK_CLEAR_HOST.with(|bits| bits.set(thread_pending_bit(14)));
+        clear_proc_pending();
+        assert_eq!(
+            take_pending_event_for(991).unwrap().origin,
+            PendingSignalOrigin::Host
+        );
+        let mut fork_hold = prepare_process_pending_for_fork().hold();
+        publish_process_signal(12);
+        fork_hold.clear(); // borrowed guard, no nested acquisition
+        assert!(!has_process_pending());
+        drop(fork_hold); // parent/failure path only; no fork
+        for invalid in [i32::MIN, -1, 0, 65, i32::MAX] {
+            publish_process_signal(invalid);
+            publish_process_timer_signal(invalid, None);
+        }
+        proc_pending_fetch_or(0);
+        assert!(!has_process_pending());
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn single_mask_thread_first_masked_bypass_and_exact_retirement() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        publish_process_signal(14);
+        assert!(claim_unblocked_pending_for(991, SigBlockMask::NONE));
+        publish_pending_for(992, 12);
+        assert!(claim_unblocked_pending_for(992, SigBlockMask::NONE));
+        assert_eq!(
+            take_pending_event_for(992).unwrap().scope,
+            PendingSignalScope::Thread
+        );
+        assert_eq!(take_pending_event_for(992), None);
+        forget_thread(993); // only the exact owner may retire the claim
+        assert_eq!(take_pending_event_for(992), None);
+        assert_eq!(take_pending_in_for(992, SigSet::EMPTY.with(14)), 14);
+        assert_eq!(PROC_WAKE_OWNER.load(Ordering::SeqCst), 0);
+        for signum in [LINUX_SIGKILL, LINUX_SIGSTOP] {
+            publish_process_signal(signum);
+            assert!(claim_unblocked_pending_for(
+                991,
+                SigBlockMask::blocking_all_of(SigSet::EMPTY.complement())
+            ));
+            assert_eq!(take_pending_for(991), signum);
+        }
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn single_mask_concurrent_owned_results_and_reentrant_wake_after_release() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let _lock = lock_test();
+        let deadline = Duration::from_secs(5);
+        for second_first in [false, true] {
+            clear_proc_pending();
+            let first_info = PendingTimerInfo {
+                id: i32::MIN,
+                overrun: i32::MAX,
+                value: i64::MIN,
+            };
+            let second_info = PendingTimerInfo {
+                id: i32::MAX,
+                overrun: i32::MIN,
+                value: i64::MAX,
+            };
+            publish_process_timer_signal(14, Some(first_info));
+            let (owned_tx, owned_rx) = channel();
+            let (release_tx, release_rx) = channel();
+            let (first_tx, first_rx) = channel();
+            let first = std::thread::spawn(move || {
+                let event =
+                    take_proc_pending_event_in_after_take(SigSet::EMPTY.complement(), || {
+                        // This is where a normal caller can wake/reenter. Even a
+                        // paused caller holds an owned copy, never origin custody.
+                        assert!(PROC_CUSTODY.get().try_lock().is_ok());
+                        owned_tx.send(()).unwrap();
+                        release_rx.recv_timeout(deadline).unwrap();
+                    });
+                first_tx.send(event).unwrap();
+            });
+            owned_rx.recv_timeout(deadline).unwrap();
+            // Real normal publication + wake callback: reenter claim/take
+            // after timer publication returns, checking release explicitly.
+            publish_process_timer_signal(14, Some(second_info));
+            assert!(PROC_CUSTODY.get().try_lock().is_ok());
+            assert!(claim_unblocked_pending_for(992, SigBlockMask::NONE));
+            if !second_first {
+                release_tx.send(()).unwrap();
+            }
+            let first_event = if !second_first {
+                Some(first_rx.recv_timeout(deadline).unwrap())
+            } else {
+                None
+            };
+            let second_event = take_pending_event_for(992).unwrap();
+            assert_eq!(
+                second_event.origin,
+                PendingSignalOrigin::PosixTimer(second_info)
+            );
+            if second_first {
+                release_tx.send(()).unwrap();
+            }
+            let first_event = first_event
+                .unwrap_or_else(|| first_rx.recv_timeout(deadline).unwrap())
+                .unwrap();
+            assert_eq!(
+                first_event.origin,
+                PendingSignalOrigin::PosixTimer(first_info)
+            );
+            first.join().unwrap();
+        }
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn single_mask_normal_timer_and_consumer_share_actual_custody() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let _lock = lock_test();
+        let deadline = Duration::from_secs(5);
+        let info = PendingTimerInfo {
+            id: i32::MIN,
+            overrun: i32::MAX,
+            value: i64::MIN,
+        };
+        for timer_waiter in [false, true] {
+            clear_proc_pending();
+            publish_process_timer_signal(14, Some(info));
+            let mut custody = lock_process_custody();
+            let first =
+                take_proc_pending_guarded(SigSet::EMPTY.complement(), &mut custody).unwrap();
+            publish_process_signal(14); // async publication never needs custody
+            let (blocked_tx, blocked_rx) = channel();
+            let (done_tx, done_rx) = channel();
+            let worker = std::thread::spawn(move || {
+                assert!(matches!(
+                    PROC_CUSTODY.get().try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                blocked_tx.send(()).unwrap();
+                let event = if timer_waiter {
+                    publish_process_timer_signal(14, Some(info));
+                    None
+                } else {
+                    take_pending_event_for(992)
+                };
+                done_tx.send(event).unwrap();
+            });
+            blocked_rx.recv_timeout(deadline).unwrap();
+            drop(custody);
+            let result = done_rx.recv_timeout(deadline).unwrap();
+            worker.join().unwrap();
+            assert_eq!(first.origin, PendingSignalOrigin::PosixTimer(info));
+            let host = if timer_waiter {
+                take_pending_event_for(993)
+            } else {
+                result
+            }
+            .unwrap();
+            assert_eq!(host.signum, 14);
+            assert_eq!(host.origin, PendingSignalOrigin::Host);
+        }
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn single_mask_empty_paths_and_async_or_do_not_acquire_custody() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        let origins = lock_process_custody();
+        assert_eq!(take_pending_event_for(991), None);
+        assert!(!claim_unblocked_pending_for(991, SigBlockMask::NONE));
+        proc_pending_fetch_or(thread_pending_bit(12) | thread_pending_bit(14));
+        assert!(has_process_pending());
+        assert!(has_unblocked_pending_for(992, SigBlockMask::NONE));
+        assert_eq!(proc_pending_mask(), SigSet::EMPTY.with(12).with(14));
+        drop(origins);
+        assert_eq!(take_process_pending(), 12);
+        assert_eq!(take_process_pending(), 14);
+        clear_proc_pending();
+    }
+
+    #[test]
     fn pending_bit_basics() {
         let _lock = lock_test();
         assert_eq!(pending_bit(1), Some(1));
@@ -792,12 +1177,19 @@ mod tests {
     fn process_publish_during_dequeue_remains_pending() {
         let _lock = lock_test();
         clear_proc_pending();
-        publish_process_signal(10);
-        let first = take_proc_pending_event_in_after_take(SigSet::EMPTY.complement(), || {
-            publish_process_signal(10)
-        });
-        assert_eq!(first.unwrap().signum, 10);
-        assert_eq!(take_process_pending(), 10);
+        let timer = PendingTimerInfo {
+            id: i32::MIN,
+            overrun: i32::MAX,
+            value: i64::MIN,
+        };
+        publish_process_timer_signal(10, Some(timer));
+        AFTER_MASK_TAKE_HOST.with(|bits| bits.set(thread_pending_bit(10)));
+        let first = take_proc_pending_event_in(SigSet::EMPTY.complement()).unwrap();
+        assert_eq!(first.signum, 10);
+        assert_eq!(first.origin, PendingSignalOrigin::PosixTimer(timer));
+        let next = take_pending_event_for(992).unwrap();
+        assert_eq!(next.signum, 10);
+        assert_eq!(next.origin, PendingSignalOrigin::Host);
         assert_eq!(take_process_pending(), NO_PENDING_SIGNAL);
         clear_proc_pending();
     }

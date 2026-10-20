@@ -326,6 +326,79 @@ mod tests {
         carrick_signal_linux::clear_proc_pending();
     }
 
+    /// Real fallback -> registry -> backend kick, reentering the pending owner.
+    /// Completion is bounded even if a regression retains origin custody while
+    /// invoking the kick. No guest, VM, host fork, or Docker is involved.
+    #[test]
+    fn fallback_posix_timer_wake_can_claim_and_consume_full_payload() {
+        struct DeliveryKick(
+            std::sync::mpsc::Sender<Option<carrick_signal_linux::PendingSignalEvent>>,
+        );
+        impl VcpuKickDyn for DeliveryKick {
+            fn kick(&self) {
+                let event = if carrick_signal_linux::claim_unblocked_pending_for(
+                    901,
+                    carrick_abi::SigBlockMask::NONE,
+                ) {
+                    carrick_signal_linux::take_pending_event_for(901)
+                } else {
+                    None
+                };
+                let _ = self.0.send(event);
+            }
+        }
+        let _serial = crate::guest_timer_bridge::TIMER_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::posix_timer::clear();
+        carrick_signal_linux::clear_proc_pending();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let registry = Arc::new(GenericVcpuRegistry::new());
+        let in_guest = crate::InGuestFlag::for_guest_thread();
+        assert!(matches!(
+            registry.subscribe_register(
+                ThreadId::synthetic_for_tests(901),
+                Box::new(DeliveryKick(tx)),
+                &in_guest,
+                Arc::new(|| {}),
+            ),
+            VcpuRegistrationEnrollment::Registered
+        ));
+        let kicker: Arc<dyn VcpuRegistry> = registry;
+        let value = i64::MIN + 0x12345678;
+        let id = crate::posix_timer::create_with_target_and_value(0, 14, None, value);
+        arm_fallback_posix_timer(
+            id,
+            TimerSpecNs {
+                value: 1,
+                interval: 0,
+            },
+            &kicker,
+        )
+        .unwrap();
+        let event = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wake reentry completes after origin release")
+            .unwrap();
+        assert_eq!(
+            event,
+            carrick_signal_linux::PendingSignalEvent {
+                signum: 14,
+                scope: carrick_signal_linux::PendingSignalScope::Process,
+                origin: carrick_signal_linux::PendingSignalOrigin::PosixTimer(
+                    carrick_signal_linux::PendingTimerInfo {
+                        id,
+                        overrun: 0,
+                        value
+                    }
+                ),
+            }
+        );
+        disarm_fallback_posix_timer(id);
+        assert!(crate::posix_timer::delete(id));
+        carrick_signal_linux::clear_proc_pending();
+    }
+
     use crate::guest_timer_bridge::TIMER_REGISTRY_TEST_LOCK as TEST_LOCK;
 
     #[derive(Clone, Copy, Debug, Default)]

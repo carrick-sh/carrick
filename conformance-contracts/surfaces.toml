@@ -825,7 +825,7 @@ contracts = ["kernel.timer.delivery-gate"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/timer_delivery.rs"
-contracts = ["kernel.timer.delivery-gate"]
+contracts = ["kernel.timer.delivery-gate", "kernel.el1.signal-delivery-owner"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/itimer.rs"
@@ -1651,3 +1651,15 @@ contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"
 [[surfaces]]
 path = "crates/carrick-vmm-kvm/src/guest_setup.rs"
 contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-signal-linux/src/lib.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
+path = "crates/carrick-signal-linux/src/fork_reset.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/host_signal.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
