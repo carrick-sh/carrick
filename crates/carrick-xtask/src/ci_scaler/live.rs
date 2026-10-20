@@ -2033,8 +2033,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn recovery_try_recover_is_zero_wait_when_contended_and_acquires_when_free() {
+    fn assert_recovery_try_recover_contended_then_free(
+        around_release: impl FnOnce(&mut dyn FnMut()),
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let lock = temp.path().join("host.lock");
         std::fs::File::create(&lock).unwrap();
@@ -2053,24 +2054,44 @@ mod tests {
         let contender = std::thread::spawn(move || {
             let file = std::fs::File::open(&lock_path).unwrap();
             file.try_lock().unwrap();
+            let guard = crate::lock_file::OwnedFileLock::from_locked(file);
             locked_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-            drop(file);
+            drop(guard);
             released_tx.send(()).unwrap();
         });
 
         locked_rx.recv().unwrap();
-        assert!(
-            !lease.try_recover(&ledger).unwrap(),
-            "contended recovery must return false without waiting"
-        );
-        assert!(lease.held.is_none());
-        release_tx.send(()).unwrap();
-        released_rx.recv().unwrap();
-        contender.join().unwrap();
+        let mut contender = Some((release_tx, released_rx, contender));
+        around_release(&mut || {
+            let (release_tx, released_rx, contender) = contender.take().unwrap();
+            assert!(
+                !lease.try_recover(&ledger).unwrap(),
+                "contended recovery must return false without waiting"
+            );
+            assert!(lease.held.is_none());
+            release_tx.send(()).unwrap();
+            released_rx.recv().unwrap();
+            contender.join().unwrap();
 
+            assert!(lease.try_recover(&ledger).unwrap());
+            assert!(lease.held.is_some());
+        });
+        assert!(contender.is_none());
         assert!(lease.try_recover(&ledger).unwrap());
         assert!(lease.held.is_some());
+    }
+
+    #[test]
+    fn recovery_try_recover_is_zero_wait_when_contended_and_acquires_when_free() {
+        assert_recovery_try_recover_contended_then_free(|verify| verify());
+    }
+
+    #[test]
+    fn serial_host_recovery_try_recover_acquires_across_unrelated_fork_exec() {
+        assert_recovery_try_recover_contended_then_free(|verify| {
+            crate::lock_file::tests::with_unrelated_fork_exec(verify, || {});
+        });
     }
 
     #[test]
