@@ -442,6 +442,7 @@ test *ARGS: _test-stdio
     else
         just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
         just --justfile {{justfile()}} _test-unit-host {{ARGS}}
+        just --justfile {{justfile()}} _test-unit-kernel {{ARGS}}
         just --justfile {{justfile()}} _test-unit-runtime {{ARGS}}
         {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1-linux {{ARGS}}
         just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1-linux {{ARGS}}
