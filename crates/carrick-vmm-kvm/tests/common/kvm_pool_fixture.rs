@@ -75,6 +75,14 @@ pub fn try_run_program_with_root_affinity_typed(
         Cpl0Carrier::boot_production(physical_inventory(), extent).expect("production KVM image");
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
     let root = dispatcher.capture_one_task_context().expect("issued root");
+    root.kernel()
+        .object_ids()
+        .bind_initial_birth_source(
+            carrier
+                .birth_serial_source()
+                .expect("stopped carrier source"),
+        )
+        .expect("bind initial carrier birth and MM source");
     carrier
         .bind_initial_task_identity(InitialTaskBinding {
             task: root.task().key(),
