@@ -399,6 +399,78 @@ impl core::fmt::Display for IdError {
 }
 impl core::error::Error for IdError {}
 
+/// Shared birth-issuer protocol: one atomic last-issued word, initially zero.
+/// Included in the image ABI hash independently of the word's layout.
+pub const SERIAL_ISSUER_PROTOCOL: u64 = 1;
+
+/// Carrier-owned birth serial storage. All-zero bytes are a valid initial
+/// state; MAX is terminal. Unlike [`SerialAllocator`], this shared word cannot
+/// be transferred, reset or reopened. Revocation belongs to the host handle,
+/// never to storage that other graphs may still use.
+#[derive(Debug, Default)]
+#[repr(transparent)]
+pub struct SerialIssuerWord {
+    last_issued: AtomicU64,
+}
+
+impl SerialIssuerWord {
+    pub const fn new() -> Self {
+        Self {
+            last_issued: AtomicU64::new(0),
+        }
+    }
+
+    /// Borrow this exact source. The reference is not a mapping, carrier
+    /// authentication or retention grant: the caller must already own those.
+    pub const fn issuer(&self) -> SerialIssuer<'_> {
+        SerialIssuer { word: self }
+    }
+}
+
+/// An issuance capability borrowed from one retained word. Copying the borrow
+/// shares the same atomic source; it never copies a cursor or extends custody.
+///
+/// ```compile_fail
+/// use carrick_sched_core::process::identity_allocator::{SerialIssuer, SerialIssuerWord};
+/// fn dangling() -> SerialIssuer<'static> {
+///     let word = SerialIssuerWord::new();
+///     word.issuer()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct SerialIssuer<'a> {
+    word: &'a SerialIssuerWord,
+}
+
+impl SerialIssuer<'_> {
+    /// Issue once, burning the value even if later preparation rolls back.
+    /// Relaxed ordering proves uniqueness only. The birth record has its own
+    /// publication protocol, and the owner publishes initialized source custody.
+    pub fn allocate(self) -> Option<NonZeroU64> {
+        self.word
+            .last_issued
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                last.checked_add(1)
+            })
+            .ok()
+            .and_then(|last| NonZeroU64::new(last + 1))
+    }
+
+    /// Observe an already-issued serial, including MAX, without reopening an
+    /// exhausted source. This is idempotent admission accounting, NOT a safe
+    /// way to merge an independent live issuer: collisions may predate it.
+    pub fn advance_past(self, issued: NonZeroU64) {
+        self.word
+            .last_issued
+            .fetch_max(issued.get(), Ordering::Relaxed);
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<SerialIssuerWord>() == core::mem::size_of::<AtomicU64>());
+    assert!(core::mem::align_of::<SerialIssuerWord>() == core::mem::align_of::<AtomicU64>());
+};
+
 /// Monotonic, non-reusing object serials. The caller retains the allocator's
 /// scope: a kernel for task/object serials, the carrier for MM serials.
 #[derive(Debug)]
@@ -505,6 +577,113 @@ impl SerialAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_valid_issuer_burns_unpublished_births_and_never_wraps() {
+        // This is the representation actually present in a zeroed zone.
+        let word: SerialIssuerWord = unsafe { core::mem::zeroed() };
+        let first_graph = word.issuer();
+        let second_graph = word.issuer();
+        assert_eq!(first_graph.allocate(), NonZeroU64::new(1));
+        let abandoned = first_graph.allocate().unwrap();
+        assert_eq!(second_graph.allocate(), NonZeroU64::new(3));
+        second_graph.advance_past(abandoned);
+        assert_eq!(first_graph.allocate(), NonZeroU64::new(4));
+
+        first_graph.advance_past(NonZeroU64::new(u64::MAX - 1).unwrap());
+        assert_eq!(second_graph.allocate(), Some(NonZeroU64::MAX));
+        assert_eq!(first_graph.allocate(), None);
+        second_graph.advance_past(NonZeroU64::MIN);
+        assert_eq!(second_graph.allocate(), None);
+        second_graph.advance_past(NonZeroU64::MAX);
+        assert_eq!(first_graph.allocate(), None);
+    }
+
+    #[test]
+    fn issuer_imports_reserved_births_idempotently_including_terminal_value() {
+        let word = SerialIssuerWord::new();
+        let issuer = word.issuer();
+        let reserved = NonZeroU64::new(103).unwrap();
+        issuer.advance_past(reserved);
+        issuer.advance_past(reserved);
+        assert_eq!(issuer.allocate(), NonZeroU64::new(104));
+        issuer.advance_past(NonZeroU64::MIN);
+        assert_eq!(issuer.allocate(), NonZeroU64::new(105));
+
+        let terminal = SerialIssuerWord::default();
+        terminal.issuer().advance_past(NonZeroU64::MAX);
+        assert_eq!(terminal.issuer().allocate(), None);
+        assert_eq!(terminal.issuer().allocate(), None);
+    }
+
+    #[test]
+    fn shared_issuer_reserves_before_publication() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Withhold an allocated ticket while a peer issues another birth.
+        // This proves word behavior, not production fork/registration binding.
+        let word = SerialIssuerWord::new();
+        let (prepared_tx, prepared_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let issuer = word.issuer();
+            let prepared = scope.spawn(move || {
+                let ticket = issuer.allocate().unwrap();
+                prepared_tx.send(ticket).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                ticket
+            });
+            let unpublished = prepared_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let peer = word.issuer().allocate().unwrap();
+            assert_ne!(unpublished, peer);
+            release_tx.send(()).unwrap();
+            assert_eq!(prepared.join().unwrap(), unpublished);
+            assert!(word.issuer().allocate().unwrap() > peer);
+        });
+    }
+
+    #[test]
+    fn shared_issuer_concurrent_borrowers_have_one_complete_population() {
+        let word = SerialIssuerWord::new();
+        std::thread::scope(|scope| {
+            let workers: alloc::vec::Vec<_> = (0..4)
+                .map(|_| {
+                    let issuer = word.issuer();
+                    scope.spawn(move || {
+                        (0..256)
+                            .map(|_| issuer.allocate().unwrap())
+                            .collect::<alloc::vec::Vec<_>>()
+                    })
+                })
+                .collect();
+            let mut issued = alloc::collections::BTreeSet::new();
+            for worker in workers {
+                for serial in worker.join().unwrap() {
+                    assert!(issued.insert(serial));
+                }
+            }
+            assert_eq!(issued.len(), 1024);
+            assert_eq!(issued.first(), Some(&NonZeroU64::MIN));
+            assert_eq!(issued.last(), NonZeroU64::new(1024).as_ref());
+            assert_eq!(word.issuer().allocate(), NonZeroU64::new(1025));
+        });
+    }
+
+    #[test]
+    fn late_observation_cannot_repair_independently_issued_tickets() {
+        // Negative control: advancing a private cursor after a prepared fork
+        // cannot revoke its already-issued identity. No admission scan fixes it.
+        let host = SerialAllocator::new();
+        host.advance_to(NonZeroU64::new(103).unwrap());
+        let reserved_host_birth = host.allocate().unwrap();
+        let native = SerialAllocator::new();
+        native.advance_to(NonZeroU64::new(103).unwrap());
+        let unpublished_fork = native.allocate().unwrap();
+        native.advance_past(reserved_host_birth).unwrap();
+        assert_eq!(reserved_host_birth, unpublished_fork);
+        assert!(native.allocate().unwrap() > reserved_host_birth);
+    }
 
     #[test]
     fn transferred_serial_source_never_reopens_or_reuses_issued_values() {
