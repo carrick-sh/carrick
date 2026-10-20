@@ -1369,9 +1369,9 @@ snapshot-consistency race witness, and structural budget bounds across
 
 ## Software vCPU physical retirement (`softmmu.x86.physical-retirement`, #681 slice 2, #607)
 
-Surface: `carrick-softmmu::retirement` (`SoftVcpuSeat`, `RunningSeat`,
+Surface: `carrick-softmmu::retirement` (`SoftVcpu`, `SoftVcpuSeat`, `RunningSeat`,
 `SeatAdmission`, `PendingRetirement`, `SoftRequester`), the `ExtentTable`
-retirement edits, and the soft CPU's `RunningCpu`, block entry and
+retirement edits, and the soft CPU's `RunningCpu`, `RunningContext`, block entry and
 `HostAccess`-gated guest access in `carrick-softcpu-x86`. Authority: Intel SDM
 Vol. 3 §4.10.4 and AMD APM Vol. 2 §5.5: a processor may keep using a cached
 translation until it is invalidated, so software invalidates on every

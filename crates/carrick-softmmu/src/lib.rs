@@ -57,7 +57,8 @@ pub use placement::{
 };
 pub use retirement::{
     InventoryTerminal, LookupAdmission, PendingRetirement, RetirementWaitError, RunningSeat,
-    SOFT_VCPU_MEMBERS, SeatAdmission, SoftDomainHandle, SoftRequester, SoftSeatError, SoftVcpuSeat,
+    SOFT_VCPU_MEMBERS, SeatAdmission, SoftAdmitError, SoftDomainHandle, SoftRequester,
+    SoftSeatError, SoftVcpu, SoftVcpuSeat,
 };
 pub use tlb::{
     SOFT_TLB_BITS, SOFT_TLB_ENTRIES, SOFT_TLB_INDEX_MASK, SoftTlb, SoftTlbEntry, SoftTlbPlane,

@@ -16,7 +16,7 @@ pub use cflow::{compute_effective_va, eval_cc, resolve_cflow};
 pub use context::{
     AdmitRefused, FxsaveArea, HostAccess, SoftCpuContext, X86Exception, X86ExceptionVector, reg,
 };
-pub use cpu::{JitCodeBuffer, RunningCpu, SoftCpu, SoftCpuExit, SoftCpuNewError};
+pub use cpu::{JitCodeBuffer, RunningContext, RunningCpu, SoftCpu, SoftCpuExit, SoftCpuNewError};
 pub use decode::{CflowKind, DecodedInsn, InsnClass, SensitiveOp, classify, gpr_index};
 pub use emit::{EmitError, EmittedBlock, JitStage, emit_block};
 pub use mmu::{

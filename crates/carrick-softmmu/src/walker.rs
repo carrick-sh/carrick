@@ -16,12 +16,12 @@ use crate::domains::{
 };
 use crate::placement::{HostVa, LinearPlacement, PlacementError, X86HostPage4K};
 use crate::retirement::{
-    CommitRefused, PendingRetirement, SoftDomainHandle, SoftRequester, SoftSeatError, SoftVcpuSeat,
-    commit_domain,
+    CommitRefused, PendingRetirement, SoftDomainHandle, SoftRequester, SoftSeatError, SoftVcpu,
+    SoftVcpuSeat, commit_domain,
 };
 use crate::tlb::SoftTlb;
 use carrick_core::mm::retirement::invalidation::{
-    DomainCompletion, GenerationExhausted, InvalidationKind, ReclaimQueue,
+    DomainCompletion, GenerationExhausted, InvalidationKind, ReclaimQueue, ReclaimTag,
 };
 
 /// Committed physical extent record used to authenticate `(Stage1Gpa, len, OwnerGeneration) -> AuthenticatedGpa`.
@@ -156,6 +156,31 @@ const fn spans_overlap(a: ExtentRecord, b: ExtentRecord) -> bool {
     a.base.raw() < b.end_gpa() && b.base.raw() < a.end_gpa()
 }
 
+fn retired_conflicts_with_extent(retired: RetiredIdentity, record: ExtentRecord) -> bool {
+    match retired {
+        RetiredIdentity::Extent(retired) => {
+            spans_overlap(retired, record) || retired.generation == record.generation
+        }
+        RetiredIdentity::Root(root) => record.contains_span(root.address().raw(), PAGE_SIZE_4K),
+        RetiredIdentity::RootGeneration(generation) => generation == record.generation,
+    }
+}
+
+fn retired_conflicts_with_root(
+    retired: RetiredIdentity,
+    root: RootGpa,
+    generation: OwnerGeneration,
+) -> bool {
+    match retired {
+        RetiredIdentity::Extent(retired) => {
+            retired.contains_span(root.address().raw(), PAGE_SIZE_4K)
+                || retired.generation == generation
+        }
+        RetiredIdentity::Root(retired) => retired == root,
+        RetiredIdentity::RootGeneration(retired) => retired == generation,
+    }
+}
+
 impl ExtentTable {
     /// Create an empty extent table with no registered roots and a fresh
     /// invalidation domain.
@@ -197,10 +222,28 @@ impl ExtentTable {
     }
 
     /// Seat a soft vCPU whose translation cache is `tlb` in this
-    /// inventory's domain. The claim flushes `tlb` before adopting the
-    /// member, and the CPU starts parked.
-    pub fn register_vcpu(&self, tlb: &mut SoftTlb) -> Result<SoftVcpuSeat, SoftSeatError> {
-        SoftVcpuSeat::claim(&self.domain, tlb)
+    /// inventory's domain, returning a [`SoftVcpu`] that owns the seat and
+    /// `tlb` together. The claim flushes `tlb` before adopting the member,
+    /// and the CPU starts parked.
+    pub fn register_vcpu(&self, tlb: SoftTlb) -> Result<SoftVcpu, SoftSeatError> {
+        SoftVcpu::claim(&self.domain, tlb)
+    }
+
+    /// Split-field primitive for [`register_vcpu`](Self::register_vcpu) when a
+    /// `#[repr(C)]` context stores `tlb` and [`SoftVcpuSeat`] in separate
+    /// private fields.
+    ///
+    /// # Safety
+    /// The caller must enforce a permanent 1:1 pairing between the returned
+    /// [`SoftVcpuSeat`] and `tlb` and pass only `tlb` to that seat's
+    /// `*_unguarded` methods.
+    pub unsafe fn register_vcpu_unguarded(
+        &self,
+        tlb: &mut SoftTlb,
+    ) -> Result<SoftVcpuSeat, SoftSeatError> {
+        // SAFETY: the caller guarantees the 1:1 pairing between `tlb` and the
+        // returned seat.
+        unsafe { SoftVcpuSeat::claim_unguarded(&self.domain, tlb) }
     }
 
     /// Whether `seat` is a member of this inventory's domain.
@@ -224,10 +267,12 @@ impl ExtentTable {
     }
 
     /// Release what a completed retirement held back: its retired
-    /// identities become reusable and its deferred replacements go live. A
-    /// completion also covers every earlier retirement of this inventory
-    /// (they are all domain-wide), including one whose pending request was
-    /// dropped.
+    /// identities become reusable and its deferred replacements go live,
+    /// unless a later still-pending retirement holds the deferred target's
+    /// generation or span retired (in which case publication waits on that
+    /// later retirement). A completion also covers every earlier retirement
+    /// of this inventory (they are all domain-wide), including one whose
+    /// pending request was dropped.
     ///
     /// A terminal inventory publishes nothing: its CPUs are stopped and no
     /// owner may go live through it.
@@ -237,19 +282,46 @@ impl ExtentTable {
             match item {
                 ReclaimItem::Retired(_) => reclaimed.identities += 1,
                 ReclaimItem::Publish(_) if self.terminal => {}
-                ReclaimItem::Publish(Deferred::Extent(record)) => {
-                    // Its span stayed reserved, so nothing can overlap it.
-                    self.by_base.insert(record.base.raw(), record);
-                    reclaimed.published += 1;
-                }
-                ReclaimItem::Publish(Deferred::RootGeneration(root, generation)) => {
-                    self.root_generations
-                        .insert(root.address().raw(), generation);
-                    reclaimed.published += 1;
+                ReclaimItem::Publish(deferred) => {
+                    if let Some(blocking) = self.deferred_blocked_by(deferred) {
+                        self.reclaim.push(blocking, ReclaimItem::Publish(deferred));
+                        continue;
+                    }
+                    match deferred {
+                        Deferred::Extent(record) => {
+                            // Its span stayed reserved, so nothing can overlap it.
+                            self.by_base.insert(record.base.raw(), record);
+                            reclaimed.published += 1;
+                        }
+                        Deferred::RootGeneration(root, generation) => {
+                            self.root_generations
+                                .insert(root.address().raw(), generation);
+                            reclaimed.published += 1;
+                        }
+                    }
                 }
             }
         }
         reclaimed
+    }
+
+    fn deferred_blocked_by(&self, deferred: Deferred) -> Option<ReclaimTag> {
+        let mut blocker = None;
+        for (tag, item) in self.reclaim.iter_tagged() {
+            let ReclaimItem::Retired(retired) = *item else {
+                continue;
+            };
+            let conflicts = match deferred {
+                Deferred::Extent(record) => retired_conflicts_with_extent(retired, record),
+                Deferred::RootGeneration(root, generation) => {
+                    retired_conflicts_with_root(retired, root, generation)
+                }
+            };
+            if conflicts {
+                blocker = Some(tag);
+            }
+        }
+        blocker
     }
 
     /// Recover from a dropped [`PendingRetirement`]: publish an empty
@@ -265,11 +337,9 @@ impl ExtentTable {
 
     fn extent_reserved(&self, record: ExtentRecord) -> bool {
         self.reclaim.iter().any(|item| match *item {
-            ReclaimItem::Retired(RetiredIdentity::Extent(retired)) => {
-                spans_overlap(retired, record) || retired.generation == record.generation
-            }
+            ReclaimItem::Retired(retired) => retired_conflicts_with_extent(retired, record),
             ReclaimItem::Publish(Deferred::Extent(deferred)) => spans_overlap(deferred, record),
-            _ => false,
+            ReclaimItem::Publish(Deferred::RootGeneration(..)) => false,
         })
     }
 
@@ -289,10 +359,9 @@ impl ExtentTable {
 
     fn root_reserved(&self, root: RootGpa, generation: OwnerGeneration) -> bool {
         self.reclaim.iter().any(|item| match *item {
-            ReclaimItem::Retired(RetiredIdentity::Root(retired)) => retired == root,
-            ReclaimItem::Retired(RetiredIdentity::RootGeneration(retired)) => retired == generation,
+            ReclaimItem::Retired(retired) => retired_conflicts_with_root(retired, root, generation),
             ReclaimItem::Publish(Deferred::RootGeneration(deferred, _)) => deferred == root,
-            _ => false,
+            ReclaimItem::Publish(Deferred::Extent(_)) => false,
         })
     }
 

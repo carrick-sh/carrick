@@ -683,7 +683,7 @@ unsafe impl InvalidationProof<InvalidationGeneration> for DomainCompletion {
 }
 
 /// Non-forgeable reclaim key, minted only from a published request.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReclaimTag {
     generation: InvalidationGeneration,
     kind: InvalidationKind,
@@ -750,6 +750,10 @@ impl<T> ReclaimQueue<T> {
     /// identity while its retirement is outstanding.
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.entries.iter().map(|(_, item)| item)
+    }
+    /// The objects still waiting and the tag each waits on.
+    pub fn iter_tagged(&self) -> impl Iterator<Item = (ReclaimTag, &T)> {
+        self.entries.iter().map(|(tag, item)| (*tag, item))
     }
     /// Release every object tagged with exactly this completion's domain,
     /// generation and kind. A completion for one context's generation says

@@ -1064,9 +1064,6 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
 -> Result<(), PlacementError> {
     let mut rig = Rig::new()?;
     let mut tlb_cpu1 = SoftTlb::new();
-    // Both TLBs are members of the inventory's domain, parked between steps.
-    let mut seat_cpu0 = rig.mem.extents().register_vcpu(&mut rig.tlb).unwrap();
-    let mut seat_cpu1 = rig.mem.extents().register_vcpu(&mut tlb_cpu1).unwrap();
     let mode = CpuAccessMode::ring3();
 
     let va_rw = GuestVa::new(0x0000_0080_0000);
@@ -1163,63 +1160,111 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
             .is_some()
     );
 
-    rig.probe_tlb(&mut tlb_cpu1, va_rw, Access::Read, mode);
+    // Seat both TLBs as members of the inventory's domain, parked between steps.
+    let mut vcpu0 = rig
+        .mem
+        .extents()
+        .register_vcpu(std::mem::replace(&mut rig.tlb, SoftTlb::new()))
+        .unwrap();
+    let mut vcpu1 = rig.mem.extents().register_vcpu(tlb_cpu1).unwrap();
+    for vcpu in [&mut vcpu0, &mut vcpu1] {
+        vcpu.probe_or_walk_outcome(
+            &mut rig.walker,
+            &mut rig.mem,
+            rig.root,
+            va_rw,
+            8,
+            Access::Read,
+            mode,
+        )
+        .unwrap();
+    }
     let removed = rig.mem.extents_mut().remove(FrameGpa::new(F4_GPA), None);
     assert!(retire_now(&mut rig.mem, removed).is_some());
     // Each CPU serves the retirement at its next block entry.
-    for (seat, tlb) in [
-        (&mut seat_cpu0, &mut rig.tlb),
-        (&mut seat_cpu1, &mut tlb_cpu1),
-    ] {
+    for vcpu in [&mut vcpu0, &mut vcpu1] {
         // One block: the run guard parks the CPU again when it drops.
-        assert!(seat.run().block_entry(tlb).unwrap());
+        assert!(vcpu.run().block_entry().unwrap());
     }
-    assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
-    assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
+    assert_eq!(vcpu0.probe(va_rw, 8, Access::Read, mode), None);
+    assert_eq!(vcpu1.probe(va_rw, 8, Access::Read, mode), None);
 
-    let _ = rig.probe_ram(va_rw, Access::Read, mode);
-    rig.probe_tlb(&mut tlb_cpu1, va_rw, Access::Read, mode);
+    for vcpu in [&mut vcpu0, &mut vcpu1] {
+        vcpu.probe_or_walk_outcome(
+            &mut rig.walker,
+            &mut rig.mem,
+            rig.root,
+            va_rw,
+            8,
+            Access::Read,
+            mode,
+        )
+        .unwrap();
+    }
     let retired_pt = ExtentRecord::new(FrameGpa::new(PT_A_GPA), PAGE_SIZE_4K, generation(2));
     assert!(!rig.mem.extents_mut().install(retired_pt));
     let replaced = rig.mem.extents_mut().replace(retired_pt, None);
     assert!(retire_now(&mut rig.mem, replaced).is_some());
-    for (seat, tlb) in [
-        (&mut seat_cpu0, &mut rig.tlb),
-        (&mut seat_cpu1, &mut tlb_cpu1),
-    ] {
+    for vcpu in [&mut vcpu0, &mut vcpu1] {
         // One block: the run guard parks the CPU again when it drops.
-        assert!(seat.run().block_entry(tlb).unwrap());
+        assert!(vcpu.run().block_entry().unwrap());
     }
-    assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
-    assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
+    assert_eq!(vcpu0.probe(va_rw, 8, Access::Read, mode), None);
+    assert_eq!(vcpu1.probe(va_rw, 8, Access::Read, mode), None);
     assert_ne!(rig.mem.get(PT_A_GPA, idx(va_rw, 3)), 0);
-    assert_eq!(rig.walk(va_rw, Access::Read, mode), Err(missing_tbl));
+    assert_eq!(
+        vcpu0.probe_or_walk_outcome(
+            &mut rig.walker,
+            &mut rig.mem,
+            rig.root,
+            va_rw,
+            8,
+            Access::Read,
+            mode
+        ),
+        Err(missing_tbl)
+    );
 
     let restored_pt = ExtentRecord::new(FrameGpa::new(PT_A_GPA), PAGE_SIZE_4K, generation(1));
     let restored = rig.mem.extents_mut().replace(restored_pt, None);
     assert!(retire_now(&mut rig.mem, restored).is_some());
-    for (seat, tlb) in [
-        (&mut seat_cpu0, &mut rig.tlb),
-        (&mut seat_cpu1, &mut tlb_cpu1),
-    ] {
+    for vcpu in [&mut vcpu0, &mut vcpu1] {
         // One block: the run guard parks the CPU again when it drops.
-        assert!(seat.run().block_entry(tlb).unwrap());
+        assert!(vcpu.run().block_entry().unwrap());
     }
-    let _ = rig.probe_ram(va_rw, Access::Read, mode);
-    rig.probe_tlb(&mut tlb_cpu1, va_rw, Access::Read, mode);
+    for vcpu in [&mut vcpu0, &mut vcpu1] {
+        vcpu.probe_or_walk_outcome(
+            &mut rig.walker,
+            &mut rig.mem,
+            rig.root,
+            va_rw,
+            8,
+            Access::Read,
+            mode,
+        )
+        .unwrap();
+    }
     let root = rig.root;
     let removed_root = rig.mem.extents_mut().remove_root_generation(root, None);
     assert_eq!(retire_now(&mut rig.mem, removed_root), Some(generation(1)));
-    for (seat, tlb) in [
-        (&mut seat_cpu0, &mut rig.tlb),
-        (&mut seat_cpu1, &mut tlb_cpu1),
-    ] {
+    for vcpu in [&mut vcpu0, &mut vcpu1] {
         // One block: the run guard parks the CPU again when it drops.
-        assert!(seat.run().block_entry(tlb).unwrap());
+        assert!(vcpu.run().block_entry().unwrap());
     }
-    assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
-    assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
-    assert_eq!(rig.walk(va_rw, Access::Read, mode), Err(missing_tbl));
+    assert_eq!(vcpu0.probe(va_rw, 8, Access::Read, mode), None);
+    assert_eq!(vcpu1.probe(va_rw, 8, Access::Read, mode), None);
+    assert_eq!(
+        vcpu0.probe_or_walk_outcome(
+            &mut rig.walker,
+            &mut rig.mem,
+            rig.root,
+            va_rw,
+            8,
+            Access::Read,
+            mode
+        ),
+        Err(missing_tbl)
+    );
     Ok(())
 }
 
