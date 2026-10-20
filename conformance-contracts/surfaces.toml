@@ -519,6 +519,10 @@ path = "crates/carrick-hal/src/threaded.rs"
 contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
+path = "crates/carrick-hal/src/birth_serial.rs"
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle", "core.lifecycle.publication"]
+
+[[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem.rs"
 contracts = ["kernel.el1.stage1-publication", "kernel.mm.user-va-ceiling"]
 
