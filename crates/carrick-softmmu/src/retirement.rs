@@ -100,7 +100,7 @@ pub(crate) struct SoftDomain<W: ServedWord = AtomicU64> {
     kicks: AtomicU64,
 }
 
-/// Owning handle to a [`SoftDomain`]: a soft vCPU outlives any borrow of its
+/// Owning handle to a `SoftDomain`: a soft vCPU outlives any borrow of its
 /// inventory, so its seat holds the domain through this handle.
 #[derive(Debug)]
 pub struct SoftDomainHandle<W: ServedWord = AtomicU64>(Arc<SoftDomain<W>>);
