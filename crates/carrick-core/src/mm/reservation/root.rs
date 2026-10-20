@@ -3033,11 +3033,29 @@ impl<
             child.release_tree(source_tree);
             child.set_source_tree(0);
             child.set_source_retired(0);
+            child.clear_fork_origin();
             child.drain_host_reserve();
             return Err(reason);
         }
         let mut cursor = list.head;
-        let tree = self.build_balanced(list.len, &mut cursor);
+        let tree = match self.build_balanced(list.len, &mut cursor) {
+            Ok(tree) => tree,
+            Err(reason) => {
+                let mut id = list.head;
+                while id != 0 {
+                    let next = self.read(id).right;
+                    self.table.release(id, self.banks);
+                    id = next;
+                }
+                let source_tree = child.source_tree();
+                child.release_tree(source_tree);
+                child.set_source_tree(0);
+                child.set_source_retired(0);
+                child.clear_fork_origin();
+                child.drain_host_reserve();
+                return Err(reason);
+            }
+        };
         let layout = self.state().layout;
         let (minted, retired_below) = (self.state().minted, self.state().retired_below);
         let state = child.state_mut();
@@ -3125,32 +3143,33 @@ impl<
     /// Consume `len` nodes of a `right`-linked sorted list into a perfectly
     /// balanced subtree (a valid AVL tree), constant work per node. The
     /// left-first build runs over an explicit stack of pending levels.
-    fn build_balanced(&mut self, len: usize, cursor: &mut u32) -> u32 {
+    ///
+    /// # Contract
+    /// Refuses with `Refusal::Invalid` up front if `len` exceeds the capacity
+    /// supported by `BUILD_DEPTH`. A refusal guarantees that `cursor` is
+    /// unchanged and no nodes from the list have been consumed or relinked.
+    fn build_balanced(&mut self, len: usize, cursor: &mut u32) -> Result<u32, Refusal> {
         #[cfg(test)]
         let _probe = walk_probe::enter(walk_probe::Walk::Build);
+        if (usize::BITS.saturating_sub(len.leading_zeros())) as usize > BUILD_DEPTH {
+            return Err(Refusal::Invalid);
+        }
         let mut levels = WalkStack::<BuildLevel, BUILD_DEPTH>::new();
         let mut request = len;
         loop {
             // Descend: each subtree builds its left half first.
             while request != 0 {
-                if levels
-                    .push(BuildLevel {
-                        len: request,
-                        left: 0,
-                        id: 0,
-                    })
-                    .is_err()
-                {
-                    // Unreachable: a list holds at most TREE_CAPACITY nodes,
-                    // whose balanced build nests BUILD_DEPTH levels.
-                    return 0;
-                }
+                levels.push(BuildLevel {
+                    len: request,
+                    left: 0,
+                    id: 0,
+                })?;
                 request /= 2;
             }
             let mut built = 0;
             loop {
                 let Some(level) = levels.top() else {
-                    return built;
+                    return Ok(built);
                 };
                 if level.id == 0 {
                     // Left subtree done: take this level's node off the list
@@ -3162,7 +3181,7 @@ impl<
                     break;
                 }
                 let Some(level) = levels.pop() else {
-                    return built;
+                    return Ok(built);
                 };
                 let mut n = self.read(level.id);
                 n.left = level.left;
@@ -5048,6 +5067,96 @@ mod tests {
         parent.clone_into(&mut child).unwrap();
         assert!(child.mapping(0x100000).is_some());
     }
+
+    #[test]
+    fn build_balanced_refuses_on_stack_overflow() {
+        let table = table();
+        let mut g = admitted(&table, 0, 15);
+        let mut cursor = 42;
+        let len = 1usize << (super::BUILD_DEPTH + 1);
+        assert_eq!(g.build_balanced(len, &mut cursor), Err(Refusal::Invalid));
+        assert_eq!(cursor, 42);
+    }
+
+    #[test]
+    fn reservation_clone_into_partial_failure_restores_pool_and_source_tree() {
+        let table = table();
+        let parent_mm = ReservationMm::new(60).unwrap();
+        let child_mm = ReservationMm::new(61).unwrap();
+        table.publish(0, parent_mm, layout()).unwrap();
+        table.publish(1, child_mm, layout()).unwrap();
+        let mut parent = table.lock(0, parent_mm).unwrap();
+
+        // Populate parent with multiple mappings that have host backing.
+        let mappings = 8;
+        for i in 0..mappings {
+            let source = HostBackingIdentity::new(
+                core::num::NonZeroU64::new(100 + i).unwrap(),
+                core::num::NonZeroU64::new(1).unwrap(),
+                0x1000,
+            );
+            parent
+                .import_with_backing(
+                    range(0x100000 + i * 0x2000, 0x100000 + i * 0x2000 + 0x1000),
+                    ReservationProtection::READ_WRITE,
+                    ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+                    source,
+                )
+                .unwrap();
+        }
+        parent.finish_import().unwrap();
+
+        let count_free = |g: &Reservations<'_>| -> usize {
+            let mut nodes = Vec::new();
+            while let Ok(node) = g.pool_node() {
+                nodes.push(node);
+            }
+            let count = nodes.len();
+            for node in nodes {
+                table.release(node, g.banks);
+            }
+            count
+        };
+
+        let initial_free = count_free(&parent);
+
+        // Exhaust the pool until only enough nodes remain for:
+        // - HOST_RESERVE (8)
+        // - 1 copied mapping node + 1 source tree node
+        // So the subsequent mapping copy will exhaust the pool.
+        let mut held = Vec::new();
+        let budget = (HOST_RESERVE as usize) + 2;
+        while count_free(&parent) > budget {
+            held.push(parent.pool_node().unwrap());
+        }
+
+        let free_before = count_free(&parent);
+        assert_eq!(free_before, budget);
+
+        let mut child = table.lock(1, child_mm).unwrap();
+        assert_eq!(
+            parent.clone_into(&mut child),
+            Err(Refusal::MetadataRequired)
+        );
+
+        // Assert child source tree is left empty and child is not admitted
+        assert_eq!(child.source_tree(), 0);
+        assert!(!child.is_admitted());
+
+        // Assert the pool free count is restored to what it was before clone_into
+        let free_after = count_free(&parent);
+        assert_eq!(
+            free_after, free_before,
+            "pool free count was not restored after failed clone_into"
+        );
+
+        // Release all held nodes and verify pool returned to full capacity
+        for node in held {
+            table.release(node, parent.banks);
+        }
+        assert_eq!(count_free(&parent), initial_free);
+    }
+
     #[test]
     fn reservation_out_of_layout_hint_forwards_instead_of_relocating() {
         let table = table();

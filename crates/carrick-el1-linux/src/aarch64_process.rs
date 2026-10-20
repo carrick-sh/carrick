@@ -36,8 +36,8 @@ use super::native_fork_refusal::{NativeForkStage, refused};
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 use super::native_process_runtime::NativeResume;
 use super::native_process_runtime::{
-    NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
-    NativeProcessRuntime, NativeProcessService,
+    FallibleBox, NativeForkPreparation, NativeLifecycleResources, NativeProcessError,
+    NativeProcessRegistry, NativeProcessRuntime, NativeProcessService,
 };
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use carrick_el1::memory::reservations;
@@ -480,10 +480,7 @@ impl AdmittedCustodyToken {
         rows: &[PortalForkCustody],
         index: carrick_sched_core::SpaceIndex,
     ) -> Result<Box<Self>, NativeProcessError> {
-        let mut boxed = Vec::new();
-        boxed
-            .try_reserve_exact(1)
-            .map_err(|_| NativeProcessError::Exhausted)?;
+        let boxed = FallibleBox::try_reserve()?;
         let mut custody = Vec::new();
         custody
             .try_reserve_exact(rows.len())
@@ -515,14 +512,11 @@ impl AdmittedCustodyToken {
         }
         let commit = ForkStockSettlement::commit_reserved(loan, completion)
             .ok_or(NativeProcessError::Stale)?;
-        boxed.push(Self {
+        Ok(boxed.put(Self {
             loan,
             commit,
             index,
-        });
-        let raw = Box::into_raw(boxed.into_boxed_slice()).cast::<Self>();
-        // SAFETY: `boxed` had length and capacity 1, so `raw` is a valid Box<Self> allocation.
-        Ok(unsafe { Box::from_raw(raw) })
+        }))
     }
 
     #[allow(clippy::boxed_local)]
@@ -1268,6 +1262,19 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             ));
         }
         custody.extend_from_slice(plan.custody());
+        let boxed_prepared = match FallibleBox::try_reserve() {
+            Ok(slot) => slot,
+            Err(_) => {
+                owner.spaces.free(index);
+                return Err(abandon_loan(
+                    &self.crossing,
+                    self.worker(),
+                    &loan,
+                    None,
+                    NativeProcessError::Exhausted,
+                ));
+            }
+        };
         let mut child = match owner.publish_fork(plan, &*live, self.worker()) {
             Ok(child) => child,
             Err(e) => {
@@ -1328,7 +1335,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             root,
             generation: ContextGeneration::new(completion.child.incarnation()),
         };
-        Ok(Box::new(Prepared {
+        Ok(boxed_prepared.put(Prepared {
             loan,
             child,
             words: live,

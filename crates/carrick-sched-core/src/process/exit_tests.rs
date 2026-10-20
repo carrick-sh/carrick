@@ -264,13 +264,20 @@ fn exit_reparents_many_children_identically_whatever_their_serial_order() {
         };
         let children: Vec<TaskKey> = (0..CHILDREN)
             .map(|index| TaskKey {
-                id: id(10 + index),
-                serial: serial(if against_key_order {
-                    1000 - index as u64
+                id: id(if against_key_order {
+                    10 + (CHILDREN - 1 - index)
                 } else {
-                    100 + index as u64
+                    10 + index
                 }),
+                serial: serial(100 + index as u64),
             })
+            .collect();
+        let iteration_order: Vec<TaskSerial> = children
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .iter()
+            .map(|key| key.serial)
             .collect();
         let zombie = |index: usize| index.is_multiple_of(3);
         let mut tasks = alloc::vec![
@@ -339,9 +346,15 @@ fn exit_reparents_many_children_identically_whatever_their_serial_order() {
             )
             .collect();
         let adopted: BTreeSet<TaskId> = adopted.iter().map(|key| key.id).collect();
-        (parents, adopted, plan.reserved_ids().clone())
+        (
+            (parents, adopted, plan.reserved_ids().clone()),
+            iteration_order,
+        )
     };
-    assert_eq!(published(true), published(false));
+    let (published_rev, order_rev) = published(true);
+    let (published_fwd, order_fwd) = published(false);
+    assert_ne!(order_rev, order_fwd);
+    assert_eq!(published_rev, published_fwd);
 }
 
 #[test]

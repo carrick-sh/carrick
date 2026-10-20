@@ -159,6 +159,33 @@ impl NativeProcessError {
         }
     }
 }
+
+/// Pre-reserved single-item heap allocation for EL1 structures.
+///
+/// Uses `Vec::try_reserve_exact(1)` and converts to `Box<T>` via boxed slice,
+/// allowing fallible allocation before unrecoverable state transitions.
+pub struct FallibleBox<T>(Vec<T>);
+
+impl<T> FallibleBox<T> {
+    pub fn try_reserve() -> Result<Self, NativeProcessError> {
+        let mut vec = Vec::new();
+        vec.try_reserve_exact(1)
+            .map_err(|_| NativeProcessError::Exhausted)?;
+        Ok(Self(vec))
+    }
+
+    pub fn put(mut self, value: T) -> Box<T> {
+        self.0.push(value);
+        let raw = Box::into_raw(self.0.into_boxed_slice()).cast::<T>();
+        // SAFETY: `self.0` had length and capacity 1, so `raw` is a valid Box<T> allocation.
+        unsafe { Box::from_raw(raw) }
+    }
+}
+
+pub fn try_box<T>(value: T) -> Result<Box<T>, NativeProcessError> {
+    FallibleBox::try_reserve().map(|slot| slot.put(value))
+}
+
 /// Physical crossings are outside graph guards. commit_mm is only the final
 /// guest-core root publication; preparation has already performed descriptor
 /// work. A failed settlement retains the closed child and never queues it.
@@ -4370,6 +4397,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// Reserve the child's identity and capture everything it inherits.
     #[inline(never)]
     fn fork_reserve(&mut self) -> Result<Box<ForkReservation<'a, M>>, NativeProcessError> {
+        let boxed_reservation =
+            FallibleBox::try_reserve().map_err(|_| NativeProcessError::Exhausted)?;
         let (
             snapshot,
             permit,
@@ -4510,13 +4539,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         };
         let (parent_identity, blocked, parent_page, parent_file_table) = {
-            let graph = self.runtime.graph.lock();
-            let resources = graph
-                .owner
-                .task(self.key)
-                .map_err(|_| NativeProcessError::Stale)?
-                .native()
-                .resources();
+            let mut graph = self.runtime.graph.lock();
+            let resources = match graph.owner.task(self.key) {
+                Ok(task) => task.native().resources(),
+                Err(_) => {
+                    graph.owner.rollback_birth(&permit);
+                    return Err(NativeProcessError::Stale);
+                }
+            };
             (
                 self.source.zone.record(resources.record.id).identity(),
                 resources.control.blocked(),
@@ -4524,7 +4554,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 resources.file_table,
             )
         };
-        Ok(Box::new(ForkReservation {
+        Ok(boxed_reservation.put(ForkReservation {
             snapshot,
             permit,
             child_key,
