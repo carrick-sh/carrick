@@ -3,7 +3,7 @@
 //! supervisor direct alias. No host pointer crosses this record.
 
 pub const X86_INITIAL_BOOT_MAGIC: u64 = u64::from_le_bytes(*b"CXRUN001");
-pub const X86_INITIAL_BOOT_VERSION: u32 = 5;
+pub const X86_INITIAL_BOOT_VERSION: u32 = 6;
 pub const X86_INITIAL_BOOT_HEADER_GPA: u64 = 0x10_1000;
 pub const X86_INITIAL_BOOT_PORT: u16 = 0xc6;
 /// Physical stop after the initial MM is installed, before entering EL0.

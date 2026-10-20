@@ -257,6 +257,7 @@ impl NativeSignalFixture {
             mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
             generation: ContextGeneration::new(NonZeroU64::MIN),
         };
+        zone.mm_issuer().observe_existing(address.mm);
         let space = zone.spaces.publish_closed(mm, root, 0).unwrap();
         zone.spaces.open(space);
         zone.drive(slot, 1);

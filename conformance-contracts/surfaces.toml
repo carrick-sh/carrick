@@ -520,7 +520,7 @@ contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.el1.stage1-publ
 
 [[surfaces]]
 path = "crates/carrick-hal/src/birth_serial.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle", "core.lifecycle.publication"]
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle", "core.lifecycle.publication", "kernel.el1.address-space-switch"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem.rs"

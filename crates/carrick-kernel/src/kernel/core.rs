@@ -439,6 +439,7 @@ impl RootBootstrap {
 
     /// Boot the root task inside `container` (the `Arc` `Runtime::execute`
     /// built from the CLI's `LaunchContext` and installed on the dispatcher).
+    /// Bind retained birth and MM custody before bootstrap issues the first MM.
     pub fn with_birth_source(
         mut self,
         source: Arc<dyn carrick_hal::birth_serial::BirthSerialSource>,

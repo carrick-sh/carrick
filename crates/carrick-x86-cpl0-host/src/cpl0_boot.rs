@@ -3652,10 +3652,10 @@ impl PhysicalBirthSource {
             live,
         })
     }
-    fn with_issuer<T>(
+    fn with_zone<T>(
         &self,
         expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-        op: impl FnOnce(carrick_sched_core::process::identity_allocator::SerialIssuer<'_>) -> T,
+        op: impl FnOnce(&X86Cpl0Zone) -> T,
     ) -> Result<T, carrick_hal::birth_serial::BirthSourceError> {
         use carrick_hal::birth_serial::BirthSourceError;
         let live = self.live.read().map_err(|_| BirthSourceError::StaleOwner)?;
@@ -3664,7 +3664,7 @@ impl PhysicalBirthSource {
         }
         // SAFETY: physical bootstrap initialized this zone in immutable windows;
         // the owning Arc<GuestRam> retains every mapped byte through this borrow.
-        Ok(op(unsafe { self.zone.as_ref() }.serial_issuer()))
+        Ok(op(unsafe { self.zone.as_ref() }))
     }
 }
 // SAFETY: zone is derived once from the retained initialized GuestRam. Only
@@ -3675,11 +3675,29 @@ impl carrick_hal::birth_serial::BirthSerialSource for PhysicalBirthSource {
     fn identity(&self) -> &carrick_hal::birth_serial::BirthSourceIdentity {
         &self.identity
     }
+    fn allocate_mm(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+    ) -> Result<carrick_guest_arch::MmGeneration, carrick_hal::birth_serial::BirthSourceError> {
+        self.with_zone(expected, |zone| zone.mm_issuer().allocate())?
+            .ok_or(carrick_hal::birth_serial::BirthSourceError::Exhausted)
+    }
+    fn adopt_initial_mm(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+        high_water: carrick_guest_arch::MmGeneration,
+    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
+        if self.with_zone(expected, |zone| zone.mm_issuer().adopt_initial(high_water))? {
+            Ok(())
+        } else {
+            Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner)
+        }
+    }
     fn allocate(
         &self,
         expected: &carrick_hal::birth_serial::BirthSourceIdentity,
     ) -> Result<NonZeroU64, carrick_hal::birth_serial::BirthSourceError> {
-        self.with_issuer(expected, |issuer| issuer.allocate())?
+        self.with_zone(expected, |zone| zone.serial_issuer().allocate())?
             .ok_or(carrick_hal::birth_serial::BirthSourceError::Exhausted)
     }
     fn adopt_initial(
@@ -3687,7 +3705,9 @@ impl carrick_hal::birth_serial::BirthSerialSource for PhysicalBirthSource {
         expected: &carrick_hal::birth_serial::BirthSourceIdentity,
         high_water: NonZeroU64,
     ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
-        if self.with_issuer(expected, |issuer| issuer.adopt_initial(high_water))? {
+        if self.with_zone(expected, |zone| {
+            zone.serial_issuer().adopt_initial(high_water)
+        })? {
             Ok(())
         } else {
             Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner)
@@ -3698,7 +3718,7 @@ impl carrick_hal::birth_serial::BirthSerialSource for PhysicalBirthSource {
         expected: &carrick_hal::birth_serial::BirthSourceIdentity,
         issued: NonZeroU64,
     ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
-        self.with_issuer(expected, |issuer| issuer.advance_past(issued))
+        self.with_zone(expected, |zone| zone.serial_issuer().advance_past(issued))
     }
 }
 
@@ -3977,9 +3997,24 @@ mod birth_source_tests {
         let (custody, source) = source();
         let weak_backing = Arc::downgrade(&source._ram);
         assert_eq!(source.allocate(source.identity()).unwrap().get(), 1);
+        assert_eq!(
+            source.allocate_mm(source.identity()).unwrap().raw(),
+            NonZeroU64::MIN
+        );
         let peer = source.clone();
         drop(custody); // Same revocation owner as Cpl0HostCustody::drop.
         assert!(weak_backing.upgrade().is_some());
+        assert_eq!(
+            source.allocate_mm(source.identity()),
+            Err(BirthSourceError::StaleOwner)
+        );
+        assert_eq!(
+            peer.adopt_initial_mm(
+                peer.identity(),
+                carrick_guest_arch::MmGeneration::new(NonZeroU64::MIN)
+            ),
+            Err(BirthSourceError::StaleOwner)
+        );
         assert_eq!(
             source.allocate(source.identity()),
             Err(BirthSourceError::StaleOwner)
@@ -4001,6 +4036,22 @@ mod birth_source_tests {
         let (_first_custody, first) = source();
         let (_second_custody, second) = source();
         assert_ne!(first.identity(), second.identity());
+        assert_eq!(
+            first.allocate_mm(second.identity()),
+            Err(BirthSourceError::StaleOwner)
+        );
+        assert_eq!(
+            first.allocate_mm(first.identity()).unwrap().raw(),
+            core::num::NonZeroU64::MIN
+        );
+        assert!(
+            first
+                .adopt_initial_mm(
+                    first.identity(),
+                    carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::MIN)
+                )
+                .is_err()
+        );
         assert_eq!(
             first.allocate(second.identity()),
             Err(BirthSourceError::StaleOwner)

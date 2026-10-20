@@ -2680,10 +2680,10 @@ unsafe impl Send for CarrierBirthSource {}
 unsafe impl Sync for CarrierBirthSource {}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierBirthSource {
-    fn with_issuer<T>(
+    fn with_zone<T>(
         &self,
         expected: &carrick_hal::birth_serial::BirthSourceIdentity,
-        op: impl FnOnce(carrick_sched_core::process::identity_allocator::SerialIssuer<'_>) -> T,
+        op: impl FnOnce(&carrick_el1_abi::ZoneTables) -> T,
     ) -> Result<T, carrick_hal::birth_serial::BirthSourceError> {
         let state = self.custody.state.lock();
         if expected != &self.identity
@@ -2702,7 +2702,7 @@ impl CarrierBirthSource {
                 .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
                 .cast::<carrick_el1_abi::ZoneTables>()
         };
-        Ok(op(zone.serial_issuer()))
+        Ok(op(zone))
     }
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2710,11 +2710,29 @@ impl carrick_hal::birth_serial::BirthSerialSource for CarrierBirthSource {
     fn identity(&self) -> &carrick_hal::birth_serial::BirthSourceIdentity {
         &self.identity
     }
+    fn allocate_mm(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+    ) -> Result<carrick_guest_arch::MmGeneration, carrick_hal::birth_serial::BirthSourceError> {
+        self.with_zone(expected, |zone| zone.mm_issuer().allocate())?
+            .ok_or(carrick_hal::birth_serial::BirthSourceError::Exhausted)
+    }
+    fn adopt_initial_mm(
+        &self,
+        expected: &carrick_hal::birth_serial::BirthSourceIdentity,
+        high_water: carrick_guest_arch::MmGeneration,
+    ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
+        if self.with_zone(expected, |zone| zone.mm_issuer().adopt_initial(high_water))? {
+            Ok(())
+        } else {
+            Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner)
+        }
+    }
     fn allocate(
         &self,
         expected: &carrick_hal::birth_serial::BirthSourceIdentity,
     ) -> Result<core::num::NonZeroU64, carrick_hal::birth_serial::BirthSourceError> {
-        self.with_issuer(expected, |issuer| issuer.allocate())?
+        self.with_zone(expected, |zone| zone.serial_issuer().allocate())?
             .ok_or(carrick_hal::birth_serial::BirthSourceError::Exhausted)
     }
     fn adopt_initial(
@@ -2722,7 +2740,9 @@ impl carrick_hal::birth_serial::BirthSerialSource for CarrierBirthSource {
         expected: &carrick_hal::birth_serial::BirthSourceIdentity,
         high_water: core::num::NonZeroU64,
     ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
-        if self.with_issuer(expected, |issuer| issuer.adopt_initial(high_water))? {
+        if self.with_zone(expected, |zone| {
+            zone.serial_issuer().adopt_initial(high_water)
+        })? {
             Ok(())
         } else {
             Err(carrick_hal::birth_serial::BirthSourceError::StaleOwner)
@@ -2733,7 +2753,7 @@ impl carrick_hal::birth_serial::BirthSerialSource for CarrierBirthSource {
         expected: &carrick_hal::birth_serial::BirthSourceIdentity,
         issued: core::num::NonZeroU64,
     ) -> Result<(), carrick_hal::birth_serial::BirthSourceError> {
-        self.with_issuer(expected, |issuer| issuer.advance_past(issued))
+        self.with_zone(expected, |zone| zone.serial_issuer().advance_past(issued))
     }
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2839,6 +2859,22 @@ mod birth_source_tests {
         assert_eq!(first.generation, second.generation);
         assert_ne!(first.identity(), second.identity());
         assert_eq!(
+            first.allocate_mm(second.identity()),
+            Err(BirthSourceError::StaleOwner)
+        );
+        assert_eq!(
+            first.allocate_mm(first.identity()).unwrap().raw(),
+            core::num::NonZeroU64::MIN
+        );
+        assert!(
+            first
+                .adopt_initial_mm(
+                    first.identity(),
+                    carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::MIN)
+                )
+                .is_err()
+        );
+        assert_eq!(
             first.allocate(second.identity()),
             Err(BirthSourceError::StaleOwner)
         );
@@ -2849,12 +2885,20 @@ mod birth_source_tests {
         first.custody.begin_destroy(first.generation).unwrap();
         first.custody.commit_destroy(first.generation).unwrap();
         assert_eq!(
+            first.allocate_mm(first.identity()),
+            Err(BirthSourceError::StaleOwner)
+        );
+        assert_eq!(
             first.allocate(first.identity()),
             Err(BirthSourceError::StaleOwner)
         );
         let replacement = first.custody.begin_create().unwrap();
         first.custody.commit_create(replacement).unwrap();
         assert_ne!(first.generation, replacement);
+        assert_eq!(
+            first.allocate_mm(first.identity()),
+            Err(BirthSourceError::StaleOwner)
+        );
         assert_eq!(
             first.allocate(first.identity()),
             Err(BirthSourceError::StaleOwner)

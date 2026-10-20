@@ -82,7 +82,8 @@ impl LinuxTid {
 #[error("file slot {0} is negative")]
 pub struct InvalidFileSlot(i32);
 
-/// The carrier-wide source of [`MmId`]s ([`ObjectIdRegistry::mm_id`]).
+/// Reference/pre-carrier MM source. Its lock is the actual allocation
+/// authority during a stopped initial transfer into a carrier zone.
 static CARRIER_MM_IDS: ObjectIdRegistry = ObjectIdRegistry::new();
 
 /// Monotonic source for object identities that are never reused by one kernel.
@@ -160,7 +161,7 @@ impl ObjectIdRegistry {
         })
     }
 
-    /// Install the actual carrier source before this registry issues births.
+    /// Install the retained carrier birth and MM sources before any issuance.
     pub fn with_birth_source(
         source: std::sync::Arc<dyn carrick_hal::birth_serial::BirthSerialSource>,
     ) -> Self {
@@ -189,6 +190,15 @@ impl ObjectIdRegistry {
             }
             HostMmIdentityAuthority::Local => {}
         }
+        // Lock order: registry issuance, then the actual process-wide local MM
+        // source. Every local MM allocation takes this same global lock.
+        // Capture all issued MM IDs, including reserved/burned/unpublished ones,
+        // and keep both authorities until permanent routing is installed.
+        let _global_mm = CARRIER_MM_IDS.host_mm.write();
+        let mm_high_water = carrick_hal::MmGeneration::new(CARRIER_MM_IDS.allocate()?);
+        source
+            .adopt_initial_mm(source.identity(), mm_high_water)
+            .map_err(|_| ObjectIdError::ForeignBirthSource)?;
         let high_water = self.allocate()?;
         source
             .adopt_initial(source.identity(), high_water)
@@ -247,23 +257,34 @@ impl ObjectIdRegistry {
             .map(ThreadSerial::from_registry_allocation)
     }
 
-    /// MM identities are unique across every kernel in the carrier process,
-    /// not only within this one: the EL1 zone's occupancy words and
-    /// published address spaces key on them, and one carrier runs several
-    /// containers (kernels) whose vCPUs share that table. A per-kernel
-    /// counter gave two containers' first MMs the same key, so a pause of
-    /// one counted the other's vCPUs (the concurrent container gate).
+    /// Active kernels and native graphs share their carrier zone's MM word.
+    /// Reference/pre-carrier kernels use the separately locked global source
+    /// until an exclusive stopped handoff permanently binds this registry.
     pub fn mm_id(&self) -> Result<MmId, ObjectIdError> {
         let authority = self.host_mm.read();
-        if matches!(*authority, HostMmIdentityAuthority::Transferred) {
-            // The moved serial source also owns the refusal receipt. Its
-            // terminal state cannot allocate or be reopened by imports.
-            let _ = self.allocator.allocate();
-            return Err(ObjectIdError::AuthorityTransferred);
+        match &*authority {
+            HostMmIdentityAuthority::Zone(source) => source
+                .allocate_mm(source.identity())
+                .map(|mm| MmId::from_registry_allocation(mm.raw()))
+                .map_err(|error| match error {
+                    carrick_hal::birth_serial::BirthSourceError::Exhausted => {
+                        ObjectIdError::Exhausted
+                    }
+                    carrick_hal::birth_serial::BirthSourceError::StaleOwner => {
+                        ObjectIdError::ForeignBirthSource
+                    }
+                }),
+            HostMmIdentityAuthority::Local => {
+                let _global = CARRIER_MM_IDS.host_mm.read();
+                CARRIER_MM_IDS
+                    .allocate()
+                    .map(MmId::from_registry_allocation)
+            }
+            HostMmIdentityAuthority::Transferred => {
+                let _ = self.allocator.allocate();
+                Err(ObjectIdError::AuthorityTransferred)
+            }
         }
-        CARRIER_MM_IDS
-            .allocate()
-            .map(MmId::from_registry_allocation)
     }
 
     pub fn file_table_id(&self) -> Result<FileTableId, ObjectIdError> {
@@ -367,6 +388,17 @@ mod tests {
         assert!(after_native.raw() > unpublished_native.get());
         // Later host/pool supply and another root both use the same word.
         let (other_kernel, other) = make_root();
+        assert_ne!(first.shared().mm().id(), other.shared().mm().id());
+        let host_reserved_mm = kernel.object_ids().mm_id().unwrap();
+        let native_reserved_mm = source.zone.mm_issuer().allocate().unwrap();
+        assert!(native_reserved_mm.raw() > host_reserved_mm.nonzero());
+        assert!(other_kernel.object_ids().mm_id().unwrap().nonzero() > native_reserved_mm.raw());
+        let (later_kernel, later) = make_root();
+        assert!(later.shared().mm().id().nonzero() > native_reserved_mm.raw());
+        assert!(
+            later_kernel.object_ids().mm_id().unwrap().nonzero()
+                > later.shared().mm().id().nonzero()
+        );
         assert_ne!(first.task().key().serial, other.task().key().serial);
         assert_ne!(first.thread().key().serial, other.thread().key().serial);
         for _ in 0..16 {
@@ -384,8 +416,17 @@ mod tests {
         let ids = ObjectIdRegistry::new();
         let burned = ids.thread_serial().unwrap();
         let reserved = ids.thread_serial().unwrap();
+        let burned_mm = ids.mm_id().unwrap();
+        let reserved_mm = ids.mm_id().unwrap();
+        let another_precarrier_registry = ObjectIdRegistry::new();
+        let global_reserved_mm = another_precarrier_registry.mm_id().unwrap();
         // Neither identity is in a visible-member inventory.
         ids.bind_initial_birth_source(source.clone()).unwrap();
+        let native_mm = source.zone.mm_issuer().allocate().unwrap();
+        assert!(native_mm.raw() > global_reserved_mm.nonzero());
+        assert!(native_mm.raw() > reserved_mm.nonzero());
+        assert!(native_mm.raw() > burned_mm.nonzero());
+        assert!(ids.mm_id().unwrap().nonzero() > native_mm.raw());
         let native = source.zone.serial_issuer().allocate().unwrap();
         assert!(native.get() > reserved.raw());
         assert!(native.get() > burned.raw());
@@ -410,12 +451,17 @@ mod tests {
             first.allocate(second.identity()),
             Err(BirthSourceError::StaleOwner)
         );
+        assert_eq!(
+            first.allocate_mm(second.identity()),
+            Err(BirthSourceError::StaleOwner)
+        );
         let ids = ObjectIdRegistry::with_birth_source(first.clone());
         assert_eq!(
             ids.bind_initial_birth_source(second),
             Err(ObjectIdError::ForeignBirthSource)
         );
         first.retire();
+        assert_eq!(ids.mm_id(), Err(ObjectIdError::ForeignBirthSource));
         assert_eq!(ids.thread_serial(), Err(ObjectIdError::ForeignBirthSource));
     }
 
@@ -424,6 +470,7 @@ mod tests {
         let source = birth_zone();
         let old = ObjectIdRegistry::with_birth_source(source.clone());
         let peer = ObjectIdRegistry::with_birth_source(source.clone());
+        let before_mm = old.mm_id().unwrap();
         let before = old.thread_serial().unwrap();
         let (_objects, exported) = old.transfer_serials_and_births().unwrap();
         let exported = ObjectIdRegistry::with_birth_source(exported.unwrap());
@@ -431,6 +478,9 @@ mod tests {
             old.thread_serial(),
             Err(ObjectIdError::AuthorityTransferred)
         );
+        assert_eq!(old.mm_id(), Err(ObjectIdError::AuthorityTransferred));
+        assert!(peer.mm_id().unwrap().nonzero() > before_mm.nonzero());
+        assert!(exported.mm_id().unwrap().nonzero() > before_mm.nonzero());
         assert!(peer.thread_serial().unwrap().raw() > before.raw());
         let next = exported.thread_serial().unwrap();
         assert!(peer.thread_serial().unwrap().raw() > next.raw());

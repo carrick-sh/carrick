@@ -1,4 +1,4 @@
-//! Retained host access to the carrier zone's task/thread birth source.
+//! Retained host access to distinct carrier-zone birth and MM sources.
 use core::num::NonZeroU64;
 
 /// Exact backend-issued carrier and VM incarnation, never a generation alone.
@@ -41,7 +41,7 @@ impl core::fmt::Debug for BirthSourceIdentity {
 pub enum BirthSourceError {
     #[error("birth issuer belongs to a different or retired carrier VM")]
     StaleOwner,
-    #[error("carrier birth serial space exhausted")]
+    #[error("carrier identity space exhausted")]
     Exhausted,
 }
 /// Implementations own backing through every operation, authenticate the exact
@@ -49,6 +49,17 @@ pub enum BirthSourceError {
 /// escapes this boundary. Guest issuance accesses that same word directly.
 pub trait BirthSerialSource: Send + Sync + core::fmt::Debug {
     fn identity(&self) -> &BirthSourceIdentity;
+    /// MM identities use a distinct zone word under the same retained custody.
+    fn allocate_mm(
+        &self,
+        expected: &BirthSourceIdentity,
+    ) -> Result<carrick_guest_arch::MmGeneration, BirthSourceError>;
+    fn adopt_initial_mm(
+        &self,
+        expected: &BirthSourceIdentity,
+        high_water: carrick_guest_arch::MmGeneration,
+    ) -> Result<(), BirthSourceError>;
+
     fn allocate(&self, expected: &BirthSourceIdentity) -> Result<NonZeroU64, BirthSourceError>;
     fn adopt_initial(
         &self,
@@ -111,6 +122,28 @@ pub mod test_support {
     {
         fn identity(&self) -> &BirthSourceIdentity {
             &self.identity
+        }
+        fn allocate_mm(
+            &self,
+            expected: &BirthSourceIdentity,
+        ) -> Result<carrick_guest_arch::MmGeneration, BirthSourceError> {
+            self.check(expected)?;
+            self.zone
+                .mm_issuer()
+                .allocate()
+                .ok_or(BirthSourceError::Exhausted)
+        }
+        fn adopt_initial_mm(
+            &self,
+            expected: &BirthSourceIdentity,
+            high_water: carrick_guest_arch::MmGeneration,
+        ) -> Result<(), BirthSourceError> {
+            self.check(expected)?;
+            if self.zone.mm_issuer().adopt_initial(high_water) {
+                Ok(())
+            } else {
+                Err(BirthSourceError::StaleOwner)
+            }
         }
         fn allocate(&self, expected: &BirthSourceIdentity) -> Result<NonZeroU64, BirthSourceError> {
             self.check(expected)?;

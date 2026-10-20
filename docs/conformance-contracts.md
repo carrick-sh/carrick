@@ -1591,3 +1591,21 @@ and fills admitted storage; native contexts and retained aggregate results use
 heap custody. See [the stack contract](el1-stack-budget.md) for the exact scope
 and remaining #369 work. The existing anonymous mapping retirement signed
 witness remains the macOS integration binding.
+
+### Carrier-wide MM identity composition
+
+`kernel.el1.address-space-switch` and `core.lifecycle.publication` require MM
+keys to be distinct across live roots, native children, reservations and later
+host supply in one carrier. Linux `fork(2)` separates child address-space identity;
+carrier address-space and occupancy tables cannot alias unrelated MMs.
+`two_live_roots_keep_native_and_later_host_mm_keys_distinct` retained a real
+production-bound RED: active keys `[1,2,3,5]`, later host keys `[3,4]`. The adapted
+older baseline passed the same schedule, without proving universal baseline MM
+safety. The repair routes both producers through a distinct typed zone MM word,
+bound before issuance or under the actual stopped global MM allocation authority.
+`two_live_roots_concurrently_publish_native_mms_before_host_supply` additionally
+covers concurrent real graph forks, later host supply, unpublished rollback and
+exhaustion without child publication. Existing kernel bootstrap/handoff/export
+and retained physical-source controls cover the owner and revocation protocol.
+No receiver authentication, wait4 behavior, work budget or graph-lock scope is
+weakened. See the carrier issuer handoff for custody and per-ticket costs.
