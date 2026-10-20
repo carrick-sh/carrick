@@ -6692,8 +6692,10 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
 
     // A subsequent fresh checkpoint on an unrelated syscall neither finds
     // retained custody nor rewinds the frame, even after a non-restart handler.
-    let mut later = carrick_el1_abi::TrapFrame::default();
-    later.elr = 0x600004;
+    let mut later = carrick_el1_abi::TrapFrame {
+        elr: 0x600004,
+        ..Default::default()
+    };
     later.x[0] = 99;
     later.x[8] = 172;
     let mut later_words = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
