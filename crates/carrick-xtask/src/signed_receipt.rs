@@ -68,6 +68,71 @@ fn steps(receipt: &AcceptReceipt) -> Result<BTreeMap<&str, &StepResult>, Receipt
     Ok(result)
 }
 
+fn is_qualified_panic_location(after_panicked: &str) -> bool {
+    let loc_token = match after_panicked.find(|c: char| c.is_whitespace()) {
+        Some(idx) => &after_panicked[..idx],
+        None => after_panicked,
+    };
+    let Some(loc_without_trailing_colon) = loc_token.strip_suffix(':') else {
+        return false;
+    };
+    let mut parts: Vec<&str> = loc_without_trailing_colon.split(':').collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let last = parts.pop().unwrap_or("");
+    if last.is_empty() || !last.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if parts.len() >= 2 {
+        let second_last = parts.pop().unwrap_or("");
+        if second_last.is_empty() || !second_last.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    let path = parts.join(":");
+    !path.is_empty()
+}
+
+fn normalize_panic_header_line(line: &str) -> String {
+    let Some(start) = line.find("thread '") else {
+        return line.to_string();
+    };
+    if !line[..start].chars().all(|c| c == ' ' || c == '\t') {
+        return line.to_string();
+    }
+    let indent = &line[..start];
+    let rest = &line[start + "thread '".len()..];
+    let Some(quote_paren_idx) = rest.find("' (") else {
+        return line.to_string();
+    };
+    let thread_name = &rest[..quote_paren_idx];
+    let after_open_paren = &rest[quote_paren_idx + "' (".len()..];
+    let Some(close_paren_idx) = after_open_paren.find(") panicked at ") else {
+        return line.to_string();
+    };
+    let thread_id = &after_open_paren[..close_paren_idx];
+    if thread_id.is_empty() || !thread_id.bytes().all(|b| b.is_ascii_digit()) {
+        return line.to_string();
+    }
+    let after_panicked = &after_open_paren[close_paren_idx + ") panicked at ".len()..];
+    if !is_qualified_panic_location(after_panicked) {
+        return line.to_string();
+    }
+    format!("{indent}thread '{thread_name}' (<tid>) panicked at {after_panicked}")
+}
+
+fn normalize_probe_line(s: &str) -> String {
+    if !s.contains("thread '") || !s.contains(") panicked at ") {
+        return s.to_string();
+    }
+    let mut result = Vec::new();
+    for line in s.split_inclusive('\n') {
+        result.push(normalize_panic_header_line(line));
+    }
+    result.concat()
+}
+
 fn structured_failures(receipt: &AcceptReceipt) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
     for step in &receipt.steps {
@@ -78,7 +143,9 @@ fn structured_failures(receipt: &AcceptReceipt) -> BTreeSet<String> {
     for probe in &receipt.probe_diffs {
         keys.insert(format!(
             "probe:{}:{}:{}",
-            probe.step, probe.probe, probe.line
+            probe.step,
+            probe.probe,
+            normalize_probe_line(&probe.line)
         ));
     }
     for cleanup in &receipt.cleanup_counts {

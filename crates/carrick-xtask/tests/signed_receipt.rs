@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use carrick_xtask::accept::AcceptReceipt;
+use carrick_xtask::accept::{AcceptReceipt, ProbeDiff};
 use carrick_xtask::signed_gate::{allowed, label_authorized, trusted_run, validate_receipt};
 use carrick_xtask::signed_receipt::compare;
 use serde_json::json;
@@ -471,4 +471,241 @@ else:
         "{}",
         String::from_utf8_lossy(&main.stderr)
     );
+}
+
+#[test]
+fn panic_headers_differing_only_in_numeric_thread_id_produce_no_new_or_fixed() {
+    let mut base = base();
+    let mut candidate = base.clone();
+    base.probe_diffs = vec![ProbeDiff {
+        step: "probe-cases".into(),
+        probe: "case_04_id_root_credentials".into(),
+        line: "thread 'case_04_id_root_credentials' (26967979) panicked at crates/carrick-embed/src/testing.rs:466:9:".into(),
+    }];
+    candidate.probe_diffs = vec![ProbeDiff {
+        step: "probe-cases".into(),
+        probe: "case_04_id_root_credentials".into(),
+        line: "thread 'case_04_id_root_credentials' (31288555) panicked at crates/carrick-embed/src/testing.rs:466:9:".into(),
+    }];
+    let diff = compare(&base, &candidate).unwrap();
+    assert!(diff.passed, "expected diff to pass but got: {:?}", diff.new);
+    assert!(
+        diff.new.is_empty(),
+        "expected 0 NEW but got: {:?}",
+        diff.new
+    );
+    assert!(
+        diff.fixed.is_empty(),
+        "expected 0 FIXED but got: {:?}",
+        diff.fixed
+    );
+}
+
+#[test]
+fn embedded_multiline_panic_headers_differing_only_in_thread_id_produce_no_new_or_fixed() {
+    let mut base = base();
+    let mut candidate = base.clone();
+    base.probe_diffs = vec![ProbeDiff {
+        step: "probe-cases".into(),
+        probe: "case_04_id_root_credentials".into(),
+        line: "stack backtrace:\nthread 'case_04_id_root_credentials' (26967979) panicked at crates/carrick-embed/src/testing.rs:466:9:\nsome backtrace line".into(),
+    }];
+    candidate.probe_diffs = vec![ProbeDiff {
+        step: "probe-cases".into(),
+        probe: "case_04_id_root_credentials".into(),
+        line: "stack backtrace:\nthread 'case_04_id_root_credentials' (31288555) panicked at crates/carrick-embed/src/testing.rs:466:9:\nsome backtrace line".into(),
+    }];
+    let diff = compare(&base, &candidate).unwrap();
+    assert!(
+        diff.passed,
+        "expected multiline to pass but got: {:?}",
+        diff.new
+    );
+    assert!(diff.new.is_empty());
+    assert!(diff.fixed.is_empty());
+}
+
+#[test]
+fn negative_controls_changed_errno_location_diagnostic_test_or_malformed_header_produce_new() {
+    let base_receipt = base();
+
+    // 1. Changed errno/value elsewhere in line produces NEW
+    {
+        let mut b = base_receipt.clone();
+        let mut c = base_receipt.clone();
+        b.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'case_04' (12345) panicked at src/lib.rs:10:5: Os { code: 2, kind: NotFound }".into(),
+        }];
+        c.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'case_04' (67890) panicked at src/lib.rs:10:5: Os { code: 22, kind: InvalidInput }".into(),
+        }];
+        let diff = compare(&b, &c).unwrap();
+        assert!(!diff.passed);
+        assert_eq!(diff.new.len(), 1);
+        assert_eq!(diff.fixed.len(), 1);
+    }
+
+    // 2. Changed diagnostic suffix/message produces NEW
+    {
+        let mut b = base_receipt.clone();
+        let mut c = base_receipt.clone();
+        b.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'case_04' (12345) panicked at src/lib.rs:10:5: assertion `left == right` failed".into(),
+        }];
+        c.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'case_04' (67890) panicked at src/lib.rs:10:5: assertion `left != right` failed".into(),
+        }];
+        let diff = compare(&b, &c).unwrap();
+        assert!(!diff.passed);
+        assert_eq!(diff.new.len(), 1);
+        assert_eq!(diff.fixed.len(), 1);
+    }
+
+    // 3. Changed test identity produces NEW
+    {
+        let mut b = base_receipt.clone();
+        let mut c = base_receipt.clone();
+        b.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'case_04' (12345) panicked at src/lib.rs:10:5:".into(),
+        }];
+        c.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'case_05' (67890) panicked at src/lib.rs:10:5:".into(),
+        }];
+        let diff = compare(&b, &c).unwrap();
+        assert!(!diff.passed);
+        assert_eq!(diff.new.len(), 1);
+        assert_eq!(diff.fixed.len(), 1);
+    }
+
+    // 4. Changed source location (line / column / file) produces NEW
+    {
+        let mut b = base_receipt.clone();
+        let mut c = base_receipt.clone();
+        b.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'case_04' (12345) panicked at src/lib.rs:10:5:".into(),
+        }];
+        c.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'case_04' (67890) panicked at src/lib.rs:20:5:".into(),
+        }];
+        let diff = compare(&b, &c).unwrap();
+        assert!(!diff.passed);
+        assert_eq!(diff.new.len(), 1);
+        assert_eq!(diff.fixed.len(), 1);
+    }
+
+    // 5. Malformed header (non-numeric thread ID) stays exact and produces NEW
+    {
+        let mut b = base_receipt.clone();
+        let mut c = base_receipt.clone();
+        b.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'case_04' (not_a_number) panicked at src/lib.rs:10:5:".into(),
+        }];
+        c.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'case_04' (other_token) panicked at src/lib.rs:10:5:".into(),
+        }];
+        let diff = compare(&b, &c).unwrap();
+        assert!(!diff.passed);
+        assert_eq!(diff.new.len(), 1);
+        assert_eq!(diff.fixed.len(), 1);
+    }
+
+    // 6. Malformed header (missing quotes) stays exact and produces NEW
+    {
+        let mut b = base_receipt.clone();
+        let mut c = base_receipt.clone();
+        b.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread case_04 (12345) panicked at src/lib.rs:10:5:".into(),
+        }];
+        c.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread case_04 (67890) panicked at src/lib.rs:10:5:".into(),
+        }];
+        let diff = compare(&b, &c).unwrap();
+        assert!(!diff.passed);
+        assert_eq!(diff.new.len(), 1);
+        assert_eq!(diff.fixed.len(), 1);
+    }
+
+    // 7. DIFF payload containing panic-like phrase stays exact
+    {
+        let mut b = base_receipt.clone();
+        let mut c = base_receipt.clone();
+        b.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "DIFF encoded=thread 'worker' (14) panicked at src/lib.rs:10:5:".into(),
+        }];
+        c.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "DIFF encoded=thread 'worker' (22) panicked at src/lib.rs:10:5:".into(),
+        }];
+        let diff = compare(&b, &c).unwrap();
+        assert!(!diff.passed);
+        assert_eq!(diff.new.len(), 1);
+        assert_eq!(diff.fixed.len(), 1);
+    }
+
+    // 8. Unqualified source location stays exact
+    {
+        let mut b = base_receipt.clone();
+        let mut c = base_receipt.clone();
+        b.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'worker' (14) panicked at not_a_source_location".into(),
+        }];
+        c.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'worker' (22) panicked at not_a_source_location".into(),
+        }];
+        let diff = compare(&b, &c).unwrap();
+        assert!(!diff.passed);
+        assert_eq!(diff.new.len(), 1);
+        assert_eq!(diff.fixed.len(), 1);
+    }
+
+    // 9. Quoted/escaped panic phrase in diagnostic message stays exact
+    {
+        let mut b = base_receipt.clone();
+        let mut c = base_receipt.clone();
+        b.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "\"thread 'worker' (14) panicked at src/lib.rs:10:5:\"".into(),
+        }];
+        c.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "\"thread 'worker' (22) panicked at src/lib.rs:10:5:\"".into(),
+        }];
+        let diff = compare(&b, &c).unwrap();
+        assert!(!diff.passed);
+        assert_eq!(diff.new.len(), 1);
+        assert_eq!(diff.fixed.len(), 1);
+    }
 }
