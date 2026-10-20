@@ -1128,6 +1128,26 @@ fn sigaltstack_serves_off_the_alternate_stack() {
         );
         assert_eq!(*bad_old, [0x55; 24]);
     }
+    // On the active alternate stack, an unreadable ss pointer faults with
+    // EFAULT (-14) before the on-stack EPERM (-1) check.
+    w.cpu.regs.sp_el0 = 0x10_2000;
+    let bad_in = Box::new(stack_t(0x20_0000, 0, 0x4000));
+    let mut frame = TrapFrame::default();
+    frame.x[..2].copy_from_slice(&[addr(&*bad_in), 0]);
+    frame.x[8] = SYS_SIGALTSTACK as u64;
+    frame.slot = SLOT_IDX as u64;
+    let mut user = FaultingUser {
+        deny_in: std::vec![addr(&*bad_in)],
+        ..FaultingUser::default()
+    };
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::Served)
+    );
+    assert_eq!(
+        frame.x[0] as i64, -14,
+        "input copy-in precedes active-stack EPERM"
+    );
     w.cpu.regs.sp_el0 = 0x2222_0000;
     // Linux error numbers stay in ring.
     for (bad, errno) in [
@@ -1205,6 +1225,117 @@ fn sigaltstack_serves_off_the_alternate_stack() {
     assert_eq!(action, Action::Served);
     assert_eq!(*old, *autodisarm);
     assert_eq!(w.served(SYS_SIGALTSTACK), 12);
+}
+
+/// sigaltstack(2): native Linux commits a valid replacement (including
+/// SS_DISABLE) before copying old_ss out, so a faulting old_ss returns EFAULT
+/// while retaining the new stack state; when executing on the active alternate
+/// stack, ss copy-in precedes the on-stack EPERM check.
+#[test]
+fn sigaltstack_old_fault_keeps_replacement_and_onstack_fault_precedes_eperm() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let first = Box::new(stack_t(0x10_0000, 0, 0x4000));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*first), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, 0);
+    assert_eq!(
+        w.venue.leader_slot().read_altstack(),
+        AltStack {
+            sp: 0x10_0000,
+            size: 0x4000,
+            flags: 0,
+        }
+    );
+
+    // Valid replacement with faulting old_ss: returns EFAULT (-14) and keeps
+    // the second stack committed.
+    let second = Box::new(stack_t(0x20_0000, 0, 0x4000));
+    let bad_old = Box::new([0x55u8; 24]);
+    let mut frame = TrapFrame::default();
+    frame.x[..2].copy_from_slice(&[addr(&*second), addr(&*bad_old)]);
+    frame.x[8] = SYS_SIGALTSTACK as u64;
+    frame.slot = SLOT_IDX as u64;
+    let mut user = FaultingUser {
+        deny_out: std::vec![addr(&*bad_old)],
+        ..FaultingUser::default()
+    };
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::Served)
+    );
+    assert_eq!(frame.x[0] as i64, -14);
+    assert_eq!(*bad_old, [0x55u8; 24]);
+    assert_eq!(
+        w.venue.leader_slot().read_altstack(),
+        AltStack {
+            sp: 0x20_0000,
+            size: 0x4000,
+            flags: 0,
+        }
+    );
+
+    // Aliased ss == old_ss: writes captured previous stack to old_ss and
+    // commits the replacement.
+    let alias = Box::new(stack_t(0x30_0000, 0, 0x4000));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*alias), addr(&*alias)]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, 0);
+    assert_eq!(*alias, stack_t(0x20_0000, 0, 0x4000));
+    assert_eq!(
+        w.venue.leader_slot().read_altstack(),
+        AltStack {
+            sp: 0x30_0000,
+            size: 0x4000,
+            flags: 0,
+        }
+    );
+
+    // While on the active alternate stack, an unreadable ss faults with EFAULT
+    // (-14) before the on-stack EPERM (-1) check, and leaves the active stack
+    // untouched.
+    w.cpu.regs.sp_el0 = 0x30_2000;
+    let bad_in = Box::new(stack_t(0x40_0000, 0, 0x4000));
+    let mut frame = TrapFrame::default();
+    frame.x[..2].copy_from_slice(&[addr(&*bad_in), 0]);
+    frame.x[8] = SYS_SIGALTSTACK as u64;
+    frame.slot = SLOT_IDX as u64;
+    let mut user = FaultingUser {
+        deny_in: std::vec![addr(&*bad_in)],
+        ..FaultingUser::default()
+    };
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::Served)
+    );
+    assert_eq!(frame.x[0] as i64, -14);
+    assert_eq!(
+        w.venue.leader_slot().read_altstack(),
+        AltStack {
+            sp: 0x30_0000,
+            size: 0x4000,
+            flags: 0,
+        }
+    );
+
+    // Off-stack SS_DISABLE with faulting old_ss: returns EFAULT (-14) and
+    // commits the disabled stack state.
+    w.cpu.regs.sp_el0 = 0x2222_0000;
+    let disable = Box::new(stack_t(0, SS_DISABLE, 0));
+    let mut frame = TrapFrame::default();
+    frame.x[..2].copy_from_slice(&[addr(&*disable), addr(&*bad_old)]);
+    frame.x[8] = SYS_SIGALTSTACK as u64;
+    frame.slot = SLOT_IDX as u64;
+    let mut user = FaultingUser {
+        deny_out: std::vec![addr(&*bad_old)],
+        ..FaultingUser::default()
+    };
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::Served)
+    );
+    assert_eq!(frame.x[0] as i64, -14);
+    assert_eq!(*bad_old, [0x55u8; 24]);
+    assert!(w.venue.leader_slot().read_altstack().is_disabled());
 }
 
 /// sigaltstack(2), LTP sigaltstack02: arm64 requires 5120 bytes and returns

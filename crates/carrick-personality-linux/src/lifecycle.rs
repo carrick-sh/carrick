@@ -700,8 +700,11 @@ pub fn serve_sigprocmask(
 }
 
 /// `sigaltstack(ss, old_ss)`. `sp` is the caller's stack pointer, when
-/// known. An active alternate stack rejects changes before touching either
-/// userspace argument, while a query may still report `SS_ONSTACK`.
+/// known. An active alternate stack reads `ss` first (so an invalid input
+/// pointer returns `EFAULT`), then rejects replacement with `EPERM`, while a
+/// query may still report `SS_ONSTACK`. Valid replacement (including
+/// `SS_DISABLE`) is committed before copying `old_ss` out, so an invalid
+/// `old_ss` returns `EFAULT` with the replacement retained.
 fn serve_sigaltstack(
     args: [u64; 6],
     thread: LifecycleThread<'_>,
@@ -721,13 +724,13 @@ fn serve_sigaltstack(
     } else {
         false
     };
-    if ss != 0 && on_stack {
-        return Some(Err(carrick_syscall_abi::LINUX_EPERM));
-    }
     let replacement = if ss != 0 {
         let mut bytes = [0u8; STACK_T_SIZE];
         if !user.copy_in(&mut bytes, UserVa::new(ss)) {
             return Some(Err(carrick_syscall_abi::LINUX_EFAULT));
+        }
+        if on_stack {
+            return Some(Err(carrick_syscall_abi::LINUX_EPERM));
         }
         let [sp, flags, size] = stack_t_words(&bytes);
         let flags = flags as u32;
@@ -752,6 +755,9 @@ fn serve_sigaltstack(
     } else {
         None
     };
+    if let Some(stack) = replacement {
+        thread.slot.write_altstack(stack);
+    }
     if old_ss != 0 {
         let (sp, flags, size) = if current.is_disabled() {
             (0, SS_DISABLE, 0)
@@ -768,9 +774,6 @@ fn serve_sigaltstack(
         ) {
             return Some(Err(carrick_syscall_abi::LINUX_EFAULT));
         }
-    }
-    if let Some(stack) = replacement {
-        thread.slot.write_altstack(stack);
     }
     Some(Ok(()))
 }
