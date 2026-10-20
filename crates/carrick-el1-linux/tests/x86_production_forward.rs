@@ -522,8 +522,14 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         retired_count: 0,
         retired_fd_tables: Vec::new(),
     };
-    // This fixture published its root MM by hand rather than issuing it from
-    // the production host registry. Import it before actual native admission.
+    // This fixture published its root identities by hand rather than issuing
+    // them from the production host registry. Account for that exact published
+    // birth before actual native admission, including its separate MM domain.
+    let root_birth = control.host_birth_identity().unwrap();
+    zone.serial_issuer()
+        .advance_past(NonZeroU64::new(root_birth.birth().raw()).unwrap());
+    zone.serial_issuer()
+        .advance_past(NonZeroU64::new(root_birth.thread().raw()).unwrap());
     zone.mm_issuer().observe_existing(address.mm);
     let runtime = Arc::new(
         NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
