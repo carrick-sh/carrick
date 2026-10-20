@@ -869,46 +869,6 @@ struct PendingSignalWait {
     channel: Arc<WaitChannel>,
     deadline: Option<carrick_guest_arch::Deadline>,
 }
-// Supplementary monotone observation, never membership authentication. A peer
-// may claim/retire a pool entry during this bounded scan; the real shared source
-// already burned that identity before publication, so a vanished snapshot is
-// neither an allocation gap nor a reason to reject a legitimate registration.
-fn observe_page_births<C: ProcessContext>(zone: &ZoneTables<C>, page: &ThreadLifecyclePage) {
-    let issuer = zone.serial_issuer();
-    for index in 0..page.entry_count() {
-        let Some((generation, state)) = page.state(index) else {
-            continue;
-        };
-        if matches!(
-            state,
-            carrick_el1_abi::EntryState::Reserved
-                | carrick_el1_abi::EntryState::Claimed
-                | carrick_el1_abi::EntryState::Born
-                | carrick_el1_abi::EntryState::Published
-        ) {
-            let Some(identity) = page.identity(EntryRef::new(index as u32, generation)) else {
-                continue;
-            };
-            if let Some(serial) = NonZeroU64::new(identity.thread_serial) {
-                issuer.advance_past(serial);
-            }
-            if let Some(birth) = NonZeroU64::new(identity.birth.raw()) {
-                issuer.advance_past(birth);
-            }
-        }
-    }
-    for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
-        if let Some(identity) = page.host_birth_identity(index) {
-            if let Some(serial) = NonZeroU64::new(identity.thread().raw()) {
-                issuer.advance_past(serial);
-            }
-            if let Some(birth) = NonZeroU64::new(identity.birth().raw()) {
-                issuer.advance_past(birth);
-            }
-        }
-    }
-}
-
 struct Graph<'a, M: Clone, C: ProcessContext> {
     owner: Owner<'a, M, C>,
     root_key: TaskKey,
@@ -2002,10 +1962,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             )?;
             (issued.visible_tid, Some(issued))
         };
-        source.zone.serial_issuer().advance_past(
-            NonZeroU64::new(binding.thread_generation.raw()).ok_or(NativeProcessError::Invalid)?,
-        );
-        observe_page_births(source.zone, page);
+        // Births were issued by this carrier before publication. Admission
+        // authenticates the exact member; it does not reconstruct issuance
+        // from a lifecycle-page snapshot.
         let group_key = Self::group_key(source.zone, address, page, visible_pid);
         let mut state = self.state.lock();
         if !page.gate().serves_ring() {
@@ -2502,6 +2461,22 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         words: C,
     ) -> Result<Self, NativeProcessError> {
         source.zone.mm_issuer().observe_existing(address.mm);
+        // These fixtures hand-publish root identities without host issuance.
+        // Account for those exact values in setup, never in production admission.
+        source.zone.serial_issuer().advance_past(
+            NonZeroU64::new(current.mm.thread_generation.load(Ordering::Acquire))
+                .ok_or(NativeProcessError::Invalid)?,
+        );
+        source.zone.serial_issuer().advance_past(
+            NonZeroU64::new(
+                control
+                    .host_birth_identity()
+                    .ok_or(NativeProcessError::Stale)?
+                    .birth()
+                    .raw(),
+            )
+            .ok_or(NativeProcessError::Invalid)?,
+        );
         Self::admit_fresh_root::<B>(source, current, page, control, mm, address, words)
     }
 
@@ -2618,14 +2593,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 thread_claim.claims.push((number, ClaimKind::Thread));
             }
         }
-        source
-            .zone
-            .serial_issuer()
-            .advance_past(NonZeroU64::new(key.serial.raw()).ok_or(NativeProcessError::Invalid)?);
-        source.zone.serial_issuer().advance_past(
-            NonZeroU64::new(binding.thread_generation.raw()).ok_or(NativeProcessError::Invalid)?,
-        );
-        observe_page_births(source.zone, page);
+        // Births were issued by this carrier before publication. Admission
+        // authenticates the exact member; it does not reconstruct issuance
+        // from a lifecycle-page snapshot.
         let serials = SerialAllocator::new();
         let file_table = if identity.file_table != 0 {
             identity.file_table
