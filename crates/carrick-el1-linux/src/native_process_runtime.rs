@@ -1457,12 +1457,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             return Self::external_member(state, zone, event);
         }
         // A process-directed event may outlive the polling thread or an
-        // execve MM replacement. Authenticate the durable process generation,
+        // execve MM replacement. Authenticate the observed execution identity
+        // and the durable process birth serial in their respective domains,
         // then choose a surviving member of that exact process. The original
         // thread record is only an observation, never the target owner.
+        let target = event.process_target()?;
         if !event.identity().issued()
             || !event.identity().matches(event.binding())
-            || event.binding().generation != event.process_generation()
+            || !event.binding().issued()
         {
             return None;
         }
@@ -1472,8 +1474,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .iter()
             .find_map(|((place, process), group)| {
                 (*place == carrier
-                    && process.id.raw() as u64 == event.process_id().raw()
-                    && process.serial.raw() == event.process_generation().raw())
+                    && process.id.raw() as u64 == target.id().raw()
+                    && process.serial == target.birth().task_serial())
                 .then_some(group)
             })?;
         let mut fallback = None;
