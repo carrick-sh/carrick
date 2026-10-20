@@ -1562,10 +1562,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         {
             return None;
         }
-        if let Some(member) = Self::external_member(state, zone, event)
-            && member.process.id.raw() as u64 == target.id().raw()
-            && member.process.serial == target.birth().task_serial()
-        {
+        let process_id = i32::try_from(target.id().raw())
+            .ok()
+            .and_then(|id| carrick_personality_linux::identity::task_id_from_linux_pid(id).ok())?;
+        let target_process = TaskKey {
+            id: process_id,
+            serial: target.birth().task_serial(),
+        };
+        if let Some(member) = Self::external_member(state, zone, event) {
+            if member.process != target_process {
+                return None;
+            }
             let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
                 carrick_signal_core::SignalSet::from_bits(member.control.blocked().0),
             );
@@ -1573,16 +1580,40 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 return Some(member);
             }
         }
+        if let Some(record_member) = state
+            .records
+            .get(&Self::record_key(zone, event.record()))
+            .and_then(|key| state.members.get(key))
+            && record_member.process != target_process
+        {
+            return None;
+        }
         let carrier = core::ptr::from_ref(zone).addr();
-        let (_, keys) = state
-            .by_process
-            .iter()
-            .find_map(|((place, process), group)| {
-                (*place == carrier
-                    && process.id.raw() as u64 == target.id().raw()
-                    && process.serial == target.birth().task_serial())
-                .then_some(group)
-            })?;
+        let observed_task = NativeThreadIdentity::from_binding(event.binding()).ok()?;
+        let start = NativeExecutionKey {
+            carrier,
+            task: observed_task,
+            mm: 0,
+            thread_generation: 0,
+            root: 0,
+            address_generation: 0,
+        };
+        let end = NativeExecutionKey {
+            carrier,
+            task: observed_task,
+            mm: u64::MAX,
+            thread_generation: u64::MAX,
+            root: u64::MAX,
+            address_generation: u64::MAX,
+        };
+        if state
+            .members
+            .range(start..=end)
+            .any(|(_, member)| member.process != target_process)
+        {
+            return None;
+        }
+        let (_, keys) = state.by_process.get(&(carrier, target_process))?;
         let mut fallback = None;
         for key in keys {
             let Some(member) = state.members.get(key) else {
@@ -7594,6 +7625,10 @@ mod tests {
             core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new()),
         ];
         let tasks = [CurrentTask::new(), CurrentTask::new()];
+        let births = [
+            carrick_core_abi::entry::BirthSerial::of_task(TaskSerial::from_raw_u64(5).unwrap()),
+            carrick_core_abi::entry::BirthSerial::of_task(TaskSerial::from_raw_u64(6).unwrap()),
+        ];
         let mut runtimes = Vec::new();
         let mut addresses = Vec::new();
         for index in 0..2 {
@@ -7616,7 +7651,14 @@ mod tests {
                 &pages[index] as *const _ as u64,
                 &controls[index] as *const _ as u64,
             );
-            publish_test_birth(&controls[index], task);
+            controls[index].publish_host_birth_identity(
+                carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                    carrick_core_abi::EntryTaskKey::from_raw(tid),
+                    births[index],
+                    carrick_core_abi::EntryThreadGeneration::from_raw(101 + index as u64),
+                )
+                .unwrap(),
+            );
             let address = AddressContext {
                 root: RootGpa::page_aligned(FrameGpa::new(root)).unwrap(),
                 mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
@@ -7664,12 +7706,22 @@ mod tests {
         // An ingress record authenticates the exact live native member, not
         // just a tid shared by two roots or a recycled record slot.
         let first_binding = crate::common_entry::execution_binding(&tasks[0]);
+        assert_ne!(first_binding.generation.raw(), births[0].raw());
         let first_record = registry
             .state
             .lock()
             .members
             .iter()
             .find(|(key, _)| key.task.id().raw() == 41)
+            .unwrap()
+            .1
+            .record;
+        let second_record = registry
+            .state
+            .lock()
+            .members
+            .iter()
+            .find(|(key, _)| key.task.id().raw() == 51)
             .unwrap()
             .1
             .record;
@@ -7752,6 +7804,7 @@ mod tests {
                 .unwrap()
         );
         let signals = runtimes[0].current_signals(&tasks[0]).unwrap();
+        let second_signals = runtimes[1].current_signals(&tasks[1]).unwrap();
         assert!(signals.pending_set(first_record).contains(event.signal()));
         assert!(registry.signal_checkpoint_needed(&zone, first_record));
         let _ = signals.take_deliverable(
@@ -7812,9 +7865,70 @@ mod tests {
             event.signal(),
             event.source(),
         )
-        .process_directed()
-        .for_process(first_binding.task, first_binding.generation);
+        .for_process(first_binding.task, births[0]);
         assert!(registry.for_external_event(&zone, process_event).is_some());
+        let wrong_process_live =
+            event.for_process(carrick_core_abi::EntryTaskKey::from_raw(51), births[1]);
+        assert!(
+            registry
+                .for_external_event(&zone, wrong_process_live)
+                .is_none()
+        );
+        queue.admit(wrong_process_live).unwrap();
+        assert_eq!(
+            registry
+                .drain_external_ingress(
+                    &zone,
+                    &queue,
+                    carrick_sched_core::SlotId::new(0),
+                    &mut services[0],
+                )
+                .unwrap(),
+            0
+        );
+        assert!(!signals.pending_set(first_record).contains(event.signal()));
+        assert!(
+            !second_signals
+                .pending_set(second_record)
+                .contains(event.signal())
+        );
+        assert!(
+            registry
+                .for_external_event(&zone, event.for_process(first_binding.task, births[1]))
+                .is_none()
+        );
+        assert!(
+            registry
+                .for_external_event(
+                    &zone,
+                    process_event.for_process(first_binding.task, births[1]),
+                )
+                .is_none()
+        );
+        assert!(
+            registry
+                .for_external_event(
+                    &zone,
+                    process_event
+                        .for_process(carrick_core_abi::EntryTaskKey::from_raw(51), births[1],),
+                )
+                .is_none()
+        );
+        assert!(
+            registry
+                .for_external_event(&zone, stale.for_process(first_binding.task, births[0]))
+                .is_none()
+        );
+        let foreign_zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        assert!(
+            registry
+                .for_external_event(&foreign_zone, process_event)
+                .is_none()
+        );
         queue.admit(process_event).unwrap();
         assert_eq!(
             registry

@@ -210,7 +210,11 @@ impl Drop for NativeSignalFixture {
 }
 
 impl NativeSignalFixture {
-    pub fn new(binding: ExecutionBinding, process: carrick_core_abi::EntryTaskKey) -> Self {
+    pub fn new(
+        binding: ExecutionBinding,
+        process: carrick_core_abi::EntryTaskKey,
+        process_birth: carrick_core_abi::BirthSerial,
+    ) -> Self {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: one aligned allocation owns this zero-valid compact zone for
         // the entire leaked host-test fixture lifetime.
@@ -243,10 +247,7 @@ impl NativeSignalFixture {
         control.publish_host_birth_identity(
             carrick_core::terminal::ThreadBirthIdentity::from_parts(
                 binding.task,
-                carrick_core_abi::entry::BirthSerial::of_task(
-                    carrick_sched_core::process::TaskSerial::from_raw_u64(binding.generation.raw())
-                        .unwrap(),
-                ),
+                process_birth,
                 binding.thread_generation,
             )
             .unwrap(),
@@ -606,14 +607,20 @@ impl carrick_personality_linux::signal::SignalBackend for HostArmBackend {
 }
 
 pub fn empty_signal_checkpoint_lock_witness() {
-    use carrick_core_abi::{EntryMmKey, EntryTaskKey, EntryThreadGeneration, SnapshotGeneration};
+    use carrick_core_abi::{
+        BirthSerial, EntryMmKey, EntryTaskKey, EntryThreadGeneration, SnapshotGeneration,
+    };
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(123_450),
         generation: SnapshotGeneration::from_raw(11),
         mm: EntryMmKey::from_raw(1),
         thread_generation: EntryThreadGeneration::from_raw(101),
     };
-    let fixture = NativeSignalFixture::new(binding, EntryTaskKey::from_raw(123_450));
+    let fixture = NativeSignalFixture::new(
+        binding,
+        EntryTaskKey::from_raw(123_450),
+        BirthSerial::of_task(carrick_sched_core::process::TaskSerial::from_raw_u64(5).unwrap()),
+    );
     let registry_guard = fixture.registry.state.lock();
     let graph_guard = fixture.runtime.graph.lock();
     std::thread::scope(|scope| {
