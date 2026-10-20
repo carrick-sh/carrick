@@ -1419,8 +1419,16 @@ impl<'a> NetView<'a> {
         // Prepare the peer-address output before dequeuing or accepting a
         // connection: an owner refusal parks and retries this syscall, which
         // is only clean while the connection is still queued (#711).
+        let expected_addr_len = match family {
+            LINUX_AF_INET => 16,
+            LINUX_AF_INET6 => 28,
+            LINUX_AF_UNIX => host_fd
+                .and_then(support::peek_pending_unix_client_addr_len)
+                .unwrap_or(2),
+            _ => LINUX_SOCKADDR_STORAGE_SIZE,
+        };
         let mut addr_out = if addr_addr != 0 && addrlen_addr != 0 {
-            match prepare_linux_sockaddr(memory, addr_addr, addrlen_addr) {
+            match prepare_linux_sockaddr(memory, addr_addr, addrlen_addr, expected_addr_len) {
                 Ok(out) => Some(out),
                 Err(refusal) => return refusal.into_outcome(),
             }
@@ -3732,10 +3740,30 @@ impl<'a> NetView<'a> {
                 let client_flows = this
                     .open_file(fd)
                     .map(|of| of.description.common().ensure_socket_flows());
+                let client_addr_len = {
+                    let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+                    let mut sa_len = sa.len() as libc::socklen_t;
+                    let gsn_rc = unsafe {
+                        libc::getsockname(
+                            host_fd.get(),
+                            sa.as_mut_ptr() as *mut _,
+                            &mut sa_len as *mut _,
+                        )
+                    };
+                    if gsn_rc == 0 {
+                        let used = (sa_len as usize).min(sa.len());
+                        host_to_linux_sockaddr(&sa[..used], family, false)
+                            .len()
+                            .max(2)
+                    } else {
+                        2
+                    }
+                };
                 if let Some(server_cred) = support::lookup_and_queue_unix_connect(
                     &host_addr[2..end],
                     client_cred,
                     client_flows,
+                    client_addr_len,
                 ) {
                     this.record_unix_peer_cred(fd, server_cred);
                 }
@@ -3860,10 +3888,10 @@ impl<'a> NetView<'a> {
                         if addr_addr == 0 || addrlen_addr == 0 {
                             return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                         }
-                        if let Ok(b) = memory.read_bytes(addrlen_addr, 4)
-                            && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
-                        {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        match crate::dispatch::copyout::read_u32_before_effects(memory, addrlen_addr) {
+                            Ok(Ok(cur)) if (cur as i32) < 0 => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                            Ok(_) => {}
+                            Err(refusal) => return Ok(refusal.into_outcome()),
                         }
                         let local = socket.local_addr();
                         let linux_bytes = if let Some(local) = local {
@@ -3892,11 +3920,11 @@ impl<'a> NetView<'a> {
             }
             // A negative input *addrlen → EINVAL (getsockname01); the kernel
             // reads addrlen first and rejects len < 0 before copying out. A bad
-            // (unreadable) addrlen pointer surfaces EFAULT via the write below.
-            if let Ok(b) = memory.read_bytes(addrlen_addr, 4)
-                && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            // (unreadable) addrlen pointer surfaces EFAULT or ReadSuspended.
+            match crate::dispatch::copyout::read_u32_before_effects(memory, addrlen_addr) {
+                Ok(Ok(cur)) if (cur as i32) < 0 => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                Ok(_) => {}
+                Err(refusal) => return Ok(refusal.into_outcome()),
             }
             if let Some(guest_local) = host_authority.guest_local
                 && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_local.0)
@@ -3938,10 +3966,10 @@ impl<'a> NetView<'a> {
                         if addr_addr == 0 || addrlen_addr == 0 {
                             return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                         }
-                        if let Ok(b) = memory.read_bytes(addrlen_addr, 4)
-                            && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
-                        {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        match crate::dispatch::copyout::read_u32_before_effects(memory, addrlen_addr) {
+                            Ok(Ok(cur)) if (cur as i32) < 0 => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                            Ok(_) => {}
+                            Err(refusal) => return Ok(refusal.into_outcome()),
                         }
                         let peer = socket.getpeername_addr();
                         let Some(peer) = peer else {
@@ -3969,10 +3997,10 @@ impl<'a> NetView<'a> {
                 if addr_addr == 0 || addrlen_addr == 0 {
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
-                if let Ok(b) = memory.read_bytes(addrlen_addr, 4)
-                    && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
-                {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                match crate::dispatch::copyout::read_u32_before_effects(memory, addrlen_addr) {
+                    Ok(Ok(cur)) if (cur as i32) < 0 => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                    Ok(_) => {}
+                    Err(refusal) => return Ok(refusal.into_outcome()),
                 }
                 let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_peer.0) else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -4000,10 +4028,10 @@ impl<'a> NetView<'a> {
             if addr_addr == 0 || addrlen_addr == 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
             }
-            if let Ok(b) = memory.read_bytes(addrlen_addr, 4)
-                && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
-            {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            match crate::dispatch::copyout::read_u32_before_effects(memory, addrlen_addr) {
+                Ok(Ok(cur)) if (cur as i32) < 0 => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                Ok(_) => {}
+                Err(refusal) => return Ok(refusal.into_outcome()),
             }
             if let Ok(Some(guest_peer)) = this
                 .network
