@@ -339,7 +339,9 @@ impl ExtentTable {
         self.reclaim.iter().any(|item| match *item {
             ReclaimItem::Retired(retired) => retired_conflicts_with_extent(retired, record),
             ReclaimItem::Publish(Deferred::Extent(deferred)) => spans_overlap(deferred, record),
-            ReclaimItem::Publish(Deferred::RootGeneration(..)) => false,
+            ReclaimItem::Publish(Deferred::RootGeneration(deferred, _)) => {
+                record.contains_span(deferred.address().raw(), PAGE_SIZE_4K)
+            }
         })
     }
 
@@ -361,7 +363,9 @@ impl ExtentTable {
         self.reclaim.iter().any(|item| match *item {
             ReclaimItem::Retired(retired) => retired_conflicts_with_root(retired, root, generation),
             ReclaimItem::Publish(Deferred::RootGeneration(deferred, _)) => deferred == root,
-            ReclaimItem::Publish(Deferred::Extent(_)) => false,
+            ReclaimItem::Publish(Deferred::Extent(deferred)) => {
+                deferred.contains_span(root.address().raw(), PAGE_SIZE_4K)
+            }
         })
     }
 

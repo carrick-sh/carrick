@@ -658,6 +658,21 @@ fn retirement_issued_by_a_running_cpu_completes_without_waiting_on_itself() {
     let mut run = cpu.run();
     assert_eq!(run.step_block(&mut mem).unwrap(), expect);
     assert!(run.context().seat().is_running());
+
+    // When a retirement is published without this running CPU as requester,
+    // this CPU still owes it: waiting with `None` on this thread is refused,
+    // not wedged, and passing `Some(run.requester())` serves it inline.
+    let unserved = mem.extents_mut().retire_abandoned(None).unwrap();
+    let (unserved, error) = unserved
+        .wait(None, bounded_relax())
+        .expect_err("its own thread runs a counted CPU that still owes the retirement");
+    assert_eq!(error, RetirementWaitError::SelfWait);
+    let c0 = unserved
+        .wait(Some(run.requester()), bounded_relax())
+        .map_err(|(_, error)| error)
+        .unwrap();
+    mem.extents_mut().reclaim(&c0);
+
     let kicks = mem.extents().retirement_kicks();
     let retirement = mem
         .extents_mut()
@@ -670,13 +685,8 @@ fn retirement_issued_by_a_running_cpu_completes_without_waiting_on_itself() {
         kicks,
         "never kicks itself"
     );
-    // Without itself as the requester its own thread is refused, not wedged.
-    let (pending, error) = retirement
+    let completion = retirement
         .pending
-        .wait(None, bounded_relax())
-        .expect_err("its own thread runs a counted CPU");
-    assert_eq!(error, RetirementWaitError::SelfWait);
-    let completion = pending
         .wait(Some(run.requester()), bounded_relax())
         .map_err(|(_, error)| error)
         .unwrap();

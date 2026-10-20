@@ -500,31 +500,6 @@ impl<W: ServedWord> SoftVcpu<W> {
         &mut self.tlb
     }
 
-    /// Probe this vCPU's [`SoftTlb`] for a cached translation.
-    pub fn probe(
-        &mut self,
-        va: crate::domains::GuestVa,
-        access_len: usize,
-        access: crate::domains::Access,
-        mode: crate::domains::CpuAccessMode,
-    ) -> Option<usize> {
-        self.tlb.probe(va, access_len, access, mode)
-    }
-
-    /// Probe this vCPU's [`SoftTlb`] or walk `va` through `walker` and `memory` on a miss.
-    pub fn probe_or_walk_outcome<M: crate::walker::SoftMmuMemory>(
-        &mut self,
-        walker: &mut crate::walker::SoftWalker,
-        memory: &mut M,
-        root: crate::domains::RootGpa,
-        va: crate::domains::GuestVa,
-        access_len: usize,
-        access: crate::domains::Access,
-        mode: crate::domains::CpuAccessMode,
-    ) -> Result<crate::walker::AccessOutcome, crate::domains::SoftTranslationError> {
-        walker.probe_or_walk_outcome(memory, &mut self.tlb, root, va, access_len, access, mode)
-    }
-
     /// Run a sequence of blocks; the CPU parks when the guard drops.
     pub fn run(&mut self) -> RunningSeat<'_, W> {
         RunningSeat { vcpu: self }
@@ -551,6 +526,10 @@ impl SoftVcpu<AtomicU64> {
         if !extents.is_member(&self.seat) {
             return Err(SoftAdmitError::ForeignInventory);
         }
+        if extents.is_terminal() {
+            self.seat.park();
+            return Err(SoftAdmitError::Terminal);
+        }
         // SAFETY: `self.tlb` is the exact TLB paired with `self.seat`,
         // membership in `extents` was just verified, and `SeatAdmission`
         // releases the admission on drop.
@@ -560,6 +539,41 @@ impl SoftVcpu<AtomicU64> {
             vcpu: self,
             admission: Some(admission),
         })
+    }
+
+    /// Probe this vCPU's [`SoftTlb`] through `extents`: a parked CPU enters
+    /// (serving its retirement debt first) and parks again on return, while a
+    /// foreign or terminal inventory is refused.
+    pub fn probe(
+        &mut self,
+        extents: &crate::walker::ExtentTable,
+        va: crate::domains::GuestVa,
+        access_len: usize,
+        access: crate::domains::Access,
+        mode: crate::domains::CpuAccessMode,
+    ) -> Result<Option<usize>, SoftAdmitError> {
+        let mut admitted = self.admit(extents)?;
+        Ok(admitted.probe(va, access_len, access, mode))
+    }
+
+    /// Probe this vCPU's [`SoftTlb`] or walk `va` through `walker` and
+    /// `memory` on a miss, admitting a parked CPU for the lookup and refusing
+    /// a foreign or terminal inventory.
+    #[allow(clippy::too_many_arguments)]
+    pub fn probe_or_walk_outcome<M: crate::walker::SoftMmuMemory>(
+        &mut self,
+        walker: &mut crate::walker::SoftWalker,
+        memory: &mut M,
+        root: crate::domains::RootGpa,
+        va: crate::domains::GuestVa,
+        access_len: usize,
+        access: crate::domains::Access,
+        mode: crate::domains::CpuAccessMode,
+    ) -> Result<crate::walker::AccessOutcome, crate::domains::SoftTranslationError> {
+        let mut admitted = self
+            .admit(memory.extents())
+            .map_err(|error| crate::domains::SoftTranslationError::Admission { va, error })?;
+        admitted.probe_or_walk_outcome(walker, memory, root, va, access_len, access, mode)
     }
 
     /// This vCPU as the requester of a retirement it issues itself.
@@ -607,6 +621,36 @@ impl<W: ServedWord> RunningSeat<'_, W> {
 }
 
 impl<'s> RunningSeat<'s, AtomicU64> {
+    /// Probe this running vCPU's [`SoftTlb`] through `extents` (using the
+    /// zero-shared-write running admission fast path after `block_entry`).
+    pub fn probe(
+        &mut self,
+        extents: &crate::walker::ExtentTable,
+        va: crate::domains::GuestVa,
+        access_len: usize,
+        access: crate::domains::Access,
+        mode: crate::domains::CpuAccessMode,
+    ) -> Result<Option<usize>, SoftAdmitError> {
+        self.vcpu.probe(extents, va, access_len, access, mode)
+    }
+
+    /// Probe this running vCPU's [`SoftTlb`] or walk `va` through `walker` and
+    /// `memory` on a miss.
+    #[allow(clippy::too_many_arguments)]
+    pub fn probe_or_walk_outcome<M: crate::walker::SoftMmuMemory>(
+        &mut self,
+        walker: &mut crate::walker::SoftWalker,
+        memory: &mut M,
+        root: crate::domains::RootGpa,
+        va: crate::domains::GuestVa,
+        access_len: usize,
+        access: crate::domains::Access,
+        mode: crate::domains::CpuAccessMode,
+    ) -> Result<crate::walker::AccessOutcome, crate::domains::SoftTranslationError> {
+        self.vcpu
+            .probe_or_walk_outcome(walker, memory, root, va, access_len, access, mode)
+    }
+
     /// This running CPU as the requester of a retirement it issues itself.
     pub fn requester(&mut self) -> SoftRequester<'_> {
         // SAFETY: `self.vcpu.seat` and `self.vcpu.tlb` are the paired seat
@@ -640,6 +684,62 @@ impl<W: ServedWord> SeatAdmission<'_, W> {
     #[cfg(test)]
     pub(crate) fn tlb_mut_for_test(&mut self) -> &mut SoftTlb {
         &mut self.vcpu.tlb
+    }
+
+    /// Probe the admitted [`SoftTlb`] for a cached translation, returning
+    /// `None` if the domain became terminal.
+    pub fn probe(
+        &mut self,
+        va: crate::domains::GuestVa,
+        access_len: usize,
+        access: crate::domains::Access,
+        mode: crate::domains::CpuAccessMode,
+    ) -> Option<usize> {
+        if self.vcpu.seat.domain.is_terminal() {
+            self.vcpu.seat.park();
+            return None;
+        }
+        self.vcpu.tlb.probe(va, access_len, access, mode)
+    }
+}
+
+impl SeatAdmission<'_, AtomicU64> {
+    /// Probe the admitted [`SoftTlb`] or walk `va` through `walker` and
+    /// `memory` on a miss, verifying that `memory` belongs to this seat's
+    /// non-terminal inventory.
+    #[allow(clippy::too_many_arguments)]
+    pub fn probe_or_walk_outcome<M: crate::walker::SoftMmuMemory>(
+        &mut self,
+        walker: &mut crate::walker::SoftWalker,
+        memory: &mut M,
+        root: crate::domains::RootGpa,
+        va: crate::domains::GuestVa,
+        access_len: usize,
+        access: crate::domains::Access,
+        mode: crate::domains::CpuAccessMode,
+    ) -> Result<crate::walker::AccessOutcome, crate::domains::SoftTranslationError> {
+        if !memory.extents().is_member(&self.vcpu.seat) {
+            return Err(crate::domains::SoftTranslationError::Admission {
+                va,
+                error: SoftAdmitError::ForeignInventory,
+            });
+        }
+        if self.vcpu.seat.domain.is_terminal() || memory.extents().is_terminal() {
+            self.vcpu.seat.park();
+            return Err(crate::domains::SoftTranslationError::Admission {
+                va,
+                error: SoftAdmitError::Terminal,
+            });
+        }
+        walker.probe_or_walk_outcome(
+            memory,
+            &mut self.vcpu.tlb,
+            root,
+            va,
+            access_len,
+            access,
+            mode,
+        )
     }
 }
 
@@ -781,7 +881,8 @@ impl PendingRetirement {
         }
     }
 
-    /// Whether a counted member other than `requester_cpu` is running on the
+    /// Whether a counted member other than `requester_cpu` that still owes
+    /// this specific retirement's generation and kind is running on the
     /// calling thread.
     fn waits_on_current_thread(
         &self,
@@ -793,7 +894,7 @@ impl PendingRetirement {
             && domain.0.slots.iter().enumerate().any(|(index, slot)| {
                 let cpu = CpuId::new(index as u32);
                 requester_cpu != Some(cpu)
-                    && self.pending.counts(cpu)
+                    && self.pending.still_owes(cpu)
                     && slot.runner.load(Ordering::Relaxed) == token
             })
     }
