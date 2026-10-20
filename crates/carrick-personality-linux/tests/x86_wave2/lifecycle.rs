@@ -473,7 +473,9 @@ pub fn x5_exit_requeued_after_wake_wakes_once() {
                     tid: 50,
                     visible_tid: 7,
                     thread_serial: 5050,
-                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+                    ),
                     uid_credit: 1,
                 },
             )
