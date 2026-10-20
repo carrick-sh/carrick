@@ -4842,9 +4842,10 @@ fn arm_rehomed_adopted_member_settles_on_its_birth_identity() {
         zone: fixture.zone,
         slot,
     };
-    // Adoption succeeds on the quantum whose execution generation equals the
-    // birth identity's process generation (12 for this fixture).
-    let first = bind(12);
+    // Adoption must succeed even when the first EL1 entry quantum carries a
+    // renewed execution generation (777) distinct from the birth identity's
+    // durable process generation (12 for this fixture).
+    let first = bind(777);
     registry()
         .register_thread(source, sibling_task, fixture.address, fixture.page, control)
         .expect("adopt host-born sibling");

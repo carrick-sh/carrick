@@ -1513,9 +1513,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 .map_err(|_| NativeProcessError::Stale)?;
             let already_owned = if let Some(issued) = host_issued {
                 let already_owned = issued.authorize_group(source, row, address, page, control)?;
-                if !page.release_adopted_host_birth(
-                    carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding),
-                ) {
+                if !page.release_adopted_host_birth(host_identity) {
                     return Err(NativeProcessError::Stale);
                 }
                 already_owned
@@ -1668,14 +1666,13 @@ impl IssuedHostThread {
             .issued()
             .ok_or(NativeProcessError::Stale)?;
         let visible_tid = control.visible_tid().ok_or(NativeProcessError::Stale)?;
-        if control.host_birth_identity()
-            != Some(carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding))
-            || !(0..carrick_el1_abi::THREAD_POOL_ENTRIES).any(|index| {
-                page.host_birth_identity(index)
-                    == Some(
-                        carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding),
-                    )
-            })
+        let birth = control
+            .host_birth_identity()
+            .ok_or(NativeProcessError::Stale)?;
+        if birth.task() != binding.task
+            || birth.thread() != binding.thread_generation
+            || !(0..carrick_el1_abi::THREAD_POOL_ENTRIES)
+                .any(|index| page.host_birth_identity(index) == Some(birth))
         {
             return Err(NativeProcessError::Stale);
         }
@@ -2078,9 +2075,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             zone: source.zone,
             record: source.zone.record_ref(record),
             control: retain_member_control(control)?,
-            expected_host: carrick_core::terminal::HostThreadRetirementReceipt::from_binding(
-                binding,
-            ),
+            expected_host: adopted_host_identity(control, binding),
         }];
         members.extend(imported.iter().map(|(member, _, _)| member.clone()));
         let resources = NativeResources {
