@@ -122,3 +122,64 @@ worker evidence. Higher-layer acceptance must use the exact final top artifact.
 Necessary layout consequences are confined to the source protocol/hash, x86 boot
 version and the EL1 host-mapping custody enum. Existing HVF mapping tests wrap
 exclusive owners in that enum; their mapping expectations are unchanged.
+
+## Distinct carrier MM authority
+
+The two-live-root MM witness is a separate correctness obligation. On the RED
+head, native children used MM keys 3 and 5 while later host supply returned 3
+and 4. The adapted older baseline passed that schedule; it was not proof that
+independent MM cursors were universally safe. Task/thread birth correctness
+alone does not establish MM identity composition.
+
+`MmIssuerWord` now stores a separate zero-valid carrier-wide MM source in the
+existing zone. Its borrowed API returns `MmGeneration`, not a birth serial or
+bare semantic integer. It uses the same checked atomic protocol, burns tickets
+on rollback, issues MAX once and remains terminal. ABI protocol/hash facts and
+x86 initial-boot version authenticate the new storage/behavior. Fixture inputs
+change and require a newly identified bundle; the separate publisher is not
+part of this worker change.
+
+The retained HAL capability exposes typed MM operations under the same exact
+custody/generation/backing/liveness guard as births. ARM installs that capability
+in `RootBootstrap` before `Kernel::bootstrap_root` calls `mm_id`. Later container
+roots and host supply allocate from the same word. Native `fork_reserve` uses
+its actual zone MM source; the graph cursor is now only a graph-owned transaction
+source, with no birth/file/MM maximum-scalar seed. Context and snapshot revisions,
+physical roots, file IDs and task/thread births retain their distinct domains.
+
+The actual x86 prepared launch creates its private host root before the physical
+carrier. Its existing stopped binding now takes the registry issuance write lock
+and then **the current global MM source's write lock**. All reference/pre-carrier
+`mm_id` allocations take that global source's read lock. Under both guards, the
+handoff burns/captures the complete global MM high-water (including reserved,
+unpublished and retired values), adopts it only into a zero MM word, adopts the
+complete local birth high-water, and permanently switches the registry before
+releasing either authority. The caller binds the initial task identity and loads
+the guest MM afterward, before native entry. Failure burns values and publishes
+no child; it cannot join an active independently issued source. The per-registry
+birth lock alone is not presented as global MM authority.
+
+Already-bound handles authenticate the same retained owner and never reseed
+later roots. Boot export transfers the existing retained capability and revokes
+old MM admission; surviving peers keep both unchanged words. There is no active
+carrier fallback to the reference/pre-carrier global allocator. Production
+admission performs no MM inventory scan or late advancement. Existing fixtures
+that manually publish root MM values account for those values in test-only
+setup; the unchanged production-bound MM witness needs no such import.
+
+Guest MM issuance is one checked atomic RMW (with contention retries), no trap
+or allocation. Host MM issuance adds its registry read lock and the existing ARM
+custody mutex or x86 revocation read guard. Only initial pre-carrier transfer takes
+the global write lock. No graph lock spans backend preparation and receiver
+record/identity/process-birth/thread-prefix/rehome checks and indexed cost remain
+unchanged. No runtime-ratio claim follows from VM-free checks.
+
+The unchanged MM regression now tests host-before-native and native-before-host
+supply with two live roots. A second production-bound witness starts real native
+forks in two graphs on separate host threads with bounded actor coordination,
+then checks later host supply, unpublished rollback burning and terminal partial
+allocation without child publication. Kernel bootstrap tests cover later root
+MMs, complete initial transfer, foreign custody and export revocation. Physical
+source controls apply the actual retained backing/revocation protocol to MM
+operations too. Full cross-host, signed/runtime and exact-top acceptance remain
+director gates.

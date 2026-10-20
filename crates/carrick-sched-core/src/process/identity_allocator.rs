@@ -401,7 +401,7 @@ impl core::error::Error for IdError {}
 
 /// Shared birth-issuer protocol: one atomic last-issued word, initially zero.
 /// Included in the image ABI hash independently of the word's layout.
-pub const SERIAL_ISSUER_PROTOCOL: u64 = 2;
+pub const SERIAL_ISSUER_PROTOCOL: u64 = 3;
 
 /// Carrier-owned birth serial storage. All-zero bytes are a valid initial
 /// state; MAX is terminal. Unlike [`SerialAllocator`], this shared word cannot
@@ -970,5 +970,63 @@ mod tests {
         let exhausted = SerialAllocator::starting_at(NonZeroU64::MAX);
         assert_eq!(exhausted.allocate(), None);
         assert_eq!(exhausted.allocate(), None);
+    }
+}
+
+/// Separate carrier-wide MM identity domain, never a task/thread birth cursor.
+///
+/// ```compile_fail
+/// use carrick_sched_core::process::identity_allocator::MmIssuerWord;
+/// let word = MmIssuerWord::new();
+/// let birth: core::num::NonZeroU64 = word.issuer().allocate().unwrap();
+/// ```
+#[derive(Debug, Default)]
+#[repr(transparent)]
+pub struct MmIssuerWord(SerialIssuerWord);
+impl MmIssuerWord {
+    pub const fn new() -> Self {
+        Self(SerialIssuerWord::new())
+    }
+    pub const fn issuer(&self) -> MmIssuer<'_> {
+        MmIssuer(self.0.issuer())
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct MmIssuer<'a>(SerialIssuer<'a>);
+impl MmIssuer<'_> {
+    pub fn allocate(self) -> Option<carrick_guest_arch::MmGeneration> {
+        self.0.allocate().map(carrick_guest_arch::MmGeneration::new)
+    }
+    pub fn adopt_initial(self, issued: carrick_guest_arch::MmGeneration) -> bool {
+        self.0.adopt_initial(issued.raw())
+    }
+    /// Fixture/import accounting only; active producers must share this source
+    /// before issuance. Never a merge protocol for escaped independent tickets.
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn observe_existing(self, issued: carrick_guest_arch::MmGeneration) {
+        self.0.advance_past(issued.raw());
+    }
+}
+
+#[cfg(test)]
+mod mm_issuer_tests {
+    use super::MmIssuerWord;
+    use carrick_guest_arch::MmGeneration;
+    use core::num::NonZeroU64;
+    #[test]
+    fn mm_word_is_distinct_zero_valid_and_terminal_without_reopening() {
+        let mm = MmIssuerWord::new();
+        assert_eq!(mm.issuer().allocate().unwrap().raw(), NonZeroU64::MIN);
+        assert!(
+            !mm.issuer()
+                .adopt_initial(MmGeneration::new(NonZeroU64::MIN))
+        );
+        mm.issuer()
+            .observe_existing(MmGeneration::new(NonZeroU64::new(u64::MAX - 1).unwrap()));
+        assert_eq!(mm.issuer().allocate().unwrap().raw(), NonZeroU64::MAX);
+        assert!(mm.issuer().allocate().is_none());
+        mm.issuer()
+            .observe_existing(MmGeneration::new(NonZeroU64::MIN));
+        assert!(mm.issuer().allocate().is_none());
     }
 }

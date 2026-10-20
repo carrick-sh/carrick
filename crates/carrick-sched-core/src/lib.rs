@@ -1168,6 +1168,7 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     /// previously published tables keep their offsets. Source custody must be
     /// installed before the first host or guest birth, not during admission.
     serial_issuer: process::identity_allocator::SerialIssuerWord,
+    mm_issuer: process::identity_allocator::MmIssuerWord,
 }
 
 /// A fallible acquisition policy for callers that retain work on refusal.
@@ -1629,6 +1630,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// issuer storage or a raw-pointer construction path.
     pub const fn serial_issuer_offset() -> usize {
         core::mem::offset_of!(Self, serial_issuer)
+    }
+    /// Borrow the distinct MM source from this exact retained carrier zone.
+    pub const fn mm_issuer(&self) -> process::identity_allocator::MmIssuer<'_> {
+        self.mm_issuer.issuer()
+    }
+    pub const fn mm_issuer_offset() -> usize {
+        core::mem::offset_of!(Self, mm_issuer)
     }
 
     /// Context-independent hashing for an owner's actual saved-context ABI.

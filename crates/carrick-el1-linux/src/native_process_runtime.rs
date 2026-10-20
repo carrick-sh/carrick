@@ -2424,6 +2424,24 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         Ok(members)
     }
 
+    /// Fixtures importing existing MM records must account for those records
+    /// before exercising production allocation. Active launch paths bind their
+    /// retained owner before issuing MMs and never perform this import.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn admit_fixture_root<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
+        source: BornInZoneSource<'a, C>,
+        current: &'a CurrentTask,
+        page: &'a ThreadLifecyclePage,
+        control: &'a ThreadControlSlot,
+        mm: M,
+        address: AddressContext<RootGpa>,
+        words: C,
+    ) -> Result<Self, NativeProcessError> {
+        source.zone.mm_issuer().observe_existing(address.mm);
+        Self::admit_fresh_root::<B>(source, current, page, control, mm, address, words)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn admit_fresh_root<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
         source: BornInZoneSource<'a, C>,
@@ -2546,27 +2564,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         );
         observe_page_births(source.zone, page);
         let serials = SerialAllocator::new();
-        serials
-            .advance_past(
-                NonZeroU64::new(
-                    key.serial
-                        .raw()
-                        .max(binding.thread_generation.raw())
-                        .max(binding.mm.raw())
-                        .max(identity.file_table)
-                        .max(
-                            imported
-                                .iter()
-                                .map(|(member, _, serial)| {
-                                    member.expected_host.birth().raw().max(*serial)
-                                })
-                                .max()
-                                .unwrap_or(0),
-                        ),
-                )
-                .ok_or(NativeProcessError::Invalid)?,
-            )
-            .ok_or(NativeProcessError::Exhausted)?;
         let file_table = if identity.file_table != 0 {
             identity.file_table
         } else {
@@ -5093,12 +5090,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .serial_issuer()
                 .allocate()
                 .ok_or(NativeProcessError::Exhausted)?;
-            let child_mm = MmGeneration::new(
-                graph
-                    .serials
-                    .allocate()
-                    .ok_or(NativeProcessError::Exhausted)?,
-            );
+            let child_mm = self
+                .runtime
+                .zone
+                .mm_issuer()
+                .allocate()
+                .ok_or(NativeProcessError::Exhausted)?;
             let transaction = graph
                 .serials
                 .allocate()
@@ -7563,17 +7560,18 @@ mod tests {
             )
             .unwrap();
             let source = BornInZoneSource { zone: &zone, slot };
-            let runtime =
-                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
-                    source,
-                    &task,
-                    &page,
-                    &control,
-                    address,
-                    address,
-                    words(address),
-                )
-                .unwrap();
+            let runtime = NativeProcessRuntime::admit_fixture_root::<
+                carrick_mmu_core::x86::owner_mmu::X86Mmu,
+            >(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
             let tid_va = UserVa::new(0x7000);
             let mut service = Physical {
                 zone: &zone,
@@ -7773,18 +7771,21 @@ mod tests {
             )
             .unwrap();
             let source = BornInZoneSource { zone: &zone, slot };
-            let runtime = Arc::new(
-                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
-                    source,
-                    task,
-                    &pages[index],
-                    &controls[index],
-                    address,
-                    address,
-                    words(address),
-                )
-                .unwrap(),
-            );
+            let runtime =
+                Arc::new(
+                    NativeProcessRuntime::admit_fixture_root::<
+                        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+                    >(
+                        source,
+                        task,
+                        &pages[index],
+                        &controls[index],
+                        address,
+                        address,
+                        words(address),
+                    )
+                    .unwrap(),
+                );
             registry
                 .register_root(runtime.clone(), source, task, address)
                 .unwrap();
@@ -8133,6 +8134,220 @@ mod tests {
         ));
     }
     #[test]
+    fn two_live_roots_concurrently_publish_native_mms_before_host_supply() {
+        // Root identities come from the actual host registry, bound before
+        // births to the same retained zone used by both native graphs.
+        let zone: Arc<ZoneTables<ParkedContextWords>> = Arc::from(unsafe {
+            let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        });
+        let host_source =
+            Arc::new(carrick_hal::birth_serial::test_support::OwnedBirthZone::new(zone.clone()));
+        let host_ids = carrick_kernel::kernel::ObjectIdRegistry::with_birth_source(host_source);
+        let pages = [ThreadLifecyclePage::new(), ThreadLifecyclePage::new()];
+        let controls = [ThreadControlSlot::new(), ThreadControlSlot::new()];
+        let child_pages = [ThreadLifecyclePage::new(), ThreadLifecyclePage::new()];
+        let child_controls = [
+            core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new()),
+            core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new()),
+        ];
+        let tasks = [CurrentTask::new(), CurrentTask::new()];
+        let mut runtimes = Vec::new();
+        let mut addresses = Vec::new();
+        for index in 0..2 {
+            let tid = 41 + index as u64 * 10;
+            let birth = host_ids.task_serial().unwrap();
+            let thread = host_ids.thread_serial().unwrap();
+            let mm = MmGeneration::new(host_ids.mm_id().unwrap().nonzero());
+            let file = host_ids.file_table_id().unwrap();
+            let root = 0x1000 + index as u64 * 0x2000;
+            let slot = carrick_sched_core::SlotId::new(index as u8);
+            let task = &tasks[index];
+            task.set(
+                carrick_el1_abi::El1TaskId::from_linux_tid(tid as i32),
+                carrick_el1_abi::SnapshotGeneration::INITIAL,
+                file.raw(),
+            );
+            task.mm.key.store(mm.raw().get(), Ordering::Release);
+            task.mm
+                .thread_generation
+                .store(thread.raw(), Ordering::Release);
+            task.publish_visible_pid(tid as u32);
+            task.publish_lifecycle(
+                &pages[index] as *const _ as u64,
+                &controls[index] as *const _ as u64,
+            );
+            controls[index].publish_host_birth_identity(
+                carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                    carrick_core_abi::EntryTaskKey::from_raw(tid),
+                    carrick_core_abi::entry::BirthSerial::of_task(birth),
+                    carrick_core_abi::EntryThreadGeneration::from_raw(thread.raw()),
+                )
+                .unwrap(),
+            );
+            let address = AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(root)).unwrap(),
+                mm,
+                generation: ContextGeneration::new(NonZeroU64::MIN),
+            };
+            let space = zone.spaces.publish_closed(mm.raw().get(), root, 0).unwrap();
+            zone.spaces.open(space);
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, 1, Some(index as u32), 1);
+            zone.enter_guest(slot);
+            zone.install_space(slot, mm.raw().get()).unwrap();
+            zone.current_or_new(
+                slot,
+                ThreadIdentity {
+                    tid,
+                    serial: thread.raw(),
+                    mm: mm.raw().get(),
+                    file_table: file.raw(),
+                    generation: carrick_el1_abi::SnapshotGeneration::INITIAL.raw(),
+                    affinity: 1,
+                    lifecycle_page: &pages[index] as *const _ as u64,
+                    control_slot: &controls[index] as *const _ as u64,
+                },
+            )
+            .unwrap();
+            let source = BornInZoneSource { zone: &zone, slot };
+            runtimes.push(
+                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                    source,
+                    task,
+                    &pages[index],
+                    &controls[index],
+                    address,
+                    address,
+                    words(address),
+                )
+                .unwrap(),
+            );
+            addresses.push(address);
+        }
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let children = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut starts = Vec::new();
+            for index in 0..2 {
+                let zone = &zone;
+                let tasks = &tasks;
+                let runtimes = &runtimes;
+                let addresses = &addresses;
+                let child_pages = &child_pages;
+                let child_controls = &child_controls;
+                let ready_tx = ready_tx.clone();
+                let (start_tx, start_rx) = std::sync::mpsc::channel();
+                starts.push(start_tx);
+                handles.push(scope.spawn(move || {
+                    let source = BornInZoneSource {
+                        zone,
+                        slot: carrick_sched_core::SlotId::new(index as u8),
+                    };
+                    let runtime = &runtimes[index];
+                    let mut service = Physical {
+                        zone,
+                        page: &child_pages[index],
+                        controls: &child_controls[index],
+                        copies: Vec::new(),
+                        tid_words: BTreeMap::new(),
+                        tid_wakes: 0,
+                        tid_writes: Vec::new(),
+                        refuse_copy: false,
+                        child_copy_error: None,
+                        on_signal_clock: None,
+                    };
+                    let mut entry = runtime
+                        .enter(source, &tasks[index], words(addresses[index]), &mut service)
+                        .unwrap();
+                    ready_tx.send(()).unwrap();
+                    start_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    let LifecycleOutcome::Returned { result, .. } =
+                        entry.fork(ProcessForkChildTid::NONE)
+                    else {
+                        panic!("fork return")
+                    };
+                    assert!(result.raw() > 0);
+                    let root_key = runtime.graph.lock().root_key;
+                    let key = runtime
+                        .namespace_child_key(root_key, result.raw() as u32)
+                        .unwrap();
+                    runtime.task_binding(key).unwrap().address.mm
+                }));
+            }
+            for _ in 0..2 {
+                ready_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            for start in starts {
+                start.send(()).unwrap();
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_ne!(children[0], children[1]);
+        for child in &children {
+            assert!(!addresses.iter().any(|root| root.mm == *child));
+        }
+        for _ in 0..2 {
+            let later = MmGeneration::new(host_ids.mm_id().unwrap().nonzero());
+            assert!(!children.contains(&later));
+            assert!(!addresses.iter().any(|root| root.mm == later));
+        }
+        // An allocated but unpublished fork burns its MM ticket on rollback.
+        let source = BornInZoneSource {
+            zone: &zone,
+            slot: carrick_sched_core::SlotId::new(0),
+        };
+        let runtime = &runtimes[0];
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_pages[0],
+            controls: &child_controls[0],
+            copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
+            refuse_copy: false,
+            child_copy_error: None,
+            on_signal_clock: None,
+        };
+        let mut entry = runtime
+            .enter(source, &tasks[0], words(addresses[0]), &mut service)
+            .unwrap();
+        let reservation = entry.fork_reserve().unwrap();
+        let burned = reservation.child_mm;
+        runtime
+            .graph
+            .lock()
+            .owner
+            .rollback_birth(&reservation.permit);
+        drop(reservation);
+        let host_after_rollback = MmGeneration::new(host_ids.mm_id().unwrap().nonzero());
+        assert!(host_after_rollback.raw() > burned.raw());
+        let population = runtime.graph.lock().owner.tasks().len();
+        zone.mm_issuer()
+            .observe_existing(MmGeneration::new(NonZeroU64::new(u64::MAX - 1).unwrap()));
+        let last = entry.fork_reserve().unwrap();
+        assert_eq!(last.child_mm.raw(), NonZeroU64::MAX);
+        runtime.graph.lock().owner.rollback_birth(&last.permit);
+        drop(last);
+        assert!(matches!(
+            entry.fork_reserve(),
+            Err(NativeProcessError::Exhausted)
+        ));
+        assert_eq!(runtime.graph.lock().owner.tasks().len(), population);
+        assert!(host_ids.mm_id().is_err());
+    }
+
+    #[test]
     fn two_live_roots_keep_native_and_later_host_mm_keys_distinct() {
         // Root identities come from the actual host registry, bound before
         // births to the same retained zone used by both native graphs.
@@ -8387,7 +8602,7 @@ mod tests {
         };
         let reserved = reserved_before_admission.then(reserve_observer);
         let runtime = Arc::new(
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &leader,
                 &page,
@@ -8696,7 +8911,7 @@ mod tests {
         let source = BornInZoneSource { zone: &zone, slot };
         let thread = CurrentTask::new();
         let runtime = Arc::new(
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &leader,
                 &page,
@@ -8897,11 +9112,11 @@ mod tests {
             );
             let source = BornInZoneSource { zone: &zone, slot };
             let admitted = if arm {
-                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::owner_mmu::Aarch64Mmu>(
+                NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::owner_mmu::Aarch64Mmu>(
                     source, &task, &page, &control, address, address, saved,
                 )
             } else {
-                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                     source, &task, &page, &control, address, address, saved,
                 )
             };
@@ -8981,7 +9196,7 @@ mod tests {
         let source = BornInZoneSource { zone: &zone, slot };
         assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
         assert!(matches!(
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -8995,7 +9210,7 @@ mod tests {
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -9332,7 +9547,7 @@ mod tests {
         let source = BornInZoneSource { zone: &zone, slot };
         assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
         assert!(matches!(
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -9346,7 +9561,7 @@ mod tests {
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -9461,7 +9676,7 @@ mod tests {
         let source = BornInZoneSource { zone: &zone, slot };
         assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
         assert!(matches!(
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -9475,7 +9690,7 @@ mod tests {
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -9605,7 +9820,7 @@ mod tests {
             let source = BornInZoneSource { zone: &zone, slot };
             assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
             assert!(matches!(
-                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                     source,
                     &task,
                     &page,
@@ -9618,17 +9833,18 @@ mod tests {
             ));
             assert_eq!(page.live(), 2, "admission must not remove a live member");
             page.release_live(1).unwrap(); // fixture settles its bootstrap census
-            let runtime =
-                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
-                    source,
-                    &task,
-                    &page,
-                    &control,
-                    address,
-                    address,
-                    words(address),
-                )
-                .unwrap();
+            let runtime = NativeProcessRuntime::admit_fixture_root::<
+                carrick_mmu_core::x86::owner_mmu::X86Mmu,
+            >(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
             assert_eq!(page.live(), 1);
             let mut service = Physical {
                 zone: &zone,
@@ -9879,7 +10095,7 @@ mod tests {
         let source = BornInZoneSource { zone: &zone, slot };
         assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
         assert!(matches!(
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -9893,7 +10109,7 @@ mod tests {
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -10094,7 +10310,7 @@ mod tests {
         assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -10673,7 +10889,7 @@ mod tests {
         let grandchild_controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
         let peer_task = CurrentTask::new();
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -11078,7 +11294,7 @@ mod tests {
         assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -11264,17 +11480,18 @@ mod tests {
             let descendant_pages = [ThreadLifecyclePage::new(), ThreadLifecyclePage::new()];
             let descendant_controls: [[ThreadControlSlot; 9]; 2] =
                 core::array::from_fn(|_| core::array::from_fn(|_| ThreadControlSlot::new()));
-            let runtime =
-                NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
-                    source,
-                    &task,
-                    &page,
-                    &control,
-                    address,
-                    address,
-                    words(address),
-                )
-                .unwrap();
+            let runtime = NativeProcessRuntime::admit_fixture_root::<
+                carrick_mmu_core::x86::owner_mmu::X86Mmu,
+            >(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
             assert_eq!(page.live(), 1);
             let mut service = Physical {
                 zone: &zone,
@@ -11496,7 +11713,7 @@ mod tests {
         .unwrap();
         let source = BornInZoneSource { zone: &zone, slot };
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -11684,7 +11901,7 @@ mod tests {
         .unwrap();
         let source = BornInZoneSource { zone: &zone, slot };
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -11790,7 +12007,7 @@ mod tests {
         .unwrap();
         let source = BornInZoneSource { zone: &zone, slot };
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -11930,7 +12147,7 @@ mod tests {
         .unwrap();
         let source = BornInZoneSource { zone: &zone, slot };
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -12032,7 +12249,7 @@ mod tests {
         .unwrap();
         let source = BornInZoneSource { zone: &zone, slot };
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -12188,7 +12405,7 @@ mod tests {
         .unwrap();
         let source = BornInZoneSource { zone: &zone, slot };
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -12633,7 +12850,7 @@ mod tests {
         .unwrap();
         let source = BornInZoneSource { zone: &zone, slot };
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -12789,7 +13006,7 @@ mod tests {
         let source = BornInZoneSource { zone: &zone, slot };
         assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
         assert!(matches!(
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -12804,7 +13021,7 @@ mod tests {
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
         let registry = Box::leak(Box::new(NativeProcessRegistry::new()));
         let runtime = Arc::new(
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -13291,7 +13508,7 @@ mod tests {
             .map(|_| core::array::from_fn(|_| ThreadControlSlot::new()))
             .collect();
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,
@@ -13483,7 +13700,7 @@ mod tests {
             .map(|_| core::array::from_fn(|_| ThreadControlSlot::new()))
             .collect();
         let runtime =
-            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            NativeProcessRuntime::admit_fixture_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
                 &page,

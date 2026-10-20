@@ -557,6 +557,7 @@ impl Fixture {
             mm: MmGeneration::new(NonZeroU64::new(leader.mm).unwrap()),
             generation: ContextGeneration::new(NonZeroU64::new(101).unwrap()),
         };
+        zone.mm_issuer().observe_existing(address.mm);
         task.publish_root_generation(address.generation);
 
         let slot = SlotId::new(0);
