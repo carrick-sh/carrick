@@ -857,8 +857,9 @@ pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
 struct NativeExecutionKey {
     carrier: usize,
     task: NativeThreadIdentity,
-    mm: u64,
+    // Keep one thread incarnation contiguous across MM/root rehomes.
     thread_generation: u64,
+    mm: u64,
     root: u64,
     address_generation: u64,
 }
@@ -1560,16 +1561,16 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let start = NativeExecutionKey {
             carrier,
             task: observed_task,
+            thread_generation: event.binding().thread_generation.raw(),
             mm: 0,
-            thread_generation: 0,
             root: 0,
             address_generation: 0,
         };
         let end = NativeExecutionKey {
             carrier,
             task: observed_task,
+            thread_generation: event.binding().thread_generation.raw(),
             mm: u64::MAX,
-            thread_generation: u64::MAX,
             root: u64::MAX,
             address_generation: u64::MAX,
         };
@@ -8062,6 +8063,275 @@ mod tests {
             ),
             Err(NativeProcessError::Stale)
         ));
+    }
+    #[test]
+    fn process_receiver_survives_internal_task_id_reuse() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let registry = Box::leak(Box::new(NativeProcessRegistry::<
+            AddressContext<RootGpa>,
+            ParkedContextWords,
+        >::new()));
+        let page = ThreadLifecyclePage::new();
+        let leader_control = ThreadControlSlot::new();
+        let thread_control = ThreadControlSlot::new();
+        let child_page = ThreadLifecyclePage::new();
+        let child_controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
+        let leader = CurrentTask::new();
+        leader.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
+        leader.mm.key.store(1, Ordering::Release);
+        leader.mm.thread_generation.store(101, Ordering::Release);
+        leader.publish_visible_pid(41);
+        leader.publish_lifecycle(&page as *const _ as u64, &leader_control as *const _ as u64);
+        publish_test_birth(&leader_control, &leader);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &page as *const _ as u64,
+                control_slot: &leader_control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let thread = CurrentTask::new();
+        let runtime = Arc::new(
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &leader,
+                &page,
+                &leader_control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap(),
+        );
+        registry
+            .register_root(runtime.clone(), source, &leader, address)
+            .unwrap();
+
+        // Model the allocator custody held by the thread birth owner. Use
+        // the real namespace claim/release path, not just a visible TID.
+        let namespace = runtime.graph.lock().namespace.clone();
+        let number = namespace
+            .lock()
+            .reserve_exact(42, ClaimKind::Thread)
+            .unwrap();
+        let observer_claim = NativeClaim {
+            namespace,
+            claims: vec![(number, ClaimKind::Thread)],
+        };
+        let entry = page
+            .stock(
+                0,
+                carrick_el1_abi::EntryIdentity {
+                    tid: 42,
+                    visible_tid: 42,
+                    thread_serial: 107,
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(12).unwrap(),
+                    ),
+                    uid_credit: 0,
+                },
+            )
+            .unwrap();
+        page.bind_control_address(entry, &thread_control as *const _ as u64)
+            .unwrap();
+        thread_control
+            .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+            .unwrap();
+        assert!(thread_control.publish_visible_tid(42));
+        let claim = page.claim(entry).unwrap();
+        page.record_born(
+            claim,
+            carrick_el1_abi::BornRecord {
+                caller_task: 41,
+                caller_serial: 101,
+                clone_flags: 0x0001_0000,
+                clear_child_tid: 0,
+                blocked: carrick_el1_abi::BlockedMask(0),
+            },
+        )
+        .unwrap();
+        page.thread_born().unwrap();
+        page.publish(entry).unwrap();
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 42,
+                serial: 107,
+                mm: 1,
+                file_table: 5,
+                generation: carrick_core_abi::SnapshotGeneration::INITIAL.raw(),
+                affinity: 1,
+                lifecycle_page: &page as *const _ as u64,
+                control_slot: &thread_control as *const _ as u64,
+            })
+            .unwrap();
+        thread_control.bind_zone_record(zone.record_ref(record));
+        zone.requeue_preempted(slot, record);
+        assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
+        thread.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(42),
+            carrick_el1_abi::SnapshotGeneration::INITIAL,
+            5,
+        );
+        thread.mm.key.store(1, Ordering::Release);
+        thread.mm.thread_generation.store(107, Ordering::Release);
+        thread.publish_visible_pid(41);
+        thread.publish_lifecycle(&page as *const _ as u64, &thread_control as *const _ as u64);
+        publish_test_birth(&thread_control, &thread);
+        assert!(matches!(
+            registry.for_entry(source, &thread, address),
+            Err(NativeProcessError::Stale)
+        ));
+        assert!(matches!(
+            registry.register_thread(source, &thread, address, &page, &leader_control),
+            Err(NativeProcessError::Stale)
+        ));
+        registry
+            .register_thread(source, &thread, address, &page, &thread_control)
+            .unwrap();
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &child_controls,
+            copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
+            refuse_copy: false,
+            child_copy_error: None,
+            on_signal_clock: None,
+        };
+        let observed = crate::common_entry::execution_binding(&thread);
+        let process_key = runtime.graph.lock().root_key;
+        let observer_record = zone.record_ref(record);
+        let event = carrick_el1_abi::ExternalSignalRecord::new(
+            carrick_core_abi::EntryEventIdentity::from_binding(observed),
+            observed,
+            observer_record,
+            carrick_el1_abi::SignalEventGeneration::new(NonZeroU64::MIN),
+            carrick_signal_core::policy::Signal::from_number(2).unwrap(),
+            carrick_el1_abi::ExternalSignalSource::Terminal,
+        )
+        .for_process(
+            carrick_core_abi::EntryTaskKey::from_raw(process_key.id.raw() as u64),
+            carrick_core_abi::BirthSerial::of_task(process_key.serial),
+        );
+        assert!(registry.for_external_event(&zone, event).is_some());
+        let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+        queue.admit(event).unwrap();
+        let mut process = runtime
+            .enter_registered(
+                registry,
+                source,
+                &thread,
+                address,
+                &words(address),
+                &mut service,
+            )
+            .unwrap();
+        // Retire the registered observer, retaining the leader and its process.
+        process.retire_thread_identity(42);
+        assert!(registry.for_external_event(&zone, event).is_some());
+        let retired = carrick_core::entry::retire_current(observed, source, record).unwrap();
+        let _ = retired;
+        drop(observer_claim);
+        drop(process);
+        let leader_record = runtime.task_binding(process_key).unwrap().record;
+        zone.requeue_preempted(slot, leader_record.id);
+        assert_eq!(zone.switch_in_full(slot).unwrap().record, leader_record.id);
+        let mut leader_entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &leader,
+                address,
+                &words(address),
+                &mut service,
+            )
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } =
+            leader_entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("surviving leader fork refused");
+        };
+        assert_eq!(result.raw(), 42);
+        let child = runtime.namespace_child_key(process_key, 42).unwrap();
+        let state = registry.state.lock();
+        let reused_key = state
+            .by_process
+            .get(&(core::ptr::from_ref(&*zone).addr(), child))
+            .unwrap()
+            .1[0];
+        let reused_member = state.members.get(&reused_key).unwrap();
+        assert_eq!(
+            reused_key.binding().task,
+            observed.task,
+            "internal TaskId must be reused"
+        );
+        assert_eq!(reused_key.binding().generation, observed.generation);
+        assert_ne!(
+            reused_key.binding().thread_generation,
+            observed.thread_generation
+        );
+        assert_ne!(child.serial, process_key.serial);
+        assert_ne!(reused_member.record, observer_record);
+        assert!(
+            !state.records.contains_key(&NativeProcessRegistry::<
+                AddressContext<RootGpa>,
+                ParkedContextWords,
+            >::record_key(&zone, observer_record)),
+            "old record must not trigger the separate record-owner rejection"
+        );
+        let reused_record_identity = zone.record(reused_member.record.id).identity();
+        assert_eq!(reused_record_identity.tid, observed.task.raw());
+        assert_eq!(reused_record_identity.serial, reused_key.thread_generation);
+        drop(state);
+        assert!(
+            registry.for_external_event(&zone, event).is_some(),
+            "valid P1 event must survive observer TaskId reuse by P2"
+        );
+        assert_eq!(
+            registry
+                .drain_external_ingress(&zone, &queue, slot, leader_entry.service)
+                .unwrap(),
+            1
+        );
+        assert!(
+            runtime
+                .current_signals(&leader)
+                .unwrap()
+                .pending_set(leader_record)
+                .contains(event.signal())
+        );
     }
     #[test]
     fn nonleader_thread_forks_through_its_authenticated_process_owner() {
