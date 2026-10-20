@@ -2645,7 +2645,7 @@ mod tests {
 /// metadata and stage-2 retirement stay with their existing owner; this Arc
 /// retains mmap lifetime for outstanding host issuance handles.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct BirthZoneBacking {
     pub(crate) mapping: OwnedHostMapping,
     pub(crate) live: AtomicBool,
