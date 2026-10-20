@@ -569,6 +569,7 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
     )
     .expect("forwarded read continuation");
     let tid = context.thread().key().tid.raw();
+    let _ = carrick_signal_linux::take_pending_event_for(tid);
     carrick_signal_linux::publish_pending_for(tid, 2);
     let event = SignalReadinessProbe::from_continuation(&continuation)
         .event()
@@ -586,6 +587,40 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
     let event = queue.take().unwrap();
     assert_eq!(event.signal().number(), 2);
     assert_eq!(event.scope(), carrick_el1_abi::ExternalSignalScope::Thread);
+    assert_eq!(event.binding().generation.raw(), 1);
+    assert_eq!(event.process_birth(), None);
+    assert_eq!(event.process_target(), None);
+    assert_eq!(carrick_signal_linux::take_pending_for(tid), 0);
+
+    carrick_signal_linux::publish_process_signal(2);
+    let proc_wake = SignalReadinessProbe::from_continuation(&continuation)
+        .event()
+        .expect("process signal wakes forwarded read");
+    assert!(matches!(proc_wake, ContinuationEvent::Signal));
+    let target = super::super::signal_ingress_producer::HostIngressTarget::from_context(&context);
+    assert_eq!(
+        producer
+            .publish(&queue, target, carrick_signal_linux::take_pending_event_for)
+            .unwrap(),
+        super::super::signal_ingress_producer::HostIngressStep::Published
+    );
+    let proc_event = queue.take().unwrap();
+    let expected_birth = carrick_core_abi::BirthSerial::of_task(context.task().key().serial);
+    assert_eq!(proc_event.signal().number(), 2);
+    assert_eq!(
+        proc_event.scope(),
+        carrick_el1_abi::ExternalSignalScope::Process
+    );
+    assert_eq!(proc_event.binding().generation.raw(), 1);
+    assert_eq!(proc_event.process_birth(), Some(expected_birth));
+    assert_ne!(proc_event.binding().generation.raw(), expected_birth.raw());
+    assert_eq!(
+        proc_event.process_target(),
+        carrick_el1_abi::ExternalProcessTarget::new(
+            carrick_core_abi::EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+            expected_birth,
+        )
+    );
     assert_eq!(carrick_signal_linux::take_pending_for(tid), 0);
 }
 
