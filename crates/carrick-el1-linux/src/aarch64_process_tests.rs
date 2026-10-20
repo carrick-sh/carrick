@@ -6225,11 +6225,13 @@ fn arm_unadopted_exit_wakes_unplaceable_closing_owner_without_process_venue() {
     );
 }
 
+#[cfg(test)]
 struct ArmWaitSignalMachine {
     user_sp: UserVa,
     backend: ArmWaitSignalBackend,
 }
 
+#[cfg(test)]
 impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSignalMachine {
     type Backend = ArmWaitSignalBackend;
 
@@ -6267,8 +6269,10 @@ impl crate::signal_delivery::SignalMachine<Aarch64ParkedContext> for ArmWaitSign
     }
 }
 
+#[cfg(test)]
 struct ArmWaitSignalBackend;
 
+#[cfg(test)]
 impl carrick_guest_arch::ArchTypes for ArmWaitSignalBackend {
     type Error = carrick_el1::isa::ArchError;
     type NativeFrame = carrick_el1_abi::TrapFrame;
@@ -6283,6 +6287,7 @@ impl carrick_guest_arch::ArchTypes for ArmWaitSignalBackend {
     type InterruptMask = ();
 }
 
+#[cfg(test)]
 impl carrick_personality_linux::signal::SignalBackend for ArmWaitSignalBackend {
     fn setup_signal_frame(
         &mut self,
@@ -6308,6 +6313,7 @@ impl carrick_personality_linux::signal::SignalBackend for ArmWaitSignalBackend {
 // VM-free binding for kernel.el1.signal-delivery-owner: the scheduler must
 // preserve the original wait4 context across a fresh signal-delivery entry.
 // No guest instructions or hardware user-memory translation execute here.
+#[cfg(test)]
 #[repr(C, align(16))]
 struct ArmWaitSignalStack([u8; 16384]);
 
@@ -6326,6 +6332,7 @@ fn arm_parked_wait4_signal_wake_replaced_record_discards_restart_context() {
     arm_parked_wait4_signal_wake_case(true, true, false);
 }
 
+#[cfg(test)]
 fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member: bool) {
     use carrick_personality_linux::signal::{
         ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
