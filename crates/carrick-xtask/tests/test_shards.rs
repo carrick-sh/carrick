@@ -249,3 +249,17 @@ test-shard-a:
         "expected per-binary feature diff naming alpha/host-test, got: {stderr}"
     );
 }
+
+#[test]
+fn workspace_test_and_shards_agree_including_unconditional_kernel_control() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["--root", root.to_str().unwrap(), "check-test-shards"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
