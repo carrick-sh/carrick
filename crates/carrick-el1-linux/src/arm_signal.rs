@@ -30,7 +30,7 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
     fn restart(
         &self,
         frame: &mut TrapFrame,
-        original: carrick_sched_core::Aarch64ParkedContext,
+        original: &carrick_sched_core::Aarch64ParkedContext,
     ) -> bool {
         frame.x[0] = original.syscall_return();
         if let Some(pc) = frame.elr.checked_sub(4) {
