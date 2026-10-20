@@ -911,7 +911,10 @@ pub struct SignalFrameParams {
     pub signal: Signal,
     pub sigcode: i32,
     pub fault_addr: u64,
+    /// Selected stack pointer base/top for placing the handler frame (`delivery_stack` output).
     pub sp: carrick_guest_arch::UserVa,
+    /// Interrupted user stack pointer before alternate-stack selection, saved in public `ucontext`.
+    pub interrupted_sp: carrick_guest_arch::UserVa,
     pub handler: carrick_guest_arch::UserVa,
     pub restorer: Option<carrick_guest_arch::UserVa>,
     pub mask: carrick_signal_core::policy::SigBlockMask,

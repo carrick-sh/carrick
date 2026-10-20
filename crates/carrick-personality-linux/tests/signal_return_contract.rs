@@ -235,6 +235,7 @@ fn frame_masks_cross_as_blocked_domains() {
         sigcode: 0,
         fault_addr: 0,
         sp: carrick_guest_arch::UserVa::new(0x4000),
+        interrupted_sp: carrick_guest_arch::UserVa::new(0x4000),
         handler: carrick_guest_arch::UserVa::new(0x5000),
         restorer: Some(carrick_guest_arch::UserVa::new(0x6000)),
         mask,
