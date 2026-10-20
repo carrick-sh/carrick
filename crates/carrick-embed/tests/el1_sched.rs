@@ -1062,18 +1062,23 @@ fn el1_sched_signal_reaches_a_wfi_parked_vcpu() {
     );
 }
 
+/// Validate actual build flags at invocation, keeping all build modes compilable.
+fn validate_timing_build(debug_assertions: bool, conformance_metrics: bool) {
+    assert!(!debug_assertions, "timing requires a release executable");
+    assert!(
+        !conformance_metrics,
+        "timing requires an uninstrumented executable"
+    );
+}
+
 /// One release timing sample for the paired signal-delivery runtime driver.
 /// The existing semantic tests retain their smoke-image path.
 #[test]
 #[ignore = "requires explicit pinned image and signed release runtime driver"]
 fn el1_sched_signal_delivery_contract_sample() {
-    assert!(
-        !cfg!(debug_assertions),
-        "timing requires a release executable"
-    );
-    assert!(
-        !cfg!(feature = "conformance-metrics"),
-        "timing requires an uninstrumented executable"
+    validate_timing_build(
+        cfg!(debug_assertions),
+        cfg!(feature = "conformance-metrics"),
     );
     let image = std::env::var("CARRICK_SIGNAL_CONTRACT_IMAGE")
         .expect("CARRICK_SIGNAL_CONTRACT_IMAGE must name image@sha256:digest");
