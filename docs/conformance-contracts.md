@@ -932,8 +932,26 @@ FPSIMD and optional ESR; SVE/SME and out-of-line extra context are refused.
 Authority for this record format is the [public arm64 SVE signal ABI
 documentation](https://www.kernel.org/doc/html/latest/arch/arm64/sve.html#signal-handling)
 and [Arm's Linux Plumbers 2017 signal-frame diagrams](https://blog.linuxplumbersconf.org/2017/ocw/system/presentations/4671/original/plumbers-dm-2017.pdf),
-alongside sigreturn(2). This extraction changes no signal routing and does not
-establish in-ring delivery or alternate-stack restoration.
+alongside [sigreturn(2)](https://man7.org/linux/man-pages/man2/sigreturn.2.html)
+and the Arm Architecture Reference Manual for A-profile (`SPSR_EL1` / `PSTATE`
+EL0 condition and execution-state fields `NZCV[31:28]`, `DIT[24]`, `SSBS[12]`
+versus privileged `M[4:0]` and `DAIF[9:6]`). On signal delivery, `arm_signal::build`
+masks internal EL1/EL0 execution-control bits (`0x3c0` in masked mode or `0x340`
+in GIC mode) out of `uc_mcontext.pstate` via `AARCH64_EL0_USER_PSTATE_MASK`
+while preserving legal guest EL0 flags, and `SignalFrameParams` carries
+`interrupted_sp` separately from the selected placement `sp` so `uc_mcontext.sp`
+records the interrupted user SP even when `SA_ONSTACK` places the handler frame
+on the alternate stack (matching native arm64 Linux oracle
+`sha256:5e927c284bf55a7dc796262e311a0703344f62f41f5621eb56843111b1d37e15`:
+`sa_onstack frame_on_alt=1 saved_sp_on_alt=0 pstate=0x60000000`). On `rt_sigreturn`,
+`arm::decode` rejects any non-EL0-user `pstate` bit before register or FPSIMD
+publication, and `arm_signal::restore` / `apply_restored_context` re-apply the
+canonical internal EL0 return mask (`0x3c0`, `AARCH64_EL0_VISIBLE_DAIF`; cleared
+of `PSTATE.I` at the `write_el1_hook` `eret` boundary when `El1IrqMode::Gic` is
+active) while preserving legal guest EL0 flags (`arm_signal_delivery_masks_internal_daif_and_preserves_el0_user_pstate_flags`,
+`arm_public_return_restores_internal_daif_and_preserves_el0_user_flags`,
+`arm_signal_delivery_separates_interrupted_sp_from_altstack_placement`, and
+`production_deliver_signal_with_control_preserves_interrupted_sp_and_masks_daif`).
 
 The ARM `sigaltstack` setup case of `kernel.el1.signal-delivery-owner`
 uses the VM-free `sigaltstack_serves_off_the_alternate_stack` witness. Native

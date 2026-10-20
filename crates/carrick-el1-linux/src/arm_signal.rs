@@ -117,6 +117,28 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
     )
 }
 
+/// Internal EL0t DAIF mask stored in `TrapFrame.spsr` and `ThreadCtx.pstate` across the EL1
+/// kernel. In `El1IrqMode::Gic`, the EL1 vector hook (`carrick-mem::write_el1_hook`) clears
+/// `PSTATE.I` (`0x80`) from `TrapFrame.spsr` right before `msr spsr_el1, x1; eret`; in both
+/// modes, `TrapFrame.spsr | PSTATE_I == 0x3c0` is the required internal return invariant.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+const AARCH64_INTERNAL_EL0_RETURN_DAIF: u64 = 0x3c0;
+
+#[cfg(any(
+    test,
+    feature = "host-test",
+    all(target_os = "none", target_arch = "aarch64")
+))]
+const fn public_el0_pstate(internal_spsr: u64) -> u64 {
+    internal_spsr & carrick_syscall_abi::AARCH64_EL0_USER_PSTATE_MASK
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+const fn internal_el0_return_spsr(public_pstate: u64) -> u64 {
+    (public_pstate & carrick_syscall_abi::AARCH64_EL0_USER_PSTATE_MASK)
+        | AARCH64_INTERNAL_EL0_RETURN_DAIF
+}
+
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(crate) fn restore(
     frame: &mut TrapFrame,
@@ -139,7 +161,7 @@ pub(crate) fn restore(
     fpstate.copy_from_slice(fp.as_bytes());
     frame.x = resume.regs;
     frame.elr = resume.pc.raw();
-    frame.spsr = resume.pstate;
+    frame.spsr = internal_el0_return_spsr(resume.pstate);
     Ok((resume.mask.signals().bits(), resume.sp.raw(), stack))
 }
 
@@ -171,7 +193,7 @@ pub(crate) fn apply_restored_context(
 ) {
     context.x = frame.x;
     context.pc = frame.elr;
-    context.pstate = frame.spsr;
+    context.pstate = internal_el0_return_spsr(frame.spsr);
     context.sp_el0 = sp;
     context.v = fp.vregs;
     context.fpsr = u64::from(fp.fpsr);
@@ -230,8 +252,8 @@ pub(crate) fn build(
     let context = &mut signal.rt.ucontext.uc_mcontext;
     context.regs = frame.x;
     context.pc = frame.elr;
-    context.sp = params.sp.raw();
-    context.pstate = frame.spsr;
+    context.sp = params.interrupted_sp.raw();
+    context.pstate = public_el0_pstate(frame.spsr);
     context.fault_address = params.fault_addr;
     signal.rt.ucontext.uc_stack = params.stack;
     signal.rt.ucontext.uc_sigmask = params.mask.signals().bits();
@@ -465,6 +487,7 @@ mod tests {
             sigcode: 0,
             fault_addr: 0,
             sp: UserVa::new(0x20000),
+            interrupted_sp: UserVa::new(0x20000),
             handler: UserVa::new(0x30000),
             restorer: Some(UserVa::new(0x40000)),
             mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
@@ -728,5 +751,229 @@ mod tests {
         records[528..532].copy_from_slice(&0x4553_5201_u32.to_le_bytes());
         records[532..536].copy_from_slice(&3568_u32.to_le_bytes());
         refused_without_publication(signal);
+    }
+
+    #[test]
+    fn arm_signal_delivery_masks_internal_daif_and_preserves_el0_user_pstate_flags() {
+        use carrick_personality_linux::signal::SignalFrameParams;
+        use carrick_syscall_abi::AARCH64_EL0_USER_PSTATE_MASK;
+
+        let fp = LinuxFpsimdContext::empty();
+        // Positive controls: internal EL0 SPSR carries either masked DAIF (0x3c0) or GIC-unmasked
+        // IRQ DAIF (0x340) plus legal EL0 condition/execution flags (e.g. Z+C = 0x6000_0000 from
+        // the native arm64 oracle, all admitted EL0 user bits NZCV|DIT|SSBS, or zero).
+        for internal_daif in [0x3c0_u64, 0x340_u64] {
+            for user_flags in [0_u64, 0x6000_0000_u64, AARCH64_EL0_USER_PSTATE_MASK] {
+                let mut frame = TrapFrame::default();
+                frame.x[0] = 0xdead_beef;
+                frame.elr = 0x10000;
+                frame.spsr = user_flags | internal_daif;
+                let params = SignalFrameParams {
+                    stack: carrick_syscall_abi::LinuxSignalStack::empty(),
+                    signal: carrick_signal_core::policy::Signal::from_number(10).unwrap(),
+                    sigcode: 0,
+                    fault_addr: 0,
+                    sp: UserVa::new(0x20000),
+                    interrupted_sp: UserVa::new(0x20000),
+                    handler: UserVa::new(0x30000),
+                    restorer: Some(UserVa::new(0x40000)),
+                    mask: carrick_signal_core::policy::SigBlockMask::NONE,
+                };
+                let (handler_sp, bytes) = build(&frame, params, None, fp.as_bytes()).expect(
+                    "valid interrupted EL0 SPSR with internal DAIF must build a public frame",
+                );
+                let built = arm::SignalFrame::ref_from_bytes(&bytes).unwrap();
+                let public_pstate = built.rt.ucontext.uc_mcontext.pstate;
+                assert_eq!(
+                    public_pstate, user_flags,
+                    "public uc_mcontext.pstate must expose legal EL0 flags without internal DAIF bits"
+                );
+                assert_eq!(public_pstate & !AARCH64_EL0_USER_PSTATE_MASK, 0);
+
+                // Roundtrip restore must re-apply internal EL0 DAIF mask (0x3c0) while preserving
+                // the guest's legal EL0 user flags in both TrapFrame.spsr and ThreadCtx.pstate.
+                let mut restored_frame = TrapFrame::default();
+                let mut restored_fp = [0_u8; 528];
+                let (_, restored_sp, _) =
+                    restore(&mut restored_frame, &built.rt, &mut restored_fp, handler_sp)
+                        .expect("public frame built from interrupted EL0 state must restore");
+                assert_eq!(restored_frame.spsr, user_flags | 0x3c0);
+                let mut thread_ctx = carrick_sched_core::ThreadCtx::ZERO;
+                apply_restored_context(&mut thread_ctx, &restored_frame, &fp, restored_sp);
+                assert_eq!(thread_ctx.pstate, user_flags | 0x3c0);
+            }
+        }
+
+        // Negative controls: any privileged/internal bit in public ucontext.uc_mcontext.pstate
+        // (EL1h 0x5, AArch32 0x10, any DAIF bit 0x40..0x200, IL 1<<20, PAN 1<<22) is rejected
+        // before mutating TrapFrame, FPSIMD, or ThreadCtx.
+        for bad_bit in [
+            0x5_u64,
+            0x10,
+            1 << 6,
+            1 << 7,
+            1 << 8,
+            1 << 9,
+            0x3c0,
+            1 << 20,
+            1 << 22,
+        ] {
+            let mut forged = valid();
+            forged.ucontext.uc_mcontext.pstate = 0x6000_0000 | bad_bit;
+            refused_without_publication(forged);
+        }
+    }
+
+    #[test]
+    fn arm_public_return_restores_internal_daif_and_preserves_el0_user_flags() {
+        use carrick_syscall_abi::AARCH64_EL0_USER_PSTATE_MASK;
+
+        let fp = LinuxFpsimdContext::empty();
+        // Standalone restore-only witness: starts from an already valid public RtSigframe
+        // (independent of build()) with legal EL0 user flags in uc_mcontext.pstate.
+        // Internal authority: carrick-mem/src/memory.rs:5078-5083 (write_el1_hook) loads
+        // TrapFrame.spsr and, when El1IrqMode::Gic is active, clears PSTATE.I (0x80) via
+        // `bic x1, x1, #0x80` right before `msr spsr_el1, x1`; carrick-mem/src/memory/
+        // el1_hook_kick.rs:533 requires `spsr | PSTATE_I == 0x3c0` (EL0_DAIF_MASKED) on
+        // every EL0 return. Therefore restore() and apply_restored_context() must re-apply
+        // the canonical internal EL0 DAIF mask (0x3c0) while preserving legal EL0 user flags.
+        for user_flags in [0_u64, 0x6000_0000_u64, AARCH64_EL0_USER_PSTATE_MASK] {
+            let mut signal = valid();
+            signal.ucontext.uc_mcontext.pstate = user_flags;
+            let mut restored_frame = TrapFrame::default();
+            let mut restored_fp = [0_u8; 528];
+            let (_, restored_sp, _) = restore(
+                &mut restored_frame,
+                &signal,
+                &mut restored_fp,
+                UserVa::new(0x40000),
+            )
+            .expect("valid public RtSigframe must decode and restore");
+            assert_eq!(
+                restored_frame.spsr,
+                user_flags | 0x3c0,
+                "restore must re-apply internal EL0 DAIF mask (0x3c0) to TrapFrame.spsr"
+            );
+            let mut thread_ctx = carrick_sched_core::ThreadCtx::ZERO;
+            apply_restored_context(&mut thread_ctx, &restored_frame, &fp, restored_sp);
+            assert_eq!(
+                thread_ctx.pstate,
+                user_flags | 0x3c0,
+                "apply_restored_context must preserve internal EL0 DAIF mask (0x3c0) in ThreadCtx.pstate"
+            );
+        }
+    }
+
+    #[test]
+    fn arm_signal_delivery_separates_interrupted_sp_from_altstack_placement() {
+        use carrick_personality_linux::abi::thread::AltStack;
+        use carrick_personality_linux::signal::{SignalFrameParams, delivery_stack};
+        use carrick_signal_core::policy::{SigBlockMask, Signal};
+
+        // Reproduces the exact delivery_stack -> SignalFrameParams -> setup_arm_signal_frame
+        // pipeline from signal_delivery::deliver_signal_with_control.
+        let deliver_case = |altstack: AltStack, on_stack: bool, interrupted_sp_raw: u64| {
+            let interrupted_sp = UserVa::new(interrupted_sp_raw);
+            let (sp, stack) = delivery_stack(altstack, interrupted_sp, on_stack)
+                .expect("delivery_stack selection must succeed");
+            let params = SignalFrameParams {
+                stack,
+                signal: Signal::from_number(10).unwrap(),
+                sigcode: 0,
+                fault_addr: 0,
+                handler: UserVa::new(0x7000),
+                restorer: Some(UserVa::new(0x8000)),
+                mask: SigBlockMask::NONE,
+                sp,
+                interrupted_sp,
+            };
+            let mut frame = TrapFrame {
+                elr: 0x10000,
+                spsr: 0x6000_0000 | 0x3c0,
+                ..Default::default()
+            };
+            let fp = LinuxFpsimdContext::empty();
+            let mut written: Option<(UserVa, Vec<u8>)> = None;
+            let handler_sp = setup_arm_signal_frame(
+                &mut frame,
+                params,
+                None,
+                fp.as_bytes(),
+                &mut |va, bytes| {
+                    written = Some((va, bytes.to_vec()));
+                    true
+                },
+            )
+            .expect("setup_arm_signal_frame must succeed");
+            let (written_va, written_bytes) = written.expect("signal frame bytes must be written");
+            assert_eq!(written_va, handler_sp);
+            let decoded = arm::SignalFrame::ref_from_bytes(&written_bytes).unwrap();
+            (handler_sp.raw(), *decoded)
+        };
+
+        let altstack = AltStack {
+            sp: 0x10_0000,
+            size: 0x4000,
+            flags: 0,
+        };
+        let main_sp = 0x20_0000_u64;
+
+        // 1. SA_ONSTACK when off-altstack: frame is placed on altstack [0x10_0000, 0x10_4000),
+        // while saved uc_mcontext.sp preserves the interrupted user SP (0x20_0000).
+        let (onstack_handler_sp, onstack_frame) = deliver_case(altstack, true, main_sp);
+        assert!(
+            (0x10_0000..0x10_4000).contains(&onstack_handler_sp),
+            "SA_ONSTACK handler SP {onstack_handler_sp:#x} must be placed on the alternate stack"
+        );
+        let saved_sp = onstack_frame.rt.ucontext.uc_mcontext.sp;
+        let saved_pstate = onstack_frame.rt.ucontext.uc_mcontext.pstate;
+        let saved_stack = onstack_frame.rt.ucontext.uc_stack;
+        assert_eq!(
+            saved_sp, main_sp,
+            "uc_mcontext.sp under SA_ONSTACK must preserve interrupted user SP, not altstack top"
+        );
+        assert_eq!(saved_pstate, 0x6000_0000);
+        let saved_stack_fields = (saved_stack.ss_sp, saved_stack.ss_size, saved_stack.ss_flags);
+        assert_eq!(saved_stack_fields, (0x10_0000, 0x4000, 0));
+
+        // 2. Counterexample: enabled altstack, but handler registered WITHOUT SA_ONSTACK:
+        // frame is placed on the normal stack below main_sp, saved uc_mcontext.sp is main_sp,
+        // and uc_stack still records the configured altstack without forcing altstack placement.
+        let (non_onstack_sp, non_onstack_frame) = deliver_case(altstack, false, main_sp);
+        assert!(
+            non_onstack_sp < main_sp && non_onstack_sp > 0x1f_0000,
+            "non-SA_ONSTACK handler SP {non_onstack_sp:#x} must stay on the interrupted stack"
+        );
+        let non_onstack_saved_sp = non_onstack_frame.rt.ucontext.uc_mcontext.sp;
+        let non_onstack_stack = non_onstack_frame.rt.ucontext.uc_stack;
+        assert_eq!(non_onstack_saved_sp, main_sp);
+        let non_onstack_stack_fields = (
+            non_onstack_stack.ss_sp,
+            non_onstack_stack.ss_size,
+            non_onstack_stack.ss_flags,
+        );
+        assert_eq!(non_onstack_stack_fields, (0x10_0000, 0x4000, 0));
+
+        // 3. Nested SA_ONSTACK: interrupted SP is already on altstack (onstack_handler_sp).
+        // Delivery must grow down from onstack_handler_sp (not reset to altstack top 0x10_4000),
+        // preserve uc_mcontext.sp == onstack_handler_sp, and report SS_ONSTACK in uc_stack.ss_flags.
+        let (nested_sp, nested_frame) = deliver_case(altstack, true, onstack_handler_sp);
+        assert!(
+            nested_sp < onstack_handler_sp && nested_sp >= 0x10_0000,
+            "nested SA_ONSTACK SP {nested_sp:#x} must grow down from outer altstack SP {onstack_handler_sp:#x}"
+        );
+        let nested_saved_sp = nested_frame.rt.ucontext.uc_mcontext.sp;
+        let nested_flags = nested_frame.rt.ucontext.uc_stack.ss_flags;
+        assert_eq!(nested_saved_sp, onstack_handler_sp);
+        assert_eq!(nested_flags, carrick_syscall_abi::LINUX_SS_ONSTACK as i32);
+
+        // 4. Disabled altstack control: frame is placed below main_sp, uc_mcontext.sp == main_sp,
+        // and uc_stack reports SS_DISABLE.
+        let (disabled_sp, disabled_frame) = deliver_case(AltStack::DISABLED, true, main_sp);
+        assert_eq!(disabled_sp, non_onstack_sp);
+        let disabled_saved_sp = disabled_frame.rt.ucontext.uc_mcontext.sp;
+        let disabled_flags = disabled_frame.rt.ucontext.uc_stack.ss_flags;
+        assert_eq!(disabled_saved_sp, main_sp);
+        assert_eq!(disabled_flags, carrick_syscall_abi::LINUX_SS_DISABLE as i32);
     }
 }

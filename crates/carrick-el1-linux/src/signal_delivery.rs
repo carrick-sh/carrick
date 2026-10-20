@@ -133,6 +133,7 @@ where
                 restorer: action.restorer.map(|r| UserVa::new(r.0)),
                 mask: saved_mask,
                 sp,
+                interrupted_sp,
             };
             let info_bytes = info.as_ref().map(|i| {
                 // SAFETY: a borrowed ABI record is contiguous for its own size.
@@ -255,5 +256,63 @@ mod altstack_tests {
         .unwrap();
         let flags = restored.flags;
         assert_eq!(flags, carrick_syscall_abi::LINUX_SS_AUTODISARM as u32);
+    }
+
+    #[test]
+    fn production_deliver_signal_with_control_preserves_interrupted_sp_and_masks_daif() {
+        use crate::native_process_runtime::host_test_support::{
+            NativeSignalFixture, take_signal_copies,
+        };
+        use carrick_core_abi::{
+            EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+        };
+        use carrick_personality_linux::signal::arm;
+        use zerocopy::FromBytes;
+
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(777),
+            generation: SnapshotGeneration::from_raw(1),
+            mm: EntryMmKey::from_raw(1),
+            thread_generation: EntryThreadGeneration::from_raw(1),
+        };
+        let fixture = NativeSignalFixture::new(binding, EntryTaskKey::from_raw(777));
+        fixture.install_sigint_handler(false);
+
+        let _ = take_signal_copies();
+        let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+        queue
+            .admit(carrick_el1_abi::ExternalSignalRecord::new(
+                carrick_core_abi::EntryEventIdentity::from_binding(binding),
+                binding,
+                fixture.record(),
+                carrick_el1_abi::SignalEventGeneration::new(core::num::NonZeroU64::MIN),
+                carrick_signal_core::policy::Signal::from_number(2).unwrap(),
+                carrick_el1_abi::ExternalSignalSource::Terminal,
+            ))
+            .unwrap();
+        let mut frame = carrick_el1_abi::TrapFrame {
+            elr: 0x40_0000,
+            // Interrupted EL0 SPSR with Z+C flags (0x6000_0000) and internal EL0 DAIF (0x3c0).
+            // Before the fix, deliver_signal_with_control -> setup_arm_signal_frame -> build
+            // fails in arm::encode because 0x3c0 is rejected by validate_pstate, causing
+            // deliver_signal_with_control to take force_delivery_fault (SIGSEGV) instead of
+            // writing the handler frame!
+            spsr: 0x6000_03c0,
+            ..Default::default()
+        };
+        let (drained, route) = fixture.drain_and_deliver(&queue, &mut frame);
+        assert_eq!(drained, 1);
+        assert_eq!(
+            route, None,
+            "deliver_signal_with_control must deliver SIGINT to handler without faulting on internal DAIF"
+        );
+        let copies = take_signal_copies();
+        assert_eq!(copies.len(), 1, "signal frame must be copied to user stack");
+        let (_, bytes) = &copies[0];
+        let built = arm::SignalFrame::ref_from_bytes(bytes).unwrap();
+        let saved_sp = built.rt.ucontext.uc_mcontext.sp;
+        let saved_pstate = built.rt.ucontext.uc_mcontext.pstate;
+        assert_eq!(saved_sp, 0x40_0000);
+        assert_eq!(saved_pstate, 0x6000_0000);
     }
 }
