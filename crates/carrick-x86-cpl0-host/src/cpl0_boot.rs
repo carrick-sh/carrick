@@ -3613,7 +3613,7 @@ impl Drop for BirthSourceRevocation {
     }
 }
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 struct PhysicalBirthSource {
     live: Arc<std::sync::RwLock<bool>>,
     _ram: Arc<GuestRam>,
