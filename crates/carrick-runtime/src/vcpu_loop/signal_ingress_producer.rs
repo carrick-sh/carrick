@@ -16,7 +16,7 @@ pub(crate) struct HostIngressTarget {
     record: RecordRef,
     bridge_thread: carrick_hal::ThreadId,
     process_id: carrick_core_abi::EntryTaskKey,
-    process_generation: carrick_core_abi::SnapshotGeneration,
+    process_birth: carrick_core_abi::BirthSerial,
 }
 
 impl HostIngressTarget {
@@ -49,9 +49,7 @@ impl HostIngressTarget {
             process_id: carrick_core_abi::EntryTaskKey::from_raw(
                 context.task().key().id.raw() as u64
             ),
-            process_generation: carrick_core_abi::SnapshotGeneration::from_raw(
-                context.task().key().serial.raw(),
-            ),
+            process_birth: carrick_core_abi::BirthSerial::of_task(context.task().key().serial),
         })
     }
 }
@@ -143,9 +141,7 @@ impl HostSignalIngressProducer {
         )
         .with_timer_info(timer);
         if bridge_event.scope == carrick_hal::PendingSignalScope::Process {
-            event = event
-                .process_directed()
-                .for_process(target.process_id, target.process_generation);
+            event = event.for_process(target.process_id, target.process_birth);
         }
         match queue.admit(event) {
             Ok(()) => Ok(HostIngressStep::Published),
@@ -171,14 +167,15 @@ impl HostSignalIngressProducer {
 mod tests {
     use super::*;
     use carrick_core_abi::{
-        EntryEventIdentity, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
-        SnapshotGeneration,
+        BirthSerial, EntryEventIdentity, EntryMmKey, EntryTaskKey, EntryThreadGeneration,
+        ExecutionBinding, SnapshotGeneration,
     };
     use carrick_el1_abi::{
-        ExternalSignalRecord, ExternalSignalSource, SignalEventGeneration, SignalIngressQueue,
+        ExternalProcessTarget, ExternalSignalRecord, ExternalSignalSource, SignalEventGeneration,
+        SignalIngressQueue,
     };
     use carrick_personality_linux::signal::policy::Signal;
-    use carrick_sched_core::{RecordId, RecordRef};
+    use carrick_sched_core::{RecordId, RecordRef, process::TaskSerial};
     use core::num::NonZeroU64;
 
     #[test]
@@ -207,6 +204,11 @@ mod tests {
         assert_eq!(target.binding.task.raw(), 100);
         assert_eq!(target.binding.generation.raw(), 1);
         assert_eq!(target.bridge_thread.raw(), 217);
+        assert_eq!(
+            target.process_birth,
+            BirthSerial::of_task(context.task().key().serial)
+        );
+        assert_ne!(target.binding.generation.raw(), target.process_birth.raw());
     }
 
     #[test]
@@ -246,14 +248,21 @@ mod tests {
         let prepared = kernel.prepare_exec(&context, None).unwrap();
         let replacement = kernel.commit_exec(prepared, None).unwrap();
         let queued = queue.take().unwrap();
+        let expected_birth = BirthSerial::of_task(replacement.task().key().serial);
         assert_eq!(replacement.task().key().serial, before.serial);
-        assert_eq!(
-            queued.process_generation().raw(),
-            replacement.task().key().serial.raw()
-        );
+        assert_eq!(queued.binding().generation.raw(), 1);
+        assert_eq!(queued.process_birth(), Some(expected_birth));
+        assert_ne!(queued.binding().generation.raw(), expected_birth.raw());
         assert_eq!(
             queued.process_id().raw(),
             replacement.task().key().id.raw() as u64
+        );
+        assert_eq!(
+            queued.process_target(),
+            ExternalProcessTarget::new(
+                EntryTaskKey::from_raw(replacement.task().key().id.raw() as u64),
+                expected_birth,
+            )
         );
         assert_eq!(
             queued.scope(),
@@ -376,6 +385,10 @@ mod tests {
                 HostIngressStep::Published
             );
             let event = queue.take().unwrap();
+            assert_eq!(event.scope(), carrick_el1_abi::ExternalSignalScope::Thread);
+            assert_eq!(event.process_id(), EntryTaskKey::from_raw(0));
+            assert_eq!(event.process_birth(), None);
+            assert_eq!(event.process_target(), None);
             let live_binding = ExecutionBinding {
                 task: EntryTaskKey::from_raw(tid as u64),
                 generation: SnapshotGeneration::from_raw(expected_gen),
@@ -413,15 +426,14 @@ mod tests {
             HostIngressStep::Published
         );
         let proc_event = queue.take().unwrap();
+        let expected_birth = BirthSerial::of_task(second.task().key().serial);
         assert_eq!(
             proc_event.scope(),
             carrick_el1_abi::ExternalSignalScope::Process
         );
         assert_eq!(proc_event.binding().generation.raw(), 3);
-        assert_eq!(
-            proc_event.process_generation().raw(),
-            second.task().key().serial.raw()
-        );
+        assert_eq!(proc_event.process_birth(), Some(expected_birth));
+        assert_ne!(proc_event.binding().generation.raw(), expected_birth.raw());
     }
 
     #[test]
@@ -454,7 +466,7 @@ mod tests {
             record,
             bridge_thread: carrick_hal::ThreadId::synthetic_for_tests(41),
             process_id: EntryTaskKey::from_raw(41),
-            process_generation: SnapshotGeneration::from_raw(11),
+            process_birth: BirthSerial::of_task(TaskSerial::from_raw_u64(5).unwrap()),
         };
         let mut producer = HostSignalIngressProducer::new();
         let mut consumed = 0;
@@ -495,6 +507,11 @@ mod tests {
         assert_eq!(delivered.signal(), Signal::from_number(2).unwrap());
         assert_eq!(delivered.binding(), binding);
         assert_eq!(delivered.record(), record);
+        assert_eq!(
+            delivered.scope(),
+            carrick_el1_abi::ExternalSignalScope::Thread
+        );
+        assert_eq!(delivered.process_birth(), None);
         assert!(queue.take().is_none());
     }
 
@@ -503,10 +520,11 @@ mod tests {
         let queue = SignalIngressQueue::<2>::new();
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(61),
-            generation: SnapshotGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(1),
             mm: EntryMmKey::from_raw(301),
             thread_generation: EntryThreadGeneration::from_raw(101),
         };
+        let process_birth = BirthSerial::of_task(TaskSerial::from_raw_u64(5).unwrap());
         let target = HostIngressTarget {
             binding,
             record: RecordRef {
@@ -515,7 +533,7 @@ mod tests {
             },
             bridge_thread: carrick_hal::ThreadId::synthetic_for_tests(61),
             process_id: EntryTaskKey::from_raw(61),
-            process_generation: SnapshotGeneration::from_raw(11),
+            process_birth,
         };
         carrick_signal_linux::publish_process_signal(2);
         let mut producer = HostSignalIngressProducer::new();
@@ -529,10 +547,14 @@ mod tests {
                 .unwrap(),
             HostIngressStep::Published
         );
+        let sigint = queue.take().unwrap();
         assert_eq!(
-            queue.take().unwrap().scope(),
+            sigint.scope(),
             carrick_el1_abi::ExternalSignalScope::Process
         );
+        assert_eq!(sigint.binding().generation.raw(), 1);
+        assert_eq!(sigint.process_birth(), Some(process_birth));
+        assert_ne!(sigint.binding().generation.raw(), process_birth.raw());
 
         let timer = carrick_signal_linux::PendingTimerInfo {
             id: 9,
@@ -552,6 +574,8 @@ mod tests {
         );
         let event = queue.take().unwrap();
         assert_eq!(event.scope(), carrick_el1_abi::ExternalSignalScope::Process);
+        assert_eq!(event.binding().generation.raw(), 1);
+        assert_eq!(event.process_birth(), Some(process_birth));
         assert_eq!(event.source(), ExternalSignalSource::PosixTimer);
         assert_eq!(event.timer_info().id, timer.id);
         assert_eq!(event.timer_info().overrun, timer.overrun);

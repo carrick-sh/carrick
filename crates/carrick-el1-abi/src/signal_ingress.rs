@@ -13,7 +13,7 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Transport protocol for the shared ARM EL1 / x86 CPL0 ingress record.
-pub const SIGNAL_INGRESS_PROTOCOL: u64 = 6;
+pub const SIGNAL_INGRESS_PROTOCOL: u64 = 7;
 
 /// Shared queue capacity; event producers must retain ownership on fullness.
 pub const SIGNAL_INGRESS_CAPACITY: usize = 64;
@@ -31,7 +31,7 @@ pub const fn signal_ingress_offsets_hash() -> u64 {
         core::mem::offset_of!(ExternalSignalRecord, source) as u64,
         core::mem::offset_of!(ExternalSignalRecord, scope) as u64,
         core::mem::offset_of!(ExternalSignalRecord, process_id) as u64,
-        core::mem::offset_of!(ExternalSignalRecord, process_generation) as u64,
+        core::mem::offset_of!(ExternalSignalRecord, process_birth) as u64,
         core::mem::offset_of!(ExternalSignalRecord, timer) as u64,
         core::mem::offset_of!(SignalIngressSlot, sequence) as u64,
         core::mem::offset_of!(SignalIngressSlot, record) as u64,
@@ -93,6 +93,38 @@ pub enum ExternalSignalScope {
     Thread = 2,
 }
 
+/// Durable process incarnation targeted by a process-directed external signal.
+///
+/// The process incarnation is a [`carrick_core_abi::BirthSerial`] (the owning
+/// task's registry serial), never a thread's [`carrick_core_abi::SnapshotGeneration`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct ExternalProcessTarget {
+    id: carrick_core_abi::EntryTaskKey,
+    birth: carrick_core_abi::BirthSerial,
+}
+
+impl ExternalProcessTarget {
+    pub const fn new(
+        id: carrick_core_abi::EntryTaskKey,
+        birth: carrick_core_abi::BirthSerial,
+    ) -> Option<Self> {
+        if id.raw() == 0 {
+            None
+        } else {
+            Some(Self { id, birth })
+        }
+    }
+
+    pub const fn id(self) -> carrick_core_abi::EntryTaskKey {
+        self.id
+    }
+
+    pub const fn birth(self) -> carrick_core_abi::BirthSerial {
+        self.birth
+    }
+}
+
 /// Identity and source of one external event. The source-specific payload is
 /// added with the producer; this record does not authorize signal delivery by
 /// itself. In particular, a numeric Linux tid is never an identity check.
@@ -107,7 +139,7 @@ pub struct ExternalSignalRecord {
     source: ExternalSignalSource,
     scope: ExternalSignalScope,
     process_id: carrick_core_abi::EntryTaskKey,
-    process_generation: carrick_core_abi::SnapshotGeneration,
+    process_birth: Option<carrick_core_abi::BirthSerial>,
     timer: ExternalSignalTimerInfo,
 }
 
@@ -159,8 +191,8 @@ impl ExternalSignalRecord {
             signal,
             source,
             scope: ExternalSignalScope::Thread,
-            process_id: binding.task,
-            process_generation: binding.generation,
+            process_id: carrick_core_abi::EntryTaskKey::from_raw(0),
+            process_birth: None,
             timer: ExternalSignalTimerInfo {
                 id: 0,
                 overrun: 0,
@@ -169,31 +201,43 @@ impl ExternalSignalRecord {
         }
     }
 
-    pub const fn process_directed(mut self) -> Self {
-        self.scope = ExternalSignalScope::Process;
-        self
-    }
-
     pub const fn scope(self) -> ExternalSignalScope {
         self.scope
     }
 
+    /// Promote this record to process scope with an explicit durable process
+    /// incarnation. Thread execution snapshot generations cannot be passed as
+    /// [`carrick_core_abi::BirthSerial`].
     pub const fn for_process(
         mut self,
         id: carrick_core_abi::EntryTaskKey,
-        generation: carrick_core_abi::SnapshotGeneration,
+        birth: carrick_core_abi::BirthSerial,
     ) -> Self {
+        self.scope = ExternalSignalScope::Process;
         self.process_id = id;
-        self.process_generation = generation;
+        self.process_birth = Some(birth);
         self
+    }
+
+    pub const fn for_process_target(self, target: ExternalProcessTarget) -> Self {
+        self.for_process(target.id(), target.birth())
+    }
+
+    pub const fn process_target(self) -> Option<ExternalProcessTarget> {
+        match (self.scope, self.process_birth) {
+            (ExternalSignalScope::Process, Some(birth)) => {
+                ExternalProcessTarget::new(self.process_id, birth)
+            }
+            _ => None,
+        }
     }
 
     pub const fn process_id(self) -> carrick_core_abi::EntryTaskKey {
         self.process_id
     }
 
-    pub const fn process_generation(self) -> carrick_core_abi::SnapshotGeneration {
-        self.process_generation
+    pub const fn process_birth(self) -> Option<carrick_core_abi::BirthSerial> {
+        self.process_birth
     }
 
     pub const fn signal(self) -> Signal {
@@ -511,6 +555,53 @@ mod tests {
                 ..record
             }
         ));
+    }
+
+    #[test]
+    fn external_event_separates_execution_snapshot_from_process_birth() {
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(41),
+            generation: SnapshotGeneration::from_raw(1),
+            mm: EntryMmKey::from_raw(301),
+            thread_generation: EntryThreadGeneration::from_raw(101),
+        };
+        let record = RecordRef {
+            id: RecordId::from_raw(4).unwrap(),
+            incarnation: 9,
+        };
+        let identity = EntryEventIdentity::from_binding(binding);
+        let thread_event = ExternalSignalRecord::new(
+            identity,
+            binding,
+            record,
+            SignalEventGeneration::new(NonZeroU64::new(1).unwrap()),
+            Signal::from_number(2).unwrap(),
+            ExternalSignalSource::Terminal,
+        );
+        assert_eq!(thread_event.scope(), ExternalSignalScope::Thread);
+        assert_eq!(thread_event.process_id(), EntryTaskKey::from_raw(0));
+        assert_eq!(thread_event.process_birth(), None);
+        assert_eq!(thread_event.process_target(), None);
+
+        let birth = carrick_core_abi::BirthSerial::of_task(
+            carrick_sched_core::process::TaskSerial::from_raw_u64(5).unwrap(),
+        );
+        let process_event = thread_event.for_process(EntryTaskKey::from_raw(41), birth);
+        assert_eq!(process_event.scope(), ExternalSignalScope::Process);
+        assert_eq!(
+            process_event.binding().generation,
+            SnapshotGeneration::from_raw(1)
+        );
+        assert_eq!(process_event.process_id(), EntryTaskKey::from_raw(41));
+        assert_eq!(process_event.process_birth(), Some(birth));
+        assert_ne!(process_event.binding().generation.raw(), birth.raw());
+        assert_eq!(
+            process_event.process_target(),
+            ExternalProcessTarget::new(EntryTaskKey::from_raw(41), birth)
+        );
+
+        let unissued_process = thread_event.for_process(EntryTaskKey::from_raw(0), birth);
+        assert_eq!(unissued_process.process_target(), None);
     }
 
     #[test]
