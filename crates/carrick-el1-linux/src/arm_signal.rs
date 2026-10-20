@@ -120,7 +120,8 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
 /// Internal EL0t DAIF mask stored in `TrapFrame.spsr` and `ThreadCtx.pstate` across the EL1
 /// kernel. In `El1IrqMode::Gic`, the EL1 vector hook (`carrick-mem::write_el1_hook`) clears
 /// `PSTATE.I` (`0x80`) from `TrapFrame.spsr` right before `msr spsr_el1, x1; eret`; in both
-/// modes, `TrapFrame.spsr | PSTATE_I == 0x3c0` is the required internal return invariant.
+/// modes, `(TrapFrame.spsr & 0x3c0) | PSTATE_I == 0x3c0` is the required internal DAIF return
+/// invariant alongside any preserved legal EL0 user flags (`AARCH64_EL0_USER_PSTATE_MASK`).
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 const AARCH64_INTERNAL_EL0_RETURN_DAIF: u64 = 0x3c0;
 
@@ -834,9 +835,10 @@ mod tests {
         // Internal authority: carrick-mem/src/memory.rs:5078-5083 (write_el1_hook) loads
         // TrapFrame.spsr and, when El1IrqMode::Gic is active, clears PSTATE.I (0x80) via
         // `bic x1, x1, #0x80` right before `msr spsr_el1, x1`; carrick-mem/src/memory/
-        // el1_hook_kick.rs:533 requires `spsr | PSTATE_I == 0x3c0` (EL0_DAIF_MASKED) on
-        // every EL0 return. Therefore restore() and apply_restored_context() must re-apply
-        // the canonical internal EL0 DAIF mask (0x3c0) while preserving legal EL0 user flags.
+        // el1_hook_kick.rs:533 requires internal DAIF bits `(spsr & 0x3c0) | PSTATE_I == 0x3c0`
+        // (EL0_DAIF_MASKED) on every EL0 return. Therefore restore() and apply_restored_context()
+        // must re-apply the canonical internal EL0 DAIF mask (0x3c0) while preserving legal
+        // EL0 user flags in `AARCH64_EL0_USER_PSTATE_MASK`.
         for user_flags in [0_u64, 0x6000_0000_u64, AARCH64_EL0_USER_PSTATE_MASK] {
             let mut signal = valid();
             signal.ucontext.uc_mcontext.pstate = user_flags;
