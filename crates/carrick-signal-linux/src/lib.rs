@@ -790,6 +790,11 @@ mod tests {
     fn single_mask_async_publication_during_timer_prepare_is_visible() {
         let _lock = lock_test();
         clear_proc_pending();
+        let info = PendingTimerInfo {
+            id: i32::MIN,
+            overrun: i32::MAX,
+            value: i64::MIN + 0x12345678,
+        };
         TIMER_PREPARED.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(|| {
                 proc_pending_fetch_or(thread_pending_bit(14) | thread_pending_bit(12));
@@ -804,9 +809,26 @@ mod tests {
                 );
             }))
         });
-        publish_process_timer_signal(14, None);
-        assert_eq!(take_process_pending(), 12);
-        assert_eq!(take_process_pending(), 14);
+        publish_process_timer_signal(14, Some(info));
+        assert_eq!(
+            take_pending_event_for(991),
+            Some(PendingSignalEvent {
+                signum: 12,
+                scope: PendingSignalScope::Process,
+                origin: PendingSignalOrigin::Host,
+            })
+        );
+        // Timer preparation overlaps Host publication; the retained complete
+        // origin admits the timer-before-Host whole-operation order.
+        assert_eq!(
+            take_pending_event_for(991),
+            Some(PendingSignalEvent {
+                signum: 14,
+                scope: PendingSignalScope::Process,
+                origin: PendingSignalOrigin::PosixTimer(info),
+            })
+        );
+        assert_eq!(take_pending_event_for(991), None);
         clear_proc_pending();
     }
 
@@ -814,6 +836,11 @@ mod tests {
     fn single_mask_global_query_sees_async_publish_during_timer_prepare() {
         let _lock = lock_test();
         clear_proc_pending();
+        let info = PendingTimerInfo {
+            id: i32::MIN,
+            overrun: i32::MAX,
+            value: i64::MIN + 0x12345678,
+        };
         TIMER_PREPARED.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(|| {
                 publish_process_signal(14);
@@ -824,8 +851,18 @@ mod tests {
                 assert_eq!(proc_pending_mask(), SigSet::EMPTY.with(14));
             }))
         });
-        publish_process_timer_signal(14, None);
-        assert_eq!(take_process_pending(), 14);
+        publish_process_timer_signal(14, Some(info));
+        // Timer preparation overlaps Host publication; the retained complete
+        // origin admits the timer-before-Host whole-operation order.
+        assert_eq!(
+            take_pending_event_for(991),
+            Some(PendingSignalEvent {
+                signum: 14,
+                scope: PendingSignalScope::Process,
+                origin: PendingSignalOrigin::PosixTimer(info),
+            })
+        );
+        assert_eq!(take_pending_event_for(991), None);
         clear_proc_pending();
     }
 
@@ -846,8 +883,9 @@ mod tests {
             clear_proc_pending();
             publish_process_timer_signal(14, Some(info));
             let mut second = None;
+            // Publish the NEW Host after mask removal, before origin reset.
+            AFTER_MASK_TAKE_HOST.with(|bits| bits.set(thread_pending_bit(14)));
             let first = take_proc_pending_event_in_after_take(SigSet::EMPTY.complement(), || {
-                publish_process_signal(14);
                 // Coalescence with the NEW Host retains Host custody.
                 publish_process_timer_signal(14, Some(later));
                 if second_first {
@@ -858,12 +896,32 @@ mod tests {
             if !second_first {
                 second = take_pending_event_for(992);
             }
-            assert_eq!(first.origin, PendingSignalOrigin::PosixTimer(info));
-            assert_eq!(second.unwrap().origin, PendingSignalOrigin::Host);
+            assert_eq!(
+                first,
+                PendingSignalEvent {
+                    signum: 14,
+                    scope: PendingSignalScope::Process,
+                    origin: PendingSignalOrigin::PosixTimer(info),
+                }
+            );
+            assert_eq!(
+                second,
+                Some(PendingSignalEvent {
+                    signum: 14,
+                    scope: PendingSignalScope::Process,
+                    origin: PendingSignalOrigin::Host,
+                })
+            );
             publish_process_timer_signal(14, Some(later));
             let third = take_pending_event_for(993).unwrap();
-            assert_eq!(third.signum, 14);
-            assert_eq!(third.origin, PendingSignalOrigin::PosixTimer(later));
+            assert_eq!(
+                third,
+                PendingSignalEvent {
+                    signum: 14,
+                    scope: PendingSignalScope::Process,
+                    origin: PendingSignalOrigin::PosixTimer(later),
+                }
+            );
             assert_eq!(take_process_pending(), 0);
         }
         clear_proc_pending();
