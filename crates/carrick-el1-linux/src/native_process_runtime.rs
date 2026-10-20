@@ -8325,13 +8325,16 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert!(
-            runtime
-                .current_signals(&leader)
-                .unwrap()
-                .pending_set(leader_record)
-                .contains(event.signal())
-        );
+        let signals = runtime.current_signals(&leader).unwrap();
+        assert!(signals.pending_set(leader_record).contains(event.signal()));
+        let delivered = signals
+            .take_deliverable(
+                leader_record,
+                carrick_signal_core::policy::SigBlockMask::NONE,
+            )
+            .unwrap();
+        assert_eq!(delivered.0, event.signal());
+        assert_eq!(signals.pending_count(), 0);
     }
     #[test]
     fn nonleader_thread_forks_through_its_authenticated_process_owner() {
