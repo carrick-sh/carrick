@@ -369,6 +369,12 @@ pub enum SoftTranslationError {
         va: GuestVa,
         frame_gpa: AuthenticatedGpa,
     },
+    /// The soft vCPU was refused admission to the memory's inventory (foreign
+    /// domain or terminal inventory).
+    Admission {
+        va: GuestVa,
+        error: crate::retirement::SoftAdmitError,
+    },
 }
 
 impl SoftTranslationError {

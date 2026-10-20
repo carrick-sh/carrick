@@ -428,13 +428,26 @@ fn an_exhausted_inventory_stops_every_cpu_and_refuses_edits_loudly() {
     let mut vcpu = table.register_vcpu(SoftTlb::new()).unwrap();
     let mut run = vcpu.run();
     run.block_entry().unwrap();
+    cache_translation(run.tlb_mut_for_test(), OLD_ADDEND);
+    assert_eq!(
+        run.probe(&table, VA, 1, Access::Read, CpuAccessMode::ring3()),
+        Ok(Some((VA.raw() + OLD_ADDEND) as usize))
+    );
     // The real exhaustion path's terminal transition (the issue counter
     // cannot be driven to u64::MAX in a test).
     table.exhaust_for_test();
+    assert_eq!(
+        run.probe(&table, VA, 1, Access::Read, CpuAccessMode::ring3()),
+        Err(SoftAdmitError::Terminal)
+    );
     assert_eq!(run.block_entry(), Err(InventoryTerminal));
     drop(run);
     assert!(!vcpu.is_running(), "a terminal block entry parks");
     assert!(matches!(vcpu.admit(&table), Err(SoftAdmitError::Terminal)));
+    assert_eq!(
+        vcpu.probe(&table, VA, 1, Access::Read, CpuAccessMode::ring3()),
+        Err(SoftAdmitError::Terminal)
+    );
     assert_eq!(
         table.remove(FrameGpa::new(EXTENT), None).map(|_| ()),
         Err(ExtentEditError::Terminal)
@@ -1198,4 +1211,218 @@ fn wait_with_another_same_thread_seat_or_foreign_requester_is_refused() {
     drop(run1);
     let completion = pending.try_complete().unwrap();
     table.reclaim(&completion);
+}
+
+#[test]
+fn already_served_same_thread_running_seat_does_not_trigger_false_self_wait() {
+    let mut table = ExtentTable::new().unwrap();
+    assert!(table.install(ExtentRecord::new(
+        FrameGpa::new(0x1000),
+        0x1000,
+        generation(1)
+    )));
+    assert!(table.install(ExtentRecord::new(
+        FrameGpa::new(0x2000),
+        0x1000,
+        generation(2)
+    )));
+    assert!(table.install(ExtentRecord::new(
+        FrameGpa::new(0x3000),
+        0x1000,
+        generation(3)
+    )));
+
+    let mut vcpu_a1 = table.register_vcpu(SoftTlb::new()).unwrap();
+    let mut vcpu_a2 = table.register_vcpu(SoftTlb::new()).unwrap();
+    let mut vcpu_b = table.register_vcpu(SoftTlb::new()).unwrap();
+
+    let mut run_a1 = vcpu_a1.run();
+    let mut run_a2 = vcpu_a2.run();
+    run_a1.block_entry().unwrap();
+    run_a2.block_entry().unwrap();
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (serve_tx, serve_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let mut run_b = vcpu_b.run();
+        run_b.block_entry().unwrap();
+        ready_tx.send(()).unwrap();
+        serve_rx.recv().unwrap();
+        assert!(run_b.block_entry().unwrap());
+        drop(run_b);
+        done_tx.send(vcpu_b).unwrap();
+    });
+    ready_rx.recv().unwrap();
+
+    // Publish R1 while A1, A2 (on current thread) and B (on peer thread) are running.
+    let r1 = table.remove(FrameGpa::new(0x1000), None).unwrap().unwrap();
+    assert_eq!(r1.pending.counted_members(), 3);
+
+    // Both A1 and A2 serve R1 at block_entry and remain running on this thread.
+    assert!(run_a1.block_entry().unwrap());
+    assert!(run_a2.block_entry().unwrap());
+
+    // Publish a later retirement R2 so A1 and A2 owe a LATER generation,
+    // verifying that R1 queries its own pending generation/kind rather than
+    // any-later-debt.
+    let r2 = table.remove(FrameGpa::new(0x2000), None).unwrap().unwrap();
+
+    serve_tx.send(()).unwrap();
+    // wait(None) on Thread A must not fail with SelfWait for R1 because A1 and
+    // A2 have already served R1's generation.
+    let c1 = r1
+        .pending
+        .wait(None, bounded())
+        .map_err(|(_, e)| e)
+        .expect("already-served running seats on current thread must not trigger SelfWait");
+    table.reclaim(&c1);
+    let vcpu_b = done_rx.recv().unwrap();
+    peer.join().unwrap();
+
+    // Now A1 and A2 both owe R2; A2 serves R2 at block_entry and stays running,
+    // then wait(Some(run_a1.requester())) serves A1 inline and must not refuse
+    // because of already-served A2 (even if R3 is published after A2 served R2).
+    assert!(run_a2.block_entry().unwrap());
+    let r3 = table.remove(FrameGpa::new(0x3000), None).unwrap().unwrap();
+    let c2 = r2
+        .pending
+        .wait(Some(run_a1.requester()), bounded())
+        .map_err(|(_, e)| e)
+        .expect("wait(Some(A1)) with already-served same-thread A2 must succeed");
+    table.reclaim(&c2);
+
+    // By contrast, R3 was published AFTER A2's last block_entry, so A2 genuinely
+    // still owes R3 while running on this thread: wait(Some(A1)) must refuse.
+    let (r3_pending, err) = r3
+        .pending
+        .wait(Some(run_a1.requester()), || -> Result<(), &'static str> {
+            panic!("relax must not run when same-thread peer still owes this generation")
+        })
+        .expect_err("genuinely still-owing same-thread A2 must refuse with SelfWait");
+    assert_eq!(err, RetirementWaitError::SelfWait);
+
+    drop(run_a1);
+    drop(run_a2);
+    drop(vcpu_b);
+    let c3 = r3_pending.try_complete().unwrap();
+    table.reclaim(&c3);
+}
+
+#[test]
+fn requeued_deferred_root_and_extent_reserve_their_targets_until_published() {
+    use carrick_guest_arch::RootGpa;
+
+    // 1. DeferredRootGeneration requeued under T2 still reserves root 0x1000
+    // against installing an extent at 0x1000.
+    let mut table = ExtentTable::new().unwrap();
+    let root = RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap();
+    assert!(table.set_root_generation(root, generation(1)));
+    assert!(table.install(ExtentRecord::new(
+        FrameGpa::new(0x3000),
+        0x1000,
+        generation(2)
+    )));
+    let t1 = table
+        .replace_root_generation(root, generation(2), None)
+        .unwrap()
+        .unwrap();
+    let mut vcpu0 = table.register_vcpu(SoftTlb::new()).unwrap();
+    let mut run0 = vcpu0.run();
+    run0.block_entry().unwrap();
+    let t2 = table.remove(FrameGpa::new(0x3000), None).unwrap().unwrap();
+
+    let c1 = t1.pending.try_complete().expect("T1 counted no CPUs");
+    assert_eq!(
+        table.reclaim(&c1),
+        Reclaimed {
+            identities: 2,
+            published: 0,
+        }
+    );
+    assert!(
+        !table.install(ExtentRecord::new(
+            FrameGpa::new(0x1000),
+            0x1000,
+            generation(3)
+        )),
+        "requeued DeferredRootGeneration at 0x1000 must still reserve 0x1000 against extent install"
+    );
+    assert!(run0.block_entry().unwrap());
+    let c2 = t2.pending.try_complete().unwrap();
+    assert_eq!(
+        table.reclaim(&c2),
+        Reclaimed {
+            identities: 1,
+            published: 1,
+        }
+    );
+    assert_eq!(table.expected_generation(root), Some(generation(2)));
+    // Once published, installing the root frame extent at 0x1000 succeeds, and
+    // multiple live extents sharing generation(2) remain valid.
+    assert!(table.install(ExtentRecord::new(
+        FrameGpa::new(0x1000),
+        0x1000,
+        generation(2)
+    )));
+    assert!(table.install(ExtentRecord::new(
+        FrameGpa::new(0x5000),
+        0x1000,
+        generation(2)
+    )));
+    drop(run0);
+
+    // 2. Symmetric: DeferredExtent requeued under T2 still reserves its span
+    // against set_root_generation / replace_root_generation.
+    let mut table2 = ExtentTable::new().unwrap();
+    assert!(table2.install(ExtentRecord::new(
+        FrameGpa::new(0x1000),
+        0x1000,
+        generation(1)
+    )));
+    assert!(table2.install(ExtentRecord::new(
+        FrameGpa::new(0x3000),
+        0x1000,
+        generation(2)
+    )));
+    let t1 = table2
+        .replace(
+            ExtentRecord::new(FrameGpa::new(0x1000), 0x1000, generation(2)),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    let mut vcpu0 = table2.register_vcpu(SoftTlb::new()).unwrap();
+    let mut run0 = vcpu0.run();
+    run0.block_entry().unwrap();
+    let t2 = table2.remove(FrameGpa::new(0x3000), None).unwrap().unwrap();
+
+    let c1 = t1.pending.try_complete().expect("T1 counted no CPUs");
+    assert_eq!(
+        table2.reclaim(&c1),
+        Reclaimed {
+            identities: 1,
+            published: 0,
+        }
+    );
+    assert!(
+        !table2.set_root_generation(root, generation(3)),
+        "requeued DeferredExtent at 0x1000 must still reserve 0x1000 against set_root_generation"
+    );
+    assert_eq!(
+        table2
+            .replace_root_generation(root, generation(3), None)
+            .map(|_| ()),
+        Err(ExtentEditError::Refused)
+    );
+    assert!(run0.block_entry().unwrap());
+    let c2 = t2.pending.try_complete().unwrap();
+    assert_eq!(
+        table2.reclaim(&c2),
+        Reclaimed {
+            identities: 1,
+            published: 1,
+        }
+    );
+    assert!(table2.set_root_generation(root, generation(2)));
 }

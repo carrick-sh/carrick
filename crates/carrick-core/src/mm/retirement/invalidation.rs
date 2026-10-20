@@ -591,6 +591,17 @@ where
     pub fn counts(&self, cpu: CpuId) -> bool {
         u32::try_from(N).is_ok_and(|n| cpu.raw() < n) && self.counted & (1 << cpu.raw()) != 0
     }
+    /// Whether this member was counted by this request and has not yet served
+    /// this request's specific generation and kind.
+    pub fn still_owes(&self, cpu: CpuId) -> bool {
+        self.counts(cpu)
+            && self
+                .handle
+                .table()
+                .members()
+                .get(cpu.raw() as usize)
+                .is_some_and(|member| !self.generation.served_by(member.served(self.kind)))
+    }
     /// How many members owe this generation: the request's per-member work.
     pub fn counted_members(&self) -> u32 {
         self.counted.count_ones()

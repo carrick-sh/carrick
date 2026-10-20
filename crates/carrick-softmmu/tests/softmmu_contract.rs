@@ -1186,8 +1186,14 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
         // One block: the run guard parks the CPU again when it drops.
         assert!(vcpu.run().block_entry().unwrap());
     }
-    assert_eq!(vcpu0.probe(va_rw, 8, Access::Read, mode), None);
-    assert_eq!(vcpu1.probe(va_rw, 8, Access::Read, mode), None);
+    assert_eq!(
+        vcpu0.probe(rig.mem.extents(), va_rw, 8, Access::Read, mode),
+        Ok(None)
+    );
+    assert_eq!(
+        vcpu1.probe(rig.mem.extents(), va_rw, 8, Access::Read, mode),
+        Ok(None)
+    );
 
     for vcpu in [&mut vcpu0, &mut vcpu1] {
         vcpu.probe_or_walk_outcome(
@@ -1209,8 +1215,14 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
         // One block: the run guard parks the CPU again when it drops.
         assert!(vcpu.run().block_entry().unwrap());
     }
-    assert_eq!(vcpu0.probe(va_rw, 8, Access::Read, mode), None);
-    assert_eq!(vcpu1.probe(va_rw, 8, Access::Read, mode), None);
+    assert_eq!(
+        vcpu0.probe(rig.mem.extents(), va_rw, 8, Access::Read, mode),
+        Ok(None)
+    );
+    assert_eq!(
+        vcpu1.probe(rig.mem.extents(), va_rw, 8, Access::Read, mode),
+        Ok(None)
+    );
     assert_ne!(rig.mem.get(PT_A_GPA, idx(va_rw, 3)), 0);
     assert_eq!(
         vcpu0.probe_or_walk_outcome(
@@ -1251,8 +1263,14 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
         // One block: the run guard parks the CPU again when it drops.
         assert!(vcpu.run().block_entry().unwrap());
     }
-    assert_eq!(vcpu0.probe(va_rw, 8, Access::Read, mode), None);
-    assert_eq!(vcpu1.probe(va_rw, 8, Access::Read, mode), None);
+    assert_eq!(
+        vcpu0.probe(rig.mem.extents(), va_rw, 8, Access::Read, mode),
+        Ok(None)
+    );
+    assert_eq!(
+        vcpu1.probe(rig.mem.extents(), va_rw, 8, Access::Read, mode),
+        Ok(None)
+    );
     assert_eq!(
         vcpu0.probe_or_walk_outcome(
             &mut rig.walker,
@@ -1264,6 +1282,101 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
             mode
         ),
         Err(missing_tbl)
+    );
+    Ok(())
+}
+
+#[test]
+fn parked_soft_vcpu_probe_and_walk_serve_retirement_and_refuse_foreign_or_terminal()
+-> Result<(), PlacementError> {
+    use carrick_softmmu::SoftAdmitError;
+
+    let mut rig = Rig::new()?;
+    let mode = CpuAccessMode::ring3();
+    let va_rw = GuestVa::new(0x0000_0058_0000);
+    rig.map_a(va_rw, pte(F4_GPA, true, true, false, false));
+
+    let mut vcpu = rig.mem.extents().register_vcpu(SoftTlb::new()).unwrap();
+    let filled = vcpu
+        .probe_or_walk_outcome(
+            &mut rig.walker,
+            &mut rig.mem,
+            rig.root,
+            va_rw,
+            8,
+            Access::Read,
+            mode,
+        )
+        .unwrap();
+    assert!(matches!(filled, AccessOutcome::Ram(_)));
+    assert!(!vcpu.is_running(), "host walk parks vcpu again on return");
+
+    // Foreign inventory must not get a hit from this vcpu's warm TLB, whether
+    // probed directly, walked directly, or walked through an admitted guard.
+    let mut foreign_rig = Rig::new()?;
+    assert_eq!(
+        vcpu.probe(foreign_rig.mem.extents(), va_rw, 8, Access::Read, mode),
+        Err(SoftAdmitError::ForeignInventory)
+    );
+    assert_eq!(
+        vcpu.probe_or_walk_outcome(
+            &mut rig.walker,
+            &mut foreign_rig.mem,
+            rig.root,
+            va_rw,
+            8,
+            Access::Read,
+            mode,
+        ),
+        Err(SoftTranslationError::Admission {
+            va: va_rw,
+            error: SoftAdmitError::ForeignInventory,
+        })
+    );
+    {
+        let mut admitted = vcpu.admit(rig.mem.extents()).unwrap();
+        assert_eq!(
+            admitted.probe_or_walk_outcome(
+                &mut rig.walker,
+                &mut foreign_rig.mem,
+                rig.root,
+                va_rw,
+                8,
+                Access::Read,
+                mode,
+            ),
+            Err(SoftTranslationError::Admission {
+                va: va_rw,
+                error: SoftAdmitError::ForeignInventory,
+            })
+        );
+    }
+
+    // Retire, complete, and reclaim F4 while vcpu is parked.
+    let removed = rig.mem.extents_mut().remove(FrameGpa::new(F4_GPA), None);
+    assert!(retire_now(&mut rig.mem, removed).is_some());
+
+    // Probing or walking on the parked vcpu must serve its owed flush first,
+    // never returning the retired host address.
+    assert_eq!(
+        vcpu.probe(rig.mem.extents(), va_rw, 8, Access::Read, mode),
+        Ok(None),
+        "parked vcpu probe after reclaim must serve debt and miss"
+    );
+    assert!(
+        matches!(
+            vcpu.probe_or_walk_outcome(
+                &mut rig.walker,
+                &mut rig.mem,
+                rig.root,
+                va_rw,
+                8,
+                Access::Read,
+                mode,
+            ),
+            Err(SoftTranslationError::UnauthenticatedExtent { .. })
+        ),
+        "parked vcpu probe_or_walk_outcome after reclaim must serve debt and fault"
     );
     Ok(())
 }
