@@ -4984,7 +4984,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             permit,
         );
         let child_task = child_key.serial.nonzero();
-        let child_execution = child_key.serial.nonzero();
+        let child_execution =
+            NonZeroU64::new(thread.generation).ok_or(NativeProcessError::Stale)?;
         let result = {
             let mut graph = self.runtime.graph.lock();
             prep.try_publish_with(&mut graph.owner, |prepared| {
@@ -11836,6 +11837,7 @@ mod tests {
         fail_context: bool,
         fail_fd_table: bool,
         fail_commit: bool,
+        committed_children: Vec<(NonZeroU64, NonZeroU64)>,
     }
 
     impl<'a> NativeProcessService<'a, ParkedContextWords> for FaultyPhysical<'a> {
@@ -11900,6 +11902,19 @@ mod tests {
             if self.fail_commit {
                 return Err((NativeProcessError::Busy, p));
             }
+            Ok(p)
+        }
+
+        fn commit_child(
+            &mut self,
+            p: Self::PreparedMm,
+            child_task: core::num::NonZeroU64,
+            child_execution: core::num::NonZeroU64,
+        ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)> {
+            if self.fail_commit {
+                return Err((NativeProcessError::Busy, p));
+            }
+            self.committed_children.push((child_task, child_execution));
             Ok(p)
         }
 
@@ -12065,6 +12080,7 @@ mod tests {
             fail_context: false,
             fail_fd_table: false,
             fail_commit: false,
+            committed_children: Vec::new(),
         };
 
         let mut entry = runtime
@@ -12170,5 +12186,121 @@ mod tests {
         for r in filled_records {
             zone.free_record(r);
         }
+    }
+
+    #[test]
+    fn fork_commits_child_execution_snapshot_independently_of_durable_task_serial() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let task = CurrentTask::new();
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(77),
+            5,
+        );
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        control.publish_host_birth_identity(
+            carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                carrick_core_abi::EntryTaskKey::from_raw(41),
+                carrick_core_abi::entry::BirthSerial::of_task(
+                    TaskSerial::from_raw_u64(11).unwrap(),
+                ),
+                carrick_core_abi::EntryThreadGeneration::from_raw(101),
+            )
+            .unwrap(),
+        );
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 77,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let child_pages: Vec<_> = (0..4).map(|_| ThreadLifecyclePage::new()).collect();
+        let child_controls: Vec<_> = (0..4)
+            .map(|_| core::array::from_fn(|_| ThreadControlSlot::new()))
+            .collect();
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let mut service = FaultyPhysical {
+            zone: &zone,
+            child_pages: &child_pages,
+            child_controls: &child_controls,
+            active_loan: None,
+            next_page: 0,
+            loan_in_flight: false,
+            abort_count: 0,
+            fail_context: false,
+            fail_fd_table: false,
+            fail_commit: false,
+            committed_children: Vec::new(),
+        };
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        let outcome = entry.fork(ProcessForkChildTid::NONE);
+        let LifecycleOutcome::Returned {
+            result: child_pid, ..
+        } = outcome
+        else {
+            panic!("expected fork success");
+        };
+        assert_eq!(child_pid.raw(), 42);
+        assert_eq!(entry.service.committed_children.len(), 1);
+        let (committed_task, committed_execution) = entry.service.committed_children[0];
+        let switched = zone.switch_in_full(slot).expect("runnable forked child");
+        let child_identity = zone.record(switched.record).identity();
+        assert_eq!(committed_task.get(), 102);
+        assert_ne!(
+            committed_task, committed_execution,
+            "child durable TaskSerial must differ from its initial execution snapshot"
+        );
+        assert_eq!(
+            committed_execution.get(),
+            child_identity.generation,
+            "commit_child must publish the child's actual execution SnapshotGeneration"
+        );
+        assert_eq!(
+            committed_execution.get(),
+            carrick_core_abi::SnapshotGeneration::INITIAL.raw()
+        );
     }
 }

@@ -513,16 +513,28 @@ impl Cpl0Carrier {
             return false;
         };
         let identity = zone.record(record).identity();
-        let (tid, serial) = self
-            .custody
-            .initial_task()
-            .map_or((41, 101), |root| (root.thread.tid, root.thread.serial));
+        let (tid, serial, birth_serial) = self.custody.initial_task().map_or(
+            (
+                41,
+                101,
+                carrick_sched_core::process::TaskSerial::from_raw_u64(11),
+            ),
+            |root| (root.thread.tid, root.thread.serial, Some(root.task.serial)),
+        );
+        let expected_birth = birth_serial.and_then(|birth| {
+            carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                carrick_core_abi::EntryTaskKey::from_raw(tid),
+                carrick_core_abi::BirthSerial::of_task(birth),
+                carrick_core_abi::EntryThreadGeneration::from_raw(serial),
+            )
+        });
         zone.record(record).home() == Some(slot)
             && identity.tid == tid
             && identity.serial == serial
             && identity.mm == self.initial_mm_key()
             && identity.lifecycle_page == METADATA_VA
             && identity.control_slot == METADATA_VA + CONTROL_OFFSET
+            && expected_birth.is_some_and(|birth| self.slot(0).host_birth_identity() == Some(birth))
     }
 
     /// Initial data publications belong to the carrier's one frame inventory,
@@ -699,6 +711,12 @@ impl Cpl0Carrier {
         }
         let tid = u32::try_from(identity.thread.tid)
             .map_err(|_| fail("initial task TID outside guest ABI"))?;
+        let birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            carrick_core_abi::EntryTaskKey::from_raw(identity.thread.tid),
+            carrick_core_abi::BirthSerial::of_task(identity.task.serial),
+            carrick_core_abi::EntryThreadGeneration::from_raw(identity.thread.serial),
+        )
+        .ok_or_else(|| fail("initial root birth identity"))?;
         let control: &ThreadControlSlot = self.metadata(CONTROL_OFFSET);
         control
             .reset_for_host_birth(BlockedMask(0))
@@ -706,6 +724,7 @@ impl Cpl0Carrier {
         if !control.publish_visible_tid(tid) {
             return Err(fail("initial root control slot identity"));
         }
+        control.publish_host_birth_identity(birth);
         let task = self.task(0);
         task.set(
             El1TaskId::from_linux_tid(identity.task.id.raw()),
@@ -1428,8 +1447,13 @@ impl Cpl0Carrier {
                 root.thread.affinity
             }
         });
+        let birth_serial = task
+            .map(|root| root.task.serial)
+            .or_else(|| carrick_sched_core::process::TaskSerial::from_raw_u64(11))
+            .ok_or_else(|| fail("production root birth serial"))?;
         self.bind_execution(
             0,
+            birth_serial,
             carrick_el1_abi::ExecutionBinding {
                 task: carrick_el1_abi::EntryTaskKey::from_raw(tid),
                 generation: carrick_el1_abi::SnapshotGeneration::from_raw(generation),
@@ -1983,6 +2007,16 @@ impl Cpl0Carrier {
                 if !(*slot).publish_visible_tid(41 + index as u32) {
                     return Err(fail("issued slot identity"));
                 }
+                let birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                    carrick_core_abi::EntryTaskKey::from_raw(41 + index as u64),
+                    carrick_core_abi::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(11 + index as u64)
+                            .ok_or_else(|| fail("issued slot birth serial"))?,
+                    ),
+                    carrick_core_abi::EntryThreadGeneration::from_raw(101 + index as u64),
+                )
+                .ok_or_else(|| fail("issued slot birth identity"))?;
+                (*slot).publish_host_birth_identity(birth);
                 let task = ram
                     .host_ptr(META_GPA + TASK_OFFSET + offset, size_of::<CurrentTask>())
                     .ok_or_else(|| fail("current task backing"))?
@@ -2864,6 +2898,7 @@ impl Cpl0Carrier {
     pub fn bind_execution(
         &mut self,
         index: usize,
+        birth_serial: carrick_sched_core::process::TaskSerial,
         binding: carrick_el1_abi::ExecutionBinding,
         file_table: u64,
     ) -> Result<(), TrapError> {
@@ -2875,7 +2910,23 @@ impl Cpl0Carrier {
         {
             return Err(fail("invalid CPL0 fixture execution binding"));
         }
+        if index == 0
+            && let Some(root) = self.custody.initial_task()
+            && (birth_serial != root.task.serial
+                || root.thread.tid != binding.task.raw()
+                || root.thread.serial != binding.thread_generation.raw())
+        {
+            return Err(fail(
+                "initial root execution binding mismatches retained birth",
+            ));
+        }
         let tid = i32::try_from(binding.task.raw()).map_err(|_| fail("fixture task range"))?;
+        let birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            binding.task,
+            carrick_core_abi::BirthSerial::of_task(birth_serial),
+            binding.thread_generation,
+        )
+        .ok_or_else(|| fail("fixture birth identity"))?;
         let page_offset = index as u64 * 0x4000;
         let slot_offset = CONTROL_OFFSET + index as u64 * STRIDE;
         // SAFETY: exclusively stopped fixture vCPUs, initialized retained and
@@ -2888,6 +2939,7 @@ impl Cpl0Carrier {
         if !self.slot(index).publish_visible_tid(tid as u32) {
             return Err(fail("fixture visible task publication"));
         }
+        self.slot(index).publish_host_birth_identity(birth);
         let task = self.task(index);
         task.set(
             El1TaskId::from_linux_tid(tid),
@@ -3420,6 +3472,9 @@ impl Cpl0Carrier {
                 .cast::<ZoneTables>()
         };
         for index in 0..2 {
+            let birth_serial =
+                carrick_sched_core::process::TaskSerial::from_raw_u64(21 + index as u64)
+                    .ok_or_else(|| fail("lifecycle birth serial"))?;
             let binding = carrick_el1_abi::ExecutionBinding {
                 task: carrick_el1_abi::EntryTaskKey::from_raw(41 + index as u64),
                 generation: carrick_el1_abi::SnapshotGeneration::from_raw(11 + index as u64),
@@ -3428,7 +3483,7 @@ impl Cpl0Carrier {
                     101 + index as u64,
                 ),
             };
-            carrier.bind_execution(index, binding, 5)?;
+            carrier.bind_execution(index, birth_serial, binding, 5)?;
             let root = if index == 0 {
                 LAYOUT.pml4_base
             } else {
@@ -3457,6 +3512,13 @@ impl Cpl0Carrier {
                 *control = ThreadControlSlot::new();
             }
             controls[0].publish_visible_tid(binding.task.raw() as u32);
+            let birth = carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                binding.task,
+                carrick_core_abi::BirthSerial::of_task(birth_serial),
+                binding.thread_generation,
+            )
+            .ok_or_else(|| fail("lifecycle birth identity"))?;
+            controls[0].publish_host_birth_identity(birth);
             carrier
                 .task(index)
                 .publish_lifecycle(page_address, controls_address);

@@ -175,7 +175,7 @@ fn native_exit_workers(
                 serial: issued.thread().key().serial.raw(),
                 mm: 0,
                 file_table: issued.resources().files().id().raw(),
-                generation: 1,
+                generation: 77,
                 affinity: 3,
                 lifecycle_page: 0,
                 control_slot: 0,

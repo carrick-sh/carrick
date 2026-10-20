@@ -540,7 +540,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     }
     fn commit_mm(&mut self, p: Prepared) -> Result<Box<Born>, (NativeProcessError, Prepared)> {
         let child_task = p.address.mm.raw().get();
-        let child_execution = child_task;
+        let child_execution = carrick_core_abi::SnapshotGeneration::INITIAL.raw();
         self.commit_child(
             p,
             NonZeroU64::new(child_task).unwrap_or(NonZeroU64::MIN),
