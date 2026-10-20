@@ -95,6 +95,13 @@ fn is_qualified_panic_location(after_panicked: &str) -> bool {
 }
 
 fn normalize_panic_header_line(line: &str) -> String {
+    if line.matches("thread '").count() != 1
+        || line.matches("' (").count() != 1
+        || line.matches("panicked at ").count() != 1
+        || line.matches(") panicked at ").count() != 1
+    {
+        return line.to_string();
+    }
     let Some(start) = line.find("thread '") else {
         return line.to_string();
     };

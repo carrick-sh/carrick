@@ -708,4 +708,44 @@ fn negative_controls_changed_errno_location_diagnostic_test_or_malformed_header_
         assert_eq!(diff.new.len(), 1);
         assert_eq!(diff.fixed.len(), 1);
     }
+
+    // 10. Ambiguous multiple panic-header delimiters in thread name stay exact
+    {
+        let mut b = base_receipt.clone();
+        let mut c = base_receipt.clone();
+        b.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "thread-name-control".into(),
+            line: "thread 'worker' (14) panicked at src/lib.rs:10:5: name' (999) panicked at src/main.rs:20:3:".into(),
+        }];
+        c.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "thread-name-control".into(),
+            line: "thread 'worker' (22) panicked at src/lib.rs:10:5: name' (999) panicked at src/main.rs:20:3:".into(),
+        }];
+        let diff = compare(&b, &c).unwrap();
+        assert!(!diff.passed);
+        assert_eq!(diff.new.len(), 1);
+        assert_eq!(diff.fixed.len(), 1);
+    }
+
+    // 11. Ambiguous panic-header delimiter in diagnostic suffix stays exact
+    {
+        let mut b = base_receipt.clone();
+        let mut c = base_receipt.clone();
+        b.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'worker' (999) panicked at src/main.rs:20:3: nested ' (14) panicked at src/lib.rs:10:5:".into(),
+        }];
+        c.probe_diffs = vec![ProbeDiff {
+            step: "probe-cases".into(),
+            probe: "probe".into(),
+            line: "thread 'worker' (999) panicked at src/main.rs:20:3: nested ' (22) panicked at src/lib.rs:10:5:".into(),
+        }];
+        let diff = compare(&b, &c).unwrap();
+        assert!(!diff.passed);
+        assert_eq!(diff.new.len(), 1);
+        assert_eq!(diff.fixed.len(), 1);
+    }
 }
