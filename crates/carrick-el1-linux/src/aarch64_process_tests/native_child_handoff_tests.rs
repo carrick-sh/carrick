@@ -26,7 +26,7 @@ fn arm_native_wait_runs_ready_child_before_host_handoff() {
     let child = fixture.zone.runnable_head(fixture.slot).unwrap();
     let identity = fixture.zone.record(child).identity();
     assert!(identity.affinity_source.is_guest_mapped());
-    assert!(fixture.zone.record(child).allows_cpu(0));
+    assert_eq!(identity.affinity_source.load(), Some(1));
     assert_ne!(identity.mm, fixture.address.mm.raw().get());
     assert!(fixture.zone.spaces.is_open(identity.mm));
     assert_eq!(service.crossing.loans_requested.load(Ordering::Acquire), 1);
