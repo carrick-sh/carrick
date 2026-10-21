@@ -567,16 +567,24 @@ mod tests {
             CarrierWaitService, ContinuationCapture, RestartClass, RestartDecision, ZoneWait,
         };
 
-        for (index, (nr, restart, expected)) in [
+        for (index, (nr, restart, sa_restart, expected)) in [
             (
                 carrick_abi::syscall::nr::FSTAT.raw(),
                 RestartClass::RestartNoIntr,
+                false,
                 RestartDecision::Restart,
             ),
             (
                 carrick_abi::syscall::nr::WAIT4.raw(),
                 RestartClass::RestartSyscall,
+                false,
                 RestartDecision::NoRestart,
+            ),
+            (
+                carrick_abi::syscall::nr::WAIT4.raw(),
+                RestartClass::RestartSyscall,
+                true,
+                RestartDecision::Restart,
             ),
         ]
         .into_iter()
@@ -639,6 +647,9 @@ mod tests {
                     .unwrap();
             let mut action = carrick_abi::LinuxSigaction::empty();
             action.sa_handler = 0x5000;
+            if sa_restart {
+                action.sa_flags = carrick_abi::LINUX_SA_RESTART;
+            }
             context.signal_authority().install_action(signal, action);
             assert!(
                 context
@@ -669,6 +680,15 @@ mod tests {
             )
             .unwrap();
             assert_eq!(trap.injected_signals, 1);
+            assert_eq!(trap.injected_signal_records.len(), 1);
+            assert_eq!(
+                trap.injected_signal_records[0].pending_syscall_retval,
+                Some(carrick_abi::LINUX_EINTR.guest_retval())
+            );
+            assert_eq!(
+                trap.injected_signal_records[0].restart_syscall,
+                expected == RestartDecision::Restart
+            );
             assert_eq!(
                 trap.completed_syscalls,
                 [carrick_abi::LINUX_EINTR.guest_retval()]
@@ -760,6 +780,10 @@ mod tests {
         )
         .unwrap();
         assert!(context.task().is_job_control_stopped());
+        assert!(
+            engine.completed_syscalls.is_empty(),
+            "a stop changes task state without completing the parked syscall"
+        );
 
         let cont =
             carrick_kernel::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGCONT)

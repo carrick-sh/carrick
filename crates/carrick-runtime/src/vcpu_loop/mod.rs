@@ -3269,6 +3269,7 @@ pub(crate) mod tests {
         pub(crate) next_syscall: Option<carrick_hal::RawSyscall>,
         pub(crate) completed_syscalls: Vec<i64>,
         pub(crate) injected_signals: usize,
+        pub(crate) injected_signal_records: Vec<carrick_hal::SignalInjection>,
         pub(crate) completion_events: Option<Arc<Mutex<Vec<&'static str>>>>,
         pub(crate) execve_installs: usize,
         pub(crate) exec_inventory_arms: usize,
@@ -3554,11 +3555,9 @@ pub(crate) mod tests {
             if self.exec_support { (0, 1) } else { (0, 0) }
         }
 
-        fn inject_signal(
-            &mut self,
-            _signal: carrick_hal::SignalInjection,
-        ) -> Result<(), TrapError> {
+        fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
             self.injected_signals += 1;
+            self.injected_signal_records.push(signal);
             Ok(())
         }
 
