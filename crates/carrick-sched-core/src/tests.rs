@@ -3199,3 +3199,22 @@ fn switched_sibling_mask_cannot_replace_the_host_loaded_affinity_source() {
     zone.free_record(record);
     zone.publish_slot_with_affinity(SLOT, 0, None, AffinitySource::UNBOUND);
 }
+
+#[test]
+fn host_only_affinity_is_not_an_el1_residency() {
+    let zone = zone();
+    let authority = crate::affinity::AffinityAuthority::new();
+    authority.initialize(1);
+    // SAFETY: the host allocation stays live; EL1 has no mapping for it.
+    let source = unsafe {
+        crate::AffinitySource::from_aliases(
+            core::ptr::from_ref(&authority).expose_provenance() as u64,
+            0,
+        )
+    };
+    zone.publish_slot_with_affinity(SLOT, MM, Some(1), source);
+    assert!(
+        !zone.slot(SLOT).affinity_excludes_cpu(),
+        "host-only placement must not force an EL1 exit on every interrupt"
+    );
+}
