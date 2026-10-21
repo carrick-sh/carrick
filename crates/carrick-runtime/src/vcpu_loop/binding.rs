@@ -275,6 +275,7 @@ pub(super) enum HvpatchProductionPhase {
     },
     ResumeJobControlStop {
         _subscription: carrick_kernel::kernel::objects::TaskWakeSubscription,
+        owner_resume: Option<Box<OwnerResumeAfterStop>>,
     },
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     RetryProcessFork {
@@ -359,6 +360,19 @@ pub(super) enum HvpatchProductionPhase {
         _subscription: TerminalRetireSubscription,
     },
     Complete,
+}
+
+pub(super) enum OwnerResumeAfterStop {
+    Zone {
+        frame: carrick_hal::RawSyscall,
+        resume: OwnedSyscallResume,
+    },
+    Physical {
+        frame: carrick_hal::RawSyscall,
+        resume: OwnedSyscallResume,
+        wait: carrick_guest_mem::OwnedMemoryWait,
+        subscription: Box<dyn std::fmt::Debug + Send + Sync>,
+    },
 }
 
 pub(super) enum RetainedMemoryAction {
@@ -2132,7 +2146,7 @@ where
         }
     }
 
-    fn suspend_for_job_control(
+    pub(super) fn suspend_for_job_control(
         &mut self,
         engine: &mut E,
         _control: &executor::HvpatchQuantumControl<'_, '_>,
@@ -2197,6 +2211,7 @@ where
                     }
                     self.phase = HvpatchProductionPhase::ResumeJobControlStop {
                         _subscription: subscription,
+                        owner_resume: None,
                     };
                     let exit = self.suspend(
                         HvpatchLoopSuspension::BlockedContinuation,
@@ -4436,6 +4451,134 @@ where
                     wait,
                     _subscription,
                 } => {
+                    let context = self
+                        .state
+                        .service_kernel_context
+                        .as_ref()
+                        .ok_or_else(|| {
+                            RuntimeError::Configuration(
+                                "physical owner signal wake lost context".to_owned(),
+                            )
+                        })?
+                        .retain_exact();
+                    if let Some(reservation) = context
+                        .signal_authority()
+                        .reserve_deliverable_for_wait(carrick_abi::WaitSigMask::NONE)
+                    {
+                        let reserved =
+                            carrick_kernel::kernel::continuation::ReservedSignal::from_kernel_reservation(
+                                context.signal_authority(),
+                                reservation,
+                            );
+                        let delivery = carrick_kernel::kernel::evaluate_signal_delivery_action(
+                            reserved.signum(),
+                            reserved.action(),
+                        );
+                        let ptrace_stop = carrick_kernel::exec_helpers::stop_for_ptrace_signal(
+                            &self.kernel.dispatcher,
+                            reserved.signum(),
+                        );
+                        if ptrace_stop
+                            || matches!(
+                                delivery,
+                                carrick_kernel::kernel::SignalDeliveryAction::Stop
+                            )
+                        {
+                            if ptrace_stop {
+                                drop(reserved);
+                            } else {
+                                let pc = engine.current_pc()?;
+                                if let Some(outcome) = service_signals_threaded(
+                                    &self.kernel,
+                                    &context,
+                                    engine,
+                                    self.state.this_tid,
+                                    self.state.fatal_image_generation,
+                                    None,
+                                    Some(pc),
+                                    None,
+                                    Some(reserved),
+                                    self.traps,
+                                )? {
+                                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                                }
+                            }
+                            if let Some(exit) = self.suspend_for_job_control(engine, control)? {
+                                let HvpatchProductionPhase::ResumeJobControlStop {
+                                    owner_resume,
+                                    ..
+                                } = &mut self.phase
+                                else {
+                                    return Err(RuntimeError::Configuration(
+                                        "physical owner stop lost job-control phase".to_owned(),
+                                    )
+                                    .into());
+                                };
+                                *owner_resume = Some(Box::new(OwnerResumeAfterStop::Physical {
+                                    frame,
+                                    resume,
+                                    wait,
+                                    subscription: _subscription,
+                                }));
+                                return Ok(exit);
+                            }
+                        } else if matches!(
+                            delivery,
+                            carrick_kernel::kernel::SignalDeliveryAction::Ignore
+                                | carrick_kernel::kernel::SignalDeliveryAction::Terminate
+                        ) {
+                            let pc = engine.current_pc()?;
+                            if let Some(outcome) = service_signals_threaded(
+                                &self.kernel,
+                                &context,
+                                engine,
+                                self.state.this_tid,
+                                self.state.fatal_image_generation,
+                                None,
+                                Some(pc),
+                                None,
+                                Some(reserved),
+                                self.traps,
+                            )? {
+                                return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                            }
+                        } else {
+                            let write_committed = resume.committed_len();
+                            let has_committed_prefix =
+                                self.state.owner_read_progress > 0 || write_committed > 0;
+                            let outcome = if has_committed_prefix {
+                                self.state.continuation_restart = None;
+                                DispatchOutcome::Returned {
+                                    value: i64::try_from(write_committed).unwrap_or(i64::MAX),
+                                }
+                            } else {
+                                let request = self
+                                    .state
+                                    .syscall_completion
+                                    .guest("physical owner signal lost syscall")?
+                                    .syscall()
+                                    .request;
+                                let restart_class = match zone::ZoneWaitPolicy::for_owner_resume(
+                                    &resume, request,
+                                ) {
+                                    zone::ZoneWaitPolicy::Ordinary { restart, .. } => restart,
+                                };
+                                let handler_restarts =
+                                    reserved.action().sa_flags & carrick_abi::LINUX_SA_RESTART != 0;
+                                self.state.continuation_restart = Some(match restart_class {
+                                    carrick_kernel::kernel::continuation::RestartClass::RestartNoIntr => carrick_kernel::kernel::continuation::RestartDecision::Restart,
+                                    carrick_kernel::kernel::continuation::RestartClass::RestartSyscall if handler_restarts => carrick_kernel::kernel::continuation::RestartDecision::Restart,
+                                    _ => carrick_kernel::kernel::continuation::RestartDecision::NoRestart,
+                                });
+                                DispatchOutcome::Errno {
+                                    errno: carrick_abi::LINUX_EINTR,
+                                }
+                            };
+                            self.state.reserved_signal = Some(reserved);
+                            drop(_subscription);
+                            return self.route_outcome(engine, control, frame, outcome);
+                        }
+                    }
                     if !wait.0.is_ready() {
                         self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
                             frame,
@@ -4518,7 +4661,10 @@ where
                 HvpatchProductionPhase::ResumeForkQuiesce { _subscription } => {
                     drop(_subscription);
                 }
-                HvpatchProductionPhase::ResumeJobControlStop { _subscription } => {
+                HvpatchProductionPhase::ResumeJobControlStop {
+                    _subscription,
+                    owner_resume,
+                } => {
                     drop(_subscription);
                     let context = match self.state.service_kernel_context.as_ref() {
                         Some(context) => context.retain_exact(),
@@ -4546,6 +4692,48 @@ where
                         self.traps,
                     )? {
                         return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                    }
+                    if let Some(owner_resume) = owner_resume {
+                        match *owner_resume {
+                            OwnerResumeAfterStop::Zone { frame, resume } => {
+                                let outcome = self.state.resume_owned_syscall(
+                                    &self.kernel,
+                                    engine,
+                                    resume,
+                                    control.submission.host_wait_context(),
+                                )?;
+                                return self.route_outcome(engine, control, frame, outcome);
+                            }
+                            OwnerResumeAfterStop::Physical {
+                                frame,
+                                resume,
+                                wait,
+                                subscription,
+                            } => {
+                                if !wait.0.is_ready() {
+                                    self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
+                                        frame,
+                                        resume,
+                                        wait,
+                                        _subscription: subscription,
+                                    };
+                                    return Ok(self.suspend(
+                                        HvpatchLoopSuspension::BlockedContinuation,
+                                        executor::ExecutorExit::Blocked(
+                                            carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                                        ),
+                                    ));
+                                }
+                                drop(subscription);
+                                let outcome = self.state.resume_owned_syscall(
+                                    &self.kernel,
+                                    engine,
+                                    resume,
+                                    control.submission.host_wait_context(),
+                                )?;
+                                return self.route_outcome(engine, control, frame, outcome);
+                            }
+                        }
                     }
                 }
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

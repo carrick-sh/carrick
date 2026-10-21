@@ -18,7 +18,9 @@
 //! - [`ProductionHvpatchLoopJob::resume_zone`]: a zone-parked thread loaded
 //!   from its record applies how its wait ended ([`Handback`]).
 
-use super::binding::{HvpatchProductionPhase, OwnedSyscallResume, ProductionHvpatchLoopJob};
+use super::binding::{
+    HvpatchProductionPhase, OwnedSyscallResume, OwnerResumeAfterStop, ProductionHvpatchLoopJob,
+};
 use super::exec::ProductionHvpatchPollError;
 use super::outcome::HvpatchLoopSuspension;
 use super::*;
@@ -37,7 +39,7 @@ pub(super) enum OwnerMemoryAction {
     Retained,
 }
 
-enum ZoneWaitPolicy {
+pub(super) enum ZoneWaitPolicy {
     Ordinary {
         timeout: Option<std::time::Duration>,
         restart: carrick_kernel::kernel::continuation::RestartClass,
@@ -45,7 +47,7 @@ enum ZoneWaitPolicy {
 }
 
 impl ZoneWaitPolicy {
-    fn for_owner_resume(resume: &OwnedSyscallResume, request: SyscallRequest) -> Self {
+    pub(super) fn for_owner_resume(resume: &OwnedSyscallResume, request: SyscallRequest) -> Self {
         use carrick_kernel::kernel::continuation::RestartClass;
         let restart = match resume {
             OwnedSyscallResume::PreparedCopyout(
@@ -307,7 +309,10 @@ pub(super) fn owner_wait_interruption(
             })
         }
         carrick_kernel::kernel::continuation::ContinuationCompletion::Errno(errno)
-            if *errno == carrick_abi::LINUX_EINTR => Some(DispatchOutcome::Errno { errno: *errno }),
+            if *errno == carrick_abi::LINUX_EINTR =>
+        {
+            Some(DispatchOutcome::Errno { errno: *errno })
+        }
         _ => None,
     }
 }
@@ -941,12 +946,71 @@ where
         resume: OwnedSyscallResume,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let mut result = self.consume_owner_zone(control)?;
-        let committed = self
-            .state
-            .owner_read_progress
-            .max(resume.committed_len());
-        let interruption = owner_wait_interruption(&result.completion, committed);
+        let write_committed = resume.committed_len();
+        let has_committed_prefix = self.state.owner_read_progress > 0 || write_committed > 0;
+        let interruption = owner_wait_interruption(&result.completion, write_committed);
         let effects = result.take_resume_effects();
+        let ptrace_stop = effects.reserved_signal.as_ref().is_some_and(|signal| {
+            carrick_kernel::exec_helpers::stop_for_ptrace_signal(
+                &self.kernel.dispatcher,
+                signal.signum(),
+            )
+        });
+        let job_control_stop = effects.reserved_signal.as_ref().is_some_and(|signal| {
+            matches!(
+                carrick_kernel::kernel::evaluate_signal_delivery_action(
+                    signal.signum(),
+                    signal.action()
+                ),
+                carrick_kernel::kernel::SignalDeliveryAction::Stop
+            )
+        });
+        if ptrace_stop || job_control_stop {
+            let context = self
+                .state
+                .service_kernel_context
+                .as_ref()
+                .ok_or_else(|| RuntimeError::Configuration("owner stop lost context".to_owned()))?
+                .retain_exact();
+            if ptrace_stop {
+                drop(effects.reserved_signal);
+            } else {
+                let pc = engine.current_pc()?;
+                if let Some(outcome) = service_signals_threaded(
+                    &self.kernel,
+                    &context,
+                    engine,
+                    self.state.this_tid,
+                    self.state.fatal_image_generation,
+                    None,
+                    Some(pc),
+                    None,
+                    effects.reserved_signal,
+                    self.traps,
+                )? {
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
+            }
+            if let Some(exit) = self.suspend_for_job_control(engine, control)? {
+                let HvpatchProductionPhase::ResumeJobControlStop { owner_resume, .. } =
+                    &mut self.phase
+                else {
+                    return Err(RuntimeError::Configuration(
+                        "owner stop lost job-control phase".to_owned(),
+                    )
+                    .into());
+                };
+                *owner_resume = Some(Box::new(OwnerResumeAfterStop::Zone { frame, resume }));
+                return Ok(exit);
+            }
+            let outcome = self.state.resume_owned_syscall(
+                &self.kernel,
+                engine,
+                resume,
+                control.submission.host_wait_context(),
+            )?;
+            return self.route_outcome(engine, control, frame, outcome);
+        }
         let reserved_signum = effects
             .reserved_signal
             .as_ref()
@@ -963,11 +1027,15 @@ where
         } else {
             previous.or(reserved)
         };
-        self.state.continuation_restart = interruption
-            .as_ref()
-            .is_some_and(|outcome| matches!(outcome, DispatchOutcome::Errno { errno } if *errno == carrick_abi::LINUX_EINTR))
-            .then_some(effects.restart)
-            .flatten();
+        self.state.continuation_restart = if !has_committed_prefix
+            && interruption.as_ref().is_some_and(
+                |outcome| matches!(outcome, DispatchOutcome::Errno { errno } if *errno == carrick_abi::LINUX_EINTR),
+            )
+        {
+            effects.restart
+        } else {
+            None
+        };
         let outcome = match interruption {
             Some(outcome) => outcome,
             None => self.state.resume_owned_syscall(

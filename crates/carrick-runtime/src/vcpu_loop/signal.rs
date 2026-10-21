@@ -2724,10 +2724,9 @@ mod tests {
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.exact_signal_context_for_test();
         let tid = ThreadId::main_from_host_pid();
-        let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(
-            crate::linux_abi::LINUX_SIGUSR1,
-        )
-        .expect("SIGUSR1");
+        let signal =
+            carrick_kernel::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGUSR1)
+                .expect("SIGUSR1");
         let mut action = carrick_abi::LinuxSigaction::empty();
         action.sa_handler = 0x1234;
         action.sa_flags = carrick_abi::LINUX_SA_RESTART;
