@@ -4,6 +4,16 @@ use carrick_core::mm::{fork::ForkError, reservation::Refusal, transaction::MmErr
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeForkStage {
+    ParentLifecycleGate,
+    BirthReservation,
+    ParentSpaceEdit,
+    ParentForkReady,
+    ChildLifecycleClaim,
+    ChildControlReset,
+    BirthPublication,
+    PrepareService,
+    ForkFileTable,
+    CommitChildService,
     MappingCount,
     SpaceAccess,
     ParentRoot,
@@ -23,6 +33,7 @@ pub enum NativeForkStage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeForkCause {
+    Busy,
     Mm(MmError),
     Reservation(Refusal),
     Fork(ForkError),
@@ -60,6 +71,7 @@ impl NativeForkRefusal {
         use super::native_process_runtime::NativeProcessError as E;
         use carrick_el1_abi::ForkStockRefusal as R;
         match self.cause {
+            NativeForkCause::Busy => E::Busy,
             NativeForkCause::StockReservation(R::Invalid) => E::Invalid,
             NativeForkCause::StockReservation(R::Stale) => E::Stale,
             NativeForkCause::StockReservation(R::Capacity) => E::Exhausted,
@@ -80,6 +92,23 @@ pub fn refused(
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     emit(format_args!("{refusal:?}"));
     super::native_process_runtime::NativeProcessError::ForkRefused(refusal)
+}
+
+/// Preserve the existing EAGAIN policy while retaining the exact refusing site.
+pub fn busy(stage: NativeForkStage) -> super::native_process_runtime::NativeProcessError {
+    refused(stage, NativeForkCause::Busy)
+}
+
+/// A service may already have emitted a more precise typed refusal.
+pub fn at_busy_site(
+    stage: NativeForkStage,
+    error: super::native_process_runtime::NativeProcessError,
+) -> super::native_process_runtime::NativeProcessError {
+    if error == super::native_process_runtime::NativeProcessError::Busy {
+        busy(stage)
+    } else {
+        error
+    }
 }
 
 /// Error-only alias observation alongside the typed Prepare refusal. It never

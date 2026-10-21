@@ -3,6 +3,7 @@
 //! incarnation; it does not import a host TaskSerial or launcher credentials.
 extern crate alloc;
 use super::{
+    native_fork_refusal::{NativeForkStage, at_busy_site, busy},
     native_process_custody::{ProcessResources, ProcessWake, RetainedProcessCustody},
     native_process_entry::{self, CopiedWaitOutcome, ForkTryError, PreparedFork, WaitWork},
     native_process_signals::{NativeExitSignals, NativeProcessSignals},
@@ -5022,7 +5023,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .lock()
                         .owner
                         .rollback_birth(&reservation.permit);
-                    return Err(error);
+                    return Err(at_busy_site(NativeForkStage::PrepareService, error));
                 }
             };
         self.fork_publish(child_tid, reservation, prepared)
@@ -5062,7 +5063,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .task(self.key)
                 .map_err(|_| NativeProcessError::Stale)?;
             if row.native().resources().page.gate() != carrick_el1_abi::GateState::Open {
-                return Err(NativeProcessError::Busy);
+                return Err(busy(NativeForkStage::ParentLifecycleGate));
             }
             let parent_mm = row.native().resources().mm.clone();
             let identity = row.identity();
@@ -5150,7 +5151,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let permit = graph
                 .owner
                 .reserve_birth(snapshot, snapshot, transaction)
-                .map_err(|_| NativeProcessError::Busy)?;
+                .map_err(|_| busy(NativeForkStage::BirthReservation))?;
             (
                 snapshot,
                 permit,
@@ -5313,7 +5314,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| NativeProcessError::Invalid)?;
             let claim = page
                 .claim(lifecycle_entry)
-                .map_err(|_| NativeProcessError::Busy)?;
+                .map_err(|_| busy(NativeForkStage::ChildLifecycleClaim))?;
             if control
                 .reset_for_birth(
                     blocked,
@@ -5328,7 +5329,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             {
                 page.unclaim(claim)
                     .map_err(|_| NativeProcessError::Quarantined)?;
-                return Err(NativeProcessError::Busy);
+                return Err(busy(NativeForkStage::ChildControlReset));
             }
             if control.set_affinity(parent_affinity).is_err() {
                 page.unclaim(claim)
@@ -5441,7 +5442,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             if let Err((_, p)) = self.service.abort_mm(prepared) {
                 self.service.quarantine_prepared(p)
             };
-            return Err(error);
+            return Err(at_busy_site(NativeForkStage::ForkFileTable, error));
         }
         let child_words = self
             .service
@@ -5525,8 +5526,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Err(failure) => {
                 drop(member_registration);
                 let (error, prep) = match failure {
-                    ForkTryError::Admission(_, prep) => (NativeProcessError::Busy, prep),
-                    ForkTryError::Commit(error, prep) => (error, prep),
+                    ForkTryError::Admission(_, prep) => {
+                        (busy(NativeForkStage::BirthPublication), prep)
+                    }
+                    ForkTryError::Commit(error, prep) => (
+                        at_busy_site(NativeForkStage::CommitChildService, error),
+                        prep,
+                    ),
                 };
                 let returned = {
                     let mut graph = self.runtime.graph.lock();
