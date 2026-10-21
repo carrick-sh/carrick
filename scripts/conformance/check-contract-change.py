@@ -2296,11 +2296,11 @@ def _compute_transitive_call_closure(
                 r"(\.|::)\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^{};]*>\s*)?\(",
                 code,
             ):
-                if match.group(2) not in crate_fn_files:
-                    continue
                 prefix = code[:match.start()].rstrip()
                 receiver = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)$", prefix)
-                associated = receiver is not None and receiver.group(1)[0].isupper()
+                associated = prefix.endswith(">") or (
+                    receiver is not None and receiver.group(1)[0].isupper()
+                )
                 if match.group(1) == "." or associated:
                     needs_method_snapshot = True
             for cm in _CALLEE_EXTRACT_RE.finditer(code):
@@ -2692,11 +2692,14 @@ def _scope_declares_mod(scope_s: str, scope_cs: str, mod_name: str) -> bool:
 _MACRO_SCOPE_META = "/*__CONTRACT_MACROS__:"
 
 
-def _scope_macro_names(scope_s: str, scope_cs: str, inherited: dict[str, str]) -> dict[str, str]:
+def _scope_macro_names(
+    scope_s: str, scope_cs: str, inherited: dict[str, str],
+    glob_candidates: dict[str, str] | None = None, include_nested: bool = False,
+) -> dict[str, str]:
     names = dict(inherited)
     depths = _compute_brace_depths(scope_s)
     for m in _MACRO_DECL_RE.finditer(scope_s):
-        if depths[m.start()] == 0:
+        if include_nested or depths[m.start()] == 0:
             opening = m.end()
             while opening < len(scope_s) and scope_s[opening].isspace():
                 opening += 1
@@ -2706,17 +2709,42 @@ def _scope_macro_names(scope_s: str, scope_cs: str, inherited: dict[str, str]) -
     clean, _ = _blank_macro_defs(scope_s, scope_s)
     depths = _compute_brace_depths(clean)
     for m in re.finditer(r"\buse\s+([^;]+);", clean):
-        if depths[m.start()] != 0:
+        if not include_nested and depths[m.start()] != 0:
             continue
         tree = m.group(1).strip()
         if tree.startswith(("std::", "core::")):
             continue
+        if "*" in tree and glob_candidates:
+            # Without rustc name resolution, a local glob can expose any of
+            # these macro definitions/re-exports. Treat each candidate as
+            # shadowing the built-in until its expansion is proven.
+            names.update(glob_candidates)
         # Named imports may shadow a standard assertion, even if the origin
         # is an external macro whose expansion cannot be validated here.
         for name in _KNOWN_EXEC_MACROS:
             if re.search(rf"\b{re.escape(name)}\b", tree):
                 names[name] = tree
     return names
+
+
+def _crate_macro_import_candidates(view: RepoView, pkg_name: str) -> dict[str, str]:
+    cache = getattr(view, "_macro_import_candidates", None)
+    if cache is None:
+        cache = {}
+        view._macro_import_candidates = cache
+    if pkg_name not in cache:
+        candidates: dict[str, str] = {}
+        for rel_path in view.glob_files(f"crates/{pkg_name}", ".rs"):
+            for name, definition in _scope_macro_names(
+                view.read_stripped_rust(rel_path),
+                view.read_comments_stripped_rust(rel_path),
+                {}, include_nested=True,
+            ).items():
+                # Retain every candidate definition, including same-name
+                # re-exports in separate modules.
+                candidates[name] = candidates.get(name, "") + "\n" + definition
+        cache[pkg_name] = candidates
+    return cache[pkg_name]
 
 
 def _with_macro_scope(bodies: list[str] | None, macros: dict[str, str]) -> list[str] | None:
@@ -2753,7 +2781,10 @@ def _resolve_in_module_tree(
                 return None
             visited.add(state_key)
 
-            scope_macros = _scope_macro_names(scope_s, scope_cs, inherited_macros)
+            scope_macros = _scope_macro_names(
+                scope_s, scope_cs, inherited_macros,
+                _crate_macro_import_candidates(view, pkg_name),
+            )
             in_test_context = entered_test_mod or not require_test_module_for_root
 
             if not rem_segments:

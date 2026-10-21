@@ -168,8 +168,10 @@ transitive helpers without inventing call chains between unrelated receiver
 types. An unrelated implementation edit may therefore require fresh relevance.
 Fingerprinting retains literal contents and whitespace inside literals, while
 identifier relevance still excludes literals. Parent module macro definitions
-and named macro imports accompany resolved child modules, so a shadowed
-assertion cannot supply relevance. Signed lanes evaluate `debug_assertions`
+and macro imports accompany resolved child modules, so a shadowed
+assertion cannot supply relevance. Globs conservatively carry every local
+macro definition and re-export candidate; an unresolved expansion cannot
+impersonate a built-in assertion. Signed lanes evaluate `debug_assertions`
 using the release profile built by `test-signed-body.sh`; host, KVM and
 integration lanes use the test profile. Workspace profile overrides apply.
 Targets with `harness = false` cannot supply ordinary libtest evidence.

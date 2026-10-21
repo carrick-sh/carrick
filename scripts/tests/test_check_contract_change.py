@@ -2883,6 +2883,53 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         result = self.run_check(base_sha=base)
         self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
 
+    def test_review1_generic_and_generated_method_helpers_fail(self):
+        for helper, call in (
+            (
+                "struct Fixture<T>(core::marker::PhantomData<T>);\nimpl<T> Fixture<T> {\n"
+                "fn check_surface(&self) { assert_eq!(super::futex::surface_answer(), 1); }\n}\n",
+                "Fixture::<()>::check_surface(&Fixture(core::marker::PhantomData));",
+            ),
+            (
+                "macro_rules! fixture { ($method:ident) => {\nstruct Fixture;\n"
+                "impl Fixture { fn $method(&self) { assert_eq!(super::futex::surface_answer(), 1); } }\n"
+                "}; }\nfixture!(check_surface);\n",
+                "Fixture.check_surface();",
+            ),
+        ):
+            with self.subTest(call=call):
+                base, test_file = self._review_fingerprint_fixture(helper, call)
+                test_file.write_text(test_file.read_text().replace(
+                    "assert_eq!(super::futex::surface_answer(), 1);", ""
+                ))
+                self._commit_all("gut generic or generated method helper")
+                result = self.run_check(base_sha=base)
+                self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+                self.assertIn("does not reference changed surface", result.stderr)
+
+    def test_review3_glob_import_assertion_macro_fails(self):
+        self.use_single_contract_surface()
+        self.guest_file.write_text("pub fn surface_answer() -> u64 { 1 }\n")
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base = self._commit_all("seed glob assertion surface")
+        self.guest_file.write_text("pub fn surface_answer() -> u64 { 2 }\n")
+        self.guest_file.with_name("mod.rs").write_text(
+            "pub mod futex;\n#[cfg(test)]\nmod parent {\n"
+            "mod helpers {\nmacro_rules! discard { ($($t:tt)*) => {}; }\n"
+            "pub(crate) use discard as assert_eq;\n}\n"
+            '#[path = "../review_child.rs"]\nmod child;\n}\n'
+        )
+        (self.guest_file.parent / "parent").mkdir(exist_ok=True)
+        self.guest_file.with_name("review_child.rs").write_text(
+            "use super::helpers::*;\n#[test]\nfn witness() {\n"
+            "assert_eq!(crate::dispatch::futex::surface_answer(), 1);\n}\n"
+        )
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::parent::child::witness"\n')
+        self._commit_all("glob-import discarded assertion")
+        result = self.run_check(base_sha=base)
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("does not reference changed surface", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
