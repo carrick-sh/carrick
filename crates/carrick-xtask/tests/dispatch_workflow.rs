@@ -175,7 +175,7 @@ fn foreground(case: &str) {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    if case != "oversize" {
+    if !matches!(case, "oversize" | "checkout") {
         let account = Command::new("/usr/bin/id")
             .args(["-u", "carrick-dispatch-agent"])
             .output()
@@ -404,13 +404,16 @@ fi
             .unwrap();
         assert!(output.status.success(), "{action}: {output:?}");
     };
-    if case == "oversize" {
+    if matches!(case, "oversize" | "checkout") {
         let package = temp.path().join("dispatch-output");
         std::fs::create_dir(&package).unwrap();
         std::fs::File::create(package.join("raw.log"))
             .unwrap()
             .set_len(21 * 1024 * 1024)
             .unwrap();
+        if case == "checkout" {
+            std::fs::write(root.join(".git/HEAD"), "broken\n").unwrap();
+        }
         invoke("complete");
         assert!(
             std::fs::read_to_string(temp.path().join("gh.args"))
@@ -644,4 +647,11 @@ fn agent_step_has_no_job_token() {
         .find(|s| s["id"].as_str() == Some("worker"))
         .unwrap();
     assert!(worker["env"]["GH_TOKEN"].is_badvalue());
+    assert!(!format!("{worker:?}").contains("github.token"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn failed_checkout_still_reports() {
+    foreground("checkout");
 }

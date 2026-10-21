@@ -683,11 +683,7 @@ fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerErr
 }
 
 fn regular_text(path: &Path) -> Result<String, ScalerError> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if !meta.is_file() || meta.len() > 20 * 1024 * 1024 {
-        return Err(ScalerError::Guard("unsafe or oversized dispatch output"));
-    }
-    Ok(std::fs::read_to_string(path)?)
+    Ok(crate::safe_copy::text(path, 20 * 1024 * 1024)?)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -776,7 +772,9 @@ fn snapshot(source: &Path, target: &Path, branch: &str) -> Result<(), ScalerErro
 fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerError> {
     let base =
         std::env::var("GITHUB_SHA").map_err(|_| ScalerError::Guard("missing admitted SHA"))?;
-    if !sha(&base) || git(root, &["rev-parse", "HEAD"])?.trim() != base {
+    if !sha(&base)
+        || (setup == "success/success" && git(root, &["rev-parse", "HEAD"])?.trim() != base)
+    {
         return Err(ScalerError::Guard("checkout differs from admitted SHA"));
     }
     let state = crate::agent_runner::state()?;
