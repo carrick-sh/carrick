@@ -847,7 +847,7 @@ fn service_take_keeps_identity_after_return_and_reuse() {
     let zone = zone();
     let record = service_record(&zone, 1);
     let expected = zone.record_ref(record);
-    assert!(zone.requeue_on(SLOT, record));
+    assert!(zone.requeue_on(SLOT, record).is_some());
     let taken = zone.take_service_head(SLOT).unwrap();
     zone.free_record(record);
     assert_eq!(zone.alloc_record(identity(2)).unwrap(), record);
@@ -1833,7 +1833,7 @@ fn only_the_executor_still_driving_a_slot_vacates_it() {
     zone.enter_guest(OTHER);
     // Queue a service thread on SLOT directly (its executor was about to take
     // it when its lease moved away).
-    assert!(zone.requeue_on(SLOT, service));
+    assert!(zone.requeue_on(SLOT, service).is_some());
     let mut taken = Vec::new();
     let mut placed = Vec::new();
     // Another executor drives the slot now: nothing happens.
@@ -1893,7 +1893,10 @@ fn only_its_driver_steps_away_from_and_back_to_a_slot() {
     assert_eq!(zone.slot(SLOT).driver(), Some(7), "away, not gone");
     let service = service_record(&zone, 5);
     assert_eq!(zone.place_from_host(service), None);
-    assert!(zone.requeue_on(SLOT, service), "it waits for its driver");
+    assert!(
+        zone.requeue_on(SLOT, service).is_some(),
+        "it waits for its driver"
+    );
     zone.step_back(SLOT, 9);
     assert!(!zone.slot(SLOT).is_live());
     zone.step_back(SLOT, 7);

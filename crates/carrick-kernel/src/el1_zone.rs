@@ -1003,10 +1003,6 @@ pub(crate) fn route_first_entry_handback(record: RecordRef) -> bool {
 }
 
 fn route_first_entry_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
-    let Some(rec) = zone.live(record) else {
-        return false;
-    };
-    let last_slot = rec.last_slot();
     let Some(custody) = zone.claim_first_entry_placement(record) else {
         return false;
     };
@@ -1014,12 +1010,7 @@ fn route_first_entry_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
         Ok(placement) => return deliver_placement(Some(placement)),
         Err(custody) => custody,
     };
-    if !zone.release_first_entry_placement(custody) {
-        return true;
-    }
-    // As for an ordinary held service row, preserve custody on the previous
-    // driver when every eligible slot is temporarily away on host work.
-    last_slot.is_some_and(|slot| zone.requeue_on(slot, record.id))
+    !zone.release_first_entry_placement(custody)
 }
 
 fn deliver_handback_event(event: HandbackEvent<'_>) {
@@ -1171,7 +1162,8 @@ fn settle_vacated(
             if deliver_placement(zone.place_from_host(record.id)) {
                 continue;
             }
-            if fallback.is_some_and(|fallback| zone.requeue_on(fallback, record.id)) {
+            if deliver_placement(fallback.and_then(|fallback| zone.requeue_on(fallback, record.id)))
+            {
                 continue;
             }
             // No slot runs an executor that could take it (every one is
@@ -1410,7 +1402,7 @@ pub mod deferred_capture_control {
         if zone.slot(slot).driver() != Some(driver)
             || !zone.slot(slot).is_live()
             || !zone.record_allows_slot(record.id, slot)
-            || !zone.requeue_on(slot, record.id)
+            || !deliver_placement(zone.requeue_on(slot, record.id))
         {
             return;
         }
@@ -1674,7 +1666,7 @@ mod tests {
                     HostClaim::Claimed,
                 );
                 original.push(zone.record_ref(record));
-                assert!(zone.requeue_on(slot, record));
+                assert!(zone.requeue_on(slot, record).is_some());
             }
             let mut records = Vec::new();
             let mut placements = Vec::new();
@@ -1980,7 +1972,7 @@ mod tests {
         zone.drive(slot, 7);
         let queued = zone.alloc_host_runnable(identity(1)).unwrap();
         let reference = zone.record_ref(queued);
-        assert!(zone.requeue_on(slot, queued));
+        assert!(zone.requeue_on(slot, queued).is_some());
         let mut records = Vec::new();
         let mut placements = Vec::new();
         assert!(zone.step_away(
@@ -2190,7 +2182,7 @@ mod tests {
                             // Production: the record is already queued on the
                             // slot whose driver steps away.
                             let id = zone.alloc_host_runnable(expected).unwrap();
-                            assert!(zone.requeue_on(away, id));
+                            assert!(zone.requeue_on(away, id).is_some());
                             record = Some(zone.record_ref(id));
                             step_away_from_slot(away, 7);
                         }
@@ -2251,7 +2243,7 @@ mod tests {
         zone.drive(slot, 7);
         let old_id = zone.alloc_host_runnable(identity(1)).unwrap();
         let old = zone.record_ref(old_id);
-        assert!(zone.requeue_on(slot, old_id));
+        assert!(zone.requeue_on(slot, old_id).is_some());
         let mut records = Vec::new();
         let mut placements = Vec::new();
         assert!(zone.leave_slot(
@@ -2385,7 +2377,7 @@ mod tests {
         zone.drive(slot, 7);
         let record = zone.alloc_host_runnable(identity(1)).unwrap();
         let expected = zone.record_ref(record);
-        assert!(zone.requeue_on(slot, record));
+        assert!(zone.requeue_on(slot, record).is_some());
         let mut records = Vec::new();
         let mut placements = Vec::new();
         assert!(zone.leave_slot(

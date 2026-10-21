@@ -405,7 +405,7 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
                     &mut |_| panic!("unexpected take"),
                     &mut |_| panic!("unexpected place")
                 ));
-                assert!(zone.requeue_on(slot, record));
+                assert!(zone.requeue_on(slot, record).is_some());
                 waiting.push((slot, record, driver));
             }
             let view = nodes(&region);

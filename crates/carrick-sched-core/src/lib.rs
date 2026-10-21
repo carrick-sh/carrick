@@ -2045,14 +2045,30 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         &self,
         custody: FirstEntryPlacement,
     ) -> Result<HostPlacement, FirstEntryPlacement> {
-        self.place_from_claim(
-            custody.record.id,
-            Claim::Placing {
+        let from = Claim::Placing {
+            seq: custody.seq,
+            host_requested: false,
+        };
+        if let Some(placement) = self.place_from_claim(custody.record.id, from) {
+            return Ok(placement);
+        }
+        // A requested placement still belongs to this producer. Preserve
+        // that custody through fallback publication, including the wakeup
+        // debt, instead of exposing Host between release and requeue.
+        let rec = self.record(custody.record.id);
+        if let Some(slot) = rec.last_slot() {
+            let requested = Claim::Placing {
                 seq: custody.seq,
-                host_requested: false,
-            },
-        )
-        .ok_or(custody)
+                host_requested: true,
+            };
+            if let Some(placement) = self
+                .requeue_from_claim(slot, custody.record.id, from)
+                .or_else(|| self.requeue_from_claim(slot, custody.record.id, requested))
+            {
+                return Ok(placement);
+            }
+        }
+        Err(custody)
     }
 
     pub fn release_first_entry_placement(&self, custody: FirstEntryPlacement) -> bool {
@@ -2088,19 +2104,44 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Queue the host-owned `record` back on `slot`, whether or not the slot
     /// is live: a service thread no other slot will take waits for this
     /// slot's driver, which is away on the host or about to drive it.
-    pub fn requeue_on(&self, slot: SlotId, record: RecordId) -> bool {
-        let rec = self.record(record);
-        let Claim::Host { seq } = rec.claim() else {
-            return false;
+    /// Deliver the returned reschedule receipt when its vCPU is in the guest.
+    pub fn requeue_on(&self, slot: SlotId, record: RecordId) -> Option<HostPlacement> {
+        let Claim::Host { seq } = self.record(record).claim() else {
+            return None;
         };
-        let Some(guard) = self.slot_lock(slot, &SpinForever) else {
-            return false;
-        };
-        if !rec.cas(Claim::Host { seq }, Claim::Queued { slot, seq }) {
-            return false;
+        self.requeue_from_claim(slot, record, Claim::Host { seq })
+    }
+
+    fn requeue_from_claim(
+        &self,
+        slot: SlotId,
+        record: RecordId,
+        from: Claim,
+    ) -> Option<HostPlacement> {
+        let guard = self.slot_lock(slot, &SpinForever)?;
+        if !self.record(record).cas(
+            from,
+            Claim::Queued {
+                slot,
+                seq: from.seq(),
+            },
+        ) {
+            return None;
         }
         self.push_locked(&guard, record, None);
-        true
+        // WFI admission takes this same lock and refuses a nonempty queue.
+        // Queue publication and its wake debt therefore cannot miss sleep.
+        let resched = matches!(
+            self.slot(slot).state(),
+            SlotState::Running | SlotState::IdleWfi
+        );
+        if resched {
+            self.slot(slot).resched_owed.store(1, Ordering::Release);
+            self.counters
+                .host_resched_kicks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Some(HostPlacement { slot, resched })
     }
 
     /// Executor `driver` (never 0, never with [`SLOT_AWAY`]) drives `slot`

@@ -140,9 +140,9 @@ fn requested_fallback_on_wfi_owes_a_kick() {
             zone.claim_for_host(record, None, Handback::Control, &SpinForever),
             HostClaim::Deferred
         );
-        let custody = zone.place_first_entry(custody).unwrap_err();
-        assert!(zone.release_first_entry_placement(custody));
-        assert!(zone.requeue_on(SLOT, record.id));
+        let placement = zone.place_first_entry(custody).ok().unwrap();
+        assert!(placement.resched, "WFI receipt must force the vCPU out");
+        assert_eq!(placement.slot, SLOT);
         assert!(
             zone.take_resched(SLOT),
             "P1 queued record behind WFI without kick debt"
@@ -313,7 +313,7 @@ fn wfi_entry_races_fallback_publication() {
         let record = birth(&zone);
         let sleeper_zone = zone.clone();
         let sleeper = thread::spawn(move || sleeper_zone.enter_idle(SLOT, true));
-        assert!(zone.requeue_on(SLOT, record.id));
+        assert!(zone.requeue_on(SLOT, record.id).is_some());
         let sleeping = sleeper.join().unwrap();
         assert!(
             !sleeping || zone.take_resched(SLOT),

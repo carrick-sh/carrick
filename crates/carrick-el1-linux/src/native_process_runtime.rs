@@ -11005,7 +11005,7 @@ mod tests {
             zone.claim_for_host(child_record, None, Handback::Resumed, &BoundedSpin(0)),
             carrick_sched_core::HostClaim::Claimed
         );
-        assert!(zone.requeue_on(peer_slot, child_record.id));
+        assert!(zone.requeue_on(peer_slot, child_record.id).is_some());
         let peer_source = BornInZoneSource {
             zone: &zone,
             slot: peer_slot,

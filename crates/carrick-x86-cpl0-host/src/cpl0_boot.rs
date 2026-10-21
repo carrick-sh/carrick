@@ -2029,7 +2029,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
             // existing home-release primitive to publish its actor affinity.
             let _ = zone.unhome(slot, record, 1 << cpu.raw());
         }
-        if !zone.requeue_on(slot, record) {
+        if zone.requeue_on(slot, record).is_none() {
             return Err(fail("fixture queue placement refused"));
         }
         Ok(())
