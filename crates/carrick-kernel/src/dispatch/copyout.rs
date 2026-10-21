@@ -95,6 +95,13 @@ impl CopyoutRefusal {
         *self.0
     }
 
+    pub(crate) fn suspend(self, operation: OwnedCopyoutOperation) -> DispatchOutcome {
+        DispatchOutcome::CopyoutSuspended(Box::new(OwnedCopyout {
+            wait: self.0,
+            operation,
+        }))
+    }
+
     pub(crate) fn from_read_error(error: carrick_guest_mem::MemoryError) -> Option<Self> {
         use carrick_guest_mem::{MemoryError, MemoryReadWait, MemorySupplyRequest};
         let outcome = match error {
@@ -135,6 +142,101 @@ impl CopyoutRefusal {
             _ => return None,
         };
         Some(Self(Box::new(outcome)))
+    }
+}
+
+/// Exact authority retained for an owner-refused syscall copyout.
+pub enum OwnedCopyoutOperation {
+    Getdents {
+        open_file: crate::dispatch::fd_table::OpenFile,
+        lease: crate::kernel::objects::FileDescriptionFdLease,
+        address: u64,
+        length: usize,
+    },
+    SocketError {
+        open_file: crate::dispatch::fd_table::OpenFile,
+        lease: crate::kernel::objects::FileDescriptionFdLease,
+        optval_addr: u64,
+        optlen_addr: u64,
+    },
+    Accept {
+        open_file: crate::dispatch::fd_table::OpenFile,
+        sockaddr: Option<Vec<u8>>,
+        addr: u64,
+        addrlen: u64,
+        record: Option<crate::dispatch::net::AcceptedAddressRecord>,
+    },
+}
+
+/// An owner-memory wait paired with the operation that owns the side effect.
+pub struct OwnedCopyout {
+    wait: Box<DispatchOutcome>,
+    pub(crate) operation: OwnedCopyoutOperation,
+}
+
+impl OwnedCopyout {
+    pub fn into_parts(self) -> (DispatchOutcome, OwnedCopyoutOperation) {
+        (*self.wait, self.operation)
+    }
+}
+
+impl std::fmt::Debug for OwnedCopyout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedCopyout")
+            .field("wait", &self.wait)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for OwnedCopyout {
+    fn eq(&self, other: &Self) -> bool {
+        self.wait == other.wait && std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for OwnedCopyout {}
+
+impl super::SyscallDispatcher {
+    /// Resume a copyout against the authority captured by the first dispatch.
+    pub fn resume_owned_copyout<M: CurrentMmMemory>(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: super::SyscallRequest,
+        operation: OwnedCopyoutOperation,
+        memory: &mut M,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        match operation {
+            OwnedCopyoutOperation::Getdents {
+                open_file,
+                lease: _,
+                address,
+                length,
+            } if request.number == carrick_abi::syscall::nr::GETDENTS64 => self
+                .fs_view()
+                .getdents64_from_open_file(kernel, open_file, address, length, memory),
+            OwnedCopyoutOperation::SocketError {
+                open_file,
+                lease: _,
+                optval_addr,
+                optlen_addr,
+            } if request.number == carrick_abi::syscall::nr::GETSOCKOPT => self
+                .net_view()
+                .socket_error_from_open_file(open_file, optval_addr, optlen_addr, memory),
+            OwnedCopyoutOperation::Accept {
+                open_file,
+                sockaddr,
+                addr,
+                addrlen,
+                record,
+            } if request.number == carrick_abi::syscall::nr::ACCEPT
+                || request.number == carrick_abi::syscall::nr::ACCEPT4 =>
+            {
+                Ok(self
+                    .net_view()
+                    .finish_owned_accept(open_file, sockaddr, addr, addrlen, record, memory))
+            }
+            _ => Err(DispatchError::Errno(carrick_abi::LINUX_EIO)),
+        }
     }
 }
 

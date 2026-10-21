@@ -67,12 +67,24 @@ impl Guest {
         untouched: &[(u64, usize)],
     ) -> DispatchOutcome {
         let wait = self.memory.refuse_next();
+        let request = SyscallRequest::new(number, SyscallArgs::from(args));
         let refused = self.call(number, args);
-        assert_eq!(
-            refused,
-            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
-            "syscall {number}: a transient owner refusal is a wait, not EFAULT",
-        );
+        let retained = if let DispatchOutcome::CopyoutSuspended(pending) = refused {
+            let (refused, operation) = (*pending).into_parts();
+            assert_eq!(
+                refused,
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                "syscall {number}: retained copyout has the exact owner wait",
+            );
+            Some(operation)
+        } else {
+            assert_eq!(
+                refused,
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                "syscall {number}: a transient owner refusal is a wait, not EFAULT",
+            );
+            None
+        };
         for &(address, len) in untouched {
             assert_eq!(
                 self.memory.read_bytes(address, len).unwrap(),
@@ -80,7 +92,14 @@ impl Guest {
                 "syscall {number}: nothing is written before the retry",
             );
         }
-        self.call(number, args)
+        if let Some(operation) = retained {
+            let context = self.dispatcher.capture_one_task_context().unwrap();
+            self.dispatcher
+                .resume_owned_copyout(&context, request, operation, &mut self.memory)
+                .expect("resume retained copyout")
+        } else {
+            self.call(number, args)
+        }
     }
 
     fn pipe(&mut self) -> (i32, i32) {
@@ -95,6 +114,40 @@ impl Guest {
 
     fn seed_path(&mut self, path: &str) {
         self.memory.seed(PATH, format!("{path}\0").as_bytes());
+    }
+
+    fn retained_refusal(
+        &mut self,
+        number: u64,
+        args: [u64; 6],
+        wait: carrick_el1_abi::PortalOwnerWait,
+    ) -> OwnedCopyoutOperation {
+        let DispatchOutcome::CopyoutSuspended(pending) = self.call(number, args) else {
+            panic!("syscall {number} did not retain its copyout");
+        };
+        let (outcome, operation) = (*pending).into_parts();
+        assert_eq!(
+            outcome,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        operation
+    }
+
+    fn resume_retained(
+        &mut self,
+        number: u64,
+        args: [u64; 6],
+        operation: OwnedCopyoutOperation,
+    ) -> DispatchOutcome {
+        let context = self.dispatcher.capture_one_task_context().unwrap();
+        self.dispatcher
+            .resume_owned_copyout(
+                &context,
+                SyscallRequest::new(number, SyscallArgs::from(args)),
+                operation,
+                &mut self.memory,
+            )
+            .unwrap()
     }
 }
 
@@ -237,6 +290,82 @@ fn getdents64_waits_for_an_owner_refused_copyout_without_consuming_entries() {
     assert_eq!(&first[19..21], b".\0");
 }
 
+#[test]
+fn getdents64_retained_copyout_ignores_numeric_fd_reuse() {
+    let mut g = Guest::new();
+    let root = g.dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::FILES
+                    | carrick_abi::LinuxCloneFlags::THREAD,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(71_102),
+            None,
+        )
+        .unwrap();
+    assert!(root.exact_thread_is_live() && sibling.exact_thread_is_live());
+    g.seed_path("/proc/self/fd");
+    let dir = g.ok(
+        nr::OPENAT.raw(),
+        [LINUX_AT_FDCWD, PATH, LINUX_O_DIRECTORY, 0, 0, 0],
+    );
+    let args = [dir as u64, OUT, 0x1000, 0, 0, 0];
+    let wait = g.memory.refuse_next();
+    let operation = g.retained_refusal(nr::GETDENTS64.raw(), args, wait);
+    let close = g
+        .dispatcher
+        .dispatch(
+            &sibling,
+            SyscallRequest::new(
+                nr::CLOSE.raw(),
+                SyscallArgs::from([dir as u64, 0, 0, 0, 0, 0]),
+            ),
+            &mut g.memory,
+            &g.reporter,
+        )
+        .unwrap();
+    assert_eq!(close, DispatchOutcome::Returned { value: 0 });
+    g.seed_path("/proc/self/fdinfo");
+    let DispatchOutcome::Returned { value: replacement } = g
+        .dispatcher
+        .dispatch(
+            &sibling,
+            SyscallRequest::new(
+                nr::OPENAT.raw(),
+                SyscallArgs::from([LINUX_AT_FDCWD, PATH, LINUX_O_DIRECTORY, 0, 0, 0]),
+            ),
+            &mut g.memory,
+            &g.reporter,
+        )
+        .unwrap()
+    else {
+        panic!("sibling replacement open failed");
+    };
+    assert_eq!(replacement, dir, "the sibling action really reused the fd");
+    let DispatchOutcome::Returned { value } =
+        g.resume_retained(nr::GETDENTS64.raw(), args, operation)
+    else {
+        panic!("retained getdents did not complete");
+    };
+    assert!(value > 0);
+    assert_eq!(&g.memory.read_bytes(OUT, 21).unwrap()[19..21], b".\0");
+
+    g.memory.seed(OUT, &[FILL; 64]);
+    let replacement_read = g.call(nr::GETDENTS64.raw(), args);
+    assert!(matches!(replacement_read, DispatchOutcome::Returned { value } if value > 0));
+    assert_eq!(
+        &g.memory.read_bytes(OUT, 21).unwrap()[19..21],
+        b".\0",
+        "the retained operation did not advance the replacement description"
+    );
+}
+
 fn socketpair(g: &mut Guest) -> (i32, i32) {
     assert_eq!(
         g.ok(
@@ -331,7 +460,7 @@ fn getsockopt_waits_for_an_owner_refused_copyout_instead_of_efault() {
 }
 
 #[test]
-fn accept_waits_for_an_owner_refused_copyout_without_dequeuing() {
+fn accept_owns_the_dequeued_connection_across_an_owner_refusal() {
     let mut g = Guest::new();
     let socket = |g: &mut Guest| {
         g.ok(
@@ -371,16 +500,18 @@ fn accept_waits_for_an_owner_refused_copyout_without_dequeuing() {
     g.memory.seed(LEN_ADDR, &16u32.to_ne_bytes());
     let next_fd = client + 1;
     let wait = g.memory.refuse_next();
-    assert_eq!(
-        g.call(nr::ACCEPT.raw(), [listener as u64, OUT, LEN_ADDR, 0, 0, 0]),
-        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
-    );
+    let args = [listener as u64, OUT, LEN_ADDR, 0, 0, 0];
+    let operation = g.retained_refusal(nr::ACCEPT.raw(), args, wait);
     assert!(
         g.dispatcher.open_file(next_fd as i32).is_none(),
         "the refused accept installs nothing",
     );
     assert_eq!(g.memory.read_bytes(OUT, 16).unwrap(), [FILL; 16]);
-    let accepted = g.ok(nr::ACCEPT.raw(), [listener as u64, OUT, LEN_ADDR, 0, 0, 0]);
+    let DispatchOutcome::Returned { value: accepted } =
+        g.resume_retained(nr::ACCEPT.raw(), args, operation)
+    else {
+        panic!("retained accept did not complete");
+    };
     assert_eq!(
         accepted, next_fd,
         "the queued connection survived the refusal"
@@ -716,16 +847,17 @@ fn accept_and_getsockopt_preserve_read_suspension_on_length_pointer() {
     g.memory.seed(LEN_ADDR, &16u32.to_ne_bytes());
     let next_fd = client + 1;
     let wait = g.memory.refuse_next_read();
-    assert_eq!(
-        g.call(nr::ACCEPT.raw(), [listener as u64, OUT, LEN_ADDR, 0, 0, 0]),
-        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
-        "read suspension on addrlen must return OwnerMemoryWait, not EFAULT",
-    );
+    let accept_args = [listener as u64, OUT, LEN_ADDR, 0, 0, 0];
+    let operation = g.retained_refusal(nr::ACCEPT.raw(), accept_args, wait);
     assert!(
         g.dispatcher.open_file(next_fd as i32).is_none(),
-        "read-suspended accept must not dequeue or install an fd",
+        "read-suspended accept must not install an fd",
     );
-    let accepted = g.ok(nr::ACCEPT.raw(), [listener as u64, OUT, LEN_ADDR, 0, 0, 0]);
+    let DispatchOutcome::Returned { value: accepted } =
+        g.resume_retained(nr::ACCEPT.raw(), accept_args, operation)
+    else {
+        panic!("retained accept did not complete");
+    };
     assert_eq!(accepted, next_fd);
 
     // 2. Read suspension on `optlen` in `getsockopt` (`write_sockopt_value`) must park and retry cleanly.
@@ -794,12 +926,12 @@ fn getsockopt_so_error_retains_pending_error_across_owner_refusal() {
         0,
     ];
     let wait = g.memory.refuse_next();
-    assert_eq!(
-        g.call(nr::GETSOCKOPT.raw(), args),
-        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
-    );
+    let operation = g.retained_refusal(nr::GETSOCKOPT.raw(), args, wait);
     assert_eq!(g.memory.read_bytes(OUT, 4).unwrap(), [FILL; 4]);
-    assert_eq!(g.ok(nr::GETSOCKOPT.raw(), args), 0);
+    assert_eq!(
+        g.resume_retained(nr::GETSOCKOPT.raw(), args, operation),
+        DispatchOutcome::Returned { value: 0 }
+    );
     assert_eq!(
         i32::from_ne_bytes(g.memory.read_bytes(OUT, 4).unwrap().try_into().unwrap()),
         carrick_abi::LINUX_ECONNREFUSED.get(),
@@ -817,11 +949,11 @@ fn getsockopt_so_error_retains_pending_error_across_owner_refusal() {
     }
     g.memory.seed(OUT, &[FILL; 4]);
     let wait = g.memory.refuse_next_read();
+    let operation = g.retained_refusal(nr::GETSOCKOPT.raw(), args, wait);
     assert_eq!(
-        g.call(nr::GETSOCKOPT.raw(), args),
-        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        g.resume_retained(nr::GETSOCKOPT.raw(), args, operation),
+        DispatchOutcome::Returned { value: 0 }
     );
-    assert_eq!(g.ok(nr::GETSOCKOPT.raw(), args), 0);
     assert_eq!(
         i32::from_ne_bytes(g.memory.read_bytes(OUT, 4).unwrap().try_into().unwrap()),
         carrick_abi::LINUX_ECONNREFUSED.get(),
@@ -884,11 +1016,11 @@ fn getsockopt_so_error_retains_pending_error_across_owner_refusal() {
         0,
     ];
     let wait = g.memory.refuse_next();
+    let operation = g.retained_refusal(nr::GETSOCKOPT.raw(), inmem_args, wait);
     assert_eq!(
-        g.call(nr::GETSOCKOPT.raw(), inmem_args),
-        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        g.resume_retained(nr::GETSOCKOPT.raw(), inmem_args, operation),
+        DispatchOutcome::Returned { value: 0 }
     );
-    assert_eq!(g.ok(nr::GETSOCKOPT.raw(), inmem_args), 0);
     assert_eq!(
         i32::from_ne_bytes(g.memory.read_bytes(OUT, 4).unwrap().try_into().unwrap()),
         carrick_abi::LINUX_EPIPE.get(),
@@ -899,6 +1031,44 @@ fn getsockopt_so_error_retains_pending_error_across_owner_refusal() {
         i32::from_ne_bytes(g.memory.read_bytes(OUT, 4).unwrap().try_into().unwrap()),
         0,
     );
+}
+
+#[test]
+fn getsockopt_so_error_retained_copyout_ignores_numeric_fd_reuse() {
+    let mut g = Guest::new();
+    let (socket, peer) = socketpair(&mut g);
+    let open_file = g.dispatcher.open_file(socket).unwrap();
+    let mut desc = crate::kernel::FileDescription::write_for_io(&open_file.description).unwrap();
+    let crate::dispatch::fd_table::OpenDescription::HostSocket { base, .. } = &mut *desc else {
+        panic!("expected HostSocket");
+    };
+    base.set_pending_socket_error(carrick_abi::LINUX_ECONNREFUSED.get());
+    drop(desc);
+    g.memory.seed(OUT, &[FILL; 4]);
+    g.memory.seed(LEN_ADDR, &4u32.to_ne_bytes());
+    let args = [
+        socket as u64,
+        LINUX_SOL_SOCKET as u64,
+        carrick_abi::LINUX_SO_ERROR as u64,
+        OUT,
+        LEN_ADDR,
+        0,
+    ];
+    let wait = g.memory.refuse_next();
+    let operation = g.retained_refusal(nr::GETSOCKOPT.raw(), args, wait);
+    assert_eq!(g.ok(nr::CLOSE.raw(), [socket as u64, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(g.ok(nr::CLOSE.raw(), [peer as u64, 0, 0, 0, 0, 0]), 0);
+    let (replacement, _) = g.pipe();
+    assert_eq!(replacement, socket, "the fd number was genuinely reused");
+    assert_eq!(
+        g.resume_retained(nr::GETSOCKOPT.raw(), args, operation),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        i32::from_ne_bytes(g.memory.read_bytes(OUT, 4).unwrap().try_into().unwrap()),
+        carrick_abi::LINUX_ECONNREFUSED.get(),
+    );
+    assert!(g.dispatcher.open_file(replacement).is_some());
 }
 
 #[test]
