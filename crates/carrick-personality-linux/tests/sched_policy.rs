@@ -258,8 +258,15 @@ fn missing_affinity_targets_precede_buffer_failures() {
         (SchedCall::SetAffinity, [9999, 8, 0x1000]),
         (SchedCall::GetAffinity, [9999, 8, 0]),
     ] {
-        let mut venue = AffinityVenue { args, esrch: true, ..Default::default() };
-        assert_eq!(serve_sched(call, &mut venue), FamilyCompletion::Complete(-3));
+        let mut venue = AffinityVenue {
+            args,
+            esrch: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            serve_sched(call, &mut venue),
+            FamilyCompletion::Complete(-3)
+        );
         assert_eq!(venue.out_len, 0);
     }
 }
@@ -285,7 +292,11 @@ fn arm_affinity_routes_in_ring_and_x86_stays_unported() {
     for nr in [122, 123] {
         assert_eq!(
             carrick_personality_linux::dispatch::route_aarch64(nr, 0),
-            Family::Sched(if nr == 122 { SchedCall::SetAffinity } else { SchedCall::GetAffinity })
+            Family::Sched(if nr == 122 {
+                SchedCall::SetAffinity
+            } else {
+                SchedCall::GetAffinity
+            })
         );
         assert_eq!(route_x86(nr, 0), Family::Unported);
     }

@@ -873,10 +873,24 @@ fn production_venue_remote_set_prompts_a_record_without_host_residency() {
         let mut physical = NoPhysicalCrossings::default();
         let mut entry = enter_native(&p, 0, &mut physical);
         let mut mask = 1;
-        assert_eq!(ring_call(entry.as_mut(), p.current, p.zone, 0, 122,
-            p.sibling.thread().key().tid.raw(), &mut mask), 0);
+        assert_eq!(
+            ring_call(
+                entry.as_mut(),
+                p.current,
+                p.zone,
+                0,
+                122,
+                u32::try_from(p.sibling.thread().key().tid.raw()).unwrap(),
+                &mut mask
+            ),
+            0
+        );
         drop(entry);
-        let prompts: Vec<_> = physical.effects.iter().flat_map(|e| e.sgi_slots()).collect();
+        let prompts: Vec<_> = physical
+            .effects
+            .iter()
+            .flat_map(|e| e.sgi_slots())
+            .collect();
         assert_eq!(prompts, [slot]);
     });
 }
