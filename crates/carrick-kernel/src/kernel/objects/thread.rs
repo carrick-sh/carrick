@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex};
 
 use carrick_abi::keyring::KeySerial;
 use carrick_abi::{LinuxGuestAbi, LinuxSigaltstack, SigSet};
@@ -528,34 +528,34 @@ struct ThreadExecutionRecord {
 #[derive(Debug)]
 struct AffinityResidency {
     binding: crate::kernel::scheduler::ExecutorBinding,
-    cpu: carrick_hal::GuestCpuId,
     kick: Weak<dyn crate::kernel::scheduler::ExecutorKick>,
+    token: carrick_core::affinity::AffinityResidencyToken,
 }
 
+// The shared authority decides when notification is owed. This adapter only
+// retains its exact host transport until the execution lock is released.
+#[derive(Default)]
+struct HostAffinityNotification(Option<carrick_core::affinity::AffinityNotification>);
+impl carrick_core::affinity::AffinityNotifier for HostAffinityNotification {
+    fn notify(&mut self, notification: carrick_core::affinity::AffinityNotification) {
+        self.0 = Some(notification);
+    }
+    fn supports_unrouted(&self) -> bool {
+        true
+    }
+}
 impl AffinityResidency {
-    fn excluded_kick(
+    fn notification(
         &self,
-        state: ThreadExecutionState,
-        affinity: CpuAffinity,
+        event: Option<carrick_core::affinity::AffinityNotification>,
     ) -> Option<(
         Arc<dyn crate::kernel::scheduler::ExecutorKick>,
         crate::kernel::scheduler::ExecutorKickToken,
     )> {
-        match state {
-            ThreadExecutionState::Running {
-                generation,
-                executor,
-                executor_epoch,
-                ..
-            } if generation == self.binding.generation()
-                && executor == self.binding.executor()
-                && executor_epoch == self.binding.executor_epoch()
-                && !affinity.is_allowed(self.cpu) =>
-            {
-                Some((self.kick.upgrade()?, self.binding.token()))
-            }
-            _ => None,
-        }
+        (event?.token == self.token)
+            .then(|| self.kick.upgrade())
+            .flatten()
+            .map(|kick| (kick, self.binding.token()))
     }
 }
 
@@ -677,6 +677,17 @@ impl ThreadExecutionLease {
         self.owner
             .upgrade()
             .map(|thread| thread.resources().files().id())
+    }
+
+    /// Bind the exact current residency to its backend slot before entry.
+    pub fn attach_affinity_slot(&self, slot: carrick_sched_core::SlotId) -> bool {
+        self.owner
+            .upgrade()
+            .filter(|thread| thread.key() == self.owner_key)
+            .is_some_and(|thread| {
+                thread.validate_running_execution_lease(self).is_ok()
+                    && thread.attach_affinity_slot(slot)
+            })
     }
 
     /// The exact live thread's ABI backing, retained independently of its graph.
@@ -965,7 +976,6 @@ pub struct Thread {
     /// gets for free by starting it at `None`.
     thread_keyring: Mutex<Option<KeySerial>>,
     last_cpu: AtomicU32,
-    affinity: RwLock<carrick_hal::CpuAffinity>,
 }
 
 #[derive(Debug, Default)]
@@ -1051,7 +1061,7 @@ impl Thread {
     /// The guest CPUs this thread may be placed on. `Copy`, so the placement
     /// path reads it without allocating.
     pub fn affinity(&self) -> carrick_hal::CpuAffinity {
-        *self.affinity.read()
+        carrick_hal::CpuAffinity::from_words(self.control.affinity().words())
     }
 
     /// Scheduling permission belongs to the exact target thread's current
@@ -1061,18 +1071,19 @@ impl Thread {
     }
 
     pub fn set_affinity(&self, affinity: carrick_hal::CpuAffinity) {
-        // Claim publication and mask changes serialize on the execution
-        // record. Either this change sees a published residency and kicks it,
-        // or residency publication sees the changed mask and supplies the kick.
-        let kick = {
+        let notification = {
             let execution = self.execution.lock();
-            *self.affinity.write() = affinity;
+            let mut notifier = HostAffinityNotification::default();
+            self.control.change_affinity(
+                carrick_core::affinity::CpuAffinity::from_words(affinity.words()),
+                &mut notifier,
+            );
             execution
                 .affinity_residency
                 .as_ref()
-                .and_then(|residency| residency.excluded_kick(execution.state, affinity))
+                .and_then(|r| r.notification(notifier.0))
         };
-        if let Some((kick, token)) = kick {
+        if let Some((kick, token)) = notification {
             kick.deliver_exact(token);
         }
     }
@@ -1082,16 +1093,64 @@ impl Thread {
         binding: crate::kernel::scheduler::ExecutorBinding,
         cpu: carrick_hal::GuestCpuId,
         kick: Weak<dyn crate::kernel::scheduler::ExecutorKick>,
-    ) {
-        let kick = {
+    ) -> Result<(), ThreadExecutionError> {
+        let notification = {
             let mut execution = self.execution.lock();
-            let residency = AffinityResidency { binding, cpu, kick };
-            let kick = residency.excluded_kick(execution.state, self.affinity());
+            if !matches!(execution.state, ThreadExecutionState::Running {
+                generation, executor, executor_epoch, ..
+            } if generation == binding.generation() && executor == binding.executor()
+                && executor_epoch == binding.executor_epoch())
+            {
+                return Err(ThreadExecutionError::InvalidTransition {
+                    operation: "publish_affinity_residency",
+                    state: execution.state,
+                });
+            }
+            self.retire_affinity_residency(&mut execution);
+            let mut notifier = HostAffinityNotification::default();
+            let token = self
+                .control
+                .affinity_authority()
+                .bind(cpu.as_u32(), &mut notifier)
+                .map_err(|_| ThreadExecutionError::GenerationExhausted)?;
+            let residency = AffinityResidency {
+                binding,
+                kick,
+                token,
+            };
+            let notification = residency.notification(notifier.0);
             execution.affinity_residency = Some(residency);
-            kick
+            notification
         };
-        if let Some((kick, token)) = kick {
+        if let Some((kick, token)) = notification {
             kick.deliver_exact(token);
+        }
+        Ok(())
+    }
+
+    /// Attach only the currently claimed host residency before guest entry.
+    pub fn attach_affinity_slot(&self, slot: carrick_sched_core::SlotId) -> bool {
+        let (attached, notification) = {
+            let execution = self.execution.lock();
+            let Some(residency) = execution.affinity_residency.as_ref() else {
+                return false;
+            };
+            let mut notifier = HostAffinityNotification::default();
+            let attached =
+                self.control
+                    .affinity_authority()
+                    .attach(residency.token, slot, &mut notifier);
+            (attached, residency.notification(notifier.0))
+        };
+        if let Some((kick, token)) = notification {
+            kick.deliver_exact(token);
+        }
+        attached
+    }
+
+    fn retire_affinity_residency(&self, execution: &mut ThreadExecutionRecord) {
+        if let Some(residency) = execution.affinity_residency.take() {
+            self.control.affinity_authority().unbind(residency.token);
         }
     }
 
@@ -1441,6 +1500,7 @@ impl Thread {
                             crate::kernel::continuation::ContinuationEvent::Ready,
                         );
                     }
+                    self.retire_affinity_residency(execution);
                     execution.state = ThreadExecutionState::Runnable { generation };
                     Ok(ThreadSchedulerAction::Queue {
                         key: self.key,
@@ -1490,6 +1550,7 @@ impl Thread {
                 executor_epoch,
                 ..
             } => {
+                self.retire_affinity_residency(execution);
                 execution.state = ThreadExecutionState::SwitchingOut {
                     generation,
                     executor,
@@ -1587,6 +1648,7 @@ impl Thread {
                             crate::kernel::continuation::ContinuationEvent::Ready,
                         );
                     }
+                    self.retire_affinity_residency(&mut execution);
                     execution.state = ThreadExecutionState::Runnable { generation };
                     drop(execution);
                     self.revision.publish();
@@ -1633,6 +1695,7 @@ impl Thread {
                 let generation = predecessor
                     .next()
                     .ok_or(ThreadExecutionError::GenerationExhausted)?;
+                self.retire_affinity_residency(&mut execution);
                 execution.state = ThreadExecutionState::Runnable { generation };
                 ThreadSchedulerAction::Queue {
                     key: self.key,
@@ -1787,6 +1850,7 @@ impl Thread {
         execution.task_state = Some(Box::new(state));
         execution.blocked_continuation = None;
         execution.exec_invalidation_pending = false;
+        self.retire_affinity_residency(&mut execution);
         execution.state = ThreadExecutionState::Runnable { generation };
         drop(execution);
         self.revision.publish();
@@ -1829,7 +1893,7 @@ impl Thread {
         {
             return Err(ThreadExecutionError::AffinityExcluded { cpu });
         }
-        execution.affinity_residency = None;
+        self.retire_affinity_residency(&mut execution);
         let executor_epoch = execution.next_executor_epoch;
         let next_executor_epoch = executor_epoch
             .checked_add(1)
@@ -1932,6 +1996,7 @@ impl Thread {
                 && executor == lease.executor
                 && executor_epoch == lease.executor_epoch =>
             {
+                self.retire_affinity_residency(&mut execution);
                 execution.state = ThreadExecutionState::SwitchingOut {
                     generation,
                     executor,
@@ -2022,6 +2087,7 @@ impl Thread {
             generation, reason, ..
         } = execution.state
         {
+            self.retire_affinity_residency(&mut execution);
             execution.state = ThreadExecutionState::Blocked {
                 generation,
                 reason,
@@ -2091,6 +2157,7 @@ impl Thread {
         );
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
+        self.retire_affinity_residency(&mut execution);
         execution.state = ThreadExecutionState::Failed { generation, reason };
         lease.settled = true;
         drop(execution);
@@ -2140,6 +2207,7 @@ impl Thread {
         );
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
+        self.retire_affinity_residency(&mut execution);
         execution.state = ThreadExecutionState::Failed {
             generation: successor,
             reason,
@@ -2160,6 +2228,7 @@ impl Thread {
         execution.blocked_continuation = None;
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
+        self.retire_affinity_residency(&mut execution);
         execution.state = ThreadExecutionState::Failed {
             generation: ExecutionGeneration::INITIAL,
             reason,
@@ -2193,6 +2262,7 @@ impl Thread {
         );
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
+        self.retire_affinity_residency(&mut execution);
         execution.state = ThreadExecutionState::Failed {
             generation: expected,
             reason,
@@ -2231,6 +2301,7 @@ impl Thread {
         );
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
+        self.retire_affinity_residency(&mut execution);
         execution.state = ThreadExecutionState::Failed { generation, reason };
         drop(execution);
         self.revision.publish();
@@ -2299,6 +2370,7 @@ impl Thread {
                 &mut lease.blocked_continuation,
                 crate::kernel::continuation::CancellationCause::Exec,
             );
+            self.retire_affinity_residency(&mut execution);
             execution.state = ThreadExecutionState::Exited { generation };
             execution.exec_invalidation_pending = false;
             execution.control_quantum = None;
@@ -2308,6 +2380,7 @@ impl Thread {
                     execution.task_state = lease.task_state.take();
                     execution.blocked_continuation =
                         Self::carry_continuation_through_lease(&mut lease);
+                    self.retire_affinity_residency(&mut execution);
                     execution.state = ThreadExecutionState::Runnable { generation };
                     if scheduler_owned {
                         action = ThreadSchedulerAction::Queue {
@@ -2337,6 +2410,7 @@ impl Thread {
                                     crate::probes::HvpatchLeaseSettleFlag::ContinuationReady.raw();
                             }
                         }
+                        self.retire_affinity_residency(&mut execution);
                         execution.state = ThreadExecutionState::Runnable { generation };
                         action = ThreadSchedulerAction::Queue {
                             key: self.key,
@@ -2345,6 +2419,7 @@ impl Thread {
                             closing_authorized: true,
                         };
                     } else {
+                        self.retire_affinity_residency(&mut execution);
                         execution.state = ThreadExecutionState::Blocked {
                             generation,
                             reason,
@@ -2404,6 +2479,7 @@ impl Thread {
                             settle_flags |=
                                 crate::probes::HvpatchLeaseSettleFlag::ContinuationReady.raw();
                         }
+                        self.retire_affinity_residency(&mut execution);
                         execution.state = ThreadExecutionState::Runnable { generation };
                         action = ThreadSchedulerAction::Queue {
                             key: self.key,
@@ -2412,6 +2488,7 @@ impl Thread {
                             closing_authorized: true,
                         };
                     } else {
+                        self.retire_affinity_residency(&mut execution);
                         execution.state = ThreadExecutionState::Blocked {
                             generation,
                             reason,
@@ -2432,6 +2509,7 @@ impl Thread {
                         &mut lease.blocked_continuation,
                         crate::kernel::continuation::CancellationCause::ThreadExit,
                     );
+                    self.retire_affinity_residency(&mut execution);
                     execution.state = ThreadExecutionState::Exited { generation };
                     execution.control_quantum = None;
                 }
@@ -2537,6 +2615,7 @@ impl Thread {
         );
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
+        self.retire_affinity_residency(&mut execution);
         execution.state = ThreadExecutionState::Failed {
             generation,
             reason: ExecutionFailure::UnsettledLeaseDropped {
@@ -2580,6 +2659,7 @@ impl Thread {
         );
         execution.exec_invalidation_pending = false;
         execution.control_quantum = None;
+        self.retire_affinity_residency(&mut execution);
         execution.state = ThreadExecutionState::Exited { generation };
         drop(execution);
         self.revision.publish();
@@ -2880,7 +2960,7 @@ impl Thread {
         self.control.clone()
     }
 
-    /// The sole storage for this thread's mask, altstack and robust-list head.
+    /// The sole storage for affinity, signal mask, altstack and robust-list head.
     pub fn control_slot(&self) -> &ThreadControlSlot {
         &self.control
     }
@@ -3018,8 +3098,12 @@ impl Thread {
         task: &Task,
         key: ThreadKey,
         seed: &ThreadSignalState,
+        affinity: CpuAffinity,
     ) -> super::ThreadControlLease {
         let slot = task.allocate_thread_control(key);
+        slot.set_affinity(carrick_core::affinity::CpuAffinity::from_words(
+            affinity.words(),
+        ));
         slot.init_blocked(BlockedMask(seed.blocked().raw()));
         slot.write_altstack(altstack_to_slot(seed.altstack()));
         slot
@@ -3116,7 +3200,12 @@ impl Thread {
             task: Arc::downgrade(task),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(ThreadSignalState::default()),
-            control: Self::new_control(task, key, &ThreadSignalState::default()),
+            control: Self::new_control(
+                task,
+                key,
+                &ThreadSignalState::default(),
+                CpuAffinity::all(crate::kernel::scheduler::guest_cpu_count()),
+            ),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             start_gate_open: AtomicBool::new(true),
@@ -3130,7 +3219,6 @@ impl Thread {
             next_crash_safe_point_participation: AtomicU64::new(1),
             thread_keyring: Mutex::new(None),
             last_cpu: AtomicU32::new(u32::MAX),
-            affinity: RwLock::new(CpuAffinity::all(crate::kernel::scheduler::guest_cpu_count())),
         })
     }
 
@@ -3139,7 +3227,12 @@ impl Thread {
         key: ThreadKey,
         blocked: SigSet,
     ) -> super::ThreadControlLease {
-        Self::new_control(task, key, &ThreadSignalState::for_clone_thread(blocked))
+        Self::new_control(
+            task,
+            key,
+            &ThreadSignalState::for_clone_thread(blocked),
+            CpuAffinity::all(crate::kernel::scheduler::guest_cpu_count()),
+        )
     }
 
     pub(in crate::kernel) fn prepare_clone(
@@ -3152,6 +3245,15 @@ impl Thread {
         let (_, key) = control.identity();
         if !task.owns_thread_control(&control) {
             carrick_fatal!("thread::control", "adoption crossed control owner");
+        }
+        if control.entry().is_some() {
+            control.initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(
+                caller_affinity.words(),
+            ));
+        } else {
+            control.set_affinity(carrick_core::affinity::CpuAffinity::from_words(
+                caller_affinity.words(),
+            ));
         }
         Arc::new(Thread {
             key,
@@ -3174,7 +3276,6 @@ impl Thread {
             next_crash_safe_point_participation: AtomicU64::new(1),
             thread_keyring: Mutex::new(None),
             last_cpu: AtomicU32::new(u32::MAX),
-            affinity: RwLock::new(caller_affinity),
         })
     }
 
@@ -3194,7 +3295,7 @@ impl Thread {
             task: Arc::downgrade(task),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(Self::live_state(seed)),
-            control: Self::new_control(task, key, seed),
+            control: Self::new_control(task, key, seed, caller_affinity),
             revision: ObjectRevision::new(),
             runner_gate: Arc::new(RunnerGate::new(key)),
             start_gate_open: AtomicBool::new(false),
@@ -3208,7 +3309,6 @@ impl Thread {
             next_crash_safe_point_participation: AtomicU64::new(1),
             thread_keyring: Mutex::new(None),
             last_cpu: AtomicU32::new(u32::MAX),
-            affinity: RwLock::new(caller_affinity),
         })
     }
 
@@ -3227,7 +3327,7 @@ impl Thread {
             task: Arc::downgrade(task),
             resources: ArcSwap::new(resources),
             signal_state: Mutex::new(Self::live_state(seed)),
-            control: Self::new_control(task, key, seed),
+            control: Self::new_control(task, key, seed, caller.affinity()),
             revision: ObjectRevision::new(),
             runner_gate: Arc::clone(&caller.runner_gate),
             start_gate_open: AtomicBool::new(true),
@@ -3241,7 +3341,6 @@ impl Thread {
             next_crash_safe_point_participation: AtomicU64::new(1),
             thread_keyring: Mutex::new(None),
             last_cpu: AtomicU32::new(u32::MAX),
-            affinity: RwLock::new(caller.affinity()),
         });
         thread.publish_pending(seed.pending());
         thread

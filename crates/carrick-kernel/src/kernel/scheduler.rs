@@ -119,6 +119,8 @@ pub enum RunQueueError {
     ObserverBindingMissing,
     #[error("generation observer outlived its scheduler")]
     ObserverSchedulerGone,
+    #[error("thread affinity residency epochs are exhausted")]
+    AffinityResidencyExhausted,
     #[error("executor identifiers are exhausted")]
     ExecutorIdExhausted,
     #[error("executor is already running another exact generation")]
@@ -4705,8 +4707,23 @@ impl Scheduler {
             self.executors.deliver_kick_to(executor.id);
         }
         let bound_cpu = executor.bound_cpu().unwrap_or(GuestCpuId::new(0));
-        row.thread
-            .publish_affinity_residency(binding, bound_cpu, Arc::downgrade(&executor.kick));
+        if let Err(error) = row.thread.publish_affinity_residency(
+            binding,
+            bound_cpu,
+            Arc::downgrade(&executor.kick),
+        ) {
+            // No guest entry may own an unpublished residency. Retire the
+            // exact binding and lease through the existing failed-claim path.
+            self.executors.unbind(binding);
+            drop(lease);
+            self.queue.inner.finish_claim();
+            return Err(match error {
+                ThreadExecutionError::GenerationExhausted => {
+                    RunQueueError::AffinityResidencyExhausted
+                }
+                _ => RunQueueError::AuthorityMismatch,
+            });
+        }
         row.thread.set_last_cpu(bound_cpu);
         let thread_id = SchedThreadId::new(row.thread.key().serial.raw());
         let process_id = SchedProcessId::new(row.thread.task_key().serial.raw());
@@ -5068,7 +5085,7 @@ impl Scheduler {
                 successor,
                 running.guest_cpu,
                 Arc::downgrade(&kick),
-            );
+            )?;
         }
         drop(generation_transition);
         self.kernel
