@@ -1035,7 +1035,13 @@ impl<E: ThreadedEngine> GuestGrantBackend for EngineGrantBackend<'_, E> {
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
     ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
     {
-        self.0.settle_el1_descriptor_receipt(txn, receipt)
+        self.0
+            .settle_el1_descriptor_receipt(txn, receipt)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "settle EL1 frame-grant descriptor receipt: {error:?}"
+                ))
+            })
     }
 
     fn complete(

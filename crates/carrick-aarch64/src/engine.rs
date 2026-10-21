@@ -5812,13 +5812,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         &mut self,
         txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
-    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
-    {
+    ) -> Result<
+        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        carrick_mmu_core::aarch64::GuestTxnSettleError,
+    > {
         self.page_tables
             .settle_guest_descriptor_receipt(txn, receipt)
-            .map_err(|error| {
-                TrapError::Hypervisor(format!("settle EL1 descriptor receipt: {error:?}"))
-            })
     }
 
     fn abandon_el1_descriptor_txn(
