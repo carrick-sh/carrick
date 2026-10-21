@@ -3218,6 +3218,8 @@ mod layout_manifest {
 
 #[cfg(test)]
 mod affinity_seed_tests {
+    #![allow(clippy::unwrap_used)]
+    extern crate std;
     #[test]
     fn quiescent_affinity_seed_refuses_live_residency_without_panicking() {
         let slot = super::ThreadControlSlot::new();
