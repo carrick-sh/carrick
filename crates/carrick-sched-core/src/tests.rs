@@ -3218,3 +3218,26 @@ fn host_only_affinity_is_not_an_el1_residency() {
         "host-only placement must not force an EL1 exit on every interrupt"
     );
 }
+
+#[test]
+fn switched_affinity_change_prompts_only_the_exact_excluded_owner() {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(1), 3);
+    zone.enter_guest(SLOT);
+    let record = zone.alloc_record(identity(703)).unwrap();
+    zone.requeue_preempted(SLOT, record);
+    zone.switch_in_full(SLOT).unwrap();
+    let reference = zone.record_ref(record);
+    zone.record(record).set_affinity(1);
+    let mut effects = WakeEffects::default();
+    zone.affinity_change_effects(reference, &mut effects);
+    assert_eq!(effects.sgi_slots().collect::<Vec<_>>(), [SLOT]);
+    zone.record(record).set_affinity(3);
+    let mut effects = WakeEffects::default();
+    zone.affinity_change_effects(reference, &mut effects);
+    assert_eq!(effects, WakeEffects::default());
+    zone.unswitch(SLOT, record);
+    zone.record(record).set_affinity(1);
+    zone.affinity_change_effects(reference, &mut effects);
+    assert_eq!(effects, WakeEffects::default());
+}

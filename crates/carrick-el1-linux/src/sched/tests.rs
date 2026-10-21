@@ -2070,3 +2070,26 @@ fn affinity_reschedule_without_sgi_route_reaches_host_transport_once() {
     );
     assert_eq!(deliveries[0].0, target);
 }
+
+#[test]
+fn switched_admission_rechecks_affinity_before_loading_its_frame() {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(1), 3);
+    zone.enter_guest(SLOT);
+    let record = zone.alloc_record(identity(703)).unwrap();
+    zone.requeue_preempted(SLOT, record);
+    let switched = zone.switch_in_full(SLOT).unwrap();
+    zone.record(record).set_affinity(1);
+    let task = task_for(703);
+    let mut cpu = FakeCpu::default();
+    let mut frame = TrapFrame::default();
+    frame.x[0] = 703;
+    let mut scheduler = Sched {
+        zone: &zone, slot: SLOT, task: &task, cpu: &mut cpu,
+        user: &HardwareUserWord, counters: counters(), handoff: None,
+    };
+    assert!(matches!(scheduler.load(&mut frame, switched), super::LoadResult::NeedsHost));
+    assert_eq!(frame.x[0], 703);
+    assert_eq!(zone.slot(SLOT).current(), None);
+    assert_eq!(zone.record(record).claim(), carrick_sched_core::Claim::Queued { slot: SLOT, seq: 1 });
+}
