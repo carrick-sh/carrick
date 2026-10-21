@@ -1,3 +1,6 @@
+use carrick_core::affinity::CpuAffinity;
+use carrick_syscall_abi::LinuxErrno;
+type AffinityResult = Result<CpuAffinity, LinuxErrno>;
 use carrick_guest_arch::UserVa;
 use carrick_personality_linux::{
     dispatch::{Family, FamilyCompletion, route_x86},
@@ -44,17 +47,10 @@ impl SchedVenue for Venue {
         carrick_core::affinity::MAX_GUEST_CPUS
     }
 
-    fn get_affinity(
-        &self,
-        _: u32,
-    ) -> Result<carrick_core::affinity::CpuAffinity, carrick_syscall_abi::LinuxErrno> {
+    fn get_affinity(&self, _: u32) -> AffinityResult {
         Err(carrick_syscall_abi::LINUX_ESRCH)
     }
-    fn set_affinity(
-        &mut self,
-        _: u32,
-        _: carrick_core::affinity::CpuAffinity,
-    ) -> Result<carrick_core::affinity::CpuAffinity, carrick_syscall_abi::LinuxErrno> {
+    fn set_affinity(&mut self, _: u32, _: carrick_core::affinity::CpuAffinity) -> AffinityResult {
         Err(carrick_syscall_abi::LINUX_ESRCH)
     }
 }
@@ -143,10 +139,7 @@ impl SchedVenue for AffinityVenue {
     fn current_cpu(&self) -> Option<u32> {
         self.current_cpu
     }
-    fn get_affinity(
-        &self,
-        _pid: u32,
-    ) -> Result<carrick_core::affinity::CpuAffinity, carrick_syscall_abi::LinuxErrno> {
+    fn get_affinity(&self, _pid: u32) -> AffinityResult {
         if self.esrch {
             Err(carrick_syscall_abi::LINUX_ESRCH)
         } else {
@@ -157,7 +150,7 @@ impl SchedVenue for AffinityVenue {
         &mut self,
         _pid: u32,
         mask: carrick_core::affinity::CpuAffinity,
-    ) -> Result<carrick_core::affinity::CpuAffinity, carrick_syscall_abi::LinuxErrno> {
+    ) -> AffinityResult {
         if self.esrch {
             Err(carrick_syscall_abi::LINUX_ESRCH)
         } else {

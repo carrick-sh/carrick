@@ -4,8 +4,8 @@
 use super::*;
 use carrick_el1_abi::{BornInZoneSource, CurrentTask, Lifecycle};
 use carrick_el1_linux::native_process_runtime::{
-    NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
-    NativeProcessRuntime, NativeProcessService,
+    NativeForkPreparation, NativeLifecycleResources, NativeProcessEntry, NativeProcessError,
+    NativeProcessRegistry, NativeProcessRuntime, NativeProcessService,
 };
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa, UserVa,
@@ -342,15 +342,7 @@ fn enter_native<'r, 'a: 'r>(
     pair: &'r Pair<'_, 'a>,
     index: usize,
     service: &'r mut NoPhysicalCrossings,
-) -> Box<
-    carrick_el1_linux::native_process_runtime::NativeProcessEntry<
-        'r,
-        'a,
-        Address,
-        Words,
-        NoPhysicalCrossings,
-    >,
-> {
+) -> Box<NativeProcessEntry<'r, 'a, Address, Words, NoPhysicalCrossings>> {
     pair.runtime
         .enter_registered(
             pair.registry,
