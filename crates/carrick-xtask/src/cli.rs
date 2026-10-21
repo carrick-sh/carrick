@@ -37,6 +37,8 @@ pub enum Commands {
 
     #[command(about = "Owner-approved JIT ephemeral runners: Willow KVM clones and cloudmac HVF")]
     CiScaler(crate::ci_scaler::ScalerArgs),
+    #[command(about = "Retire all other processes of the calling non-root uid")]
+    RetireProcesses(crate::process_helper::RetireArgs),
     #[command(about = "Compare trusted-runner accept receipts against a per-SHA baseline")]
     CiReceipt(crate::ci_receipt::ReceiptArgs),
     #[command(about = "Authorize, execute and publish the on-demand signed Actions gate")]
@@ -204,6 +206,8 @@ pub enum CliError {
     AsmDiff(#[from] crate::asm_diff::AsmDiffError),
     #[error("ci-scaler: {0}")]
     CiScaler(#[from] crate::ci_scaler::ScalerError),
+    #[error(transparent)]
+    Process(#[from] crate::process_helper::ProcessError),
     #[error("ci-receipt: {0}")]
     CiReceipt(#[from] crate::ci_receipt::ReceiptError),
     #[error("ci-changes: {0}")]
@@ -426,6 +430,7 @@ where
             crate::asm_diff::run(&info.repository_root, args, writer)?;
             Ok(())
         }
+        Commands::RetireProcesses(args) => Ok(crate::process_helper::retire(args)?),
         Commands::CiScaler(args) => {
             crate::ci_scaler::run(args)?;
             Ok(())

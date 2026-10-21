@@ -25,6 +25,7 @@ mod lock_file;
 pub mod probe_coverage;
 pub mod probe_emitters;
 pub mod probe_inventory;
+pub mod process_helper;
 pub mod provision;
 mod prune_fs;
 pub mod remote_accept;
