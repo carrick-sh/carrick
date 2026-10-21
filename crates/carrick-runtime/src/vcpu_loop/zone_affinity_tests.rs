@@ -776,6 +776,11 @@ fn switched_self_affinity(exclude: bool) {
             assert_eq!(result, 0);
             if exclude {
                 assert_eq!(
+                    p.current[0].linux.take_served_boundary(),
+                    Some(carrick_el1_abi::ServedBoundary::Completed),
+                    "migration must retain the owned completed host return boundary"
+                );
+                assert_eq!(
                     route,
                     carrick_personality_linux::dispatch::CompletionRoute::Suspended,
                     "successful self exclusion must migrate at the completed return, without an IRQ"
