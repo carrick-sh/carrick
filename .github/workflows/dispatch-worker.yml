@@ -79,10 +79,6 @@ jobs:
         run: |
           cargo build --locked --release -p carrick-xtask
           install -m 0700 target/release/carrick-xtask "$RUNNER_TEMP/carrick-dispatch-driver"
-      - uses: actions/cache/restore@v4
-        with:
-          path: ~/.rustup/toolchains
-          key: dispatch-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}
       - name: Bootstrap pinned agent tools and private foreground launcher
         id: bootstrap
         timeout-minutes: 10
@@ -95,21 +91,22 @@ jobs:
           CODEX_AUTH_JSON: ${{ needs.guard.outputs.backend == 'codex' && secrets.CODEX_AUTH_JSON || '' }}
           AGY_OAUTH_TOKEN: ${{ needs.guard.outputs.backend == 'agy' && secrets.AGY_OAUTH_TOKEN || '' }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner auth --event "$GITHUB_EVENT_PATH"'
+      - name: Admit continuation before agent execution
+        id: admission
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: '"$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker guard --admit --event "$GITHUB_EVENT_PATH"'
       - name: Run foreground agent and collect output
         id: worker
-        if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.driver.outcome == 'success' && steps.admission.outcome == 'success' }}
         timeout-minutes: 40
-        env:
-          # Used by the driver for continuation admission only; env_clear keeps
-          # this token out of the agent command.
-          GH_TOKEN: ${{ github.token }}
         run: >-
           "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode carrick --check-load --
           "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker run --event "$GITHUB_EVENT_PATH"
           --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
       - name: Scan output, push only this run branch and report its draft PR
         id: complete
-        if: ${{ !cancelled() && steps.worker.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker complete --event "$GITHUB_EVENT_PATH"'

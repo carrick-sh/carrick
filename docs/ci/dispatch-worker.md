@@ -46,7 +46,8 @@ The whole clone is destroyed after the job.
 For at most 40 minutes, the job token can write issues/PRs and any
 `work/dispatch-*` branch, including branches belonging to other runs. Driver
 branch selection narrows normal publication, not the token's repository grant.
-Rulesets 25522481 and 25523683 block tags and non-dispatch branches. The issue
+Ruleset 25522481 is disabled. Branch scope currently rests on the uid boundary
+and the driver’s fixed refspec. Tag ruleset 25523683 is active. The issue
 must be owner-authored, but collaborators may have edited its brief before
 labeling; the owner must review it. Provider credential trust and review of
 agent changes remain necessary.
@@ -55,8 +56,8 @@ agent changes remain necessary.
 
 The whole worker job overrides `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER` and
 both `CARGO_BUILD_*` wrapper forms to empty, sets `CARRICK_SCCACHE=0`, disables
-sccache and clears its endpoint selection. No rust-cache action runs. The
-restore-only toolchain archive remains, after the driver build. The first
+sccache and clears its endpoint selection. No rust-cache action runs. No
+restore-only toolchain cache is used. The first
 worker step refuses admission if the runner UID owns an sccache process or the
 process census fails; it never contacts that service. Templates must not
 prestart one.
