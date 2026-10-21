@@ -1164,7 +1164,8 @@ where
             }
             DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }
-            | DispatchOutcome::OwnerPhysicalWait { .. } => {
+            | DispatchOutcome::OwnerPhysicalWait { .. }
+            | DispatchOutcome::PreparedCopyoutWait { .. } => {
                 return Err(RuntimeError::Configuration(
                     "EL1 owner memory outcome reached the retired single-thread loop".into(),
                 ));
