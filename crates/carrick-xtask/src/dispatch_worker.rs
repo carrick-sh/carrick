@@ -6,6 +6,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+const AGENT_USER: &str = "carrick-dispatch-agent";
+
 #[derive(clap::Args, Debug)]
 pub struct DispatchArgs {
     #[command(subcommand)]
@@ -284,7 +286,7 @@ fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Res
             }
             result => {
                 // SAFETY: the unreaped foreground child owns this process group.
-                // The disposable runner owns any detached descendants.
+                // UID-wide retirement follows before any scan or later step.
                 unsafe {
                     libc::kill(-pgid, libc::SIGKILL);
                 }
@@ -385,14 +387,32 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         .env("AGY_BIN", state.join("bin/agy"))
         .env("AGY_DIRECTOR_CODEX_SDK_BIN", state.join("bin/codex"))
         .current_dir(root);
-    command
+    let mut isolated = Command::new("/usr/bin/sudo");
+    private_environment(&mut isolated);
+    // Enter the private worktree only after sudo has switched credentials.
+    isolated
+        .args(["-n", "-u", AGENT_USER, "--", "/usr/bin/env", "-i", "-C"])
+        .arg(root);
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            let mut assignment = key.to_os_string();
+            assignment.push("=");
+            assignment.push(value);
+            isolated.arg(assignment);
+        }
+    }
+    isolated
+        .arg(command.get_program())
+        .args(command.get_args())
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(state.join("agent.out"))?)
         .stderr(std::fs::File::create(state.join("agent.err"))?);
-    Ok(wait_agent(
-        &mut command,
-        crate::agent_runner::job_remaining(32)?,
-    )?)
+    hand_over(&state)?;
+    let outcome = wait_agent(&mut isolated, crate::agent_runner::job_remaining(32)?);
+    retire_agent()?;
+    let code = outcome?;
+    Ok(code)
 }
 
 fn admissible_file(path: &str) -> bool {
@@ -446,7 +466,8 @@ fn output(command: &mut Command) -> Result<Vec<u8>, ScalerError> {
 }
 pub(crate) fn git_invocation(root: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
-    // All repositories used by the driver have freshly created configuration.
+    // Repository-local config still applies. After agent retirement, snapshot()
+    // copies objects and files into a fresh repo before any runner Git command.
     // No candidate .git/config, alternates, hooks, attributes or env is trusted.
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("GIT_") {
@@ -490,6 +511,73 @@ fn git(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
 fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
     String::from_utf8(output(Command::new("gh").args(args).current_dir(root))?)
         .map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
+}
+fn sudo(args: &[&str]) -> Result<(), ScalerError> {
+    output(Command::new("/usr/bin/sudo").arg("-n").args(args))?;
+    Ok(())
+}
+fn hand_over(path: &Path) -> Result<(), ScalerError> {
+    sudo(&[
+        "/usr/bin/chown",
+        "-hR",
+        AGENT_USER,
+        path.to_str().ok_or(ScalerError::Guard("agent path"))?,
+    ])
+}
+fn retire_agent() -> Result<(), ScalerError> {
+    // Include real and effective UIDs (setuid tools), regardless of sessions.
+    for selector in ["-u", "-U"] {
+        let _ = sudo(&["/usr/bin/pkill", "-STOP", selector, AGENT_USER]);
+        let _ = sudo(&["/usr/bin/pkill", "-KILL", selector, AGENT_USER]);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        // SAFETY: the driver is a subreaper and has already waited for its
+        // foreground child. Reap only completed adopted children.
+        while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
+        let mut empty = true;
+        for selector in ["-u", "-U"] {
+            let status = Command::new("/usr/bin/sudo")
+                .args(["-n", "/usr/bin/pgrep", selector, AGENT_USER])
+                .output()?;
+            match status.status.code() {
+                Some(1) if status.stdout.is_empty() && status.stderr.is_empty() => {}
+                Some(0) => empty = false,
+                _ => return Err(ScalerError::Guard("cannot verify agent process retirement")),
+            }
+        }
+        if empty {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ScalerError::Guard(
+                "agent user still has processes; packaging refused",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+pub(crate) fn cleanup_agent_user() -> Result<(), ScalerError> {
+    let status = Command::new("/usr/bin/id")
+        .args(["-u", AGENT_USER])
+        .output()?;
+    if status.status.success() {
+        let uid = String::from_utf8_lossy(&status.stdout)
+            .trim()
+            .parse::<libc::uid_t>()
+            .map_err(|_| ScalerError::Guard("invalid agent account identity"))?;
+        // Auth fixtures also run inside the worker. Only its separate runner
+        // retires the account; a worker may clean its own credential state.
+        // SAFETY: geteuid has no preconditions.
+        if uid == unsafe { libc::geteuid() } {
+            return Ok(());
+        }
+        retire_agent()?;
+        sudo(&["/usr/sbin/userdel", AGENT_USER])?;
+    } else if status.status.code() != Some(1) {
+        return Err(ScalerError::Guard("cannot verify agent account cleanup"));
+    }
+    Ok(())
 }
 fn sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
@@ -585,6 +673,7 @@ struct Receipt {
     branch: String,
     exit_code: i32,
     expected_tip: String,
+    refused_workflow: bool,
 }
 
 pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
@@ -610,7 +699,110 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     }
     if let Some(setup) = setup {
         produce(&root, &dispatch, &setup)?;
+    } else if let Some(path) = std::env::var_os("GITHUB_OUTPUT") {
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(path)?,
+            "backend={}",
+            dispatch.tier.backend
+        )?;
     }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum TreeLinks {
+    Preserve,
+    Refuse,
+}
+fn copy_tree(
+    source: &Path,
+    target: &Path,
+    count: &mut usize,
+    links: TreeLinks,
+) -> Result<(), ScalerError> {
+    std::fs::create_dir(target)?;
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o700))?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        if matches!(entry.file_name().to_str(), Some("target" | ".git")) {
+            continue;
+        }
+        *count += 1;
+        if *count > 100_000 {
+            return Err(ScalerError::Guard("snapshot file count exceeded"));
+        }
+        let kind = entry.file_type()?;
+        let dest = target.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &dest, count, links)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), dest)?;
+        } else if kind.is_symlink() && matches!(links, TreeLinks::Preserve) {
+            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, dest)?;
+        } else {
+            return Err(ScalerError::Guard("snapshot refused nonregular file"));
+        }
+    }
+    Ok(())
+}
+fn snapshot(source: &Path, target: &Path, branch: &str) -> Result<(), ScalerError> {
+    let dotgit = source.join(".git");
+    if !std::fs::symlink_metadata(&dotgit)?.is_dir() {
+        return Err(ScalerError::Guard("agent git directory redirected"));
+    }
+    let head = regular_text(&dotgit.join("HEAD"))?;
+    let expected = format!("ref: refs/heads/{branch}");
+    if head.trim() != expected {
+        return Err(ScalerError::Guard("agent changed branch"));
+    }
+    // Loose ref is guaranteed by preparation. Ref directories must not be links.
+    let mut path = dotgit.clone();
+    for part in format!("refs/heads/{branch}").split('/') {
+        path.push(part);
+        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(ScalerError::Guard("redirected candidate ref"));
+        }
+    }
+    let head = regular_text(&path)?.trim().to_owned();
+    if !sha(&head) {
+        return Err(ScalerError::Guard("invalid candidate head"));
+    }
+    copy_tree(source, target, &mut 0, TreeLinks::Preserve)?;
+    git(target, &["init"])?;
+    // Deliberately omit info/alternates, config, grafts, shallow, index and refs.
+    let objects = dotgit.join("objects");
+    if std::fs::symlink_metadata(&objects)?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(ScalerError::Guard("redirected objects"));
+    }
+    for entry in std::fs::read_dir(objects)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or(ScalerError::Guard("object path"))?;
+        if name == "info" {
+            continue;
+        }
+        if name != "pack" && !(name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Err(ScalerError::Guard("unexpected object directory"));
+        }
+        if !entry.file_type()?.is_dir() {
+            return Err(ScalerError::Guard("object directory link"));
+        }
+        let dest = target.join(".git/objects").join(name);
+        if dest.exists() {
+            std::fs::remove_dir(&dest)?;
+        }
+        copy_tree(&entry.path(), &dest, &mut 0, TreeLinks::Refuse)?;
+    }
+    git(
+        target,
+        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+    )?;
+    git(target, &["update-ref", "HEAD", &head])?;
+    git(target, &["read-tree", "HEAD"])?;
     Ok(())
 }
 
@@ -623,11 +815,16 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
     let state = crate::agent_runner::state()?;
     std::fs::create_dir_all(&state)?;
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+    let temporary =
+        PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?);
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
     let work = state.join("work");
     let package =
         PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?)
             .join("dispatch-output");
     std::fs::create_dir(&package)?;
+    std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o700))?;
     let mut contract = Contract {
         status: ContractStatus::Failed,
         summary: format!("Worker setup did not complete: {setup}"),
@@ -638,12 +835,44 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
     let mut expected_tip = String::new();
     let mut raw = String::new();
     let mut diffstat = String::new();
+    let mut refused_workflow = false;
     if setup == "success/success" {
         if dispatch.resume {
             require_owned_pr(root, dispatch)?;
         }
+        #[cfg(target_os = "linux")]
+        // SAFETY: adopt and reap detached children before scanning agent bytes.
+        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        cleanup_agent_user()?;
+        sudo(&[
+            "/usr/sbin/useradd",
+            "--system",
+            "--user-group",
+            "--no-create-home",
+            "--shell",
+            "/usr/sbin/nologin",
+            AGENT_USER,
+        ])?;
+        let outer = tempfile::Builder::new()
+            .prefix("carrick-dispatch-")
+            .tempdir_in("/var/tmp")?;
+        std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o711))?;
+        let actor = outer.path().join("agent");
+        std::fs::create_dir(&actor)?;
+        std::fs::set_permissions(&actor, std::fs::Permissions::from_mode(0o700))?;
+        for name in ["home", "bin", "director"] {
+            copy_tree(
+                &state.join(name),
+                &actor.join(name),
+                &mut 0,
+                TreeLinks::Preserve,
+            )?;
+        }
+        let actor_work = actor.join("work");
         git(
-            &state,
+            &actor,
             &[
                 "clone",
                 "--no-local",
@@ -655,7 +884,7 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         )?;
         if dispatch.resume {
             git(
-                &work,
+                &actor_work,
                 &[
                     "-c",
                     "credential.helper=!gh auth git-credential",
@@ -665,23 +894,44 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
                     &format!("refs/heads/{}", dispatch.branch),
                 ],
             )?;
-            expected_tip = git(&work, &["rev-parse", "FETCH_HEAD"])?.trim().to_owned();
-            git(&work, &["checkout", "-b", &dispatch.branch, "FETCH_HEAD"])?;
-            git(&work, &["rebase", &base])?;
+            expected_tip = git(&actor_work, &["rev-parse", "FETCH_HEAD"])?
+                .trim()
+                .to_owned();
+            git(
+                &actor_work,
+                &["checkout", "-b", &dispatch.branch, "FETCH_HEAD"],
+            )?;
+            git(&actor_work, &["rebase", &base])?;
         } else {
-            git(&work, &["checkout", "-b", &dispatch.branch, &base])?;
+            git(&actor_work, &["checkout", "-b", &dispatch.branch, &base])?;
         }
-        git(&work, &["config", "user.name", "github-actions[bot]"])?;
+        git(&actor_work, &["config", "user.name", "github-actions[bot]"])?;
         git(
-            &work,
+            &actor_work,
             &[
                 "config",
                 "user.email",
                 "41898282+github-actions[bot]@users.noreply.github.com",
             ],
         )?;
-        code = agent(&work, dispatch)?;
-        contract = read_contract(&state.join("result.json")).unwrap_or(Contract {
+        let result = agent(&actor_work, dispatch);
+        // This is mandatory even on launcher failure, before scanning or hand-back.
+        cleanup_agent_user()?;
+        sudo(&[
+            "/usr/bin/chmod",
+            "700",
+            actor.to_str().ok_or(ScalerError::Guard("agent state"))?,
+        ])?;
+        // SAFETY: geteuid has no preconditions.
+        sudo(&[
+            "/usr/bin/chown",
+            "-hR",
+            &unsafe { libc::geteuid() }.to_string(),
+            actor.to_str().ok_or(ScalerError::Guard("agent state"))?,
+        ])?;
+        code = result?;
+        snapshot(&actor_work, &work, &dispatch.branch)?;
+        contract = read_contract(&actor.join("result.json")).unwrap_or(Contract {
             status: ContractStatus::Failed,
             summary: "No valid worker contract".into(),
             tests: vec![],
@@ -689,13 +939,25 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         });
         for name in ["agent.out", "agent.err"] {
             raw.push_str(&format!("=== {name} ===\n"));
-            raw.push_str(&regular_text(&state.join(name))?);
+            raw.push_str(&regular_text(&actor.join(name))?);
         }
         if checkpoint(&work, dispatch)? {
             contract.status = ContractStatus::Failed;
             contract
                 .risks
                 .push("Workflow checkpointed unfinished changes".into());
+        }
+        refused_workflow = git(
+            &work,
+            &["diff", "--name-only", "--no-renames", "-z", &base, "HEAD"],
+        )?
+        .split('\0')
+        .any(|path| path.starts_with(".github/workflows/"));
+        if refused_workflow {
+            contract.status = ContractStatus::Failed;
+            contract.risks.push(
+                "Refused workflow changes: job token cannot publish .github/workflows/*".into(),
+            );
         }
         diffstat = git(&work, &["diff", "--stat", &base, "HEAD"])?;
     }
@@ -728,6 +990,7 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
             branch: dispatch.branch.clone(),
             exit_code: code,
             expected_tip,
+            refused_workflow,
         })?,
     )?;
     Ok(())
@@ -810,6 +1073,7 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
 }
 
 fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
+    cleanup_agent_user()?;
     let token = std::env::var("GH_TOKEN").map_err(|_| ScalerError::Guard("missing job token"))?;
     let state = crate::agent_runner::state()?;
     let package =
@@ -840,65 +1104,111 @@ fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
     );
     std::fs::write(&report_path, report.replace(&token, "[REDACTED]"))?;
     let work = state.join("work");
-    if work.is_dir() && git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base {
-        output(&mut push_command(
-            &work,
-            dispatch,
-            &id,
-            &receipt.expected_tip,
-        )?)?;
-        let prs = open_prs(root, &dispatch.branch)?;
-        if prs.as_array().is_some_and(|prs| !prs.is_empty()) {
-            let pr = require_owned_pr(root, dispatch)?;
-            gh(
-                root,
+    let publication = (|| -> Result<(), ScalerError> {
+        if !receipt.refused_workflow
+            && work.is_dir()
+            && git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base
+        {
+            let tip = git(
+                &work,
                 &[
-                    "pr",
-                    "comment",
-                    &pr["number"].to_string(),
-                    "--repo",
-                    REPOSITORY,
-                    "--body-file",
-                    report_path
-                        .to_str()
-                        .ok_or(ScalerError::Guard("transcript path"))?,
+                    "-c",
+                    "credential.helper=!gh auth git-credential",
+                    "ls-remote",
+                    "--heads",
+                    "https://github.com/carrick-sh/carrick",
+                    &format!("refs/heads/{}", dispatch.branch),
                 ],
             )?;
-        } else {
-            let template = include_str!("../../../.github/pull_request_template.md")
-                .replace("Closes #\n", &format!("Closes #{}\n", dispatch.issue))
-                .replace(
-                    "<!-- Approach and any candid divergence from Linux. -->",
-                    &contract.summary.chars().take(4_000).collect::<String>(),
-                )
-                .replace("NEW: none / FIXED: none", "Not compared")
-                .replace("NEW: / FIXED:", "Not compared")
-                .replace("HEAD, SHA-256, CDHash", "Not collected");
-            let body = format!(
-                "{template}\nCloses #{}\n\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/{id}\n",
-                dispatch.issue
-            );
-            let path = state.join("pr-body.md");
-            std::fs::write(&path, body.replace(&token, "[REDACTED]"))?;
-            gh(
-                root,
-                &[
-                    "pr",
-                    "create",
-                    "--repo",
-                    REPOSITORY,
-                    "--draft",
-                    "--base",
-                    "main",
-                    "--head",
-                    &dispatch.branch,
-                    "--title",
-                    &format!("chore(ci): work issue {}", dispatch.issue),
-                    "--body-file",
-                    path.to_str().ok_or(ScalerError::Guard("body path"))?,
-                ],
-            )?;
+            let head = git(&work, &["rev-parse", "HEAD"])?;
+            let existing = tip.split_whitespace().next();
+            if existing.is_some()
+                && receipt.expected_tip.is_empty()
+                && existing != Some(head.trim())
+            {
+                let pr = require_owned_pr(root, dispatch)?;
+                use std::io::Write;
+                writeln!(
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&report_path)?,
+                    "\nExisting dispatch branch `{}` and PR #{} retained; this rerun did not replace it.",
+                    dispatch.branch,
+                    pr["number"]
+                )?;
+            } else if existing != Some(head.trim()) {
+                output(&mut push_command(
+                    &work,
+                    dispatch,
+                    &id,
+                    &receipt.expected_tip,
+                )?)?;
+            }
+            let prs = open_prs(root, &dispatch.branch)?;
+            if prs.as_array().is_some_and(|prs| !prs.is_empty()) {
+                let pr = require_owned_pr(root, dispatch)?;
+                gh(
+                    root,
+                    &[
+                        "pr",
+                        "comment",
+                        &pr["number"].to_string(),
+                        "--repo",
+                        REPOSITORY,
+                        "--body-file",
+                        report_path
+                            .to_str()
+                            .ok_or(ScalerError::Guard("transcript path"))?,
+                    ],
+                )?;
+            } else {
+                let template = include_str!("../../../.github/pull_request_template.md")
+                    .replace("Closes #\n", &format!("Closes #{}\n", dispatch.issue))
+                    .replace(
+                        "<!-- Approach and any candid divergence from Linux. -->",
+                        &contract.summary.chars().take(4_000).collect::<String>(),
+                    )
+                    .replace("NEW: none / FIXED: none", "Not compared")
+                    .replace("NEW: / FIXED:", "Not compared")
+                    .replace("HEAD, SHA-256, CDHash", "Not collected");
+                let body = format!(
+                    "{template}\nCloses #{}\n\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/{id}\n",
+                    dispatch.issue
+                );
+                let path = state.join("pr-body.md");
+                std::fs::write(&path, body.replace(&token, "[REDACTED]"))?;
+                gh(
+                    root,
+                    &[
+                        "pr",
+                        "create",
+                        "--repo",
+                        REPOSITORY,
+                        "--draft",
+                        "--base",
+                        "main",
+                        "--head",
+                        &dispatch.branch,
+                        "--title",
+                        &format!("chore(ci): work issue {}", dispatch.issue),
+                        "--body-file",
+                        path.to_str().ok_or(ScalerError::Guard("body path"))?,
+                    ],
+                )?;
+            }
         }
+        Ok(())
+    })();
+    if let Err(error) = &publication {
+        use std::io::Write;
+        let diagnostic = crate::dispatch_redaction::redact(error.to_string().as_bytes());
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&report_path)?,
+            "\nPublication failed: {}",
+            diagnostic.chars().take(4_000).collect::<String>()
+        )?;
     }
     if let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY") {
         use std::io::Write;
@@ -922,7 +1232,7 @@ fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
                 .ok_or(ScalerError::Guard("transcript path"))?,
         ],
     )?;
-    if receipt.exit_code != 0 || contract.status != ContractStatus::Done {
+    if publication.is_err() || receipt.exit_code != 0 || contract.status != ContractStatus::Done {
         // Report failure separately, so scanned artifacts remain available on failed runs.
         if let Some(path) = std::env::var_os("GITHUB_OUTPUT") {
             use std::io::Write;

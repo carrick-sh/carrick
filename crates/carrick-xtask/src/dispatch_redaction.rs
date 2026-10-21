@@ -51,13 +51,7 @@ impl DiagnosticSecrets {
     /// Capture once before agent execution, never from agent-modified state.
     pub(crate) fn capture() -> Result<Self, ScalerError> {
         let mut gate = Self { secrets: vec![] };
-        for key in [
-            "CODEX_AUTH_JSON",
-            "AGY_OAUTH_TOKEN",
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-            "AGENT_DIRECTOR_TOKEN",
-        ] {
+        for key in ["GH_TOKEN", "GITHUB_TOKEN", "AGENT_DIRECTOR_TOKEN"] {
             if let Ok(value) = std::env::var(key) {
                 gate.add(&value);
             }
