@@ -2023,19 +2023,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         &self,
         custody: FirstEntryPlacement,
     ) -> Result<HostPlacement, FirstEntryPlacement> {
-        match self.place_in_guest(
+        self.place_from_claim(
             custody.record.id,
             Claim::Placing {
                 seq: custody.seq,
                 host_requested: false,
             },
-            None,
-            &SpinForever,
-            |_| {},
-        ) {
-            Placement::Placed(placement) => Ok(placement),
-            Placement::NoSlot | Placement::Lost => Err(custody),
-        }
+        )
+        .ok_or(custody)
     }
 
     pub fn release_first_entry_placement(&self, custody: FirstEntryPlacement) -> bool {
@@ -3883,14 +3878,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let Claim::Host { seq } = rec.claim() else {
             return None;
         };
+        self.place_from_claim(record, Claim::Host { seq })
+    }
+
+    fn place_from_claim(&self, record: RecordId, from: Claim) -> Option<HostPlacement> {
+        let rec = self.record(record);
+        let seq = from.seq();
         let service = rec.needs_host() || rec.is_unadopted_birth();
         if let Some(home) = rec.home() {
             // The host believes its thread runs on its home slot: only that
             // slot may run it, and only while it is in the guest.
             let guard = self.slot_lock(home, &SpinForever)?;
             let state = self.slot(home).state();
-            if !state.in_guest() || !rec.cas(Claim::Host { seq }, Claim::Queued { slot: home, seq })
-            {
+            if !state.in_guest() || !rec.cas(from, Claim::Queued { slot: home, seq }) {
                 return None;
             }
             self.push_locked(&guard, record, None);
@@ -3935,7 +3935,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             if !fits {
                 continue;
             }
-            if !rec.cas(Claim::Host { seq }, Claim::Queued { slot, seq }) {
+            if !rec.cas(from, Claim::Queued { slot, seq }) {
                 return None;
             }
             self.push_locked(&guard, record, None);
