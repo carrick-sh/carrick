@@ -469,6 +469,9 @@ mod tests {
             )).unwrap();
             std::fs::write(project.join("Cargo.toml"), "[package]\nname = 'isolation-witness'\nversion = '0.0.0'\nedition = '2021'\n[lib]\npath = 'lib.rs'\n[workspace]\n").unwrap();
             std::fs::write(project.join("lib.rs"), "pub fn witness() {}\n").unwrap();
+            for name in ["credentials", "credentials.toml"] {
+                std::fs::write(cargo_home.join(name), "runner-registry-secret").unwrap();
+            }
             let cargo = PathBuf::from(env!("CARGO"));
             let mut command = std::process::Command::new(&cargo);
             super::super::dispatch_worker::private_environment(&mut command);
@@ -486,7 +489,7 @@ mod tests {
                 "runner wrapper executed via {filename}: {output:?}"
             );
             assert!(output.status.success(), "{output:?}");
-            for name in ["config", "config.toml"] {
+            for name in ["config", "config.toml", "credentials", "credentials.toml"] {
                 assert!(
                     !state.join("rust/cargo").join(name).exists(),
                     "runner Cargo config crossed boundary"

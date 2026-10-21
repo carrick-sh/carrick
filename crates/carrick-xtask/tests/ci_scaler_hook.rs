@@ -247,8 +247,8 @@ fn agent_auth_is_job_scoped_private_and_always_cleanable() {
                 .env("GITHUB_RUN_ID", "42")
                 .env("GITHUB_RUN_ATTEMPT", "1")
                 .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
-                .env("CODEX_AUTH_JSON", r#"{"access_token":"fixture-secret"}"#)
-                .env("AGY_OAUTH_TOKEN", "fixture-secret\nraw")
+                .env("CODEX_AUTH_JSON", r#"{"access_token":"codex-only-secret"}"#)
+                .env("AGY_OAUTH_TOKEN", "agy-only-secret\nraw")
                 .output()
                 .unwrap()
         };
@@ -263,12 +263,22 @@ fn agent_auth_is_job_scoped_private_and_always_cleanable() {
         };
         assert_eq!(auth.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         if backend == "agy" {
-            assert_eq!(std::fs::read(&auth).unwrap(), b"fixture-secret\nraw");
+            assert_eq!(std::fs::read(&auth).unwrap(), b"agy-only-secret\nraw");
             assert_eq!(
                 std::fs::read_dir(auth.parent().unwrap()).unwrap().count(),
                 1
             );
         }
+        let remembered = std::fs::read_to_string(state.join("redaction-secrets.json")).unwrap();
+        let unselected = if backend == "codex" {
+            "agy-only-secret"
+        } else {
+            "codex-only-secret"
+        };
+        assert!(
+            !remembered.contains(unselected),
+            "captured unselected provider {unselected}"
+        );
         assert_eq!(home.join(".codex").exists(), backend == "codex");
         assert_eq!(home.join(".gemini").exists(), backend == "agy");
         assert!(
