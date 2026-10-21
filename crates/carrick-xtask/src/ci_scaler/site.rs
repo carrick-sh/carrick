@@ -289,7 +289,7 @@ impl Site {
             Headroom::Directory => "qcow2",
         };
         Ok(format!(
-            "SITE_NODE={}\nSITE_API_HOST={}\nSITE_STORAGE={}\nSITE_DISK_FORMAT={disk_format}\nSITE_BRIDGE={}\nSITE_CORES={}\nSITE_MEMORY_MIB={}\nSITE_DISK_GIB={}\nSITE_TEMPLATE_IPCONFIG={}\nSITE_NAMESERVER={}\nSITE_VM_FIREWALL={}\nSITE_API_CA={}\nSITE_ALLOW_KSM={}\n",
+            "SITE_NODE={}\nSITE_API_HOST={}\nSITE_STORAGE={}\nSITE_DISK_FORMAT={disk_format}\nSITE_BRIDGE={}\nSITE_CORES={}\nSITE_MEMORY_MIB={}\nSITE_DISK_GIB={}\nSITE_TEMPLATE_IPCONFIG={}\nSITE_NAMESERVER={}\nSITE_VM_FIREWALL={}\nSITE_API_CA={}\nSITE_ALLOW_KSM={}\nSITE_TEMPLATE_VMID={}\n",
             self.node,
             self.api_host,
             self.storage,
@@ -297,11 +297,12 @@ impl Site {
             self.cores,
             self.memory_mib,
             self.disk_gib,
-            self.ipconfig(300)?,
+            self.ipconfig(self.lane.template())?,
             self.nameserver().unwrap_or("none"),
             u8::from(self.isolates_bridge()),
             self.api_ca.unwrap_or("system"),
             u8::from(self.allows_ksm()),
+            self.lane.template(),
         ))
     }
 }
@@ -454,6 +455,17 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
     #[test]
     fn agent_lane_uses_approved_contabo_resources_and_template_firewall_address() {
         let site = CONTABO.for_lane(super::super::CloneLane::Agent).unwrap();
+        let env = site.shell_env().unwrap();
+        for line in [
+            "SITE_TEMPLATE_VMID=9000",
+            "SITE_CORES=8",
+            "SITE_MEMORY_MIB=20480",
+            "SITE_ALLOW_KSM=0",
+            "SITE_VM_FIREWALL=1",
+            "SITE_TEMPLATE_IPCONFIG=ip=10.77.0.150/24,gw=10.77.0.1",
+        ] {
+            assert!(env.lines().any(|actual| actual == line), "{line}");
+        }
         assert!(CONTABO.host_lease.is_none());
         assert!(site.host_lease.is_none());
         assert_eq!(
@@ -477,7 +489,7 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
     fn template_builder_inputs_are_bare_tokens() {
         assert_eq!(
             WILLOW.shell_env().unwrap(),
-            "SITE_NODE=willow\nSITE_API_HOST=willow.atxconsulting.com\nSITE_STORAGE=local-lvm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr0\nSITE_CORES=2\nSITE_MEMORY_MIB=4096\nSITE_DISK_GIB=64\nSITE_TEMPLATE_IPCONFIG=ip=dhcp\nSITE_NAMESERVER=none\nSITE_VM_FIREWALL=0\nSITE_API_CA=system\nSITE_ALLOW_KSM=1\n"
+            "SITE_NODE=willow\nSITE_API_HOST=willow.atxconsulting.com\nSITE_STORAGE=local-lvm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr0\nSITE_CORES=2\nSITE_MEMORY_MIB=4096\nSITE_DISK_GIB=64\nSITE_TEMPLATE_IPCONFIG=ip=dhcp\nSITE_NAMESERVER=none\nSITE_VM_FIREWALL=0\nSITE_API_CA=system\nSITE_ALLOW_KSM=1\nSITE_TEMPLATE_VMID=300\n"
         );
         for site in SITES {
             for line in site.shell_env().unwrap().lines() {

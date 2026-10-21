@@ -873,13 +873,13 @@ fn template_sets_and_verifies_disk_boot_order_after_attaching_the_disk() {
     let lines: Vec<&str> = source.lines().collect();
     let attach = lines
         .iter()
-        .position(|l| l.starts_with("qm set 300 --scsi0 "))
+        .position(|l| l.starts_with("qm set \"$template\" --scsi0 "))
         .unwrap();
     // Combined with the attach, PVE 9 kept `order=net0;ide2` (live failure).
     assert!(!lines[attach].contains("--boot"));
     let boot = lines
         .iter()
-        .position(|l| *l == "qm set 300 --boot order=scsi0")
+        .position(|l| *l == "qm set \"$template\" --boot order=scsi0")
         .unwrap();
     assert!(boot > attach);
     assert!(lines[boot + 1].contains("grep -qx 'boot: order=scsi0'"));
@@ -892,7 +892,7 @@ fn template_sets_and_verifies_disk_boot_order_after_attaching_the_disk() {
     let guard = lines.iter().position(|l| l.contains("glibc_max=")).unwrap();
     let create = lines
         .iter()
-        .position(|l| l.starts_with("qm create 300"))
+        .position(|l| l.starts_with("qm create \"$template\""))
         .unwrap();
     assert!(guard < create);
 }
@@ -1102,4 +1102,27 @@ fn agent_resource_admission_uses_eight_cores_and_twenty_gib_plus_host_reserve() 
     assert!(admit_resources(0.63, 48, 26 << 30, 8, 20480));
     assert!(!admit_resources(0.64, 48, 26 << 30, 8, 20480));
     assert!(!admit_resources(0.1, 48, (26 << 30) - 1, 8, 20480));
+}
+
+#[test]
+fn agent_template_profile_preserves_hardening_without_root_sudo() {
+    let source = include_str!("../../../scripts/ci/build-template-debian.sh");
+    for required in [
+        "profile=${4:-kvm}",
+        "ci-scaler site --lane",
+        "ci-scaler vm-firewall --lane",
+        "/usr/sbin/useradd --system --user-group --no-create-home --shell /usr/sbin/nologin carrick-dispatch-agent",
+        "/usr/sbin/usermod -aG carrick-dispatch-agent runner",
+        "runner ALL=(carrick-dispatch-agent) NOPASSWD: ALL",
+        "/usr/sbin/visudo -c",
+        "rm -f /etc/sudoers.d/90-cloud-init-users",
+        "systemctl enable --now nftables",
+        "--allow-ksm 0",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing hardened agent profile: {required}"
+        );
+    }
+    assert!(!source.contains("rm -f /etc/sudoers.d/carrick-dispatch-agent"));
 }
