@@ -368,14 +368,12 @@ fn sched_pid_exists<M: CurrentMmMemory>(
     resolve_sched_target(this, cx, pid) != SchedTarget::NotFound
 }
 
-/// `check_same_owner` for a cross-process `sched_setparam`/`sched_setaffinity`
-/// (an already-resolved `SchedTarget::OtherGuest`). Root always may; a non-root
-/// caller may change another process's scheduling attributes only when its euid
-/// matches the target's — the same ownership rule carrick's `kill`/`setpriority`
-/// use, NOT a root-only proxy (a SAME-OWNER non-root set must succeed: LTP
-/// sched_setparam05 / sched_setaffinity01). Returns true when the set is
-/// PERMITTED.
-fn sched_cross_owner_ok(target_euid: carrick_abi::NsUid, caller_euid: carrick_abi::NsUid) -> bool {
+/// Existing sched_setparam ownership policy. Affinity uses the shared Linux
+/// real/effective UID and capability check at its exact-thread call site.
+fn sched_setparam_cross_owner_ok(
+    target_euid: carrick_abi::NsUid,
+    caller_euid: carrick_abi::NsUid,
+) -> bool {
     caller_euid.is_root() || caller_euid == target_euid
 }
 
@@ -582,37 +580,8 @@ pub(super) struct ProcState {
     pub membarrier_ready: u64,
 }
 
-/// Serialize an affinity word-mask into exactly `out_len` little-endian bytes
-/// (the kernel's `cpumask_size`), truncating or zero-padding as needed.
-pub(super) fn affinity_to_bytes(mask: &[u64], out_len: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; out_len];
-    for (i, word) in mask.iter().enumerate() {
-        let off = i * 8;
-        if off >= out_len {
-            break;
-        }
-        let wb = word.to_le_bytes();
-        let n = (out_len - off).min(8);
-        buf[off..off + n].copy_from_slice(&wb[..n]);
-    }
-    buf
-}
-
-/// Parse a little-endian CPU bitmask from user bytes into `words` 64-bit words.
-pub(super) fn affinity_from_bytes(bytes: &[u8], words: usize) -> Vec<u64> {
-    let mut mask = vec![0u64; words.max(1)];
-    for (i, w) in mask.iter_mut().enumerate() {
-        let off = i * 8;
-        if off >= bytes.len() {
-            break;
-        }
-        let mut wb = [0u8; 8];
-        let n = (bytes.len() - off).min(8);
-        wb[..n].copy_from_slice(&bytes[off..off + n]);
-        *w = u64::from_le_bytes(wb);
-    }
-    mask
-}
+#[cfg(test)]
+pub(super) use carrick_core::affinity::{affinity_from_bytes, affinity_to_bytes};
 
 /// Armed interval timer. `value`/`interval` are the configured initial
 /// expiration and reload period; `set_at` anchors `value` to the monotonic
@@ -2060,42 +2029,48 @@ impl<'a> ProcView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             };
             let memory = &mut *cx.memory;
-            let kernel_bytes = crate::kernel::scheduler::guest_cpu_count().div_ceil(64) * 8;
-            if size < kernel_bytes {
+            let ncpu = crate::kernel::scheduler::guest_cpu_count();
+            let kernel_bytes = carrick_core::affinity::kernel_cpumask_bytes(ncpu);
+            if !carrick_core::affinity::validate_getaffinity_size(size, ncpu) {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let mask = target.affinity();
-            let buf = affinity_to_bytes(mask.words(), kernel_bytes);
+            let buf = carrick_core::affinity::affinity_to_bytes(mask.words(), kernel_bytes);
             memory.write_bytes(address.0, &buf)?;
             Ok(DispatchOutcome::returned_len(kernel_bytes)?)
         }
 
         fn sched_setaffinity(this, cx, pid: u64, size: u64, address: GuestPtr) {
             let size = size as usize;
+            let ncpu = crate::kernel::scheduler::guest_cpu_count();
+            let kernel_bytes = carrick_core::affinity::kernel_cpumask_bytes(ncpu);
+            let read_len = size.min(kernel_bytes);
             let memory = &*cx.memory;
-
-            let read_len = size.min(128);
-            let bytes = memory.read_bytes(address.0, read_len)?;
+            let bytes = if read_len == 0 {
+                Vec::new()
+            } else {
+                memory.read_bytes(address.0, read_len)?
+            };
             let Some(target) = resolve_affinity_thread(cx, pid) else {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             };
             if target.task().is_none() {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
-            if !sched_cross_owner_ok(target.scheduling_credentials().euid(), this.cred_snapshot().euid) {
+            let target_credentials = target.scheduling_credentials();
+            if !carrick_core::affinity::sched_cross_owner_ok(
+                target_credentials.ruid().raw(),
+                target_credentials.euid().raw(),
+                this.cred_snapshot().euid.raw(),
+                super::creds::has_effective_capability(cx.kernel, crate::namespace::process::CAP_SYS_NICE),
+            ) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
-            let ncpu = crate::kernel::scheduler::guest_cpu_count();
-            let online = carrick_hal::CpuAffinity::all(ncpu);
-            let requested = carrick_hal::CpuAffinity::from_words(&affinity_from_bytes(
-                &bytes,
-                carrick_hal::MAX_GUEST_CPUS.div_ceil(64),
-            ));
-            let effective = online.intersect(&requested);
-            if effective.is_empty() {
+            let requested = carrick_core::affinity::CpuAffinity::from_bytes(&bytes);
+            let Some(effective) = carrick_core::affinity::compute_effective_affinity(&requested, &carrick_core::affinity::CpuAffinity::all(ncpu)) else {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            target.set_affinity(effective);
+            };
+            target.set_affinity(carrick_hal::CpuAffinity::from_words(effective.words()));
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -2236,7 +2211,7 @@ impl<'a> ProcView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             if let SchedTarget::OtherGuest { euid } = target
-                && !sched_cross_owner_ok(euid, this.cred_snapshot().euid)
+                && !sched_setparam_cross_owner_ok(euid, this.cred_snapshot().euid)
             {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }

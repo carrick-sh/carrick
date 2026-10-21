@@ -185,6 +185,10 @@ pub fn compute_effective_affinity(
 /// Linux sched_setaffinity ownership check. The caller's effective UID may
 /// match either of the target's real and effective UIDs. UID zero alone does
 /// not bypass ownership: cross-owner access requires CAP_SYS_NICE.
+///
+/// The current affinity venues model one user namespace per container.
+/// `caller_has_sys_nice` refers to that shared target namespace; this pure
+/// predicate does not establish capability authority across user namespaces.
 #[inline]
 pub const fn sched_cross_owner_ok(
     target_ruid: u32,

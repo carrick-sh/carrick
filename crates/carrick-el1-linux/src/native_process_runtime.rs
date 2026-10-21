@@ -5830,7 +5830,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             .source
             .zone
             .carrier_affinity_mask()
-            .ok_or(carrick_syscall_abi::LINUX_ENOSYS)?]);
+            .unwrap_or_else(|| {
+                crate::dispatch::invalid_completion(
+                    crate::dispatch::NativeInvariant::PhysicalCustody(
+                        "affinity carrier topology missing after venue admission",
+                    ),
+                )
+            })]);
         let effective = carrick_core::affinity::compute_effective_affinity(&mask, &online)
             .ok_or(carrick_syscall_abi::LINUX_EINVAL)?;
         let control = target
