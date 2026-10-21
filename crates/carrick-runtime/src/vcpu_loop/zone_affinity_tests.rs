@@ -338,26 +338,40 @@ struct Pair<'r, 'a> {
     words: Words,
 }
 
+fn enter_native<'r, 'a: 'r>(
+    pair: &'r Pair<'_, 'a>,
+    index: usize,
+    service: &'r mut NoPhysicalCrossings,
+) -> Box<
+    carrick_el1_linux::native_process_runtime::NativeProcessEntry<
+        'r,
+        'a,
+        Address,
+        Words,
+        NoPhysicalCrossings,
+    >,
+> {
+    pair.runtime
+        .enter_registered(
+            pair.registry,
+            BornInZoneSource {
+                zone: pair.zone,
+                slot: SlotId::from_index(index).unwrap(),
+            },
+            &pair.current[index],
+            pair.address,
+            &pair.words,
+            service,
+        )
+        .unwrap()
+}
+
 #[test]
 fn production_venue_affinity_survives_host_affinity_round_trip() {
     with_pair(|p| {
         let mut physical = NoPhysicalCrossings::default();
         for (index, mask) in [(0, 1u64), (1, 2u64)] {
-            let source = BornInZoneSource {
-                zone: p.zone,
-                slot: SlotId::new(index),
-            };
-            let mut entry = p
-                .runtime
-                .enter_registered(
-                    p.registry,
-                    source,
-                    &p.current[usize::from(index)],
-                    p.address,
-                    &p.words,
-                    &mut physical,
-                )
-                .unwrap();
+            let mut entry = enter_native(&p, usize::from(index), &mut physical);
             let mut mask = mask;
             assert_eq!(
                 ring_call(entry.as_mut(), p.current, p.zone, index, 122, 0, &mut mask),
@@ -438,18 +452,7 @@ fn production_venue_affinity_survives_host_affinity_round_trip() {
             let placement = run_guest(Some(context.thread()), Some((p.zone, slot)), || {
                 p.zone.slot(slot).affinity()
             });
-            let source = BornInZoneSource { zone: p.zone, slot };
-            let mut entry = p
-                .runtime
-                .enter_registered(
-                    p.registry,
-                    source,
-                    &p.current[usize::from(index)],
-                    p.address,
-                    &p.words,
-                    &mut physical,
-                )
-                .unwrap();
+            let mut entry = enter_native(&p, usize::from(index), &mut physical);
             let mut observed = 0;
             assert_eq!(
                 ring_call(
@@ -626,21 +629,7 @@ fn remote_affinity_migration(host_route: bool) {
             });
             ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let mut service = NoPhysicalCrossings::default();
-            let source = BornInZoneSource {
-                zone: p.zone,
-                slot: SlotId::new(0),
-            };
-            let mut entry = p
-                .runtime
-                .enter_registered(
-                    p.registry,
-                    source,
-                    &p.current[0],
-                    p.address,
-                    &p.words,
-                    &mut service,
-                )
-                .unwrap();
+            let mut entry = enter_native(&p, 0, &mut service);
             let tid = p.sibling.thread().control_slot().visible_tid().unwrap();
             let mut widen = 3;
             assert_eq!(
@@ -649,17 +638,7 @@ fn remote_affinity_migration(host_route: bool) {
             );
             drop(entry);
             assert!(service.effects.is_empty(), "widening owes zero kicks");
-            let mut entry = p
-                .runtime
-                .enter_registered(
-                    p.registry,
-                    source,
-                    &p.current[0],
-                    p.address,
-                    &p.words,
-                    &mut service,
-                )
-                .unwrap();
+            let mut entry = enter_native(&p, 0, &mut service);
             let mut narrow = 1;
             assert_eq!(
                 ring_call(entry.as_mut(), p.current, p.zone, 0, 122, tid, &mut narrow),
@@ -797,18 +776,7 @@ fn switched_self_affinity(exclude: bool) {
             assert_eq!(p.zone.slot(slot).affinity(), 3);
 
             let mut physical = NoPhysicalCrossings::default();
-            let source = BornInZoneSource { zone: p.zone, slot };
-            let mut entry = p
-                .runtime
-                .enter_registered(
-                    p.registry,
-                    source,
-                    &p.current[0],
-                    p.address,
-                    &p.words,
-                    &mut physical,
-                )
-                .unwrap();
+            let mut entry = enter_native(&p, 0, &mut physical);
             let expected = if exclude { 2 } else { 1 };
             let mut mask = expected;
             let (result, route) =
