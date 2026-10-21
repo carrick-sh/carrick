@@ -1249,7 +1249,7 @@ pub mod first_entry_test_control {
     /// inspection. Refuse incomplete inspection rather than treating it as clear.
     pub fn links_clear(record: RecordRef) -> Option<bool> {
         struct Deadline(std::time::Instant);
-        impl carrick_el1_abi::LockWait for Deadline {
+        impl carrick_el1_abi::LockWait<carrick_el1_abi::Aarch64ParkedContext> for Deadline {
             fn wait(&self, _: u32) -> bool {
                 std::thread::yield_now();
                 self.0.elapsed() < std::time::Duration::from_secs(5)
