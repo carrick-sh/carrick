@@ -1918,8 +1918,15 @@ mod tests {
         independent.try_lock().unwrap();
     }
 
-    #[test]
-    fn admit_early_returns_never_hold_or_leak_clone_lease() {
+    fn lock_file(path: &Path) -> crate::lock_file::OwnedFileLock {
+        let file = std::fs::File::open(path).unwrap();
+        file.try_lock().unwrap();
+        crate::lock_file::OwnedFileLock::from_locked(file)
+    }
+
+    fn assert_admit_early_returns_never_hold_or_leak_clone_lease(
+        mut around_release: impl FnMut(&mut dyn FnMut()),
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let lock = temp.path().join("host.lock");
         std::fs::File::create(&lock).unwrap();
@@ -1933,8 +1940,7 @@ mod tests {
         // 1. Early return when resource_admission is false: neither waits on
         // a contended lock nor retains an existing idle lease across POLL.
         let mut ledger = Ledger::default();
-        let external = std::fs::File::open(&lock).unwrap();
-        external.try_lock().unwrap();
+        let mut external = Some(lock_file(&lock));
         let mut lease = CloneLease {
             path: Some(lock.clone()),
             held: None,
@@ -1951,9 +1957,10 @@ mod tests {
         .unwrap();
         assert!(reserved.is_none());
         assert!(lease.held.is_none());
-        drop(external);
-
-        lease.acquire().unwrap();
+        around_release(&mut || {
+            drop(external.take().unwrap());
+            lease.acquire().unwrap();
+        });
         let reserved = reserve_admitted_clone(
             &mut ledger,
             &path,
@@ -1969,15 +1976,17 @@ mod tests {
             lease.held.is_none(),
             "resource_admission=false retained clone lease on idle ledger"
         );
-        let probe = std::fs::File::open(&lock).unwrap();
-        probe.try_lock().unwrap();
-        drop(probe);
+        let mut probe = Some(lock_file(&lock));
 
         // 2. Early return when ledger.served(job) is true: neither waits on
         // a contended lock nor retains an existing idle lease across POLL.
         ledger.refused.push(job);
-        let external = std::fs::File::open(&lock).unwrap();
-        external.try_lock().unwrap();
+        let mut external = None;
+        around_release(&mut || {
+            drop(probe.take().unwrap());
+            external = Some(lock_file(&lock));
+        });
+        assert!(external.is_some());
         let reserved = reserve_admitted_clone(
             &mut ledger,
             &path,
@@ -1990,9 +1999,10 @@ mod tests {
         .unwrap();
         assert!(reserved.is_none());
         assert!(lease.held.is_none());
-        drop(external);
-
-        lease.acquire().unwrap();
+        around_release(&mut || {
+            drop(external.take().unwrap());
+            lease.acquire().unwrap();
+        });
         let reserved = reserve_admitted_clone(
             &mut ledger,
             &path,
@@ -2008,22 +2018,24 @@ mod tests {
             lease.held.is_none(),
             "ledger.served(job)=true retained clone lease on idle ledger"
         );
-        let probe = std::fs::File::open(&lock).unwrap();
-        probe.try_lock().unwrap();
-        drop(probe);
+        let mut probe = Some(lock_file(&lock));
 
         // 3. Admitted reservation acquires immediately before ledger.reserve.
         ledger.refused.clear();
-        let reserved = reserve_admitted_clone(
-            &mut ledger,
-            &path,
-            job,
-            Concurrency::ONE,
-            &mut lease,
-            || Ok(true),
-            || Ok(Vec::new()),
-        )
-        .unwrap();
+        let mut reserved = None;
+        around_release(&mut || {
+            drop(probe.take().unwrap());
+            reserved = reserve_admitted_clone(
+                &mut ledger,
+                &path,
+                job,
+                Concurrency::ONE,
+                &mut lease,
+                || Ok(true),
+                || Ok(Vec::new()),
+            )
+            .unwrap();
+        });
         assert!(reserved.is_some());
         assert!(lease.held.is_some());
         let probe = std::fs::File::open(&lock).unwrap();
@@ -2034,7 +2046,20 @@ mod tests {
     }
 
     #[test]
-    fn recovery_try_recover_is_zero_wait_when_contended_and_acquires_when_free() {
+    fn admit_early_returns_never_hold_or_leak_clone_lease() {
+        assert_admit_early_returns_never_hold_or_leak_clone_lease(|reacquire| reacquire());
+    }
+
+    #[test]
+    fn serial_host_admit_early_returns_reacquire_across_unrelated_fork_exec() {
+        assert_admit_early_returns_never_hold_or_leak_clone_lease(|reacquire| {
+            crate::lock_file::tests::with_unrelated_fork_exec(reacquire, || {});
+        });
+    }
+
+    fn assert_recovery_try_recover_contended_then_free(
+        around_release: impl FnOnce(&mut dyn FnMut()),
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let lock = temp.path().join("host.lock");
         std::fs::File::create(&lock).unwrap();
@@ -2051,26 +2076,44 @@ mod tests {
 
         let lock_path = lock.clone();
         let contender = std::thread::spawn(move || {
-            let file = std::fs::File::open(&lock_path).unwrap();
-            file.try_lock().unwrap();
+            let guard = lock_file(&lock_path);
             locked_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-            drop(file);
+            drop(guard);
             released_tx.send(()).unwrap();
         });
 
         locked_rx.recv().unwrap();
-        assert!(
-            !lease.try_recover(&ledger).unwrap(),
-            "contended recovery must return false without waiting"
-        );
-        assert!(lease.held.is_none());
-        release_tx.send(()).unwrap();
-        released_rx.recv().unwrap();
-        contender.join().unwrap();
+        let mut contender = Some((release_tx, released_rx, contender));
+        around_release(&mut || {
+            let (release_tx, released_rx, contender) = contender.take().unwrap();
+            assert!(
+                !lease.try_recover(&ledger).unwrap(),
+                "contended recovery must return false without waiting"
+            );
+            assert!(lease.held.is_none());
+            release_tx.send(()).unwrap();
+            released_rx.recv().unwrap();
+            contender.join().unwrap();
 
+            assert!(lease.try_recover(&ledger).unwrap());
+            assert!(lease.held.is_some());
+        });
+        assert!(contender.is_none());
         assert!(lease.try_recover(&ledger).unwrap());
         assert!(lease.held.is_some());
+    }
+
+    #[test]
+    fn recovery_try_recover_is_zero_wait_when_contended_and_acquires_when_free() {
+        assert_recovery_try_recover_contended_then_free(|verify| verify());
+    }
+
+    #[test]
+    fn serial_host_recovery_try_recover_acquires_across_unrelated_fork_exec() {
+        assert_recovery_try_recover_contended_then_free(|verify| {
+            crate::lock_file::tests::with_unrelated_fork_exec(verify, || {});
+        });
     }
 
     #[test]
