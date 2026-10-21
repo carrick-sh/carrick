@@ -10,16 +10,6 @@
       "from": "carrick_vmm_hvf::host_signal::ForkResetWaiterRegistry::hold_for_fork",
       "to": "carrick_signal_linux::fork_reset::PreparedForkBacking<T>::hold",
       "issue": 488
-    },
-    {
-      "from": "carrick_kernel::dispatch::fs::directory::FsView<'a>::getdents64",
-      "to": "carrick_kernel::dispatch::fs::directory::FsView<'a>::getdents64_from_open_file",
-      "issue": 711
-    },
-    {
-      "from": "carrick_kernel::dispatch::net::lifecycle::NetView<'a>::take_socket_pending_error",
-      "to": "carrick_kernel::dispatch::net::lifecycle::NetView<'a>::take_socket_pending_error_from",
-      "issue": 711
     }
   ],
   "terminal_custody": []

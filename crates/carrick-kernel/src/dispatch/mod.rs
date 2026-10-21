@@ -666,7 +666,6 @@ pub(crate) mod fifo_beacon;
 pub(crate) mod ioring;
 #[macro_use]
 pub mod fs;
-pub use copyout::{OwnedCopyout, OwnedCopyoutOperation};
 #[cfg(any(test, feature = "test-support"))]
 pub use fs::RecordLockContentionFixture;
 pub use fs::StdioSink;

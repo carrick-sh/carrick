@@ -228,17 +228,9 @@ pub(super) enum OwnerSupplyWait {
 pub(super) enum OwnedSyscallResume {
     Redispatch,
     PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
-    PreparedCopyout(Box<carrick_kernel::dispatch::OwnedCopyoutOperation>),
 }
 
 fn owner_copyin_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
-    if let DispatchOutcome::CopyoutSuspended(pending) = outcome {
-        let (wait, operation) = (*pending).into_parts();
-        return (
-            wait,
-            Some(OwnedSyscallResume::PreparedCopyout(Box::new(operation))),
-        );
-    }
     let DispatchOutcome::WriteCopyInSuspended(pending) = outcome else {
         return (outcome, None);
     };

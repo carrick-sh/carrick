@@ -765,7 +765,11 @@ where
                             state,
                             zone.record_ref(record),
                             seq,
-                            ZoneWaitPolicy::KillableOwnerWrite,
+                            if matches!(resume, OwnedSyscallResume::PreparedWrite(_)) {
+                                ZoneWaitPolicy::KillableOwnerWrite
+                            } else {
+                                ZoneWaitPolicy::Ordinary(None)
+                            },
                             request,
                         )?;
                         self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame, resume };

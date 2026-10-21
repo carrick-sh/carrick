@@ -330,13 +330,7 @@ pub(crate) mod epoll_zone;
 #[cfg(test)]
 use epoll_ops::epoll_kqueue_for_wake_test;
 pub(in crate::dispatch) use epoll_ops::{IoRearm, WriteRearm};
-pub(in crate::dispatch) mod lifecycle;
-pub(in crate::dispatch) use lifecycle::AcceptedAddressRecord;
-
-pub enum SocketErrorSource {
-    Host(fd_table::HostFdRef),
-    InMemory(Arc<unix_pure::PureSocketInner>),
-}
+pub(super) mod lifecycle;
 pub(super) use lifecycle::{host_stream_socket_is_connected, host_stream_socket_rdhup};
 pub(super) mod netlink;
 pub(crate) mod packet;

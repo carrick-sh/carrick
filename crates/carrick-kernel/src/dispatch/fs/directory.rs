@@ -508,104 +508,6 @@ impl<'a> FsView<'a> {
         }
     }
 
-    pub(in crate::dispatch) fn getdents64_from_open_file<M: CurrentMmMemory>(
-        &self,
-        kernel: &crate::kernel::KernelContext,
-        open_file: crate::dispatch::fd_table::OpenFile,
-        address: u64,
-        length: usize,
-        memory: &mut M,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description)
-        else {
-            return Ok(DispatchOutcome::errno(LINUX_EBADF));
-        };
-        let OpenDescription::Directory {
-            listing,
-            offset,
-            path,
-            trusted_host_dir,
-            ..
-        } = &mut *open
-        else {
-            return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-        };
-        let visible_self = proc_visible_self(kernel);
-        let is_self_fd = is_proc_self_fd_dir(path, visible_self);
-        let is_self_fdinfo = is_proc_self_fdinfo_dir(path, visible_self);
-        if (is_self_fd || is_self_fdinfo)
-            && (*offset == 0 || matches!(listing, DirListing::Pending))
-        {
-            *listing = DirListing::Fixed(self.proc_self_fd_entries(path, is_self_fdinfo));
-        } else if matches!(listing, DirListing::Pending) {
-            *listing =
-                DirListing::Loaded(self.list_directory_entries(path, trusted_host_dir.as_ref()));
-        }
-        let entries = match listing {
-            DirListing::Loaded(entries) | DirListing::Fixed(entries) => entries,
-            DirListing::Pending => unreachable!("listing materialized above"),
-        };
-        if entries.first().map(|e| e.name.as_str()) != Some(".") {
-            let parent = std::path::Path::new(path.as_str())
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "/".to_string());
-            let dir_path = path.clone();
-            let dot_entry = |name: &str, p: String| RootFsDirEntry {
-                name: name.to_string(),
-                metadata: RootFsMetadata {
-                    path: std::path::PathBuf::from(p),
-                    kind: RootFsEntryKind::Directory,
-                    mode: 0o755,
-                    size: 0,
-                },
-                ino: 0,
-            };
-            entries.insert(0, dot_entry("..", parent));
-            entries.insert(0, dot_entry(".", dir_path));
-        }
-        let batch_limit = crate::dispatch::copyout::bounded_capacity(memory, length);
-        let mut out = Vec::with_capacity(batch_limit.min(65536));
-        let mut cursor = *offset;
-        while cursor < entries.len() {
-            let rec_len = dirent64_record_len(&entries[cursor]);
-            if rec_len > length {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-            }
-            if out.len() + rec_len > batch_limit {
-                break;
-            }
-            append_dirent64_record(&entries[cursor], cursor + 1, &mut out);
-            cursor += 1;
-        }
-        let prepared = match crate::dispatch::copyout::prepare(
-            memory,
-            [Some(crate::dispatch::copyout::UserSlot::new(
-                address,
-                out.len(),
-            ))],
-        ) {
-            Ok(prepared) => prepared,
-            Err(refusal) => {
-                let Some(lease) = open_file.description.retain_fd_lease() else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                };
-                drop(open);
-                return Ok(
-                    refusal.suspend(crate::dispatch::OwnedCopyoutOperation::Getdents {
-                        open_file,
-                        lease,
-                        address,
-                        length,
-                    }),
-                );
-            }
-        };
-        prepared.commit([&out])?;
-        *offset = cursor;
-        Ok(DispatchOutcome::returned_len_or_errno(out.len()))
-    }
-
     define_syscall! {
         fn getdents64(this, cx, fd: Fd, dirp: GuestPtr, count: u64) {
             let fd: Fd = fd;
@@ -616,7 +518,84 @@ impl<'a> FsView<'a> {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            this.getdents64_from_open_file(cx.kernel, open_file, address, length, memory)
+            let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let OpenDescription::Directory {
+                listing,
+                offset,
+                path,
+                trusted_host_dir,
+                ..
+            } = &mut *open
+            else {
+                return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+            };
+
+            // The listing is taken LAZILY on the first read (Linux lists at
+            // getdents time, and a walk anchor that never reads pays
+            // nothing): streamed off a trusted host dirfd when nothing
+            // interferes, the exact layered merge otherwise.
+            let visible_self = proc_visible_self(cx.kernel);
+            let is_self_fd = is_proc_self_fd_dir(path, visible_self);
+            let is_self_fdinfo = is_proc_self_fdinfo_dir(path, visible_self);
+            if (is_self_fd || is_self_fdinfo)
+                && (*offset == 0 || matches!(listing, DirListing::Pending))
+            {
+                *listing = DirListing::Fixed(this.proc_self_fd_entries(path, is_self_fdinfo));
+            } else if matches!(listing, DirListing::Pending) {
+                *listing = DirListing::Loaded(
+                    this.list_directory_entries(path, trusted_host_dir.as_ref()),
+                );
+            }
+            let entries = match listing {
+                DirListing::Loaded(entries) | DirListing::Fixed(entries) => entries,
+                DirListing::Pending => unreachable!("listing materialized above"),
+            };
+
+            // Real Linux getdents64 always returns `.` (self) and `..` (parent)
+            // first. Synthesize them on the READ path only — NOT in
+            // layered_directory_entries, which also backs the rmdir/unlinkat
+            // emptiness check (two synthetic dot entries there made every empty
+            // dir look non-empty → ENOTEMPTY broke `rm -rf`). Idempotent: prepend
+            // once if absent.
+            if entries.first().map(|e| e.name.as_str()) != Some(".") {
+                let parent = std::path::Path::new(path.as_str())
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/".to_string());
+                let dir_path = path.clone();
+                let dot_entry = |name: &str, p: String| RootFsDirEntry {
+                    name: name.to_string(),
+                    metadata: RootFsMetadata {
+                        path: std::path::PathBuf::from(p),
+                        kind: RootFsEntryKind::Directory,
+                        mode: 0o755,
+                        size: 0,
+                    },
+                    // "."/".." are skipped by scandir; ino unused → hash fallback.
+                    ino: 0,
+                };
+                entries.insert(0, dot_entry("..", parent));
+                entries.insert(0, dot_entry(".", dir_path));
+            }
+
+            let mut out = Vec::with_capacity(length.min(65536));
+            while *offset < entries.len() {
+                let rec_len = dirent64_record_len(&entries[*offset]);
+                if rec_len > length {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
+                if out.len() + rec_len > length {
+                    break;
+                }
+                append_dirent64_record(&entries[*offset], *offset + 1, &mut out);
+                *offset += 1;
+            }
+
+            memory.write_bytes(address, &out)?;
+
+            Ok(DispatchOutcome::returned_len_or_errno(out.len()))
         }
 
         fn readlinkat(this, cx, dirfd: u64, pathname: GuestPtr, buf: GuestPtr, bufsiz: u64) {

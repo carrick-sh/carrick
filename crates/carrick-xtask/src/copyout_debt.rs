@@ -75,7 +75,10 @@ struct DirectWrites {
 }
 
 impl DirectWrites {
-    fn call_group(tokens: &[proc_macro2::TokenTree], index: usize) -> Option<&proc_macro2::Group> {
+    fn call_group<'a>(
+        tokens: &'a [proc_macro2::TokenTree],
+        index: usize,
+    ) -> Option<&'a proc_macro2::Group> {
         match tokens.get(index + 1) {
             Some(proc_macro2::TokenTree::Group(group))
                 if group.delimiter() == proc_macro2::Delimiter::Parenthesis =>
@@ -224,7 +227,7 @@ impl<'ast> Visit<'ast> for DirectWrites {
             && let Some(last) = path.path.segments.last()
         {
             let name = last.ident.to_string();
-            if helper(&name) || (!node.args.is_empty() && method(&name, node.args.len() - 1)) {
+            if helper(&name) || (node.args.len() > 0 && method(&name, node.args.len() - 1)) {
                 self.count += 1;
             }
         }

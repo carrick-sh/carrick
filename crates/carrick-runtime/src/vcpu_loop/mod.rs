@@ -1843,32 +1843,7 @@ where
             binding::OwnedSyscallResume::PreparedWrite(pending) => {
                 self.resume_write_copy_in(kernel, engine, pending, host_wait)
             }
-            binding::OwnedSyscallResume::PreparedCopyout(pending) => {
-                self.resume_copyout(kernel, engine, *pending, host_wait)
-            }
         }
-    }
-
-    fn resume_copyout(
-        &mut self,
-        kernel: &Kernel,
-        engine: &mut E,
-        pending: carrick_kernel::dispatch::OwnedCopyoutOperation,
-        _host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
-    ) -> Result<DispatchOutcome, RuntimeError> {
-        let request = self
-            .syscall_completion
-            .guest("copyout lost syscall completion")?
-            .syscall()
-            .request;
-        let context = self
-            .service_kernel_context
-            .as_ref()
-            .ok_or_else(|| RuntimeError::Configuration("copyout lost context".to_owned()))?
-            .retain_exact();
-        Ok(kernel
-            .dispatcher
-            .resume_owned_copyout(&context, request, pending, engine)?)
     }
 
     fn redispatch_threaded_syscall_for_executor(
@@ -3398,6 +3373,10 @@ pub(crate) mod tests {
         pub(crate) prepared_write_context: Option<carrick_kernel::kernel::KernelContext>,
         pub(crate) prepared_cancels: usize,
         pub(crate) prepared_commits: usize,
+        pub(crate) copyout_owner_wait: Option<(
+            carrick_el1_abi::PortalOwnerWait,
+            Arc<std::sync::atomic::AtomicBool>,
+        )>,
     }
 
     struct TestPreparedClear<'a> {
@@ -3429,9 +3408,30 @@ pub(crate) mod tests {
         }
     }
 
+    struct TestPreparedCopyout<'a> {
+        engine: &'a mut CrashCaptureTestEngine,
+        address: u64,
+        committed: bool,
+    }
+    impl carrick_guest_mem::PreparedGuestWrite for TestPreparedCopyout<'_> {
+        fn commit(mut self: Box<Self>, outputs: &[&[u8]]) {
+            let bytes = outputs.concat();
+            self.engine.guest_memory.insert(self.address, bytes);
+            self.engine.prepared_commits += 1;
+            self.committed = true;
+        }
+    }
+    impl Drop for TestPreparedCopyout<'_> {
+        fn drop(&mut self) {
+            if !self.committed {
+                self.engine.prepared_cancels += 1;
+            }
+        }
+    }
+
     impl carrick_guest_mem::GuestMemory for CrashCaptureTestEngine {
         fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
-            if self.prepare_dependency.is_some() {
+            if self.prepare_dependency.is_some() || self.copyout_owner_wait.is_some() {
                 carrick_guest_mem::UserMemoryVenue::Owner
             } else {
                 carrick_guest_mem::UserMemoryVenue::Legacy
@@ -3444,6 +3444,17 @@ pub(crate) mod tests {
             Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
             carrick_guest_mem::MemoryPrepareError,
         > {
+            if let Some((wait, released)) = &self.copyout_owner_wait {
+                if !released.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(*wait));
+                }
+                assert_eq!(ranges.len(), 1);
+                return Ok(Box::new(TestPreparedCopyout {
+                    address: ranges[0].address().raw(),
+                    engine: self,
+                    committed: false,
+                }));
+            }
             let wait = self.prepare_dependency.as_ref().unwrap();
             if !wait.0.is_ready() {
                 return Err(carrick_guest_mem::MemoryPrepareError::Physical(
@@ -3483,6 +3494,11 @@ pub(crate) mod tests {
             address: u64,
             bytes: &[u8],
         ) -> Result<(), carrick_guest_mem::MemoryError> {
+            if let Some((wait, released)) = &self.copyout_owner_wait
+                && !released.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(carrick_guest_mem::MemoryError::OwnerWait(*wait));
+            }
             self.guest_memory.insert(address, bytes.to_vec());
             Ok(())
         }
@@ -3839,6 +3855,158 @@ pub(crate) mod tests {
         }};
     }
     pub(crate) use test_carrier_graph_with_dispatcher;
+
+    #[test]
+    fn pipe2_owner_wait_redispatches_through_production_runtime_once() {
+        use carrick_abi::{LinuxCloneFlags, syscall::nr};
+        use carrick_el1_linux::mm_portal::{
+            MmPortal,
+            test_support::{ROOT, Region, admit_notified, nodes},
+        };
+        use std::num::NonZeroU64;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_runtime, _scheduler, kernel, _root, process, _generation) =
+            test_carrier_graph_with_dispatcher!(71_102, SyscallDispatcher::new());
+        let root = kernel.dispatcher.capture_one_task_context().unwrap();
+        let sibling = root
+            .kernel()
+            .reserve_thread_clone(
+                &root,
+                carrick_kernel::kernel::ClonePlan::from_flags(
+                    LinuxCloneFlags::VM | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::THREAD,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(71_103))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_context()
+            .unwrap();
+        let root = root
+            .kernel()
+            .context(root.task().key().id, root.thread().key().tid)
+            .unwrap();
+        assert!(root.exact_thread_is_live() && sibling.exact_thread_is_live());
+        assert_eq!(root.shared().mm().id(), sibling.shared().mm().id());
+
+        let this_tid = ThreadId::synthetic_for_tests(71_102);
+        let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(this_tid)),
+            Arc::new(FutexTable::new()),
+            Arc::new(NoopPlatformFutex),
+            Arc::new(|_| Arc::new(NoopPlatformFutex)),
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            this_tid,
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            Arc::clone(&kicker),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(
+                    Some(Arc::clone(root.thread())),
+                    kicker,
+                    this_tid,
+                    test_execution_slot(),
+                )
+                .expect("root MM executor participation"),
+        );
+        let frame = carrick_hal::RawSyscall {
+            current_guest_sp: None,
+            number: nr::PIPE2,
+            args: [0x71_1020, 0, 0, 0, 0, 0],
+            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            native_number: carrick_abi::NativeNr(nr::PIPE2.raw()),
+        };
+
+        let region = Region::new();
+        let zone = region.zone();
+        let mm = admit_notified(&region, root.shared().mm().id().raw(), ROOT, 1, 0);
+        let view = nodes(&region);
+        let portal = MmPortal::new(
+            NonZeroU64::new(712).unwrap(),
+            region.table(),
+            &zone.spaces,
+            &view,
+        )
+        .with_zone(zone)
+        .unwrap();
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let released = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut engine = CrashCaptureTestEngine::default();
+
+        let (first, observed_wait) = std::thread::scope(|scope| {
+            let peer_released = Arc::clone(&released);
+            let peer = scope.spawn(move || {
+                let access = carrick_el1_linux::sched::object_wait::space_access(
+                    zone,
+                    carrick_sched_core::SlotId::new(1),
+                );
+                let editor = access
+                    .try_begin_edit(
+                        zone.spaces.find(sibling.shared().mm().id().raw()).unwrap(),
+                        mm.raw(),
+                        NonZeroU64::new(2).unwrap(),
+                    )
+                    .unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                drop(editor);
+                peer_released.store(true, Ordering::Release);
+            });
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let wait = portal
+                .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
+                .unwrap()
+                .unwrap();
+            engine.copyout_owner_wait = Some((wait, Arc::clone(&released)));
+            let first = state
+                .service_threaded_syscall(&kernel, &mut engine, frame, None)
+                .unwrap();
+            release_tx.send(()).unwrap();
+            peer.join().unwrap();
+            (first, wait)
+        });
+        assert_eq!(
+            first,
+            DispatchOutcome::OwnerMemoryWait {
+                wait: observed_wait,
+                committed: 0,
+            },
+            "the production service must park on the sibling's editor, never return EFAULT",
+        );
+        assert_eq!(engine.prepared_commits, 0);
+        assert_eq!(root.resources().files().slot_count(), 0);
+
+        let completed = state
+            .resume_owned_syscall(
+                &kernel,
+                &mut engine,
+                binding::OwnedSyscallResume::Redispatch,
+                None,
+            )
+            .unwrap();
+        assert_eq!(completed, DispatchOutcome::Returned { value: 0 });
+        assert_eq!(engine.prepared_commits, 1);
+        assert_eq!(engine.guest_memory[&0x71_1020].len(), 8);
+        assert_eq!(root.resources().files().slot_count(), 2);
+    }
 
     // Linux asm-generic/siginfo.h SIGTRAP si_codes.
     const SIGTRAP: i32 = 5;

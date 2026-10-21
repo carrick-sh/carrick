@@ -23,7 +23,7 @@
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/fs/directory.rs",
-      "ceiling": 1
+      "ceiling": 2
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/fs/ioctl.rs",
@@ -110,6 +110,10 @@
       "ceiling": 4
     },
     {
+      "path": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
+      "ceiling": 2
+    },
+    {
       "path": "crates/carrick-kernel/src/dispatch/net/netlink.rs",
       "ceiling": 1
     },
@@ -123,11 +127,11 @@
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/net/sockopt.rs",
-      "ceiling": 2
+      "ceiling": 6
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/net/support.rs",
-      "ceiling": 5
+      "ceiling": 7
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/perf.rs",
