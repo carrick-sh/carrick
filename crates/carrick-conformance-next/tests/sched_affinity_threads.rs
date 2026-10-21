@@ -6,7 +6,7 @@ mod common;
 use carrick_conformance_next::{PullPolicy, ResultAssert, TestContainer};
 
 #[test]
-fn sched_affinity_threads_mask_reflection() {
+fn case_sched_affinity_threads_mask_reflection() {
     let _guard = common::guest_lock();
     let script = include_str!("fixtures/sched_affinity_threads.py");
     let container = TestContainer::new("python:3.12-slim").pull_policy(PullPolicy::Missing);
