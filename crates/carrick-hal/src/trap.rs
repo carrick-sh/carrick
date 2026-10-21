@@ -413,6 +413,8 @@ pub enum TrapError {
 
     #[error("vCPU execution admission refused: host file-table access is active")]
     ExecutionAdmissionBusy,
+    #[error("execution residency retired before affinity route attachment")]
+    ExecutionResidencyRetired,
     #[error("fatal vCPU execution admission: protection lock poisoned")]
     ExecutionAdmissionPoisoned,
 

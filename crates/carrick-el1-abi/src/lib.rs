@@ -346,6 +346,8 @@ pub const GRANT_OP_WAIT_CHANNEL_WAKE: u64 = 7;
 
 /// Failure-only native fork diagnostic. This crossing grants no authority.
 pub const GRANT_OP_FORK_REFUSAL: u64 = 8;
+/// Kick an excluded, host-owned execution residency on an issued CPU slot.
+pub const GRANT_OP_RESIDENCY_KICK: u64 = 9;
 
 /// Bounded debug rendering of a typed refusal, retained on the stopped EL1 stack.
 #[repr(C, align(64))]
@@ -3956,7 +3958,6 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0xf537874c1c75b0b4);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

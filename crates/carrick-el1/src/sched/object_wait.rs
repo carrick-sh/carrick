@@ -173,9 +173,16 @@ pub fn deliver_effects_with<C: carrick_el1_abi::EntryContext>(
         .chain(own.filter(|slot| effects.queued_own && Some(*slot) != venue))
     {
         let target = zone.slot(slot).sgi_target();
-        if target != 0 {
-            send(slot, target);
-        }
+        // An affinity writer may target a host residency while the guest
+        // scheduler or GIC is disabled. The host route discharges that latch.
+        send(
+            slot,
+            if target == 0 {
+                carrick_sched_core::HOST_RESCHEDULE_TARGET
+            } else {
+                target
+            },
+        );
     }
     if effects.misplaced
         && let Some(slot) = own

@@ -1632,7 +1632,30 @@ pub(crate) fn handle_metadata_grant_trap(
     } else {
         None
     };
-    let result = if op == GRANT_OP_FORK_STOCK {
+    let result = if op == carrick_el1_abi::GRANT_OP_RESIDENCY_KICK {
+        let slot = usize::try_from(arg1)
+            .ok()
+            .and_then(carrick_sched_core::SlotId::from_index);
+        if let Some((zone, slot)) = carrick_el1_abi::zone_tables().zip(slot) {
+            let lane = zone.slot(slot);
+            // A delayed receipt cannot kick an allowed successor. The host
+            // reads its retained alias, including host-only control bindings.
+            let excluded = lane
+                .affinity_source()
+                .load()
+                .zip(lane.bound_cpu())
+                .is_some_and(|(mask, cpu)| {
+                    !carrick_core::affinity::CpuAffinity::from_words(&[mask]).is_allowed(cpu)
+                });
+            if excluded {
+                carrick_el1_abi::mark_pending_host_work(usize::from(slot.raw()));
+                crate::vcpu_kick::kick_zone_slot(usize::from(slot.raw()));
+            }
+            [METADATA_GRANT_SUCCESS, 0, 0, 0]
+        } else {
+            [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
+        }
+    } else if op == GRANT_OP_FORK_STOCK {
         if let Some(region) = region {
             let ttbr0 = vcpu
                 .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)

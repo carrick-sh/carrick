@@ -2,7 +2,7 @@
 use crate::affinity::AffinityAuthority;
 
 /// Live dual-alias source encoding, folded into the carrier image ABI.
-pub const AFFINITY_SOURCE_PROTOCOL: u64 = 1;
+pub const AFFINITY_SOURCE_PROTOCOL: u64 = 2;
 
 /// The two virtual aliases of one retained authority allocation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

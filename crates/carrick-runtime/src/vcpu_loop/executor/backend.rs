@@ -906,13 +906,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                     .affinity_source(),
                 zone_driver(self.executor_id),
             )?;
-            if let Some(slot) = carrick_sched_core::SlotId::from_index(slot) {
-                if !task.lease().attach_affinity_slot(slot) {
-                    return Err(TrapError::Hypervisor(
-                        "loaded affinity residency retired before entry".into(),
-                    ));
-                }
-            }
+            attach_loaded_affinity_route(slot, |slot| task.lease().attach_affinity_slot(slot))?;
         }
         asid_load.mark_resident().map_err(|error| {
             self.clear_live_current_task();
@@ -1030,15 +1024,17 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             .ok_or_else(|| TrapError::Hypervisor("exec affinity lost task binding".into()))?;
         let source = control.affinity_source();
         let mm = binding.identity().mm.raw();
-        if let Some(zone) = carrick_kernel::el1_zone::zone() {
+        let zone_enabled = carrick_kernel::el1_zone::zone().is_some();
+        let mm = if zone_enabled { mm } else { 0 };
+        if let Some(zone) = carrick_el1_abi::zone_tables() {
+            if !zone_enabled {
+                zone.slot(slot)
+                    .set_sgi_target(carrick_sched_core::HOST_RESCHEDULE_TARGET);
+            }
             zone.publish_slot_with_affinity(slot, mm, self.bound_cpu, source);
         }
         carrick_el1_abi::publish_zone_identity(index, mm, thread.key().serial.raw());
-        if !thread.attach_affinity_slot(slot) {
-            return Err(TrapError::Hypervisor(
-                "exec affinity residency retired".into(),
-            ));
-        }
+        attach_loaded_affinity_route(index, |slot| thread.attach_affinity_slot(slot))?;
         Ok(())
     }
 
@@ -1573,6 +1569,29 @@ pub(crate) fn leave_driven_zone_slot() {
     }
 }
 
+/// Load and exec attach through one entry-admission decision. Without a
+/// published transport, keep the residency host-routable rather than latching
+/// ring notifications onto an unusable slot.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn attach_loaded_affinity_route(
+    index: usize,
+    attach: impl FnOnce(carrick_sched_core::SlotId) -> bool,
+) -> Result<(), TrapError> {
+    let Some((zone, slot)) =
+        carrick_el1_abi::zone_tables().zip(carrick_sched_core::SlotId::from_index(index))
+    else {
+        return Ok(());
+    };
+    if zone.slot(slot).sgi_target() == 0 {
+        return Ok(());
+    }
+    if attach(slot) {
+        Ok(())
+    } else {
+        Err(TrapError::ExecutionResidencyRetired)
+    }
+}
+
 /// Publish the zone identity of the task just loaded on mailbox `slot`: its
 /// process's zone key (0 when the zone is off, so EL1 forwards every futex
 /// operation), its thread serial, and the slot's vCPU for zone kicks. No
@@ -1591,6 +1610,13 @@ fn publish_zone_slot(
 ) -> Result<(), TrapError> {
     carrick_vmm_hvf::vcpu_kick::bind_zone_slot_vcpu(slot, vcpu);
     let Some(zone) = carrick_kernel::el1_zone::zone() else {
+        if let Some((zone, lane)) =
+            carrick_el1_abi::zone_tables().zip(carrick_sched_core::SlotId::from_index(slot))
+        {
+            zone.slot(lane)
+                .set_sgi_target(carrick_sched_core::HOST_RESCHEDULE_TARGET);
+            zone.publish_slot_with_affinity(lane, 0, bound_cpu, affinity);
+        }
         carrick_el1_abi::publish_zone_identity(slot, 0, serial);
         return Ok(());
     };

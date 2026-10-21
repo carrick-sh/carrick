@@ -46,7 +46,19 @@ pub trait ThreadCpu {
     fn send_sgi(&mut self, sgi1r: u64);
     /// Publish a scheduler reschedule to one issued CPU slot. `target` is the
     /// architecture's stored route; ARM retains its exact SGI encoding.
-    fn send_resched(&mut self, _slot: SlotId, target: u64) {
+    fn send_resched(&mut self, slot: SlotId, target: u64) {
+        if target == carrick_sched_core::HOST_RESCHEDULE_TARGET {
+            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+            if crate::isa::aarch64::cross_hvc_residency_kick(slot).is_err() {
+                hw::fatal_entry_binding();
+            }
+            #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+            {
+                let _ = slot;
+                self.send_sgi(target);
+            }
+            return;
+        }
         self.send_sgi(target | (u64::from(GIC_RESCHED_INTID) << 24));
     }
     /// Acknowledge the highest-priority pending interrupt (`ICC_IAR1_EL1`);
@@ -603,6 +615,16 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if self.zone.slot(self.slot).affinity_excludes_cpu() {
             self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
+            return carrick_el1_abi::Action::Forward;
+        }
+        if self.zone.current_affinity_excludes_cpu(self.slot) {
+            if self.park_preempted(frame) {
+                let mut effects = WakeEffects::default();
+                self.zone.migrate_queued(self.slot, &mut effects);
+                self.send_sgis(&effects);
+                self.service_exit();
+                return carrick_el1_abi::Action::Idle;
+            }
             return carrick_el1_abi::Action::Forward;
         }
         if self.task.linux.has_pending_host_work() {

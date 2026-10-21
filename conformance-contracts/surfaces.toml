@@ -1434,7 +1434,7 @@ contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/isa/aarch64.rs"
-contracts = ["process.native.terminal-child"]
+contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
@@ -1506,7 +1506,7 @@ contracts = ["process.native.arm-admission", "core.entry.completion", "core.pers
 
 [[surfaces]]
 path = "crates/carrick-hal/src/trap.rs"
-contracts = ["process.native.arm-admission"]
+contracts = ["kernel.scheduler.runnable-progress", "process.native.arm-admission"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
@@ -1740,4 +1740,12 @@ contracts = ["kernel.scheduler.runnable-progress"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/src/abi/thread.rs"
+contracts = ["kernel.scheduler.runnable-progress"]
+
+[[surfaces]]
+path = "crates/carrick-guest-arch/src/lib.rs"
+contracts = ["kernel.scheduler.runnable-progress"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/sched/object_wait.rs"
 contracts = ["kernel.scheduler.runnable-progress"]

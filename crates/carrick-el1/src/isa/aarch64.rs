@@ -69,6 +69,23 @@ pub fn cross_hvc_fork_refusal(record: &carrick_el1_abi::NativeForkDiagnostic) {
     }
 }
 
+/// Synchronously discharge a host residency notification without GIC support.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub fn cross_hvc_residency_kick(slot: carrick_sched_core::SlotId) -> Result<(), ()> {
+    let mut status = carrick_el1_abi::GRANT_OP_RESIDENCY_KICK;
+    // SAFETY: the issued slot names retained carrier state; HVC resumes this stack.
+    unsafe {
+        core::arch::asm!("hvc #6", inout("x0") status,
+            inlateout("x1") u64::from(slot.raw()) => _,
+            inlateout("x2") 0u64 => _, inlateout("x3") 0u64 => _, options(nostack));
+    }
+    if status == carrick_el1_abi::METADATA_GRANT_SUCCESS {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 pub fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), u64> {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {

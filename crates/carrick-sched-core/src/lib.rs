@@ -87,6 +87,8 @@ extern crate std;
 
 /// Shared deadline-index publication protocol, authenticated by the image ABI.
 pub const TIMER_INDEX_PROTOCOL: u64 = 1;
+/// Reschedule through the carrier when no architectural SGI route exists.
+pub const HOST_RESCHEDULE_TARGET: u64 = 1 << 63;
 pub mod affinity;
 pub mod affinity_source;
 pub use affinity_source::AffinitySource;
@@ -3536,6 +3538,17 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.slot(slot).current.store(NIL, Ordering::Release);
     }
 
+    /// Inspect the currently switched record's own authority rather than the
+    /// host-loaded source. No scan or queue demand is needed for exclusion.
+    pub fn current_affinity_excludes_cpu(&self, slot: SlotId) -> bool {
+        let lane = self.slot(slot);
+        lane.current().is_some_and(|record| {
+            !self
+                .record(record)
+                .allows_cpu(lane.cpu.load(Ordering::Acquire))
+        })
+    }
+
     /// EL1 preempts the running thread of `slot` into `record` (from
     /// [`Self::current_or_new`], its context already saved): it becomes
     /// runnable at the tail of the slot's run queue, to resume with its
@@ -4069,6 +4082,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             cpu.map_or(0, |cpu| cpu.saturating_add(1)),
             Ordering::Release,
         );
+        self.bind_slot_affinity(slot, source);
+    }
+
+    /// Refresh only the retained affinity source on re-entry. Terminal
+    /// custody, address-space identity and CPU binding belong to the load owner.
+    pub fn bind_slot_affinity(&self, slot: SlotId, source: AffinitySource) {
+        let s = self.slot(slot);
         s.affinity.store(source.raw_host(), Ordering::Relaxed);
         s.affinity_source
             .store(source.encoded_guest(), Ordering::Release);

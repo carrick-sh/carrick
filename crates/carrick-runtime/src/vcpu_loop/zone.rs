@@ -276,13 +276,7 @@ pub(super) fn run_guest<R>(
 ) -> R {
     if let Some((zone, slot)) = zone_slot {
         if let Some(thread) = thread {
-            zone.publish_slot_with_affinity(
-                slot,
-                zone.slot(slot).mm(),
-                zone.slot(slot).bound_cpu(),
-                thread.control_slot().affinity_source(),
-            );
-            thread.attach_affinity_slot(slot);
+            zone.bind_slot_affinity(slot, thread.control_slot().affinity_source());
         }
         zone.enter_guest(slot);
     }
