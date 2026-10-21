@@ -949,6 +949,20 @@ pub fn register_handback_publisher(publisher: HandbackPublisher) {
     *HANDBACK_PUBLISHER.write() = Some(publisher);
 }
 
+/// Bind a VM-free fixture's scheduler handback publisher for the duration of
+/// one serial test, restoring the process-global carrier publisher afterward.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_test_handback_publisher<T>(publisher: HandbackPublisher, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<HandbackPublisher>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            *HANDBACK_PUBLISHER.write() = self.0.take();
+        }
+    }
+    let _restore = Restore(HANDBACK_PUBLISHER.write().replace(publisher));
+    run()
+}
+
 /// Hand host-owned zone threads back to their host continuations: each
 /// zone wait becomes ready and the scheduler makes its thread runnable.
 pub fn hand_back(records: &[RecordRef]) {

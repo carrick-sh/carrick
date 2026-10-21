@@ -3241,6 +3241,28 @@ pub(crate) mod tests {
 
     pub(crate) type CrashReadTracker = Arc<Mutex<Vec<(u64, usize)>>>;
 
+    #[derive(Clone, Copy)]
+    pub(crate) struct CopyoutOwnerProbe {
+        wait: carrick_el1_abi::PortalOwnerWait,
+        zone: usize,
+    }
+
+    impl CopyoutOwnerProbe {
+        fn wait_if_busy(self) -> Option<carrick_el1_abi::PortalOwnerWait> {
+            // SAFETY: the VM-free fixture retains the exact carrier region
+            // until the test has completed every prepare and resume.
+            let zone = unsafe { &*(self.zone as *const carrick_el1_abi::ZoneTables) };
+            let entry =
+                zone.space_entry(std::num::NonZeroU64::new(self.wait.handle().mm().raw())?)?;
+            let source = entry.notifications(self.wait.handle().incarnation()).ok()?;
+            (source
+                .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor)
+                .revision()
+                == self.wait.revision())
+            .then_some(self.wait)
+        }
+    }
+
     #[derive(Default)]
     pub(crate) struct CrashCaptureTestEngine {
         pub(crate) next_syscall: Option<carrick_hal::RawSyscall>,
@@ -3267,10 +3289,7 @@ pub(crate) mod tests {
         pub(crate) prepared_write_context: Option<carrick_kernel::kernel::KernelContext>,
         pub(crate) prepared_cancels: usize,
         pub(crate) prepared_commits: usize,
-        pub(crate) copyout_owner_wait: Option<(
-            carrick_el1_abi::PortalOwnerWait,
-            Arc<std::sync::atomic::AtomicBool>,
-        )>,
+        pub(crate) copyout_owner_probe: Option<CopyoutOwnerProbe>,
     }
 
     struct TestPreparedClear<'a> {
@@ -3325,7 +3344,7 @@ pub(crate) mod tests {
 
     impl carrick_guest_mem::GuestMemory for CrashCaptureTestEngine {
         fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
-            if self.prepare_dependency.is_some() || self.copyout_owner_wait.is_some() {
+            if self.prepare_dependency.is_some() || self.copyout_owner_probe.is_some() {
                 carrick_guest_mem::UserMemoryVenue::Owner
             } else {
                 carrick_guest_mem::UserMemoryVenue::Legacy
@@ -3338,9 +3357,9 @@ pub(crate) mod tests {
             Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
             carrick_guest_mem::MemoryPrepareError,
         > {
-            if let Some((wait, released)) = &self.copyout_owner_wait {
-                if !released.load(std::sync::atomic::Ordering::Acquire) {
-                    return Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(*wait));
+            if let Some(probe) = self.copyout_owner_probe {
+                if let Some(wait) = probe.wait_if_busy() {
+                    return Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(wait));
                 }
                 assert_eq!(ranges.len(), 1);
                 return Ok(Box::new(TestPreparedCopyout {
@@ -3388,10 +3407,10 @@ pub(crate) mod tests {
             address: u64,
             bytes: &[u8],
         ) -> Result<(), carrick_guest_mem::MemoryError> {
-            if let Some((wait, released)) = &self.copyout_owner_wait
-                && !released.load(std::sync::atomic::Ordering::Acquire)
+            if let Some(probe) = self.copyout_owner_probe
+                && let Some(wait) = probe.wait_if_busy()
             {
-                return Err(carrick_guest_mem::MemoryError::OwnerWait(*wait));
+                return Err(carrick_guest_mem::MemoryError::OwnerWait(wait));
             }
             self.guest_memory.insert(address, bytes.to_vec());
             Ok(())
@@ -3751,18 +3770,17 @@ pub(crate) mod tests {
     pub(crate) use test_carrier_graph_with_dispatcher;
 
     #[test]
-    fn pipe2_owner_wait_redispatches_through_production_runtime_once() {
+    fn serial_host_pipe2_owner_wait_redispatches_through_production_runtime_once() {
         use carrick_abi::{LinuxCloneFlags, syscall::nr};
         use carrick_el1_linux::mm_portal::{
             MmPortal,
             test_support::{ROOT, Region, admit_notified, nodes},
         };
         use std::num::NonZeroU64;
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let (_runtime, _scheduler, kernel, _root, process, _generation) =
+        let (_runtime, _carrier_scheduler, kernel, _carrier_root, process, _carrier_generation) =
             test_carrier_graph_with_dispatcher!(71_102, SyscallDispatcher::new());
         let root = kernel.dispatcher.capture_one_task_context().unwrap();
         let sibling = root
@@ -3788,6 +3806,42 @@ pub(crate) mod tests {
             .unwrap();
         assert!(root.exact_thread_is_live() && sibling.exact_thread_is_live());
         assert_eq!(root.shared().mm().id(), sibling.shared().mm().id());
+        let mut root_state = executor::tests::task_state(&root, 501);
+        root_state.asid_generation = process.asid_generation();
+        let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) = &mut root_state.cpu else {
+            unreachable!()
+        };
+        Arc::make_mut(cpu).asid_generation = process.asid_generation();
+        let scheduler = Arc::new(carrick_kernel::kernel::Scheduler::new(Arc::clone(
+            root.kernel(),
+        )));
+        let bindings = Arc::new(executor::TaskBindingDirectory::<
+            crate::vcpu_loop::continuation::HvpatchTaskBinding,
+        >::default());
+        bindings.install_scheduler(&scheduler).unwrap();
+        let generation = root
+            .thread()
+            .publish_initial_task_state(root_state.clone())
+            .unwrap();
+        let binding = executor::tests::hvpatch_test_binding(&root, &root_state, 601);
+        let dormant = bindings
+            .prepare_submission(
+                &scheduler,
+                executor::TaskSubmissionShape::Root,
+                None,
+                Arc::clone(root.thread()),
+                generation,
+                Arc::clone(&binding),
+            )
+            .unwrap();
+        executor::tests::activate_hvpatch_test_submission(
+            dormant,
+            &scheduler,
+            &root,
+            &root_state,
+            generation,
+            binding.as_ref(),
+        );
 
         let this_tid = ThreadId::synthetic_for_tests(71_102);
         let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
@@ -3827,79 +3881,246 @@ pub(crate) mod tests {
             native_number: carrick_abi::NativeNr(nr::PIPE2.raw()),
         };
 
-        let region = Region::new();
+        let region = Box::leak(Box::new(Region::new()));
         let zone = region.zone();
         let mm = admit_notified(&region, root.shared().mm().id().raw(), ROOT, 1, 0);
-        let view = nodes(&region);
-        let portal = MmPortal::new(
-            NonZeroU64::new(712).unwrap(),
-            region.table(),
-            &zone.spaces,
-            &view,
-        )
-        .with_zone(zone)
-        .unwrap();
+        let view = Box::leak(Box::new(nodes(&region)));
+        let portal = Box::leak(Box::new(
+            MmPortal::new(
+                NonZeroU64::new(712).unwrap(),
+                region.table(),
+                &zone.spaces,
+                view,
+            )
+            .with_zone(zone)
+            .unwrap(),
+        ));
         let handle = portal.admitted_handle(mm, 0).unwrap();
-        let released = Arc::new(AtomicBool::new(false));
+        assert!(
+            region
+                .portal_slots()
+                .bind_carrier(NonZeroU64::new(712).unwrap())
+        );
+        carrick_el1_abi::record_el1_region_host_ptr(region.ptr.as_ptr() as usize);
+        struct ClearRegion;
+        impl Drop for ClearRegion {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(0);
+            }
+        }
+        let _clear_region = ClearRegion;
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let mut engine = CrashCaptureTestEngine::default();
 
-        let (first, observed_wait) = std::thread::scope(|scope| {
-            let peer_released = Arc::clone(&released);
-            let peer = scope.spawn(move || {
-                let access = carrick_el1_linux::sched::object_wait::space_access(
-                    zone,
-                    carrick_sched_core::SlotId::new(1),
-                );
-                let editor = access
-                    .try_begin_edit(
-                        zone.spaces.find(sibling.shared().mm().id().raw()).unwrap(),
-                        mm.raw(),
-                        NonZeroU64::new(2).unwrap(),
-                    )
-                    .unwrap();
-                entered_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                drop(editor);
-                peer_released.store(true, Ordering::Release);
-            });
-            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            let wait = portal
-                .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
-                .unwrap()
-                .unwrap();
-            engine.copyout_owner_wait = Some((wait, Arc::clone(&released)));
-            let first = state
-                .service_threaded_syscall(&kernel, &mut engine, frame, None)
-                .unwrap();
-            release_tx.send(()).unwrap();
-            peer.join().unwrap();
-            (first, wait)
+        let handback_scheduler = Arc::downgrade(&scheduler);
+        let handback: carrick_kernel::el1_zone::HandbackPublisher = Arc::new(move |event| {
+            if let Some(scheduler) = handback_scheduler.upgrade()
+                && let carrick_kernel::el1_zone::HandbackEvent::Ready(record) = event
+            {
+                scheduler.publish_zone_handback(record);
+            }
         });
-        assert_eq!(
-            first,
-            DispatchOutcome::OwnerMemoryWait {
-                wait: observed_wait,
-                committed: 0,
-            },
-            "the production service must park on the sibling's editor, never return EFAULT",
-        );
-        assert_eq!(engine.prepared_commits, 0);
-        assert_eq!(root.resources().files().slot_count(), 0);
+        carrick_kernel::el1_zone::with_test_handback_publisher(handback, || {
+            carrick_kernel::el1_zone::with_test_zone(zone, || {
+                std::thread::scope(|scope| {
+                    let peer = scope.spawn(move || {
+                        let access = carrick_el1_linux::sched::object_wait::space_access(
+                            zone,
+                            carrick_sched_core::SlotId::new(1),
+                        );
+                        let editor = access
+                            .try_begin_edit(
+                                zone.spaces.find(sibling.shared().mm().id().raw()).unwrap(),
+                                mm.raw(),
+                                NonZeroU64::new(2).unwrap(),
+                            )
+                            .unwrap();
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        if std::env::var_os("CARRICK_TEST_FORGET_OWNER_EDITOR").is_some() {
+                            std::mem::forget(editor);
+                        } else {
+                            drop(editor);
+                        }
+                    });
+                    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let wait = portal
+                        .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
+                        .unwrap()
+                        .unwrap();
+                    engine.copyout_owner_probe = Some(CopyoutOwnerProbe {
+                        wait,
+                        zone: zone as *const _ as usize,
+                    });
+                    let first = state
+                        .service_threaded_syscall(&kernel, &mut engine, frame, None)
+                        .unwrap();
+                    assert_eq!(
+                        first,
+                        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                        "the production service must park on the sibling's editor, never return EFAULT",
+                    );
+                    assert_eq!(engine.prepared_commits, 0);
+                    assert_eq!(root.resources().files().slot_count(), 0);
 
-        let completed = state
-            .resume_owned_syscall(
-                &kernel,
-                &mut engine,
-                binding::OwnedSyscallResume::CopyoutRedispatch,
-                None,
-            )
-            .unwrap();
-        assert_eq!(completed, DispatchOutcome::Returned { value: 0 });
-        assert_eq!(engine.prepared_commits, 1);
-        assert_eq!(engine.guest_memory[&0x71_1020].len(), 8);
-        assert_eq!(root.resources().files().slot_count(), 2);
+                    state.zone_mm = Some(mm.raw());
+                    let mut snapshot = executor::tests::task_state(&root, 500).cpu;
+                    let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) = &mut snapshot else {
+                        unreachable!()
+                    };
+                    let cpu = Arc::make_mut(cpu);
+                    cpu.asid_generation = process.asid_generation();
+                    cpu.syscall_continuation =
+                        Some(carrick_hal::threaded::Aarch64SyscallContinuationV1 {
+                            sequence: 1,
+                            state: 1,
+                            trap_kind: 1,
+                            response_action: 0,
+                            flags: 0,
+                            native_nr: nr::PIPE2.raw(),
+                            args: frame.args,
+                            x8: nr::PIPE2.raw(),
+                            resume_pc: 0x4004,
+                            spsr: 0,
+                            fp: 0x7000,
+                            lr: 0x4100,
+                            sp: 0x7100,
+                            esr: 0x15 << 26,
+                            return_value: 0,
+                            resume_x16: 0x1616,
+                            resume_x17: 0x1717,
+                        });
+                    engine.exec_support = true;
+                    engine.snapshot_cpu = Some(snapshot);
+                    let mut job = suffix_failure_test_job(
+                        &kernel,
+                        state,
+                        HvpatchProductionPhase::Resident,
+                        None,
+                    );
+                    let registration = scheduler
+                        .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+                        .unwrap();
+                    let mut running = scheduler.take(&registration).unwrap();
+                    if running.thread_key() != root.thread().key() {
+                        scheduler.settle_runnable_successor(running).unwrap();
+                        running = scheduler.take(&registration).unwrap();
+                    }
+                    assert_eq!(running.generation(), generation);
+                    let lease = running.take_lease();
+                    let owner_context = job.state.service_kernel_context.as_ref().unwrap();
+                    assert!(owner_context.exact_thread_is_live());
+                    assert_eq!(lease.thread_key(), owner_context.thread().key());
+                    assert_eq!(
+                        owner_context.thread().execution_state().generation(),
+                        Some(lease.generation())
+                    );
+                    assert_eq!(
+                        lease.task_state_authority().unwrap().0,
+                        owner_context.shared().mm().id()
+                    );
+                    let reject_descendant = |_, _| unreachable!();
+                    let mut submission = executor::ExecutorSubmissionContext {
+                        registration: Some(&registration),
+                        scheduler: &scheduler,
+                        publish_test_descendant: &reject_descendant,
+                        current: None,
+                        authority: executor::ExecutionLeaseAuthoritySlot::new(Some(lease)),
+                        exec_replacement: None,
+                    };
+                    let need_resched = std::sync::atomic::AtomicBool::new(false);
+                    let mut control = executor::HvpatchQuantumControl {
+                        need_resched: &need_resched,
+                        submission: &mut submission,
+                        binding: Some(&binding),
+                        cow_invalidation_observer: None,
+                    };
+                    let parked = job
+                        .owner_memory_park(
+                            &mut engine,
+                            &mut control,
+                            frame,
+                            wait,
+                            binding::OwnedSyscallResume::CopyoutRedispatch,
+                        )
+                        .unwrap();
+                    let executor::ExecutorExit::BlockedContinuation {
+                        continuation,
+                        vfork_activation: None,
+                    } = parked
+                    else {
+                        panic!("owner wait did not return its production continuation");
+                    };
+                    let wait_service =
+                        carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::clone(
+                            &scheduler,
+                        ));
+                    let mut wait_registration = wait_service.prepare_registration(&continuation);
+                    wait_service.enroll(&mut wait_registration).unwrap();
+                    let lease = submission.take_execution_lease().unwrap();
+                    running.restore_lease(lease).unwrap();
+                    scheduler
+                        .settle_blocked_continuation(running, *continuation, wait_registration)
+                        .unwrap();
+
+                    release_tx.send(()).unwrap();
+                    peer.join().unwrap();
+                    carrick_kernel::el1_zone::hand_back_completions();
+                    let deadline = std::time::Instant::now() + Duration::from_millis(200);
+                    while scheduler.queued_len() == 0 && std::time::Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                    assert_ne!(
+                        scheduler.queued_len(),
+                        0,
+                        "owner release did not wake the production continuation before the bound",
+                    );
+
+                    let mut resumed = scheduler.take(&registration).unwrap();
+                    let lease = resumed.take_lease();
+                    job.state.guest_execution = Some(
+                        kernel
+                            .dispatcher
+                            .enter_mm_executor_for_thread(
+                                Some(Arc::clone(root.thread())),
+                                Arc::clone(&job.state.kicker),
+                                job.state.this_tid,
+                                test_execution_slot(),
+                            )
+                            .expect("resumed MM executor participation"),
+                    );
+                    let mut resumed_submission = executor::ExecutorSubmissionContext {
+                        registration: Some(&registration),
+                        scheduler: &scheduler,
+                        publish_test_descendant: &reject_descendant,
+                        current: None,
+                        authority: executor::ExecutionLeaseAuthoritySlot::new(Some(lease)),
+                        exec_replacement: None,
+                    };
+                    let mut resumed_control = executor::HvpatchQuantumControl::for_test(
+                        &need_resched,
+                        &mut resumed_submission,
+                    );
+                    let completed = job
+                        .resume_owner_zone(
+                            &mut engine,
+                            &mut resumed_control,
+                            frame,
+                            binding::OwnedSyscallResume::CopyoutRedispatch,
+                        )
+                        .unwrap();
+                    assert!(matches!(completed, executor::ExecutorExit::Syscall));
+                    let lease = resumed_submission.take_execution_lease().unwrap();
+                    resumed.restore_lease(lease).unwrap();
+                    scheduler.settle_runnable_successor(resumed).unwrap();
+                    assert_eq!(engine.completed_syscalls, [0]);
+                    assert_eq!(engine.prepared_commits, 1);
+                    assert_eq!(engine.guest_memory[&0x71_1020].len(), 8);
+                    assert_eq!(root.resources().files().slot_count(), 2);
+                });
+            });
+        });
     }
 
     // Linux asm-generic/siginfo.h SIGTRAP si_codes.
