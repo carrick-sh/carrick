@@ -151,6 +151,8 @@ fn serial_host_workflow_edits_are_reported_without_push() {
 fn foreground(case: &str) {
     static ACCOUNT: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _account = ACCOUNT.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: this serial fixture adopts only its own command descendants.
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
 
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
@@ -377,7 +379,9 @@ fi
             .parse()
             .unwrap();
         println!("retirement witness detached pid={pid}");
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let alive = std::path::Path::new(&format!("/proc/{pid}"))
+            .try_exists()
+            .unwrap();
         if alive {
             assert!(
                 Command::new("/usr/bin/sudo")
@@ -386,6 +390,20 @@ fi
                     .unwrap()
                     .success()
             );
+        }
+        if alive {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::path::Path::new(&format!("/proc/{pid}"))
+                .try_exists()
+                .unwrap()
+                && std::time::Instant::now() < deadline
+            {
+                // SAFETY: reap only the fixture's known adopted detached PID.
+                unsafe {
+                    libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
         assert!(
             !alive,

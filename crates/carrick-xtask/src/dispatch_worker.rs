@@ -1249,6 +1249,71 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "runner-only OS account witness; run with --include-ignored"]
+    fn serial_host_timeout_retires_detached_and_signal_resistant_agent() {
+        cleanup_agent_user().unwrap();
+        sudo(&[
+            "/usr/sbin/useradd",
+            "--system",
+            "--user-group",
+            "--no-create-home",
+            "--shell",
+            "/usr/sbin/nologin",
+            AGENT_USER,
+        ])
+        .unwrap();
+        // SAFETY: this serial runner-only fixture owns its foreground/adopted children.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("pids");
+        let mut command = Command::new("/usr/bin/sudo");
+        private_environment(&mut command);
+        command.args(["-n", "-u", AGENT_USER, "--", "/usr/bin/env", "-i", "/usr/bin/python3", "-c",
+            "import os,signal,subprocess,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); signal.signal(signal.SIGHUP,signal.SIG_IGN); p=subprocess.Popen(['/usr/bin/setsid','/bin/sleep','10'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); print(os.getpid(),p.pid,flush=True); time.sleep(5)"])
+            .stdin(Stdio::null()).stdout(std::fs::File::create(&log).unwrap()).stderr(Stdio::null());
+        let start = std::time::Instant::now();
+        let result = wait_agent(&mut command, std::time::Duration::from_secs(1));
+        let elapsed = start.elapsed();
+        let retirement = retire_agent();
+        let pids = std::fs::read_to_string(log)
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2, "agent did not reach the timeout fixture");
+        let survivors = pids
+            .iter()
+            .copied()
+            .filter(|pid| Path::new(&format!("/proc/{pid}")).try_exists().unwrap())
+            .collect::<Vec<_>>();
+        // Cleanup also owns the intentionally broken retirement control run.
+        for pid in &survivors {
+            sudo(&["/usr/bin/kill", "-KILL", "--", &pid.to_string()]).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while Path::new(&format!("/proc/{pid}")).try_exists().unwrap()
+                && std::time::Instant::now() < deadline
+            {
+                // SAFETY: only this fixture's adopted PID is reaped, never another test's child.
+                unsafe {
+                    libc::waitpid(*pid, std::ptr::null_mut(), libc::WNOHANG);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        cleanup_agent_user().unwrap();
+        assert_eq!(result.unwrap(), 124);
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "foreground wait blocked before retirement: {elapsed:?}"
+        );
+        assert!(retirement.is_ok(), "{retirement:?}");
+        assert!(
+            survivors.is_empty(),
+            "agent processes survived timeout: {survivors:?}"
+        );
+    }
+    #[test]
     fn worker_disables_compiler_servers_for_every_runner_step() {
         let documents = yaml_rust2::YamlLoader::load_from_str(include_str!(
             "../../../.github/workflows/dispatch-worker.yml"
