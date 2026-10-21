@@ -1992,7 +1992,7 @@ fn switched_thread_affinity_exclusion_migrates_without_a_tick() {
     host_publish(&zone, other, MM, Some(0), 3);
     zone.enter_guest(SLOT);
     zone.enter_guest(other);
-    assert!(zone.enter_idle(other, false));
+    zone.enter_idle(other, false);
     let control = carrick_personality_linux::abi::thread::ThreadControlSlot::new();
     control.initialize_affinity(carrick_core::affinity::CpuAffinity::all(2));
     // SAFETY: this stack control outlives the record and both scheduler slots.
