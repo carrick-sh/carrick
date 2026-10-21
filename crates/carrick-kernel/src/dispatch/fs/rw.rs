@@ -175,6 +175,30 @@ impl OwnedWriteCopyIn {
     pub fn wait(&self) -> &carrick_guest_mem::MemoryReadWait {
         &self.suspension.wait
     }
+
+    /// Bytes irreversibly published by this retained operation before its
+    /// current guest-memory read suspended.
+    pub fn committed_len(&self) -> usize {
+        match &self.op {
+            OwnedCopyInOperation::Writev(WritevCopyInState {
+                phase:
+                    WritevCopyInPhase::EventFd { total, .. }
+                    | WritevCopyInPhase::EventFdTail { total, .. }
+                    | WritevCopyInPhase::PerIovec { total, .. },
+                ..
+            }) => *total,
+            OwnedCopyInOperation::Writev(WritevCopyInState {
+                phase: WritevCopyInPhase::BlockingWriteTail { write, total, .. },
+                ..
+            }) => total.saturating_add(write.offset()),
+            OwnedCopyInOperation::Write { .. }
+            | OwnedCopyInOperation::Pwrite64 { .. }
+            | OwnedCopyInOperation::Writev(_)
+            | OwnedCopyInOperation::Pwritev { .. }
+            | OwnedCopyInOperation::Sendto { .. }
+            | OwnedCopyInOperation::Sendmsg { .. } => 0,
+        }
+    }
 }
 
 impl SyscallDispatcher {

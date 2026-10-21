@@ -901,7 +901,7 @@ mod tests {
             let mut result = continuation
                 .resume(ContinuationEvent::ReservedSignal(reserved), &context)
                 .unwrap();
-            let outcome = crate::vcpu_loop::zone::owner_wait_interruption(&result.completion)
+            let outcome = crate::vcpu_loop::zone::owner_wait_interruption(&result.completion, 0)
                 .expect("a signal wake must complete the original call before handler delivery");
             let carrick_kernel::dispatch::DispatchOutcome::Errno { errno } = outcome else {
                 panic!("interrupted owner wait must return EINTR");

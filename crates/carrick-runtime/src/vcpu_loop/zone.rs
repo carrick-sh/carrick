@@ -292,6 +292,7 @@ fn apply_zone_exit(
 
 pub(super) fn owner_wait_interruption(
     completion: &carrick_kernel::kernel::continuation::ContinuationCompletion,
+    committed: u64,
 ) -> Option<DispatchOutcome> {
     // A producer notification is not a guest result. A signal interruption
     // must, however, complete the original syscall before entering a handler.
@@ -299,10 +300,14 @@ pub(super) fn owner_wait_interruption(
     // from the original syscall, not this internal zone wait's Never policy.
     match completion {
         carrick_kernel::kernel::continuation::ContinuationCompletion::Errno(errno)
-            if *errno == carrick_abi::LINUX_EINTR =>
+            if *errno == carrick_abi::LINUX_EINTR && committed > 0 =>
         {
-            Some(DispatchOutcome::Errno { errno: *errno })
+            Some(DispatchOutcome::Returned {
+                value: i64::try_from(committed).unwrap_or(i64::MAX),
+            })
         }
+        carrick_kernel::kernel::continuation::ContinuationCompletion::Errno(errno)
+            if *errno == carrick_abi::LINUX_EINTR => Some(DispatchOutcome::Errno { errno: *errno }),
         _ => None,
     }
 }
@@ -936,7 +941,11 @@ where
         resume: OwnedSyscallResume,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let mut result = self.consume_owner_zone(control)?;
-        let interruption = owner_wait_interruption(&result.completion);
+        let committed = self
+            .state
+            .owner_read_progress
+            .max(resume.committed_len());
+        let interruption = owner_wait_interruption(&result.completion, committed);
         let effects = result.take_resume_effects();
         let reserved_signum = effects
             .reserved_signal
@@ -954,7 +963,11 @@ where
         } else {
             previous.or(reserved)
         };
-        self.state.continuation_restart = effects.restart;
+        self.state.continuation_restart = interruption
+            .as_ref()
+            .is_some_and(|outcome| matches!(outcome, DispatchOutcome::Errno { errno } if *errno == carrick_abi::LINUX_EINTR))
+            .then_some(effects.restart)
+            .flatten();
         let outcome = match interruption {
             Some(outcome) => outcome,
             None => self.state.resume_owned_syscall(

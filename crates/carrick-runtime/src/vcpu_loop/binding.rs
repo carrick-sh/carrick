@@ -231,6 +231,15 @@ pub(super) enum OwnedSyscallResume {
     PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
 }
 
+impl OwnedSyscallResume {
+    pub(super) fn committed_len(&self) -> u64 {
+        match self {
+            Self::PreparedWrite(pending) => pending.committed_len() as u64,
+            Self::Redispatch | Self::PreparedCopyout(_) => 0,
+        }
+    }
+}
+
 fn owner_copyin_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
     if let DispatchOutcome::PreparedCopyoutWait { wait, restart } = outcome {
         return (*wait, Some(OwnedSyscallResume::PreparedCopyout(restart)));
