@@ -5857,6 +5857,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         // Placement reads the exact retained authority; no slot or record copy
         // is rewritten by a guest-switched caller.
         control.change_affinity(effective, &mut notification);
+        if let Some(record) = control.zone_record() {
+            self.source
+                .zone
+                .affinity_change_effects(record, &mut notification.0);
+        }
         drop(graph);
         if notification.0.sgi_slots().next().is_some() {
             self.service.wake_effects(notification.0);

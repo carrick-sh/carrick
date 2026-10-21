@@ -106,7 +106,7 @@ fn ring_call_route(
     frame.x[8] = number;
     frame.x[0] = u64::from(tid);
     frame.x[1] = 8;
-    frame.x[2] = core::ptr::from_mut(mask).addr() as u64;
+    frame.x[2] = core::ptr::from_mut(mask).expose_provenance() as u64;
     let counters = carrick_el1_abi::Counters::default();
     let mut cpu = carrick_el1_linux::sched::FakeCpu::default();
     let route = carrick_el1_linux::dispatch::dispatch_syscall_with_native(
