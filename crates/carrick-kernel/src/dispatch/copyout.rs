@@ -17,14 +17,15 @@
 //!
 //! An invalid pointer is not a retry: on both venues it surfaces at the
 //! commit as [`CopyoutFault`] (EFAULT), after the side effect, which is where
-//! Linux reports it (`pipe2` creates and then frees its files; `accept` still
-//! answers EAGAIN on an empty queue). Only a retryable owner wait refuses
-//! preparation.
+//! Linux reports it (`pipe2` creates and then frees its files). Only a
+//! retryable owner wait refuses preparation.
 //!
 //! The order relative to side effects is the handler's obligation: call
-//! `prepare` before creating, consuming or installing anything, and treat a
-//! [`CopyoutRefusal`] as "return now". Side-effect-free handlers (stat,
-//! clock reads) may prepare immediately before committing.
+//! `prepare` before creating or installing anything, and treat a
+//! [`CopyoutRefusal`] as "return now". Consuming syscalls require retained
+//! operation authority and are deliberately outside this slice (#744).
+//! Side-effect-free handlers (stat, clock reads) may prepare immediately
+//! before committing.
 
 use carrick_abi::{KernelAbi, LINUX_EFAULT};
 use carrick_guest_mem::{
@@ -34,8 +35,8 @@ use carrick_guest_mem::{
 use super::{DispatchError, DispatchOutcome};
 
 /// The largest total output one copyout prepares: one owner portal permit.
-/// Fixed records are checked at compile time; variable outputs bound their
-/// capacity with [`bounded_capacity`] before preparing.
+/// Fixed records are checked at compile time; variable outputs must clamp
+/// their capacity before preparing.
 pub(crate) const COPYOUT_MAX_BYTES: usize = carrick_el1_abi::MM_PORTAL_MAX_BYTES as usize;
 
 /// One guest output: an address and the most bytes the handler may commit
@@ -70,17 +71,6 @@ impl UserSlot {
     }
 }
 
-/// Cap a variable-length output (a directory batch, an address or option
-/// value) at what one prepared permit can hold on this venue. Linux allows
-/// these syscalls to return less than the caller's buffer. The legacy venue
-/// has no permit bound and keeps the caller's length.
-pub(crate) fn bounded_capacity(memory: &impl CurrentMmMemory, requested: usize) -> usize {
-    match memory.user_memory_venue() {
-        UserMemoryVenue::Owner => requested.min(COPYOUT_MAX_BYTES),
-        UserMemoryVenue::Legacy => requested,
-    }
-}
-
 /// A retryable owner refusal: the editor is busy, or the output needs physical
 /// supply or a retained writer to drain. Nothing was written; the handler
 /// returns this outcome before its first side effect and the runtime parks,
@@ -93,13 +83,6 @@ pub(crate) struct CopyoutRefusal(Box<DispatchOutcome>);
 impl CopyoutRefusal {
     pub(crate) fn into_outcome(self) -> DispatchOutcome {
         *self.0
-    }
-
-    pub(crate) fn suspend(self, operation: OwnedCopyoutOperation) -> DispatchOutcome {
-        DispatchOutcome::CopyoutSuspended(Box::new(OwnedCopyout {
-            wait: self.0,
-            operation,
-        }))
     }
 
     pub(crate) fn from_read_error(error: carrick_guest_mem::MemoryError) -> Option<Self> {
@@ -142,103 +125,6 @@ impl CopyoutRefusal {
             _ => return None,
         };
         Some(Self(Box::new(outcome)))
-    }
-}
-
-/// Exact authority retained for an owner-refused syscall copyout.
-pub enum OwnedCopyoutOperation {
-    Getdents {
-        open_file: crate::dispatch::fd_table::OpenFile,
-        lease: crate::kernel::objects::FileDescriptionFdLease,
-        address: u64,
-        length: usize,
-    },
-    SocketError {
-        open_file: crate::dispatch::fd_table::OpenFile,
-        lease: crate::kernel::objects::FileDescriptionFdLease,
-        source: crate::dispatch::net::SocketErrorSource,
-        optval_addr: u64,
-        optlen_addr: u64,
-    },
-    Accept {
-        open_file: crate::dispatch::fd_table::OpenFile,
-        sockaddr: Option<Vec<u8>>,
-        addr: u64,
-        addrlen: u64,
-        record: Option<crate::dispatch::net::AcceptedAddressRecord>,
-    },
-}
-
-/// An owner-memory wait paired with the operation that owns the side effect.
-pub struct OwnedCopyout {
-    wait: Box<DispatchOutcome>,
-    pub(crate) operation: OwnedCopyoutOperation,
-}
-
-impl OwnedCopyout {
-    pub fn into_parts(self) -> (DispatchOutcome, OwnedCopyoutOperation) {
-        (*self.wait, self.operation)
-    }
-}
-
-impl std::fmt::Debug for OwnedCopyout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OwnedCopyout")
-            .field("wait", &self.wait)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PartialEq for OwnedCopyout {
-    fn eq(&self, other: &Self) -> bool {
-        self.wait == other.wait && std::ptr::eq(self, other)
-    }
-}
-
-impl Eq for OwnedCopyout {}
-
-impl super::SyscallDispatcher {
-    /// Resume a copyout against the authority captured by the first dispatch.
-    pub fn resume_owned_copyout<M: CurrentMmMemory>(
-        &self,
-        kernel: &crate::kernel::KernelContext,
-        request: super::SyscallRequest,
-        operation: OwnedCopyoutOperation,
-        memory: &mut M,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        match operation {
-            OwnedCopyoutOperation::Getdents {
-                open_file,
-                lease: _,
-                address,
-                length,
-            } if request.number == carrick_abi::syscall::nr::GETDENTS64 => self
-                .fs_view()
-                .getdents64_from_open_file(kernel, open_file, address, length, memory),
-            OwnedCopyoutOperation::SocketError {
-                open_file,
-                lease: _,
-                source,
-                optval_addr,
-                optlen_addr,
-            } if request.number == carrick_abi::syscall::nr::GETSOCKOPT => self
-                .net_view()
-                .socket_error_from_open_file(open_file, source, optval_addr, optlen_addr, memory),
-            OwnedCopyoutOperation::Accept {
-                open_file,
-                sockaddr,
-                addr,
-                addrlen,
-                record,
-            } if request.number == carrick_abi::syscall::nr::ACCEPT
-                || request.number == carrick_abi::syscall::nr::ACCEPT4 =>
-            {
-                Ok(self
-                    .net_view()
-                    .finish_owned_accept(open_file, sockaddr, addr, addrlen, record, memory))
-            }
-            _ => Err(DispatchError::Errno(carrick_abi::LINUX_EIO)),
-        }
     }
 }
 
@@ -340,9 +226,8 @@ pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
             break;
         };
         if next_total > COPYOUT_MAX_BYTES {
-            // Owner capacities are fixed records (checked at compile time),
-            // carrick-sized values, or `bounded_capacity` results, so no guest
-            // length reaches this. A larger permit would be refused as a Limit,
+            // Owner capacities are fixed records (checked at compile time) or
+            // carrick-sized values, so no guest length reaches this. A larger permit would be refused as a Limit,
             // which the owner refusal path treats as fatal; report EFAULT at
             // the commit instead and never abort the carrier.
             debug_assert!(
@@ -602,13 +487,6 @@ pub(crate) mod owner_fixture {
             wait
         }
 
-        /// Refuse the next read with a `MemoryError::ReadSuspended` Editor wait.
-        pub(crate) fn refuse_next_read(&mut self) -> PortalOwnerWait {
-            let wait = editor_wait();
-            self.refuse_read.set(Some(wait));
-            wait
-        }
-
         /// Mark `[address, address + len)` readable but not writable (`PROT_READ`).
         pub(crate) fn protect_readonly(&mut self, address: u64, len: usize) {
             self.readonly.push((address, len));
@@ -792,15 +670,6 @@ mod tests {
             prepared.commit(&LinuxTimespec::new(1, 1)),
             Err(CopyoutFault)
         );
-    }
-
-    #[test]
-    fn variable_outputs_bound_to_one_owner_permit() {
-        let owner = OwnerRefusingMemory::new(BASE, 0x1000, 0);
-        let legacy = LinearMemory::new(BASE, vec![0; 0x100]);
-        assert_eq!(bounded_capacity(&owner, 1 << 20), COPYOUT_MAX_BYTES);
-        assert_eq!(bounded_capacity(&owner, 12), 12);
-        assert_eq!(bounded_capacity(&legacy, 1 << 20), 1 << 20);
     }
 
     #[test]
