@@ -331,8 +331,12 @@ pub fn hand_back_foreign_timer(slot: SlotId) {
 /// handback claimed it), so its thread may run.
 pub fn is_host_owned(record: RecordRef) -> bool {
     zone_tables().is_some_and(|zone| {
-        zone.live(record)
-            .is_some_and(|rec| matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. }))
+        zone.live(record).is_some_and(|rec| {
+            matches!(
+                rec.claim(),
+                carrick_el1_abi::Claim::Host { .. } | carrick_el1_abi::Claim::FirstEntryHost { .. }
+            )
+        })
     })
 }
 
@@ -666,7 +670,8 @@ pub fn record_runs(record: RecordRef) -> Option<bool> {
         carrick_el1_abi::Claim::Queued { .. }
         | carrick_el1_abi::Claim::OnCpu { .. }
         | carrick_el1_abi::Claim::OnCpuRequested { .. }
-        | carrick_el1_abi::Claim::Host { .. } => Some(true),
+        | carrick_el1_abi::Claim::Host { .. }
+        | carrick_el1_abi::Claim::FirstEntryHost { .. } => Some(true),
         _ => None,
     }
 }
@@ -700,7 +705,8 @@ fn thread_record_runs_in(
         carrick_el1_abi::Claim::Queued { .. }
         | carrick_el1_abi::Claim::OnCpu { .. }
         | carrick_el1_abi::Claim::OnCpuRequested { .. }
-        | carrick_el1_abi::Claim::Host { .. } => Some(true),
+        | carrick_el1_abi::Claim::Host { .. }
+        | carrick_el1_abi::Claim::FirstEntryHost { .. } => Some(true),
         _ => None,
     }
 }

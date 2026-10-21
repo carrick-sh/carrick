@@ -297,11 +297,16 @@ pub enum Claim {
     /// Owned by the host; the context is frozen until the thread is loaded.
     Host { seq: u32 },
     /// A producer is routing a first entry; a claimant may record a request.
-    Placing { seq: u32, host_requested: bool },
+    Placing {
+        incarnation: u64,
+        host_requested: bool,
+    },
     /// Exclusive first-entry placement or executor activation custody.
-    Activating { seq: u32 },
+    Activating { incarnation: u64 },
     /// Terminal activation custody; no publication is permitted.
-    Retiring { seq: u32 },
+    Retiring { incarnation: u64 },
+    /// Frozen unadopted birth; the acquisition CAS authenticates its epoch.
+    FirstEntryHost { incarnation: u64 },
 }
 
 const STATE_FREE: u64 = 0;
@@ -317,6 +322,10 @@ const STATE_PLACING: u64 = 9;
 const STATE_PLACING_REQUESTED: u64 = 10;
 const STATE_ACTIVATING: u64 = 11;
 const STATE_RETIRING: u64 = 12;
+const STATE_FIRST_ENTRY_HOST: u64 = 13;
+
+/// First-entry words carry their entire 60-bit incarnation above a 4-bit tag.
+pub const CLAIM_WORD_PROTOCOL: u64 = 2;
 
 impl Claim {
     pub const fn encode(self) -> u64 {
@@ -334,17 +343,18 @@ impl Claim {
             }
             Self::Host { seq } => STATE_HOST | ((seq as u64) << 16),
             Self::Placing {
-                seq,
+                incarnation,
                 host_requested,
             } => {
                 (if host_requested {
                     STATE_PLACING_REQUESTED
                 } else {
                     STATE_PLACING
-                }) | ((seq as u64) << 16)
+                }) | (incarnation << 4)
             }
-            Self::Activating { seq } => STATE_ACTIVATING | ((seq as u64) << 16),
-            Self::Retiring { seq } => STATE_RETIRING | ((seq as u64) << 16),
+            Self::Activating { incarnation } => STATE_ACTIVATING | (incarnation << 4),
+            Self::Retiring { incarnation } => STATE_RETIRING | (incarnation << 4),
+            Self::FirstEntryHost { incarnation } => STATE_FIRST_ENTRY_HOST | (incarnation << 4),
             Self::Transferring {
                 seq,
                 cancelled,
@@ -362,6 +372,27 @@ impl Claim {
     }
 
     pub const fn decode(word: u64) -> Self {
+        // First-entry states use the full remaining word for identity;
+        // ordinary parked/queued records retain their slot/sequence encoding.
+        let incarnation = word >> 4;
+        match word & 0xf {
+            STATE_PLACING => {
+                return Self::Placing {
+                    incarnation,
+                    host_requested: false,
+                };
+            }
+            STATE_PLACING_REQUESTED => {
+                return Self::Placing {
+                    incarnation,
+                    host_requested: true,
+                };
+            }
+            STATE_ACTIVATING => return Self::Activating { incarnation },
+            STATE_RETIRING => return Self::Retiring { incarnation },
+            STATE_FIRST_ENTRY_HOST => return Self::FirstEntryHost { incarnation },
+            _ => {}
+        }
         let seq = (word >> 16) as u32;
         let slot = SlotId::new(((word >> 8) & 0xff) as u8);
         match word & 0xff {
@@ -370,16 +401,6 @@ impl Claim {
             STATE_ONCPU => Self::OnCpu { slot, seq },
             STATE_ONCPU_REQUESTED => Self::OnCpuRequested { slot, seq },
             STATE_HOST => Self::Host { seq },
-            STATE_PLACING => Self::Placing {
-                seq,
-                host_requested: false,
-            },
-            STATE_PLACING_REQUESTED => Self::Placing {
-                seq,
-                host_requested: true,
-            },
-            STATE_ACTIVATING => Self::Activating { seq },
-            STATE_RETIRING => Self::Retiring { seq },
             STATE_TRANSFERRING => Self::Transferring {
                 seq,
                 cancelled: false,
@@ -399,7 +420,7 @@ impl Claim {
         }
     }
 
-    /// The park this claim belongs to (0 for [`Claim::Free`]).
+    /// The park this claim belongs to (0 for Free and incarnation-owned births).
     pub const fn seq(self) -> u32 {
         match self {
             Self::Free => 0,
@@ -408,10 +429,11 @@ impl Claim {
             | Self::OnCpu { seq, .. }
             | Self::OnCpuRequested { seq, .. }
             | Self::Host { seq }
-            | Self::Placing { seq, .. }
-            | Self::Activating { seq }
-            | Self::Retiring { seq }
             | Self::Transferring { seq, .. } => seq,
+            Self::FirstEntryHost { .. }
+            | Self::Placing { .. }
+            | Self::Activating { .. }
+            | Self::Retiring { .. } => 0,
         }
     }
 }
@@ -427,16 +449,22 @@ enum FirstEntryOperation {
 
 const fn first_entry_transition(claim: Claim, operation: FirstEntryOperation) -> Option<Claim> {
     match (claim, operation) {
-        (Claim::Host { seq }, FirstEntryOperation::AdmitPlacement) => Some(Claim::Placing {
-            seq,
-            host_requested: false,
-        }),
-        (Claim::Host { seq }, FirstEntryOperation::MintActivation) => {
-            Some(Claim::Activating { seq })
+        (Claim::FirstEntryHost { incarnation }, FirstEntryOperation::AdmitPlacement) => {
+            Some(Claim::Placing {
+                incarnation,
+                host_requested: false,
+            })
         }
-        (Claim::Placing { seq, .. }, FirstEntryOperation::Release) => Some(Claim::Host { seq }),
-        (Claim::Activating { seq }, FirstEntryOperation::Release) => Some(Claim::Host { seq }),
-        (Claim::Activating { seq }, FirstEntryOperation::Retire) => Some(Claim::Retiring { seq }),
+        (Claim::FirstEntryHost { incarnation }, FirstEntryOperation::MintActivation) => {
+            Some(Claim::Activating { incarnation })
+        }
+        (
+            Claim::Placing { incarnation, .. } | Claim::Activating { incarnation },
+            FirstEntryOperation::Release,
+        ) => Some(Claim::FirstEntryHost { incarnation }),
+        (Claim::Activating { incarnation }, FirstEntryOperation::Retire) => {
+            Some(Claim::Retiring { incarnation })
+        }
         (Claim::Retiring { .. }, FirstEntryOperation::FinishRetire) => Some(Claim::Free),
         _ => None,
     }
@@ -899,23 +927,56 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         cpu_plus_one == 0 || mask == 0 || cpu_plus_one > 64 || mask & (1 << (cpu_plus_one - 1)) != 0
     }
 
+    fn ready_host_claim(&self, seq: u32) -> Claim {
+        if self.is_unadopted_birth() {
+            Claim::FirstEntryHost {
+                incarnation: self.incarnation(),
+            }
+        } else {
+            Claim::Host { seq }
+        }
+    }
+
+    fn parked_sequence(&self, claim: Claim) -> u32 {
+        match claim {
+            Claim::FirstEntryHost { .. }
+            | Claim::Placing { .. }
+            | Claim::Activating { .. }
+            | Claim::Retiring { .. } => self.last_seq.load(Ordering::Acquire),
+            _ => claim.seq(),
+        }
+    }
+
+    fn apply_first_entry_request(&self, incarnation: u64) {
+        // Only the exclusive first-entry owner writes the untagged payload.
+        // A delayed requester can publish an old tagged intent after reuse,
+        // but cannot change the replacement's return reason.
+        if let Some(kind) = self.host_wanted.take(incarnation) {
+            self.handback.store(kind as u32, Ordering::Release);
+        }
+    }
+
     fn release_first_entry_claim(&self, owned: Claim) -> bool {
         let Some(next) = first_entry_transition(owned, FirstEntryOperation::Release) else {
             return false;
         };
+        if let Claim::Placing { incarnation, .. } | Claim::Activating { incarnation } = owned {
+            self.apply_first_entry_request(incarnation);
+        }
         if self.cas(owned, next) {
             return true;
         }
-        // Only Closing's false -> true request can interfere with Placing
-        // custody. Keep the acquisition through this one finite transition.
         if let Claim::Placing {
-            seq,
+            incarnation,
             host_requested: false,
         } = owned
         {
+            // Closing can only add the request bit. Keep custody across that
+            // finite transition and publish every already-observed request.
+            self.apply_first_entry_request(incarnation);
             return self.cas(
                 Claim::Placing {
-                    seq,
+                    incarnation,
                     host_requested: true,
                 },
                 next,
@@ -1509,7 +1570,6 @@ impl FirstEntryActivation {
 #[must_use = "first-entry placement custody must be placed or released"]
 pub struct FirstEntryPlacement {
     record: RecordRef,
-    seq: u32,
 }
 
 /// A service-queue take either carries ordinary host work or exclusive
@@ -1570,7 +1630,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> HostTransfer<'_, C> {
                         // endpoint token is still retained by this incarnation.
                         rec.handback
                             .store(Handback::Cancelled as u32, Ordering::Release);
-                        if rec.cas(claim, Claim::Host { seq }) {
+                        if rec.cas(claim, rec.ready_host_claim(seq)) {
                             return Some(self.record);
                         }
                     } else {
@@ -1583,7 +1643,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> HostTransfer<'_, C> {
                     cancelled: false,
                     ..
                 } if seq == self.seq => {
-                    if rec.cas(claim, Claim::Host { seq }) {
+                    if rec.cas(claim, rec.ready_host_claim(seq)) {
                         return Some(self.record);
                     }
                 }
@@ -1923,7 +1983,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         rec.handback
             .store(Handback::Service as u32, Ordering::Release);
         rec.claim
-            .store(Claim::Host { seq }.encode(), Ordering::Release);
+            .store(rec.ready_host_claim(seq).encode(), Ordering::Release);
         Ok(id)
     }
 
@@ -1961,9 +2021,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         transfer.publish()
     }
 
-    /// Take the executor's service head. An unadopted birth becomes activation
-    /// custody while its claim is still `Transferring`, before `Host` can be
-    /// observed by a concurrent terminal settlement.
+    /// Take the executor's service head. An unadopted birth is published with
+    /// its exact incarnation, then acquired as activation custody. Concurrent
+    /// current executors may win that custody; stale executors cannot take it.
     pub fn take_service_head_for_executor(&self, slot: SlotId) -> Option<ServiceHead> {
         let guard = self.slot_lock(slot, &SpinForever)?;
         let s = self.slot(slot);
@@ -2030,30 +2090,28 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         operation: FirstEntryOperation,
     ) -> Option<Claim> {
         let rec = self.record(record.id);
-        let current = rec.claim();
+        let current = Claim::FirstEntryHost {
+            incarnation: record.incarnation,
+        };
+        if rec.claim() != current {
+            return None;
+        }
         let owned = first_entry_transition(current, operation)?;
         #[cfg(all(test, not(feature = "loom")))]
         if operation == FirstEntryOperation::MintActivation {
             tests::pause_activation_mint(self as *const Self as usize, record);
         }
+        // The expected word contains the exact epoch. A stale caller cannot
+        // transiently acquire a replacement or consume its service delivery.
         if !rec.cas(current, owned) {
             return None;
         }
-        // The successful CAS pins this incarnation and its birth metadata.
-        // Authentication BEFORE it is merely a racy hint: another executor
-        // can retire the record and publish a replacement Host in between.
-        // No public token exists until validation under custody succeeds.
-        if rec.incarnation() == record.incarnation
-            && rec.is_unadopted_birth()
-            && (operation != FirstEntryOperation::AdmitPlacement || !rec.is_cancelled())
-        {
-            Some(owned)
-        } else {
-            // This may be a different birth. Restore its eligible Host claim
-            // through the acquired word, not through the stale RecordRef.
+        if operation == FirstEntryOperation::AdmitPlacement && rec.is_cancelled() {
             let _ = rec.release_first_entry_claim(owned);
-            None
+            return None;
         }
+        rec.apply_first_entry_request(record.incarnation);
+        Some(owned)
     }
 
     /// Retire an exclusively owned first-entry record. Refuse if any run
@@ -2064,24 +2122,21 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             return false;
         };
         let current = rec.claim();
-        let Some(Claim::Retiring { seq }) =
+        let Some(Claim::Retiring { incarnation }) =
             first_entry_transition(current, FirstEntryOperation::Retire)
         else {
             return false;
         };
-        if !rec.cas(current, Claim::Retiring { seq }) {
+        if !rec.cas(current, Claim::Retiring { incarnation }) {
             return false;
         }
-        self.finish_retiring_record(record.id, seq);
+        self.finish_retiring_record(record);
         true
     }
 
     pub fn claim_first_entry_placement(&self, record: RecordRef) -> Option<FirstEntryPlacement> {
-        let owned = self.acquire_first_entry(record, FirstEntryOperation::AdmitPlacement)?;
-        Some(FirstEntryPlacement {
-            record,
-            seq: owned.seq(),
-        })
+        self.acquire_first_entry(record, FirstEntryOperation::AdmitPlacement)?;
+        Some(FirstEntryPlacement { record })
     }
 
     pub fn place_first_entry(
@@ -2089,9 +2144,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         custody: FirstEntryPlacement,
     ) -> Result<HostPlacement, FirstEntryPlacement> {
         let from = Claim::Placing {
-            seq: custody.seq,
+            incarnation: custody.record.incarnation,
             host_requested: false,
         };
+        self.record(custody.record.id)
+            .apply_first_entry_request(custody.record.incarnation);
         if let Some(placement) = self.place_from_claim(custody.record.id, from) {
             return Ok(placement);
         }
@@ -2100,8 +2157,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         // debt, instead of exposing Host between release and requeue.
         let rec = self.record(custody.record.id);
         if let Some(slot) = rec.last_slot() {
+            rec.apply_first_entry_request(custody.record.incarnation);
             let requested = Claim::Placing {
-                seq: custody.seq,
+                incarnation: custody.record.incarnation,
                 host_requested: true,
             };
             if let Some(placement) = self
@@ -2117,7 +2175,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     pub fn release_first_entry_placement(&self, custody: FirstEntryPlacement) -> bool {
         self.live(custody.record).is_some_and(|rec| {
             rec.release_first_entry_claim(Claim::Placing {
-                seq: custody.seq,
+                incarnation: custody.record.incarnation,
                 host_requested: false,
             })
         })
@@ -2134,10 +2192,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// slot's driver, which is away on the host or about to drive it.
     /// Deliver the returned reschedule receipt when its vCPU is in the guest.
     pub fn requeue_on(&self, slot: SlotId, record: RecordId) -> Option<HostPlacement> {
-        let Claim::Host { seq } = self.record(record).claim() else {
+        let from = self.record(record).claim();
+        if !matches!(from, Claim::Host { .. } | Claim::FirstEntryHost { .. }) {
             return None;
-        };
-        self.requeue_from_claim(slot, record, Claim::Host { seq })
+        }
+        self.requeue_from_claim(slot, record, from)
     }
 
     fn requeue_from_claim(
@@ -2151,7 +2210,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             from,
             Claim::Queued {
                 slot,
-                seq: from.seq(),
+                seq: self.record(record).parked_sequence(from),
             },
         ) {
             return None;
@@ -2374,13 +2433,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
     }
 
-    fn finish_retiring_record(&self, id: RecordId, seq: u32) {
+    fn finish_retiring_record(&self, identity: RecordRef) {
+        let id = identity.id;
         let record = self.record(id);
         if record.has_object_operation() {
             return;
         }
         self.timers.cancel_record(id);
-        let current = Claim::Retiring { seq };
+        let current = Claim::Retiring {
+            incarnation: identity.incarnation,
+        };
         let Some(next) = first_entry_transition(current, FirstEntryOperation::FinishRetire) else {
             return;
         };
@@ -4016,15 +4078,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// ([`Self::take_resched`]).
     pub fn place_from_host(&self, record: RecordId) -> Option<HostPlacement> {
         let rec = self.record(record);
-        let Claim::Host { seq } = rec.claim() else {
+        let from = rec.claim();
+        if !matches!(from, Claim::Host { .. } | Claim::FirstEntryHost { .. }) {
             return None;
-        };
-        self.place_from_claim(record, Claim::Host { seq })
+        }
+        self.place_from_claim(record, from)
     }
 
     fn place_from_claim(&self, record: RecordId, from: Claim) -> Option<HostPlacement> {
         let rec = self.record(record);
-        let seq = from.seq();
+        let seq = rec.parked_sequence(from);
         let service = rec.needs_host() || rec.is_unadopted_birth();
         if let Some(home) = rec.home() {
             // The host believes its thread runs on its home slot: only that
@@ -4119,21 +4182,22 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         claimed: impl FnOnce(&ZoneRecord<C>),
     ) -> Placement {
         let rec = self.record(record);
-        let (Claim::Parked { seq }
-        | Claim::Queued { seq, .. }
-        | Claim::Host { seq }
-        | Claim::Transferring {
-            seq,
-            cancelled: false,
-            host_requested: false,
-        }
-        | Claim::Activating { seq }
-        | Claim::Placing {
-            seq,
-            host_requested: false,
-        }) = from
-        else {
-            return Placement::Lost;
+        let seq = match from {
+            Claim::Parked { seq }
+            | Claim::Queued { seq, .. }
+            | Claim::Host { seq }
+            | Claim::Transferring {
+                seq,
+                cancelled: false,
+                host_requested: false,
+            } => seq,
+            Claim::FirstEntryHost { .. }
+            | Claim::Activating { .. }
+            | Claim::Placing {
+                host_requested: false,
+                ..
+            } => rec.parked_sequence(from),
+            _ => return Placement::Lost,
         };
         let home = rec.home();
         let candidates = match home {
@@ -4560,19 +4624,28 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     return HostClaim::Deferred;
                 }
                 Claim::Host { .. } => return HostClaim::AlreadyHost,
+                Claim::FirstEntryHost { incarnation } => {
+                    return if incarnation == r.incarnation {
+                        HostClaim::AlreadyHost
+                    } else {
+                        HostClaim::Stale
+                    };
+                }
                 Claim::Placing {
-                    seq: current,
+                    incarnation,
                     host_requested,
                 } => {
-                    if seq.is_some_and(|wanted| wanted != current) {
+                    if incarnation != r.incarnation
+                        || seq.is_some_and(|wanted| wanted != rec.last_seq.load(Ordering::Acquire))
+                    {
                         return HostClaim::Stale;
                     }
-                    rec.handback.store(kind as u32, Ordering::Release);
+                    rec.host_wanted.publish(r.incarnation, kind);
                     if !host_requested
                         && !rec.cas(
                             claim,
                             Claim::Placing {
-                                seq: current,
+                                incarnation,
                                 host_requested: true,
                             },
                         )

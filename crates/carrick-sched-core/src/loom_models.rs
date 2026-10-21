@@ -132,7 +132,7 @@ fn release_races_closing_without_losing_custody() {
         closing.join().unwrap();
         assert!(released, "P1 release consumed custody after request CAS");
         assert!(
-            matches!(zone.record(record.id).claim(), Claim::Host { .. }),
+            matches!(zone.record(record.id).claim(), Claim::FirstEntryHost { .. }),
             "Closing has no eligible owner: {:?}",
             zone.record(record.id).claim()
         );
@@ -197,7 +197,10 @@ fn stale_admission(placement: bool) {
             assert_ne!(new.incarnation, old.incarnation);
         }
         stale.join().unwrap();
-        assert!(matches!(zone.record(old.id).claim(), Claim::Host { .. }));
+        assert!(matches!(
+            zone.record(old.id).claim(),
+            Claim::FirstEntryHost { .. }
+        ));
     });
 }
 #[test]
@@ -275,7 +278,7 @@ fn producer_closing_executor_and_second_birth_complete_once() {
             closing.join().unwrap();
             let state = zone.record(record.id).claim();
             assert!(
-                matches!(state, Claim::Host { .. } | Claim::Free),
+                matches!(state, Claim::FirstEntryHost { .. } | Claim::Free),
                 "Closing has no eligible or terminal record: {state:?}"
             );
             if !matches!(state, Claim::Free) {
@@ -401,7 +404,7 @@ fn closing_producer_executor_sleep_and_reuse_preserve_delivery() {
                     ServiceHead::Record(_) => panic!("birth escaped activation custody"),
                 }
             }
-            Claim::Host { .. } => finish(
+            Claim::FirstEntryHost { .. } => finish(
                 &zone,
                 zone.claim_current_first_entry_activation(record).unwrap(),
                 &deliveries,
@@ -446,7 +449,7 @@ fn stale_placement_releases_replacement_despite_its_closing_request() {
         }
         stale.join().unwrap();
         assert!(
-            matches!(zone.record(old.id).claim(), Claim::Host { .. }),
+            matches!(zone.record(old.id).claim(), Claim::FirstEntryHost { .. }),
             "rejected stale acquisition poisoned replacement custody"
         );
     });
@@ -496,7 +499,7 @@ fn closing_republishes_while_producer_and_executor_contend() {
                     ServiceHead::Record(_) => panic!("republished birth lost activation custody"),
                 }
             }
-            Claim::Host { .. } => finish(
+            Claim::FirstEntryHost { .. } => finish(
                 &zone,
                 zone.claim_current_first_entry_activation(record).unwrap(),
                 &deliveries,

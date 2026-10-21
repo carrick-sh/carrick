@@ -1676,8 +1676,8 @@ transfers use CAS and the WFI handshake uses a slot lock, not a Dekker pair.
 `closing_producer_executor_sleep_and_reuse_preserve_delivery` counts returned
 kick receipts and their consumption, while requiring every surviving queued
 WFI record to have owed or delivered wakeup debt. The replacement-Closing
-case also checks release of an internally rejected stale acquisition. The
-ten cases run through `just test-loom` and the existing CI loom job.
+case also checks that stale admission cannot poison replacement custody. All
+eleven cases run through `just test-loom` and the existing CI loom job.
 
 `stale_mint_cannot_consume_reused_service_head_delivery` adds a stronger P3
 RED control. A stale incarnation-1 call is suspended until an executor retires
@@ -1688,3 +1688,15 @@ delivery, and stale validation restores an unqueued Host record. There is no
 remaining delivery event. This fails at focused bound 3 even with validation
 under exclusive custody: eligibility alone is not delivery. The acquisition
 CAS must reject a different incarnation without taking its ownership.
+
+The repair encodes the full non-wrapping 60-bit incarnation in first-entry
+claim words (`FirstEntryHost`, `Placing`/requested, `Activating`, `Retiring`).
+Admission compares that exact word: a stale caller cannot acquire a new
+birth even transiently. Ordinary parked and queued states retain their
+slot/sequence encoding; the retained `last_seq` supplies that sequence when
+first-entry custody queues a record. The ABI hash includes the claim protocol
+version. Closing publishes a tagged intent, and the exclusive owner applies
+its handback reason before release/publication; a delayed old requester
+cannot overwrite a replacement's untagged handback. Placement release retains
+custody across the single request-bit transition. Fallback publication and
+its owed kick occur under the slot lock, returning a receipt to the adapter.
