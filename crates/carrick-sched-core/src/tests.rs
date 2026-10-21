@@ -376,9 +376,11 @@ impl MintPause {
                 |arrived| *arrived < count,
             )
             .unwrap();
+        let seen = *arrived;
+        drop(arrived);
         assert!(
             !timeout.timed_out(),
-            "mint arrivals timed out: {arrived}/{count}"
+            "mint arrivals timed out: {seen}/{count}"
         );
     }
 
@@ -401,12 +403,13 @@ pub(super) fn pause_activation_mint(table: usize, record: RecordRef) {
         let mut arrived = pause.arrived.lock().unwrap();
         *arrived += 1;
         pause.changed.notify_all();
-        let (_guard, timeout) = pause
+        let (guard, timeout) = pause
             .changed
             .wait_timeout_while(arrived, std::time::Duration::from_secs(5), |_| {
                 !pause.released.load(Ordering::Acquire)
             })
             .unwrap();
+        drop(guard);
         assert!(!timeout.timed_out(), "activation mint pause timed out");
     }
 }
