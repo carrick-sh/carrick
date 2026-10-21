@@ -544,3 +544,37 @@ fn stale_mint_cannot_consume_reused_service_head_delivery() {
         stale.join().unwrap();
     });
 }
+
+#[test]
+fn delayed_closing_cannot_overwrite_replacement_handback() {
+    model(|| {
+        let zone = zone();
+        let old = birth(&zone);
+        let custody = zone.claim_first_entry_placement(old).unwrap();
+        let closing_zone = zone.clone();
+        let closing = thread::spawn(move || {
+            closing_zone.claim_for_host(old, None, Handback::Control, &SpinForever)
+        });
+        let custody = zone.place_first_entry(custody).unwrap_err();
+        assert!(zone.release_first_entry_placement(custody));
+        finish(
+            &zone,
+            zone.claim_current_first_entry_activation(old).unwrap(),
+            &AtomicU32::new(0),
+        );
+        let replacement = birth(&zone);
+        assert_eq!(replacement.id, old.id);
+        closing.join().unwrap();
+        assert_eq!(
+            zone.record(replacement.id).handback(),
+            Some(Handback::Service),
+            "old Closing overwrote replacement handback after reuse"
+        );
+        finish(
+            &zone,
+            zone.claim_current_first_entry_activation(replacement)
+                .unwrap(),
+            &AtomicU32::new(0),
+        );
+    });
+}

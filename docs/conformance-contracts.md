@@ -1677,7 +1677,7 @@ transfers use CAS and the WFI handshake uses a slot lock, not a Dekker pair.
 kick receipts and their consumption, while requiring every surviving queued
 WFI record to have owed or delivered wakeup debt. The replacement-Closing
 case also checks that stale admission cannot poison replacement custody. All
-eleven cases run through `just test-loom` and the existing CI loom job.
+twelve cases run through `just test-loom` and the existing CI loom job.
 
 `stale_mint_cannot_consume_reused_service_head_delivery` adds a stronger P3
 RED control. A stale incarnation-1 call is suspended until an executor retires
@@ -1700,3 +1700,11 @@ its handback reason before release/publication; a delayed old requester
 cannot overwrite a replacement's untagged handback. Placement release retains
 custody across the single request-bit transition. Fallback publication and
 its owed kick occur under the slot lock, returning a receipt to the adapter.
+
+`delayed_closing_cannot_overwrite_replacement_handback` holds the old birth
+in Placing while Closing reads its word and incarnation. The producer then
+releases it, the executor retires it and a replacement reuses the index.
+The old requester resumes its untagged Control write before its failed CAS,
+overwriting the replacement's Service handback despite returning Stale.
+This is RED on the under-custody repair at focused bound 3; publishing tagged
+intent and applying payload only under exact owner custody preserves Service.
