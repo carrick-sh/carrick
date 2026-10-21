@@ -697,6 +697,56 @@ mod tests {
     }
 
     #[test]
+    fn partial_io_result_reaches_the_handler_without_restart_or_prefix_replay() {
+        use carrick_hal::SyscallTrap;
+
+        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+        let (process, context) = crate::hvpatch::process_context_for_tests(71_304);
+        dispatcher.bind_hvpatch_process(std::sync::Arc::new(process.clone()));
+        let kernel = std::sync::Arc::new(crate::vcpu_loop::KernelState::new(
+            dispatcher,
+            std::sync::Arc::new(crate::vcpu_loop::tests::EndpointTestSignalPump),
+            std::sync::Arc::new(crate::vcpu_loop::tests::EndpointTestSignalArrival),
+            Some(process),
+            None,
+        ));
+        let signal =
+            carrick_kernel::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGUSR1)
+                .unwrap();
+        let mut action = carrick_abi::LinuxSigaction::empty();
+        action.sa_handler = 0x5000;
+        action.sa_flags = carrick_abi::LINUX_SA_RESTART;
+        context.signal_authority().install_action(signal, action);
+        assert!(
+            context
+                .kernel()
+                .post_signal_to_task(context.task().key().id, signal, None)
+        );
+        let mut engine = crate::vcpu_loop::tests::CrashCaptureTestEngine::default();
+        engine.complete_syscall(7).unwrap();
+        crate::vcpu_loop::service_signals_threaded(
+            &kernel,
+            &context,
+            &mut engine,
+            carrick_hal::ThreadId::synthetic_for_tests(context.thread().key().tid.raw()),
+            0,
+            Some(7),
+            None,
+            Some(carrick_kernel::kernel::continuation::RestartDecision::Restart),
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(engine.completed_syscalls, [7]);
+        assert_eq!(engine.injected_signal_records.len(), 1);
+        assert_eq!(
+            engine.injected_signal_records[0].pending_syscall_retval,
+            Some(7)
+        );
+        assert!(!engine.injected_signal_records[0].restart_syscall);
+    }
+
+    #[test]
     fn sigstop_interrupts_every_owner_park_before_release_and_sigcont_allows_retry() {
         use carrick_kernel::kernel::continuation::{
             CarrierWaitService, ContinuationCapture, RestartClass, ZoneWait,
