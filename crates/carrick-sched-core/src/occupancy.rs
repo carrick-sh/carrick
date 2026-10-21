@@ -279,7 +279,8 @@ impl Occupancy {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(test)]
+#[cfg(not(feature = "loom"))]
 mod tests {
     extern crate std;
 
