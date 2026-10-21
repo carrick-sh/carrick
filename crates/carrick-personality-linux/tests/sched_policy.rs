@@ -66,3 +66,14 @@ fn existing_child_and_absent_pid_use_the_namespace_authority() {
         assert_eq!(serve_sched(SchedCall::RrGetInterval, &mut venue), expected);
     }
 }
+
+#[test]
+fn arm_affinity_routes_in_ring_and_x86_stays_unported() {
+    for nr in [122, 123] {
+        assert_ne!(
+            carrick_personality_linux::dispatch::route_aarch64(nr, 0),
+            Family::Unported
+        );
+        assert_eq!(route_x86(nr, 0), Family::Unported);
+    }
+}
