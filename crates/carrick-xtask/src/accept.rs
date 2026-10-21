@@ -266,18 +266,10 @@ pub const KVM_STEPS: &[StepSpec] = &[StepSpec {
     log_name: "01-kvm-tests.log",
 }];
 
-pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
-    StepSpec {
-        name: "test-kernel",
-        program: "just",
-        args: &["test-kernel"],
-        env: &[],
-        log_name: "01-test-kernel.log",
-    },
-    StepSpec {
-        name: "portable-tests",
-        program: "cargo",
-        args: &[
+// Keep the package/target selection identical for both ownership passes.
+macro_rules! linux_portable_test_args {
+    ($($harness_arg:literal),+ $(,)?) => {
+        &[
             "test",
             "--no-fail-fast",
             "-p",
@@ -328,9 +320,36 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
             "carrick-conformance-contract",
             "-p",
             "carrick-xtask",
-        ],
+            "--",
+            $($harness_arg),+
+        ]
+    };
+}
+
+pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
+    StepSpec {
+        name: "test-kernel",
+        program: "just",
+        args: &["test-kernel"],
+        env: &[],
+        log_name: "01-test-kernel.log",
+    },
+    StepSpec {
+        name: "portable-tests",
+        program: "cargo",
+        args: linux_portable_test_args!("--skip", "serial_host"),
         env: &[],
         log_name: "02-portable-tests.log",
+    },
+    // Match just test's process-global ownership policy without serializing
+    // ordinary tests. Retain the receipt name: baseline comparison unions
+    // same-name steps, so moving serial tests into this pass loses no history.
+    StepSpec {
+        name: "portable-tests",
+        program: "cargo",
+        args: linux_portable_test_args!("serial_host"),
+        env: &[("RUST_TEST_THREADS", "1")],
+        log_name: "03-portable-tests-serial-host.log",
     },
     StepSpec {
         name: "clippy-linux",
@@ -2188,6 +2207,7 @@ mod tests {
             vec![
                 "test-kernel",
                 "portable-tests",
+                "portable-tests",
                 "clippy-linux",
                 "fmt-check",
                 "lint-domains-source",
@@ -2248,6 +2268,168 @@ mod tests {
                 .contains(&"carrick-cli/platform-linux,carrick-cli/syscall-shim")
         );
         assert!(clippy.args.ends_with(&["--", "-D", "warnings"]));
+    }
+
+    #[test]
+    fn linux_portable_partitions_serial_host_without_losing_test_targets() {
+        let steps = host_steps(AcceptProfile::LinuxPortable);
+        let parallel_index = steps
+            .iter()
+            .position(|s| s.name == "portable-tests")
+            .unwrap();
+        let parallel = &steps[parallel_index];
+        assert!(
+            parallel.args.ends_with(&["--", "--skip", "serial_host"]),
+            "parallel portable tests must exclude process-global serial_host owners"
+        );
+        let serial = &steps[parallel_index + 1];
+        assert_eq!(
+            serial.name, parallel.name,
+            "retain baseline receipt identity"
+        );
+        assert_eq!(parallel.program, "cargo");
+        assert_eq!(serial.program, parallel.program);
+        assert!(serial.args.ends_with(&["--", "serial_host"]));
+        assert_eq!(serial.env, &[("RUST_TEST_THREADS", "1")]);
+        assert!(
+            parallel.env.is_empty(),
+            "ordinary tests retain harness parallelism"
+        );
+        let selection = &parallel.args[..parallel.args.len() - 3];
+        assert_eq!(selection, &serial.args[..serial.args.len() - 2]);
+        // Preserve the complete original cargo selection, including implicit
+        // integration and doc targets (no --lib/--bins narrowing).
+        let mut expected = vec!["test", "--no-fail-fast"];
+        for package in [
+            "carrick-el1",
+            "carrick-el1-linux",
+            "carrick-el1-abi",
+            "carrick-sched-core",
+            "carrick-fd-core",
+            "carrick-pipe-core",
+            "carrick-signal-core",
+            "carrick-kernel-example",
+            "carrick-x86",
+            "carrick-aarch64",
+            "carrick-abi",
+            "carrick-guest-mem",
+            "carrick-mmu-core",
+            "carrick-timer-core",
+            "carrick-inotify-core",
+            "carrick-hal",
+            "carrick-portable",
+            "carrick-host-linux",
+            "carrick-x86-cpl0-host",
+            "carrick-signal-linux",
+            "carrick-spec",
+            "carrick-observability",
+            "carrick-conformance-contract",
+            "carrick-xtask",
+        ] {
+            expected.extend(["-p", package]);
+        }
+        assert_eq!(selection, expected);
+        // Distinct argv/logs expose both passes under one receipt population.
+        // The host runner visits every step even after a failed parallel pass.
+        assert_ne!(parallel.log_name, serial.log_name);
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| s.name.starts_with("portable-tests"))
+                .count(),
+            2
+        );
+        let logs = steps
+            .iter()
+            .map(|s| s.log_name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(logs.len(), steps.len());
+    }
+
+    #[test]
+    fn linux_portable_split_preserves_baseline_population_and_failure_authority() {
+        let mut baseline: AcceptReceipt = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "timestamp": "test", "head": "test",
+            "clean_tree": true, "phase": "host", "profile": "linux-portable",
+            "overall": "PASS", "steps": [], "failures": []
+        }))
+        .unwrap();
+        let steps = host_steps(AcceptProfile::LinuxPortable)
+            .iter()
+            .filter(|s| s.name == "portable-tests")
+            .collect::<Vec<_>>();
+        assert_eq!(steps.len(), 2);
+        let parallel_log = "Running unittests src/lib.rs (target/debug/deps/carrick_el1_linux-abcdef)\ntest ordinary ... ok\ntest result: ok. 1 passed; 0 failed\n";
+        let serial_log = "Running unittests src/lib.rs (target/debug/deps/carrick_el1_linux-abcdef)\ntest serial_host_checkpoint ... ok\ntest result: ok. 1 passed; 0 failed\n";
+        let result = |spec: &StepSpec, log: &str, exit_code| {
+            let mut step = StepResult {
+                name: spec.name.into(),
+                command: format!("{} {}", spec.program, spec.args.join(" ")),
+                exit_code: Some(exit_code),
+                log_path: spec.log_name.into(),
+                duration_s: 0.0,
+                passed: exit_code == 0,
+                error: None,
+                failed_tests: vec![],
+                unitemized_failures: vec![],
+                started_tests: vec![],
+                finished_binaries: vec![],
+                unfinished_binaries: vec![],
+            };
+            populate_step_from_log(&mut step, log, &mut vec![]);
+            step
+        };
+        // The old receipt ran both populations in one invocation.
+        baseline
+            .steps
+            .push(result(steps[0], &format!("{parallel_log}{serial_log}"), 0));
+        assert_eq!(baseline.steps[0].started_tests.len(), 2);
+        let mut candidate = baseline.clone();
+        candidate.steps = vec![
+            result(steps[0], parallel_log, 0),
+            result(steps[1], serial_log, 0),
+        ];
+        assert_ne!(candidate.steps[0].command, candidate.steps[1].command);
+        let round_trip: AcceptReceipt =
+            serde_json::from_str(&serde_json::to_string(&candidate).unwrap()).unwrap();
+        assert_eq!(candidate, round_trip);
+        let diff = crate::ci_receipt::diff(&baseline, &candidate).unwrap();
+        assert!(diff.new.is_empty(), "{diff:?}");
+        assert!(diff.fixed.is_empty(), "{diff:?}");
+
+        candidate.steps.pop();
+        let diff = crate::ci_receipt::diff(&baseline, &candidate).unwrap();
+        assert_eq!(
+            diff.new,
+            ["missing:carrick_el1_linux::serial_host_checkpoint"]
+        );
+        candidate.steps.push(result(
+            steps[1],
+            &serial_log
+                .replace("... ok", "... FAILED")
+                .replace("result: ok", "result: FAILED")
+                .replace("1 passed; 0 failed", "0 passed; 1 failed"),
+            101,
+        ));
+        let diff = crate::ci_receipt::diff(&baseline, &candidate).unwrap();
+        assert!(
+            diff.new
+                .iter()
+                .any(|key| key == "test:portable-tests:carrick_el1_linux::serial_host_checkpoint"),
+            "{diff:?}"
+        );
+        candidate.steps[1] = result(
+            steps[1],
+            "Running unittests src/lib.rs (target/debug/deps/carrick_el1_linux-abcdef)\ntest serial_host_checkpoint ...",
+            101,
+        );
+        let diff = crate::ci_receipt::diff(&baseline, &candidate).unwrap();
+        assert!(
+            diff.new
+                .iter()
+                .any(|key| key.contains("unfinished:carrick_el1_linux")),
+            "{diff:?}"
+        );
     }
 
     #[test]
