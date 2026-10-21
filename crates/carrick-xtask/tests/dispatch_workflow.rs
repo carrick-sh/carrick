@@ -148,6 +148,7 @@ fn serial_host_workflow_edits_are_reported_without_push() {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::unwrap_used)] // Shared integration fixture, not a product entry point.
 fn foreground(case: &str) {
     static ACCOUNT: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _account = ACCOUNT.lock().unwrap_or_else(|e| e.into_inner());
