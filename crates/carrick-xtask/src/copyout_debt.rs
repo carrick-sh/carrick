@@ -24,6 +24,7 @@ const OWNER: &str = "crates/carrick-kernel/src/dispatch/copyout.rs";
 /// `write_bytes` is a pipe or buffer write, not guest memory.
 const DIRECT_METHODS: &[(&str, usize)] = &[
     ("write_bytes", 2),
+    ("write_bytes_raw", 2),
     ("write_struct", 2),
     ("write_struct_va", 2),
     ("write_va", 2),
@@ -74,6 +75,47 @@ struct DirectWrites {
 }
 
 impl DirectWrites {
+    fn call_group<'a>(
+        tokens: &'a [proc_macro2::TokenTree],
+        index: usize,
+    ) -> Option<&'a proc_macro2::Group> {
+        match tokens.get(index + 1) {
+            Some(proc_macro2::TokenTree::Group(group))
+                if group.delimiter() == proc_macro2::Delimiter::Parenthesis =>
+            {
+                Some(group)
+            }
+            Some(proc_macro2::TokenTree::Punct(first)) if first.as_char() == ':' => {
+                let Some(proc_macro2::TokenTree::Punct(second)) = tokens.get(index + 2) else {
+                    return None;
+                };
+                if second.as_char() != ':' {
+                    return None;
+                }
+                let mut angle_depth = 0usize;
+                for token in &tokens[index + 3..] {
+                    match token {
+                        proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '<' => {
+                            angle_depth += 1;
+                        }
+                        proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '>' => {
+                            angle_depth = angle_depth.checked_sub(1)?;
+                        }
+                        proc_macro2::TokenTree::Group(group)
+                            if angle_depth == 0
+                                && group.delimiter() == proc_macro2::Delimiter::Parenthesis =>
+                        {
+                            return Some(group);
+                        }
+                        _ => {}
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// syn leaves macro arguments (every `define_syscall!` handler) opaque.
     /// Scan call-shaped token runs and recurse into groups.
     fn scan_tokens(&mut self, tokens: proc_macro2::TokenStream) {
@@ -81,12 +123,9 @@ impl DirectWrites {
         for (index, token) in tokens.iter().enumerate() {
             match token {
                 proc_macro2::TokenTree::Ident(ident) => {
-                    let Some(proc_macro2::TokenTree::Group(group)) = tokens.get(index + 1) else {
+                    let Some(group) = Self::call_group(&tokens, index) else {
                         continue;
                     };
-                    if group.delimiter() != proc_macro2::Delimiter::Parenthesis {
-                        continue;
-                    }
                     let previous = index.checked_sub(1).and_then(|before| tokens.get(before));
                     let name = ident.to_string();
                     match previous {
@@ -96,8 +135,15 @@ impl DirectWrites {
                                 self.count += 1;
                             }
                         }
+                        Some(proc_macro2::TokenTree::Punct(punct)) if punct.as_char() == ':' => {
+                            let arguments = arity(group.stream());
+                            if arguments > 0 && method(&name, arguments - 1) {
+                                self.count += 1;
+                            }
+                        }
                         _ => {
-                            if helper(&name) {
+                            let arguments = arity(group.stream());
+                            if helper(&name) || (arguments > 0 && method(&name, arguments - 1)) {
                                 self.count += 1;
                             }
                         }
@@ -179,9 +225,11 @@ impl<'ast> Visit<'ast> for DirectWrites {
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let syn::Expr::Path(path) = &*node.func
             && let Some(last) = path.path.segments.last()
-            && helper(&last.ident.to_string())
         {
-            self.count += 1;
+            let name = last.ident.to_string();
+            if helper(&name) || (node.args.len() > 0 && method(&name, node.args.len() - 1)) {
+                self.count += 1;
+            }
         }
         visit::visit_expr_call(self, node);
     }
@@ -413,6 +461,19 @@ mod tests {
                 "define_syscall! { fn pipe2(this, cx, fd: u64) { \
                  (*cx.memory).write_bytes(a, &b)?; write_packed(memory, a, &b); \
                  if x { memory.write_bytes(a, &[0u8; 4]).is_err(); } } }"
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn raw_ufcs_and_generic_guest_writes_are_counted() {
+        assert_eq!(
+            count(
+                "fn f(memory: &mut M) { memory.write_bytes_raw(a, b)?; \
+                 GuestMemory::write_bytes(memory, a, b)?; } \
+                 define_syscall! { fn g(this, cx) { \
+                 write_struct::<LinuxStat>(cx.memory, a, &value)?; } }"
             ),
             3
         );
