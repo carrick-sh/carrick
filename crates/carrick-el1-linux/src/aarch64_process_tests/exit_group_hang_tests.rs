@@ -284,15 +284,34 @@ fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
     );
     // Consume each real host job and withdraw its actual Kernel thread before
     // publishing the exact retirement receipt, as the runtime exit path does.
-    for _ in members {
-        let running = scheduler
-            .try_take(&executor)
-            .unwrap()
-            .expect("woken member");
-        let member = members
-            .iter()
-            .find(|member| member.thread().key() == running.thread().key())
-            .unwrap();
+    let mut service_records = Vec::new();
+    for slot in [fixture.slot, slot] {
+        while let Some(ready) = fixture.zone.take_service_head(slot) {
+            service_records.push(ready);
+            assert!(service_records.len() <= members.len());
+        }
+    }
+    for member in members {
+        let running = if let Some(ready) = service_records.iter().find(|ready| {
+            fixture.zone.record(ready.id).identity().tid == member.thread().key().tid.raw() as u64
+        }) {
+            let running = scheduler
+                .take_zone(
+                    &executor,
+                    member.thread().key(),
+                    member.thread().execution_state().generation().unwrap(),
+                )
+                .unwrap()
+                .expect("woken service member");
+            fixture.zone.free_record(ready.id);
+            running
+        } else {
+            scheduler
+                .try_take(&executor)
+                .unwrap()
+                .expect("woken host member")
+        };
+        assert_eq!(running.thread().key(), member.thread().key());
         kernel.exit_thread(member, None).unwrap();
         let birth =
             carrick_kernel::kernel::host_birth_identity(member.task().key(), member.thread().key())
