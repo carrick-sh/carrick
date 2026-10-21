@@ -509,6 +509,7 @@ impl NetView<'_> {
     pub(in crate::dispatch) fn socket_error_from_open_file<M: CurrentMmMemory>(
         &self,
         open_file: crate::dispatch::fd_table::OpenFile,
+        source: super::SocketErrorSource,
         optval_addr: u64,
         optlen_addr: u64,
         memory: &mut M,
@@ -525,21 +526,21 @@ impl NetView<'_> {
                         crate::dispatch::OwnedCopyoutOperation::SocketError {
                             open_file,
                             lease,
+                            source,
                             optval_addr,
                             optlen_addr,
                         },
                     ));
                 }
             };
-        let mut open = crate::kernel::FileDescription::write_for_io(&open_file.description)
-            .ok_or(DispatchError::Errno(LINUX_ENOTSOCK))?;
-        let value = match &mut *open {
-            OpenDescription::InMemorySocket { base, socket } => base
-                .take_pending_socket_error()
+        let pending = self.take_socket_pending_error_from(&open_file);
+        let value = match source {
+            super::SocketErrorSource::InMemory(socket) => pending
+                .map(carrick_abi::LinuxErrno::get)
                 .unwrap_or_else(|| socket.take_so_error().unwrap_or(0)),
-            OpenDescription::HostSocket { host_fd, base, .. } => {
-                if let Some(error) = base.take_pending_socket_error() {
-                    error
+            super::SocketErrorSource::Host(host_fd) => {
+                if let Some(error) = pending {
+                    error.get()
                 } else {
                     let mut host_error = 0i32;
                     let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
@@ -562,9 +563,7 @@ impl NetView<'_> {
                     }
                 }
             }
-            _ => return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK)),
         };
-        drop(open);
         Ok(prepared.commit(&value.to_ne_bytes()))
     }
 }
@@ -1029,15 +1028,20 @@ impl<'a> NetView<'a> {
                         return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                     };
                     if level == LINUX_SOL_SOCKET && optname == LINUX_SO_ERROR {
-                        let socket = matches!(
-                            &*desc,
-                            OpenDescription::InMemorySocket { .. }
-                                | OpenDescription::HostSocket { .. }
-                        );
+                        let source = match &*desc {
+                            OpenDescription::InMemorySocket { socket, .. } => {
+                                Some(super::SocketErrorSource::InMemory(Arc::clone(socket)))
+                            }
+                            OpenDescription::HostSocket { host_fd, .. } => {
+                                Some(super::SocketErrorSource::Host(host_fd.clone()))
+                            }
+                            _ => None,
+                        };
                         drop(desc);
-                        if socket {
+                        if let Some(source) = source {
                             return this.socket_error_from_open_file(
                                 of,
+                                source,
                                 optval_addr,
                                 optlen_addr,
                                 memory,
