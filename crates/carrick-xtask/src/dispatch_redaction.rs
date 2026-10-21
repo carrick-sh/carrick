@@ -1,15 +1,13 @@
-//! Shared credential gate for publication and bounded command diagnostics.
+//! Credential masking for bounded scaler command diagnostics. No publication gate.
 use crate::ci_scaler::ScalerError;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
 
-pub(crate) const MAX_FILE_BYTES: u64 = 1024 * 1024;
-const MAX_OUTPUT_BYTES: u64 = 20 * MAX_FILE_BYTES;
-const REFUSAL: &str = "redaction gate refused sensitive or unsafe output";
-pub(crate) struct Gate {
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
+const REFUSAL: &str = "diagnostic redaction refused unsafe credential state";
+struct DiagnosticSecrets {
     secrets: Vec<String>,
 }
-impl Gate {
+impl DiagnosticSecrets {
     fn add(&mut self, value: &str) {
         if !value.is_empty() && !self.secrets.iter().any(|s| s == value) {
             self.secrets.push(value.to_owned());
@@ -59,7 +57,6 @@ impl Gate {
             "GH_TOKEN",
             "GITHUB_TOKEN",
             "AGENT_DIRECTOR_TOKEN",
-            "AGENT_WORKER_TOKEN",
         ] {
             if let Ok(value) = std::env::var(key) {
                 gate.add(&value);
@@ -106,47 +103,6 @@ impl Gate {
             Ok(())
         }
     }
-    pub(crate) fn absorb_provider_home(&mut self, home: &Path) -> Result<(), ScalerError> {
-        for relative in [
-            ".codex/auth.json",
-            ".gemini/antigravity-cli/antigravity-oauth-token",
-        ] {
-            let path = home.join(relative);
-            if !path.exists() {
-                continue;
-            }
-            let meta = std::fs::symlink_metadata(&path)?;
-            if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
-                return Err(ScalerError::Guard(REFUSAL));
-            }
-            self.add(&std::fs::read_to_string(path)?);
-        }
-        Ok(())
-    }
-    pub(crate) fn file(&self, path: &Path) -> Result<u64, ScalerError> {
-        let meta = std::fs::symlink_metadata(path).map_err(|_| ScalerError::Guard(REFUSAL))?;
-        if !meta.is_file() || meta.len() > MAX_OUTPUT_BYTES {
-            return Err(ScalerError::Guard(REFUSAL));
-        }
-        self.check(&std::fs::read(path).map_err(|_| ScalerError::Guard(REFUSAL))?)?;
-        Ok(meta.len())
-    }
-    pub(crate) fn directory(&self, path: &Path) -> Result<(), ScalerError> {
-        let meta = std::fs::symlink_metadata(path)?;
-        if !meta.is_dir() || meta.file_type().is_symlink() {
-            return Err(ScalerError::Guard(REFUSAL));
-        }
-        let mut total = 0;
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            self.check(entry.file_name().as_encoded_bytes())?;
-            total += self.file(&entry.path())?;
-            if total > MAX_OUTPUT_BYTES {
-                return Err(ScalerError::Guard(REFUSAL));
-            }
-        }
-        Ok(())
-    }
     pub(crate) fn diagnostic(&self, bytes: &[u8]) -> String {
         let text = String::from_utf8_lossy(bytes);
         let mut output = String::new();
@@ -185,7 +141,7 @@ fn token_shape(bytes: &[u8], prefix: &[u8], jwt: bool) -> bool {
 }
 /// Persist earlier-step secrets outside artifacts; the run captures them once.
 pub(crate) fn remember() -> Result<(), ScalerError> {
-    let gate = Gate::capture()?;
+    let gate = DiagnosticSecrets::capture()?;
     let path = crate::agent_runner::state()?.join("redaction-secrets.json");
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -198,7 +154,7 @@ pub(crate) fn remember() -> Result<(), ScalerError> {
     Ok(())
 }
 pub(crate) fn redact(bytes: &[u8]) -> String {
-    Gate::capture()
+    DiagnosticSecrets::capture()
         .map(|gate| gate.diagnostic(bytes))
         .unwrap_or_else(|_| "[REDACTED: credential state unavailable]".into())
 }
@@ -208,7 +164,7 @@ mod tests {
     fn incomplete_prefixes_in_binary_objects_are_not_credentials()
     -> Result<(), crate::ci_scaler::ScalerError> {
         assert!(
-            super::Gate::capture()?
+            super::DiagnosticSecrets::capture()?
                 .check(b"\0eyJ\0ghs_\0ghp_\0github_pat_\0")
                 .is_ok()
         );

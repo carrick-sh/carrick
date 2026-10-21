@@ -52,32 +52,16 @@ fn invoke(dir: &Path, program: &str, args: &[&str]) -> Result<(), ScalerError> {
     let result = execute(&mut command, &[], std::time::Duration::from_secs(120));
     if let Err(error) = result {
         if program == "git" && args.first() == Some(&"fetch") {
-            return Err(check_token(dir, TokenScope::Director)
-                .err()
-                .unwrap_or(error));
+            return Err(check_token(dir).err().unwrap_or(error));
         }
         return Err(error);
     }
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum TokenScope {
-    Director,
-    Worker,
-}
-
-pub(crate) fn check_token(root: &Path, scope: TokenScope) -> Result<(), ScalerError> {
-    let (repository, message) = match scope {
-        TokenScope::Director => (
-            "carrick-sh/agy-director",
-            "host/infra: AGENT_DIRECTOR_TOKEN rejected or expired, or GitHub access unavailable; check the Mac agent-secrets refresher and runner connectivity",
-        ),
-        TokenScope::Worker => (
-            "carrick-sh/carrick",
-            "host/infra: AGENT_WORKER_TOKEN rejected or expired, or GitHub access unavailable; check the Mac agent-secrets refresher and runner connectivity",
-        ),
-    };
+fn check_token(root: &Path) -> Result<(), ScalerError> {
+    let repository = "carrick-sh/agy-director";
+    let message = "host/infra: AGENT_DIRECTOR_TOKEN rejected or expired, or GitHub access unavailable; bootstrap requires read access to the private launcher repository";
     if !std::env::var("GH_TOKEN").is_ok_and(|token| !token.is_empty()) {
         return Err(ScalerError::Guard(message));
     }
@@ -92,8 +76,7 @@ pub(crate) fn check_token(root: &Path, scope: TokenScope) -> Result<(), ScalerEr
     Ok(())
 }
 
-/// All authenticated work ends before the job's 40-minute cap. The Mac
-/// supplies at least 45 minutes of token life when the job starts.
+/// Leave time for workflow reporting before the job's 40-minute cap.
 pub(crate) fn job_remaining(minutes: u64) -> Result<std::time::Duration, ScalerError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -108,7 +91,7 @@ pub(crate) fn job_remaining(minutes: u64) -> Result<std::time::Duration, ScalerE
     let seconds = started.saturating_add(minutes * 60).saturating_sub(now);
     if started > now || seconds == 0 {
         return Err(ScalerError::Guard(
-            "host/infra: dispatch token window exhausted; start a fresh job after the Mac agent-secrets refresh",
+            "host/infra: dispatch job time budget exhausted; start a fresh job",
         ));
     }
     Ok(std::time::Duration::from_secs(seconds))
@@ -316,7 +299,7 @@ fn extract(tool: &Tool, archive: &Path, bin: &Path) -> Result<(), ScalerError> {
 }
 
 fn bootstrap(root: &Path) -> Result<(), ScalerError> {
-    check_token(root, TokenScope::Director)?;
+    check_token(root)?;
     let state = state()?;
     private_dir(&state)?;
     crate::dispatch_redaction::remember()?;
@@ -440,7 +423,6 @@ pub fn run(root: &Path, args: Args) -> Result<(), ScalerError> {
         Action::Bootstrap => bootstrap(root),
         Action::Auth { event } => auth(&event),
         Action::Cleanup => {
-            crate::dispatch_worker::cleanup_agent_user()?;
             let state = state()?;
             match std::fs::symlink_metadata(&state) {
                 Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
