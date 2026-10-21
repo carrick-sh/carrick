@@ -499,8 +499,10 @@ fn first_entry_mint_witness(concurrent: bool) {
     for raw in 0..ZONE_SLOTS {
         let slot = SlotId::new(raw as u8);
         assert_eq!(zone.runnable_head(slot), None);
+        assert_eq!(zone.slot(slot).tail.load(Ordering::Acquire), NIL);
         assert!(zone.take_service_head_for_executor(slot).is_none());
     }
+    assert_eq!(zone.record(record.id).next.load(Ordering::Acquire), NIL);
 }
 
 #[test]
