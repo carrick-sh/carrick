@@ -337,16 +337,18 @@ fn host_and_control_share_the_only_affinity_mask() {
             thread.control_slot().affinity().words(),
             thread.affinity().words()
         );
-        struct NoResidency;
+        struct NoResidency(usize);
         impl carrick_core::affinity::AffinityNotifier for NoResidency {
             fn notify(&mut self, _: carrick_core::affinity::AffinityNotification) {
-                panic!("fixture has no running residency");
+                self.0 += 1;
             }
         }
+        let mut notifications = NoResidency(0);
         thread.control_slot().change_affinity(
             carrick_core::affinity::CpuAffinity::single(1),
-            &mut NoResidency,
+            &mut notifications,
         );
+        assert_eq!(notifications.0, 0);
         assert_eq!(thread.affinity().words(), &[2]);
     }
 }
