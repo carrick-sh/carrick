@@ -2463,6 +2463,7 @@ mod tests {
                             mm: 7,
                             file_table: 5,
                             generation: if mutation == 0 { 11 } else { 0 },
+                            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                             affinity: 0,
                             lifecycle_page: 0x1000,
                             control_slot: 0x2000,
