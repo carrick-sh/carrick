@@ -276,6 +276,27 @@ fn getsockname_and_getpeername_wait_for_an_owner_refused_copyout() {
         assert_eq!(family, LINUX_AF_UNIX as u16, "syscall {number}");
     }
 }
+
+#[test]
+fn sockaddr_addrlen_read_suspension_waits_before_copyout() {
+    let mut g = Guest::new();
+    let (left, _) = socketpair(&mut g);
+    for number in [nr::GETSOCKNAME.raw(), nr::GETPEERNAME.raw()] {
+        g.memory.seed(LEN_ADDR, &16u32.to_ne_bytes());
+        g.memory.seed(OUT, &[FILL; 16]);
+        let wait = g.memory.refuse_next_read();
+        assert_eq!(
+            g.call(number, [left as u64, OUT, LEN_ADDR, 0, 0, 0]),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            "syscall {number}: addrlen read suspension must retain its owner wait",
+        );
+        assert_eq!(g.memory.read_bytes(OUT, 16).unwrap(), [FILL; 16]);
+        assert_eq!(
+            g.call(number, [left as u64, OUT, LEN_ADDR, 0, 0, 0]),
+            DispatchOutcome::Returned { value: 0 },
+        );
+    }
+}
 #[test]
 fn time_and_resource_records_wait_for_an_owner_refused_copyout() {
     let mut g = Guest::new();
