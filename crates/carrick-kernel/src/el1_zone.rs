@@ -1007,6 +1007,7 @@ fn route_first_entry_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
         rec.is_unadopted_birth()
             && !rec.is_cancelled()
             && matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. })
+            && rec.handback() != Some(Handback::Activation)
     }) else {
         return false;
     };

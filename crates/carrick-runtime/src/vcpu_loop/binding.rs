@@ -7158,6 +7158,7 @@ mod tests {
                 page.state(entry.index()),
                 Some((entry.generation(), carrick_el1_abi::EntryState::Published))
             );
+            let mut activation_custody = None;
             if already_host {
                 assert_eq!(
                     zone.claim_for_host(
@@ -7178,9 +7179,19 @@ mod tests {
                 else {
                     panic!("first-entry handback was not queued");
                 };
-                assert_eq!(zone.take_service_head(activation_slot), Some(record));
-                // Pause here: the executor removed the record but has not yet
-                // completed first-entry adoption and retirement.
+                let Some(carrick_el1_abi::ServiceHead::FirstEntry(custody)) =
+                    zone.take_service_head_for_executor(activation_slot)
+                else {
+                    panic!("uninitialized service head did not yield activation custody");
+                };
+                assert_eq!(custody.record(), record);
+                assert_eq!(
+                    zone.record(record.id).handback(),
+                    Some(carrick_el1_abi::Handback::Activation)
+                );
+                // Hold the token here: this is the deterministic executor pause
+                // between queue removal and first-entry adoption.
+                activation_custody = Some(custody);
             }
             control.request_host_exit();
             page.publish_exit_wait(carrick_core_abi::EntryMmKey::from_raw(mm), 0x9900);
@@ -7198,7 +7209,11 @@ mod tests {
                     zone.record(record.id).claim(),
                     carrick_el1_abi::Claim::Host { .. }
                 ));
-                zone.free_record(record.id);
+                assert_eq!(
+                    zone.record(record.id).handback(),
+                    Some(carrick_el1_abi::Handback::Activation)
+                );
+                assert!(zone.free_first_entry_activation(activation_custody.take().unwrap()));
                 assert!(zone.live(record).is_none());
                 assert_eq!(zone.runnable_head(slot), None);
                 assert_eq!(zone.take_service_head(slot), None);

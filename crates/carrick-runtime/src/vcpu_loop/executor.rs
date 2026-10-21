@@ -1537,8 +1537,9 @@ impl From<carrick_kernel::kernel::RunQueueError> for NextError {
 fn adopt_born_record(
     scheduler: &Arc<Scheduler>,
     zone: &carrick_el1_abi::ZoneTables,
-    record: carrick_el1_abi::RecordRef,
+    custody: carrick_el1_abi::FirstEntryActivation,
 ) -> Result<bool, NextError> {
+    let record = custody.record();
     let Some(live) = zone.live(record) else {
         return Ok(false);
     };
@@ -1546,6 +1547,11 @@ fn adopt_born_record(
         return Ok(false);
     }
     let Some(key) = carrick_kernel::el1_zone::thread_key_of(record) else {
+        if !zone.release_first_entry_activation(custody) {
+            return Err(NextError::Fatal(
+                "first-entry activation could not release custody".into(),
+            ));
+        }
         return Ok(false);
     };
     // SAFETY: the stopped executor owns this Host handback or claimed service head.
@@ -1555,8 +1561,17 @@ fn adopt_born_record(
         .adopt_born_thread_at_first_entry(key, &frame.native)
         .map_err(NextError::Fatal)?
     {
-        zone.free_record(record.id);
+        if !zone.free_first_entry_activation(custody) {
+            return Err(NextError::Fatal(
+                "first-entry activation lost exclusive record custody".into(),
+            ));
+        }
         return Ok(true);
+    }
+    if !zone.release_first_entry_activation(custody) {
+        return Err(NextError::Fatal(
+            "first-entry activation could not release custody".into(),
+        ));
     }
     Ok(false)
 }
@@ -1630,7 +1645,9 @@ fn next_runnable<F: PersistentExecutor>(
         return Ok(None);
     }
     if let Some(record) = crate::vcpu_loop::zone::take_pending_adoption() {
-        if adopt_born_record(scheduler, zone, record)? {
+        if let Some(custody) = zone.claim_current_first_entry_activation(record)
+            && adopt_born_record(scheduler, zone, custody)?
+        {
             return Ok(scheduler.try_take(registration)?);
         }
         if let Some(running) = scheduler.adopt_zone_handback(registration, record)? {
@@ -1649,10 +1666,16 @@ fn next_runnable<F: PersistentExecutor>(
         // (`ExecutorKick::parking_spare`), so nothing waits there for it.
         return Ok(scheduler.try_take(registration)?);
     }
-    if let Some(record) = zone.take_service_head(slot) {
-        if adopt_born_record(scheduler, zone, record)? {
-            return Ok(scheduler.try_take(registration)?);
-        }
+    if let Some(service) = zone.take_service_head_for_executor(slot) {
+        let record = match service {
+            carrick_el1_abi::ServiceHead::FirstEntry(custody) => {
+                if adopt_born_record(scheduler, zone, custody)? {
+                    return Ok(scheduler.try_take(registration)?);
+                }
+                return Ok(None);
+            }
+            carrick_el1_abi::ServiceHead::Record(record) => record,
+        };
         if zone.live(record).and_then(|rec| rec.handback())
             != Some(carrick_el1_abi::Handback::Service)
         {

@@ -387,6 +387,9 @@ pub enum Handback {
     /// The kernel published a group stop while this operation was blocked.
     /// This is an owned handback reason, not a second job-control state.
     GroupStop = 8,
+    /// A first-entry executor has removed this birth from every queue and
+    /// exclusively owns activation through retirement.
+    Activation = 9,
 }
 
 impl Handback {
@@ -400,6 +403,7 @@ impl Handback {
             6 => Some(Self::Cancelled),
             7 => Some(Self::Service),
             8 => Some(Self::GroupStop),
+            9 => Some(Self::Activation),
             _ => None,
         }
     }
@@ -1375,6 +1379,26 @@ pub enum HostClaim {
     Stale,
 }
 
+/// Exclusive first-entry executor custody after a service-queue take.
+#[must_use = "activation custody must be released or retired"]
+pub struct FirstEntryActivation {
+    record: RecordRef,
+    prior_handback: u32,
+}
+
+impl FirstEntryActivation {
+    pub fn record(&self) -> RecordRef {
+        self.record
+    }
+}
+
+/// A service-queue take either carries ordinary host work or exclusive
+/// custody of an unadopted birth through its first-entry activation.
+pub enum ServiceHead {
+    Record(RecordRef),
+    FirstEntry(FirstEntryActivation),
+}
+
 /// Exclusive mutation authority between claiming a record and publishing
 /// host readiness. A deferred wake carries this token, never a bare index.
 #[must_use = "a host transfer must finish cleanup and publish or retire"]
@@ -1408,8 +1432,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> HostTransfer<'_, C> {
             // A service record carries scheduler custody through the host
             // handoff. Keep its interruption alongside that custody until
             // the executor consumes the record, instead of replacing it.
-            if rec.handback() != Some(Handback::Service)
-                && rec.host_wanted.take(self.record.incarnation) == Some(Handback::GroupStop)
+            if !matches!(
+                rec.handback(),
+                Some(Handback::Activation | Handback::Service)
+            ) && rec.host_wanted.take(self.record.incarnation) == Some(Handback::GroupStop)
                 && rec.has_object_operation()
             {
                 rec.handback
@@ -1815,6 +1841,142 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 .fetch_add(1, Ordering::Relaxed);
         }
         transfer.publish()
+    }
+
+    /// Take the executor's service head. An unadopted birth becomes activation
+    /// custody while its claim is still `Transferring`, before `Host` can be
+    /// observed by a concurrent terminal settlement.
+    pub fn take_service_head_for_executor(&self, slot: SlotId) -> Option<ServiceHead> {
+        let guard = self.slot_lock(slot, &SpinForever)?;
+        let s = self.slot(slot);
+        let record = RecordId::from_raw(s.head.load(Ordering::Acquire))?;
+        let rec = self.record(record);
+        let Claim::Queued { slot: owner, seq } = rec.claim() else {
+            return None;
+        };
+        if owner != slot || !self.needs_executor(slot, rec) {
+            return None;
+        }
+        let identity = self.record_ref(record);
+        let transfer = self.begin_host_transfer(identity, Claim::Queued { slot, seq })?;
+        self.remove_locked(&guard, record);
+        let prior_handback = rec.handback.load(Ordering::Acquire);
+        let first_entry = rec.is_unadopted_birth();
+        if first_entry {
+            rec.handback
+                .store(Handback::Activation as u32, Ordering::Release);
+        } else if rec.is_cancelled() && rec.has_object_operation() {
+            rec.handback
+                .store(Handback::Cancelled as u32, Ordering::Release);
+        }
+        drop(guard);
+        let published = transfer.publish()?;
+        if first_entry {
+            Some(ServiceHead::FirstEntry(FirstEntryActivation {
+                record: published,
+                prior_handback,
+            }))
+        } else {
+            if rec.handback() == Some(Handback::Service) {
+                self.counters
+                    .service_adoptions
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.counters
+                    .foreign_adoptions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Some(ServiceHead::Record(published))
+        }
+    }
+
+    /// Relinquish activation custody without retiring the record.
+    pub fn release_first_entry_activation(&self, custody: FirstEntryActivation) -> bool {
+        let record = custody.record;
+        self.live(record).is_some_and(|rec| {
+            rec.handback
+                .compare_exchange(
+                    Handback::Activation as u32,
+                    custody.prior_handback,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        })
+    }
+
+    /// Whether this exact live incarnation is held by a first-entry executor.
+    pub fn is_first_entry_activation(&self, record: RecordRef) -> bool {
+        self.live(record)
+            .is_some_and(|rec| rec.handback() == Some(Handback::Activation))
+    }
+
+    /// Authenticate executor-local custody of a current record that did not
+    /// come through a service queue. If a concurrent publisher linked it,
+    /// custody is refused and the record remains deliverable from that queue.
+    pub fn claim_current_first_entry_activation(
+        &self,
+        record: RecordRef,
+    ) -> Option<FirstEntryActivation> {
+        let rec = self.live(record)?;
+        if !rec.is_unadopted_birth() || !matches!(rec.claim(), Claim::Host { .. }) {
+            return None;
+        }
+        let prior_handback = rec.handback.load(Ordering::Acquire);
+        rec.handback
+            .compare_exchange(
+                prior_handback,
+                Handback::Activation as u32,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        let custody = FirstEntryActivation {
+            record,
+            prior_handback,
+        };
+        if !matches!(rec.claim(), Claim::Host { .. })
+            || self.slots.iter().any(|slot| {
+                let mut cursor = slot.head.load(Ordering::Acquire);
+                while cursor != NIL {
+                    if cursor == record.id.raw() {
+                        return true;
+                    }
+                    cursor = self.record(RecordId(cursor)).next.load(Ordering::Acquire);
+                }
+                false
+            })
+        {
+            let _ = self.release_first_entry_activation(custody);
+            return None;
+        }
+        Some(custody)
+    }
+
+    /// Retire an exclusively owned first-entry record. Refuse if any run
+    /// queue still links it; freeing linked storage would corrupt the queue.
+    pub fn free_first_entry_activation(&self, custody: FirstEntryActivation) -> bool {
+        let record = custody.record;
+        let Some(rec) = self.live(record) else {
+            return false;
+        };
+        if !matches!(rec.claim(), Claim::Host { .. })
+            || rec.handback() != Some(Handback::Activation)
+            || self.slots.iter().any(|slot| {
+                let mut cursor = slot.head.load(Ordering::Acquire);
+                while cursor != NIL {
+                    if cursor == record.id.raw() {
+                        return true;
+                    }
+                    cursor = self.record(RecordId(cursor)).next.load(Ordering::Acquire);
+                }
+                false
+            })
+        {
+            return false;
+        }
+        self.free_record(record.id);
+        true
     }
 
     /// Whether `record`'s affinity allows the guest CPU `slot` is bound to.
