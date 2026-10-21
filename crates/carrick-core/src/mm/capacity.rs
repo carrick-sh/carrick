@@ -761,6 +761,89 @@ mod tests {
         assert_eq!(diag.allocated_bytes, 0);
     }
 
+    #[repr(C, align(4096))]
+    struct PrefixSplitArena([u8; 4096]);
+
+    /// A 768-byte free hole starts on a 256-byte boundary. Reusing it for
+    /// (size=512, align=256) leaves a 224-byte prefix and no suffix.
+    fn prefix_split_fixture() -> (
+        std::boxed::Box<PrefixSplitArena>,
+        MetadataAllocatorCore,
+        *mut u8,
+        *mut u8,
+    ) {
+        let mut backing = std::boxed::Box::new(PrefixSplitArena([0; 4096]));
+        let base = backing.0.as_mut_ptr() as u64;
+        let mut allocator = MetadataAllocatorCore::new();
+        allocator
+            .admit_extent(base, 4096, ExtentKind::Bootstrap)
+            .unwrap();
+        let hole = allocator.allocate(736, 16).unwrap();
+        let following = allocator.allocate(96, 16).unwrap();
+        let _guard = allocator.allocate(96, 16).unwrap();
+        allocator.deallocate(hole, 16);
+        let (live, metrics) = allocator.allocate_with_metrics(512, 256);
+        let live = live.unwrap();
+        assert_eq!(live as u64, base + 256);
+        assert_eq!(following as u64, base + 800);
+        assert_eq!(metrics.splits_performed, 1);
+        assert!(metrics.bins_checked <= 2 && metrics.blocks_inspected <= 2);
+        (backing, allocator, live, following)
+    }
+
+    #[test]
+    fn prefix_only_split_keeps_following_physical_predecessor() {
+        let (backing, _allocator, live, following) = prefix_split_fixture();
+        // SAFETY: both payloads are live allocations in retained aligned RAM.
+        let predecessor =
+            unsafe { (*following.sub(HEADER_SIZE).cast::<BlockHeader>()).prev_phys_offset };
+        let live_header_offset = live as usize - HEADER_SIZE - backing.0.as_ptr() as usize;
+        assert_eq!(
+            predecessor as usize, live_header_offset,
+            "following block must name the live allocation, not its free prefix"
+        );
+    }
+
+    #[test]
+    fn prefix_only_split_payload_writes_cannot_corrupt_free_links() {
+        let (backing, mut allocator, live, following) = prefix_split_fixture();
+        allocator.deallocate(following, 16);
+        let replacement = allocator.allocate(256, 16).unwrap();
+        // Exercise ordinary caller data, exclusively inside the still-live
+        // 512-byte payload. Never forge or write an allocator header directly.
+        for word in 0..64 {
+            // SAFETY: the allocator issued this aligned 512-byte allocation;
+            // this caller has not freed it, and every write stays in bounds.
+            unsafe {
+                live.cast::<u64>()
+                    .add(word)
+                    .write(if word % 2 == 0 { 7 } else { 1 });
+            }
+        }
+        let head = allocator.bins[0];
+        if !head.is_null() {
+            let base = backing.0.as_ptr() as usize;
+            let address = head as usize;
+            assert!(address >= base && address <= base + 4096 - HEADER_SIZE);
+            assert_eq!(address % core::mem::align_of::<BlockHeader>(), 0);
+            // Inspect only the checked bin head; never dereference its links.
+            let (prev, next) = unsafe { ((*head).prev_free, (*head).next_free) };
+            assert!(
+                prev.is_null(),
+                "legal payload writes corrupted bin head: offset={:#x}, prev={:#x}, next={:#x}",
+                address - base,
+                prev as usize,
+                next as usize
+            );
+        }
+        let replacement_end = replacement as usize + 256;
+        let live_end = live as usize + 512;
+        assert!(
+            replacement_end <= live as usize || live_end <= replacement as usize,
+            "allocator returned overlapping live payloads"
+        );
+    }
+
     #[test]
     fn test_extent_admission_validation_and_overlap_rejection() {
         let mut alloc = MetadataAllocatorCore::new();
