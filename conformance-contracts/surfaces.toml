@@ -1697,3 +1697,6 @@ contracts = ["kernel.copyout.owner-refusal"]
 path = "crates/carrick-kernel/src/dispatch/copyout_tests.rs"
 contracts = ["kernel.copyout.owner-refusal"]
 
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/copyout_contention_tests.rs"
+contracts = ["kernel.copyout.owner-refusal"]
