@@ -224,18 +224,29 @@ fn finish(zone: &ZoneTables, custody: FirstEntryActivation, deliveries: &AtomicU
         0,
         "duplicate adoption/delivery"
     );
-    zone.record(record.id)
-        .generation
-        .store(1, Ordering::Release);
+    // Production graph adoption does not rewrite this zone birth's
+    // generation. Keep its eligibility bytes unchanged until retirement.
     assert!(
         zone.free_first_entry_activation(custody),
         "retirement refused"
     );
     assert_eq!(zone.record(record.id).claim(), Claim::Free);
-    assert!(
-        zone.slot(SLOT).head.load(Ordering::Acquire) == NIL,
+    assert_eq!(
+        zone.record(record.id).incarnation(),
+        record.incarnation + 1,
+        "retirement must advance the exact incarnation once"
+    );
+    assert_eq!(
+        zone.slot(SLOT).head.load(Ordering::Acquire),
+        NIL,
         "linked after free"
     );
+    assert_eq!(
+        zone.slot(SLOT).tail.load(Ordering::Acquire),
+        NIL,
+        "tail linked after free"
+    );
+    assert_eq!(zone.slot(SLOT).len.load(Ordering::Acquire), 0);
 }
 
 #[test]
