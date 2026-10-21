@@ -11,6 +11,11 @@ for admits it only after the controller re-vets that run
 the controller binary in `/root/carrick-ci/bin` carries this, so deploying it
 needs a controller restart, not a template rebuild.
 
+The same standing service also serves issue-label agent clones from template
+9000; see [dispatch-worker.md](dispatch-worker.md) for the four-clone budget,
+runner-independent credentials and VM-local leases. The KVM placement
+and its one-clone budget below stay the same.
+
 This is trusted-ref CI infrastructure for an experimental project, not an
 adversarial isolation boundary.
 
@@ -22,15 +27,16 @@ adversarial isolation boundary.
 | Clone storage | `local-lvm` (thin pool, `lvs` headroom) | `local` directory (PVE storage-status headroom) |
 | Bridge, addressing | `vmbr0`, LAN DHCP | `vmbr1` NAT, static `10.77.0.(VMID-200)/24`, resolver 1.1.1.1 |
 | Template 300 and each clone | 2 vCPU, 4 GiB, 64 GiB | 8 vCPU, 16 GiB, 100 GiB |
-| VMs the token must not touch | 105 | 101-104 (agent workers), 9000 (worker template) |
+| VMs the token must not touch | 105 | 101-104 (agent workers); 9000 is licensed for agent clones after dispatch cutover |
 | KSM page merging | allowed (PVE default) | off (`allow-ksm: 0` on template 300, inherited by clones, checked before each boot) |
 
 Selection is by `/etc/hostname` and fails closed: an unknown host is refused,
 never treated as Willow. Both sites use pool `carrick-ci`, template VMID 300
-and clone VMIDs 308-349. `--max-concurrency` stays 1. Contabo has 48 threads,
-and the agent workers already hold 40 vCPU and 96 GiB. The 80% CPU admission
+and clone VMIDs 308-349. `--max-concurrency` stays 1. Contabo has 48 threads. Before dispatch cutover, the four static agent
+workers hold 40 vCPU and 96 GiB; agent clones must also pass headroom
+admission until those workers are retired. The 80% CPU admission
 ceiling remains an additional admission check; it is not cross-VM isolation.
-The physical-host lease below serializes gates, clones and oracle phases.
+Each VM serializes its own builds, gates and oracle phases with a local lease.
 
 On Contabo, clones sit on the private NAT bridge, which they share with the
 agent workers 10.77.0.11-14 (which hold codex and gh credentials). There is no
@@ -187,154 +193,30 @@ Willow's "forward over SSH stdin, never write it on the host", because a
 standing service must survive reboots. See
 [the security review](willow-pilot-security-review.md#contabo-standing-credential).
 
-## Physical-host lease (owner-applied, #565)
+## VM-local leases (owner decision #639)
 
-**These steps are not applied by the PR or by workers.** Drain the controller,
-clones, worker builds/gates and oracle phases before installing or replacing the
-broker, its binary, keys or lock file. The four workers remain CCD-pinned;
-there is no dedicated quiet CCD (#564 owner decision).
+[Owner decision #639](https://github.com/carrick-sh/carrick/issues/639)
+supersedes the physical-host broker design from #565. Leases are per VM,
+never the whole hypervisor. The standing controller takes no shared or
+exclusive physical-host lock for either KVM or agent clones. Each clone runs
+its build/test work under its local lease. A local `gate` lease excludes
+other local work; it does not promise a quiet physical host or isolate other VMs.
 
-`just lease carrick` shares the physical lock; `gate` and `docker` exclude all
-other leases. The broker holds a real flock on an existing regular file at
-`/run/carrick/host-lease.lock` (never `O_CREAT`) for the SSH session lifetime.
-Requests are bounded JSON on stdin (`mode`, `wait_ms`); stdout is `waiting` then
-`acquired` (or `waiting` then `timeout` on wait expiry), or just `acquired` when
-uncontended. Invalid requests, excess waits, timeouts and transport failures
-exit nonzero, never skip or use a local fallback. One `HOST_LEASE_WAIT_LIMIT`
-(one hour) bounds admission; the broker's initial request and client transport
-validation deadlines are five seconds.
+The owner disabled `/etc/carrick/host-lease.toml` on ctb-w1..w4 on
+2026-10-18. With no broker config, `HostLease` selects the VM-local lock.
+The owner also retires that config from VM 110 and the templates, the
+`carrick-lease` broker account, its authorized keys and sshd drop-in. Workers
+must not perform those administrative changes or reinstall the broker.
+The generic broker implementation remains available for separately configured
+hosts; it is not part of Contabo clone custody.
 
-### Host installation (root on carrick-ctb)
-
-1. Install a reviewed Linux `carrick-xtask` at
-   `/usr/local/libexec/carrick-xtask`, owned root:root, mode 0755.
-   Create a dedicated account, with no password login, sudo or supplementary
-   groups: `useradd --system --create-home --home-dir /var/lib/carrick-lease
-   --shell /bin/sh carrick-lease`. A valid shell is needed for sshd's forced
-   command; it does not grant an interactive login with the restricted key.
-   Follow the site's sshd/PAM policy for key-only system accounts.
-2. Install `/etc/tmpfiles.d/carrick-host-lease.conf`:
-
-   ```text
-   d /run/carrick 0750 root carrick-lease -
-   f /run/carrick/host-lease.lock 0660 carrick-lease carrick-lease -
-   ```
-
-   Run `systemd-tmpfiles --create /etc/tmpfiles.d/carrick-host-lease.conf`.
-   The directory is not writable by the broker account: it cannot replace the
-   lock inode. The broker requires an existing regular file and does not create
-   or chmod the lock. **Never unlink or replace a live lock**; tmpfiles `f`
-   preserves it. The root controller opens this exact path directly, independent
-   of VM client configuration.
-3. Generate a separate Ed25519 key **on each worker/oracle**, not on a CI clone,
-   with no passphrase for unattended gates. Transfer only the public keys to
-   the host. Keep each private key readable only by the VM's gate user
-   (for example root:carrick 0640 in root-owned `/etc/carrick`).
-4. Use a root-owned authorized-key file, not one the broker account can edit,
-   e.g. `/etc/ssh/authorized_keys/carrick-lease`, and add each public key as
-   one line (substitute its verified public key):
-
-   ```text
-   restrict,from="10.77.0.0/24",command="/usr/local/libexec/carrick-xtask host-lease broker" ssh-ed25519 PUBLIC_KEY worker-name
-   ```
-
-   `restrict` disables pty, agent/X11/TCP forwarding and user rc execution.
-   The broker ignores `SSH_ORIGINAL_COMMAND`: it cannot execute a supplied
-   command or select a lock path from client input. Add defense in depth in a
-   reviewed sshd drop-in (do not broaden existing access or firewall policy):
-
-   ```text
-   Match User carrick-lease
-       AuthorizedKeysFile /etc/ssh/authorized_keys/%u
-       AuthenticationMethods publickey
-       PasswordAuthentication no
-       KbdInteractiveAuthentication no
-       DisableForwarding yes
-       PermitTTY no
-       PermitUserRC no
-       ForceCommand /usr/local/libexec/carrick-xtask host-lease broker
-       ClientAliveInterval 5
-       ClientAliveCountMax 3
-   Match all
-   ```
-
-   Validate `sshd -t` before reloading sshd. Verify no other authorized key
-   source or authentication mechanism admits this account. Keep the current
-   administration connection open. No worker applies these changes.
-5. Deploy the updated standing-controller binary and restart it only after
-   draining its active clones. After trusted-ref and resource admission checks
-   pass, it acquires `gate` immediately before `ledger.reserve`, retains it
-   through clone POST, boot, execution, recovery and teardown, and releases on
-   any non-reserving path or once every ledger row is destroyed. An idle
-   controller holds no lease. Active-ledger recovery uses a zero-wait try: if
-   contended, it refuses new admission, reconciles immediately to reap/quarantine
-   surviving clones without booting unstarted ones, and retries on the next pass.
-   Lease contention backs off without terminating the standing controller.
-   Willow's admission is unchanged.
-
-### VM client installation (owner/director)
-
-Install `scripts/ci/contabo-host-lease.toml` at
-`/etc/carrick/host-lease.toml` on **every worker and oracle VM**. Provision its
-private key and `/etc/carrick/host-lease.known_hosts`; verify the host key
-fingerprint through the existing trusted administration channel, never trust
-an unauthenticated `ssh-keyscan` alone. All three files and their directory
-must be protected from unrelated users. The client disables ambient SSH
-configuration, multiplexing, agent use and forwarding, and requires the pinned
-host key. It uses the existing `just lease`, `accept`, `impact`, `fixtures
-restore`/`prepare`, and `target-prune` (`try_exclusive`) entry points.
-Build commands needing isolation must also run under `just lease carrick`.
-The lease is cooperative: unwrapped builds are not stopped by flock.
-
-`CARRICK_HOST_LEASE_CONFIG` selects an explicit configuration file (missing or
-malformed files fail). With no site file, other hosts retain local flock.
-`CARRICK_HOST_LEASE_PATH` cannot override a configured broker. Do not distribute
-the VM config or SSH private key to JIT clones: their controller already owns
-the exclusive physical lease and their firewall forbids access to the broker.
-They keep the existing local lease for their inner gate and nested signed-run
-semantics.
-
-Checkout admission still comes **before** host admission; no lease holder may
-acquire a remote checkout lock or upgrade `carrick` to `gate`/`docker`. Nested
-commands authenticate the same local validation capability and workload scope
-and reuse one SSH session. A `gate` may contain either mode without downgrading;
-`docker` may only contain `docker`, and `carrick` only `carrick`.
-
-### Failure model and qualification
-
-EOF or a killed broker/SSH connection releases flock. During contention the
-broker observes stdin closure rather than waiting out the hour. The supervisor
-spawns `ssh` in its own session (`setsid`) so group-directed signals to the
-supervisor's process group do not drop broker custody before the five-second
-workload cleanup completes. Lost client connections cancel supervised work and
-report a failed run; the client's keepalive window (`ServerAliveInterval=2`,
-`ServerAliveCountMax=3` = 6 s) is strictly shorter than the server's
-(`ClientAliveInterval 5`, `ClientAliveCountMax 3` = 15 s) minus the five-second
-cleanup limit (`6 s < 15 s - 5 s = 10 s`). This is not a partition-proof fencing
-service: the remote lock may release before cancellation finishes, and a
-controller crash releases its in-process lease while a clone could still be
-running. Drain/reconcile surviving clones before admitting manual gates after a
-controller failure. Do not claim crash-proof quietness or adversarial isolation.
-Remote supervised cleanup on Linux requires procfs child enumeration to exclude
-the custody SSH process from workload cancellation; unavailable enumeration
-fails the existing bounded cleanup explicitly. Remote custody is not supported
-by the Darwin guardian; macOS continues to use its local lease.
-
-The portable `host_lease_broker` integration target runs the actual broker
-binary over local stdio (the client transport wrapper execs that binary, never
-synthesizes replies). It covers all shared/exclusive pairs, a waiting second
-client proceeding after EOF/SIGKILL, bounded contention, disconnected waiters,
-single-session nesting/no upgrade, malformed config and connection-loss
-cancellation. It does not claim a deployed two-VM witness.
-
-After owner installation, qualify from two VMs: hold
-`just lease gate /bin/sleep 30` on one; on another run
-`just lease docker /bin/echo admitted` and observe waiting then admission.
-Repeat with the first VM's exact SSH-holder PID killed, and verify nonzero
-holder status plus second-client admission. Repeat while a controller-owned
-clone is active (worker/oracle must wait until destruction), and verify an idle
-controller no longer excludes the oracle. Record exact binary hashes, PIDs and
-results on #565 before claiming physical-host acceptance.
+The [agent dispatch provider](dispatch-worker.md) shares the existing ledger,
+VMID pool, admission checks, assignment re-vetting, deadlines and destruction
+path with `willow-kvm`. Its template is VM 9000, with 8 vCPU and 20 GiB per
+clone and at most four live agent clones. KVM capacity is counted separately.
+Clones are destroyed after one job, including failed or timed-out jobs. The
+owner deploys the controller and verifies the live trial; portable tests alone
+do not establish deployed acceptance.
 
 ## Debugging
 

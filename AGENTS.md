@@ -147,15 +147,13 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   hour), never skips. `CARRICK_HOST_LEASE_PATH` changes the lock file for tests;
   every participant on a gate host must use the same path. Never unlink a live
   lock file.
-- **Contabo is one physical lease domain** (#565), not one per VM.
-  Workers and oracle use `/etc/carrick/host-lease.toml` to reach the restricted
-  SSH broker on `10.77.0.1`; the standing controller holds the same
-  `/run/carrick/host-lease.lock` in-process before cloning through destruction,
-  releasing when idle. CI clones keep their inner local lease (no recursive
-  remote exclusive acquisition). Configured broker failure never falls back to
-  a VM-local lock. Connection loss cancels supervised work and fails the run.
-  Host/user/key/tmpfiles installation is **owner-applied only**:
-  [Contabo setup](docs/ci/contabo-kvm.md#physical-host-lease-owner-applied-565).
+- **Contabo leases are per VM, never the whole hypervisor** (owner decision
+  [#639](https://github.com/carrick-sh/carrick/issues/639), supersedes #565).
+  KVM and agent clones use their in-VM lease; the standing controller takes no
+  shared or exclusive physical-host custody. Broker config and its restricted
+  SSH account are retired by the owner. Never restore a worker's disabled
+  `/etc/carrick/host-lease.toml` to work around a test. See
+  [Contabo setup](docs/ci/contabo-kvm.md#vm-local-leases-owner-decision-639).
 - **Lock order:** remote-accept checkout lock → host lease → build/test work.
   No host-lease holder may acquire a remote checkout lock; never upgrade a
   shared lease into a gate/Docker lease; nested signed runs reuse the gate's
