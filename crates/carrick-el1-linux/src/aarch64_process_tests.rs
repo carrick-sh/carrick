@@ -359,6 +359,14 @@ impl ForkStockCrossing for TestStockCrossing {
                 ) {
                     return Err(NativeProcessError::Invalid);
                 }
+                for control in controls.iter() {
+                    // SAFETY: these leaked fixture controls share one host/guest alias.
+                    unsafe {
+                        control.publish_affinity_aliases(carrick_guest_arch::GuestVa::new(
+                            core::ptr::from_ref(control).expose_provenance() as u64,
+                        ));
+                    }
+                }
                 *self.pending_loan.lock().unwrap() = req.admit_loan(
                     child_base,
                     parent_base,
@@ -532,6 +540,15 @@ impl Fixture {
             )
             .unwrap(),
         );
+        control.initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(&[
+            leader.affinity
+        ]));
+        // SAFETY: this fixture retains the control at its identity-mapped address.
+        unsafe {
+            control.publish_affinity_aliases(carrick_guest_arch::GuestVa::new(
+                core::ptr::from_ref(control).expose_provenance() as u64,
+            ));
+        }
 
         let region_box = Box::new(crate::mm_portal::test_support::Region::new());
         let region = Box::leak(region_box);
