@@ -3442,6 +3442,38 @@ fn signal_restart_is_derived_from_captured_kernel_action_not_event_input() {
 }
 
 #[test]
+fn restart_nointr_restarts_even_when_the_handler_lacks_sa_restart() {
+    let (_kernel, context) = bootstrap(153_691);
+    let generation = publish(&context, 0x706);
+    let signal = crate::kernel::LinuxSignal::for_signal_number(10).expect("SIGUSR1");
+    let mut action = carrick_abi::LinuxSigaction::empty();
+    action.sa_handler = 0x1234;
+    context.signal_authority().install_action(signal, action);
+    context
+        .signal_authority()
+        .enqueue_thread_standard(signal, None);
+    let continuation = BlockedContinuation::from_zone_park(
+        ContinuationCapture::new(
+            &context,
+            generation,
+            request(80),
+            RestartClass::RestartNoIntr,
+        )
+        .expect("capture"),
+        ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1),
+        None,
+    );
+    let result = continuation
+        .resume(ContinuationEvent::Signal, &context)
+        .expect("signal completion");
+    assert_eq!(result.restart(), RestartDecision::Restart);
+    assert_eq!(
+        result.completion,
+        ContinuationCompletion::Errno(LINUX_EINTR)
+    );
+}
+
+#[test]
 fn reserved_signal_keeps_exact_action_when_opposite_restart_signal_arrives_before_resume() {
     let (_kernel, context) = bootstrap(153_692);
     let generation = publish(&context, 0x707);

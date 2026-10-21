@@ -2585,14 +2585,21 @@ impl BlockedContinuation {
                             mqueue.cancel();
                         }
                     }
-                    let restart = if family != ContinuationFamily::WaitOnSignals
-                        && !partial_write_progress
-                        && restart_class != RestartClass::Never
-                        && action_requests_restart
+                    let restart = if family == ContinuationFamily::WaitOnSignals
+                        || partial_write_progress
                     {
-                        RestartDecision::Restart
-                    } else {
                         RestartDecision::NoRestart
+                    } else {
+                        match restart_class {
+                            RestartClass::RestartNoIntr => RestartDecision::Restart,
+                            RestartClass::RestartSyscall if action_requests_restart => {
+                                RestartDecision::Restart
+                            }
+                            RestartClass::Never
+                            | RestartClass::RestartSyscall
+                            | RestartClass::RestartNoHand
+                            | RestartClass::RestartBlock => RestartDecision::NoRestart,
+                        }
                     };
                     let completion = if family == ContinuationFamily::BlockingWrite {
                         let offset = match &self.state().detail {
