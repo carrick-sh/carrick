@@ -1983,3 +1983,50 @@ fn idle_resched_keeps_an_affinity_excluded_home_record_queued() {
         assert!(!loaded.linux.has_pending_host_work());
     }
 }
+
+#[test]
+fn switched_thread_affinity_exclusion_migrates_without_a_tick() {
+    let zone = zone();
+    let other = SlotId::new(4);
+    host_publish(&zone, SLOT, MM, Some(1), 3);
+    host_publish(&zone, other, MM, Some(0), 3);
+    zone.enter_guest(SLOT);
+    zone.enter_guest(other);
+    assert!(zone.enter_idle(other, false));
+    let control = carrick_personality_linux::abi::thread::ThreadControlSlot::new();
+    control.initialize_affinity(carrick_core::affinity::CpuAffinity::all(2));
+    // SAFETY: this stack control outlives the record and both scheduler slots.
+    let source =
+        unsafe { carrick_sched_core::AffinitySource::from_authority(control.affinity_authority()) };
+    let mut id = identity(202);
+    id.affinity_source = source;
+    let record = zone.alloc_record(id).unwrap();
+    zone.requeue_preempted(SLOT, record);
+    assert_eq!(zone.switch_in(SLOT).unwrap().record, record);
+    struct NoHostResidency;
+    impl carrick_core::affinity::AffinityNotifier for NoHostResidency {
+        fn notify(&mut self, _: carrick_core::affinity::AffinityNotification) {}
+    }
+    control.change_affinity(
+        carrick_core::affinity::CpuAffinity::single(0),
+        &mut NoHostResidency,
+    );
+    let task = task_for(202);
+    let mut cpu = FakeCpu::default();
+    let before = cpu.now;
+    let mut frame = TrapFrame::default();
+    let action = Sched {
+        zone: &zone,
+        slot: SLOT,
+        task: &task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters: counters(),
+        handoff: None,
+    }
+    .interrupt(&mut frame, ETIMEDOUT_RESULT);
+    assert_eq!(action, carrick_el1_abi::Action::Idle);
+    assert_eq!(zone.slot(SLOT).current(), None);
+    assert_eq!(zone.switch_in(other).unwrap().record, record);
+    assert_eq!(cpu.now, before);
+}
