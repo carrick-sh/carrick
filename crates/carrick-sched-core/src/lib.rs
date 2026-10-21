@@ -3549,6 +3549,22 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         })
     }
 
+    /// After publishing a mask, prompt an exact EL1-owned running record.
+    /// Pair with the post-OnCpu fence in the loader: either this reader sees
+    /// the running claim, or admission sees the new mask before loading it.
+    pub fn affinity_change_effects(&self, reference: RecordRef, effects: &mut WakeEffects) {
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let Some(record) = self.live(reference) else { return };
+        let (Claim::OnCpu { slot, .. } | Claim::OnCpuRequested { slot, .. }) = record.claim() else {
+            return;
+        };
+        if !record.allows_cpu(self.slot(slot).cpu.load(Ordering::Acquire))
+            && record.incarnation() == reference.incarnation
+        {
+            effects.request_reschedule(slot);
+        }
+    }
+
     /// EL1 preempts the running thread of `slot` into `record` (from
     /// [`Self::current_or_new`], its context already saved): it becomes
     /// runnable at the tail of the slot's run queue, to resume with its

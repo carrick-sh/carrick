@@ -428,6 +428,18 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     fn load(&mut self, frame: &mut TrapFrame, switched: SwitchedIn) -> LoadResult {
         let (zone, slot) = (self.zone, self.slot);
         let rec = zone.record(switched.record);
+        // Paired with the affinity writer's claim inspection: no admission
+        // may miss both the narrowed mask and the exact running-slot prompt.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        if zone.current_affinity_excludes_cpu(slot) {
+            // The frame still belongs to the previous task. Requeue the
+            // target's saved context without saving these old registers.
+            zone.unswitch(slot, switched.record);
+            let mut effects = WakeEffects::default();
+            zone.migrate_queued(slot, &mut effects);
+            self.send_sgis(&effects);
+            return LoadResult::NeedsHost;
+        }
         if !self.enter_space(rec.identity().mm) {
             zone.unswitch(slot, switched.record);
             return LoadResult::NeedsHost;
