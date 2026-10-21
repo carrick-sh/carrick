@@ -306,7 +306,12 @@ fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Res
 pub(crate) fn private_environment(command: &mut Command) {
     command
         .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin");
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        // Empty values override Cargo configuration, including repository config.
+        // No compiler-cache service is part of the agent execution boundary.
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
+        .env("CARRICK_SCCACHE", "0");
 }
 
 fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
@@ -1387,6 +1392,54 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     #[test]
+    fn worker_disables_compiler_servers_for_every_runner_step() {
+        let documents = yaml_rust2::YamlLoader::load_from_str(include_str!(
+            "../../../.github/workflows/dispatch-worker.yml"
+        ))
+        .unwrap();
+        let worker = &documents[0]["jobs"]["worker"];
+        let environment = &worker["env"];
+        for key in [
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            "SCCACHE_SERVER_UDS",
+        ] {
+            assert_eq!(environment[key].as_str(), Some(""), "{key}");
+        }
+        assert_eq!(environment["CARRICK_SCCACHE"].as_str(), Some("0"));
+        assert_eq!(environment["SCCACHE_DISABLE"].as_str(), Some("1"));
+        assert_eq!(environment["SCCACHE_SERVER_PORT"].as_str(), Some("0"));
+        let steps = worker["steps"].as_vec().unwrap();
+        let admission = steps[0]["run"].as_str().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let pgrep = temp.path().join("pgrep");
+        std::fs::write(&pgrep, "#!/bin/sh\nexit \"$PGREP_RESULT\"\n").unwrap();
+        std::fs::set_permissions(&pgrep, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (result, admitted) in [("0", false), ("1", true), ("2", false)] {
+            let output = Command::new("/bin/sh")
+                .args(["-eu", "-c", admission])
+                .env_clear()
+                .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+                .env("PGREP_RESULT", result)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.success(), admitted, "pgrep exit {result}");
+        }
+        for step in steps {
+            assert!(!step["uses"].as_str().unwrap_or("").contains("rust-cache"));
+            if let Some(overrides) = step["env"].as_hash() {
+                for key in overrides.keys() {
+                    assert!(
+                        environment[key.as_str().unwrap()].is_badvalue(),
+                        "step overrides job compiler isolation"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
     fn safe_outputs_boundary() {
         let workflow = include_str!("../../../.github/workflows/dispatch-worker.yml");
         let worker = workflow
@@ -1550,13 +1603,15 @@ Do it"
         cmd.env("GH_TOKEN", "planted")
             .env("GITHUB_TOKEN", "planted")
             .env("GITHUB_OUTPUT", "/runner/set_output")
-            .env("GIT_CONFIG_GLOBAL", "/credential/helper");
+            .env("GIT_CONFIG_GLOBAL", "/credential/helper")
+            .env("RUSTC_WRAPPER", "/runner/sccache")
+            .env("SCCACHE_SERVER_UDS", "/runner/sccache.sock");
         private_environment(&mut cmd);
         let output = cmd.output().unwrap();
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
-            "PATH=/usr/local/bin:/usr/bin:/bin\n"
+            "CARRICK_SCCACHE=0\nPATH=/usr/local/bin:/usr/bin:/bin\nRUSTC_WORKSPACE_WRAPPER=\nRUSTC_WRAPPER=\n"
         );
     }
     #[test]

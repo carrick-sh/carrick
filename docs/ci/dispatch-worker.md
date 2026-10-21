@@ -4,7 +4,23 @@ Only the owner, account type `User`, may label/rerun an owner-authored issue.
 Guard, driver and controller enforce admission and the checked-in tier allowlist.
 The Linux clone runs the agent as a separate system user without login or sudo.
 The driver builds before restore-only caches; Rust homes are physical private
-copies. Checkout uses admitted `github.sha`; tools/launcher remain digest-pinned.
+copies, excluding both Cargo home configuration files (`config` and
+`config.toml`), including their `[env]` entries. The whole worker job overrides
+both Rust compiler wrappers to empty, disables Carrick's sccache selection and
+clears the runner cache endpoint selection; the Rust build-cache action is
+removed (the restore-only toolchain archive remains). This covers the credentialed driver build and bootstrap as well as the
+agent launch. The agent environment also sets both wrappers explicitly empty
+and `CARRICK_SCCACHE=0`; it inherits no `SCCACHE_*` variables. No runner-owned
+compiler service is an allowed part of this boundary. The first worker step
+refuses admission if the runner UID already owns an sccache process or the
+process census fails; it never contacts that service. Fresh clone templates must not prestart one.
+
+The host-portable H1 regression witness plants a marker-writing wrapper in
+runner Cargo configuration, isolates Rust homes, then executes real Cargo
+against a dependency-free fixture. It checks both config filenames, absence of
+the marker and runner endpoint environment, and successful compilation without
+a daemon or uid switch. Checkout uses admitted `github.sha`; tools/launcher
+remain digest-pinned.
 
 The agent has **no GitHub publish credential**, inherited token environment,
 Actions command-file channels or Git credential helper. Bootstrap's read token

@@ -155,7 +155,25 @@ pub(crate) fn isolate_rust_homes(
             .ok_or(ScalerError::Guard("Rust home is unavailable"))?
             .canonicalize()?;
         let destination = private.join(directory.trim_start_matches('.'));
-        copy_rust_home(&source, &destination, &mut Vec::new())?;
+        if key == "CARGO_HOME" {
+            // Cargo config is executable policy, not a cache: [build] wrappers
+            // and [env] can reconnect the agent to runner-owned services.
+            // Drop both supported filenames wholesale, including symlinks.
+            private_dir(&destination)?;
+            for entry in std::fs::read_dir(&source)? {
+                let entry = entry?;
+                if entry.file_name() == "config" || entry.file_name() == "config.toml" {
+                    continue;
+                }
+                copy_rust_home(
+                    &entry.path(),
+                    &destination.join(entry.file_name()),
+                    &mut Vec::new(),
+                )?;
+            }
+        } else {
+            copy_rust_home(&source, &destination, &mut Vec::new())?;
+        }
         command.env(key, &destination);
         homes.push((source, destination));
     }
@@ -467,7 +485,7 @@ mod tests {
                 "[build]\nrustc-wrapper = '{}'\n[env]\nSCCACHE_SERVER_UDS = '{}'\nRUSTC_WORKSPACE_WRAPPER = '{}'\n",
                 wrapper.display(), temp.path().join("runner.sock").display(), wrapper.display()
             )).unwrap();
-            std::fs::write(project.join("Cargo.toml"), "[package]\nname = 'isolation-witness'\nversion = '0.0.0'\nedition = '2021'\n[lib]\npath = 'lib.rs'\n").unwrap();
+            std::fs::write(project.join("Cargo.toml"), "[package]\nname = 'isolation-witness'\nversion = '0.0.0'\nedition = '2021'\n[lib]\npath = 'lib.rs'\n[workspace]\n").unwrap();
             std::fs::write(project.join("lib.rs"), "pub fn witness() {}\n").unwrap();
             let cargo = PathBuf::from(env!("CARGO"));
             let mut command = std::process::Command::new(&cargo);
