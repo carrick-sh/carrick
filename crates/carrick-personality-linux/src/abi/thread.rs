@@ -509,7 +509,13 @@ pub struct ThreadControlSlot {
 }
 
 /// Quiescent initialization was attempted on a live execution authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct AffinitySeedRefused;
 
 impl ThreadControlSlot {
