@@ -87,6 +87,7 @@ extern crate std;
 
 /// Shared deadline-index publication protocol, authenticated by the image ABI.
 pub const TIMER_INDEX_PROTOCOL: u64 = 1;
+pub mod affinity;
 pub mod process;
 mod timer_index;
 
