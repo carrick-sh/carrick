@@ -4698,4 +4698,25 @@ mod guest_descriptor_lane_tests {
         let continue_ = resume.find("self.ipc_continue(").expect("continue");
         assert!(settle < interrupt && settle < continue_);
     }
+
+    /// A first-touch producer must finish its descriptor transaction in the
+    /// faulting executor's bounded mutation scope. A sibling may already hold
+    /// a physical supply receipt when this executor is selected for a stop.
+    #[test]
+    fn frame_grant_publication_settles_before_fault_executor_can_stop() {
+        let source = include_str!("signal.rs");
+        let fault = source
+            .split("fn resolve_mutating_fault<")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("production fault resolver");
+        assert!(
+            fault.contains("apply_guest_descriptor_txns_now("),
+            "the producer must service the guest descriptor before returning"
+        );
+        assert!(
+            !fault.contains("GUEST_GRANT_LEDGER.submit("),
+            "a stopped fault executor cannot retain physical readiness in the ledger"
+        );
+    }
 }
