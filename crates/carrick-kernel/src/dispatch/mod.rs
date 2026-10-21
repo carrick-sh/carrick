@@ -647,6 +647,8 @@ mod abi_args;
 pub mod archive;
 pub(crate) mod copyout;
 #[cfg(test)]
+mod copyout_contention_tests;
+#[cfg(test)]
 mod copyout_tests;
 pub(crate) use archive::{
     ArchiveEntryMetadata, ArchiveFsAuthority, ArchiveFsError, MAX_ARCHIVE_BYTES,
