@@ -521,6 +521,15 @@ impl carrick_kernel::kernel::ExecutorKick for RecordedKick {
 
 #[test]
 fn production_venue_remote_affinity_migrates_running_sibling_without_tick() {
+    remote_affinity_migration(false);
+}
+
+#[test]
+fn production_venue_host_route_migrates_running_sibling_without_tick() {
+    remote_affinity_migration(true);
+}
+
+fn remote_affinity_migration(host_route: bool) {
     use carrick_hal::{CpuAffinity, GuestCpuId, GuestCpuPolicy};
     use carrick_kernel::kernel::Scheduler;
     use std::sync::mpsc;
@@ -558,6 +567,16 @@ fn production_venue_remote_affinity_migrates_running_sibling_without_tick() {
         scheduler.make_runnable(p.sibling.thread().key()).unwrap();
         let running_caller = scheduler.take(&ex0).unwrap();
         let running_target = scheduler.take(&ex1).unwrap();
+        let target_slot = SlotId::new(1);
+        let route = if host_route {
+            carrick_sched_core::HOST_RESCHEDULE_TARGET
+        } else {
+            carrick_guest_arch::sgi_target_of(1)
+        };
+        p.zone.slot(target_slot).set_sgi_target(route);
+        // Production attaches once after backend publication, before entry.
+        assert!(running_target.lease().attach_affinity_slot(target_slot));
+
         assert_eq!(
             scheduler.queued_len(),
             0,
@@ -575,27 +594,34 @@ fn production_venue_remote_affinity_migrates_running_sibling_without_tick() {
                     irq_rx
                         .recv_timeout(Duration::from_secs(5))
                         .expect("remote ring change must deliver a reschedule");
-                    let mut cpu = carrick_el1_linux::sched::FakeCpu::default();
-                    let before = cpu.now;
-                    cpu.pending.push_back(carrick_el1_abi::GIC_RESCHED_INTID);
-                    let counters = carrick_el1_abi::Counters::default();
-                    let mut sched = carrick_el1_linux::sched::Sched {
-                        zone,
-                        slot: SlotId::new(1),
-                        task,
-                        cpu: &mut cpu,
-                        user: &carrick_el1_linux::sched::HardwareUserWord,
-                        counters: &counters,
-                        handoff: None,
-                    };
-                    let action =
-                        sched.interrupt(&mut carrick_el1_abi::TrapFrame::default(), u64::MAX);
-                    assert_eq!(
-                        action,
-                        carrick_el1_abi::Action::Forward,
-                        "excluded live residency must leave EL0"
-                    );
-                    assert_eq!(cpu.now, before, "no timer advancement supplies migration");
+                    if host_route {
+                        assert!(
+                            task.linux.has_pending_host_work(),
+                            "host kick must carry owed return work"
+                        );
+                    } else {
+                        let mut cpu = carrick_el1_linux::sched::FakeCpu::default();
+                        let before = cpu.now;
+                        cpu.pending.push_back(carrick_el1_abi::GIC_RESCHED_INTID);
+                        let counters = carrick_el1_abi::Counters::default();
+                        let mut sched = carrick_el1_linux::sched::Sched {
+                            zone,
+                            slot: SlotId::new(1),
+                            task,
+                            cpu: &mut cpu,
+                            user: &carrick_el1_linux::sched::HardwareUserWord,
+                            counters: &counters,
+                            handoff: None,
+                        };
+                        let action =
+                            sched.interrupt(&mut carrick_el1_abi::TrapFrame::default(), u64::MAX);
+                        assert_eq!(
+                            action,
+                            carrick_el1_abi::Action::Forward,
+                            "excluded live residency must leave EL0"
+                        );
+                        assert_eq!(cpu.now, before, "no timer advancement supplies migration");
+                    }
                 });
             });
             ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -654,7 +680,33 @@ fn production_venue_remote_affinity_migrates_running_sibling_without_tick() {
                 1,
                 "caller mask is independent"
             );
-            irq_tx.send(()).unwrap();
+            let mut delivered = Vec::new();
+            carrick_el1_linux::sched::object_wait::deliver_effects_with(
+                p.zone,
+                Some(SlotId::new(0)),
+                carrick_sched_core::Waker::El1 {
+                    slot: SlotId::new(0),
+                },
+                service.effects[0],
+                false,
+                |slot, target| {
+                    use carrick_el1_linux::sched::ThreadCpu;
+                    let mut sender = carrick_el1_linux::sched::FakeCpu::default();
+                    sender.send_resched(slot, target);
+                    if host_route {
+                        assert_eq!(sender.sgis, [carrick_sched_core::HOST_RESCHEDULE_TARGET]);
+                        p.current[1].linux.mark_pending_host_work();
+                    }
+                    delivered.push(slot);
+                    irq_tx.send(()).unwrap();
+                },
+                (|_| {}, || {}),
+            );
+            assert_eq!(
+                delivered,
+                [SlotId::new(1)],
+                "one kick must reach exactly the running sibling"
+            );
             worker.join().unwrap();
         });
         assert!(scheduler.should_preempt(&running_target));
