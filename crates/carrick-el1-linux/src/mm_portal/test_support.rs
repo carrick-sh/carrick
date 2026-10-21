@@ -385,6 +385,7 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
                 mm: a.raw(),
                 file_table: 1,
                 generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 0,
                 lifecycle_page: 0,
                 control_slot: 0,

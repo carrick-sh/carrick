@@ -94,6 +94,7 @@ pub fn try_run_program_with_root_affinity_typed(
                 mm: 0,
                 file_table: root.resources().files().id().raw(),
                 generation: carrick_kernel::kernel::objects::ExecutionGeneration::INITIAL.raw(),
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity,
                 lifecycle_page: 0,
                 control_slot: 0,

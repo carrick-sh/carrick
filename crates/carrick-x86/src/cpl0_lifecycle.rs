@@ -245,12 +245,18 @@ mod process_exit_tests {
             mm: 77,
             file_table: 5,
             generation: 11,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
             affinity: 1,
             lifecycle_page: 0,
             control_slot: 0,
         };
         zone.drive(slot, 1);
-        zone.publish_slot(slot, parent.mm, Some(0), 0);
+        zone.publish_slot_with_affinity(
+            slot,
+            parent.mm,
+            Some(0),
+            carrick_sched_core::AffinitySource::UNBOUND,
+        );
         let space = zone
             .spaces
             .publish_closed(parent.mm, 0x1000, 0)

@@ -267,6 +267,36 @@ pub(super) fn zone_slot<E: ThreadedEngine>(engine: &E) -> Option<(&'static ZoneT
     ))
 }
 
+/// Enter and leave the zone around the production executor's hardware run,
+/// including entries following a host-served syscall.
+pub(super) fn run_guest<R>(
+    thread: Option<&carrick_kernel::kernel::Thread>,
+    zone_slot: Option<(&ZoneTables, SlotId)>,
+    run: impl FnOnce() -> R,
+) -> R {
+    if let Some((zone, slot)) = zone_slot {
+        if let Some(thread) = thread {
+            zone.publish_slot_with_affinity(
+                slot,
+                zone.slot(slot).mm(),
+                zone.slot(slot).bound_cpu(),
+                thread.control_slot().affinity_source(),
+            );
+            thread.attach_affinity_slot(slot);
+        }
+        zone.enter_guest(slot);
+    }
+    let result = run();
+    if let Some((zone, slot)) = zone_slot {
+        zone.leave_guest(slot, &HostLockWait);
+    }
+    result
+}
+
+#[cfg(test)]
+#[path = "zone_affinity_tests.rs"]
+mod affinity_tests;
+
 /// How long until the guest virtual counter reaches `deadline` (guest
 /// `CNTVCT_EL0` is the host's `mach_absolute_time` tick count).
 fn until_deadline(deadline: u64) -> std::time::Duration {
@@ -606,6 +636,7 @@ where
                 .current_submission_key()
                 .map(|(_, generation)| generation.raw())
                 .unwrap_or(0),
+            affinity_source: context.thread().control_slot().affinity_source(),
             affinity: context.thread().affinity().words()[0],
             lifecycle_page: 0,
             control_slot: 0,
@@ -757,6 +788,7 @@ where
                 .current_submission_key()
                 .map(|(_, generation)| generation.raw())
                 .unwrap_or(0),
+            affinity_source: context.thread().control_slot().affinity_source(),
             affinity: context.thread().affinity().words()[0],
             lifecycle_page: 0,
             control_slot: 0,
@@ -1337,6 +1369,7 @@ where
                 .current_submission_key()
                 .map(|(_, generation)| generation.raw())
                 .unwrap_or(0),
+            affinity_source: context.thread().control_slot().affinity_source(),
             affinity: context.thread().affinity().words()[0],
             lifecycle_page: 0,
             control_slot: 0,
@@ -1672,6 +1705,7 @@ mod ipc_tests {
             mm: 1,
             file_table: 5,
             generation: 11,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
             affinity: 1,
             lifecycle_page: 0,
             control_slot: 0,
@@ -1824,6 +1858,7 @@ mod ipc_tests {
                 mm: 7,
                 file_table: 5,
                 generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 0,
                 lifecycle_page: 0,
                 control_slot: 0,

@@ -171,7 +171,12 @@ pub fn witness(
             .cast::<ZoneTables<ParkedContextWords>>()
     };
     zone.drive(SLOT, 1);
-    zone.publish_slot(SLOT, 11, Some(0), 0);
+    zone.publish_slot_with_affinity(
+        SLOT,
+        11,
+        Some(0),
+        carrick_sched_core::AffinitySource::UNBOUND,
+    );
     zone.enter_guest(SLOT);
     let root =
         |gpa| RootGpa::page_aligned(FrameGpa::new(gpa)).ok_or_else(|| fail("unaligned root"));

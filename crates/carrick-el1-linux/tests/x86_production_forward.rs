@@ -505,6 +505,7 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
             mm: 1,
             file_table: 5,
             generation: 11,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
             affinity: 3,
             lifecycle_page: &*page as *const _ as u64,
             control_slot: &*control as *const _ as u64,

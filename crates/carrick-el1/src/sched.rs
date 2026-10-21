@@ -107,6 +107,10 @@ pub fn identity_of(task: &CurrentTask, affinity: u64) -> ThreadIdentity {
         mm: task.mm.key.load(Ordering::Relaxed),
         file_table: task.linux.file_table.load(Ordering::Relaxed),
         generation: task.execution.generation.load(Ordering::Relaxed).raw(),
+        affinity_source: task.lifecycle_refs().map_or(
+            carrick_sched_core::AffinitySource::UNBOUND,
+            |(_, control)| control.affinity_source(),
+        ),
         affinity,
         lifecycle_page: task.metadata.lifecycle_page.load(Ordering::Acquire),
         control_slot: task.metadata.control_slot.load(Ordering::Acquire),
@@ -507,7 +511,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         let spin_until = self.cpu.now().saturating_add(self.ticks(IDLE_SPIN_NS));
         loop {
             self.take_irqs();
-            if self.task.linux.has_pending_host_work() {
+            if self.task.linux.has_pending_host_work() || zone.slot(slot).affinity_excludes_cpu() {
                 self.counters.exit_reasons[El1ExitReason::IdleHostWork as usize]
                     .fetch_add(1, Ordering::Relaxed);
                 zone.leave_idle(slot);
@@ -548,7 +552,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 // have arrived before this vCPU's next effective run. The
                 // shared pending-work and owed-reschedule words are the
                 // durable half of that wake; recheck them before WFI.
-                if self.task.linux.has_pending_host_work() || zone.take_resched(slot) {
+                if self.task.linux.has_pending_host_work()
+                    || zone.slot(slot).affinity_excludes_cpu()
+                    || zone.take_resched(slot)
+                {
                     zone.enter_idle(slot, false);
                     continue;
                 }
@@ -599,6 +606,13 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
         self.take_irqs();
+        // A RESCHED receipt is only a prompt to inspect the CURRENT loaded
+        // authority. A stale SGI cannot mark an allowed successor as owing work.
+        if self.zone.slot(self.slot).affinity_excludes_cpu() {
+            self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
+                .fetch_add(1, Ordering::Relaxed);
+            return carrick_el1_abi::Action::Forward;
+        }
         if self.task.linux.has_pending_host_work() {
             self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
@@ -656,7 +670,9 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
         self.take_irqs();
-        if self.task.linux.has_pending_host_work() {
+        if self.task.linux.has_pending_host_work()
+            || self.zone.slot(self.slot).affinity_excludes_cpu()
+        {
             self.counters.exit_reasons[El1ExitReason::IdleEntryHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
             return carrick_el1_abi::Action::Idle;

@@ -1852,3 +1852,121 @@ fn second_root_reuses_carrier_fork_stock_after_first_root_exits() {
         .unwrap();
     assert_eq!(granted2.request.child_mm, mm(402));
 }
+
+#[test]
+fn accepted_cold_lifecycle_publishes_all_affinity_aliases_and_abort_scrubs_them() {
+    let mut bytes = MetadataBytes::new();
+    let window = bytes.window();
+    let mut stock = ForkStock::<UntaggedRoots>::new(
+        CARRIER,
+        ForkControlCapacity::unused(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(
+            (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            x86_lifecycles(1),
+        )
+        .unwrap();
+    let mut exchange = ForkStockExchange::new(request(parent(), 302, 1, 1)).unwrap();
+    let mut aliases = None;
+    let granted = stock
+        .loan(&mut NoTableLedger, parent(), &mut exchange, |life| {
+            aliases = window.prepare_affinity_aliases(life);
+            aliases.is_some()
+        })
+        .unwrap();
+    assert!(
+        window.is_zero(granted.lifecycle),
+        "preparation must not dirty unaccepted stock"
+    );
+    aliases.unwrap().publish();
+    let ranges = window.ranges(granted.lifecycle).unwrap();
+    let controls = unsafe {
+        core::slice::from_raw_parts(
+            ranges[1].0.cast::<carrick_el1_abi::ThreadControlSlot>(),
+            carrick_el1_abi::THREAD_POOL_ENTRIES + 1,
+        )
+    };
+    for (index, control) in controls.iter().enumerate() {
+        let source = control.affinity_source();
+        let authority = core::ptr::from_ref(control.affinity_authority()).addr() as u64;
+        let offset = authority - core::ptr::from_ref(control).addr() as u64;
+        assert_eq!(source.raw_host(), authority);
+        assert_eq!(
+            source.raw_guest(),
+            granted.lifecycle.controls.raw()
+                + (index * core::mem::size_of::<carrick_el1_abi::ThreadControlSlot>()) as u64
+                + offset
+        );
+        assert!(source.is_guest_mapped());
+        assert!(
+            control
+                .affinity_authority()
+                .initialize_quiescent(if index % 2 == 0 { 1 } else { 2 })
+        );
+        assert_eq!(source.load(), Some(if index % 2 == 0 { 1 } else { 2 }));
+    }
+    assert!(!window.is_zero(granted.lifecycle));
+    let mut abort = ForkStockSettlement::abort(granted);
+    stock
+        .settle(
+            &mut NoTableLedger,
+            parent(),
+            &mut abort,
+            |_| true,
+            |_| true,
+            |life| window.clear(life),
+        )
+        .unwrap();
+    assert!(window.is_zero(granted.lifecycle));
+    assert!(stock.pending(parent().cpu).is_none());
+}
+
+#[test]
+fn lifecycle_alias_preparation_never_dirties_a_refused_loan() {
+    struct Denied;
+    impl ForkTableLedger for Denied {
+        fn grant(&mut self, _: RootGpa, _: ReservationMm) -> bool {
+            false
+        }
+        fn give_back(&mut self, _: RootGpa, _: ReservationMm) {}
+    }
+    let mut bytes = MetadataBytes::new();
+    let window = bytes.window();
+    let lifecycle = x86_lifecycles(1)[0];
+    let mut stock = ForkStock::<UntaggedRoots>::new(
+        CARRIER,
+        ForkControlCapacity::unused(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(
+            (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            vec![lifecycle],
+        )
+        .unwrap();
+    let mut exchange = ForkStockExchange::new(request(parent(), 302, 1, 1)).unwrap();
+    let mut aliases = None;
+    assert_eq!(
+        stock.loan(&mut Denied, parent(), &mut exchange, |life| {
+            aliases = window.prepare_affinity_aliases(life);
+            aliases.is_some()
+        }),
+        Err(ForkStockRefusal::Capacity)
+    );
+    assert!(aliases.is_some());
+    assert!(window.is_zero(lifecycle));
+    assert!(stock.pending(parent().cpu).is_none());
+    let control = unsafe {
+        &*window.ranges(lifecycle).unwrap()[1]
+            .0
+            .cast::<carrick_el1_abi::ThreadControlSlot>()
+    };
+    assert!(control.publish_visible_tid(42));
+    assert!(
+        window.prepare_affinity_aliases(lifecycle).is_none(),
+        "dirty stock cannot license alias publication"
+    );
+    assert!(!control.affinity_source().is_guest_mapped());
+}

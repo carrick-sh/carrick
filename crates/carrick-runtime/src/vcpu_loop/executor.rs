@@ -595,6 +595,10 @@ where
                                 Ok(replacement_record)
                             },
                         );
+                        let replacement_record = replacement_record.and_then(|replacement| {
+                            backend.refresh_loaded_affinity(running.thread())?;
+                            Ok(replacement)
+                        });
                         let replacement_record = match replacement_record {
                             Ok(replacement) => replacement,
                             Err(error) => {

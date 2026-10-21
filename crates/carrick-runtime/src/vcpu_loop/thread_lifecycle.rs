@@ -169,6 +169,12 @@ impl CarrierLifecycleMappings {
                 let page_offset = lifecycle.page_address().raw() - lifecycle.backing_base().raw();
                 let base = self.map(&mut state, Arc::new(ControlBacking(control.clone())))?;
                 let offset = control.slot_address().raw() - control.backing_base().raw();
+                // SAFETY: both exact aliases are retained by this carrier map.
+                unsafe {
+                    control.publish_affinity_aliases(carrick_guest_arch::GuestVa::new(
+                        base.raw() + offset as u64,
+                    ));
+                }
                 if lifecycle.serves_threads() {
                     if let Some(activity) = lifecycle.ledger_activity() {
                         let offset =
@@ -184,6 +190,12 @@ impl CarrierLifecycleMappings {
                         let base = self.map(&mut state, Arc::new(ControlBacking(born.clone())))?;
                         let offset = born.slot_address().raw() - born.backing_base().raw();
                         let address = base.raw() + offset as u64;
+                        // SAFETY: the mapped pool control is retained through birth and retirement.
+                        unsafe {
+                            born.publish_affinity_aliases(carrick_guest_arch::GuestVa::new(
+                                address,
+                            ));
+                        }
                         if lifecycle.control_address(entry) != Some(address) {
                             let _ = lifecycle.bind_control_address(entry, address);
                         }

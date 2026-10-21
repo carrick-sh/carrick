@@ -46,6 +46,7 @@ fn identity(tid: u64) -> ThreadIdentity {
         mm: MM,
         file_table: 5,
         generation: 1,
+        affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
         affinity: 0,
         lifecycle_page: 0,
         control_slot: 0,
@@ -1882,4 +1883,103 @@ fn concurrent_timer_park_and_guard_refusal_preserve_record_ownership() {
     assert_eq!(zone.timer_deadline(SLOT), Some(5000));
     assert_eq!(zone.expire_timer(SLOT, 5000, 0), Ok(true));
     assert_eq!(zone.timer_deadline(SLOT), Some(10000));
+}
+
+#[test]
+fn idle_resched_keeps_an_affinity_excluded_home_record_queued() {
+    const LOADED: SlotId = SlotId::new(4);
+    for use_idle_entry in [false, true] {
+        let zone = zone();
+        use carrick_sched_core::affinity::{
+            AffinityAuthority, AffinityNotification, AffinityNotifier,
+        };
+        struct NoResidency;
+        impl AffinityNotifier for NoResidency {
+            fn notify(&mut self, _: AffinityNotification) {}
+        }
+        let authority = AffinityAuthority::new();
+        authority.initialize(3);
+        // SAFETY: this fixture pins the authority until the zone is dropped.
+        let source = unsafe { carrick_sched_core::AffinitySource::from_authority(&authority) };
+        let word = AtomicU32::new(0);
+        let address = word.as_ptr() as u64;
+        let counters = counters();
+        host_publish(&zone, SLOT, MM, Some(0), 3);
+        host_publish(&zone, LOADED, MM, Some(1), 3);
+        zone.publish_slot_with_affinity(LOADED, MM, Some(1), source);
+        zone.enter_guest(SLOT);
+        zone.enter_guest(LOADED);
+
+        let loaded = task_for(202);
+        let (mut frame, mut cpu) = live(0xB, address, FUTEX_WAIT_PRIVATE, 0);
+        frame.slot = u64::from(LOADED.raw());
+        let initial_now = cpu.now;
+        // Bound the initial futex park with a host exit, then settle that
+        // setup work before the reschedule-only idle entry under test.
+        cpu.pending.push_back(GIC_KICK_INTID);
+        assert_eq!(
+            serve_on(LOADED, &mut frame, &loaded, &zone, &mut cpu, counters),
+            Some(Served::Idle)
+        );
+        if let Some(doorbell) = loaded.linux.take_host_work_doorbell() {
+            doorbell.settled();
+        }
+        let home = zone.slot(LOADED).host_record().unwrap();
+        assert!(matches!(zone.record(home).claim(), Claim::Parked { .. }));
+
+        let waker = task_for(101);
+        let (mut wake_frame, mut wake_cpu) = live(0xA, address, FUTEX_WAKE_PRIVATE, 1);
+        assert_eq!(
+            serve_on(
+                SLOT,
+                &mut wake_frame,
+                &waker,
+                &zone,
+                &mut wake_cpu,
+                counters
+            ),
+            RETURNED
+        );
+        assert_eq!(wake_frame.x[0], 1);
+        assert_eq!(zone.runnable_head(LOADED), Some(home));
+        assert!(matches!(zone.record(home).claim(), Claim::Queued { slot, .. } if slot == LOADED));
+        assert_eq!(zone.slot(LOADED).current(), None);
+
+        // Narrow the loaded authority while its executor remains on CPU 1.
+        authority.change(1, &mut NoResidency);
+        assert_eq!(zone.slot(LOADED).bound_cpu(), Some(1));
+        assert_eq!(zone.slot(LOADED).affinity(), 1);
+        cpu.pending.push_back(GIC_RESCHED_INTID);
+        assert!(!loaded.linux.has_pending_host_work());
+        assert_eq!(cpu.now, initial_now);
+        let before = frame;
+        let mut sched = Sched {
+            handoff: None,
+            zone: &zone,
+            slot: LOADED,
+            task: &loaded,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters,
+        };
+        if use_idle_entry {
+            assert_eq!(
+                sched.idle_entry(&mut frame, ETIMEDOUT_RESULT),
+                carrick_el1_abi::Action::Idle,
+                "idle entry must refuse an excluded home record after RESCHED"
+            );
+        } else {
+            assert_eq!(
+                sched.idle(&mut frame, ETIMEDOUT_RESULT),
+                Served::Idle,
+                "idle must refuse an excluded home record after RESCHED"
+            );
+        }
+        assert_eq!(zone.slot(LOADED).current(), None);
+        assert_eq!(zone.runnable_head(LOADED), Some(home));
+        assert_eq!(frame, before, "no excluded record may be loaded");
+        assert_eq!(cpu.now, initial_now);
+        assert_eq!(cpu.wfis, 0);
+        assert!(!loaded.linux.has_pending_host_work());
+    }
 }

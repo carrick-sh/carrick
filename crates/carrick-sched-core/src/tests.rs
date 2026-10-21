@@ -79,6 +79,7 @@ fn identity(tid: u64) -> ThreadIdentity {
         mm: MM,
         file_table: 99,
         generation: 1,
+        affinity_source: crate::AffinitySource::UNBOUND,
         affinity: 0,
         lifecycle_page: 0,
         control_slot: 0,
@@ -3092,4 +3093,109 @@ fn unhome_preserves_distinct_slot_host_record() {
     assert_eq!(zone.unhome(SLOT, root, 1), None);
     assert_eq!(zone.record(root).home(), None);
     assert_eq!(zone.slot(SLOT).host_record(), None);
+}
+
+#[test]
+fn carrier_cpu_policy_survives_slot_churn() {
+    let zone = zone();
+    zone.publish_carrier_cpu_count(4);
+    assert_eq!(zone.carrier_affinity_mask(), Some(15));
+    assert_eq!(zone.carrier_cpu_count(), Some(4));
+    let slot = SlotId::new(0);
+    zone.publish_slot(slot, MM, Some(1), 2);
+    assert_eq!(zone.slot(slot).bound_cpu(), Some(1));
+    zone.publish_slot(slot, 0, None, 0);
+    assert_eq!(zone.slot(slot).bound_cpu(), None);
+    assert_eq!(zone.carrier_affinity_mask(), Some(15));
+    assert_eq!(zone.carrier_cpu_count(), Some(4));
+    zone.publish_carrier_cpu_count(64);
+    assert_eq!(zone.carrier_affinity_mask(), Some(u64::MAX));
+    assert_eq!(zone.carrier_cpu_count(), Some(64));
+}
+
+#[test]
+fn unpublished_carrier_topology_cannot_invent_cpu_zero() {
+    let zone = zone();
+    assert_eq!(zone.carrier_affinity_mask(), None);
+    assert_eq!(zone.carrier_cpu_count(), None);
+    zone.drive(SLOT, 1);
+    zone.publish_slot(SLOT, MM, Some(3), 1 << 3);
+    assert_eq!(zone.carrier_affinity_mask(), None);
+    assert_eq!(zone.carrier_cpu_count(), None);
+}
+
+#[test]
+fn live_affinity_sources_control_record_placement_and_the_host_loaded_slot() {
+    use crate::affinity::{AffinityAuthority, AffinityNotification, AffinityNotifier};
+    struct NoResidency;
+    impl AffinityNotifier for NoResidency {
+        fn notify(&mut self, _: AffinityNotification) {}
+    }
+    let authority = AffinityAuthority::new();
+    authority.initialize(3);
+    // SAFETY: this stack cell remains initialized and unmoved until all test
+    // records and slot bindings below are retired.
+    let source = unsafe { AffinitySource::from_authority(&authority) };
+    let zone = zone();
+    zone.publish_slot_with_affinity(SLOT, MM, Some(1), source);
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            affinity: 3,
+            affinity_source: source,
+            ..identity(41)
+        })
+        .unwrap();
+    authority.change(1, &mut NoResidency);
+    assert_eq!(zone.record(record).affinity(), 1);
+    assert_eq!(zone.record(record).identity().affinity, 1);
+    assert!(!zone.record(record).allows_cpu(2));
+    assert!(zone.record(record).allows_cpu(1));
+    assert_eq!(zone.slot(SLOT).affinity(), 1);
+    assert!(zone.slot(SLOT).affinity_excludes_cpu());
+    zone.record(record).set_affinity(3);
+    zone.set_slot_affinity(SLOT, 3);
+    let _ = zone.unhome(SLOT, record, 3);
+    assert_eq!(zone.record(record).affinity(), 1);
+    assert_eq!(zone.slot(SLOT).affinity(), 1);
+    authority.change(2, &mut NoResidency);
+    assert_eq!(zone.record(record).identity().affinity, 2);
+    assert!(!zone.slot(SLOT).affinity_excludes_cpu());
+    zone.free_record(record);
+    zone.publish_slot_with_affinity(SLOT, 0, None, AffinitySource::UNBOUND);
+}
+
+#[test]
+fn switched_sibling_mask_cannot_replace_the_host_loaded_affinity_source() {
+    use crate::affinity::{AffinityAuthority, AffinityNotification, AffinityNotifier};
+    struct NoResidency;
+    impl AffinityNotifier for NoResidency {
+        fn notify(&mut self, _: AffinityNotification) {}
+    }
+    let loaded = AffinityAuthority::new();
+    let sibling = AffinityAuthority::new();
+    loaded.initialize(3);
+    sibling.initialize(3);
+    // SAFETY: both initialized cells stay unmoved until the records and slot
+    // sources are cleared below, and this fixture uses identical aliases.
+    let loaded_source = unsafe { AffinitySource::from_authority(&loaded) };
+    let sibling_source = unsafe { AffinitySource::from_authority(&sibling) };
+    let zone = zone();
+    zone.publish_slot_with_affinity(SLOT, MM, Some(1), loaded_source);
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            affinity_source: sibling_source,
+            ..identity(42)
+        })
+        .unwrap();
+    sibling.change(1, &mut NoResidency);
+    zone.set_slot_affinity(SLOT, 1);
+    assert_eq!(zone.slot(SLOT).affinity(), 3);
+    assert!(!zone.slot(SLOT).affinity_excludes_cpu());
+    assert_eq!(zone.record(record).affinity(), 1);
+    assert!(!zone.record(record).allows_cpu(2));
+    loaded.change(2, &mut NoResidency);
+    assert_eq!(zone.slot(SLOT).affinity(), 2);
+    assert_eq!(zone.record(record).identity().affinity, 1);
+    zone.free_record(record);
+    zone.publish_slot_with_affinity(SLOT, 0, None, AffinitySource::UNBOUND);
 }

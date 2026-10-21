@@ -435,6 +435,22 @@ pub(crate) fn unmask_el0_irqs(vcpu: &applevisor::vcpu::Vcpu) -> Result<(), TrapE
     Ok(())
 }
 
+/// The physical reschedule destination for a host-loaded vCPU. Publish this
+/// before attaching its affinity residency, including its very first EL0 entry.
+/// The owning worker calls this while the vCPU is stopped.
+pub fn reschedule_target(vcpu: u64) -> Result<u64, TrapError> {
+    if interrupt_model() != InterruptModel::Gic {
+        return Ok(0);
+    }
+    let mut mpidr = 0;
+    // SAFETY: the caller owns this live, stopped vCPU, configured by this module.
+    gic_check(
+        unsafe { sys::hv_vcpu_get_sys_reg(vcpu, sys::hv_sys_reg_t::MPIDR_EL1, &mut mpidr) },
+        "read MPIDR_EL1 for reschedule route",
+    )?;
+    Ok(carrick_el1::substrate::sched::sgi_target_of(mpidr))
+}
+
 /// Withdraw an owed kick that some exit surfaced.
 pub(crate) fn clear_kick(vcpu: &applevisor::vcpu::Vcpu) -> Result<(), TrapError> {
     set_kick_pending(vcpu, false)

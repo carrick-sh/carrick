@@ -259,6 +259,7 @@ mod tests {
                 mm: 77,
                 file_table: 1,
                 generation: 1,
+                affinity_source: crate::AffinitySource::UNBOUND,
                 affinity: 0,
                 lifecycle_page: 0,
                 control_slot: 0,

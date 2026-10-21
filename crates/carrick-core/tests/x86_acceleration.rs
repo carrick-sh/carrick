@@ -1984,6 +1984,7 @@ fn x4_shared_wait_records() {
         mm,
         file_table: 99,
         generation: 1,
+        affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
         affinity: 0,
         lifecycle_page: 0,
         control_slot: 0,

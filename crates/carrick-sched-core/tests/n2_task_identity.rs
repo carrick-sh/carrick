@@ -30,6 +30,7 @@ fn identity(parent: u64, tid: u64) -> ThreadIdentity {
         mm: parent,
         generation: 1,
         file_table: parent + 100,
+        affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
         affinity: 0,
         lifecycle_page: 0,
         control_slot: 0,

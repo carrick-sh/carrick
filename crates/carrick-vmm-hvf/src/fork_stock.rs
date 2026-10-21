@@ -185,6 +185,39 @@ impl ForkStockHostCustody {
         ))
     }
 
+    /// Qualify cold lifecycle storage without mutating it, then publish its
+    /// exact control aliases only after the shared owner accepts the loan.
+    /// The retained metadata window outlives this loan and its reclaim.
+    pub(crate) fn loan(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        execution: GrantExecution,
+        exchange: &mut carrick_el1_abi::ForkStockExchange,
+        resolve: impl FnOnce(
+            carrick_el1_abi::ForkLifecycleLoan,
+        ) -> Option<carrick_hal::fork_stock::LifecycleWindow>,
+    ) -> Result<carrick_el1_abi::ForkStockLoan, carrick_el1_abi::ForkStockRefusal> {
+        let mut prepared = None;
+        let result = self.owner.loan(ledger, execution, exchange, |lifecycle| {
+            prepared =
+                resolve(lifecycle).and_then(|window| window.prepare_affinity_aliases(lifecycle));
+            prepared.is_some()
+        });
+        if result.is_ok() {
+            // An accepted loan necessarily consumed the successful cold
+            // qualification above. Refused loans drop the unwritten token.
+            // A lost qualification refuses exposure and leaves the pending
+            // loan retained by the stock owner until carrier teardown.
+            let Some(prepared) = prepared else {
+                let refusal = carrick_el1_abi::ForkStockRefusal::Inventory;
+                exchange.refuse(refusal);
+                return Err(refusal);
+            };
+            prepared.publish();
+        }
+        result
+    }
+
     pub fn asids(&self) -> &AsidAllocator {
         self.owner.tags()
     }

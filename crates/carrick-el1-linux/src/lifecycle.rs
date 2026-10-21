@@ -337,12 +337,7 @@ impl<
         Some(UserVa::new(scratch.native.sp_el0))
     }
     fn affinity(&self) -> Option<u64> {
-        let zone = self.zone.as_ref()?.tables;
-        let slot = self.frame.slot()?;
-        Some(match zone.slot(slot).current() {
-            Some(record) => zone.record(record).identity().affinity,
-            None => zone.slot(slot).affinity(),
-        })
+        Some(LifecycleNative::thread(self)?.slot.affinity().words()[0])
     }
     fn allocate_record(
         &mut self,

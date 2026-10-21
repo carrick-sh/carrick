@@ -708,6 +708,9 @@ impl CarrierRuntime {
                         )
                         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
                     let context = prepared.context();
+                    context.thread().set_affinity(carrick_hal::CpuAffinity::all(
+                        runtime.directory.scheduling_policy().cpu_count(),
+                    ));
                     let initialization = initialize(&runtime.kernel, &runtime.directory, &context)?;
                     let context = prepared
                         .commit()
@@ -743,6 +746,12 @@ impl CarrierRuntime {
                 self.inner.scheduling_policy.lock().clone(),
             ),
         );
+        // The root can predate publication of the scheduler's CPU topology.
+        // Seed its sole mask from this carrier's policy before user setup can
+        // install an explicit narrower mask.
+        context.thread().set_affinity(carrick_hal::CpuAffinity::all(
+            directory.scheduling_policy().cpu_count(),
+        ));
         let initialization = initialize(&kernel, &directory, &context)?;
         let runtime = Arc::new(CarrierKernelRuntime {
             debug_server: parking_lot::Mutex::new(None),
@@ -1885,6 +1894,64 @@ pub(crate) mod tests {
                 if message.contains("carrier-scoped")),
             "unexpected error: {error:?}",
         );
+    }
+
+    #[test]
+    fn kernel_roots_take_installed_affinity_before_initialization() {
+        let _serial = TEST_LOCK.lock();
+        for (ncpu, expected) in [(1, 1u64), (64, u64::MAX)] {
+            let carrier = CarrierRuntime::new_for_tests().expect("carrier");
+            carrier
+                .install_scheduling_policy(Arc::new(carrick_hal::GuestCpuPolicy::new(ncpu)))
+                .expect("install policy");
+            let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
+                73_711,
+                carrick_hal::ThreadId::synthetic_for_tests(73_711),
+                "affinity-first".to_owned(),
+            )
+            .expect("bootstrap")
+            .with_container(Arc::new(Container::new(launch("affinity-first"))));
+            let root = carrier
+                .boot_kernel_root(bootstrap, |_, _, context| {
+                    assert_eq!(
+                        context.thread().affinity().words()[0],
+                        expected,
+                        "first root must see all installed CPUs before user initialization"
+                    );
+                    context
+                        .thread()
+                        .set_affinity(carrick_hal::CpuAffinity::single(
+                            carrick_hal::GuestCpuId::new(0),
+                        ));
+                    Ok(())
+                })
+                .expect("first root");
+            assert_eq!(
+                root.context.thread().affinity().words()[0],
+                1,
+                "an explicit initialization mask must stay authoritative"
+            );
+            activate_first_root(&carrier, &root);
+            let later = carrick_kernel::kernel::RootBootstrap::for_reference_model(
+                73_712,
+                carrick_hal::ThreadId::synthetic_for_tests(73_712),
+                "affinity-later".to_owned(),
+            )
+            .expect("bootstrap")
+            .with_container(Arc::new(Container::new(launch("affinity-later"))));
+            let later = carrier
+                .boot_kernel_root(later, |_, _, context| {
+                    assert_eq!(
+                        context.thread().affinity().words()[0],
+                        expected,
+                        "later roots must use the same carrier policy"
+                    );
+                    Ok(())
+                })
+                .expect("later root");
+            assert_eq!(later.context.thread().affinity().words()[0], expected);
+            assert_eq!(root.context.thread().affinity().words()[0], 1);
+        }
     }
 
     struct ArtifactEnvGuard {

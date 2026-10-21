@@ -966,6 +966,7 @@ fn compact_common_entry_suspends_only_after_authenticated_park() {
             mm: 29,
             file_table: 9,
             generation,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
             affinity: 2,
             lifecycle_page: 0x1000,
             control_slot: 0x2000,

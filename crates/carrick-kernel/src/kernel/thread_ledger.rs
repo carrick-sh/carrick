@@ -2861,6 +2861,46 @@ mod tests {
     }
 
     #[test]
+    fn pooled_host_clone_preserves_claim_time_affinity() {
+        let (kernel, root) = bootstrap(9_614);
+        kernel.registry().thread_ledger().set_pool_depth_for_test(4);
+        // First host clone replenishes the standing identity pool.
+        let _sibling = kernel
+            .clone_thread(
+                &root,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_615),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            kernel
+                .standing_thread_identities(root.task().key().id)
+                .len(),
+            4
+        );
+        root.thread()
+            .set_affinity(carrick_hal::CpuAffinity::from_words(&[2]));
+        let reserved = kernel
+            .reserve_thread_clone(&root, thread_plan(), None)
+            .unwrap();
+        root.thread()
+            .set_affinity(carrick_hal::CpuAffinity::from_words(&[4]));
+        let child = reserved
+            .prepare(ThreadId::synthetic_for_tests(9_616))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_context()
+            .unwrap();
+        assert_eq!(
+            child.thread().affinity().words()[0],
+            2,
+            "a revoked pool identity is a host birth, not an already-born ring task"
+        );
+    }
+
+    #[test]
     fn lifecycle_clone_seed_is_bound_at_claim_in_two_processes() {
         let (kernel, root) = bootstrap(9_610);
         kernel.registry().thread_ledger().set_pool_depth_for_test(0);

@@ -1755,8 +1755,7 @@ impl RunQueueInner {
                 return;
             }
         }
-        if crate::el1_zone::place_service(key.thread, key.generation, thread.affinity().words()[0])
-        {
+        if crate::el1_zone::place_service(thread, key.generation) {
             return;
         }
         self.release_zone_row(key);
@@ -2591,6 +2590,7 @@ pub fn publish_guest_cpu_count(ncpu: usize) {
             carrick_fatal!("kernel::scheduler", "conflicting guest cpu count published");
         }
     }
+    crate::el1_zone::publish_carrier_cpu_count(ncpu);
 }
 
 #[derive(Debug)]
@@ -6231,6 +6231,7 @@ mod tests {
                 mm: 7,
                 file_table: 1,
                 generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 0,
                 lifecycle_page: 0,
                 control_slot: 0,
@@ -9049,6 +9050,7 @@ mod tests {
                 mm: 7,
                 file_table: 1,
                 generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 0,
                 lifecycle_page: 0,
                 control_slot: 0,
@@ -10128,6 +10130,7 @@ mod tests {
                 mm: root.shared().mm().id().raw(),
                 file_table: 0,
                 generation: running.generation().raw(),
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 0,
                 lifecycle_page: 0,
                 control_slot: 0,

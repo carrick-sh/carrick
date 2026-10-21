@@ -1391,8 +1391,8 @@ pub(crate) fn service_native_fork_stock(
                 exchange.refuse(ForkStockRefusal::Capacity);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
-            let result = stock.owner.loan(&mut *ledger, execution, exchange, |life| {
-                lifecycle_window(custody, life).is_some_and(|window| window.is_zero(life))
+            let result = stock.loan(&mut *ledger, execution, exchange, |life| {
+                lifecycle_window(custody, life)
             });
             if let Err(refusal) = result {
                 report_stock_refusal(

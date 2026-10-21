@@ -88,6 +88,8 @@ extern crate std;
 /// Shared deadline-index publication protocol, authenticated by the image ABI.
 pub const TIMER_INDEX_PROTOCOL: u64 = 1;
 pub mod affinity;
+pub mod affinity_source;
+pub use affinity_source::AffinitySource;
 pub mod process;
 mod timer_index;
 
@@ -664,9 +666,11 @@ pub struct ThreadIdentity {
     pub file_table: u64,
     /// The host task generation published with the thread.
     pub generation: u64,
-    /// The guest CPUs the thread may run on, one bit per CPU (CPU 0 = bit 0;
-    /// 0 means any): EL1 queues it only on a slot bound to an allowed CPU.
+    /// Fixture fallback when no live source is bound (zero means any CPU).
+    /// Production placement reads `affinity_source` directly.
     pub affinity: u64,
+    /// Live authority retained until this identity's scheduler record retires.
+    pub affinity_source: AffinitySource,
     /// Carrier-retained EL1 lifecycle binding, restored with thread identity.
     pub lifecycle_page: u64,
     pub control_slot: u64,
@@ -770,8 +774,10 @@ pub struct ZoneRecord<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     host_wanted: HostRequest,
     /// CNTVCT deadline of the current park (0: untimed).
     deadline: AtomicU64,
+    /// Host authority address when bound; otherwise the fixture mask.
     affinity: AtomicU64,
     object: object_wait::ObjectRecord,
+    affinity_source: AtomicU64,
     ctx: UnsafeCell<C>,
 }
 
@@ -802,9 +808,33 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
             mm: self.mm.load(Ordering::Relaxed),
             file_table: self.file_table.load(Ordering::Relaxed),
             generation: self.generation.load(Ordering::Relaxed),
-            affinity: self.affinity.load(Ordering::Relaxed),
+            affinity: self.affinity(),
+            affinity_source: self.affinity_source(),
             lifecycle_page: self.lifecycle_page.load(Ordering::Relaxed),
             control_slot: self.control_slot.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The affinity mask of this thread.
+    pub fn affinity_source(&self) -> AffinitySource {
+        let guest = self.affinity_source.load(Ordering::Acquire);
+        let host = self.affinity.load(Ordering::Relaxed);
+        AffinitySource::from_retained_raw(host, guest)
+    }
+
+    pub fn affinity(&self) -> u64 {
+        let source = self.affinity_source();
+        if source.is_bound() {
+            source.load().unwrap_or(0)
+        } else {
+            self.affinity.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Update the affinity mask of this thread.
+    pub fn set_affinity(&self, affinity: u64) {
+        if !self.affinity_source().is_bound() {
+            self.affinity.store(affinity, Ordering::Release);
         }
     }
 
@@ -916,7 +946,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.mm.store(id.mm, Ordering::Relaxed);
         self.file_table.store(id.file_table, Ordering::Relaxed);
         self.generation.store(id.generation, Ordering::Relaxed);
-        self.affinity.store(id.affinity, Ordering::Relaxed);
+        self.affinity.store(
+            if id.affinity_source.is_bound() {
+                id.affinity_source.raw_host()
+            } else {
+                id.affinity
+            },
+            Ordering::Relaxed,
+        );
+        self.affinity_source
+            .store(id.affinity_source.encoded_guest(), Ordering::Release);
         self.lifecycle_page
             .store(id.lifecycle_page, Ordering::Relaxed);
         self.control_slot.store(id.control_slot, Ordering::Relaxed);
@@ -925,8 +964,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     /// Whether the thread may run on a slot bound to guest CPU `cpu_plus_one`
     /// (0: the slot's CPU is unknown, which allows any thread).
     fn allows_cpu(&self, cpu_plus_one: u32) -> bool {
-        let mask = self.affinity.load(Ordering::Relaxed);
-        cpu_plus_one == 0 || mask == 0 || cpu_plus_one > 64 || mask & (1 << (cpu_plus_one - 1)) != 0
+        let mask = self.affinity();
+        cpu_plus_one == 0
+            || (mask == 0 && !self.affinity_source().is_bound())
+            || cpu_plus_one > 64
+            || mask & (1 << (cpu_plus_one - 1)) != 0
     }
 
     fn ready_host_claim(&self, seq: u32) -> Claim {
@@ -1101,15 +1143,16 @@ pub struct ZoneSlot {
     state: AtomicU32,
     /// `guest CPU + 1` the executor holding the slot is bound to (0: any).
     cpu: AtomicU32,
-    /// Retained padding preserves the published slot layout.
-    _reserved_timer_owner: [AtomicU32; 2],
+    /// Guest alias of the host-loaded affinity authority. The old reserved
+    /// timer-owner word supplies this binding without growing the slot.
+    affinity_source: AtomicU64,
     /// `ICC_SGI1R_EL1` routing bits (Aff3/Aff2/Aff1 and the target-list bit
     /// of Aff0) of this slot's vCPU; EL1 writes it from `MPIDR_EL1` before
     /// the slot idles.
     sgi_target: AtomicU64,
     /// The zone key of the address space installed on this vCPU.
     mm: AtomicU64,
-    /// The affinity mask of the thread the host loaded here.
+    /// Host-loaded authority address, or a fixture mask when unbound.
     affinity: AtomicU64,
     /// The `CNTV_CVAL_EL0` EL1 armed on this slot's vCPU (0: disarmed).
     timer_cval: AtomicU64,
@@ -1179,9 +1222,37 @@ impl ZoneSlot {
         self.mm.load(Ordering::Acquire)
     }
 
-    /// The affinity mask of the thread the host loaded on this slot.
+    /// The exact live authority of the thread the host loaded on this slot.
+    pub fn affinity_source(&self) -> AffinitySource {
+        let guest = self.affinity_source.load(Ordering::Acquire);
+        let host = self.affinity.load(Ordering::Relaxed);
+        AffinitySource::from_retained_raw(host, guest)
+    }
+
     pub fn affinity(&self) -> u64 {
-        self.affinity.load(Ordering::Relaxed)
+        let source = self.affinity_source();
+        if source.is_bound() {
+            source.load().unwrap_or(0)
+        } else {
+            self.affinity.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Whether the live host-loaded authority excludes this slot's CPU.
+    /// An idle or fixture-only slot has no host residency to discharge.
+    pub fn affinity_excludes_cpu(&self) -> bool {
+        let source = self.affinity_source();
+        match (source.load(), self.bound_cpu()) {
+            (Some(mask), Some(cpu)) => cpu >= 64 || mask & (1u64 << cpu) == 0,
+            (None, Some(_)) => source.is_bound(),
+            _ => false,
+        }
+    }
+
+    /// The guest CPU this slot's executor is bound to, if any.
+    pub fn bound_cpu(&self) -> Option<u32> {
+        let val = self.cpu.load(Ordering::Acquire);
+        if val > 0 { Some(val - 1) } else { None }
     }
 
     pub fn sgi_target(&self) -> u64 {
@@ -1350,6 +1421,8 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     /// installed before the first host or guest birth, not during admission.
     serial_issuer: process::identity_allocator::SerialIssuerWord,
     mm_issuer: process::identity_allocator::MmIssuerWord,
+    /// Installed carrier CPU policy, independent of transient executor slots.
+    online_cpus: AtomicU64,
 }
 
 /// A fallible acquisition policy for callers that retain work on refusal.
@@ -1855,6 +1928,26 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
 
     pub fn slot(&self, slot: SlotId) -> &ZoneSlot {
         &self.slots[slot.index()]
+    }
+
+    /// Publish the carrier's installed CPU policy before guest entry.
+    /// Scheduler CPU IDs are contiguous and the shared mask holds at most 64.
+    pub fn publish_carrier_cpu_count(&self, count: usize) {
+        let count = count.clamp(1, 64);
+        let mask = u64::MAX >> (64 - count);
+        self.online_cpus.store(mask, Ordering::Release);
+    }
+
+    /// Online carrier CPUs, regardless of whether an executor is busy or idle.
+    /// Unpublished topology is unavailable, including on a single-CPU carrier.
+    pub fn carrier_affinity_mask(&self) -> Option<u64> {
+        let mask = self.online_cpus.load(Ordering::Acquire);
+        (mask != 0).then_some(mask)
+    }
+
+    pub fn carrier_cpu_count(&self) -> Option<usize> {
+        self.carrier_affinity_mask()
+            .map(|mask| 64 - mask.leading_zeros() as usize)
     }
 
     /// A record reference for its current incarnation.
@@ -3896,7 +3989,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// The host publishes the affinity of the thread it runs on `slot`
     /// (before each entry: the thread may have changed it).
     pub fn set_slot_affinity(&self, slot: SlotId, affinity: u64) {
-        self.slot(slot).affinity.store(affinity, Ordering::Relaxed);
+        if !self.slot(slot).affinity_source().is_bound() {
+            self.slot(slot).affinity.store(affinity, Ordering::Relaxed);
+        }
     }
 
     /// The executor settles `slot`'s parked home record into a host zone
@@ -3906,7 +4001,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     pub fn unhome(&self, slot: SlotId, record: RecordId, affinity: u64) -> Option<(u32, u64)> {
         let s = self.slot(slot);
         let rec = self.record(record);
-        rec.affinity.store(affinity, Ordering::Relaxed);
+        rec.set_affinity(affinity);
         let timer = self
             .timers
             .owned(self.record_ref(record))
@@ -3950,7 +4045,21 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Publish what the host loaded on `slot`: the zone key of its address
     /// space (0: not a zone process), the guest CPU its executor is bound to
     /// (`None`: any) and the loaded thread's affinity mask (0: any).
+    #[cfg(any(test, feature = "host-test"))]
     pub fn publish_slot(&self, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
+        self.publish_slot_with_affinity(slot, mm, cpu, AffinitySource::UNBOUND);
+        self.slot(slot).affinity.store(affinity, Ordering::Release);
+    }
+
+    /// Bind a live control authority before guest entry. The execution lane
+    /// retains its backing until this slot is rebound or cleared while stopped.
+    pub fn publish_slot_with_affinity(
+        &self,
+        slot: SlotId,
+        mm: u64,
+        cpu: Option<u32>,
+        source: AffinitySource,
+    ) {
         let s = self.slot(slot);
         s.terminal[0].store(0, Ordering::Release);
         s.mm.store(mm, Ordering::Release);
@@ -3958,7 +4067,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             cpu.map_or(0, |cpu| cpu.saturating_add(1)),
             Ordering::Release,
         );
-        s.affinity.store(affinity, Ordering::Release);
+        s.affinity.store(source.raw_host(), Ordering::Relaxed);
+        s.affinity_source
+            .store(source.encoded_guest(), Ordering::Release);
     }
 
     /// EL1 on idle `thief`: take a queued thread it may run from another
@@ -5022,6 +5133,13 @@ mod layout_manifest {
     }
 
     #[test]
+    fn affinity_alias_preserves_slot_layout() {
+        assert_eq!((size_of::<ZoneSlot>(), align_of::<ZoneSlot>()), (128, 64));
+        field!(ZoneSlot, affinity_source, AtomicU64, 40, 8, 8);
+        field!(ZoneSlot, affinity, AtomicU64, 64, 8, 8);
+    }
+
+    #[test]
     fn zone_record() {
         assert_eq!(
             (size_of::<ZoneRecord>(), align_of::<ZoneRecord>()),
@@ -5051,6 +5169,7 @@ mod layout_manifest {
                      deadline: _,
                      affinity: _,
                      object: _,
+                     affinity_source: _,
                      ctx: _,
                  }: ZoneRecord| {};
         field!(ZoneRecord, claim, AtomicU64, 0, 8, 8);
@@ -5075,6 +5194,7 @@ mod layout_manifest {
         field!(ZoneRecord, deadline, AtomicU64, 128, 8, 8);
         field!(ZoneRecord, affinity, AtomicU64, 136, 8, 8);
         field!(ZoneRecord, object, object_wait::ObjectRecord, 144, 40, 8);
+        field!(ZoneRecord, affinity_source, AtomicU64, 184, 8, 8);
         field!(ZoneRecord, ctx, UnsafeCell<ThreadCtx>, 192, 832, 16);
     }
 }

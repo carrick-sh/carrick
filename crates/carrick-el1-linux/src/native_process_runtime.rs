@@ -2215,6 +2215,23 @@ fn custody<'a, M: Clone, C: ProcessContext>(
     custody
 }
 impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
+    /// Resolve only controls licensed by this TaskKey's retained member custody
+    /// or its live pool entry. Numeric tids alone never license a pointer.
+    fn affinity_control(&self, tid: u32) -> Option<&ThreadControlSlot> {
+        if self.control.visible_tid() == Some(tid) {
+            return Some(self.control);
+        }
+        if let Some(member) = self
+            .members
+            .iter()
+            .find(|m| m.control.visible_tid() == Some(tid))
+        {
+            return Some(member.control.control());
+        }
+        let entry = self.page.entry_ref_for_visible_tid(tid)?;
+        let address = self.page.control_address(entry)?;
+        owned_control(self.page, self.control, address)
+    }
     pub fn file_table(&self) -> u64 {
         self.file_table
     }
@@ -2599,6 +2616,19 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             Box::new(words),
             custody(resources),
             task_claim,
+        );
+        // Process admission is independent of affinity service. Until the
+        // carrier publishes its topology the scheduler venue declines affinity;
+        // retain a host-seeded mask, or leave raw control storage unpublished.
+        if let Some(carrier_mask) = source.zone.carrier_affinity_mask() {
+            control.initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(&[
+                carrier_mask,
+            ]));
+        }
+        initial.init_leader(
+            visible.get(),
+            carrick_personality_linux::identity::TaskCredentials::ROOT,
+            [0u8; 16],
         );
         for (_, tid, _) in &imported {
             initial
@@ -2987,6 +3017,7 @@ struct ForkReservation<'a, M> {
     parent_dumpable: u32,
     parent_no_new_privs: bool,
     parent_comm: [u8; 16],
+    parent_affinity: carrick_core::affinity::CpuAffinity,
     parent_container: VisibleNamespace,
     parent_identity: ThreadIdentity,
     blocked: carrick_personality_linux::abi::thread::BlockedMask,
@@ -5020,6 +5051,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             parent_dumpable,
             parent_no_new_privs,
             parent_comm,
+            parent_affinity,
             parent_container,
         ) = {
             let mut graph = self.runtime.graph.lock();
@@ -5049,6 +5081,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let parent_comm = *row
                 .comm_for(caller_tid)
                 .map_err(|_| NativeProcessError::Stale)?;
+            let parent_affinity = row
+                .native()
+                .resources()
+                .affinity_control(caller_tid)
+                .ok_or(NativeProcessError::Stale)?
+                .affinity();
             let snapshot = graph
                 .owner
                 .capture_parent(self.key)
@@ -5132,6 +5170,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 parent_dumpable,
                 parent_no_new_privs,
                 parent_comm,
+                parent_affinity,
                 parent_container,
             )
         };
@@ -5179,6 +5218,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             parent_dumpable,
             parent_no_new_privs,
             parent_comm,
+            parent_affinity,
             parent_container,
             parent_identity,
             blocked,
@@ -5218,6 +5258,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             parent_dumpable,
             parent_no_new_privs,
             parent_comm,
+            parent_affinity,
             parent_container,
             parent_identity,
             blocked,
@@ -5286,6 +5327,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .map_err(|_| NativeProcessError::Quarantined)?;
                 return Err(NativeProcessError::Busy);
             }
+            control.set_affinity(parent_affinity);
             if !control.publish_visible_tid(visible.get()) {
                 page.unclaim(claim)
                     .map_err(|_| NativeProcessError::Quarantined)?;
@@ -5362,6 +5404,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // The child's first execution snapshot. Its birth serial travels
             // only in its pool identity, never in the snapshot word.
             generation: carrick_core_abi::SnapshotGeneration::INITIAL.raw(),
+            affinity_source: control.affinity_source(),
             affinity: parent_identity.affinity,
             lifecycle_page: page as *const _ as u64,
             control_slot: control as *const _ as u64,
@@ -7539,6 +7582,7 @@ mod tests {
                     mm: 1,
                     file_table: 5,
                     generation: 11,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                     affinity: 1,
                     lifecycle_page: &page as *const _ as u64,
                     control_slot: &control as *const _ as u64,
@@ -7630,6 +7674,7 @@ mod tests {
                     mm: child_mm,
                     file_table: 5,
                     generation: 12,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                     affinity: 1,
                     lifecycle_page: &child_page as *const _ as u64,
                     control_slot: &child_controls[1] as *const _ as u64,
@@ -7750,6 +7795,7 @@ mod tests {
                     mm,
                     file_table: 5,
                     generation: 11 + index as u64,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                     affinity: 1,
                     lifecycle_page: &pages[index] as *const _ as u64,
                     control_slot: &controls[index] as *const _ as u64,
@@ -8192,6 +8238,7 @@ mod tests {
                     mm: mm.raw().get(),
                     file_table: file.raw(),
                     generation: carrick_el1_abi::SnapshotGeneration::INITIAL.raw(),
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                     affinity: 1,
                     lifecycle_page: &pages[index] as *const _ as u64,
                     control_slot: &controls[index] as *const _ as u64,
@@ -8406,6 +8453,7 @@ mod tests {
                     mm: mm.raw().get(),
                     file_table: file.raw(),
                     generation: carrick_el1_abi::SnapshotGeneration::INITIAL.raw(),
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                     affinity: 1,
                     lifecycle_page: &pages[index] as *const _ as u64,
                     control_slot: &controls[index] as *const _ as u64,
@@ -8545,6 +8593,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &page as *const _ as u64,
                 control_slot: &leader_control as *const _ as u64,
@@ -8636,6 +8685,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: carrick_core_abi::SnapshotGeneration::INITIAL.raw(),
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &page as *const _ as u64,
                 control_slot: &thread_control as *const _ as u64,
@@ -8888,6 +8938,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &page as *const _ as u64,
                 control_slot: &leader_control as *const _ as u64,
@@ -8953,6 +9004,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 13,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &page as *const _ as u64,
                 control_slot: &thread_control as *const _ as u64,
@@ -9080,6 +9132,7 @@ mod tests {
                     mm: 1,
                     file_table: 5,
                     generation: 11,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                     affinity: 1,
                     lifecycle_page: &*page as *const _ as u64,
                     control_slot: &*control as *const _ as u64,
@@ -9173,6 +9226,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -9524,6 +9578,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -9639,6 +9694,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -9783,6 +9839,7 @@ mod tests {
                     mm: 1,
                     file_table: 5,
                     generation: 11,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                     affinity: 1,
                     lifecycle_page: &*page as *const _ as u64,
                     control_slot: &*control as *const _ as u64,
@@ -10058,6 +10115,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -10132,6 +10190,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 0,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &child_controls[1] as *const _ as u64,
@@ -10235,6 +10294,7 @@ mod tests {
             assert!(!ptr.is_null());
             Box::from_raw(ptr)
         };
+        zone.publish_carrier_cpu_count(1);
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
         let child_page = Box::new(ThreadLifecyclePage::new());
@@ -10272,6 +10332,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -10848,6 +10909,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 3, // fixture owns both CPU slots before either fork
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -11256,6 +11318,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -11403,6 +11466,7 @@ mod tests {
                 assert!(!ptr.is_null());
                 Box::from_raw(ptr)
             };
+            zone.publish_carrier_cpu_count(1);
             let page = Box::new(ThreadLifecyclePage::new());
             let control = Box::new(ThreadControlSlot::new());
             let child_page = Box::new(ThreadLifecyclePage::new());
@@ -11440,6 +11504,7 @@ mod tests {
                     mm: 1,
                     file_table: 5,
                     generation: 11,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                     affinity: 1,
                     lifecycle_page: &*page as *const _ as u64,
                     control_slot: &*control as *const _ as u64,
@@ -11677,6 +11742,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -11865,6 +11931,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -11971,6 +12038,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -12111,6 +12179,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -12213,6 +12282,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -12369,6 +12439,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -12814,6 +12885,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -12969,6 +13041,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -13468,6 +13541,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
@@ -13577,6 +13651,7 @@ mod tests {
             mm: 1,
             file_table: 5,
             generation: 11,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
             affinity: 1,
             lifecycle_page: &*page as *const _ as u64,
             control_slot: &*control as *const _ as u64,
@@ -13660,6 +13735,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 77,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1,
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,

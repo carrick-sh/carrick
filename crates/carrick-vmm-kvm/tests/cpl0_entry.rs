@@ -1102,7 +1102,12 @@ fn x1_boot_shared_substrate() {
     };
     let slot = SlotId::new(0);
     zone.drive(slot, 1);
-    zone.publish_slot(slot, 11, Some(0), 0);
+    zone.publish_slot_with_affinity(
+        slot,
+        11,
+        Some(0),
+        carrick_sched_core::AffinitySource::UNBOUND,
+    );
     zone.enter_guest(slot);
 
     let mm = 11u64;

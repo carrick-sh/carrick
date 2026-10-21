@@ -1001,6 +1001,7 @@ fn el1_ipc_wait_census_names_each_waiter_object_and_its_readiness() {
                 mm: 7,
                 file_table: 1,
                 generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 0,
                 lifecycle_page: 0,
                 control_slot: 0,

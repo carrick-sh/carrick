@@ -1437,7 +1437,12 @@ impl Cpl0Carrier {
         }
         let slot = SlotId::new(0);
         zone.drive(slot, 1);
-        zone.publish_slot(slot, mm.raw(), Some(0), 0);
+        zone.publish_slot_with_affinity(
+            slot,
+            mm.raw(),
+            Some(0),
+            carrick_sched_core::AffinitySource::UNBOUND,
+        );
         zone.enter_guest(slot);
         zone.install_space(slot, mm.raw())
             .ok_or_else(|| fail("production installed MM"))?;
@@ -1477,6 +1482,7 @@ impl Cpl0Carrier {
                 mm: mm.raw(),
                 file_table,
                 generation,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity,
                 lifecycle_page: METADATA_VA,
                 control_slot: METADATA_VA + CONTROL_OFFSET,
@@ -3502,7 +3508,12 @@ impl Cpl0Carrier {
             zone.spaces.open(space);
             let slot = SlotId::new(index as u8);
             zone.drive(slot, index as u64 + 1);
-            zone.publish_slot(slot, binding.mm.raw(), Some(index as u32), 0);
+            zone.publish_slot_with_affinity(
+                slot,
+                binding.mm.raw(),
+                Some(index as u32),
+                carrick_sched_core::AffinitySource::UNBOUND,
+            );
             zone.enter_guest(slot);
             zone.install_space(slot, binding.mm.raw())
                 .ok_or_else(|| fail("lifecycle installed MM"))?;
@@ -3536,6 +3547,7 @@ impl Cpl0Carrier {
                     mm: binding.mm.raw(),
                     file_table: 5,
                     generation: binding.generation.raw(),
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                     affinity: 1 << index,
                     lifecycle_page: page_address,
                     control_slot: controls_address,
@@ -3732,6 +3744,7 @@ impl Cpl0Carrier {
             mm: 1000,
             file_table: 1,
             generation: 1,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
             affinity: 1,
             lifecycle_page: 0,
             control_slot: 0,
@@ -3782,6 +3795,7 @@ impl Cpl0Carrier {
             mm: 1001,
             file_table: 1,
             generation: 1,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
             affinity: 1,
             lifecycle_page: 0,
             control_slot: 0,

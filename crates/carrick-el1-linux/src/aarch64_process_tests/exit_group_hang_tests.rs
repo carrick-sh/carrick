@@ -91,6 +91,7 @@ fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
             mm: root.shared().mm().id().raw(),
             file_table: root.resources().files().id().raw(),
             generation: root.task().key().serial.raw(),
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
             affinity: 3,
             lifecycle_page: page as *const _ as u64,
             control_slot: root.thread().control_slot() as *const _ as u64,
@@ -291,10 +292,19 @@ fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
             assert!(service_records.len() <= members.len());
         }
     }
-    for member in members {
-        let running = if let Some(ready) = service_records.iter().find(|ready| {
-            fixture.zone.record(ready.id).identity().tid == member.thread().key().tid.raw() as u64
-        }) {
+    let mut remaining: std::collections::BTreeMap<_, _> = members
+        .iter()
+        .map(|member| (member.thread().key(), *member))
+        .collect();
+    for _ in members {
+        let running = if let Some(ready) = service_records.pop() {
+            let member = remaining
+                .values()
+                .find(|member| {
+                    fixture.zone.record(ready.id).identity().tid
+                        == member.thread().key().tid.raw() as u64
+                })
+                .expect("exact woken service member");
             let running = scheduler
                 .take_zone(
                     &executor,
@@ -311,6 +321,11 @@ fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
                 .unwrap()
                 .expect("woken host member")
         };
+        // Affinity placement can change ready-job order. Retire each exact
+        // participant once, using the job actually owned by this executor.
+        let member = remaining
+            .remove(&running.thread().key())
+            .expect("each exact member is dequeued once");
         assert_eq!(running.thread().key(), member.thread().key());
         kernel.exit_thread(member, None).unwrap();
         let birth =
@@ -319,6 +334,8 @@ fn serial_host_arm_exit_group_preserves_deferred_control_handback() {
         page.publish_exact_host_retirement(member.thread().control_slot(), birth.retirement());
         scheduler.settle_exited(running).unwrap();
     }
+    assert!(remaining.is_empty());
+    assert!(service_records.is_empty());
     assert_eq!(page.live(), 0);
     assert!(members.iter().all(|member| !member.exact_thread_is_live()));
     fixture.zone.enter_guest(fixture.slot);

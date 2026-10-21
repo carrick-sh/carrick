@@ -1493,6 +1493,7 @@ mod tests {
                     mm: 1,
                     file_table: 5,
                     generation: 11,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                     affinity: 1,
                     lifecycle_page: &page as *const _ as u64,
                     control_slot: &control as *const _ as u64,

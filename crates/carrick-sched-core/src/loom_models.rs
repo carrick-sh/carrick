@@ -68,6 +68,7 @@ fn make_zone() -> Arc<Box<ZoneTables>> {
         init!(idle_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(queued_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(completion_consumer, AtomicU32::new(0));
+        init!(online_cpus, AtomicU64::new(0));
         init!(
             delegated_host_pending,
             core::array::from_fn(|_| AtomicU64::new(0))
@@ -94,6 +95,7 @@ fn make_zone() -> Arc<Box<ZoneTables>> {
                 next: AtomicU32::new(0),
                 deadline: AtomicU64::new(0),
                 affinity: AtomicU64::new(0),
+                affinity_source: AtomicU64::new(0),
                 cancelled: IncarnationRequest(AtomicU64::new(0)),
                 host_wanted: HostRequest(AtomicU64::new(0)),
                 object: core::mem::zeroed(),
@@ -115,6 +117,7 @@ fn birth(zone: &ZoneTables) -> RecordRef {
             generation: 0,
             lifecycle_page: 1,
             control_slot: 1,
+            affinity_source: crate::AffinitySource::UNBOUND,
             affinity: 0,
         })
         .unwrap();
@@ -138,6 +141,7 @@ fn current_handback_preserves_birth_incarnation_for_mint() {
                         generation,
                         lifecycle_page: 1,
                         control_slot: 1,
+                        affinity_source: crate::AffinitySource::UNBOUND,
                         affinity: 0,
                     })
                     .unwrap();

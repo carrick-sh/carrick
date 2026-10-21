@@ -825,6 +825,9 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         TRANSFER_PIN_RETIRED,
         EL1_ZONE_OFFSET,
         carrick_sched_core::CLAIM_WORD_PROTOCOL,
+        carrick_sched_core::affinity_source::AFFINITY_SOURCE_PROTOCOL,
+        core::mem::size_of::<carrick_sched_core::AffinitySource>() as u64,
+        core::mem::align_of::<carrick_sched_core::AffinitySource>() as u64,
         carrick_sched_core::HOST_REQUEST_PROTOCOL,
         carrick_sched_core::TIMER_INDEX_PROTOCOL,
         carrick_sched_core::process::identity_allocator::SERIAL_ISSUER_PROTOCOL,
@@ -3953,7 +3956,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x994eecf8eef4c6ad);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xf537874c1c75b0b4);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

@@ -4996,18 +4996,9 @@ where
         // vCPU is in the guest; the exit closes that before the slot is
         // settled below.
         let zone_slot = zone::zone_slot(engine);
-        if let Some((zone, slot)) = zone_slot {
-            // The thread may have changed its affinity since it was loaded:
-            // EL1 places the records it creates for it by this mask.
-            if let Some(thread) = self.state.kernel_thread.as_ref() {
-                zone.set_slot_affinity(slot, thread.affinity().words()[0]);
-            }
-            zone.enter_guest(slot);
-        }
-        let next = engine.next_syscall();
-        if let Some((zone, slot)) = zone_slot {
-            zone.leave_guest(slot, &carrick_kernel::el1_zone::HostLockWait);
-        }
+        let next = zone::run_guest(self.state.kernel_thread.as_deref(), zone_slot, || {
+            engine.next_syscall()
+        });
         if let Some(thread) = self.state.kernel_thread.as_ref() {
             thread.charge_user_ns(engine.take_guest_run_receipt_ns());
         }
@@ -7225,6 +7216,7 @@ mod tests {
                     mm,
                     file_table: root.resources().files().id().raw(),
                     generation: 0,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                     affinity: 1,
                     lifecycle_page: &*page as *const _ as u64,
                     control_slot: address,
@@ -9022,9 +9014,7 @@ mod tests {
         let guard = poll
             .find("if !engine.el1_operation_suspended() {")
             .expect("suspended-EL1 guard");
-        let run = poll
-            .find("let next = engine.next_syscall();")
-            .expect("guest run");
+        let run = poll.find("let next = zone::run_guest(").expect("guest run");
         for step in [
             "guest_execution.is_none()",
             "control_quantum()",

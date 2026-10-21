@@ -266,6 +266,14 @@ pub fn with_test_zone<T>(zone: &'static ZoneTables, run: impl FnOnce() -> T) -> 
     run()
 }
 
+/// Publish the installed carrier policy independently of in-guest scheduling.
+/// Affinity remains authoritative when the futex-zone hatch is disabled.
+pub fn publish_carrier_cpu_count(count: usize) {
+    if let Some(zone) = zone_tables() {
+        zone.publish_carrier_cpu_count(count);
+    }
+}
+
 /// The zone tables, if this carrier serves private futexes in the zone.
 pub fn zone() -> Option<&'static ZoneTables> {
     #[cfg(feature = "test-support")]
@@ -879,20 +887,24 @@ pub fn count_host_executor_park() {
 /// queue and that the vCPU's executor loads when EL1 reaches it. False: no
 /// record could be allocated; the caller keeps the thread on the host.
 pub fn place_service(
-    thread: crate::kernel::ThreadKey,
+    thread: &crate::kernel::Thread,
     generation: crate::kernel::objects::ExecutionGeneration,
-    affinity: u64,
 ) -> bool {
     let Some(zone) = zone() else {
         return false;
     };
+    let affinity_source = thread.control_slot().affinity_source();
+    if !affinity_source.is_guest_mapped() {
+        return false;
+    }
     let identity = carrick_el1_abi::ThreadIdentity {
-        tid: carrick_el1_abi::El1TaskId::from_linux_tid(thread.tid.raw()).raw(),
-        serial: thread.serial.raw(),
+        tid: carrick_el1_abi::El1TaskId::from_linux_tid(thread.key().tid.raw()).raw(),
+        serial: thread.key().serial.raw(),
         mm: 0,
         file_table: 0,
         generation: generation.raw(),
-        affinity,
+        affinity_source,
+        affinity: thread.affinity().words()[0],
         lifecycle_page: 0,
         control_slot: 0,
     };
@@ -1456,6 +1468,31 @@ mod tests {
     use carrick_el1_abi::{Claim, ThreadIdentity};
 
     #[test]
+    fn serial_host_carrier_topology_is_published_with_zone_disabled() {
+        let mut region = carrick_test_support::TestEl1Region::zeroed();
+        let previous = carrick_el1_abi::get_el1_region_host_ptr();
+        struct Restore(usize, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(self.0);
+                enable(self.1);
+            }
+        }
+        let _restore = Restore(
+            previous,
+            GUEST_SCHEDULER.load(std::sync::atomic::Ordering::Acquire),
+        );
+        carrick_el1_abi::record_el1_region_host_ptr(region.as_mut_ptr() as usize);
+        enable(false);
+        let count = crate::kernel::scheduler::guest_cpu_count();
+        crate::kernel::scheduler::publish_guest_cpu_count(count);
+        assert!(zone().is_none());
+        let raw = carrick_el1_abi::zone_tables().unwrap();
+        assert_eq!(raw.carrier_affinity_mask(), Some(u64::MAX >> (64 - count)));
+        assert_eq!(raw.carrier_cpu_count(), Some(count));
+    }
+
+    #[test]
     fn foreign_parked_thread_projection_uses_exact_incarnation_not_vcpu_home() {
         let zone = heap_zone();
         let own = crate::kernel::ThreadKey::from_zone_identity(
@@ -1522,6 +1559,7 @@ mod tests {
             mm: 7,
             file_table: 1,
             generation: 1,
+            affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
             affinity: 0,
             lifecycle_page: 0,
             control_slot: 0,
@@ -1563,6 +1601,7 @@ mod tests {
                 mm: 7,
                 file_table: 1,
                 generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 0,
                 lifecycle_page: 0,
                 control_slot: 0,
@@ -1583,6 +1622,7 @@ mod tests {
                 mm: 7,
                 file_table: 1,
                 generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 0,
                 lifecycle_page: 0,
                 control_slot: 0,
@@ -1933,6 +1973,7 @@ mod tests {
                     mm: 2,
                     file_table: 1,
                     generation: 267,
+                    affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                     affinity: 0,
                     lifecycle_page: 0,
                     control_slot: 0,
@@ -2019,9 +2060,21 @@ mod tests {
         use deferred_capture_control::{HoldOutcome, arm};
         use std::time::Duration;
 
-        fn thread() -> crate::kernel::ThreadKey {
-            crate::kernel::ThreadKey::from_zone_identity(42, std::num::NonZeroU64::new(43).unwrap())
-                .unwrap()
+        fn thread(mask: u64) -> &'static crate::kernel::KernelContext {
+            let (_, context) = crate::kernel::continuation::test_support::bootstrap(42);
+            context
+                .thread()
+                .set_affinity(carrick_hal::CpuAffinity::from_words(&[mask]));
+            // Retain the real control while the leaked zone retains its source.
+            let context = Box::leak(Box::new(context));
+            let control = context.thread().control_slot();
+            // SAFETY: this VM-free fixture pins the control at both aliases.
+            unsafe {
+                control.publish_affinity_aliases(carrick_guest_arch::GuestVa::new(
+                    core::ptr::from_ref(control).expose_provenance() as u64,
+                ));
+            }
+            context
         }
 
         fn captures(run: impl FnOnce()) -> Vec<Vec<RecordRef>> {
@@ -2045,6 +2098,7 @@ mod tests {
 
         #[test]
         fn hold_is_captured_exactly_once_at_the_next_step_away() {
+            let context = thread(1);
             let zone: &'static ZoneTables = Box::leak(heap_zone());
             let slot = SlotId::new(0);
             zone.drive(slot, 7);
@@ -2057,9 +2111,8 @@ mod tests {
                     step_away_from_slot(slot, 7);
                     zone.step_back(slot, 7);
                     assert!(place_service(
-                        thread(),
-                        crate::kernel::objects::ExecutionGeneration::from_raw(9),
-                        1
+                        context.thread(),
+                        crate::kernel::objects::ExecutionGeneration::from_raw(9)
                     ));
                     // Held: not queued where the guest could run it.
                     assert_eq!(zone.slot(slot).queued(), 0);
@@ -2076,6 +2129,7 @@ mod tests {
 
         #[test]
         fn nothing_is_held_before_the_first_step_away() {
+            let context = thread(1);
             let zone: &'static ZoneTables = Box::leak(heap_zone());
             let slot = SlotId::new(0);
             zone.drive(slot, 7);
@@ -2084,9 +2138,8 @@ mod tests {
                 with_test_zone(zone, || {
                     let hold = arm(Duration::from_secs(10));
                     assert!(place_service(
-                        thread(),
-                        crate::kernel::objects::ExecutionGeneration::from_raw(9),
-                        1
+                        context.thread(),
+                        crate::kernel::objects::ExecutionGeneration::from_raw(9)
                     ));
                     // Placed normally on the live slot, not held.
                     assert_eq!(zone.slot(slot).queued(), 1);
@@ -2103,6 +2156,7 @@ mod tests {
         /// stepping away on the record's allowed CPU releases it.
         #[test]
         fn hold_needs_a_step_away_on_an_allowed_cpu() {
+            let context = thread(1);
             let zone: &'static ZoneTables = Box::leak(heap_zone());
             let (allowed, other) = (SlotId::new(0), SlotId::new(1));
             zone.drive(allowed, 7);
@@ -2111,9 +2165,8 @@ mod tests {
             zone.publish_slot(other, 0, Some(1), 0);
             let place = || {
                 assert!(place_service(
-                    thread(),
-                    crate::kernel::objects::ExecutionGeneration::from_raw(9),
-                    0b1
+                    context.thread(),
+                    crate::kernel::objects::ExecutionGeneration::from_raw(9)
                 ));
             };
             // Stall shape: only the partner's slot (another CPU) steps away.
@@ -2162,13 +2215,16 @@ mod tests {
         /// live slot's executor takes exactly that record.
         #[test]
         fn held_record_is_placed_like_a_production_record() {
+            let context = thread(3);
             let generation = crate::kernel::objects::ExecutionGeneration::from_raw(9);
             let expected = carrick_el1_abi::ThreadIdentity {
-                tid: carrick_el1_abi::El1TaskId::from_linux_tid(thread().tid.raw()).raw(),
-                serial: thread().serial.raw(),
+                tid: carrick_el1_abi::El1TaskId::from_linux_tid(context.thread().key().tid.raw())
+                    .raw(),
+                serial: context.thread().key().serial.raw(),
                 mm: 0,
                 file_table: 0,
                 generation: generation.raw(),
+                affinity_source: context.thread().control_slot().affinity_source(),
                 affinity: 0b11,
                 lifecycle_page: 0,
                 control_slot: 0,
@@ -2188,7 +2244,7 @@ mod tests {
                             let hold = arm(Duration::from_secs(10));
                             step_away_from_slot(live, 8);
                             zone.step_back(live, 8);
-                            assert!(place_service(thread(), generation, 0b11));
+                            assert!(place_service(context.thread(), generation));
                             assert_eq!(zone.slot(away).queued() + zone.slot(live).queued(), 0);
                             step_away_from_slot(away, 7);
                             let HoldOutcome::ReleasedAtStepAway { record: held, slot } =
@@ -2226,6 +2282,7 @@ mod tests {
 
         #[test]
         fn unreleased_hold_expires_to_the_host_queue() {
+            let context = thread(1);
             let zone: &'static ZoneTables = Box::leak(heap_zone());
             let slot = SlotId::new(0);
             zone.drive(slot, 7);
@@ -2239,9 +2296,8 @@ mod tests {
                     step_away_from_slot(slot, 7);
                     zone.step_back(slot, 7);
                     assert!(place_service(
-                        thread(),
-                        crate::kernel::objects::ExecutionGeneration::from_raw(9),
-                        1
+                        context.thread(),
+                        crate::kernel::objects::ExecutionGeneration::from_raw(9)
                     ));
                     outcome = hold.finish();
                     published = 1;

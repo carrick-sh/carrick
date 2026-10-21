@@ -322,10 +322,40 @@ pub struct LifecycleWindow {
     len: u64,
 }
 
+/// Prepared control aliases of one cold lifecycle loan. The carrier retains
+/// the underlying metadata mapping through the loan and its eventual reclaim.
+#[must_use = "publish aliases only after the matching loan is accepted"]
+pub struct PreparedLifecycleAffinity {
+    controls: core::ptr::NonNull<carrick_el1_abi::ThreadControlSlot>,
+    guest_controls: carrick_guest_arch::GuestVa,
+    count: usize,
+}
+impl PreparedLifecycleAffinity {
+    /// Publish only after the owner accepted the matching loan. No fallible
+    /// operation remains: preparation checked the entire retained array.
+    pub fn publish(self) {
+        let stride = core::mem::size_of::<carrick_el1_abi::ThreadControlSlot>();
+        for index in 0..self.count {
+            // SAFETY: preparation checked the complete aligned control array;
+            // the carrier's stock custody retains its mapping through reclaim.
+            let control = unsafe { &*self.controls.as_ptr().add(index) };
+            let guest = carrick_guest_arch::GuestVa::new(
+                self.guest_controls.raw() + (index * stride) as u64,
+            );
+            // SAFETY: LifecycleWindow licenses these host/guest aliases of the
+            // same retained allocation, including the complete authority cell.
+            unsafe {
+                control.publish_affinity_aliases(guest);
+            }
+        }
+    }
+}
+
 impl LifecycleWindow {
     /// # Safety
-    /// `host` must be valid for reads and writes of `len` bytes for as long
-    /// as the window is used, and must back guest kernel VAs `va..va + len`.
+    /// `host` must remain valid for reads and writes of `len` bytes while
+    /// this window or any derived alias-publication token/source is used,
+    /// and must back guest kernel VAs `va..va + len`.
     pub unsafe fn new(host: core::ptr::NonNull<u8>, va: u64, len: u64) -> Self {
         Self { host, va, len }
     }
@@ -349,6 +379,38 @@ impl LifecycleWindow {
             )?,
             range(lifecycle.controls.raw(), controls)?,
         ])
+    }
+
+    /// Prepare an infallible alias publication from cold retained storage.
+    /// Preparation itself writes nothing, so a refused loan remains cold.
+    pub fn prepare_affinity_aliases(
+        self,
+        lifecycle: ForkLifecycleLoan,
+    ) -> Option<PreparedLifecycleAffinity> {
+        let ranges = self.ranges(lifecycle)?;
+        let (controls, len) = ranges[1];
+        let stride = core::mem::size_of::<carrick_el1_abi::ThreadControlSlot>();
+        if !controls
+            .addr()
+            .is_multiple_of(core::mem::align_of::<carrick_el1_abi::ThreadControlSlot>())
+            || !len.is_multiple_of(stride)
+            || lifecycle
+                .page
+                .raw()
+                .checked_add(core::mem::size_of::<carrick_el1_abi::ThreadLifecyclePage>() as u64)?
+                > lifecycle.controls.raw()
+        {
+            return None;
+        }
+        lifecycle.controls.raw().checked_add(len as u64)?;
+        if !self.is_zero(lifecycle) {
+            return None;
+        }
+        Some(PreparedLifecycleAffinity {
+            controls: core::ptr::NonNull::new(controls.cast())?,
+            guest_controls: carrick_guest_arch::GuestVa::new(lifecycle.controls.raw()),
+            count: len / stride,
+        })
     }
 
     /// True when the record's page and controls are all zero.

@@ -910,7 +910,7 @@ impl HvpatchRuntimeDirectory {
 
     /// The policy to build the carrier's scheduler with: the installed one, or
     /// the default per-CPU policy sized by the host's guest CPU count.
-    fn scheduling_policy(&self) -> Arc<dyn carrick_hal::SchedulingPolicy> {
+    pub(crate) fn scheduling_policy(&self) -> Arc<dyn carrick_hal::SchedulingPolicy> {
         self.scheduling_policy.lock().clone().unwrap_or_else(|| {
             Arc::new(carrick_hal::GuestCpuPolicy::new(
                 carrick_kernel::kernel::scheduler::default_guest_cpu_count(),

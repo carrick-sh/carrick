@@ -502,6 +502,10 @@ pub struct ThreadControlSlot {
     native_pending_writer: AtomicU32,
     /// The exact thread's sole affinity authority, shared by ring and host.
     affinity: carrick_core::affinity::AffinityAuthority,
+    // Allocation aliases survive reset; the carrier pins both mappings before
+    // publishing this control to EL1. Never dereference the other venue's VA.
+    affinity_host_alias: AtomicU64,
+    affinity_guest_alias: AtomicU64,
 }
 
 impl ThreadControlSlot {
@@ -529,6 +533,31 @@ impl ThreadControlSlot {
     pub fn initialize_affinity(&self, mask: carrick_core::affinity::CpuAffinity) {
         self.affinity.initialize(mask.words()[0]);
     }
+    /// The carrier has mapped this host control allocation into EL1.
+    /// # Safety
+    /// `guest_control` must alias this retained control for the complete
+    /// lifetime of every scheduler source published from it.
+    pub unsafe fn publish_affinity_aliases(&self, guest_control: carrick_guest_arch::GuestVa) {
+        let host = core::ptr::from_ref(&self.affinity).expose_provenance() as u64;
+        let guest = guest_control.raw() + core::mem::offset_of!(Self, affinity) as u64;
+        self.affinity_host_alias.store(host, Ordering::Relaxed);
+        self.affinity_guest_alias.store(guest, Ordering::Release);
+    }
+    pub fn affinity_source(&self) -> carrick_sched_core::affinity_source::AffinitySource {
+        let guest = self.affinity_guest_alias.load(Ordering::Acquire);
+        let host = self.affinity_host_alias.load(Ordering::Relaxed);
+        #[cfg(not(target_os = "none"))]
+        let host = if host == 0 {
+            core::ptr::from_ref(&self.affinity).expose_provenance() as u64
+        } else {
+            host
+        };
+        // SAFETY: every scheduler publication retains this exact control's
+        // allocation until its record/slot is retired. The host-only form
+        // cannot be offered to guest scheduling before mapping publication.
+        unsafe { carrick_sched_core::affinity_source::AffinitySource::from_aliases(host, guest) }
+    }
+
     pub fn recorded_exit_kind(
         &self,
         entry: Option<EntryRef>,
@@ -539,6 +568,8 @@ impl ThreadControlSlot {
     pub const fn new() -> Self {
         Self {
             affinity: carrick_core::affinity::AffinityAuthority::new(),
+            affinity_host_alias: AtomicU64::new(0),
+            affinity_guest_alias: AtomicU64::new(0),
             visible_tid: AtomicU32::new(0),
             blocked: AtomicU64::new(0),
             forwarded_saved_mask: AtomicU64::new(0),
@@ -1979,7 +2010,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 44] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 46] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::offset_of!(PoolEntry, birth) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, terminal) as u64,
@@ -2024,6 +2055,8 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 44] = [
     ::core::mem::size_of::<ClosingVerdictRecord>() as u64,
     ::core::mem::offset_of!(ThreadControlSlot, affinity) as u64,
     ::core::mem::size_of::<carrick_core::affinity::AffinityAuthority>() as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, affinity_host_alias) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, affinity_guest_alias) as u64,
 ];
 
 #[cfg(test)]
@@ -3008,6 +3041,8 @@ mod layout_manifest {
                      native_pending: _,
                      native_pending_writer: _,
                      affinity: _,
+                     affinity_host_alias: _,
+                     affinity_guest_alias: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
@@ -3069,6 +3104,15 @@ mod layout_manifest {
             carrick_core::affinity::AffinityAuthority,
             192,
             32,
+            8
+        );
+        field!(ThreadControlSlot, affinity_host_alias, AtomicU64, 224, 8, 8);
+        field!(
+            ThreadControlSlot,
+            affinity_guest_alias,
+            AtomicU64,
+            232,
+            8,
             8
         );
     }

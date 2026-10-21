@@ -18,7 +18,7 @@ contracts = ["host.lease.workload-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/wait_wake.rs"
-contracts = ["kernel.wait.child-exit-notification-lifecycle"]
+contracts = ["kernel.scheduler.runnable-progress", "kernel.wait.child-exit-notification-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-observability/src/work_meter.rs"
@@ -63,6 +63,10 @@ contracts = ["kernel.signal.socket-restart"]
 [[surfaces]]
 path = "crates/carrick-core/src/ipc_permissions.rs"
 contracts = ["kernel.ipc.permission-classes"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/affinity.rs"
+contracts = ["kernel.scheduler.runnable-progress"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/sysv.rs"
@@ -652,7 +656,7 @@ contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.thread-lifecycle"
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/tests.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "process.native.terminal-child"]
+contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/sched.rs"
@@ -668,11 +672,11 @@ contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/el1_zone.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity"]
+contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/zone.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_sched.rs"
@@ -1434,7 +1438,7 @@ contracts = ["process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
-contracts = ["process.native.terminal-child", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-child", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/internal_read.rs"
@@ -1506,7 +1510,7 @@ contracts = ["process.native.arm-admission"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
-contracts = ["process.native.arm-admission", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.scheduler.runnable-progress", "process.native.arm-admission", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/file_region.rs"
@@ -1719,6 +1723,19 @@ contracts = ["kernel.scheduler.runnable-progress"]
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/affinity.rs"
+contracts = ["kernel.scheduler.runnable-progress"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/affinity_source.rs"
+contracts = ["kernel.scheduler.runnable-progress"]
+
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/zone_affinity_tests.rs"
+contracts = ["kernel.scheduler.runnable-progress"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/carrier.rs"
 contracts = ["kernel.scheduler.runnable-progress"]
 
 [[surfaces]]

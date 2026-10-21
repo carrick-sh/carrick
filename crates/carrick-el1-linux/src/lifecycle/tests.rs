@@ -169,12 +169,16 @@ impl World {
         cpu.regs.contextidr_el1 = PARENT_TID;
         cpu.regs.tpidrro_el0 = (PARENT_TID << 32) | PARENT_TID;
         cpu.regs.v[3] = 0xfeed;
+        let venue = Venue::new(hatches);
+        venue
+            .leader_slot()
+            .set_affinity(carrick_core::affinity::CpuAffinity::single(SLOT_IDX as u32));
         Self {
             zone,
             tasks,
             cpu,
             counters: Box::new(Counters::default()),
-            venue: Venue::new(hatches),
+            venue,
         }
     }
 
@@ -2180,6 +2184,9 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
         .child_slot(1)
         .reset_for_birth(BlockedMask(0), 0, running)
         .unwrap();
+    w.venue
+        .child_slot(1)
+        .set_affinity(carrick_core::affinity::CpuAffinity::single(SLOT_IDX as u32));
     w.task().set(
         El1TaskId::from_linux_tid(70),
         carrick_el1_abi::SnapshotGeneration::from_raw(1),
@@ -2221,6 +2228,7 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
     assert!(
         matches!(invoke(LifecycleCall::Clone, &mut native), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == i64::from(CHILD_VISIBLE))
     );
+    assert_eq!(w.venue.child_slot(0).affinity().words()[0], 1 << SLOT_IDX);
     assert_eq!(w.page().live(), 2);
     assert_eq!(w.zone.slot(SLOT).queued(), 1);
 }
@@ -2889,6 +2897,7 @@ fn clone_terminal_failure_witness(mode: u8) {
                 mm: MM,
                 file_table: 5,
                 generation: 1,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
                 affinity: 1 << SLOT_IDX,
                 lifecycle_page: w.page() as *const _ as u64,
                 control_slot: w.venue.leader_slot() as *const _ as u64,
