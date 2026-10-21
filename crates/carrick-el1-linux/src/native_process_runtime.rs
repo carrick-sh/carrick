@@ -5062,8 +5062,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .owner
                 .task(self.key)
                 .map_err(|_| NativeProcessError::Stale)?;
-            if row.native().resources().page.gate() != carrick_el1_abi::GateState::Open {
-                return Err(busy(NativeForkStage::ParentLifecycleGate));
+            let observed = row.native().resources().page.gate();
+            match observed {
+                // Exec's missing executable thread-birth capacity does not
+                // conflict with a process fork: its child receives a distinct
+                // lifecycle page. Keep the parent's binding state intact.
+                carrick_el1_abi::GateState::Open
+                | carrick_el1_abi::GateState::AwaitingExecBinding => {}
+                carrick_el1_abi::GateState::ForkClosing
+                | carrick_el1_abi::GateState::Closed
+                | carrick_el1_abi::GateState::HostOnly => {
+                    return Err(busy(NativeForkStage::ParentLifecycleGate { observed }));
+                }
             }
             let parent_mm = row.native().resources().mm.clone();
             let identity = row.identity();
@@ -8008,7 +8018,9 @@ mod tests {
                     assert_eq!(
                         error,
                         NativeProcessError::ForkRefused(NativeForkRefusal {
-                            stage: NativeForkStage::ParentLifecycleGate,
+                            stage: NativeForkStage::ParentLifecycleGate {
+                                observed: peer_gate,
+                            },
                             cause: NativeForkCause::Busy,
                         })
                     );
