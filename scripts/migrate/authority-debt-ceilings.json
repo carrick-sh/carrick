@@ -32981,7 +32981,7 @@
     {
       "family": "k1_create_install",
       "operation": "write_for_io",
-      "owner": "carrick_kernel::dispatch::fs::directory::FsView<'a>::getdents64",
+      "owner": "carrick_kernel::dispatch::fs::directory::FsView<'a>::getdents64_from_open_file",
       "lane": "shared",
       "ceiling": 1
     },
@@ -33086,7 +33086,7 @@
     {
       "family": "k1_create_install",
       "operation": "write_for_io",
-      "owner": "carrick_kernel::dispatch::net::lifecycle::NetView<'a>::take_socket_pending_error",
+      "owner": "carrick_kernel::dispatch::net::lifecycle::NetView<'a>::take_socket_pending_error_from",
       "lane": "shared",
       "ceiling": 1
     },

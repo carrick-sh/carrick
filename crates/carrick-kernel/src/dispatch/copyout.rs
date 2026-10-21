@@ -156,6 +156,7 @@ pub enum OwnedCopyoutOperation {
     SocketError {
         open_file: crate::dispatch::fd_table::OpenFile,
         lease: crate::kernel::objects::FileDescriptionFdLease,
+        source: crate::dispatch::net::SocketErrorSource,
         optval_addr: u64,
         optlen_addr: u64,
     },
@@ -217,11 +218,12 @@ impl super::SyscallDispatcher {
             OwnedCopyoutOperation::SocketError {
                 open_file,
                 lease: _,
+                source,
                 optval_addr,
                 optlen_addr,
             } if request.number == carrick_abi::syscall::nr::GETSOCKOPT => self
                 .net_view()
-                .socket_error_from_open_file(open_file, optval_addr, optlen_addr, memory),
+                .socket_error_from_open_file(open_file, source, optval_addr, optlen_addr, memory),
             OwnedCopyoutOperation::Accept {
                 open_file,
                 sockaddr,

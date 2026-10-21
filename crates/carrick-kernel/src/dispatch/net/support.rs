@@ -1518,6 +1518,7 @@ struct PendingUnixClient {
 struct UnixPathRegistry {
     paths: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
     pending_clients: std::collections::HashMap<i32, std::collections::VecDeque<PendingUnixClient>>,
+    accept_locks: std::collections::HashMap<i32, std::sync::Weak<std::sync::Mutex<()>>>,
 }
 
 pub(super) fn register_unix_listener(host_path: &[u8], host_fd: i32, cred: SocketPeerCred) {
@@ -1596,21 +1597,20 @@ pub(super) fn pop_pending_unix_client(
 /// returns no identity with which to join these two queues after the fact, so
 /// concurrent acceptors must claim both under the listener's exact lock.
 pub(super) fn unix_accept_lock(listener_host_fd: i32) -> Arc<std::sync::Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<i32, std::sync::Weak<std::sync::Mutex<()>>>>,
-    > = std::sync::OnceLock::new();
-    let mut locks = LOCKS
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    let mut registry = unix_path_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(lock) = locks
+    if let Some(lock) = registry
+        .accept_locks
         .get(&listener_host_fd)
         .and_then(std::sync::Weak::upgrade)
     {
         return lock;
     }
     let lock = Arc::new(std::sync::Mutex::new(()));
-    locks.insert(listener_host_fd, Arc::downgrade(&lock));
+    registry
+        .accept_locks
+        .insert(listener_host_fd, Arc::downgrade(&lock));
     lock
 }
 
