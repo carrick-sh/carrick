@@ -1402,7 +1402,7 @@ pub mod deferred_capture_control {
         if zone.slot(slot).driver() != Some(driver)
             || !zone.slot(slot).is_live()
             || !zone.record_allows_slot(record.id, slot)
-            || !deliver_placement(zone.requeue_on(slot, record.id))
+            || !super::deliver_placement(zone.requeue_on(slot, record.id))
         {
             return;
         }
