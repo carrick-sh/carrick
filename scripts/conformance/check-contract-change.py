@@ -3428,7 +3428,7 @@ _KNOWN_EXEC_MACROS = frozenset({
 
 
 def _strip_non_semantic_ident_occurrences(
-    text: str, extra_local_macros: set[str] | None = None
+    text: str, extra_local_macros: set[str] | None = None, preserve_bindings: bool = False
 ) -> str:
     """Blank out non-executing macro invocations (such as `stringify!(...)` or `nop!{ assert!(...) }`),
     `if false { ... }` / `while false { ... }` blocks, uncalled closures, and local `let [mut] <ident>`
@@ -3564,6 +3564,8 @@ def _strip_non_semantic_ident_occurrences(
         pos = closure_end
 
     s = "".join(chars)
+    if preserve_bindings:
+        return s
     # Blank out simple local variable pattern names in `let [mut] <ident>` (not followed by `::`, `{`, or `(`).
     let_pat_re = re.compile(r"\blet\s+(?:mut\s+)?((?:r#)?[A-Za-z_][A-Za-z0-9_]*)\b(?!\s*(?:::|\{|\())")
     chars = list(s)
@@ -3655,6 +3657,85 @@ def _crate_depends_on(view: RepoView, test_pkg: str, surface_pkg: str, strict: b
     return False
 
 
+def _method_call_uses_receiver(text: str, receiver_type: str, method: str) -> bool:
+    """Require each method call's own receiver to have the changed impl type.
+
+    Support explicit associated paths, constructors, unit values and local
+    bindings with an explicit type or constructor. Unknown receiver types fail
+    closed; an unrelated type mention elsewhere never supplies call authority.
+    """
+    type_path = rf"(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*{re.escape(receiver_type)}"
+    generics = r"(?:\s*::\s*<[^;{}]*>)?"
+    if re.search(rf"\b{type_path}{generics}\s*::\s*{re.escape(method)}\s*\(", text):
+        return True
+
+    def scopes_at(pos: int) -> tuple[int, ...]:
+        stack: list[int] = []
+        for index, char in enumerate(text[:pos]):
+            if char == "{":
+                stack.append(index)
+            elif char == "}" and stack:
+                stack.pop()
+        return tuple(stack)
+
+    def constructor(expr: str) -> bool:
+        expr = re.sub(r"^(?:\s*&\s*(?:mut\s+)?)*", "", expr.strip())
+        return bool(re.match(rf"^{type_path}{generics}\s*(?:\(|\{{|$)", expr))
+
+    def local_has_type(name: str, before: int, seen: set[str]) -> bool | None:
+        if name in seen:
+            return False
+        seen = seen | {name}
+        pattern = re.compile(
+            rf"(?<![.\w])\b(?:let\s+(?:mut\s+)?)?{re.escape(name)}\s*"
+            r"(?::\s*([^=;]+))?\s*=(?!=)\s*"
+        )
+        call_scopes = scopes_at(before)
+        visible = [
+            match for match in pattern.finditer(text, 0, before)
+            if call_scopes[:len(scopes_at(match.start()))] == scopes_at(match.start())
+        ]
+        if not visible:
+            return None
+        declaration = visible[-1]
+        annotation = declaration.group(1)
+        if annotation and re.fullmatch(rf"\s*&?\s*(?:mut\s+)?{type_path}\s*", annotation):
+            return True
+        expr = text[declaration.end():before].split(";", 1)[0].strip()
+        if constructor(expr):
+            return True
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", expr):
+            return local_has_type(expr, declaration.start(), seen) is True
+        return False
+
+    for call in re.finditer(rf"\.\s*{re.escape(method)}\s*\(", text):
+        prefix = text[:call.start()].rstrip()
+        if prefix.endswith((")", "}")):
+            closing = prefix[-1]
+            opening = "(" if closing == ")" else "{"
+            depth = 0
+            for index in range(len(prefix) - 1, -1, -1):
+                if prefix[index] == closing:
+                    depth += 1
+                elif prefix[index] == opening:
+                    depth -= 1
+                    if depth == 0:
+                        if re.search(rf"\b{type_path}{generics}\s*$", prefix[:index]):
+                            return True
+                        break
+        else:
+            value = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)$", prefix)
+            if value:
+                name = value.group(1)
+                qualifier = prefix[:value.start()].rstrip()
+                if qualifier.endswith(".") or (qualifier.endswith("::") and name != receiver_type):
+                    continue
+                local_type = local_has_type(name, call.start(), set())
+                if local_type is True or (name == receiver_type and local_type is None):
+                    return True
+    return False
+
+
 def bound_test_references_surface(
     root: Path,
     base_view: RepoView,
@@ -3696,6 +3777,10 @@ def bound_test_references_surface(
             )
         )
     cleaned_texts = [_strip_non_semantic_ident_occurrences(txt, file_macros) for txt in ref_texts]
+    receiver_texts = [
+        _strip_non_semantic_ident_occurrences(txt, file_macros, preserve_bindings=True)
+        for txt in ref_texts
+    ]
     for ident in items:
         if ident.startswith("fn:"):
             if test_pkg and surface_pkg and not _crate_depends_on(head_view, test_pkg, surface_pkg, strict=True):
@@ -3703,14 +3788,7 @@ def bound_test_references_surface(
             fn_spec = ident[3:]
             if "::" in fn_spec:
                 recv_type, fn_ident = fn_spec.split("::", 1)
-                snake_recv = re.sub(r"(?<!^)(?=[A-Z])", "_", recv_type).lower()
-                call_pat = re.compile(rf"\b{re.escape(fn_ident)}\s*\(")
-                recv_pat = re.compile(
-                    rf"\b{re.escape(recv_type)}\b|\b{re.escape(snake_recv)}\s*\("
-                )
-                if any(call_pat.search(txt) for txt in cleaned_texts) and any(
-                    recv_pat.search(txt) for txt in cleaned_texts
-                ):
+                if any(_method_call_uses_receiver(txt, recv_type, fn_ident) for txt in receiver_texts):
                     return True
             else:
                 # Free function: require non-dot call (`name(` or `path::name(`, never `.name(`).

@@ -3173,6 +3173,50 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         res_c_ok = self.run_check(base_sha=base_a)
         self.assertEqual(res_c_ok.returncode, 0, msg=f"cross-crate with dep stdout: {res_c_ok.stdout}\nstderr: {res_c_ok.stderr}")
 
+    def test_review6_unrelated_receiver_mention_fails(self):
+        """A type mention cannot license a method call on a different receiver."""
+        self.use_single_contract_surface()
+        production = (
+            "pub struct WorkMeter(u64);\nimpl WorkMeter {\n"
+            "    pub fn sample_units(&self) -> u64 {\n        self.0\n    }\n}\n"
+        )
+        self.guest_file.write_text(production)
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base = self._commit_all("seed receiver provenance")
+        tests = (
+            "#[cfg(test)]\nmod tests {\n"
+            "struct Other;\nimpl Other { fn sample_units(&self) -> u64 { 2 } }\n"
+            "#[test]\nfn witness() {\n"
+            "    let _ = core::mem::size_of::<super::WorkMeter>();\n"
+            "    assert_eq!(Other.sample_units(), 2);\n}\n}\n"
+        )
+        changed = production.replace("        self.0\n", "        self.0 + 1\n")
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::witness"\n')
+        for expression in (
+            "Other.sample_units()",
+            "{ let m = super::WorkMeter(1); let m = Other; m.sample_units() }",
+            "{ let m = Other; let _ = super::WorkMeter(1); m.sample_units() }",
+            "{ let WorkMeter = Other; WorkMeter.sample_units() }",
+            "{ { let m = super::WorkMeter(1); } let m = Other; m.sample_units() }",
+        ):
+            with self.subTest(unrelated=expression):
+                self.guest_file.write_text(changed + tests.replace("Other.sample_units()", expression))
+                self._commit_all("mention WorkMeter but invoke an unrelated receiver")
+                result = self.run_check(base_sha=base)
+                self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+                self.assertIn("does not reference changed surface", result.stderr)
+
+        for expression in ("super::WorkMeter(1).sample_units()",
+                           "{ let m = super::WorkMeter(1); m.sample_units() }",
+                           "super::WorkMeter::sample_units(&super::WorkMeter(1))",
+                           "{ let m: super::WorkMeter = super::WorkMeter(1); m.sample_units() }",
+                           "{ let m = super::WorkMeter(1); let alias = m; alias.sample_units() }"):
+            with self.subTest(expression=expression):
+                self.guest_file.write_text(changed + tests.replace("Other.sample_units()", expression))
+                self._commit_all("invoke the actual receiver")
+                result = self.run_check(base_sha=base)
+                self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

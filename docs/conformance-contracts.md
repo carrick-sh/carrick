@@ -175,6 +175,12 @@ impersonate a built-in assertion. The signed-HVF lane evaluates `debug_assertion
 using the release profile built by `test-signed-body.sh`; signed-CLI, host,
 KVM and integration harnesses use the test profile. Workspace profile overrides apply.
 Targets with `harness = false` cannot supply ordinary libtest evidence.
+For body-only method changes, each qualifying invocation must use the changed
+impl's receiver: an associated path, direct constructor or unit value, or a
+visible local binding with that type or constructor. Binding aliases preserve
+that evidence; shadowing and sibling scopes do not. A separate type mention
+cannot qualify a call on another receiver. Unresolved receiver types supply no
+relevance.
 Contract-function bindings still use only the contract
 function's body for relevance. Identifier matching is textual (after stripping
 comments, string literals, `stringify!`, and local `let` bindings), not Rust name
