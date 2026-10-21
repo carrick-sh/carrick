@@ -25,6 +25,10 @@ fn disposable_worker_has_no_publisher_or_artifact_transfer() {
     for name in ["contents", "pull-requests", "issues"] {
         assert_eq!(worker["permissions"][name].as_str(), Some("write"));
     }
+    assert!(
+        !text.contains("dispatch-toolchain-"),
+        "restore-only cache remains"
+    );
     assert_eq!(
         workflow["on"]["issues"]["types"][0].as_str(),
         Some("labeled")
@@ -38,6 +42,15 @@ fn disposable_worker_has_no_publisher_or_artifact_transfer() {
         .iter()
         .position(|s| s["id"].as_str() == Some("worker"))
         .unwrap();
+    assert!(
+        steps[agent]["env"]["GH_TOKEN"].is_badvalue(),
+        "agent step retains job token"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["id"].as_str() == Some("admission"))
+    );
     let complete = steps
         .iter()
         .position(|s| s["id"].as_str() == Some("complete"))
@@ -96,6 +109,7 @@ fn provider_workflow_selects_only_the_admitted_backend() {
 #[test]
 fn git_configuration_comment_is_honest() {
     let source = include_str!("../src/dispatch_worker.rs");
+    assert!(source.contains("Worktree .gitattributes is honored"));
     assert!(
         !source.contains("All repositories used by the driver have freshly created configuration.")
     );
@@ -104,6 +118,9 @@ fn git_configuration_comment_is_honest() {
 #[test]
 fn residual_documentation_is_honest() {
     let docs = include_str!("../../../docs/ci/dispatch-worker.md");
+    assert!(docs.contains("25522481 is disabled"));
+    assert!(docs.contains("25523683 is active"));
+    assert!(docs.contains("fixed refspec"));
     for residual in [
         "dedicated",
         "refresh token",
@@ -158,23 +175,25 @@ fn foreground(case: &str) {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    let account = Command::new("/usr/bin/id")
-        .args(["-u", "carrick-dispatch-agent"])
-        .output()
-        .unwrap();
-    if account.status.code() == Some(1) {
-        eprintln!("UNRUN: pre-created carrick-dispatch-agent account absent");
-        return;
+    if case != "oversize" {
+        let account = Command::new("/usr/bin/id")
+            .args(["-u", "carrick-dispatch-agent"])
+            .output()
+            .unwrap();
+        if account.status.code() == Some(1) {
+            eprintln!("UNRUN: pre-created carrick-dispatch-agent account absent");
+            return;
+        }
+        assert!(account.status.success());
+        assert!(
+            !Command::new("/usr/bin/sudo")
+                .args(["-n", "-u", "root", "--", "/usr/bin/true"])
+                .status()
+                .unwrap()
+                .success(),
+            "runner can become root"
+        );
     }
-    assert!(account.status.success());
-    assert!(
-        !Command::new("/usr/bin/sudo")
-            .args(["-n", "-u", "root", "--", "/usr/bin/true"])
-            .status()
-            .unwrap()
-            .success(),
-        "runner can become root"
-    );
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("checkout");
     let state = temp.path().join("carrick-agent-42-1");
@@ -378,15 +397,38 @@ fi
             .env("GITHUB_RUN_ATTEMPT", "1")
             .env("GITHUB_SHA", &base)
             .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
-            .env("GH_TOKEN", "fixture-job-token")
-            .env("GITHUB_TOKEN", "fixture-job-token")
-            .env("AGENT_DIRECTOR_TOKEN", "fixture-bootstrap-read-token")
+            .envs((action != "run").then_some(("GH_TOKEN", "fixture-job-token")))
             .env("GITHUB_STEP_SUMMARY", &summary)
             .env("GITHUB_OUTPUT", &outputs)
             .output()
             .unwrap();
         assert!(output.status.success(), "{action}: {output:?}");
     };
+    if case == "oversize" {
+        let package = temp.path().join("dispatch-output");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::File::create(package.join("raw.log"))
+            .unwrap()
+            .set_len(21 * 1024 * 1024)
+            .unwrap();
+        invoke("complete");
+        assert!(
+            std::fs::read_to_string(temp.path().join("gh.args"))
+                .unwrap()
+                .contains("issue\ncomment\n733\n")
+        );
+        assert!(
+            std::fs::read_to_string(&outputs)
+                .unwrap()
+                .contains("worker_failed=true")
+        );
+        assert!(!temp.path().join("push.args").exists());
+        for entry in std::fs::read_dir(package).unwrap() {
+            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            assert!(!text.contains("fixture-job-token"));
+        }
+        return;
+    }
     invoke("run");
     let raw = std::fs::read_to_string(temp.path().join("dispatch-output/raw.log")).unwrap();
     if case == "retirement" {
@@ -565,4 +607,41 @@ fn dispatch_requires_precreated_account_and_agent_only_sudo() {
         !source.contains("File::create(state.join(\"agent.out\"))"),
         "runner-owned output handed to agent metadata repair"
     );
+}
+
+#[test]
+fn agent_phase_rejects_a_job_token_in_its_own_environment() {
+    use std::process::Command;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+    command.args(["dispatch-worker", "run", "--event", "/missing-event"]);
+    let output = command.env("GH_TOKEN", "fixture-token").output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("agent phase received a job token"));
+    let output = command
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("agent phase received a job token"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn oversized_partial_produce_still_reports() {
+    foreground("oversize");
+}
+
+#[test]
+fn agent_step_has_no_job_token() {
+    let docs = YamlLoader::load_from_str(include_str!(
+        "../../../.github/workflows/dispatch-worker.yml"
+    ))
+    .unwrap();
+    let worker = docs[0]["jobs"]["worker"]["steps"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"].as_str() == Some("worker"))
+        .unwrap();
+    assert!(worker["env"]["GH_TOKEN"].is_badvalue());
 }

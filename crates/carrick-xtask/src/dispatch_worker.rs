@@ -19,6 +19,8 @@ pub enum DispatchAction {
     Guard {
         #[arg(long)]
         event: PathBuf,
+        #[arg(long)]
+        admit: bool,
     },
     /// Finish this job: scan artifacts, push its branch and report the contract.
     Complete {
@@ -484,45 +486,10 @@ fn output(command: &mut Command) -> Result<Vec<u8>, ScalerError> {
     crate::ci_scaler::execute(command, &[], std::time::Duration::from_secs(120))
 }
 pub(crate) fn git_invocation(root: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new("git");
-    // Repository-local config still applies. After agent retirement, snapshot()
-    // copies objects and files into a fresh repo before any runner Git command.
-    // No candidate .git/config, alternates, hooks, attributes or env is trusted.
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_GRAFT_FILE", "/dev/null")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.attributesFile=/dev/null",
-            "-c",
-            "credential.helper=",
-            "-c",
-            "filter.lfs.clean=",
-            "-c",
-            "filter.lfs.smudge=",
-            "-c",
-            "filter.lfs.process=",
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "user.name=github-actions[bot]",
-            "-c",
-            "user.email=41898282+github-actions[bot]@users.noreply.github.com",
-        ])
-        .args(args)
-        .current_dir(root);
-    cmd
+    // Worktree .gitattributes is honored; it has no driver without config.
+    crate::safe_copy::git_command(root, args)
 }
+
 fn git(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
     String::from_utf8(output(&mut git_invocation(root, args))?)
         .map_err(|_| ScalerError::Guard("non-UTF8 git output"))
@@ -733,14 +700,21 @@ struct Receipt {
 }
 
 pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
+    if matches!(&args.action, DispatchAction::Run { .. })
+        && ["GH_TOKEN", "GITHUB_TOKEN"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some())
+    {
+        return Err(ScalerError::Guard("agent phase received a job token"));
+    }
     let root = root.canonicalize()?;
-    let (event_path, setup, complete) = match args.action {
-        DispatchAction::Guard { event } => (event, None, false),
+    let (event_path, setup, complete, admit) = match args.action {
+        DispatchAction::Guard { event, admit } => (event, None, false, admit),
         DispatchAction::Run {
             event,
             setup_status,
-        } => (event, Some(setup_status), false),
-        DispatchAction::Complete { event } => (event, None, true),
+        } => (event, Some(setup_status), false, false),
+        DispatchAction::Complete { event } => (event, None, true, false),
     };
     let event: Value = serde_json::from_slice(&std::fs::read(event_path)?)?;
     let mut dispatch = validate_event(
@@ -750,11 +724,31 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     )?;
     assigned_branch(&mut dispatch)?;
     branch_run(dispatch.issue, &dispatch.branch)?;
+    if admit {
+        cleanup_agent_user()?;
+        if dispatch.resume {
+            require_owned_pr(&root, &dispatch)?;
+            git(
+                &root,
+                &[
+                    "-c",
+                    "credential.helper=!gh auth git-credential",
+                    "fetch",
+                    "--no-tags",
+                    "https://github.com/carrick-sh/carrick",
+                    &format!("refs/heads/{0}:refs/heads/{0}", dispatch.branch),
+                ],
+            )?;
+        }
+    }
     if complete {
         return finish(&root, &dispatch);
     }
     if let Some(setup) = setup {
-        produce(&root, &dispatch, &setup)?;
+        if let Err(error) = produce(&root, &dispatch, &setup) {
+            cleanup_agent_user()?;
+            produce(&root, &dispatch, &error.to_string())?;
+        }
     } else if let Some(path) = std::env::var_os("GITHUB_OUTPUT") {
         use std::io::Write;
         writeln!(
@@ -766,106 +760,17 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum TreeLinks {
-    Preserve,
-    Refuse,
-}
+use crate::safe_copy::Links as TreeLinks;
 fn copy_tree(
     source: &Path,
     target: &Path,
     count: &mut usize,
     links: TreeLinks,
 ) -> Result<(), ScalerError> {
-    std::fs::create_dir(target)?;
-    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o700))?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        if matches!(entry.file_name().to_str(), Some("target" | ".git")) {
-            continue;
-        }
-        *count += 1;
-        if *count > 100_000 {
-            return Err(ScalerError::Guard("snapshot file count exceeded"));
-        }
-        let kind = entry.file_type()?;
-        let dest = target.join(entry.file_name());
-        if kind.is_dir() {
-            copy_tree(&entry.path(), &dest, count, links)?;
-        } else if kind.is_file() {
-            std::fs::copy(entry.path(), dest)?;
-        } else if kind.is_symlink() && matches!(links, TreeLinks::Preserve) {
-            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, dest)?;
-        } else {
-            return Err(ScalerError::Guard("snapshot refused nonregular file"));
-        }
-    }
-    Ok(())
+    Ok(crate::safe_copy::tree(source, target, count, links)?)
 }
 fn snapshot(source: &Path, target: &Path, branch: &str) -> Result<(), ScalerError> {
-    if !std::fs::symlink_metadata(source)?.is_dir()
-        || !std::fs::symlink_metadata(source.parent().ok_or(ScalerError::Guard("agent root"))?)?
-            .is_dir()
-    {
-        return Err(ScalerError::Guard("agent worktree redirected"));
-    }
-    let dotgit = source.join(".git");
-    if !std::fs::symlink_metadata(&dotgit)?.is_dir() {
-        return Err(ScalerError::Guard("agent git directory redirected"));
-    }
-    let head = regular_text(&dotgit.join("HEAD"))?;
-    let expected = format!("ref: refs/heads/{branch}");
-    if head.trim() != expected {
-        return Err(ScalerError::Guard("agent changed branch"));
-    }
-    // Loose ref is guaranteed by preparation. Ref directories must not be links.
-    let mut path = dotgit.clone();
-    for part in format!("refs/heads/{branch}").split('/') {
-        path.push(part);
-        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
-            return Err(ScalerError::Guard("redirected candidate ref"));
-        }
-    }
-    let head = regular_text(&path)?.trim().to_owned();
-    if !sha(&head) {
-        return Err(ScalerError::Guard("invalid candidate head"));
-    }
-    copy_tree(source, target, &mut 0, TreeLinks::Preserve)?;
-    git(target, &["init"])?;
-    // Deliberately omit info/alternates, config, grafts, shallow, index and refs.
-    let objects = dotgit.join("objects");
-    if std::fs::symlink_metadata(&objects)?
-        .file_type()
-        .is_symlink()
-    {
-        return Err(ScalerError::Guard("redirected objects"));
-    }
-    for entry in std::fs::read_dir(objects)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_str().ok_or(ScalerError::Guard("object path"))?;
-        if name == "info" {
-            continue;
-        }
-        if name != "pack" && !(name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit())) {
-            return Err(ScalerError::Guard("unexpected object directory"));
-        }
-        if !entry.file_type()?.is_dir() {
-            return Err(ScalerError::Guard("object directory link"));
-        }
-        let dest = target.join(".git/objects").join(name);
-        if dest.exists() {
-            std::fs::remove_dir(&dest)?;
-        }
-        copy_tree(&entry.path(), &dest, &mut 0, TreeLinks::Refuse)?;
-    }
-    git(
-        target,
-        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
-    )?;
-    git(target, &["update-ref", "HEAD", &head])?;
-    git(target, &["read-tree", "HEAD"])?;
-    Ok(())
+    crate::safe_copy::repository(source, target, branch)
 }
 
 fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerError> {
@@ -885,7 +790,7 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
     let package =
         PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?)
             .join("dispatch-output");
-    std::fs::create_dir(&package)?;
+    std::fs::create_dir_all(&package)?;
     std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o700))?;
     let mut contract = Contract {
         status: ContractStatus::Failed,
@@ -897,11 +802,8 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
     let mut expected_tip = String::new();
     let mut raw = String::new();
     let mut diffstat = String::new();
-    let mut refused_workflow = false;
+    let mut refused_workflow = setup != "success/success";
     if setup == "success/success" {
-        if dispatch.resume {
-            require_owned_pr(root, dispatch)?;
-        }
         #[cfg(target_os = "linux")]
         // SAFETY: adopt and reap detached children before scanning agent bytes.
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
@@ -947,23 +849,13 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
             ],
         )?;
         if dispatch.resume {
-            git(
-                &actor_work,
-                &[
-                    "-c",
-                    "credential.helper=!gh auth git-credential",
-                    "fetch",
-                    "--no-tags",
-                    "https://github.com/carrick-sh/carrick",
-                    &format!("refs/heads/{}", dispatch.branch),
-                ],
-            )?;
-            expected_tip = git(&actor_work, &["rev-parse", "FETCH_HEAD"])?
+            let reference = format!("origin/{}", dispatch.branch);
+            expected_tip = git(&actor_work, &["rev-parse", &reference])?
                 .trim()
                 .to_owned();
             git(
                 &actor_work,
-                &["checkout", "-b", &dispatch.branch, "FETCH_HEAD"],
+                &["checkout", "-b", &dispatch.branch, &reference],
             )?;
             git(&actor_work, &["rebase", &base])?;
         } else {
@@ -1136,6 +1028,13 @@ fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
     let package =
         PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?)
             .join("dispatch-output");
+    if !state.join("receipt.json").exists() {
+        produce(
+            root,
+            dispatch,
+            "Worker phase failed before producing a receipt",
+        )?;
+    }
     mask_artifacts(&package, &token)?;
     let receipt: Receipt = serde_json::from_str(&regular_text(&state.join("receipt.json"))?)?;
     if receipt.branch != dispatch.branch
@@ -1146,7 +1045,6 @@ fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
     }
     let contract: Contract = serde_json::from_str(&regular_text(&package.join("contract.json"))?)?;
     let id = if dispatch.resume {
-        require_owned_pr(root, dispatch)?;
         branch_run(dispatch.issue, &dispatch.branch)?.to_owned()
     } else {
         run_id()?
@@ -1166,6 +1064,9 @@ fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
             && work.is_dir()
             && git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base
         {
+            if dispatch.resume {
+                require_owned_pr(root, dispatch)?;
+            }
             let tip = git(
                 &work,
                 &[
@@ -1389,6 +1290,7 @@ mod tests {
         git(&actor, &["config", "filter.poison.clean", "./poison.sh"]).unwrap();
         std::fs::write(actor.join(".gitattributes"), "data filter=poison\n").unwrap();
         std::fs::write(actor.join("data"), "agent modification").unwrap();
+        git(&actor, &["pack-refs", "--all", "--prune"]).unwrap();
         snapshot(&actor, &target, "work/dispatch-42").unwrap();
         git(&target, &["add", "."]).unwrap();
         git(&target, &["commit", "-m", "read agent data"]).unwrap();
