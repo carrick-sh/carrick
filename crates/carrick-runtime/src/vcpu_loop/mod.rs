@@ -3396,6 +3396,8 @@ pub(crate) mod tests {
         pub(crate) prepared_cancels: usize,
         pub(crate) prepared_commits: usize,
         pub(crate) copyout_owner_probe: Option<CopyoutOwnerProbe>,
+        // Frame result, result already completed when injected, restart flag.
+        pub(crate) injected_signals: Vec<(Option<i64>, Option<i64>, bool)>,
     }
 
     struct TestPreparedClear<'a> {
@@ -3658,10 +3660,12 @@ pub(crate) mod tests {
             if self.exec_support { (0, 1) } else { (0, 0) }
         }
 
-        fn inject_signal(
-            &mut self,
-            _signal: carrick_hal::SignalInjection,
-        ) -> Result<(), TrapError> {
+        fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
+            self.injected_signals.push((
+                signal.pending_syscall_retval,
+                self.completed_syscalls.last().copied(),
+                signal.restart_syscall,
+            ));
             Ok(())
         }
 
@@ -3877,6 +3881,30 @@ pub(crate) mod tests {
 
     #[test]
     fn serial_host_pipe2_owner_wait_redispatches_through_production_runtime_once() {
+        exercise_owner_wait(carrick_abi::syscall::nr::PIPE2, None);
+    }
+
+    #[test]
+    fn serial_host_owner_wait_defers_usr1_until_real_fstat_and_wait4_completion() {
+        for nr in [
+            carrick_abi::syscall::nr::FSTAT,
+            carrick_abi::syscall::nr::WAIT4,
+        ] {
+            exercise_owner_wait(nr, Some(carrick_abi::LINUX_SIGUSR1));
+        }
+    }
+
+    #[test]
+    fn serial_host_owner_wait_sigkill_terminates_with_live_sibling_editor_held() {
+        for nr in [
+            carrick_abi::syscall::nr::FSTAT,
+            carrick_abi::syscall::nr::WAIT4,
+        ] {
+            exercise_owner_wait(nr, Some(carrick_abi::LINUX_SIGKILL));
+        }
+    }
+
+    fn exercise_owner_wait(nr: carrick_abi::CanonicalNr, signum: Option<i32>) {
         use carrick_abi::{LinuxCloneFlags, syscall::nr};
         use carrick_el1_linux::mm_portal::{
             MmPortal,
@@ -3886,8 +3914,16 @@ pub(crate) mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let (_runtime, _carrier_scheduler, kernel, _carrier_root, process, _carrier_generation) =
-            test_carrier_graph_with_dispatcher!(71_102, SyscallDispatcher::new());
+        let (process, _) = crate::hvpatch::process_context_for_tests(71_102);
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
+        let kernel = Arc::new(KernelState::new(
+            dispatcher,
+            Arc::new(EndpointTestSignalPump),
+            Arc::new(EndpointTestSignalArrival),
+            Some(process.clone()),
+            None,
+        ));
         let root = kernel.dispatcher.capture_one_task_context().unwrap();
         let sibling = root
             .kernel()
@@ -3981,10 +4017,16 @@ pub(crate) mod tests {
         );
         let frame = carrick_hal::RawSyscall {
             current_guest_sp: None,
-            number: nr::PIPE2,
-            args: [0x71_1020, 0, 0, 0, 0, 0],
+            number: nr,
+            args: if nr == nr::PIPE2 {
+                [0x71_1020, 0, 0, 0, 0, 0]
+            } else if nr == nr::FSTAT {
+                [0, 0x71_1020, 0, 0, 0, 0]
+            } else {
+                [u64::MAX, 0x71_1020, 1, 0, 0, 0]
+            },
             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
-            native_number: carrick_abi::NativeNr(nr::PIPE2.raw()),
+            native_number: carrick_abi::NativeNr(nr.raw()),
         };
 
         let region = Box::leak(Box::new(Region::new()));
@@ -4030,6 +4072,13 @@ pub(crate) mod tests {
         carrick_kernel::el1_zone::with_test_handback_publisher(handback, || {
             carrick_kernel::el1_zone::with_test_zone(zone, || {
                 std::thread::scope(|scope| {
+                    struct ReleaseOnDrop<'a>(&'a mpsc::SyncSender<()>);
+                    impl Drop for ReleaseOnDrop<'_> {
+                        fn drop(&mut self) {
+                            let _ = self.0.try_send(());
+                        }
+                    }
+                    let _release_on_failure = ReleaseOnDrop(&release_tx);
                     let peer = scope.spawn(move || {
                         let access = carrick_el1_linux::sched::object_wait::space_access(
                             zone,
@@ -4084,9 +4133,9 @@ pub(crate) mod tests {
                             trap_kind: 1,
                             response_action: 0,
                             flags: 0,
-                            native_nr: nr::PIPE2.raw(),
+                            native_nr: nr.raw(),
                             args: frame.args,
-                            x8: nr::PIPE2.raw(),
+                            x8: nr.raw(),
                             resume_pc: 0x4004,
                             spsr: 0,
                             fp: 0x7000,
@@ -4170,8 +4219,47 @@ pub(crate) mod tests {
                         .settle_blocked_continuation(running, *continuation, wait_registration)
                         .unwrap();
 
-                    release_tx.send(()).unwrap();
-                    peer.join().unwrap();
+                    if let Some(signum) = signum {
+                        let signal =
+                            carrick_kernel::kernel::LinuxSignal::for_signal_number(signum).unwrap();
+                        if signum == carrick_abi::LINUX_SIGUSR1 {
+                            let mut action = carrick_abi::LinuxSigaction::empty();
+                            action.sa_handler = 0x5000;
+                            root.signal_authority().install_action(signal, action);
+                        }
+                        let carrick_kernel::kernel::ExactSignalTargetAuthorization::Allowed(target) =
+                            root.kernel().authorize_signal_target_exact(
+                                &root,
+                                root.task().key(),
+                                Some(root.thread().key()),
+                                Some(signal),
+                            )
+                        else {
+                            panic!("authorize signal for the exact live waiter")
+                        };
+                        assert!(matches!(
+                            root.kernel().post_guest_thread_signal_to_authorized_target(
+                                &target, signal, None
+                            ),
+                            carrick_kernel::kernel::ExactThreadSignalPost::Posted(Some(_))
+                        ));
+                        wait_service.publish_signal_for_thread(root.thread().key());
+                        assert!(engine.completed_syscalls.is_empty());
+                        assert!(engine.injected_signals.is_empty());
+                        if signum == carrick_abi::LINUX_SIGUSR1 {
+                            assert_eq!(
+                                scheduler.queued_len(),
+                                0,
+                                "ordinary signal cannot release the owner wait"
+                            );
+                            assert!(root.signal_authority().thread_pending().contains(signum));
+                        }
+                    }
+                    let killing = signum == Some(carrick_abi::LINUX_SIGKILL);
+                    if !killing {
+                        release_tx.send(()).unwrap();
+                        peer.join().unwrap();
+                    }
                     carrick_kernel::el1_zone::hand_back_completions();
                     let deadline = std::time::Instant::now() + Duration::from_millis(200);
                     while scheduler.queued_len() == 0 && std::time::Instant::now() < deadline {
@@ -4216,14 +4304,56 @@ pub(crate) mod tests {
                             binding::OwnedSyscallResume::CopyoutRedispatch,
                         )
                         .unwrap();
-                    assert!(matches!(completed, executor::ExecutorExit::Syscall));
+                    if killing {
+                        assert!(
+                            matches!(
+                                job.phase,
+                                HvpatchProductionPhase::TerminalProcessDrain { .. }
+                                    | HvpatchProductionPhase::RetainedMemoryRetry { .. }
+                            ),
+                            "SIGKILL must reach production termination before editor release"
+                        );
+                        assert!(kernel.process_exiting());
+                        let fatal = kernel
+                            .fatal_signal
+                            .recorded_for(job.state.fatal_image_generation)
+                            .expect("production signal service records the fatal outcome");
+                        assert_eq!(fatal.signo, carrick_abi::LINUX_SIGKILL);
+                        assert!(
+                            engine.copyout_owner_probe.unwrap().wait_if_busy().is_some(),
+                            "the real editor must remain held through termination"
+                        );
+                        assert!(engine.injected_signals.is_empty());
+                        assert_eq!(engine.prepared_commits, 0);
+                        release_tx.send(()).unwrap();
+                        // The scoped peer is joined when this scope ends.
+                    } else {
+                        assert!(matches!(completed, executor::ExecutorExit::Syscall));
+                        let result = if nr == nr::WAIT4 { -10 } else { 0 };
+                        assert_eq!(engine.completed_syscalls, [result]);
+                        if signum.is_some() {
+                            assert_eq!(
+                                engine.injected_signals,
+                                [(Some(result), Some(result), false)]
+                            );
+                            assert!(
+                                !root
+                                    .signal_authority()
+                                    .thread_pending()
+                                    .contains(carrick_abi::LINUX_SIGUSR1)
+                            );
+                        }
+                    }
                     let lease = resumed_submission.take_execution_lease().unwrap();
                     resumed.restore_lease(lease).unwrap();
                     scheduler.settle_runnable_successor(resumed).unwrap();
-                    assert_eq!(engine.completed_syscalls, [0]);
-                    assert_eq!(engine.prepared_commits, 1);
-                    assert_eq!(engine.guest_memory[&0x71_1020].len(), 8);
-                    assert_eq!(root.resources().files().slot_count(), 2);
+                    if !killing {
+                        assert_eq!(engine.prepared_commits, usize::from(nr != nr::WAIT4));
+                        if nr == nr::PIPE2 {
+                            assert_eq!(engine.guest_memory[&0x71_1020].len(), 8);
+                            assert_eq!(root.resources().files().slot_count(), 2);
+                        }
+                    }
                 });
             });
         });
