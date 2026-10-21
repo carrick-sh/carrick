@@ -87,6 +87,18 @@ fn ring_call(
     tid: u32,
     mask: &mut u64,
 ) -> i64 {
+    ring_call_route(process, current, zone, index, number, tid, mask).0
+}
+
+fn ring_call_route(
+    process: &mut dyn ProcessNative<Words>,
+    current: &[CurrentTask],
+    zone: &ZoneTables,
+    index: u8,
+    number: u64,
+    tid: u32,
+    mask: &mut u64,
+) -> (i64, carrick_personality_linux::dispatch::CompletionRoute) {
     let mut frame = carrick_el1_abi::TrapFrame {
         slot: u64::from(index),
         ..Default::default()
@@ -125,12 +137,13 @@ fn ring_call(
         route,
         carrick_personality_linux::dispatch::CompletionRoute::Served
             | carrick_personality_linux::dispatch::CompletionRoute::WithWork
+            | carrick_personality_linux::dispatch::CompletionRoute::Suspended
     ));
     assert_eq!(
         counters.refused[number as usize].load(std::sync::atomic::Ordering::Relaxed),
         0
     );
-    frame.x[0] as i64
+    (frame.x[0] as i64, route)
 }
 
 fn publish_current(
@@ -657,6 +670,15 @@ fn production_venue_remote_affinity_migrates_running_sibling_without_tick() {
 
 #[test]
 fn production_venue_switched_self_affinity_keeps_host_loaded_source() {
+    switched_self_affinity(false);
+}
+
+#[test]
+fn production_venue_switched_self_exclusion_migrates_before_return_without_irq() {
+    switched_self_affinity(true);
+}
+
+fn switched_self_affinity(exclude: bool) {
     use carrick_el1_linux::sched::{FakeCpu, HardwareUserWord, Sched, ThreadCpu};
     use std::sync::atomic::Ordering;
 
@@ -689,6 +711,10 @@ fn production_venue_switched_self_affinity_keeps_host_loaded_source() {
         assert_eq!(handed_back, [sibling]);
         p.zone.unhome(previous_slot, sibling.id, 3);
         assert!(p.zone.requeue_on(slot, sibling.id).is_some());
+        if exclude {
+            p.zone.enter_guest(previous_slot);
+            p.zone.enter_idle(previous_slot, false);
+        }
 
         run_guest(Some(p.root.thread()), Some((p.zone, slot)), || {
             let counters = carrick_el1_abi::Counters::default();
@@ -731,20 +757,31 @@ fn production_venue_switched_self_affinity_keeps_host_loaded_source() {
                     &mut physical,
                 )
                 .unwrap();
-            let mut mask = 1;
-            assert_eq!(
-                ring_call(entry.as_mut(), p.current, p.zone, 0, 122, 0, &mut mask),
-                0
-            );
+            let expected = if exclude { 2 } else { 1 };
+            let mut mask = expected;
+            let (result, route) =
+                ring_call_route(entry.as_mut(), p.current, p.zone, 0, 122, 0, &mut mask);
+            assert_eq!(result, 0);
+            if exclude {
+                assert_eq!(
+                    route,
+                    carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+                    "successful self exclusion must migrate at the completed return, without an IRQ"
+                );
+                assert_eq!(p.zone.slot(slot).current(), None);
+                assert!(matches!(p.zone.record(sibling.id).claim(),
+                    carrick_sched_core::Claim::Queued { slot, .. } if slot == previous_slot));
+                assert_eq!(p.zone.switch_in(previous_slot), Some(sibling.id));
+            }
             drop(entry);
-            assert_eq!(p.sibling.thread().affinity().words()[0], 1);
+            assert_eq!(p.sibling.thread().affinity().words()[0], expected);
             assert_eq!(p.root.thread().affinity().words()[0], 3);
             assert_eq!(
                 p.zone.slot(slot).affinity(),
                 3,
                 "B's self-set must preserve the affinity source of host-loaded A"
             );
-            assert_eq!(p.zone.record(sibling.id).affinity(), 1);
+            assert_eq!(p.zone.record(sibling.id).affinity(), expected);
 
             p.root
                 .thread()
@@ -754,7 +791,7 @@ fn production_venue_switched_self_affinity_keeps_host_loaded_source() {
                 2,
                 "the retained slot source must continue to read A's live authority"
             );
-            assert_eq!(p.sibling.thread().affinity().words()[0], 1);
+            assert_eq!(p.sibling.thread().affinity().words()[0], expected);
         });
     });
 }
