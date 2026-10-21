@@ -43,6 +43,7 @@ impl PortalMemory<'_> {
     fn prepare_record(
         &self,
         ranges: &[GuestWriteRange],
+        intent: TransferIntent,
     ) -> Result<PortalPermit<'_, '_>, MemoryPrepareError> {
         assert_eq!(ranges.len(), 1, "single-record transport fixture");
         self.prepares.set(self.prepares.get() + 1);
@@ -58,7 +59,7 @@ impl PortalMemory<'_> {
                 self.handle,
                 carrick_el1_linux::mm_portal::GuestVa::new(range.address().raw()),
                 range.len() as u64,
-                TransferIntent::UserWrite,
+                intent,
                 0,
             )
             .map_err(map_error)?;
@@ -88,9 +89,7 @@ impl PortalMemory<'_> {
             vm_generation: NonZeroU64::new(1).unwrap(),
             owner: None,
         };
-        let request = chunk
-            .request(TransferIntent::UserWrite, retained)
-            .map_err(|_| fault())?;
+        let request = chunk.request(intent, retained).map_err(|_| fault())?;
         let permit = prepare_transfer(self.portal, request, &words, 0)
             .map_err(map_error)?
             .expect("unchanged exact selection");
@@ -178,18 +177,68 @@ impl GuestMemory for PortalMemory<'_> {
         &mut self,
         ranges: &[GuestWriteRange],
     ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
-        self.prepare_record(ranges)
+        self.prepare_record(ranges, TransferIntent::UserWrite)
             .map(|permit| Box::new(permit) as Box<dyn PreparedGuestWrite>)
     }
 
-    fn read_bytes_raw(&self, _address: u64, _length: usize) -> Result<Vec<u8>, MemoryError> {
-        Err(MemoryError::Unsupported)
+    fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        let fault = || MemoryError::OutOfBounds { address, length };
+        if address < VA
+            || address
+                .checked_add(length as u64)
+                .is_none_or(|end| end > VA + 4096)
+        {
+            return Err(fault());
+        }
+        let range = GuestWriteRange::new(carrick_guest_mem::GuestVa::new(address), length).unwrap();
+        let mut permit = self
+            .prepare_record(&[range], TransferIntent::UserRead)
+            .map_err(|error| match error {
+                MemoryPrepareError::OwnerWait(wait) => {
+                    MemoryError::ReadSuspended(Box::new(carrick_guest_mem::MemoryReadSuspension {
+                        wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
+                        continuation: carrick_guest_mem::OwnedReadContinuation::new(()),
+                    }))
+                }
+                _ => fault(),
+            })?;
+        let wire = PortalTransferSlot::new();
+        let mut ticket = wire
+            .submit_commit(permit.request, permit.permit.take().unwrap(), length as u64)
+            .unwrap();
+        let mut bytes = Vec::new();
+        serve_transfer(
+            self.portal,
+            wire.claim().unwrap(),
+            &self.tables.live(&CallerInvalidatesAsid),
+            0,
+            || {
+                assert!(ticket.copy_requested(|authorization| {
+                    let request = authorization.request();
+                    assert_eq!(request, permit.request);
+                    let offset = (address - VA) as usize;
+                    assert_eq!(
+                        request.selected.ipa,
+                        self.backing.as_ptr() as u64 + offset as u64
+                    );
+                    // SAFETY: the production permit authorizes this exact read of the retained mapping.
+                    bytes = unsafe {
+                        std::slice::from_raw_parts(self.backing.as_ptr().add(offset), length)
+                    }
+                    .to_vec();
+                    true
+                }));
+            },
+        )
+        .unwrap();
+        assert_eq!(ticket.take_completion().unwrap().completed, length as u64);
+        Ok(bytes)
     }
 
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let range =
             GuestWriteRange::new(carrick_guest_mem::GuestVa::new(address), bytes.len()).unwrap();
-        match self.prepare_record(&[range]) {
+        match self.prepare_record(&[range], TransferIntent::UserWrite) {
             Ok(permit) => {
                 Box::new(permit).commit(&[bytes]);
                 Ok(())
@@ -327,4 +376,164 @@ fn pipe2_copyout_waits_for_live_sibling_editor_and_commits_once() {
         dispatcher.open_file(5).is_none(),
         "exactly one pair installed"
     );
+}
+
+#[test]
+fn newfstatat_path_copyin_waits_for_live_sibling_editor_and_bad_path_faults() {
+    stat_path_copyin(nr::NEWFSTATAT.raw());
+}
+
+#[test]
+fn statx_path_copyin_waits_for_live_sibling_editor_and_bad_path_faults() {
+    stat_path_copyin(nr::STATX.raw());
+}
+
+#[test]
+fn x86_stat_paths_copyin_wait_for_live_sibling_editor() {
+    for nr in [
+        nr::CARRICK_PRIVATE_X86_STAT,
+        nr::CARRICK_PRIVATE_X86_LSTAT,
+        nr::CARRICK_PRIVATE_X86_NEWFSTATAT,
+    ] {
+        stat_path_copyin(nr.raw());
+    }
+}
+
+fn stat_path_copyin(nr: u64) {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                LinuxCloneFlags::VM | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::THREAD,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(71_101),
+            None,
+        )
+        .unwrap();
+    let root = root
+        .kernel()
+        .context(root.task().key().id, root.thread().key().tid)
+        .unwrap();
+    assert_ne!(root.thread().key(), sibling.thread().key());
+    assert_eq!(root.shared().mm().id(), sibling.shared().mm().id());
+    assert!(root.exact_thread_is_live() && sibling.exact_thread_is_live());
+
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, root.shared().mm().id().raw(), ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(
+        NonZeroU64::new(711).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(zone)
+    .unwrap();
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let backing = OwnedHostMapping::map_shared_anon(4096, HostMappingKind::PrivateAnon).unwrap();
+    let tables = Tables::new(ROOT, backing.as_ptr() as u64, 1);
+    let mut memory = PortalMemory {
+        portal: &portal,
+        tables: &tables,
+        backing: &backing,
+        handle,
+        prepares: Cell::new(0),
+        commits: Cell::new(0),
+    };
+    let reporter = crate::compat::CompatReporter::default();
+    // SAFETY: this thread exclusively owns the retained fixture bytes.
+    unsafe { std::ptr::copy_nonoverlapping(b"/dev/null\0".as_ptr(), backing.as_ptr(), 10) };
+    let simple_path =
+        nr == nr::CARRICK_PRIVATE_X86_STAT.raw() || nr == nr::CARRICK_PRIVATE_X86_LSTAT.raw();
+    let args = if simple_path {
+        [VA, VA + 512, 0, 0, 0, 0]
+    } else if nr != nr::STATX.raw() {
+        [carrick_abi::LINUX_AT_FDCWD, VA, VA + 512, 0, 0, 0]
+    } else {
+        [carrick_abi::LINUX_AT_FDCWD, VA, 0, 0x7ff, VA + 512, 0]
+    };
+    let request = SyscallRequest::new(nr, SyscallArgs::from(args));
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let (refused, observed, released) = std::thread::scope(|scope| {
+        let sibling = &sibling;
+        let peer = scope.spawn(move || {
+            assert!(sibling.exact_thread_is_live());
+            let access = carrick_el1_linux::sched::object_wait::space_access(
+                zone,
+                carrick_sched_core::SlotId::new(1),
+            );
+            let editor = access
+                .try_begin_edit(
+                    zone.spaces.find(sibling.shared().mm().id().raw()).unwrap(),
+                    mm.raw(),
+                    NonZeroU64::new(2).unwrap(),
+                )
+                .unwrap();
+            // Hold the sibling's real editor admission at the copyout
+            // boundary without sleeps or injected refusals.
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(editor);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let observed = portal
+            .observe_wait(handle, PortalWaitCause::Editor)
+            .unwrap()
+            .unwrap();
+        let refused = dispatcher
+            .dispatch(&root, request, &mut memory, &reporter)
+            .unwrap();
+        // Always release/join before asserting, including on the red revision.
+        release_tx.send(()).unwrap();
+        peer.join().unwrap();
+        let released = portal
+            .observe_wait(handle, PortalWaitCause::Editor)
+            .unwrap()
+            .unwrap();
+        (refused, observed, released)
+    });
+    assert_eq!(
+        refused,
+        DispatchOutcome::OwnerMemoryWait {
+            wait: observed,
+            committed: 0
+        },
+        "a live sibling's editor must suspend the syscall, never return errno 14"
+    );
+    assert_ne!(
+        observed, released,
+        "editor release advances the exact wait source"
+    );
+    assert_eq!(
+        memory.commits.get(),
+        0,
+        "pathname refusal must precede output"
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(&root, request, &mut memory, &reporter)
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(memory.commits.get(), 1);
+    let mut bad_args = args;
+    bad_args[usize::from(!simple_path)] = VA + 8192;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &root,
+                SyscallRequest::new(nr, SyscallArgs::from(bad_args)),
+                &mut memory,
+                &reporter
+            )
+            .unwrap(),
+        DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
+    );
+    assert_eq!(memory.commits.get(), 1);
 }
