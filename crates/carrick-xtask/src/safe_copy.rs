@@ -1,4 +1,5 @@
-//! Bounded copies of untrusted trees; symlinks are data, never read authority.
+//! Bounded copies of untrusted trees; entry symlinks are data, never read authority.
+//! Root walks admit only root-owned links protected against untrusted replacement.
 //! Callers must keep destination ancestors private. The entry bound is not a byte budget.
 use std::fs::File;
 use std::io;
@@ -29,14 +30,84 @@ fn open_root(source: &Path) -> io::Result<File> {
     } else {
         Path::new(".")
     })?;
-    for part in source.components() {
-        match part {
-            Component::Normal(name) => source_fd = crate::prune_fs::open(&source_fd, name, true)?,
-            Component::RootDir | Component::CurDir => {}
-            _ => return Err(io::Error::other("copy root contains parent traversal")),
+    if source.components().any(|part| part == Component::ParentDir) {
+        return Err(io::Error::other("copy root contains parent traversal"));
+    }
+    // Own the pending components so link targets can be spliced into the walk.
+    let mut pending = std::collections::VecDeque::from([source.to_path_buf()]);
+    let mut followed = 0;
+    while let Some(path) = pending.pop_front() {
+        let mut parts = path.components();
+        while let Some(part) = parts.next() {
+            match part {
+                Component::Normal(name) => match crate::prune_fs::open(&source_fd, name, true) {
+                    Ok(next) => source_fd = next,
+                    Err(error) => {
+                        let before = ancestor_link(&source_fd, name)?;
+                        if before.st_mode & libc::S_IFMT != libc::S_IFLNK || before.st_uid != 0 {
+                            return Err(error);
+                        }
+                        // Root ownership alone cannot protect the stat/readlink gap
+                        // in a directory whose entries an untrusted user can replace.
+                        // Sticky root-owned directories protect root-owned entries too.
+                        use std::os::unix::fs::MetadataExt;
+                        let parent = source_fd.metadata()?;
+                        if parent.uid() != 0
+                            || (parent.mode() & 0o022 != 0 && parent.mode() & 0o1000 == 0)
+                        {
+                            return Err(io::Error::other("replaceable copy ancestor symlink"));
+                        }
+                        followed += 1;
+                        if followed > 40 {
+                            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+                        }
+                        let target = read_link(&source_fd, name)?;
+                        let after = ancestor_link(&source_fd, name)?;
+                        if before.st_dev != after.st_dev
+                            || before.st_ino != after.st_ino
+                            || after.st_uid != 0
+                            || after.st_mode & libc::S_IFMT != libc::S_IFLNK
+                        {
+                            return Err(io::Error::other("copy ancestor symlink changed"));
+                        }
+                        pending.push_front(parts.as_path().to_path_buf());
+                        pending.push_front(target);
+                        break;
+                    }
+                },
+                Component::RootDir => source_fd = crate::prune_fs::root(Path::new("/"))?,
+                Component::CurDir => {}
+                // Input parent traversal was refused; these come from trusted targets.
+                Component::ParentDir => {
+                    source_fd =
+                        crate::prune_fs::open(&source_fd, std::ffi::OsStr::new(".."), true)?;
+                }
+                Component::Prefix(_) => return Err(io::Error::other("copy root prefix")),
+            }
         }
     }
     Ok(source_fd)
+}
+// Inspect the link itself, never the object it names.
+fn ancestor_link(parent: &File, name: &std::ffi::OsStr) -> io::Result<libc::stat> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(io::Error::other)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: retained parent, single component C name and writable stat storage.
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful fstatat initialized stat.
+    Ok(unsafe { stat.assume_init() })
 }
 fn directory(
     source: &File,
@@ -255,6 +326,33 @@ pub fn repository(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn non_root_symlink_ancestor_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(real.join("child")).unwrap();
+        std::fs::write(real.join("child/data"), "ordinary").unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink("real", &link).unwrap();
+        assert_ne!(
+            std::fs::symlink_metadata(&link).unwrap().uid(),
+            0,
+            "this witness requires a non-root test user"
+        );
+        assert!(open_root(&link.join("child")).is_err());
+        assert!(text(&link.join("child/data"), 100).is_err());
+        assert!(
+            tree(
+                &link.join("child"),
+                &temp.path().join("copy"),
+                &mut 0,
+                Links::Refuse
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn text_swap_does_not_read_replacement() {
         let temp = tempfile::tempdir().unwrap();
