@@ -36,6 +36,9 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(test)]
+mod exit_group_hang_tests;
+
+#[cfg(test)]
 #[test]
 fn arm_native_wake_cross_slot_reaches_reschedule_transport() {
     use carrick_sched_core::WakeEffects;
@@ -3259,7 +3262,7 @@ fn run_as(fixture: &Fixture, tid: i32, generation: u64, serial: u64, control: &T
     fixture.task.set(
         El1TaskId::from_linux_tid(tid),
         carrick_el1_abi::SnapshotGeneration::from_raw(generation),
-        5,
+        fixture.leader.file_table,
     );
     fixture
         .task
