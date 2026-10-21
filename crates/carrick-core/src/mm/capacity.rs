@@ -434,6 +434,12 @@ impl MetadataAllocatorCore {
                 self.insert_free_block(suffix_block);
             } else {
                 (*allocated_block).size = remaining_from_cur;
+
+                let after_alloc_offset = (cur_block_addr + remaining_from_cur) - extent_base;
+                if after_alloc_offset < self.extents[extent_idx].size {
+                    let after_alloc = (extent_base + after_alloc_offset) as *mut BlockHeader;
+                    (*after_alloc).prev_phys_offset = (cur_block_addr - extent_base) as u32;
+                }
             }
 
             (*allocated_block).extent_idx = extent_idx as u8;
