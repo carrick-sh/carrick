@@ -25,8 +25,7 @@ pub fn check_process_stack(slot: carrick_el1_abi::SlotId) {
     unsafe {
         core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack));
     }
-    let base =
-        carrick_el1_abi::EL1_STACKS_BASE + u64::from(slot.raw()) * carrick_el1_abi::EL1_STACK_SIZE;
+    let base = carrick_el1_abi::stack_slot_usable_base(slot.raw() as usize);
     assert!(
         (base..base + carrick_el1_abi::EL1_STACK_SIZE).contains(&sp),
         "native process publication exceeded its CPU stack"
@@ -486,14 +485,10 @@ impl InterruptBackend for Aarch64Backend {
         Ok(())
     }
     fn current_cpu(&mut self) -> CpuId {
-        let sp = hw::read_current_sp();
-        let Some(offset) = sp.checked_sub(carrick_el1_abi::EL1_STACKS_BASE) else {
+        let Some(slot) = carrick_el1_abi::el1_stack_slot(hw::read_current_sp()) else {
             hw::fatal_entry_binding()
         };
-        if offset >= carrick_el1_abi::EL1_STACK_SLOTS * carrick_el1_abi::EL1_STACK_SIZE {
-            hw::fatal_entry_binding()
-        }
-        CpuId::new((offset / carrick_el1_abi::EL1_STACK_SIZE) as u32)
+        CpuId::new(slot as u32)
     }
 }
 

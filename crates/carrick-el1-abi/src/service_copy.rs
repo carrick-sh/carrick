@@ -11,15 +11,11 @@ pub const EL1_CARRIER_MAINT_ROOT_SIZE: u64 = 0x4000;
 /// Authenticate a host service's claimed slot against the executing EL1
 /// stack. A request cannot borrow another executor's alias or wire slots.
 pub fn service_slot_from_stack(sp: u64, claimed: u64) -> Option<crate::SlotId> {
-    let offset = sp.checked_sub(crate::EL1_STACKS_BASE)?;
-    if offset >= crate::EL1_STACK_SLOTS * crate::EL1_STACK_SIZE {
+    let index = crate::el1_stack_slot(sp)?;
+    if index as u64 != claimed {
         return None;
     }
-    let index = offset / crate::EL1_STACK_SIZE;
-    if index != claimed {
-        return None;
-    }
-    crate::SlotId::from_index(index as usize)
+    crate::SlotId::from_index(index)
 }
 
 /// Translation geometry only; callers must separately own the exact target
@@ -216,17 +212,21 @@ mod tests {
     #[test]
     fn service_slot_requires_the_executing_stack() {
         for index in 0..crate::EL1_STACK_SLOTS {
-            let sp = crate::EL1_STACKS_BASE + index * crate::EL1_STACK_SIZE + 128;
+            let sp = crate::stack_slot_usable_base(index as usize) + 128;
             assert_eq!(
                 service_slot_from_stack(sp, index).unwrap().raw() as u64,
                 index
             );
             assert!(service_slot_from_stack(sp, (index + 1) % crate::EL1_STACK_SLOTS).is_none());
+
+            // A pointer in the guard page must be refused
+            let guard_sp = crate::stack_slot_guard_base(index as usize) + 128;
+            assert!(service_slot_from_stack(guard_sp, index).is_none());
         }
         assert!(service_slot_from_stack(crate::EL1_STACKS_BASE - 1, 0).is_none());
         assert!(
             service_slot_from_stack(
-                crate::EL1_STACKS_BASE + crate::EL1_STACK_SLOTS * crate::EL1_STACK_SIZE,
+                crate::EL1_STACKS_BASE + crate::EL1_STACK_SLOTS * crate::EL1_STACK_STRIDE,
                 0
             )
             .is_none()

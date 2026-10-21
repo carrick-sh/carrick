@@ -524,6 +524,7 @@ name = "carrick-el1-image"
 version = "0.1.0"
 dependencies = [
  "carrick-el1-abi",
+ "carrick-ring-audit",
 ]
 
 [[package]]
@@ -920,6 +921,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-ring-audit"
+version = "0.1.0"
+dependencies = [
+ "carrick-el1-abi",
+]
+
+[[package]]
 name = "carrick-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1199,6 +1207,7 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-personality-linux",
+ "carrick-ring-audit",
  "carrick-runtime",
  "carrick-sched-core",
  "carrick-signal-linux",
@@ -1321,6 +1330,7 @@ dependencies = [
  "carrick-el1-abi",
  "carrick-guest-arch",
  "carrick-portable",
+ "carrick-ring-audit",
  "clap",
  "flate2",
  "libc",

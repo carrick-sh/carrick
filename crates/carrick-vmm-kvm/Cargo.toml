@@ -21,6 +21,8 @@ workspace = true
 [build-dependencies]
 # build.rs derives the CPL0 image inputs directly from local manifests.
 toml.workspace = true
+# build.rs runs the ring stack audit on both CPL0 images it embeds.
+carrick-ring-audit = { path = "../carrick-ring-audit" }
 
 [dev-dependencies]
 carrick-x86-cpl0-host = { path = "../carrick-x86-cpl0-host", features = ["test-support"] }

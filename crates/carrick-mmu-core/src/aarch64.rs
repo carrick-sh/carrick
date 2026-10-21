@@ -6090,6 +6090,59 @@ impl PageTableManager {
             })
     }
 
+    /// Leave every 4 KiB page of each `(base, len)` guard without a
+    /// translation: table descriptors down to L3 and an empty leaf, which
+    /// records no output, so no edit can re-validate it in place. A Carrick
+    /// stack guard is exactly such a page: an overflow into it takes a
+    /// stage-1 translation fault instead of writing the stack below. Every
+    /// constructor of a live HVPatch MM image calls this on the offline image
+    /// before publication, beside [`Self::provision_cow_copy_window`]; the
+    /// valid stack leaves sharing each L3 table keep it from being
+    /// coalesced or reclaimed. Returns whether any descriptor changed.
+    pub fn provision_guard_pages(
+        &mut self,
+        guards: impl IntoIterator<Item = (u64, u64)>,
+        mut source: Option<&mut dyn TableArenaSource>,
+    ) -> Result<bool, PageTableError> {
+        let mut changed = false;
+        for (base, len) in guards {
+            if base % PT_PAGE != 0 || len % PT_PAGE != 0 {
+                return Err(PageTableError::BadAddress);
+            }
+            let end = base.checked_add(len).ok_or(PageTableError::BadAddress)?;
+            for va in (base..end).step_by(PT_PAGE as usize) {
+                let (location, level) = self.leaf_offset(va, true, source.as_deref_mut())?;
+                if level != 3 {
+                    return Err(PageTableError::BadAddress);
+                }
+                if self.read_desc(location)? != 0 {
+                    self.write_desc(location, 0)?;
+                    changed = true;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Whether every page of each `(base, len)` guard has an empty L3 leaf
+    /// under table descriptors: the post-condition of
+    /// [`Self::provision_guard_pages`].
+    #[must_use]
+    pub fn guard_pages_are_unmapped(&self, guards: impl IntoIterator<Item = (u64, u64)>) -> bool {
+        guards.into_iter().all(|(base, len)| {
+            (base..base.saturating_add(len))
+                .step_by(PT_PAGE as usize)
+                .all(|va| {
+                    self.try_debug_walk(va).is_ok_and(|walk| {
+                        walk[..3]
+                            .iter()
+                            .all(|descriptor| descriptor & TYPE_BITS == TYPE_TABLE_OR_PAGE)
+                            && walk[3] == 0
+                    })
+                })
+        })
+    }
+
     /// Mark a Carrick-owned EL1 range read-only without granting EL0 access.
     /// The AP=10 distinction is architectural under PAN and must survive the
     /// fork-arm split of the kernel-only 2 MiB boot block.
@@ -10274,7 +10327,14 @@ mod tests {
     fn test_el1_stack_walk_after_rebase() {
         let bytes = stage1_hvpatch_page_tables();
         let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE, test_layout());
-        let stack_va = 0x2d04213ee0;
+        // Slot 2's usable stack (#369 put a guard below each slot).
+        let stack_va = 0x2d04217ee0;
+        let guard_va = 0x2d04213ee0;
+        assert_eq!(
+            mgr.translate(guard_va),
+            None,
+            "slot 2's guard stays unmapped"
+        );
         let leaf_before = terminal_descriptor(mgr.debug_walk(stack_va));
 
         let child_root = 0x9a_0000_0000;
@@ -10283,6 +10343,11 @@ mod tests {
         assert_eq!(leaf_before & VALID, 1);
         assert_eq!(leaf_after & VALID, 1);
         assert_eq!(leaf_after & AP_MASK, leaf_before & AP_MASK);
+        assert_eq!(
+            mgr.translate(guard_va),
+            None,
+            "the rebased child keeps the guard"
+        );
     }
 
     struct MockLiveResolver {
