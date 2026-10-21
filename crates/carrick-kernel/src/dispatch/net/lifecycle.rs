@@ -772,6 +772,13 @@ impl<'a> NetView<'a> {
 
     pub(super) fn take_socket_pending_error(&self, fd: i32) -> Option<carrick_abi::LinuxErrno> {
         let open_file = self.open_file(fd)?;
+        self.take_socket_pending_error_from(&open_file)
+    }
+
+    pub(super) fn take_socket_pending_error_from(
+        &self,
+        open_file: &crate::dispatch::fd_table::OpenFile,
+    ) -> Option<carrick_abi::LinuxErrno> {
         let mut open = crate::kernel::FileDescription::write_for_io(&open_file.description)?;
         let base = match &mut *open {
             OpenDescription::HostSocket { base, .. }
