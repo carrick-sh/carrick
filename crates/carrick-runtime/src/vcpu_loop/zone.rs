@@ -1044,7 +1044,7 @@ where
             Some(Handback::Control | Handback::GroupStop) => Some(0),
             // A service record names a thread the host made runnable; it is
             // loaded from its own residency, never resumed from a zone wait.
-            Some(Handback::Activation | Handback::Cancelled | Handback::Service) | None => {
+            Some(Handback::Cancelled | Handback::Service) | None => {
                 return Err(RuntimeError::Configuration(format!(
                     "EL1 zone resume of record {record:?} with handback {:?}",
                     rec.handback()
@@ -1517,7 +1517,7 @@ where
             Some(Handback::Control) if self.job_control_stopped() => Some(host_ipc::IpcCause::Stop),
             Some(Handback::Control | Handback::Cancelled) => Some(host_ipc::IpcCause::Control),
             Some(Handback::Woken | Handback::Resumed) => None,
-            Some(Handback::Activation | Handback::Service) | None => {
+            Some(Handback::Service) | None => {
                 return Err(RuntimeError::Configuration(format!(
                     "IPC resume with handback {handback:?}"
                 ))

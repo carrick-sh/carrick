@@ -1324,11 +1324,7 @@ impl KernelState {
                         carrick_kernel::el1_zone::hand_back(&[record]);
                     }
                     carrick_el1_abi::HostClaim::AlreadyHost => {
-                        if !carrick_kernel::el1_zone::zone()
-                            .is_some_and(|zone| zone.is_first_entry_activation(record))
-                        {
-                            carrick_kernel::el1_zone::hand_back(&[record]);
-                        }
+                        carrick_kernel::el1_zone::hand_back(&[record]);
                     }
                     carrick_el1_abi::HostClaim::Deferred
                     | carrick_el1_abi::HostClaim::El1Held { .. }

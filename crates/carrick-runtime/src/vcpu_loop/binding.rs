@@ -7185,10 +7185,10 @@ mod tests {
                     panic!("uninitialized service head did not yield activation custody");
                 };
                 assert_eq!(custody.record(), record);
-                assert_eq!(
-                    zone.record(record.id).handback(),
-                    Some(carrick_el1_abi::Handback::Activation)
-                );
+                assert!(matches!(
+                    zone.record(record.id).claim(),
+                    carrick_el1_abi::Claim::Activating { .. }
+                ));
                 // Hold the token here: this is the deterministic executor pause
                 // between queue removal and first-entry adoption.
                 activation_custody = Some(custody);
@@ -7207,12 +7207,8 @@ mod tests {
             if already_host {
                 assert!(matches!(
                     zone.record(record.id).claim(),
-                    carrick_el1_abi::Claim::Host { .. }
+                    carrick_el1_abi::Claim::Activating { .. }
                 ));
-                assert_eq!(
-                    zone.record(record.id).handback(),
-                    Some(carrick_el1_abi::Handback::Activation)
-                );
                 assert!(zone.free_first_entry_activation(activation_custody.take().unwrap()));
                 assert!(zone.live(record).is_none());
                 assert_eq!(zone.runnable_head(slot), None);

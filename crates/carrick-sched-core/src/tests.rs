@@ -216,6 +216,8 @@ fn claim_word_round_trips() {
             seq: u32::MAX,
         },
         Claim::Host { seq: 77 },
+        Claim::Activating { seq: 78 },
+        Claim::Retiring { seq: 79 },
         Claim::Transferring {
             seq: u32::MAX,
             cancelled: false,
@@ -234,6 +236,96 @@ fn claim_word_round_trips() {
     ] {
         assert_eq!(Claim::decode(claim.encode()), claim);
     }
+}
+
+#[test]
+fn first_entry_ownership_transition_table_is_exhaustive() {
+    let states = [
+        Claim::Free,
+        Claim::Parked { seq: 7 },
+        Claim::Queued { slot: SLOT, seq: 7 },
+        Claim::OnCpu { slot: SLOT, seq: 7 },
+        Claim::OnCpuRequested { slot: SLOT, seq: 7 },
+        Claim::Transferring {
+            seq: 7,
+            cancelled: false,
+            host_requested: false,
+        },
+        Claim::Transferring {
+            seq: 7,
+            cancelled: false,
+            host_requested: true,
+        },
+        Claim::Transferring {
+            seq: 7,
+            cancelled: true,
+            host_requested: false,
+        },
+        Claim::Host { seq: 7 },
+        Claim::Activating { seq: 7 },
+        Claim::Retiring { seq: 7 },
+    ];
+    let operations = [
+        FirstEntryOperation::Mint,
+        FirstEntryOperation::Release,
+        FirstEntryOperation::Retire,
+        FirstEntryOperation::FinishRetire,
+    ];
+    for state in states {
+        for operation in operations {
+            let expected = match (state, operation) {
+                (Claim::Host { seq }, FirstEntryOperation::Mint) => Some(Claim::Activating { seq }),
+                (Claim::Activating { seq }, FirstEntryOperation::Release) => {
+                    Some(Claim::Host { seq })
+                }
+                (Claim::Activating { seq }, FirstEntryOperation::Retire) => {
+                    Some(Claim::Retiring { seq })
+                }
+                (Claim::Retiring { .. }, FirstEntryOperation::FinishRetire) => Some(Claim::Free),
+                _ => None,
+            };
+            assert_eq!(
+                first_entry_transition(state, operation),
+                expected,
+                "{state:?} {operation:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn first_entry_activation_mint_has_exactly_one_concurrent_winner() {
+    let zone = Arc::new(zone());
+    let record = zone
+        .alloc_host_runnable(ThreadIdentity {
+            generation: 0,
+            lifecycle_page: 1,
+            control_slot: 1,
+            ..identity(902)
+        })
+        .unwrap();
+    let record = zone.record_ref(record);
+    let barrier = Arc::new(std::sync::Barrier::new(9));
+    let mut threads = Vec::new();
+    for _ in 0..8 {
+        let zone = Arc::clone(&zone);
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            zone.claim_current_first_entry_activation(record)
+        }));
+    }
+    barrier.wait();
+    let mut winner = None;
+    for thread in threads {
+        if let Some(custody) = thread.join().unwrap() {
+            assert!(winner.replace(custody).is_none());
+        }
+    }
+    let custody = winner.expect("one mint must win");
+    assert!(zone.claim_current_first_entry_activation(record).is_none());
+    assert!(zone.free_first_entry_activation(custody));
+    assert!(zone.live(record).is_none());
 }
 
 #[test]

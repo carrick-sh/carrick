@@ -241,7 +241,18 @@ impl SlotState {
     }
 }
 
-/// Who owns a parked thread's context. See the crate docs.
+/// The single ownership word for a scheduler record.
+///
+/// `Free` is allocatable; `Parked`, `Queued`, and `OnCpu*` belong to EL1;
+/// `Transferring` belongs to the producer named by its typed `HostTransfer`;
+/// `Host` is published host custody; `Activating` belongs to exactly one
+/// typed first-entry placement or executor token; and `Retiring` belongs to
+/// the activation token completing destruction. Every ownership change is an
+/// exact compare-exchange on this word. Producers may perform
+/// Host -> Activating -> Queued/Host, executors may perform
+/// Host -> Activating -> Retiring/Host, and only the retiring owner may
+/// perform Retiring -> Free. Host claimants defer while a transfer,
+/// activation, or retirement owner exists.
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -269,6 +280,10 @@ pub enum Claim {
     },
     /// Owned by the host; the context is frozen until the thread is loaded.
     Host { seq: u32 },
+    /// Exclusive first-entry placement or executor activation custody.
+    Activating { seq: u32 },
+    /// Terminal activation custody; no publication is permitted.
+    Retiring { seq: u32 },
 }
 
 const STATE_FREE: u64 = 0;
@@ -280,6 +295,8 @@ const STATE_TRANSFERRING: u64 = 5;
 const STATE_TRANSFER_CANCELLED: u64 = 6;
 const STATE_TRANSFER_REQUESTED: u64 = 7;
 const STATE_ONCPU_REQUESTED: u64 = 8;
+const STATE_ACTIVATING: u64 = 9;
+const STATE_RETIRING: u64 = 10;
 
 impl Claim {
     pub const fn encode(self) -> u64 {
@@ -296,6 +313,8 @@ impl Claim {
                 STATE_ONCPU_REQUESTED | ((slot.raw() as u64) << 8) | ((seq as u64) << 16)
             }
             Self::Host { seq } => STATE_HOST | ((seq as u64) << 16),
+            Self::Activating { seq } => STATE_ACTIVATING | ((seq as u64) << 16),
+            Self::Retiring { seq } => STATE_RETIRING | ((seq as u64) << 16),
             Self::Transferring {
                 seq,
                 cancelled,
@@ -321,6 +340,8 @@ impl Claim {
             STATE_ONCPU => Self::OnCpu { slot, seq },
             STATE_ONCPU_REQUESTED => Self::OnCpuRequested { slot, seq },
             STATE_HOST => Self::Host { seq },
+            STATE_ACTIVATING => Self::Activating { seq },
+            STATE_RETIRING => Self::Retiring { seq },
             STATE_TRANSFERRING => Self::Transferring {
                 seq,
                 cancelled: false,
@@ -349,8 +370,28 @@ impl Claim {
             | Self::OnCpu { seq, .. }
             | Self::OnCpuRequested { seq, .. }
             | Self::Host { seq }
+            | Self::Activating { seq }
+            | Self::Retiring { seq }
             | Self::Transferring { seq, .. } => seq,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FirstEntryOperation {
+    Mint,
+    Release,
+    Retire,
+    FinishRetire,
+}
+
+const fn first_entry_transition(claim: Claim, operation: FirstEntryOperation) -> Option<Claim> {
+    match (claim, operation) {
+        (Claim::Host { seq }, FirstEntryOperation::Mint) => Some(Claim::Activating { seq }),
+        (Claim::Activating { seq }, FirstEntryOperation::Release) => Some(Claim::Host { seq }),
+        (Claim::Activating { seq }, FirstEntryOperation::Retire) => Some(Claim::Retiring { seq }),
+        (Claim::Retiring { .. }, FirstEntryOperation::FinishRetire) => Some(Claim::Free),
+        _ => None,
     }
 }
 
@@ -387,9 +428,6 @@ pub enum Handback {
     /// The kernel published a group stop while this operation was blocked.
     /// This is an owned handback reason, not a second job-control state.
     GroupStop = 8,
-    /// A first-entry executor has removed this birth from every queue and
-    /// exclusively owns activation through retirement.
-    Activation = 9,
 }
 
 impl Handback {
@@ -403,7 +441,6 @@ impl Handback {
             6 => Some(Self::Cancelled),
             7 => Some(Self::Service),
             8 => Some(Self::GroupStop),
-            9 => Some(Self::Activation),
             _ => None,
         }
     }
@@ -1383,13 +1420,19 @@ pub enum HostClaim {
 #[must_use = "activation custody must be released or retired"]
 pub struct FirstEntryActivation {
     record: RecordRef,
-    prior_handback: u32,
 }
 
 impl FirstEntryActivation {
     pub fn record(&self) -> RecordRef {
         self.record
     }
+}
+
+/// Exclusive producer custody while routing an unadopted birth.
+#[must_use = "first-entry placement custody must be placed or released"]
+pub struct FirstEntryPlacement {
+    record: RecordRef,
+    seq: u32,
 }
 
 /// A service-queue take either carries ordinary host work or exclusive
@@ -1432,10 +1475,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> HostTransfer<'_, C> {
             // A service record carries scheduler custody through the host
             // handoff. Keep its interruption alongside that custody until
             // the executor consumes the record, instead of replacing it.
-            if !matches!(
-                rec.handback(),
-                Some(Handback::Activation | Handback::Service)
-            ) && rec.host_wanted.take(self.record.incarnation) == Some(Handback::GroupStop)
+            if !matches!(rec.handback(), Some(Handback::Service))
+                && rec.host_wanted.take(self.record.incarnation) == Some(Handback::GroupStop)
                 && rec.has_object_operation()
             {
                 rec.handback
@@ -1860,23 +1901,18 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let identity = self.record_ref(record);
         let transfer = self.begin_host_transfer(identity, Claim::Queued { slot, seq })?;
         self.remove_locked(&guard, record);
-        let prior_handback = rec.handback.load(Ordering::Acquire);
         let first_entry = rec.is_unadopted_birth();
-        if first_entry {
-            rec.handback
-                .store(Handback::Activation as u32, Ordering::Release);
-        } else if rec.is_cancelled() && rec.has_object_operation() {
+        if !first_entry && rec.is_cancelled() && rec.has_object_operation() {
             rec.handback
                 .store(Handback::Cancelled as u32, Ordering::Release);
         }
         drop(guard);
-        let published = transfer.publish()?;
         if first_entry {
-            Some(ServiceHead::FirstEntry(FirstEntryActivation {
-                record: published,
-                prior_handback,
-            }))
+            let published = transfer.publish()?;
+            self.claim_current_first_entry_activation(published)
+                .map(ServiceHead::FirstEntry)
         } else {
+            let published = transfer.publish()?;
             if rec.handback() == Some(Handback::Service) {
                 self.counters
                     .service_adoptions
@@ -1894,21 +1930,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     pub fn release_first_entry_activation(&self, custody: FirstEntryActivation) -> bool {
         let record = custody.record;
         self.live(record).is_some_and(|rec| {
-            rec.handback
-                .compare_exchange(
-                    Handback::Activation as u32,
-                    custody.prior_handback,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
+            let current = rec.claim();
+            first_entry_transition(current, FirstEntryOperation::Release)
+                .is_some_and(|next| rec.cas(current, next))
         })
-    }
-
-    /// Whether this exact live incarnation is held by a first-entry executor.
-    pub fn is_first_entry_activation(&self, record: RecordRef) -> bool {
-        self.live(record)
-            .is_some_and(|rec| rec.handback() == Some(Handback::Activation))
     }
 
     /// Authenticate executor-local custody of a current record that did not
@@ -1919,38 +1944,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         record: RecordRef,
     ) -> Option<FirstEntryActivation> {
         let rec = self.live(record)?;
-        if !rec.is_unadopted_birth() || !matches!(rec.claim(), Claim::Host { .. }) {
+        if !rec.is_unadopted_birth() {
             return None;
         }
-        let prior_handback = rec.handback.load(Ordering::Acquire);
-        rec.handback
-            .compare_exchange(
-                prior_handback,
-                Handback::Activation as u32,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .ok()?;
-        let custody = FirstEntryActivation {
-            record,
-            prior_handback,
-        };
-        if !matches!(rec.claim(), Claim::Host { .. })
-            || self.slots.iter().any(|slot| {
-                let mut cursor = slot.head.load(Ordering::Acquire);
-                while cursor != NIL {
-                    if cursor == record.id.raw() {
-                        return true;
-                    }
-                    cursor = self.record(RecordId(cursor)).next.load(Ordering::Acquire);
-                }
-                false
-            })
-        {
-            let _ = self.release_first_entry_activation(custody);
-            return None;
-        }
-        Some(custody)
+        let current = rec.claim();
+        let next = first_entry_transition(current, FirstEntryOperation::Mint)?;
+        rec.cas(current, next)
+            .then_some(FirstEntryActivation { record })
     }
 
     /// Retire an exclusively owned first-entry record. Refuse if any run
@@ -1960,23 +1960,56 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let Some(rec) = self.live(record) else {
             return false;
         };
-        if !matches!(rec.claim(), Claim::Host { .. })
-            || rec.handback() != Some(Handback::Activation)
-            || self.slots.iter().any(|slot| {
-                let mut cursor = slot.head.load(Ordering::Acquire);
-                while cursor != NIL {
-                    if cursor == record.id.raw() {
-                        return true;
-                    }
-                    cursor = self.record(RecordId(cursor)).next.load(Ordering::Acquire);
-                }
-                false
-            })
-        {
+        let current = rec.claim();
+        let Some(Claim::Retiring { seq }) =
+            first_entry_transition(current, FirstEntryOperation::Retire)
+        else {
+            return false;
+        };
+        if !rec.cas(current, Claim::Retiring { seq }) {
             return false;
         }
-        self.free_record(record.id);
+        self.finish_retiring_record(record.id, seq);
         true
+    }
+
+    pub fn claim_first_entry_placement(&self, record: RecordRef) -> Option<FirstEntryPlacement> {
+        let rec = self.live(record)?;
+        if !rec.is_unadopted_birth() || rec.is_cancelled() {
+            return None;
+        }
+        let current = rec.claim();
+        let next = first_entry_transition(current, FirstEntryOperation::Mint)?;
+        let Claim::Activating { seq } = next else {
+            return None;
+        };
+        rec.cas(current, next)
+            .then_some(FirstEntryPlacement { record, seq })
+    }
+
+    pub fn place_first_entry(
+        &self,
+        custody: FirstEntryPlacement,
+    ) -> Result<HostPlacement, FirstEntryPlacement> {
+        match self.place_in_guest(
+            custody.record.id,
+            Claim::Activating { seq: custody.seq },
+            None,
+            &SpinForever,
+            |_| {},
+        ) {
+            Placement::Placed(placement) => Ok(placement),
+            Placement::NoSlot | Placement::Lost => Err(custody),
+        }
+    }
+
+    pub fn release_first_entry_placement(&self, custody: FirstEntryPlacement) -> bool {
+        self.live(custody.record).is_some_and(|rec| {
+            rec.cas(
+                Claim::Activating { seq: custody.seq },
+                Claim::Host { seq: custody.seq },
+            )
+        })
     }
 
     /// Whether `record`'s affinity allows the guest CPU `slot` is bound to.
@@ -2200,6 +2233,24 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
         self.timers.cancel_record(id);
         record.claim.store(Claim::Free.encode(), Ordering::Release);
+        if record.advance_incarnation() {
+            Self::free_bit(&self.record_map, id.raw());
+        }
+    }
+
+    fn finish_retiring_record(&self, id: RecordId, seq: u32) {
+        let record = self.record(id);
+        if record.has_object_operation() {
+            return;
+        }
+        self.timers.cancel_record(id);
+        let current = Claim::Retiring { seq };
+        let Some(next) = first_entry_transition(current, FirstEntryOperation::FinishRetire) else {
+            return;
+        };
+        if !record.cas(current, next) {
+            return;
+        }
         if record.advance_incarnation() {
             Self::free_bit(&self.record_map, id.raw());
         }
@@ -3900,7 +3951,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             seq,
             cancelled: false,
             host_requested: false,
-        }) = from
+        }
+        | Claim::Activating { seq }) = from
         else {
             return Placement::Lost;
         };
@@ -4329,6 +4381,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     return HostClaim::Deferred;
                 }
                 Claim::Host { .. } => return HostClaim::AlreadyHost,
+                Claim::Activating { .. } | Claim::Retiring { .. } => {
+                    return HostClaim::Deferred;
+                }
                 Claim::Free => return HostClaim::Stale,
             }
             if rec.incarnation() != r.incarnation {

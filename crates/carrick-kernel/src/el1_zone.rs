@@ -1003,16 +1003,18 @@ pub(crate) fn route_first_entry_handback(record: RecordRef) -> bool {
 }
 
 fn route_first_entry_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
-    let Some(rec) = zone.live(record).filter(|rec| {
-        rec.is_unadopted_birth()
-            && !rec.is_cancelled()
-            && matches!(rec.claim(), carrick_el1_abi::Claim::Host { .. })
-            && rec.handback() != Some(Handback::Activation)
-    }) else {
+    let Some(rec) = zone.live(record) else {
         return false;
     };
     let last_slot = rec.last_slot();
-    if deliver_placement(zone.place_from_host(record.id)) {
+    let Some(custody) = zone.claim_first_entry_placement(record) else {
+        return false;
+    };
+    let custody = match zone.place_first_entry(custody) {
+        Ok(placement) => return deliver_placement(Some(placement)),
+        Err(custody) => custody,
+    };
+    if !zone.release_first_entry_placement(custody) {
         return true;
     }
     // As for an ordinary held service row, preserve custody on the previous
