@@ -5615,7 +5615,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn fork(&mut self, child_tid: ProcessForkChildTid) -> LifecycleOutcome {
         match self.fork_owned(child_tid) {
             Ok(pid) => returned(i64::from(pid)),
-            Err(error) => self.fail(error),
+            Err(error) => self.fail(super::native_fork_refusal::observe_process_error(error)),
         }
     }
     fn wait4(

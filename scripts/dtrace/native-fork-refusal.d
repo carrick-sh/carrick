@@ -7,6 +7,13 @@
  * and requested/cached address contexts as five bounded Debug strings.
  * Root-prepublish is the positive control when a corrected fork succeeds.
  * The diagnostic is failure-only, bounded, and grants no memory authority.
+ * ProcessNative::fork records final untyped errors (including admission),
+ * their original negative errno and run-failure policy. Typed MM refusals
+ * retain their existing owner record without a duplicate boundary record.
+ * LifecycleNative::process_fork venue=unavailable records None/fallback,
+ * not a final errno; it includes missing or mismatched execution bindings.
+ * The existing crossing authenticates VM/task identity before emitting:
+ * zero records cannot exclude a failure of that diagnostic authentication.
  * A Prepare/NoMemory record also observes the first primary alias beyond
  * the admitted child table prefix using the existing owner translation.
  * Perturbation on that refusal: one bounded four-level descriptor lookup;

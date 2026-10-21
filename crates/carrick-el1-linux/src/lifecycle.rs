@@ -131,7 +131,10 @@ impl<
         Ok(())
     }
     fn process_fork(&mut self, child_tid: ProcessForkChildTid) -> Option<LifecycleOutcome> {
-        Some(self.process_venue()?.fork(child_tid))
+        Some(
+            super::native_fork_refusal::observe_process_venue(self.process_venue())?
+                .fork(child_tid),
+        )
     }
     fn process_wait4(
         &mut self,
