@@ -130,7 +130,7 @@ fn git_configuration_comment_is_honest() {
 #[test]
 fn residual_documentation_is_honest() {
     let docs = include_str!("../../../docs/ci/dispatch-worker.md");
-    assert!(docs.contains("25522481 is disabled"));
+    assert!(docs.contains("25522481 was deleted"));
     assert!(docs.contains("25523683 is active"));
     assert!(docs.contains("fixed refspec"));
     for residual in [
@@ -140,6 +140,7 @@ fn residual_documentation_is_honest() {
         "25523683",
         "40 minutes",
         "other runs",
+        "pinned launcher",
     ] {
         assert!(docs.contains(residual), "missing residual: {residual}");
     }
