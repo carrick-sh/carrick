@@ -37,7 +37,6 @@ pub(super) enum OwnerMemoryAction {
     Retained,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ZoneWaitPolicy {
     Ordinary(Option<std::time::Duration>),
     KillableOwnerMemory,
@@ -79,10 +78,10 @@ mod owner_copyout_policy_tests {
 
     #[test]
     fn copyout_redispatch_is_killable_only_not_ordinary_signal_interruptible() {
-        assert_eq!(
+        assert!(matches!(
             ZoneWaitPolicy::for_owner_resume(&OwnedSyscallResume::CopyoutRedispatch),
-            ZoneWaitPolicy::KillableOwnerMemory,
-        );
+            ZoneWaitPolicy::KillableOwnerMemory
+        ));
     }
 }
 
