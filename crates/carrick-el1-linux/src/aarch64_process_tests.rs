@@ -1570,6 +1570,44 @@ fn test_abort_after_stock_loan_returns_every_page_once() {
 }
 
 #[test]
+fn test_fork_prepared_box_allocation_failure_allows_index_reuse_without_collision() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let words = fixture.tables.live(&fixture.maintenance);
+    let initial_stock = [
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000, 0x28000, 0x29000,
+        0x2a000, 0x2b000, 0x2c000, 0x2d000, 0x2e000, 0x2f000,
+    ];
+    let crossing = TestStockCrossing::new(&initial_stock);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+
+    let child_mm = MmGeneration::new(NonZeroU64::new(2).unwrap());
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+
+    // Inject allocation failure for Prepared reservation in first fork attempt.
+    super::native_process_runtime::set_inject_try_reserve_failure(true);
+    let err = service
+        .prepare_mm(&fixture.address, parked, child_mm)
+        .expect_err("prepare_mm must fail when FallibleBox::try_reserve fails");
+    super::native_process_runtime::set_inject_try_reserve_failure(false);
+    assert_eq!(err, NativeProcessError::Exhausted);
+
+    // Second fork reuses the exact same index and must not fail with Collision.
+    let prepared = service
+        .prepare_mm(&fixture.address, parked, child_mm)
+        .expect("second fork reusing the same index must succeed without Collision");
+
+    service.abort_mm(prepared).expect("abort_mm should succeed");
+}
+
+#[test]
 fn fork_reservation_refusal_from_concurrent_munmap_rolls_back_without_quarantine() {
     let fixture = Fixture::new(0x10000, asid(1));
     let source = BornInZoneSource {

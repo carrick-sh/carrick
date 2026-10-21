@@ -1175,6 +1175,19 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 NativeProcessError::Exhausted,
             ));
         };
+        let boxed_prepared = match FallibleBox::try_reserve() {
+            Ok(slot) => slot,
+            Err(_) => {
+                owner.spaces.free(index);
+                return Err(abandon_loan(
+                    &self.crossing,
+                    self.worker(),
+                    &loan,
+                    None,
+                    NativeProcessError::Exhausted,
+                ));
+            }
+        };
         if let Err(e) = owner
             .roots
             .publish(index.index(), loan.request.child_mm, layout)
@@ -1262,19 +1275,6 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             ));
         }
         custody.extend_from_slice(plan.custody());
-        let boxed_prepared = match FallibleBox::try_reserve() {
-            Ok(slot) => slot,
-            Err(_) => {
-                owner.spaces.free(index);
-                return Err(abandon_loan(
-                    &self.crossing,
-                    self.worker(),
-                    &loan,
-                    None,
-                    NativeProcessError::Exhausted,
-                ));
-            }
-        };
         let mut child = match owner.publish_fork(plan, &*live, self.worker()) {
             Ok(child) => child,
             Err(e) => {

@@ -162,12 +162,25 @@ impl NativeProcessError {
 
 /// Pre-reserved single-item heap allocation for EL1 structures.
 ///
+#[cfg(test)]
+static INJECT_TRY_RESERVE_FAILURE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub fn set_inject_try_reserve_failure(fail: bool) {
+    INJECT_TRY_RESERVE_FAILURE.store(fail, core::sync::atomic::Ordering::Release);
+}
+
 /// Uses `Vec::try_reserve_exact(1)` and converts to `Box<T>` via boxed slice,
 /// allowing fallible allocation before unrecoverable state transitions.
 pub struct FallibleBox<T>(Vec<T>);
 
 impl<T> FallibleBox<T> {
     pub fn try_reserve() -> Result<Self, NativeProcessError> {
+        #[cfg(test)]
+        if INJECT_TRY_RESERVE_FAILURE.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(NativeProcessError::Exhausted);
+        }
         let mut vec = Vec::new();
         vec.try_reserve_exact(1)
             .map_err(|_| NativeProcessError::Exhausted)?;
