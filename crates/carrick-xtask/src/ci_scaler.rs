@@ -130,7 +130,7 @@ pub enum State {
 }
 
 /// Clone placement and durable per-lane accounting in the one controller ledger.
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum CloneLane {
     #[default]
     Kvm,
@@ -935,10 +935,16 @@ pub enum ScalerAction {
     },
     /// Print this host's KVM clone site as `SITE_*=value` lines for
     /// `build-template-debian.sh`; fails closed on an unknown host.
-    Site,
+    Site {
+        #[arg(long, value_enum, default_value_t = CloneLane::Kvm)]
+        lane: CloneLane,
+    },
     /// Print this host's PVE VM firewall file for template 300; fails on a
     /// site whose bridge needs no VM firewall.
-    VmFirewall,
+    VmFirewall {
+        #[arg(long, value_enum, default_value_t = CloneLane::Kvm)]
+        lane: CloneLane,
+    },
     /// Fail unless the calling (non-root runner) user can open KVM API 12.
     VerifyKvm,
     /// Runner job-start hook: authorize before any workflow step executes.
@@ -975,13 +981,14 @@ pub fn read_policy(path: &Path, owner: Option<u32>) -> Result<JobPolicy, ScalerE
 }
 pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
     match args.action {
-        ScalerAction::Site => {
-            print!("{}", site::Site::local()?.shell_env()?);
+        ScalerAction::Site { lane } => {
+            print!("{}", site::Site::local()?.for_lane(lane)?.shell_env()?);
             Ok(())
         }
-        ScalerAction::VmFirewall => {
+        ScalerAction::VmFirewall { lane } => {
             let file = site::Site::local()?
-                .vm_firewall_file(300)?
+                .for_lane(lane)?
+                .vm_firewall_file(lane.template())?
                 .ok_or(ScalerError::Guard("this site uses no VM firewall"))?;
             print!("{file}");
             Ok(())

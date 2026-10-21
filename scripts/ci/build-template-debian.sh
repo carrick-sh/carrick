@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Root on a known KVM clone site (Willow or the Contabo host, issue #287)
-# only. Builds VM 300; never allocates or operates a clone. The site's node,
+# only. Builds approved template 300 or 9000; never allocates or operates a clone. The site's node,
 # storage, bridge and template size come from `carrick-xtask ci-scaler site`,
 # the same typed table the controller authenticates the template against.
 # Dependencies are existing PVE tools; no host package/service/network changes.
 set -euo pipefail
 umask 077
 [[ ${EUID} == 0 ]] || { echo 'Run as root on a KVM clone site' >&2; exit 1; }
-[[ $# == 3 ]] || { echo 'Usage: build-template-debian.sh INPUT_DIR SCRIPT_COMMIT X86_LINUX_XTASK' >&2; exit 1; }
+[[ $# == 3 || $# == 4 ]] || { echo 'Usage: build-template-debian.sh INPUT_DIR SCRIPT_COMMIT X86_LINUX_XTASK [kvm|agent]' >&2; exit 1; }
+profile=${4:-kvm}
+[[ $profile == kvm || $profile == agent ]] || { echo "bad template profile" >&2; exit 1; }
 inputs=$(realpath "$1")
 commit=$2
 xtask=$(realpath "$3")
@@ -28,11 +30,13 @@ declare -A site=()
 while IFS='=' read -r name value; do
   [[ $name =~ ^SITE_[A-Z_]+$ && $value =~ ^[A-Za-z0-9._=/,-]+$ ]] || { echo "bad site line: $name" >&2; exit 1; }
   site[$name]=$value
-done < <("$xtask" ci-scaler site)
-for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SITE_CORES SITE_MEMORY_MIB SITE_DISK_GIB SITE_TEMPLATE_IPCONFIG SITE_NAMESERVER SITE_VM_FIREWALL SITE_API_CA SITE_ALLOW_KSM; do
+done < <("$xtask" ci-scaler site --lane "$profile")
+for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SITE_CORES SITE_MEMORY_MIB SITE_DISK_GIB SITE_TEMPLATE_IPCONFIG SITE_NAMESERVER SITE_VM_FIREWALL SITE_API_CA SITE_ALLOW_KSM SITE_TEMPLATE_VMID; do
   [[ -n ${site[$name]:-} ]] || { echo "site lacks $name" >&2; exit 1; }
 done
 [[ ${site[SITE_NODE]} == $(hostname -s) ]] || { echo 'site node is not this host' >&2; exit 1; }
+template=${site[SITE_TEMPLATE_VMID]}
+case $profile:$template in kvm:300|agent:9000) ;; *) echo "bad profile template" >&2; exit 1 ;; esac
 node=${site[SITE_NODE]} api_host=${site[SITE_API_HOST]} storage=${site[SITE_STORAGE]}
 disk_format=${site[SITE_DISK_FORMAT]} bridge=${site[SITE_BRIDGE]}
 cores=${site[SITE_CORES]} memory_mib=${site[SITE_MEMORY_MIB]} disk_gib=${site[SITE_DISK_GIB]}
@@ -51,10 +55,10 @@ pve_call() {
       --resolve "$api_host:8006:127.0.0.1" ${api_ca_args[@]+"${api_ca_args[@]}"} --request "$1" \
       "https://$api_host:8006/api2/json$2"
 }
-! qm status 300 >/dev/null 2>&1 || { echo 'VM 300 already exists; refusing replacement' >&2; exit 1; }
+! qm status "$template" >/dev/null 2>&1 || { echo "VM $template already exists; refusing replacement" >&2; exit 1; }
 pvesh get /pools/carrick-ci --output-format json | jq -e '.poolid == "carrick-ci"' >/dev/null
 [[ $(cat /sys/module/kvm_amd/parameters/nested) == 1 ]] || { echo 'Nested SVM is disabled; director action required' >&2; exit 1; }
-work=/root/carrick-ci/template-300
+work=/root/carrick-ci/template-${template}
 mkdir -p "$work/seed"
 cd "$work"
 image=debian-13-generic-amd64-20261001-2618.qcow2
@@ -77,9 +81,10 @@ cp "$xtask" seed/carrick-xtask
 cp "$inputs/rust-toolchain.toml" "$inputs/Cargo.lock" seed/
 cp "$inputs/scripts/ci/runner-once.sh" seed/
 cp "$inputs/scripts/ci/admit-job.sh" seed/
-cat > seed/meta-data <<'DATA'
-instance-id: carrick-template-300
-local-hostname: carrick-template-300
+printf '%s\n' "$profile" > seed/profile
+cat > seed/meta-data <<DATA
+instance-id: carrick-template-${template}
+local-hostname: carrick-template-${template}
 DATA
 # A bridge without DHCP gets the template's static address in the seed
 # (NoCloud network-config v2); a DHCP site keeps the image default.
@@ -111,7 +116,7 @@ disable_root: true
 ssh_deletekeys: true
 ssh_genkeytypes: [ed25519, rsa]
 package_update: true
-packages: [build-essential, clang, git, curl, jq, just, util-linux, procps, qemu-guest-agent, openssh-server, nftables, libicu76, libssl3t64, libkrb5-3, zlib1g]
+packages: [sudo, build-essential, clang, git, curl, jq, just, util-linux, procps, qemu-guest-agent, openssh-server, nftables, libicu76, libssl3t64, libkrb5-3, zlib1g]
 runcmd:
   - [bash, -c, 'mkdir -p /mnt/carrick-seed; mount -o ro /dev/disk/by-label/cidata /mnt/carrick-seed; bash /mnt/carrick-seed/provision.sh']
 DATA
@@ -119,6 +124,13 @@ cat > seed/provision.sh <<'PROVISION'
 #!/bin/bash
 set -euo pipefail
 cd /mnt/carrick-seed
+if [[ $(cat profile) == agent ]]; then
+  /usr/sbin/useradd --system --user-group --no-create-home --shell /usr/sbin/nologin carrick-dispatch-agent
+  /usr/sbin/usermod -aG carrick-dispatch-agent runner
+  printf '%s\n' 'runner ALL=(carrick-dispatch-agent) NOPASSWD: ALL' > /etc/sudoers.d/carrick-dispatch-agent
+  chmod 0440 /etc/sudoers.d/carrick-dispatch-agent
+  /usr/sbin/visudo -c
+fi
 install -m 755 carrick-xtask /usr/local/bin/carrick-xtask
 install -m 755 runner-once.sh /usr/local/bin/carrick-ci-run-once
 install -d -o runner -g runner /home/runner/actions-runner
@@ -183,10 +195,10 @@ jq -n --arg kernel "$(uname -r)" --arg rust "$(runuser -u runner -- /home/runner
 dpkg-query -W -f='${Package}=${Version}\n' > /var/lib/carrick-ci/packages.txt
 rm -rf /tmp/rustup-init /tmp/sccache-extract
 PROVISION
-genisoimage -quiet -output /var/lib/vz/template/iso/carrick-template-300-seed.iso -volid cidata -joliet -rock seed
+genisoimage -quiet -output /var/lib/vz/template/iso/carrick-template-${template}-seed.iso -volid cidata -joliet -rock seed
 # Root qm operations below apply ONLY to the approved template build.
 # A shared private bridge gets the PVE VM firewall on net0; PVE copies
-# 300.fw to every clone, so a job that undoes the guest firewall still
+# the template firewall to every clone, so a job that undoes the guest firewall still
 # cannot reach other VMs, the host or any private range (public IPv4 only).
 net0="virtio,bridge=$bridge"
 create_extra=()
@@ -202,29 +214,29 @@ if [[ $vm_firewall == 1 ]]; then
   # The datacenter firewall must be on for a VM firewall to apply.
   awk '/^\[/{o=($0=="[OPTIONS]")} o && $1=="enable:" && $2=="1"{f=1} END{exit !f}' /etc/pve/firewall/cluster.fw ||
     { echo 'datacenter firewall is not enabled' >&2; exit 1; }
-  [[ ! -e /etc/pve/firewall/300.fw ]] || { echo 'stale 300.fw; owner inspection needed' >&2; exit 1; }
+  [[ ! -e /etc/pve/firewall/${template}.fw ]] || { echo "stale $template.fw; owner inspection needed" >&2; exit 1; }
   # The rule set comes from the site table; the controller verifies the same
   # rules on the template and on every clone before it boots.
-  "$xtask" ci-scaler vm-firewall > /etc/pve/firewall/300.fw.new
-  mv /etc/pve/firewall/300.fw.new /etc/pve/firewall/300.fw
+  "$xtask" ci-scaler vm-firewall --lane "$profile" > /etc/pve/firewall/${template}.fw.new
+  mv /etc/pve/firewall/${template}.fw.new /etc/pve/firewall/${template}.fw
   net0="$net0,firewall=1"
   # ipfilter admits only the addresses in ipconfig0, so the template needs
   # its static address there while it provisions from the seed ISO.
   create_extra+=(--ipconfig0 "$ipconfig")
 fi
-qm create 300 --name carrick-debian13-kvm --pool carrick-ci --cores "$cores" --memory "$memory_mib" --balloon 0 --cpulimit "$cores" --cpu host \
+qm create "$template" --name "carrick-debian13-$profile" --pool carrick-ci --cores "$cores" --memory "$memory_mib" --balloon 0 --cpulimit "$cores" --cpu host \
   --net0 "$net0" --scsihw virtio-scsi-pci --serial0 socket --vga serial0 --agent enabled=1 "${create_extra[@]}"
-qm importdisk 300 "$image" "$storage" --format "$disk_format"
+qm importdisk "$template" "$image" "$storage" --format "$disk_format"
 # The imported volume's name depends on the storage type; attach exactly it.
-disk=$(qm config 300 | sed -n 's/^unused0: //p')
+disk=$(qm config "$template" | sed -n 's/^unused0: //p')
 [[ $disk == "$storage:"* ]] || { echo 'imported disk is not on the site storage' >&2; exit 1; }
-qm set 300 --scsi0 "$disk" --ide2 local:iso/carrick-template-300-seed.iso,media=cdrom
+qm set "$template" --scsi0 "$disk" --ide2 local:iso/carrick-template-${template}-seed.iso,media=cdrom
 # Boot order only after the disk exists: combined with the attach in one
 # `qm set`, PVE 9 kept `order=net0;ide2` and the guest PXE/CD-looped with
 # "No bootable device" until the provisioning deadline.
-qm set 300 --boot order=scsi0
-qm config 300 | grep -qx 'boot: order=scsi0' || { echo 'VM 300 boot order is not scsi0' >&2; exit 1; }
-qm disk resize 300 scsi0 "${disk_gib}G"
+qm set "$template" --boot order=scsi0
+qm config "$template" | grep -qx 'boot: order=scsi0' || { echo "VM $template boot order is not scsi0" >&2; exit 1; }
+qm disk resize "$template" scsi0 "${disk_gib}G"
 # Measure current CPU utilization AND load average, conservatively reserve two threads.
 read -ra before < /proc/stat
 sleep 5
@@ -236,42 +248,42 @@ busy=$(awk -v a="${before[*]}" -v b="${after[*]}" -v n="$(nproc)" -v loadavg="$(
 }')
 awk -v projected="$busy" 'BEGIN { print "template projected CPU=" projected; exit !(projected<=0.80) }'
 awk '/MemAvailable:/ {exit !($2 >= 10485760)}' /proc/meminfo
-pve_call POST "/nodes/$node/qemu/300/status/start"
+pve_call POST "/nodes/$node/qemu/$template/status/start"
 # Provisioning is bounded; the clone readiness deadline is separately five minutes.
 qualified=false
 for ((attempt=0; attempt<180; attempt++)); do
-  if qm guest exec 300 -- /bin/test -s /var/lib/carrick-ci/qualification.json 2>/dev/null | jq -e '.exitcode == 0' >/dev/null; then qualified=true; break; fi
+  if qm guest exec "$template" -- /bin/test -s /var/lib/carrick-ci/qualification.json 2>/dev/null | jq -e '.exitcode == 0' >/dev/null; then qualified=true; break; fi
   sleep 10
 done
 [[ $qualified == true ]] || {
-  echo 'Template provisioning failed; preserve VM 300 for diagnosis.' >&2
-  echo 'Console: (printf "\r"; sleep 8) | timeout 15 socat -T 10 - UNIX-CONNECT:/var/run/qemu-server/300.serial0' >&2
+  echo "Template provisioning failed; preserve VM $template for diagnosis." >&2
+  echo 'Console: (printf "\r"; sleep 8) | timeout 15 socat -T 10 - UNIX-CONNECT:/var/run/qemu-server/${template}.serial0' >&2
   exit 1
 }
-qm guest exec 300 -- /bin/cat /var/lib/carrick-ci/qualification.json | jq -r '."out-data"' > qualification.json
-qm guest exec 300 -- /bin/cat /var/lib/carrick-ci/packages.txt | jq -r '."out-data"' > packages.txt
+qm guest exec "$template" -- /bin/cat /var/lib/carrick-ci/qualification.json | jq -r '."out-data"' > qualification.json
+qm guest exec "$template" -- /bin/cat /var/lib/carrick-ci/packages.txt | jq -r '."out-data"' > packages.txt
 # Clean clone identities/SSH credentials and shut down from inside the template.
-qm guest exec 300 -- /bin/bash -c 'cloud-init clean --logs --machine-id; rm -f /etc/ssh/ssh_host_* /home/runner/.ssh/authorized_keys; rm -rf /var/lib/cloud/instances /home/runner/.cache; sync'
-pve_call POST "/nodes/$node/qemu/300/status/stop"
+qm guest exec "$template" -- /bin/bash -c 'cloud-init clean --logs --machine-id; rm -f /etc/ssh/ssh_host_* /home/runner/.ssh/authorized_keys; rm -rf /var/lib/cloud/instances /home/runner/.cache; sync'
+pve_call POST "/nodes/$node/qemu/$template/status/stop"
 for ((attempt=0; attempt<60; attempt++)); do
-  [[ $(qm status 300) == 'status: stopped' ]] && break
+  [[ $(qm status "$template") == 'status: stopped' ]] && break
   sleep 2
 done
-[[ $(qm status 300) == 'status: stopped' ]] || { echo 'Template did not stop' >&2; exit 1; }
-qm set 300 --ide2 "$storage:cloudinit" --ciuser runner --ipconfig0 "$ipconfig"
-if [[ $nameserver != none ]]; then qm set 300 --nameserver "$nameserver"; fi
-qm template 300
+[[ $(qm status "$template") == 'status: stopped' ]] || { echo 'Template did not stop' >&2; exit 1; }
+qm set "$template" --ide2 "$storage:cloudinit" --ciuser runner --ipconfig0 "$ipconfig"
+if [[ $nameserver != none ]]; then qm set "$template" --nameserver "$nameserver"; fi
+qm template "$template"
 jq -n --arg commit "$commit" --arg script_hash "$(sha256sum "$inputs/scripts/ci/build-template-debian.sh" | cut -d' ' -f1)" \
   --arg image_url "$image_url" --arg image_sha512 "$image_sha512" --arg runner_version "$runner_version" --arg runner_sha256 "$runner_sha256" \
   --arg sccache_sha256 "$sccache_sha256" --arg rustup_sha256 "$rustup_sha256" --arg toolchain_hash "$(sha256sum seed/rust-toolchain.toml | cut -d' ' -f1)" \
   --arg lock_hash "$(sha256sum seed/Cargo.lock | cut -d' ' -f1)" --arg xtask_hash "$(sha256sum seed/carrick-xtask | cut -d' ' -f1)" \
   --arg packages_hash "$(sha256sum packages.txt | cut -d' ' -f1)" --slurpfile qualification qualification.json \
-  --arg node "$node" --arg storage "$storage" --arg bridge "$bridge" \
+  --argjson vmid "$template" --arg profile "$profile" --arg node "$node" --arg storage "$storage" --arg bridge "$bridge" \
   --argjson cores "$cores" --argjson memory_mib "$memory_mib" --argjson disk_gib "$disk_gib" \
   --arg bootstrap_hash "$(sha256sum seed/runner-once.sh | cut -d' ' -f1)" --arg hook_hash "$(sha256sum seed/admit-job.sh | cut -d' ' -f1)" \
-  '{vmid:300,node:$node,pool:"carrick-ci",cpu:"host",vcpus:$cores,memory_mib:$memory_mib,disk_gib:$disk_gib,storage:$storage,bridge:$bridge,script_commit:$commit,
+  '{vmid:$vmid,profile:$profile,node:$node,pool:"carrick-ci",cpu:"host",vcpus:$cores,memory_mib:$memory_mib,disk_gib:$disk_gib,storage:$storage,bridge:$bridge,script_commit:$commit,
     script_sha256:$script_hash,image_url:$image_url,image_sha512:$image_sha512,runner_version:$runner_version,runner_sha256:$runner_sha256,
     sccache_sha256:$sccache_sha256,rustup_sha256:$rustup_sha256,toolchain_sha256:$toolchain_hash,cargo_lock_sha256:$lock_hash,
     xtask_sha256:$xtask_hash,bootstrap_sha256:$bootstrap_hash,hook_sha256:$hook_hash,packages_sha256:$packages_hash,qualification:$qualification[0]}' > manifest.json
-qm config 300
+qm config "$template"
 cat manifest.json
