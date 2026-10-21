@@ -1,0 +1,130 @@
+name: Dispatch issue worker
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+# Per-issue serialization; the clone controller independently caps its pool at 4.
+concurrency:
+  group: dispatch-worker-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate actor, tier and brief before requesting a worker
+        run: cargo run --locked --release -p carrick-xtask -- dispatch-worker guard --event "$GITHUB_EVENT_PATH"
+
+  worker:
+    needs: guard
+    runs-on: [carrick-agent]
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      checks: write
+    # H1: no runner-owned compiler server may execute agent-selected builds.
+    # Environment overrides runner Cargo config for every step.
+    env:
+      RUSTC_WRAPPER: ''
+      RUSTC_WORKSPACE_WRAPPER: ''
+      CARGO_BUILD_RUSTC_WRAPPER: ''
+      CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER: ''
+      CARRICK_SCCACHE: '0'
+      SCCACHE_DISABLE: '1'
+      SCCACHE_SERVER_UDS: ''
+      SCCACHE_SERVER_PORT: '0'
+      SCCACHE_DIR: ''
+    timeout-minutes: 40
+    steps:
+      - name: Reject a pre-existing runner compiler-cache server
+        run: |
+          status=0
+          pgrep -u "$(id -u)" -x sccache > /dev/null || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo 'Runner compiler-cache server absent check failed; refusing agent admission' >&2
+            exit 1
+          fi
+      - name: Mask the job token before agent execution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "::add-mask::$GH_TOKEN"
+      - name: Start the bounded job window
+        run: echo "CARRICK_AGENT_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: '1.96.0'
+      # Credentialed driver code must never be compiled from restored objects or
+      # toolchains. Keep the resulting executable outside the restored target.
+      - name: Build workflow driver
+        id: driver
+        timeout-minutes: 10
+        run: |
+          cargo build --locked --release -p carrick-xtask
+          cp target/release/carrick-xtask "$RUNNER_TEMP/carrick-dispatch-driver"
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.rustup/toolchains
+          key: dispatch-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}
+      - name: Bootstrap pinned agent tools and private foreground launcher
+        id: bootstrap
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_DIRECTOR_TOKEN }}
+        run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner bootstrap'
+      - name: Materialize selected provider credentials
+        id: auth
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          AGY_OAUTH_TOKEN: ${{ secrets.AGY_OAUTH_TOKEN }}
+        run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner auth --event "$GITHUB_EVENT_PATH"'
+      - name: Run foreground agent and collect output
+        id: worker
+        if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
+        timeout-minutes: 40
+        env:
+          # Used by the driver for continuation admission only; env_clear keeps
+          # this token out of the agent command.
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode carrick --check-load --
+          "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker run --event "$GITHUB_EVENT_PATH"
+          --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
+      - name: Scan output, push only this run branch and report its draft PR
+        id: complete
+        if: ${{ !cancelled() && steps.worker.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: '"$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker complete --event "$GITHUB_EVENT_PATH"'
+      - uses: actions/upload-artifact@v4
+        id: upload
+        if: ${{ !cancelled() && steps.complete.outcome == 'success' }}
+        with:
+          name: dispatch-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dispatch-output
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove provider and launcher state
+        if: always()
+        run: |
+          if test -x "$RUNNER_TEMP/carrick-dispatch-driver"; then
+            "$RUNNER_TEMP/carrick-dispatch-driver" agent-runner cleanup
+          fi
+      - name: Reflect the worker contract in the job verdict
+        if: ${{ !cancelled() && steps.complete.outputs.worker_failed == 'true' }}
+        run: exit 1

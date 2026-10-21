@@ -221,3 +221,101 @@ fn serial_host_reserved_standing_job_cannot_bypass_controller_rendezvous() {
     assert!(dir.path().join("rendezvous-requested").exists());
     assert!(!dir.path().join("reserved-bypass").exists());
 }
+
+#[test]
+fn agent_auth_is_job_scoped_private_and_always_cleanable() {
+    use std::os::unix::fs::PermissionsExt;
+    let xtask = env!("CARGO_BIN_EXE_carrick-xtask");
+    for backend in ["codex", "agy"] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("carrick-agent-42-1");
+        let home = state.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let event = temp.path().join("event.json");
+        let label = if backend == "codex" {
+            "dispatch:sol-high"
+        } else {
+            "dispatch:opus"
+        };
+        std::fs::write(&event, serde_json::json!({"repository":{"full_name":"carrick-sh/carrick"},
+            "action":"labeled","sender":{"login":"tjfontaine","type":"User"},
+            "label":{"name":label},"issue":{"number":634,"user":{"login":"tjfontaine"},"title":"Fixture","body":"## Brief\nImplement fixture"}}).to_string()).unwrap();
+        let invoke = |args: &[&str]| {
+            Command::new(xtask)
+                .args(args)
+                .env("RUNNER_TEMP", temp.path())
+                .env("GITHUB_RUN_ID", "42")
+                .env("GITHUB_RUN_ATTEMPT", "1")
+                .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
+                .env("CODEX_AUTH_JSON", r#"{"access_token":"fixture-secret"}"#)
+                .env("AGY_OAUTH_TOKEN", "fixture-secret\nraw")
+                .output()
+                .unwrap()
+        };
+        let output = invoke(&["agent-runner", "auth", "--event", event.to_str().unwrap()]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-secret"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-secret"));
+        let auth = if backend == "codex" {
+            home.join(".codex/auth.json")
+        } else {
+            home.join(".gemini/antigravity-cli/antigravity-oauth-token")
+        };
+        assert_eq!(auth.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        if backend == "agy" {
+            assert_eq!(std::fs::read(&auth).unwrap(), b"fixture-secret\nraw");
+            assert_eq!(
+                std::fs::read_dir(auth.parent().unwrap()).unwrap().count(),
+                1
+            );
+        }
+        assert_eq!(home.join(".codex").exists(), backend == "codex");
+        assert_eq!(home.join(".gemini").exists(), backend == "agy");
+        assert!(
+            !invoke(&["agent-runner", "auth", "--event", event.to_str().unwrap()])
+                .status
+                .success()
+        );
+        assert!(invoke(&["agent-runner", "cleanup"]).status.success());
+        assert!(!state.exists());
+        assert!(invoke(&["agent-runner", "cleanup"]).status.success());
+    }
+}
+
+#[test]
+fn rejected_director_token_stops_bootstrap_before_downloads() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    for (name, source) in [
+        (
+            "gh",
+            "#!/bin/sh\ntest \"$1 $2\" = 'api repos/carrick-sh/agy-director' || exit 91\necho 'HTTP 401: expired fixture-only-secret' >&2\nexit 1\n",
+        ),
+        (
+            "curl",
+            "#!/bin/sh\ntouch \"$RUNNER_TEMP/download-started\"\nexit 91\n",
+        ),
+    ] {
+        let path = bin.join(name);
+        std::fs::write(&path, source).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["agent-runner", "bootstrap"])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("GH_TOKEN", "fixture-only-secret")
+        .env("RUNNER_TEMP", temp.path())
+        .env("GITHUB_RUN_ID", "42")
+        .env("GITHUB_RUN_ATTEMPT", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("host/infra"), "{stderr}");
+    assert!(stderr.contains("AGENT_DIRECTOR_TOKEN"), "{stderr}");
+    assert!(!stderr.contains("fixture-only-secret"));
+    assert!(!temp.path().join("download-started").exists());
+    assert!(!temp.path().join("carrick-agent-42-1").exists());
+}

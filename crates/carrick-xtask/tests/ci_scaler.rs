@@ -1055,6 +1055,8 @@ fn dispatch_demand_and_hook_are_bound_to_owner_main_workflow_run() {
     assert!(policy.authorize(&context).is_err());
     context.workflow_ref = format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/main");
     assert!(policy.authorize(&context).is_err());
+    let workflow = include_str!("../../../.github/workflows/dispatch-worker.yml");
+    assert_eq!(runs_on(workflow, "worker"), AGENT_LABELS);
 }
 
 #[test]

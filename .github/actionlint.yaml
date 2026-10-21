@@ -8,6 +8,7 @@ self-hosted-runner:
     - carrick-kvm
     - kvm
     - willow-kvm
+    - carrick-agent
 paths:
   .github/workflows/kernel-runtime.yml:
     ignore:
