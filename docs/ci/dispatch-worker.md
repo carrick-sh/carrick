@@ -32,6 +32,9 @@ environment without GitHub tokens or Actions command-file channels.
 materialized nor captured. The selected provider credential is intentionally
 readable by the agent and may include a refresh token. This is a residual
 credential exposure, not a claim that the agent cannot extract that credential.
+The agent can also read the pinned launcher it runs from and could publish it
+in its own draft PR; the launcher is private to keep Python out of the carrick
+tree, not because it is secret (owner-accepted residual, #231).
 
 After exit or timeout, the driver stops and kills processes by both real and
 effective agent UID, including detached sessions. A subreaper reaps adopted
