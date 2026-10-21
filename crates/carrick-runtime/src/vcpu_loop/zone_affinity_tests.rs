@@ -862,3 +862,21 @@ fn affinity_reentry_preserves_retired_terminal_custody() {
         assert_eq!(zone.slot(slot).bound_cpu(), Some(1));
     });
 }
+
+#[test]
+fn production_venue_remote_set_prompts_a_record_without_host_residency() {
+    with_pair(|p| {
+        let slot = SlotId::new(1);
+        let record = p.sibling.thread().control_slot().zone_record().unwrap().id;
+        p.zone.requeue_preempted(slot, record);
+        assert_eq!(p.zone.switch_in_full(slot).unwrap().record, record);
+        let mut physical = NoPhysicalCrossings::default();
+        let mut entry = enter_native(&p, 0, &mut physical);
+        let mut mask = 1;
+        assert_eq!(ring_call(entry.as_mut(), p.current, p.zone, 0, 122,
+            p.sibling.thread().key().tid.raw(), &mut mask), 0);
+        drop(entry);
+        let prompts: Vec<_> = physical.effects.iter().flat_map(|e| e.sgi_slots()).collect();
+        assert_eq!(prompts, [slot]);
+    });
+}
