@@ -356,6 +356,150 @@ fn first_entry_activation_mint_has_exactly_one_concurrent_winner() {
     assert!(zone.live(record).is_none());
 }
 
+// Match the exact table and record so unrelated parallel tests never pause.
+struct MintPause {
+    arrived: std::sync::Mutex<usize>,
+    changed: std::sync::Condvar,
+    released: AtomicBool,
+}
+
+static MINT_PAUSE: std::sync::Mutex<Option<(usize, RecordRef, Arc<MintPause>)>> =
+    std::sync::Mutex::new(None);
+
+impl MintPause {
+    fn wait_for(&self, count: usize) {
+        let (arrived, timeout) = self
+            .changed
+            .wait_timeout_while(
+                self.arrived.lock().unwrap(),
+                std::time::Duration::from_secs(5),
+                |arrived| *arrived < count,
+            )
+            .unwrap();
+        assert!(
+            !timeout.timed_out(),
+            "mint arrivals timed out: {arrived}/{count}"
+        );
+    }
+
+    fn release(&self) {
+        let _guard = self.arrived.lock().unwrap();
+        self.released.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
+}
+
+pub(super) fn pause_activation_mint(table: usize, record: RecordRef) {
+    let pause = MINT_PAUSE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|(owner, target, pause)| {
+            (*owner == table && *target == record).then(|| Arc::clone(pause))
+        });
+    if let Some(pause) = pause {
+        let mut arrived = pause.arrived.lock().unwrap();
+        *arrived += 1;
+        pause.changed.notify_all();
+        let (_guard, timeout) = pause
+            .changed
+            .wait_timeout_while(arrived, std::time::Duration::from_secs(5), |_| {
+                !pause.released.load(Ordering::Acquire)
+            })
+            .unwrap();
+        assert!(!timeout.timed_out(), "activation mint pause timed out");
+    }
+}
+
+#[test]
+fn first_entry_witness_repeated_mint() {
+    first_entry_mint_witness(false);
+}
+
+#[test]
+fn first_entry_witness_two_concurrent_mints() {
+    first_entry_mint_witness(true);
+}
+
+fn first_entry_mint_witness(concurrent: bool) {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(0), 1);
+    zone.enter_guest(SLOT);
+    zone.enter_idle(SLOT, true);
+    let record = zone
+        .alloc_host_runnable(ThreadIdentity {
+            generation: 0,
+            lifecycle_page: 1,
+            control_slot: 1,
+            ..identity(904)
+        })
+        .unwrap();
+    let record = zone.record_ref(record);
+    assert!(zone.place_from_host(record.id).is_some());
+    // Deliver through the real service queue before minting current-record
+    // custody. Retirement must leave that previously linked queue empty.
+    assert_eq!(zone.take_service_head(SLOT), Some(record));
+    assert_eq!(zone.take_service_head(SLOT), None);
+    assert_eq!(zone.counters.service_adoptions.load(Ordering::Relaxed), 1);
+    let custody = if concurrent {
+        let pause = Arc::new(MintPause {
+            arrived: std::sync::Mutex::new(0),
+            changed: std::sync::Condvar::new(),
+            released: AtomicBool::new(false),
+        });
+        struct Disarm(Arc<MintPause>);
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                self.0.release();
+                *MINT_PAUSE.lock().unwrap() = None;
+            }
+        }
+        let _disarm = Disarm(Arc::clone(&pause));
+        *MINT_PAUSE.lock().unwrap() = Some((
+            &*zone as *const ZoneTables as usize,
+            record,
+            Arc::clone(&pause),
+        ));
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| zone.claim_current_first_entry_activation(record));
+            let second = scope.spawn(|| zone.claim_current_first_entry_activation(record));
+            // Both production calls have read Host and are immediately before
+            // their mint operation. A start barrier alone cannot prove this.
+            pause.wait_for(2);
+            pause.release();
+            let first = first.join().unwrap();
+            let second = second.join().unwrap();
+            assert_eq!(
+                usize::from(first.is_some()) + usize::from(second.is_some()),
+                1,
+                "exactly one activation mint may succeed"
+            );
+            first.or(second).unwrap()
+        })
+    } else {
+        zone.claim_current_first_entry_activation(record).unwrap()
+    };
+    for _ in 0..2 {
+        assert!(
+            zone.claim_current_first_entry_activation(record).is_none(),
+            "a held activation must reject repeated minting"
+        );
+    }
+    assert_eq!(
+        zone.claim_for_host(record, None, Handback::Control, &HostWait),
+        HostClaim::Deferred
+    );
+    assert!(zone.free_first_entry_activation(custody));
+    assert!(zone.live(record).is_none());
+    assert_eq!(zone.record(record.id).claim(), Claim::Free);
+    assert!(zone.claim_current_first_entry_activation(record).is_none());
+    for raw in 0..ZONE_SLOTS {
+        let slot = SlotId::new(raw as u8);
+        assert_eq!(zone.runnable_head(slot), None);
+        assert!(zone.take_service_head_for_executor(slot).is_none());
+    }
+}
+
 #[test]
 fn closing_request_preempts_admitted_first_entry_placement() {
     let zone = zone();

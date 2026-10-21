@@ -1981,6 +1981,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
         let current = rec.claim();
         let next = first_entry_transition(current, FirstEntryOperation::MintActivation)?;
+        #[cfg(test)]
+        tests::pause_activation_mint(self as *const Self as usize, record);
         rec.cas(current, next)
             .then_some(FirstEntryActivation { record })
     }
