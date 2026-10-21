@@ -2002,7 +2002,7 @@ fn switched_thread_affinity_exclusion_migrates_without_a_tick() {
     id.affinity_source = source;
     let record = zone.alloc_record(id).unwrap();
     zone.requeue_preempted(SLOT, record);
-    assert_eq!(zone.switch_in(SLOT).unwrap().record, record);
+    assert_eq!(zone.switch_in_full(SLOT).unwrap().record, record);
     struct NoHostResidency;
     impl carrick_core::affinity::AffinityNotifier for NoHostResidency {
         fn notify(&mut self, _: carrick_core::affinity::AffinityNotification) {}
@@ -2027,6 +2027,6 @@ fn switched_thread_affinity_exclusion_migrates_without_a_tick() {
     .interrupt(&mut frame, ETIMEDOUT_RESULT);
     assert_eq!(action, carrick_el1_abi::Action::Idle);
     assert_eq!(zone.slot(SLOT).current(), None);
-    assert_eq!(zone.switch_in(other).unwrap().record, record);
+    assert_eq!(zone.switch_in_full(other).unwrap().record, record);
     assert_eq!(cpu.now, before);
 }
