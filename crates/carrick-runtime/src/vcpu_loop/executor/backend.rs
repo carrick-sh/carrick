@@ -872,7 +872,6 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 visible_pid,
                 root_generation,
             );
-            let mut lifecycle_published = false;
             if let Some(mappings) = &self.lifecycle_mappings {
                 let control = task.lease().control_lease().ok_or_else(|| {
                     TrapError::Hypervisor("loaded thread lost lifecycle backing".into())
@@ -887,24 +886,16 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                         ));
                     }
                 }
-                let publication = mappings.publish(slot, control).map_err(|error| {
+                mappings.publish(slot, control).map_err(|error| {
                     TrapError::Hypervisor(format!(
                         "lifecycle metadata publication failed: {error:?}"
                     ))
                 })?;
-                lifecycle_published = matches!(
-                    publication,
-                    super::super::thread_lifecycle::LifecyclePublication::Published
-                );
             }
             publish_zone_slot(
                 slot,
                 self.raw_vcpu_id,
-                if lifecycle_published {
-                    task.binding().identity().mm.raw()
-                } else {
-                    0
-                },
+                task.binding().identity().mm.raw(),
                 task.thread_key().serial.raw(),
                 self.bound_cpu,
                 task.lease()
@@ -1028,26 +1019,17 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 carrick_sched_core::affinity_source::AffinitySource::UNBOUND,
             );
         }
-        let mut lifecycle_published = false;
         if let Some(mappings) = &self.lifecycle_mappings {
-            let publication = mappings.publish(index, control.clone()).map_err(|e| {
+            mappings.publish(index, control.clone()).map_err(|e| {
                 TrapError::Hypervisor(format!("exec affinity metadata publication failed: {e:?}"))
             })?;
-            lifecycle_published = matches!(
-                publication,
-                super::super::thread_lifecycle::LifecyclePublication::Published
-            );
         }
         let binding = self
             .binding
             .as_ref()
             .ok_or_else(|| TrapError::Hypervisor("exec affinity lost task binding".into()))?;
         let source = control.affinity_source();
-        let mm = if lifecycle_published && source.is_guest_mapped() {
-            binding.identity().mm.raw()
-        } else {
-            0
-        };
+        let mm = binding.identity().mm.raw();
         if let Some(zone) = carrick_kernel::el1_zone::zone() {
             zone.publish_slot_with_affinity(slot, mm, self.bound_cpu, source);
         }
@@ -1607,7 +1589,6 @@ fn publish_zone_slot(
     affinity: carrick_sched_core::AffinitySource,
     driver: u64,
 ) -> Result<(), TrapError> {
-    let mm = if affinity.is_guest_mapped() { mm } else { 0 };
     carrick_vmm_hvf::vcpu_kick::bind_zone_slot_vcpu(slot, vcpu);
     let Some(zone) = carrick_kernel::el1_zone::zone() else {
         carrick_el1_abi::publish_zone_identity(slot, 0, serial);

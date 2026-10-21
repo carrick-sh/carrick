@@ -489,12 +489,7 @@ pub fn carrier_peer_boot<P: Personality>() -> ! {
         unsafe { &*(layout.zone.raw() as *const carrick_el1::memory::reservations::X86Cpl0Zone) };
     let slot = carrick_sched_core::SlotId::new(1);
     zone.drive(slot, 2);
-    zone.publish_slot_with_affinity(
-        slot,
-        mm.get(),
-        Some(binding.cpu_slot),
-        carrick_sched_core::AffinitySource::UNBOUND,
-    );
+    zone.publish_slot(slot, mm.get(), Some(binding.cpu_slot), 3);
     zone.enter_guest(slot);
     crate::entry::user_fault_gate::install_persistent();
     if !zone.enter_idle(slot, true) {

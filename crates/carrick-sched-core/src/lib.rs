@@ -4048,7 +4048,6 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Publish what the host loaded on `slot`: the zone key of its address
     /// space (0: not a zone process), the guest CPU its executor is bound to
     /// (`None`: any) and the loaded thread's affinity mask (0: any).
-    #[cfg(any(test, feature = "host-test"))]
     pub fn publish_slot(&self, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
         self.publish_slot_with_affinity(slot, mm, cpu, AffinitySource::UNBOUND);
         self.slot(slot).affinity.store(affinity, Ordering::Release);
