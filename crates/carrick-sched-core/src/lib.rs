@@ -245,11 +245,12 @@ impl SlotState {
 ///
 /// `Free` is allocatable; `Parked`, `Queued`, and `OnCpu*` belong to EL1;
 /// `Transferring` belongs to the producer named by its typed `HostTransfer`;
-/// `Host` is published host custody; `Activating` belongs to exactly one
-/// typed first-entry placement or executor token; and `Retiring` belongs to
+/// `Host` is published host custody; `Placing*` belongs to exactly one typed
+/// first-entry placement token; `Activating` belongs to one executor token;
+/// and `Retiring` belongs to
 /// the activation token completing destruction. Every ownership change is an
 /// exact compare-exchange on this word. Producers may perform
-/// Host -> Activating -> Queued/Host, executors may perform
+/// Host -> Placing -> Queued/Host, executors may perform
 /// Host -> Activating -> Retiring/Host, and only the retiring owner may
 /// perform Retiring -> Free. Host claimants defer while a transfer,
 /// activation, or retirement owner exists.
@@ -280,6 +281,8 @@ pub enum Claim {
     },
     /// Owned by the host; the context is frozen until the thread is loaded.
     Host { seq: u32 },
+    /// A producer is routing a first entry; a claimant may record a request.
+    Placing { seq: u32, host_requested: bool },
     /// Exclusive first-entry placement or executor activation custody.
     Activating { seq: u32 },
     /// Terminal activation custody; no publication is permitted.
@@ -295,8 +298,10 @@ const STATE_TRANSFERRING: u64 = 5;
 const STATE_TRANSFER_CANCELLED: u64 = 6;
 const STATE_TRANSFER_REQUESTED: u64 = 7;
 const STATE_ONCPU_REQUESTED: u64 = 8;
-const STATE_ACTIVATING: u64 = 9;
-const STATE_RETIRING: u64 = 10;
+const STATE_PLACING: u64 = 9;
+const STATE_PLACING_REQUESTED: u64 = 10;
+const STATE_ACTIVATING: u64 = 11;
+const STATE_RETIRING: u64 = 12;
 
 impl Claim {
     pub const fn encode(self) -> u64 {
@@ -313,6 +318,16 @@ impl Claim {
                 STATE_ONCPU_REQUESTED | ((slot.raw() as u64) << 8) | ((seq as u64) << 16)
             }
             Self::Host { seq } => STATE_HOST | ((seq as u64) << 16),
+            Self::Placing {
+                seq,
+                host_requested,
+            } => {
+                (if host_requested {
+                    STATE_PLACING_REQUESTED
+                } else {
+                    STATE_PLACING
+                }) | ((seq as u64) << 16)
+            }
             Self::Activating { seq } => STATE_ACTIVATING | ((seq as u64) << 16),
             Self::Retiring { seq } => STATE_RETIRING | ((seq as u64) << 16),
             Self::Transferring {
@@ -340,6 +355,14 @@ impl Claim {
             STATE_ONCPU => Self::OnCpu { slot, seq },
             STATE_ONCPU_REQUESTED => Self::OnCpuRequested { slot, seq },
             STATE_HOST => Self::Host { seq },
+            STATE_PLACING => Self::Placing {
+                seq,
+                host_requested: false,
+            },
+            STATE_PLACING_REQUESTED => Self::Placing {
+                seq,
+                host_requested: true,
+            },
             STATE_ACTIVATING => Self::Activating { seq },
             STATE_RETIRING => Self::Retiring { seq },
             STATE_TRANSFERRING => Self::Transferring {
@@ -370,6 +393,7 @@ impl Claim {
             | Self::OnCpu { seq, .. }
             | Self::OnCpuRequested { seq, .. }
             | Self::Host { seq }
+            | Self::Placing { seq, .. }
             | Self::Activating { seq }
             | Self::Retiring { seq }
             | Self::Transferring { seq, .. } => seq,
@@ -379,7 +403,8 @@ impl Claim {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FirstEntryOperation {
-    Mint,
+    AdmitPlacement,
+    MintActivation,
     Release,
     Retire,
     FinishRetire,
@@ -387,7 +412,14 @@ enum FirstEntryOperation {
 
 const fn first_entry_transition(claim: Claim, operation: FirstEntryOperation) -> Option<Claim> {
     match (claim, operation) {
-        (Claim::Host { seq }, FirstEntryOperation::Mint) => Some(Claim::Activating { seq }),
+        (Claim::Host { seq }, FirstEntryOperation::AdmitPlacement) => Some(Claim::Placing {
+            seq,
+            host_requested: false,
+        }),
+        (Claim::Host { seq }, FirstEntryOperation::MintActivation) => {
+            Some(Claim::Activating { seq })
+        }
+        (Claim::Placing { seq, .. }, FirstEntryOperation::Release) => Some(Claim::Host { seq }),
         (Claim::Activating { seq }, FirstEntryOperation::Release) => Some(Claim::Host { seq }),
         (Claim::Activating { seq }, FirstEntryOperation::Retire) => Some(Claim::Retiring { seq }),
         (Claim::Retiring { .. }, FirstEntryOperation::FinishRetire) => Some(Claim::Free),
@@ -1948,7 +1980,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             return None;
         }
         let current = rec.claim();
-        let next = first_entry_transition(current, FirstEntryOperation::Mint)?;
+        let next = first_entry_transition(current, FirstEntryOperation::MintActivation)?;
         rec.cas(current, next)
             .then_some(FirstEntryActivation { record })
     }
@@ -1979,8 +2011,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             return None;
         }
         let current = rec.claim();
-        let next = first_entry_transition(current, FirstEntryOperation::Mint)?;
-        let Claim::Activating { seq } = next else {
+        let next = first_entry_transition(current, FirstEntryOperation::AdmitPlacement)?;
+        let Claim::Placing { seq, .. } = next else {
             return None;
         };
         rec.cas(current, next)
@@ -1993,7 +2025,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     ) -> Result<HostPlacement, FirstEntryPlacement> {
         match self.place_in_guest(
             custody.record.id,
-            Claim::Activating { seq: custody.seq },
+            Claim::Placing {
+                seq: custody.seq,
+                host_requested: false,
+            },
             None,
             &SpinForever,
             |_| {},
@@ -2005,10 +2040,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
 
     pub fn release_first_entry_placement(&self, custody: FirstEntryPlacement) -> bool {
         self.live(custody.record).is_some_and(|rec| {
-            rec.cas(
-                Claim::Activating { seq: custody.seq },
-                Claim::Host { seq: custody.seq },
-            )
+            let current = rec.claim();
+            first_entry_transition(current, FirstEntryOperation::Release)
+                .is_some_and(|next| rec.cas(current, next))
         })
     }
 
@@ -3952,7 +3986,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             cancelled: false,
             host_requested: false,
         }
-        | Claim::Activating { seq }) = from
+        | Claim::Activating { seq }
+        | Claim::Placing {
+            seq,
+            host_requested: false,
+        }) = from
         else {
             return Placement::Lost;
         };
@@ -4381,6 +4419,27 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     return HostClaim::Deferred;
                 }
                 Claim::Host { .. } => return HostClaim::AlreadyHost,
+                Claim::Placing {
+                    seq: current,
+                    host_requested,
+                } => {
+                    if seq.is_some_and(|wanted| wanted != current) {
+                        return HostClaim::Stale;
+                    }
+                    rec.handback.store(kind as u32, Ordering::Release);
+                    if !host_requested
+                        && !rec.cas(
+                            claim,
+                            Claim::Placing {
+                                seq: current,
+                                host_requested: true,
+                            },
+                        )
+                    {
+                        continue;
+                    }
+                    return HostClaim::Deferred;
+                }
                 Claim::Activating { .. } | Claim::Retiring { .. } => {
                     return HostClaim::Deferred;
                 }

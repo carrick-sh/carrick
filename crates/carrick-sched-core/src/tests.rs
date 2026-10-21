@@ -216,6 +216,14 @@ fn claim_word_round_trips() {
             seq: u32::MAX,
         },
         Claim::Host { seq: 77 },
+        Claim::Placing {
+            seq: 77,
+            host_requested: false,
+        },
+        Claim::Placing {
+            seq: 77,
+            host_requested: true,
+        },
         Claim::Activating { seq: 78 },
         Claim::Retiring { seq: 79 },
         Claim::Transferring {
@@ -262,11 +270,20 @@ fn first_entry_ownership_transition_table_is_exhaustive() {
             host_requested: false,
         },
         Claim::Host { seq: 7 },
+        Claim::Placing {
+            seq: 7,
+            host_requested: false,
+        },
+        Claim::Placing {
+            seq: 7,
+            host_requested: true,
+        },
         Claim::Activating { seq: 7 },
         Claim::Retiring { seq: 7 },
     ];
     let operations = [
-        FirstEntryOperation::Mint,
+        FirstEntryOperation::AdmitPlacement,
+        FirstEntryOperation::MintActivation,
         FirstEntryOperation::Release,
         FirstEntryOperation::Retire,
         FirstEntryOperation::FinishRetire,
@@ -274,7 +291,18 @@ fn first_entry_ownership_transition_table_is_exhaustive() {
     for state in states {
         for operation in operations {
             let expected = match (state, operation) {
-                (Claim::Host { seq }, FirstEntryOperation::Mint) => Some(Claim::Activating { seq }),
+                (Claim::Host { seq }, FirstEntryOperation::AdmitPlacement) => {
+                    Some(Claim::Placing {
+                        seq,
+                        host_requested: false,
+                    })
+                }
+                (Claim::Host { seq }, FirstEntryOperation::MintActivation) => {
+                    Some(Claim::Activating { seq })
+                }
+                (Claim::Placing { seq, .. }, FirstEntryOperation::Release) => {
+                    Some(Claim::Host { seq })
+                }
                 (Claim::Activating { seq }, FirstEntryOperation::Release) => {
                     Some(Claim::Host { seq })
                 }
@@ -325,6 +353,42 @@ fn first_entry_activation_mint_has_exactly_one_concurrent_winner() {
     let custody = winner.expect("one mint must win");
     assert!(zone.claim_current_first_entry_activation(record).is_none());
     assert!(zone.free_first_entry_activation(custody));
+    assert!(zone.live(record).is_none());
+}
+
+#[test]
+fn closing_request_preempts_admitted_first_entry_placement() {
+    let zone = zone();
+    let record = zone
+        .alloc_host_runnable(ThreadIdentity {
+            generation: 0,
+            lifecycle_page: 1,
+            control_slot: 1,
+            ..identity(903)
+        })
+        .unwrap();
+    let record = zone.record_ref(record);
+    let placement = zone.claim_first_entry_placement(record).unwrap();
+    assert_eq!(
+        zone.claim_for_host(record, None, Handback::Control, &HostWait),
+        HostClaim::Deferred
+    );
+    assert!(matches!(
+        zone.record(record.id).claim(),
+        Claim::Placing {
+            host_requested: true,
+            ..
+        }
+    ));
+    let placement = match zone.place_first_entry(placement) {
+        Ok(_) => panic!("requested placement was published"),
+        Err(placement) => placement,
+    };
+    assert!(zone.release_first_entry_placement(placement));
+    assert!(matches!(zone.record(record.id).claim(), Claim::Host { .. }));
+    assert_eq!(zone.record(record.id).handback(), Some(Handback::Control));
+    let activation = zone.claim_current_first_entry_activation(record).unwrap();
+    assert!(zone.free_first_entry_activation(activation));
     assert!(zone.live(record).is_none());
 }
 
