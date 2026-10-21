@@ -162,15 +162,6 @@ impl NativeProcessError {
 
 /// Pre-reserved single-item heap allocation for EL1 structures.
 ///
-#[cfg(test)]
-static INJECT_TRY_RESERVE_FAILURE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-#[cfg(test)]
-pub fn set_inject_try_reserve_failure(fail: bool) {
-    INJECT_TRY_RESERVE_FAILURE.store(fail, core::sync::atomic::Ordering::Release);
-}
-
 /// Uses `Vec::try_reserve_exact(1)` and converts to `Box<T>` via boxed slice,
 /// allowing fallible allocation before unrecoverable state transitions.
 pub struct FallibleBox<T>(Vec<T>);
@@ -178,7 +169,10 @@ pub struct FallibleBox<T>(Vec<T>);
 impl<T> FallibleBox<T> {
     pub fn try_reserve() -> Result<Self, NativeProcessError> {
         #[cfg(test)]
-        if INJECT_TRY_RESERVE_FAILURE.load(core::sync::atomic::Ordering::Acquire) {
+        if INJECT_TRY_RESERVE_FAILURE
+            .try_with(|cell| cell.get())
+            .unwrap_or(false)
+        {
             return Err(NativeProcessError::Exhausted);
         }
         let mut vec = Vec::new();
@@ -197,6 +191,35 @@ impl<T> FallibleBox<T> {
 
 pub fn try_box<T>(value: T) -> Result<Box<T>, NativeProcessError> {
     FallibleBox::try_reserve().map(|slot| slot.put(value))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static INJECT_TRY_RESERVE_FAILURE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// RAII guard scoping allocator fault-injection in `FallibleBox::try_reserve`
+/// to the current thread. Resets failure injection on drop (even during unwinding).
+///
+/// In-test fork preparation (`prepare_mm`) runs synchronously on the calling
+/// thread without switching executors, so thread-local scoping isolates the fault
+/// without leaking into parallel test threads.
+#[cfg(test)]
+pub struct InjectTryReserveFailure;
+
+#[cfg(test)]
+impl InjectTryReserveFailure {
+    pub fn activate() -> Self {
+        let _ = INJECT_TRY_RESERVE_FAILURE.try_with(|cell| cell.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for InjectTryReserveFailure {
+    fn drop(&mut self) {
+        let _ = INJECT_TRY_RESERVE_FAILURE.try_with(|cell| cell.set(false));
+    }
 }
 
 /// Physical crossings are outside graph guards. commit_mm is only the final

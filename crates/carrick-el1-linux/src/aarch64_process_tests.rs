@@ -1592,12 +1592,15 @@ fn test_fork_prepared_box_allocation_failure_allows_index_reuse_without_collisio
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
 
     // Inject allocation failure for Prepared reservation in first fork attempt.
-    super::native_process_runtime::set_inject_try_reserve_failure(true);
-    let err = service
-        .prepare_mm(&fixture.address, parked, child_mm)
-        .expect_err("prepare_mm must fail when FallibleBox::try_reserve fails");
-    super::native_process_runtime::set_inject_try_reserve_failure(false);
-    assert_eq!(err, NativeProcessError::Exhausted);
+    // The fork preparation executes synchronously on this test thread, so the
+    // RAII guard safely isolates the failure without affecting concurrent tests.
+    {
+        let _fault_guard = super::native_process_runtime::InjectTryReserveFailure::activate();
+        let err = service
+            .prepare_mm(&fixture.address, parked, child_mm)
+            .expect_err("prepare_mm must fail when FallibleBox::try_reserve fails");
+        assert_eq!(err, NativeProcessError::Exhausted);
+    }
 
     // Second fork reuses the exact same index and must not fail with Collision.
     let prepared = service
