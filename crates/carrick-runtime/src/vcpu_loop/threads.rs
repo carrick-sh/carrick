@@ -1295,6 +1295,11 @@ impl KernelState {
             RuntimeError::Configuration("native terminal wake lost its scheduler".into())
         })?;
         let scheduler = directory.continuation_services(context.kernel()).0;
+        #[cfg(any(test, feature = "test-support"))]
+        carrick_kernel::el1_zone::first_entry_test_control::closing_entered(
+            context,
+            super::executor::backend::driven_zone_slot().map(|(slot, _)| slot),
+        );
         let mut woken = 0;
         for thread in context.task().threads() {
             let control = thread.control_slot();
@@ -1315,11 +1320,18 @@ impl KernelState {
                 }) else {
                     continue;
                 };
-                match carrick_kernel::el1_zone::claim(
+                let claim = carrick_kernel::el1_zone::claim(
                     record,
                     None,
                     carrick_el1_abi::Handback::Control,
-                ) {
+                );
+                #[cfg(any(test, feature = "test-support"))]
+                carrick_kernel::el1_zone::first_entry_test_control::emit(
+                    carrick_kernel::el1_zone::first_entry_test_control::Event::ClosingClaim(
+                        record, claim,
+                    ),
+                );
+                match claim {
                     carrick_el1_abi::HostClaim::Claimed => {
                         carrick_kernel::el1_zone::hand_back(&[record]);
                     }
@@ -1347,6 +1359,10 @@ impl KernelState {
             }
             woken += 1;
         }
+        #[cfg(any(test, feature = "test-support"))]
+        carrick_kernel::el1_zone::first_entry_test_control::emit(
+            carrick_kernel::el1_zone::first_entry_test_control::Event::ClosingFinished,
+        );
         Ok(woken)
     }
 }

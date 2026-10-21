@@ -2931,6 +2931,40 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             .store(cntvct, Ordering::Release);
     }
 
+    /// Read-only signed-test inspection while an activation owner prevents reuse.
+    /// A busy slot or a malformed/cyclic queue is incomplete evidence.
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn first_entry_links_clear_for_test(
+        &self,
+        record: RecordRef,
+        wait: &impl LockWait<C>,
+    ) -> Option<bool> {
+        if self.live(record)?.entry_count() != 0 {
+            return Some(false);
+        }
+        for raw in 0..ZONE_SLOTS {
+            let slot = SlotId::new(raw as u8);
+            let _guard = self.slot_lock(slot, wait)?;
+            let state = self.slot(slot);
+            if state.tail.load(Ordering::Acquire) == record.id.raw() {
+                return Some(false);
+            }
+            let mut cursor = state.head.load(Ordering::Acquire);
+            let mut remaining = ZONE_RECORDS;
+            while cursor != NIL {
+                if cursor == record.id.raw() {
+                    return Some(false);
+                }
+                if cursor as usize >= ZONE_RECORDS || remaining == 0 {
+                    return None;
+                }
+                remaining -= 1;
+                cursor = self.record(RecordId(cursor)).next.load(Ordering::Acquire);
+            }
+        }
+        Some(true)
+    }
+
     /// The oldest record on `slot`'s run queue, if it is still queued there
     /// and not cancelled (only that slot removes its head, so it stays
     /// switchable until the slot's next [`Self::switch_in`]; a thief takes

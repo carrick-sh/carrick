@@ -1184,6 +1184,90 @@ fn settle_vacated(
     }
 }
 
+/// Bounded observers for signed first-entry ownership witnesses. No observer
+/// is installed by product code; callbacks run without the subscription lock.
+#[cfg(any(test, feature = "test-support"))]
+pub mod first_entry_test_control {
+    use super::{HostClaim, RecordRef};
+    use std::sync::Arc;
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum Event {
+        ClosingEntered(Option<RecordRef>),
+        ClosingClaim(RecordRef, HostClaim),
+        ClosingFinished,
+        ExecutorTaken(RecordRef),
+        Adopted(RecordRef),
+        BeforeRetire(RecordRef),
+        Retired(RecordRef),
+        NextFatal,
+    }
+
+    type Observer = Arc<dyn Fn(Event) + Send + Sync>;
+    static OBSERVER: parking_lot::RwLock<Option<Observer>> = parking_lot::RwLock::new(None);
+
+    pub struct Subscription;
+    impl Drop for Subscription {
+        fn drop(&mut self) {
+            *OBSERVER.write() = None;
+        }
+    }
+
+    pub fn subscribe(observer: Observer) -> Subscription {
+        let mut current = OBSERVER.write();
+        assert!(
+            current.is_none(),
+            "one signed first-entry witness at a time"
+        );
+        *current = Some(observer);
+        Subscription
+    }
+
+    pub fn emit(event: Event) {
+        let observer = OBSERVER.read().clone();
+        if let Some(observer) = observer {
+            observer(event);
+        }
+    }
+
+    pub fn closing_entered(
+        context: &crate::kernel::KernelContext,
+        closing_slot: Option<super::SlotId>,
+    ) {
+        if OBSERVER.read().is_none() {
+            return;
+        }
+        let record = context.task().threads().into_iter().find_map(|thread| {
+            if thread.execution_state().generation().is_some() {
+                return None;
+            }
+            let record = thread.control_slot().zone_record()?;
+            let live = super::zone_tables()?.live(record)?;
+            // The Closing executor itself is paused. Select a real birth on
+            // another driven lane, so its executor can reach the service take.
+            (live.last_slot().is_some()
+                && live.last_slot() != closing_slot
+                && matches!(live.claim(), carrick_el1_abi::Claim::Parked { .. }))
+            .then_some(record)
+        });
+        emit(Event::ClosingEntered(record));
+    }
+
+    /// The caller owns activation custody: no reuse or requeue can race the
+    /// inspection. Refuse incomplete inspection rather than treating it as clear.
+    pub fn links_clear(record: RecordRef) -> Option<bool> {
+        struct Deadline(std::time::Instant);
+        impl carrick_el1_abi::LockWait for Deadline {
+            fn wait(&self, _: u32) -> bool {
+                std::thread::yield_now();
+                self.0.elapsed() < std::time::Duration::from_secs(5)
+            }
+        }
+        super::zone_tables()?
+            .first_entry_links_clear_for_test(record, &Deadline(std::time::Instant::now()))
+    }
+}
+
 /// Signed-witness control for the deferred-capture boundary (#695). Armed,
 /// once any slot has stepped away (past the workload's first run), it holds
 /// the next real service placement (host-owned, unqueued) and

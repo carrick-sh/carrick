@@ -303,7 +303,13 @@ where
         let taken = match next_runnable(scheduler, backend, registration, kick) {
             Ok(taken) => Ok(taken),
             Err(NextError::Queue(error)) => Err(error),
-            Err(NextError::Fatal(error)) => return Err(error),
+            Err(NextError::Fatal(error)) => {
+                #[cfg(any(test, feature = "test-support"))]
+                carrick_kernel::el1_zone::first_entry_test_control::emit(
+                    carrick_kernel::el1_zone::first_entry_test_control::Event::NextFatal,
+                );
+                return Err(error);
+            }
         };
         let mut running = match taken {
             Ok(Some(running)) => running,
@@ -1561,11 +1567,21 @@ fn adopt_born_record(
         .adopt_born_thread_at_first_entry(key, &frame.native)
         .map_err(NextError::Fatal)?
     {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            use carrick_kernel::el1_zone::first_entry_test_control::{Event, emit};
+            emit(Event::Adopted(record));
+            emit(Event::BeforeRetire(record));
+        }
         if !zone.free_first_entry_activation(custody) {
             return Err(NextError::Fatal(
                 "first-entry activation lost exclusive record custody".into(),
             ));
         }
+        #[cfg(any(test, feature = "test-support"))]
+        carrick_kernel::el1_zone::first_entry_test_control::emit(
+            carrick_kernel::el1_zone::first_entry_test_control::Event::Retired(record),
+        );
         return Ok(true);
     }
     if !zone.release_first_entry_activation(custody) {
@@ -1669,6 +1685,12 @@ fn next_runnable<F: PersistentExecutor>(
     if let Some(service) = zone.take_service_head_for_executor(slot) {
         let record = match service {
             carrick_el1_abi::ServiceHead::FirstEntry(custody) => {
+                #[cfg(any(test, feature = "test-support"))]
+                carrick_kernel::el1_zone::first_entry_test_control::emit(
+                    carrick_kernel::el1_zone::first_entry_test_control::Event::ExecutorTaken(
+                        custody.record(),
+                    ),
+                );
                 if adopt_born_record(scheduler, zone, custody)? {
                     return Ok(scheduler.try_take(registration)?);
                 }

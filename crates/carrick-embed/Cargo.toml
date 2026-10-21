@@ -69,6 +69,8 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# Signed first-entry witnesses arm runtime/kernel hooks only in test builds.
+carrick-runtime = { path = "../carrick-runtime", default-features = false, features = ["test-support"] }
 carrick-el1-image = { path = "../carrick-el1-image", features = ["allocator-test-control"] }
 carrick-kernel = { path = "../carrick-kernel", features = ["deferred-capture-test-control"] }
 flate2.workspace = true

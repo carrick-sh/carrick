@@ -748,6 +748,241 @@ fn el1_sched_signal_reaches_a_parked_thread() {
     assert_eq!(field(&stdout, "usr2_handled"), 1.0, "{stdout:?}");
 }
 
+/// Real Closing/first-entry rendezvous. Only host wake publication is driven
+/// by the test; allocation, service take, adoption and retirement stay in the
+/// production HVF executor and process-owned adoption factory.
+#[derive(Debug, Default)]
+struct FirstEntryClosingState {
+    target: Option<carrick_el1_abi::RecordRef>,
+    release_closing: bool,
+    release_executor: bool,
+    closing_finished: bool,
+    closing_claims: usize,
+    deliveries: usize,
+    adoptions: usize,
+    retirements: usize,
+    fatals: usize,
+    errors: Vec<String>,
+}
+
+#[derive(Default)]
+struct FirstEntryClosingGate {
+    state: std::sync::Mutex<FirstEntryClosingState>,
+    changed: std::sync::Condvar,
+}
+
+impl FirstEntryClosingGate {
+    fn wait_for(&self, predicate: impl Fn(&FirstEntryClosingState) -> bool) -> Result<(), String> {
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(
+                self.state.lock().unwrap(),
+                Duration::from_secs(5),
+                |state| !predicate(state) && state.errors.is_empty(),
+            )
+            .unwrap();
+        if timeout.timed_out() && !predicate(&state) {
+            return Err(format!("first-entry rendezvous timed out: {state:?}"));
+        }
+        if !state.errors.is_empty() {
+            return Err(format!("first-entry observer failed: {state:?}"));
+        }
+        Ok(())
+    }
+
+    fn observe(&self, event: carrick_kernel::el1_zone::first_entry_test_control::Event) {
+        use carrick_kernel::el1_zone::first_entry_test_control::{self as control, Event};
+        let target = self.state.lock().unwrap().target;
+        // Inspection runs outside the rendezvous mutex and before the real
+        // owner frees the record, while its activation claim excludes reuse.
+        let links = match event {
+            Event::BeforeRetire(record) if target == Some(record) => {
+                Some(control::links_clear(record))
+            }
+            _ => None,
+        };
+        let mut state = self.state.lock().unwrap();
+        let pause = match event {
+            Event::ClosingEntered(record) => {
+                if state.target.is_some() {
+                    state.errors.push("duplicate Closing entry".into());
+                }
+                state.target = record;
+                if record.is_none() {
+                    state
+                        .errors
+                        .push("Closing found no real unadopted parked birth".into());
+                }
+                true
+            }
+            Event::ClosingClaim(record, outcome) if target == Some(record) => {
+                state.closing_claims += 1;
+                if outcome != carrick_el1_abi::HostClaim::Deferred {
+                    state
+                        .errors
+                        .push(format!("Closing stole activation custody: {outcome:?}"));
+                }
+                false
+            }
+            Event::ClosingFinished => {
+                state.closing_finished = true;
+                false
+            }
+            Event::ExecutorTaken(record) if target == Some(record) => {
+                state.deliveries += 1;
+                true
+            }
+            Event::Adopted(record) if target == Some(record) => {
+                state.adoptions += 1;
+                false
+            }
+            Event::BeforeRetire(record) if target == Some(record) => {
+                if links != Some(Some(true)) {
+                    state.errors.push(format!(
+                        "retiring record linked or inspection incomplete: {links:?}"
+                    ));
+                }
+                false
+            }
+            Event::Retired(record) if target == Some(record) => {
+                state.retirements += 1;
+                if carrick_el1_abi::zone_tables()
+                    .unwrap()
+                    .live(record)
+                    .is_some()
+                {
+                    state
+                        .errors
+                        .push("retirement left the exact record live".into());
+                }
+                false
+            }
+            Event::NextFatal => {
+                state.fatals += 1;
+                state
+                    .errors
+                    .push("production next_runnable returned NextError::Fatal".into());
+                false
+            }
+            _ => false,
+        };
+        self.changed.notify_all();
+        if pause {
+            let closing = matches!(event, Event::ClosingEntered(_));
+            let (mut state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                    state.errors.is_empty()
+                        && if closing {
+                            !state.release_closing
+                        } else {
+                            !state.release_executor
+                        }
+                })
+                .unwrap();
+            if timeout.timed_out()
+                && if closing {
+                    !state.release_closing
+                } else {
+                    !state.release_executor
+                }
+            {
+                state
+                    .errors
+                    .push(format!("production pause timed out: {event:?}"));
+                self.changed.notify_all();
+            }
+        }
+    }
+
+    fn drive(self: &std::sync::Arc<Self>) -> Result<(), String> {
+        // Every error releases both production pause points. The pauses also
+        // have their own deadlines if the monitor itself fails.
+        struct Release(std::sync::Arc<FirstEntryClosingGate>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let mut state = self.0.state.lock().unwrap();
+                state.release_closing = true;
+                state.release_executor = true;
+                self.0.changed.notify_all();
+            }
+        }
+        let _release = Release(self.clone());
+        self.wait_for(|state| state.target.is_some())?;
+        let record = self.state.lock().unwrap().target.unwrap();
+        // This is a host wake of an actual EL1-parked record, not fabricated
+        // custody or a manual service-head take. The real route publishes it.
+        let claimed =
+            carrick_kernel::el1_zone::claim(record, None, carrick_el1_abi::Handback::Woken);
+        if claimed != carrick_el1_abi::HostClaim::Claimed {
+            return Err(format!("host wake did not claim parked birth: {claimed:?}"));
+        }
+        carrick_kernel::el1_zone::hand_back(&[record]);
+        self.wait_for(|state| state.deliveries == 1)?;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.release_closing = true;
+            self.changed.notify_all();
+        }
+        self.wait_for(|state| state.closing_finished)?;
+        let claim = carrick_el1_abi::zone_tables()
+            .unwrap()
+            .live(record)
+            .map(|rec| rec.claim());
+        if !matches!(claim, Some(carrick_el1_abi::Claim::Activating { .. })) {
+            return Err(format!(
+                "Closing changed executor activation custody: {claim:?}"
+            ));
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            state.release_executor = true;
+            self.changed.notify_all();
+        }
+        self.wait_for(|state| state.retirements == 1)
+    }
+}
+
+fn run_first_entry_closing_witness() {
+    use carrick_kernel::el1_zone::first_entry_test_control;
+    use std::sync::Arc;
+
+    let _guard = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(30));
+    let carrier = carrier_or_fail();
+    let gate = Arc::new(FirstEntryClosingGate::default());
+    let observer = gate.clone();
+    let _subscription =
+        first_entry_test_control::subscribe(Arc::new(move |event| observer.observe(event)));
+    let monitor_gate = gate.clone();
+    let monitor = std::thread::spawn(move || monitor_gate.drive());
+    let result = common::run_or_fail(
+        carrier
+            .container(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .scheduler(Arc::new(carrick_hal::GuestCpuPolicy::new(4)))
+            .command([FIXTURE, "exit-group"])
+            .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
+            .run_blocking(),
+    );
+    monitor.join().unwrap().unwrap();
+    let state = gate.state.lock().unwrap();
+    assert_eq!(result.exit_code, 42, "{result:?}; {state:?}");
+    assert!(state.errors.is_empty(), "{state:?}");
+    assert!(state.closing_finished, "{state:?}");
+    assert_eq!(state.closing_claims, 1, "{state:?}");
+    assert_eq!(state.deliveries, 1, "{state:?}");
+    assert_eq!(state.adoptions, 1, "{state:?}");
+    assert_eq!(state.retirements, 1, "{state:?}");
+    assert_eq!(state.fatals, 0, "{state:?}");
+}
+
+#[test]
+#[ignore = "boots HVF; run only through scripts/test-signed.sh carrick-embed"]
+fn el1_sched_closing_preserves_taken_first_entry_activation() {
+    run_first_entry_closing_witness();
+}
+
 /// `exit_group` completes while sibling threads are parked in futex waits
 /// (in-guest and host-parked) and a pair is handing off.
 #[test]
