@@ -6,15 +6,18 @@ use carrick_el1_abi::{PortalForkCustody, PortalForkRequest};
 use core::num::NonZeroU64;
 use std::sync::Arc;
 
+pub type RetainHostBacking = Arc<
+    dyn Fn(NonZeroU64, NonZeroU64) -> Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>
+        + Send
+        + Sync,
+>;
+
 pub struct ForkPhysicalCustody {
     custody: Arc<CarrierVmCustody>,
-    source: Arc<dyn Fn(NonZeroU64, NonZeroU64) -> bool + Send + Sync>,
+    source: RetainHostBacking,
 }
 impl ForkPhysicalCustody {
-    pub(crate) fn new(
-        custody: Arc<CarrierVmCustody>,
-        source: Arc<dyn Fn(NonZeroU64, NonZeroU64) -> bool + Send + Sync>,
-    ) -> Self {
+    pub(crate) fn new(custody: Arc<CarrierVmCustody>, source: RetainHostBacking) -> Self {
         Self { custody, source }
     }
 }
@@ -23,6 +26,7 @@ impl ForkPhysicalCustody {
 pub struct ForkPhysicalRetention {
     selected: PortalForkCustody,
     _frames: Vec<(CarrierStage2Pin, Arc<GlobalFrameSharedMapping>)>,
+    source: Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
 }
 impl core::fmt::Debug for ForkPhysicalRetention {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -33,6 +37,11 @@ impl core::fmt::Debug for ForkPhysicalRetention {
     }
 }
 impl ForkPhysicalRetention {
+    pub fn retained_host_backing(
+        &self,
+    ) -> Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>> {
+        self.source.clone()
+    }
     pub fn selected(&self) -> PortalForkCustody {
         self.selected
     }
@@ -119,9 +128,10 @@ impl ForkCustody for ForkPhysicalCustody {
             PortalForkCustody::HostBacking { handle, generation } => Ok((self.source)(
                 handle, generation,
             )
-            .then_some(ForkPhysicalRetention {
+            .map(|source| ForkPhysicalRetention {
                 selected,
                 _frames: Vec::new(),
+                source: Some(source),
             })),
             PortalForkCustody::Frame { ipa, len, .. } => {
                 let Some(end) = ipa.checked_add(len).filter(|_| len != 0) else {
@@ -142,6 +152,7 @@ impl ForkCustody for ForkPhysicalCustody {
                 Ok(Some(ForkPhysicalRetention {
                     selected,
                     _frames: frames,
+                    source: None,
                 }))
             }
             PortalForkCustody::StructuralCopy {
@@ -214,6 +225,7 @@ impl ForkCustody for ForkPhysicalCustody {
                 }
                 Ok(Some(ForkPhysicalRetention {
                     selected,
+                    source: None,
                     _frames: vec![
                         (source_pin, source_mapping),
                         (destination_pin, destination_mapping),
@@ -697,7 +709,7 @@ impl HvfVmState {
         let authority = runtime.authority;
         let physical = ForkPhysicalCustody::new(
             custody,
-            Arc::new(move |handle, generation| authority.retains_host_backing(handle, generation)),
+            Arc::new(move |handle, generation| authority.retain_host_backing(handle, generation)),
         );
         let source_owners = state.structural_owners.read().clone();
         Ok(Box::new(OwnerPhysicalForkBuilder {
@@ -804,7 +816,7 @@ mod tests {
         let mut inventory = HvpatchFrameInventory::default();
         inventory.extents.insert((ipa, len), extent);
         let inventory = parking_lot::Mutex::new(inventory);
-        let physical = ForkPhysicalCustody::new(custody.clone(), Arc::new(|_, _| false));
+        let physical = ForkPhysicalCustody::new(custody.clone(), Arc::new(|_, _| None));
         let selected = [
             PortalForkCustody::Frame {
                 va: 0x7000,
@@ -930,7 +942,7 @@ mod tests {
             owners.push(owner);
         }
         assert!(custody.carrier_stage2_records.lock().is_empty());
-        let physical = ForkPhysicalCustody::new(custody.clone(), Arc::new(|_, _| false));
+        let physical = ForkPhysicalCustody::new(custody.clone(), Arc::new(|_, _| None));
         let selected = PortalForkCustody::StructuralCopy {
             source_ipa: source,
             destination_ipa: request.kernel_control_ipa,
@@ -967,7 +979,7 @@ mod tests {
             )
             .unwrap();
         }
-        let physical = ForkPhysicalCustody::new(custody.clone(), Arc::new(|_, _| false));
+        let physical = ForkPhysicalCustody::new(custody.clone(), Arc::new(|_, _| None));
         let retained = physical
             .retain(
                 request,
@@ -1013,7 +1025,7 @@ mod tests {
             )
             .unwrap();
         }
-        let physical = ForkPhysicalCustody::new(custody.clone(), Arc::new(|_, _| false));
+        let physical = ForkPhysicalCustody::new(custody.clone(), Arc::new(|_, _| None));
         let a = physical
             .retain(
                 request(&custody, 1),

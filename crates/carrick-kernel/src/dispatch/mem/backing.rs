@@ -866,6 +866,21 @@ pub(crate) fn alloc_alias_ipa_for_publication_with(
 }
 
 impl<'a> MemView<'a> {
+    /// Authenticate and retain the source in one MM-ownership lookup. The
+    /// cloned lease keeps its byte custody alive across parent exec or exit.
+    pub fn retain_host_backing(
+        &self,
+        handle: core::num::NonZeroU64,
+        generation: core::num::NonZeroU64,
+    ) -> Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>> {
+        let lease = self
+            .mem()
+            .lock()
+            .host_backing_leases
+            .get(&(handle, generation))?
+            .clone();
+        Some(Arc::new(lease))
+    }
     /// Check physical source custody without byte I/O or a VMA lookup.
     pub fn retains_host_backing(
         &self,

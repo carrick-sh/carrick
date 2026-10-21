@@ -241,16 +241,16 @@ pub(crate) fn kernel_frame_cow_authority_for_test(
 }
 
 impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
-    fn retains_host_backing(
+    fn retain_host_backing(
         &self,
         handle: std::num::NonZeroU64,
         generation: std::num::NonZeroU64,
-    ) -> bool {
-        self.runtime.upgrade().is_some_and(|runtime| {
+    ) -> Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>> {
+        self.runtime.upgrade().and_then(|runtime| {
             runtime
                 .dispatcher
                 .mem_view()
-                .retains_host_backing(handle, generation)
+                .retain_host_backing(handle, generation)
         })
     }
 

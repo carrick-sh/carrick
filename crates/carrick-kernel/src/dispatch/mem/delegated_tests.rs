@@ -530,6 +530,426 @@ fn admitted_private_file_retains_owner_backing_before_fork() {
     );
 }
 
+/// Loaded-image source handles survive exec publication and are not frame IDs.
+#[test]
+fn post_exec_native_fork_reserves_loaded_image_source_custody() {
+    use carrick_el1_abi::{
+        El1MmHandle, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+        ForkLifecycleLoan, ForkStockExchange, ForkStockRefusal, ForkStockRequest,
+        ForkStockSettlement, HostBackingIdentity, PortalForkCompletion, PortalForkCustody,
+        PortalOperation, ReservationGeneration, SnapshotGeneration,
+    };
+    use carrick_guest_arch::{
+        AddressContext, ContextGeneration, CpuId, FrameGpa, KernelVa, MmGeneration, RootGpa,
+    };
+    use carrick_hal::fork_stock::{
+        ForkHostBackingCustody, ForkStock, GrantExecution, HostBackingRetention, NoTableLedger,
+    };
+    use std::num::NonZeroU64;
+
+    let nz = |value| NonZeroU64::new(value).unwrap();
+    let publish_image =
+        |dispatcher: &SyscallDispatcher, mm_raw: u64, value: u8, previous: Option<&Root>| {
+            // Publish the replacement through the same dispatcher generation commit
+            // used by successful exec, including its retained canonical ELF bytes.
+            let replacement = crate::kernel::MmId::from_registry_allocation(nz(mm_raw));
+            let start = 0x400000;
+            dispatcher
+                .publish_exec_image_state(
+                    replacement,
+                    vec![ProcMapsEntry {
+                        start,
+                        end: start + PAGE,
+                        read: true,
+                        write: false,
+                        execute: true,
+                        sharing: carrick_vfs::ProcMapSharing::Private,
+                        path: "/tmp/elf-exec-errno".to_owned(),
+                    }],
+                    Vec::new(),
+                    vec![crate::core_dump::FileMapping {
+                        start,
+                        end: start + PAGE,
+                        file_page_offset: 0,
+                        path: "/tmp/elf-exec-errno".to_owned(),
+                    }],
+                    vec![PrivateFileMapEntry {
+                        start,
+                        end: start + PAGE,
+                        offset: 0,
+                        backing: PrivateFileBacking::LoadedImage {
+                            initialized_offset: 0,
+                            bytes: Arc::new(vec![value; PAGE as usize]),
+                        },
+                    }],
+                )
+                .commit();
+            let root = if let Some(previous) = previous {
+                // Exec keeps the carrier provider and publishes a new MM slot.
+                let root = previous.publish_child(dispatcher);
+                assert_eq!(
+                    admit(dispatcher, El1AdmissionOrigin::Bind, true),
+                    Ok(El1Admission::Delegated)
+                );
+                root
+            } else {
+                Root::admit(dispatcher)
+            };
+            let source = root.lock().mapping(start).unwrap().host_backing.unwrap();
+            assert!(
+                dispatcher
+                    .mem_view()
+                    .retains_host_backing(source.handle(), source.generation())
+            );
+            assert_eq!(
+                dispatcher.mem_view().read_host_backing(source, 1).unwrap(),
+                [value]
+            );
+            (root, source)
+        };
+    let dispatcher = SyscallDispatcher::new();
+    let (old_root, predecessor_source) = publish_image(&dispatcher, 901, 0x33, None);
+    let (root, source) = publish_image(&dispatcher, 902, 0x5a, Some(&old_root));
+    let replacement = dispatcher.mm_authority().mm_id;
+    let peer = SyscallDispatcher::new();
+    let (_peer_root, peer_source) = publish_image(&peer, 905, 0x77, None);
+    let owns_source = |identity: HostBackingIdentity| {
+        dispatcher
+            .mem_view()
+            .retains_host_backing(identity.handle(), identity.generation())
+    };
+    assert!(
+        !owns_source(predecessor_source),
+        "exec retired its old byte source"
+    );
+    assert!(
+        peer.mem_view()
+            .retains_host_backing(peer_source.handle(), peer_source.generation())
+    );
+    for refused in [
+        predecessor_source,
+        peer_source,
+        HostBackingIdentity::new(source.handle(), nz(source.generation().get() + 1), 0),
+    ] {
+        assert!(
+            ForkHostBackingCustody::default()
+                .retain(refused, || {
+                    dispatcher
+                        .mem_view()
+                        .retain_host_backing(refused.handle(), refused.generation())
+                })
+                .is_none()
+        );
+    }
+    let parent = AddressContext {
+        root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+        mm: MmGeneration::new(nz(replacement.raw())),
+        generation: ContextGeneration::new(NonZeroU64::MIN),
+    };
+    let execution = GrantExecution::new(
+        CpuId::new(0),
+        ExecutionBinding {
+            task: EntryTaskKey::from_raw(41),
+            generation: SnapshotGeneration::INITIAL,
+            mm: EntryMmKey::from_raw(replacement.raw()),
+            thread_generation: EntryThreadGeneration::from_raw(101),
+        },
+        parent,
+    );
+    let pages: Vec<_> = (0..8)
+        .map(|index| RootGpa::page_aligned(FrameGpa::new(0x200000 + index * PAGE)).unwrap())
+        .collect();
+    // Owned bytes back the finite table and lifecycle capacity. No VMM or
+    // substitute backend runs; the shared production stock owner services it.
+    let storage = carrick_test_support::TestEl1Region::zeroed();
+    // SAFETY: the retained aligned region owns at least 0x8000 initialized bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(storage.as_ptr(), 0x8000) };
+    let resolve = |selected: &[RootGpa]| selected.iter().all(|page| pages.contains(page));
+    let clean = |selected: &[RootGpa]| {
+        selected.iter().all(|page| {
+            pages
+                .iter()
+                .position(|candidate| candidate == page)
+                .is_some_and(|index| {
+                    bytes[index * PAGE as usize..(index + 1) * PAGE as usize]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                })
+        })
+    };
+    let mut stock = ForkStock::<_, Vec<Arc<dyn HostBackingRetention>>>::new(
+        nz(7),
+        None,
+        carrick_hal::asid::AsidAllocator::new(),
+    );
+    let descendant_lifecycle = ForkLifecycleLoan::new(
+        KernelVa::new(ForkLifecycleLoan::ARM_DEFAULT.page.raw() + 0x4000),
+        KernelVa::new(ForkLifecycleLoan::ARM_DEFAULT.controls.raw() + 0x4000),
+    )
+    .unwrap();
+    stock
+        .install(
+            pages.clone(),
+            vec![descendant_lifecycle, ForkLifecycleLoan::ARM_DEFAULT],
+        )
+        .unwrap();
+    stock.provide_arm_control_capacity(0x50000000).unwrap();
+    let request = ForkStockRequest {
+        binding: execution.binding,
+        context: parent,
+        operation: PortalOperation {
+            carrier: nz(7),
+            mm: root.mm,
+            incarnation: NonZeroU64::MIN,
+            sequence: nz(2),
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_mm: ReservationMm::new(903).unwrap(),
+        child_bytes: PAGE * 2,
+        parent_bytes: PAGE,
+    };
+    let mut exchange = ForkStockExchange::new(request).unwrap();
+    let loan = stock
+        .loan(&mut NoTableLedger, execution, &mut exchange, |life| {
+            life == ForkLifecycleLoan::ARM_DEFAULT
+                && bytes[0x4000..0x8000].iter().all(|byte| *byte == 0)
+        })
+        .unwrap();
+    assert_eq!(
+        stock.counters().loans,
+        1,
+        "stock was provisioned and loaned"
+    );
+    let completion = PortalForkCompletion {
+        request: loan.request,
+        // SAFETY: this receipt names the exact production stock loan below.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(nz(7), request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::new(2).unwrap(),
+        child_tables_used: PAGE,
+        parent_tables_used: PAGE,
+    };
+    let rows = [PortalForkCustody::HostBacking {
+        handle: source.handle(),
+        generation: source.generation(),
+    }
+    .words()];
+    let mut reserve = ForkStockSettlement::reserve(
+        loan,
+        completion,
+        KernelVa::new(rows.as_ptr() as u64),
+        rows.len() as u64,
+    )
+    .unwrap();
+    let result = stock
+        .reserve_custody(
+            execution,
+            &mut reserve,
+            resolve,
+            clean,
+            |_, address, count| {
+                assert_eq!(address.raw(), rows.as_ptr() as u64);
+                assert_eq!(count, rows.len() as u64);
+                let mut retained = Vec::new();
+                for words in rows {
+                    let PortalForkCustody::HostBacking { handle, generation } =
+                        PortalForkCustody::decode(words).unwrap()
+                    else {
+                        panic!("source custody row");
+                    };
+                    let identity = HostBackingIdentity::new(handle, generation, 0);
+                    let receipt = ForkHostBackingCustody::default()
+                        .retain(identity, || {
+                            dispatcher
+                                .mem_view()
+                                .retain_host_backing(handle, generation)
+                        })
+                        .ok_or(ForkStockRefusal::Inventory)?;
+                    retained.push(receipt);
+                }
+                Ok(retained)
+            },
+        )
+        .map(|_| ());
+    assert!(
+        result.is_ok(),
+        "post-exec Reserve refused valid image source: {result:?}"
+    );
+    assert_eq!(reserve.take(loan), Some(Ok(())));
+    let mut commit = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
+    stock
+        .commit_admitted(&mut NoTableLedger, execution, &mut commit)
+        .unwrap();
+    assert_eq!(stock.live_children(), 1);
+    assert_eq!(stock.counters().inventory_refusals, 0);
+    let child_operation = PortalOperation {
+        mm: request.child_mm,
+        incarnation: completion.child.incarnation(),
+        ..request.operation
+    };
+    let child_root = stock.child_root(request.child_mm).unwrap();
+    assert!(
+        stock
+            .child_custody(
+                PortalOperation {
+                    incarnation: nz(2),
+                    ..child_operation
+                },
+                child_root
+            )
+            .is_none()
+    );
+    assert!(
+        stock
+            .child_custody(
+                PortalOperation {
+                    carrier: nz(8),
+                    ..child_operation
+                },
+                child_root
+            )
+            .is_none()
+    );
+    assert!(
+        stock
+            .child_custody(
+                PortalOperation {
+                    mm: root.mm,
+                    ..child_operation
+                },
+                child_root
+            )
+            .is_none()
+    );
+    assert!(stock.child_custody(child_operation, parent.root).is_none());
+    let mut inherited = ForkHostBackingCustody::default();
+    for receipt in stock.child_custody(child_operation, child_root).unwrap() {
+        inherited.inherit(Arc::clone(receipt));
+    }
+    let byte_custody = Arc::clone(&dispatcher.mem_view().mem().lock().host_backing_custody);
+    drop(dispatcher);
+    assert!(
+        byte_custody.source(source).is_some(),
+        "committed child pins original image after parent exit"
+    );
+    assert!(inherited.retain(peer_source, || None).is_none());
+    assert!(inherited.retain(predecessor_source, || None).is_none());
+    let child_context = AddressContext {
+        root: child_root,
+        mm: MmGeneration::new(nz(request.child_mm.raw())),
+        ..parent
+    };
+    let child_binding = ExecutionBinding {
+        mm: EntryMmKey::from_raw(request.child_mm.raw()),
+        ..execution.binding
+    };
+    let child_execution = GrantExecution::new(execution.cpu, child_binding, child_context);
+    // Both native births use the same carrier stock and distinct table,
+    // lifecycle and ASID loans. Only the original parent has a dispatcher.
+    stock.provide_arm_control_capacity(0x60000000).unwrap();
+    let mut descendant_exchange = ForkStockExchange::new(ForkStockRequest {
+        binding: child_binding,
+        context: child_context,
+        operation: child_operation,
+        child_mm: ReservationMm::new(906).unwrap(),
+        ..request
+    })
+    .unwrap();
+    let descendant_loan = stock
+        .loan(
+            &mut NoTableLedger,
+            child_execution,
+            &mut descendant_exchange,
+            |life| life == descendant_lifecycle && bytes.iter().all(|byte| *byte == 0),
+        )
+        .unwrap();
+    let descendant_completion = PortalForkCompletion {
+        request: descendant_loan.request,
+        // SAFETY: exact descendant loan from the production owner.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(
+                nz(7),
+                descendant_loan.request.child_mm,
+                NonZeroU64::MIN,
+            )
+        },
+        ..completion
+    };
+    let mut descendant_reserve = ForkStockSettlement::reserve(
+        descendant_loan,
+        descendant_completion,
+        KernelVa::new(rows.as_ptr() as u64),
+        1,
+    )
+    .unwrap();
+    stock
+        .reserve_custody(
+            child_execution,
+            &mut descendant_reserve,
+            resolve,
+            |_| bytes.iter().all(|byte| *byte == 0),
+            |_, _, _| {
+                Ok(vec![
+                    inherited
+                        .retain(source, || None)
+                        .ok_or(ForkStockRefusal::Inventory)?,
+                ])
+            },
+        )
+        .unwrap();
+    let mut descendant_commit =
+        ForkStockSettlement::commit_reserved(descendant_loan, descendant_completion).unwrap();
+    stock
+        .commit_admitted(&mut NoTableLedger, child_execution, &mut descendant_commit)
+        .unwrap();
+    assert_eq!(stock.live_children(), 2);
+    assert_eq!(stock.counters().inventory_refusals, 0);
+    let mut next = ForkStockExchange::new(ForkStockRequest {
+        child_mm: ReservationMm::new(904).unwrap(),
+        ..request
+    })
+    .unwrap();
+    assert_eq!(
+        stock.loan(&mut NoTableLedger, execution, &mut next, |_| panic!(
+            "no lifecycle capacity"
+        )),
+        Err(ForkStockRefusal::Capacity)
+    );
+    drop(inherited);
+    // Retirement keeps physical custody through quarantine, but closes birth admission.
+    let mut retire = carrick_el1_abi::NativeChildRetire::new(child_binding, child_context).unwrap();
+    stock.retire_child(child_execution, &mut retire).unwrap();
+    assert!(stock.child_custody(child_operation, child_root).is_none());
+    assert!(byte_custody.source(source).is_some());
+    stock
+        .reclaim(
+            &mut NoTableLedger,
+            descendant_loan.request.child_mm,
+            |mm| {
+                carrick_hal::fork_stock::SlotAbsence::scan(
+                    mm,
+                    [descendant_loan.request.child_mm.raw()],
+                )
+            },
+            clean,
+            |_| bytes.iter().all(|byte| *byte == 0),
+            |_| true,
+        )
+        .unwrap();
+    assert!(stock.child_root(request.child_mm).is_none());
+    assert!(stock.child_root(descendant_loan.request.child_mm).is_some());
+    assert!(
+        byte_custody.source(source).is_some(),
+        "descendant pins source after parent reclamation"
+    );
+    drop(stock);
+    assert!(
+        byte_custody.source(source).is_none(),
+        "last child custody releases source"
+    );
+}
+
 #[test]
 fn admitted_file_byte_service_preserves_last_page_and_refuses_beyond_eof() {
     let mut dispatcher = SyscallDispatcher::new();

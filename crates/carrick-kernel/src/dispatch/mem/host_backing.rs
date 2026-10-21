@@ -121,6 +121,11 @@ impl HostBackingLease {
         HostBackingIdentity::new(self.0.handle, NonZeroU64::MIN, offset)
     }
 }
+impl carrick_hal::fork_stock::HostBackingRetention for HostBackingLease {
+    fn identity(&self) -> HostBackingIdentity {
+        self.identity(0)
+    }
+}
 impl Drop for Record {
     fn drop(&mut self) {
         let mut state = self.custody.state.lock();
@@ -138,6 +143,56 @@ impl Drop for Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fork_source_custody_bounds_identity_work_for_many_sources() {
+        use carrick_hal::fork_stock::{ForkHostBackingCustody, HostBackingRetention};
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountedLease {
+            lease: HostBackingLease,
+            calls: Arc<AtomicUsize>,
+        }
+        impl HostBackingRetention for CountedLease {
+            fn identity(&self) -> HostBackingIdentity {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.lease.identity(0)
+            }
+        }
+
+        for count in [1, 512] {
+            let owner = Arc::new(HostBackingCustody::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut inherited = ForkHostBackingCustody::default();
+            let mut identities = Vec::new();
+            for _ in 0..count {
+                let lease = owner
+                    .retain_source(PrivateFileBacking::LoadedImage {
+                        initialized_offset: 0,
+                        bytes: Arc::new(vec![0x5a]),
+                    })
+                    .unwrap();
+                identities.push(lease.identity(0));
+                inherited.inherit(Arc::new(CountedLease {
+                    lease,
+                    calls: Arc::clone(&calls),
+                }));
+            }
+            assert_eq!(calls.load(Ordering::Relaxed), count);
+            for identity in identities.into_iter().rev() {
+                assert!(
+                    inherited
+                        .retain(identity, || panic!("inherited source needs no parent MM"))
+                        .is_some()
+                );
+            }
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                count,
+                "one identity authentication per inherited source; no repeated source scans"
+            );
+        }
+    }
+
     #[test]
     fn repeated_source_retention_uses_one_physical_record() {
         let custody = Arc::new(HostBackingCustody::default());
