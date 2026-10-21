@@ -243,10 +243,9 @@ impl<E: ThreadedEngine> GuestDrainVenue for EngineDrainVenue<'_, E> {
         carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
         GuestPublishError,
     > {
-        // The engine's settlement is untyped: never treated as a clean refusal.
         self.0
             .settle_el1_descriptor_receipt(txn, receipt)
-            .map_err(GuestPublishError::Unsettled)
+            .map_err(|error| GuestPublishError::from_settle(error, "engine descriptor drain"))
     }
 }
 
@@ -548,7 +547,13 @@ impl<E: ThreadedEngine> carrick_hal::threaded::El1FrameGrantVenue for EngineGran
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
     ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
     {
-        self.0.settle_el1_descriptor_receipt(txn, receipt)
+        self.0
+            .settle_el1_descriptor_receipt(txn, receipt)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "settle EL1 frame-grant descriptor receipt: {error:?}"
+                ))
+            })
     }
 
     fn complete(

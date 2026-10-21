@@ -3492,16 +3492,19 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     }
 
     /// Authenticate EL1's receipt for a transaction this engine returned and
-    /// return its unused table grants. Required before residency commit,
-    /// inventory repoint or old-owner retirement.
+    /// return its unused table grants. Preserve the typed clean-refusal
+    /// result so a synchronous publisher can roll back backing only when the
+    /// exact receipt proves no descriptor store remains live.
     fn settle_el1_descriptor_receipt(
         &mut self,
         _txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
         _receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
-    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
-    {
-        Err(TrapError::Hypervisor(
-            "backend issued no guest descriptor transaction".to_owned(),
+    ) -> Result<
+        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+        carrick_mmu_core::aarch64::GuestTxnSettleError,
+    > {
+        Err(carrick_mmu_core::aarch64::GuestTxnSettleError::Manager(
+            carrick_mmu_core::aarch64::PageTableError::BadAddress,
         ))
     }
 
