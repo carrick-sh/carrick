@@ -2292,14 +2292,17 @@ def _compute_transitive_call_closure(
         for b in frontier:
             code = strip_rust_comments_and_strings(b)
             code, _ = _blank_macro_defs(code, code)
-            if any(
-                match.group(1) in crate_fn_files
-                for match in re.finditer(
-                    r"(?:\.|::)\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^{};]*>\s*)?\(",
-                    code,
-                )
+            for match in re.finditer(
+                r"(\.|::)\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^{};]*>\s*)?\(",
+                code,
             ):
-                needs_method_snapshot = True
+                if match.group(2) not in crate_fn_files:
+                    continue
+                prefix = code[:match.start()].rstrip()
+                receiver = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)$", prefix)
+                associated = receiver is not None and receiver.group(1)[0].isupper()
+                if match.group(1) == "." or associated:
+                    needs_method_snapshot = True
             for cm in _CALLEE_EXTRACT_RE.finditer(code):
                 cname = cm.group(1) or cm.group(2)
                 if cname and cname not in _RUST_KEYWORDS and cname not in visited:
