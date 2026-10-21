@@ -10,6 +10,10 @@
  * ProcessNative::fork records final untyped errors (including admission),
  * their original negative errno and run-failure policy. Typed MM refusals
  * retain their existing owner record without a duplicate boundary record.
+ * Busy refusals retain their exact NativeForkStage (parent gate/edit/readiness,
+ * birth reservation/publication, child lifecycle claim/control reset).
+ * Service-boundary stages apply only when that service returned untyped Busy;
+ * an existing typed owner refusal is never replaced or emitted twice.
  * LifecycleNative::process_fork venue=unavailable records None/fallback,
  * not a final errno; it includes missing or mismatched execution bindings.
  * The existing crossing authenticates VM/task identity before emitting:

@@ -1087,12 +1087,16 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                     NonZeroU64::new(u64::from(self.worker()) + 1)
                         .ok_or(NativeProcessError::Stale)?,
                 )
-                .ok_or(NativeProcessError::Busy)?;
+                .ok_or_else(|| {
+                    super::native_fork_refusal::busy(NativeForkStage::ParentSpaceEdit)
+                })?;
             let mut root = owner
                 .root(mm, self.worker())
                 .map_err(|e| refused(NativeForkStage::ParentRoot, e))?;
             if !root.fork_ready() {
-                return Err(NativeProcessError::Busy);
+                return Err(super::native_fork_refusal::busy(
+                    NativeForkStage::ParentForkReady,
+                ));
             }
             let mut full = false;
             root.observe_mappings(&mut |mapping| {
