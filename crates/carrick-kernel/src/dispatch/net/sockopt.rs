@@ -332,27 +332,6 @@ fn setsockopt_in_memory(
     }
 }
 
-/// Write a 4-byte option value and a 4-byte length without the guest-length
-/// clamp, ignoring an invalid pointer as these answers always have. Only a
-/// retryable owner wait is reported.
-fn copyout_fixed_sockopt<M: CurrentMmMemory>(
-    memory: &mut M,
-    optval_addr: u64,
-    optlen_addr: u64,
-    value: &i32,
-) -> Result<(), crate::dispatch::copyout::CopyoutRefusal> {
-    use crate::dispatch::copyout::{UserSlot, prepare};
-    let out = prepare(
-        memory,
-        [
-            UserSlot::optional(optval_addr, 4),
-            UserSlot::optional(optlen_addr, 4),
-        ],
-    )?;
-    let _ = out.commit([&value.to_ne_bytes(), &4u32.to_ne_bytes()]);
-    Ok(())
-}
-
 fn getsockopt_in_memory<M: CurrentMmMemory>(
     socket: &std::sync::Arc<crate::dispatch::net::unix_pure::PureSocketInner>,
     memory: &mut M,
@@ -386,18 +365,8 @@ fn getsockopt_in_memory<M: CurrentMmMemory>(
                 write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
             }
             LINUX_SO_ERROR => {
-                let prepared = match super::support::prepare_sockopt_value(
-                    memory,
-                    optval_addr,
-                    optlen_addr,
-                    4,
-                ) {
-                    Ok(Ok(prepared)) => prepared,
-                    Ok(Err(fault)) => return Ok(fault.outcome()),
-                    Err(refusal) => return Ok(refusal.into_outcome()),
-                };
                 let val: i32 = socket.take_so_error().unwrap_or(0);
-                Ok(prepared.commit(&val.to_ne_bytes()))
+                write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
             }
             LINUX_SO_KEEPALIVE => {
                 let val: i32 = if socket.so_keepalive() { 1 } else { 0 };
@@ -502,69 +471,6 @@ fn getsockopt_in_memory<M: CurrentMmMemory>(
     } else {
         let val: i32 = 0;
         write_sockopt_value(memory, optval_addr, optlen_addr, &val.to_ne_bytes())
-    }
-}
-
-impl NetView<'_> {
-    pub(in crate::dispatch) fn socket_error_from_open_file<M: CurrentMmMemory>(
-        &self,
-        open_file: crate::dispatch::fd_table::OpenFile,
-        source: super::SocketErrorSource,
-        optval_addr: u64,
-        optlen_addr: u64,
-        memory: &mut M,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let prepared =
-            match super::support::prepare_sockopt_value(memory, optval_addr, optlen_addr, 4) {
-                Ok(Ok(prepared)) => prepared,
-                Ok(Err(fault)) => return Ok(fault.outcome()),
-                Err(refusal) => {
-                    let Some(lease) = open_file.description.retain_fd_lease() else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
-                    return Ok(refusal.suspend(
-                        crate::dispatch::OwnedCopyoutOperation::SocketError {
-                            open_file,
-                            lease,
-                            source,
-                            optval_addr,
-                            optlen_addr,
-                        },
-                    ));
-                }
-            };
-        let pending = self.take_socket_pending_error_from(&open_file);
-        let value = match source {
-            super::SocketErrorSource::InMemory(socket) => pending
-                .map(carrick_abi::LinuxErrno::get)
-                .unwrap_or_else(|| socket.take_so_error().unwrap_or(0)),
-            super::SocketErrorSource::Host(host_fd) => {
-                if let Some(error) = pending {
-                    error.get()
-                } else {
-                    let mut host_error = 0i32;
-                    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
-                    let rc = unsafe {
-                        libc::getsockopt(
-                            host_fd.raw(),
-                            libc::SOL_SOCKET,
-                            libc::SO_ERROR,
-                            (&mut host_error as *mut i32).cast(),
-                            &mut len,
-                        )
-                    };
-                    if let Err(errno) = rc.host_syscall_errno() {
-                        return Ok(DispatchOutcome::errno(errno));
-                    }
-                    if host_error == 0 {
-                        0
-                    } else {
-                        crate::host_to_linux_errno(host_error).get()
-                    }
-                }
-            }
-        };
-        Ok(prepared.commit(&value.to_ne_bytes()))
     }
 }
 
@@ -1013,10 +919,8 @@ impl<'a> NetView<'a> {
                 } else {
                     0
                 };
-                // Faults stay ignored here, as before; a wait still retries.
-                if let Err(refusal) = copyout_fixed_sockopt(memory, optval_addr, optlen_addr, &val) {
-                    return Ok(refusal.into_outcome());
-                }
+                let _ = memory.write_bytes(optval_addr, &val.to_ne_bytes());
+                let _ = memory.write_bytes(optlen_addr, &4u32.to_ne_bytes());
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             // LTP getsockopt01: closed fd -> EBADF, non-socket fd -> ENOTSOCK,
@@ -1027,28 +931,6 @@ impl<'a> NetView<'a> {
                     let Some(desc) = crate::kernel::FileDescription::inspect(&of.description) else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                     };
-                    if level == LINUX_SOL_SOCKET && optname == LINUX_SO_ERROR {
-                        let source = match &*desc {
-                            OpenDescription::InMemorySocket { socket, .. } => {
-                                Some(super::SocketErrorSource::InMemory(Arc::clone(socket)))
-                            }
-                            OpenDescription::HostSocket { host_fd, .. } => {
-                                Some(super::SocketErrorSource::Host(host_fd.clone()))
-                            }
-                            _ => None,
-                        };
-                        drop(desc);
-                        if let Some(source) = source {
-                            return this.socket_error_from_open_file(
-                                of,
-                                source,
-                                optval_addr,
-                                optlen_addr,
-                                memory,
-                            );
-                        }
-                        return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
-                    }
                     if let OpenDescription::InMemorySocket { socket, .. } = &*desc {
                         let socket = Arc::clone(socket);
                         drop(desc);
@@ -1083,9 +965,8 @@ impl<'a> NetView<'a> {
             // STREAM answer would mislabel the socket.
             if level == LINUX_SOL_SOCKET && optname == LINUX_SO_TYPE
                 && let Some(t) = this.socket_guest_type(fd) {
-                    if let Err(refusal) = copyout_fixed_sockopt(memory, optval_addr, optlen_addr, &t) {
-                        return Ok(refusal.into_outcome());
-                    }
+                    let _ = memory.write_bytes(optval_addr, &t.to_ne_bytes());
+                    let _ = memory.write_bytes(optlen_addr, &4u32.to_ne_bytes());
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
             // SO_DOMAIN / SO_PROTOCOL are Linux-only getsockopt options with no
@@ -1249,18 +1130,13 @@ impl<'a> NetView<'a> {
             // table the rest of the ABI uses. (getsockopt itself still
             // succeeds; only the value is mapped.)
             if level == LINUX_SOL_SOCKET && optname == LINUX_SO_ERROR {
-                let prepared = match super::support::prepare_sockopt_value(
-                    memory,
-                    optval_addr,
-                    optlen_addr,
-                    4,
-                ) {
-                    Ok(Ok(prepared)) => prepared,
-                    Ok(Err(fault)) => return Ok(fault.outcome()),
-                    Err(refusal) => return Ok(refusal.into_outcome()),
-                };
                 if let Some(linux_err) = this.take_socket_pending_error(fd) {
-                    return Ok(prepared.commit(&linux_err.get().to_ne_bytes()));
+                    return write_sockopt_value(
+                        memory,
+                        optval_addr,
+                        optlen_addr,
+                        &linux_err.get().to_ne_bytes(),
+                    );
                 }
                 let mut host_err: i32 = 0;
                 let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
@@ -1285,7 +1161,12 @@ impl<'a> NetView<'a> {
                     crate::host_to_linux_errno(host_err).get()
                 };
                 // Honor the guest's optlen (it may pass <4); clamp like Linux.
-                return Ok(prepared.commit(&linux_err.to_ne_bytes()));
+                return write_sockopt_value(
+                    memory,
+                    optval_addr,
+                    optlen_addr,
+                    &linux_err.to_ne_bytes(),
+                );
             }
             let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
                 Some(t) => t,

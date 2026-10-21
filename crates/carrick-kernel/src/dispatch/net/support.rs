@@ -1511,14 +1511,12 @@ fn nul_trimmed_slice(path: &[u8]) -> &[u8] {
 struct PendingUnixClient {
     cred: SocketPeerCred,
     flows: Option<crate::kernel::SocketFlows>,
-    peer_addr_len: usize,
 }
 
 #[derive(::core::default::Default)]
 struct UnixPathRegistry {
     paths: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
     pending_clients: std::collections::HashMap<i32, std::collections::VecDeque<PendingUnixClient>>,
-    accept_locks: std::collections::HashMap<i32, std::sync::Weak<std::sync::Mutex<()>>>,
 }
 
 pub(super) fn register_unix_listener(host_path: &[u8], host_fd: i32, cred: SocketPeerCred) {
@@ -1561,7 +1559,6 @@ pub(super) fn lookup_and_queue_unix_connect(
     host_path: &[u8],
     client_cred: SocketPeerCred,
     client_flows: Option<crate::kernel::SocketFlows>,
-    peer_addr_len: usize,
 ) -> Option<SocketPeerCred> {
     let path = nul_trimmed_slice(host_path);
     use std::os::unix::ffi::OsStrExt;
@@ -1579,39 +1576,17 @@ pub(super) fn lookup_and_queue_unix_connect(
     q.push_back(PendingUnixClient {
         cred: client_cred,
         flows: client_flows,
-        peer_addr_len,
     });
     Some(server_cred)
 }
 
 pub(super) fn pop_pending_unix_client(
     listener_host_fd: i32,
-) -> Option<(SocketPeerCred, Option<crate::kernel::SocketFlows>, usize)> {
+) -> Option<(SocketPeerCred, Option<crate::kernel::SocketFlows>)> {
     let mut reg = unix_path_registry().lock().ok()?;
     let q = reg.pending_clients.get_mut(&listener_host_fd)?;
     let client = q.pop_front()?;
-    Some((client.cred, client.flows, client.peer_addr_len))
-}
-
-/// Serialize one host `accept` with consumption of its FIFO metadata.  Darwin
-/// returns no identity with which to join these two queues after the fact, so
-/// concurrent acceptors must claim both under the listener's exact lock.
-pub(super) fn unix_accept_lock(listener_host_fd: i32) -> Arc<std::sync::Mutex<()>> {
-    let mut registry = unix_path_registry()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(lock) = registry
-        .accept_locks
-        .get(&listener_host_fd)
-        .and_then(std::sync::Weak::upgrade)
-    {
-        return lock;
-    }
-    let lock = Arc::new(std::sync::Mutex::new(()));
-    registry
-        .accept_locks
-        .insert(listener_host_fd, Arc::downgrade(&lock));
-    lock
+    Some((client.cred, client.flows))
 }
 
 /// Process-global host-socket-path → original-guest-`sun_path` map, populated by
@@ -1922,8 +1897,8 @@ pub(super) fn host_to_linux_sockaddr(
 
 /// A prepared `(addr, *addrlen)` sockaddr output pair. Linux reads the
 /// caller's `*addrlen`, writes at most that many address bytes, and stores
-/// the full required length back. Both outputs are prepared together before
-/// the caller's side effect (an accept dequeue), then committed.
+/// the full required length back. Name queries prepare both outputs together
+/// before committing either one.
 ///
 /// Linux reports a bad length pointer only at the copyout, after the side
 /// effect, so an unreadable `*addrlen` is held until the commit like any
@@ -2011,48 +1986,6 @@ pub(super) fn write_linux_sockaddr(
         .map_err(|_| ())
 }
 
-pub(in crate::dispatch) struct PreparedSockopt<'m, M: CurrentMmMemory> {
-    out: crate::dispatch::copyout::PreparedCopyout<'m, M, 2>,
-    n: usize,
-}
-
-pub(in crate::dispatch) fn prepare_sockopt_value<M: CurrentMmMemory>(
-    memory: &mut M,
-    optval_addr: u64,
-    optlen_addr: u64,
-    value_len: usize,
-) -> Result<
-    Result<PreparedSockopt<'_, M>, crate::dispatch::copyout::CopyoutFault>,
-    crate::dispatch::copyout::CopyoutRefusal,
-> {
-    use crate::dispatch::copyout::{UserSlot, prepare, read_u32_before_effects};
-    let guest_optlen = match read_u32_before_effects(memory, optlen_addr)? {
-        Ok(len) => len,
-        Err(fault) => return Ok(Err(fault)),
-    };
-    // Option values are fixed-width carrick answers (at most a `tcp_info`),
-    // so the clamped pair always fits one prepared permit.
-    let n = (guest_optlen as usize).min(value_len);
-    let out = prepare(
-        memory,
-        [
-            UserSlot::optional(optval_addr, n),
-            Some(UserSlot::new(optlen_addr, 4)),
-        ],
-    )?;
-    Ok(Ok(PreparedSockopt { out, n }))
-}
-
-impl<M: CurrentMmMemory> PreparedSockopt<'_, M> {
-    pub(in crate::dispatch) fn commit(self, value: &[u8]) -> DispatchOutcome {
-        let n = self.n.min(value.len());
-        match self.out.commit([&value[..n], &(n as u32).to_ne_bytes()]) {
-            Ok(()) => DispatchOutcome::Returned { value: 0 },
-            Err(fault) => fault.outcome(),
-        }
-    }
-}
-
 /// Clamp-and-write a scalar `getsockopt` value back to the guest: read the
 /// guest's `optlen`, write at most that many bytes of `value` to `optval`, and
 /// report the number actually written back in `optlen` (Linux truncation
@@ -2068,11 +2001,21 @@ pub(super) fn write_sockopt_value<M: CurrentMmMemory>(
     optlen_addr: u64,
     value: &[u8],
 ) -> Result<DispatchOutcome, DispatchError> {
-    match prepare_sockopt_value(memory, optval_addr, optlen_addr, value.len()) {
-        Ok(Ok(prepared)) => Ok(prepared.commit(value)),
-        Ok(Err(fault)) => Ok(fault.outcome()),
-        Err(refusal) => Ok(refusal.into_outcome()),
+    let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
+        Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+    };
+    let n = (guest_optlen as usize).min(value.len());
+    if optval_addr != 0 && n > 0 && memory.write_bytes(optval_addr, &value[..n]).is_err() {
+        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
     }
+    if memory
+        .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
+        .is_err()
+    {
+        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+    }
+    Ok(DispatchOutcome::Returned { value: 0 })
 }
 
 pub(super) fn read_linux_msghdr(

@@ -1,16 +1,5 @@
 {
   "schema": 1,
-  "authority_debt": [
-    {
-      "from": "carrick_kernel::dispatch::fs::directory::FsView<'a>::getdents64",
-      "to": "carrick_kernel::dispatch::fs::directory::FsView<'a>::getdents64_from_open_file",
-      "issue": 711
-    },
-    {
-      "from": "carrick_kernel::dispatch::net::lifecycle::NetView<'a>::take_socket_pending_error",
-      "to": "carrick_kernel::dispatch::net::lifecycle::NetView<'a>::take_socket_pending_error_from",
-      "issue": 711
-    }
-  ],
+  "authority_debt": [],
   "terminal_custody": []
 }
