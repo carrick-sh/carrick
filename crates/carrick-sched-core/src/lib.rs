@@ -260,13 +260,14 @@ impl SlotState {
 ///
 /// `Free` is allocatable; `Parked`, `Queued`, and `OnCpu*` belong to EL1;
 /// `Transferring` belongs to the producer named by its typed `HostTransfer`;
-/// `Host` is published host custody; `Placing*` belongs to exactly one typed
+/// `Host` is published host custody; `FirstEntryHost` additionally carries
+/// the exact birth incarnation; `Placing*` belongs to exactly one typed
 /// first-entry placement token; `Activating` belongs to one executor token;
-/// and `Retiring` belongs to
-/// the activation token completing destruction. Every ownership change is an
-/// exact compare-exchange on this word. Producers may perform
-/// Host -> Placing -> Queued/Host, executors may perform
-/// Host -> Activating -> Retiring/Host, and only the retiring owner may
+/// and `Retiring` belongs to the activation token completing destruction.
+/// Every ownership change is an exact compare-exchange on this word.
+/// Producers may perform FirstEntryHost -> Placing -> Queued/FirstEntryHost,
+/// executors may perform FirstEntryHost -> Activating -> Retiring/FirstEntryHost,
+/// and only the retiring owner may
 /// perform Retiring -> Free. Host claimants defer while a transfer,
 /// activation, or retirement owner exists.
 #[derive(
