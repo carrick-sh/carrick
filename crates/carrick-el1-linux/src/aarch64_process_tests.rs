@@ -539,6 +539,13 @@ impl Fixture {
                 .cast()
         };
 
+        // This fixture supplies root births without the host issuer. Account
+        // for both identities before native fork allocates from this source.
+        zone.serial_issuer()
+            .advance_past(NonZeroU64::new(leader.generation).unwrap());
+        zone.serial_issuer()
+            .advance_past(NonZeroU64::new(leader.serial).unwrap());
+
         let task = CurrentTask::new();
         task.set(
             El1TaskId::from_linux_tid(leader.tid as i32),
