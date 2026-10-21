@@ -49,7 +49,9 @@ The whole clone is destroyed after the job.
 For at most 40 minutes, the job token can write issues/PRs and any
 `work/dispatch-*` branch, including branches belonging to other runs. Driver
 branch selection narrows normal publication, not the token's repository grant.
-Ruleset 25522481 is disabled. Branch scope currently rests on the uid boundary
+Branch-scope ruleset 25522481 was deleted (it blocked merge-queue branch
+creation; owner decision, #231). The job token never coexists with the agent, so
+branch scope rests on the uid boundary
 and the driver’s fixed refspec. Tag ruleset 25523683 is active. The issue
 must be owner-authored, but collaborators may have edited its brief before
 labeling; the owner must review it. Provider credential trust and review of
