@@ -247,11 +247,6 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn return_requires_host_boundary(&self) -> bool {
         false
     }
-    /// Placement after the entry token is consumed and the result installed,
-    /// before any host-return transport is published for that completed call.
-    fn place_completed_return(&mut self, route: CompletionRoute) -> CompletionRoute {
-        route
-    }
     fn resumes_operation(&self) -> bool {
         false
     }
@@ -959,7 +954,6 @@ fn finish<'a, C: EntryContext + 'a>(
     } else {
         completion_route(result, pending.host_work())
     };
-    let route = pending.place_completed_return(route);
     match result {
         FamilyCompletion::AccountedComplete(_)
         | FamilyCompletion::AccountedSwitched(_)

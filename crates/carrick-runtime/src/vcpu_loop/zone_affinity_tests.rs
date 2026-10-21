@@ -155,6 +155,14 @@ fn publish_current(
 ) {
     let thread = context.thread();
     let page = thread.control_lease().lifecycle();
+    // SAFETY: both aliases name the fixture's retained, directly mapped control.
+    unsafe {
+        thread
+            .control_slot()
+            .publish_affinity_aliases(carrick_guest_arch::GuestVa::new(
+                core::ptr::from_ref(thread.control_slot()).expose_provenance() as u64,
+            ));
+    }
     let tid = thread.key().tid.raw();
     assert!(thread.control_slot().publish_visible_tid(tid as u32));
     let generation = carrick_el1_abi::SnapshotGeneration::INITIAL;
@@ -782,13 +790,48 @@ fn switched_self_affinity(exclude: bool) {
                 );
                 assert_eq!(
                     route,
-                    carrick_personality_linux::dispatch::CompletionRoute::Suspended,
-                    "successful self exclusion must migrate at the completed return, without an IRQ"
+                    carrick_personality_linux::dispatch::CompletionRoute::WithWork,
+                    "self exclusion must stop at its owned host completion before guest return"
                 );
-                assert_eq!(p.zone.slot(slot).current(), None);
-                assert!(matches!(p.zone.record(sibling.id).claim(),
-                    carrick_sched_core::Claim::Queued { slot, .. } if slot == previous_slot));
-                assert_eq!(p.zone.switch_in(previous_slot), Some(sibling.id));
+                assert_eq!(p.zone.slot(slot).current(), Some(sibling.id));
+                assert_eq!(
+                    p.zone.handback_current(slot, sibling.id),
+                    carrick_sched_core::CurrentHandback::HandedBack
+                );
+                // The stopped completed record goes through host claims. The
+                // live authority must exclude CPU 0 before any guest entry.
+                use carrick_hal::{GuestCpuId, GuestCpuPolicy};
+                use carrick_kernel::kernel::Scheduler;
+                p.sibling
+                    .thread()
+                    .publish_initial_task_state(crate::vcpu_loop::executor::tests::task_state(
+                        p.sibling, 32,
+                    ))
+                    .unwrap();
+                let scheduler = Scheduler::new_with_policy(
+                    Arc::clone(p.root.kernel()),
+                    Arc::new(GuestCpuPolicy::new(2)),
+                );
+                let ex0 = scheduler
+                    .register_executor_bound(
+                        Arc::new(RecordedKick::default()),
+                        Some(GuestCpuId::new(0)),
+                        false,
+                    )
+                    .unwrap();
+                let ex1 = scheduler
+                    .register_executor_bound(
+                        Arc::new(RecordedKick::default()),
+                        Some(GuestCpuId::new(1)),
+                        false,
+                    )
+                    .unwrap();
+                scheduler.make_runnable(p.sibling.thread().key()).unwrap();
+                assert!(scheduler.try_take(&ex0).unwrap().is_none());
+                let migrated = scheduler.take(&ex1).unwrap();
+                assert_eq!(migrated.thread_key(), p.sibling.thread().key());
+                assert_eq!(migrated.guest_cpu(), GuestCpuId::new(1));
+                scheduler.settle_exited(migrated).unwrap();
             }
             drop(entry);
             assert_eq!(p.sibling.thread().affinity().words()[0], expected);

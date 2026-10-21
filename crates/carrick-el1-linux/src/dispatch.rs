@@ -1477,48 +1477,6 @@ impl<
                 || self.frame.canonical_ordinal().raw()
                     == carrick_personality_linux::lifecycle::SYS_GETPID as u64)
     }
-    fn place_completed_return(
-        &mut self,
-        route: carrick_personality_linux::dispatch::CompletionRoute,
-    ) -> carrick_personality_linux::dispatch::CompletionRoute {
-        use carrick_personality_linux::dispatch::CompletionRoute;
-        // Completion already installed x0: argument 0 here is the result, not pid.
-        if !matches!(route, CompletionRoute::Served | CompletionRoute::WithWork)
-            || self.frame.canonical_ordinal() != carrick_syscall_abi::nr::SCHED_SETAFFINITY
-            || self.frame.argument(0) != Some(0)
-        {
-            return route;
-        }
-        let index = self.frame.task_index();
-        let Some(slot) = self.frame.slot() else {
-            return route;
-        };
-        let Some(task) = self.current_tasks.get(index) else {
-            return route;
-        };
-        // Preserve pre-existing host return work; its owner also settles
-        // placement. This operation handles a completed, otherwise local set.
-        if task.linux.has_pending_host_work() {
-            return route;
-        }
-        let (Some(zone), Some(frame)) = (self.zone.as_mut(), self.frame.arm_frame()) else {
-            return route;
-        };
-        let mut scheduler = sched::Sched {
-            zone: zone.tables,
-            slot,
-            task,
-            cpu: &mut *zone.cpu,
-            user: zone.user,
-            counters: self.counters,
-            handoff: None,
-        };
-        if scheduler.enforce_affinity(frame).is_some() {
-            CompletionRoute::Suspended
-        } else {
-            route
-        }
-    }
     fn install_result(&mut self, result: SyscallResult) {
         self.frame
             .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
