@@ -7044,7 +7044,7 @@ mod tests {
     }
 
     #[test]
-    fn serial_host_native_terminal_wake_routes_uninitialized_parked_member() {
+    fn serial_host_terminal_wake_preserves_first_entry_activation_custody() {
         use carrick_el1_abi::Lifecycle;
         for already_host in [true, false] {
             use carrick_kernel::kernel::objects::ThreadExecutionState;
@@ -7168,6 +7168,19 @@ mod tests {
                     ),
                     carrick_el1_abi::HostClaim::Claimed
                 );
+                carrick_kernel::el1_zone::with_test_zone(zone, || {
+                    carrick_kernel::el1_zone::hand_back(&[record]);
+                });
+                let carrick_el1_abi::Claim::Queued {
+                    slot: activation_slot,
+                    ..
+                } = zone.record(record.id).claim()
+                else {
+                    panic!("first-entry handback was not queued");
+                };
+                assert_eq!(zone.take_service_head(activation_slot), Some(record));
+                // Pause here: the executor removed the record but has not yet
+                // completed first-entry adoption and retirement.
             }
             control.request_host_exit();
             page.publish_exit_wait(carrick_core_abi::EntryMmKey::from_raw(mm), 0x9900);
@@ -7180,27 +7193,25 @@ mod tests {
             );
             assert_eq!(zone.record(record.id).entry_count(), 0);
             assert!(!zone.record(record.id).is_cancelled());
-            let carrick_el1_abi::Claim::Queued {
-                slot: service_slot, ..
-            } = zone.record(record.id).claim()
-            else {
-                panic!(
-                    "first-entry control handback left claim {:?}, handback {:?}, unadopted {}",
+            if already_host {
+                assert!(matches!(
                     zone.record(record.id).claim(),
-                    zone.record(record.id).handback(),
-                    zone.record(record.id).is_unadopted_birth()
-                );
-            };
-            assert_eq!(
-                zone.record(record.id).handback(),
-                Some(carrick_el1_abi::Handback::Control)
-            );
-            assert_eq!(zone.runnable_head(service_slot), Some(record.id));
-            assert_eq!(
-                zone.take_service_head(service_slot),
-                Some(record),
-                "Closing must offer a parked birth once, including one already host-owned"
-            );
+                    carrick_el1_abi::Claim::Host { .. }
+                ));
+                zone.free_record(record.id);
+                assert!(zone.live(record).is_none());
+                assert_eq!(zone.runnable_head(slot), None);
+                assert_eq!(zone.take_service_head(slot), None);
+            } else {
+                let carrick_el1_abi::Claim::Queued {
+                    slot: service_slot, ..
+                } = zone.record(record.id).claim()
+                else {
+                    panic!("first-entry control handback was not queued");
+                };
+                assert_eq!(zone.runnable_head(service_slot), Some(record.id));
+                assert_eq!(zone.take_service_head(service_slot), Some(record));
+            }
             assert_eq!(kernel.wake_native_terminal_members(&root).unwrap(), 0);
             scheduler.close();
         }
