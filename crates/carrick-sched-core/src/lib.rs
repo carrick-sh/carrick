@@ -1242,9 +1242,12 @@ impl ZoneSlot {
     /// An idle or fixture-only slot has no host residency to discharge.
     pub fn affinity_excludes_cpu(&self) -> bool {
         let source = self.affinity_source();
+        if !source.is_guest_mapped() {
+            return false;
+        }
         match (source.load(), self.bound_cpu()) {
             (Some(mask), Some(cpu)) => cpu >= 64 || mask & (1u64 << cpu) == 0,
-            (None, Some(_)) => source.is_bound(),
+            (None, Some(_)) => false,
             _ => false,
         }
     }

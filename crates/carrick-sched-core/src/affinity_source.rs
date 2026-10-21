@@ -111,7 +111,10 @@ mod tests {
         // SAFETY: the host authority stays pinned until the source retires;
         // there is intentionally no guest mapping yet.
         let source = unsafe {
-            AffinitySource::from_aliases(core::ptr::from_ref(&authority).addr() as u64, 0)
+            AffinitySource::from_aliases(
+                core::ptr::from_ref(&authority).expose_provenance() as u64,
+                0,
+            )
         };
         assert!(source.is_bound());
         assert!(!source.is_guest_mapped());
