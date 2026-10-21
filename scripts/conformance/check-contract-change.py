@@ -1607,6 +1607,7 @@ def _eval_cfg_expr(
     target_os: str,
     target_arch: str,
     enabled_features: set[str],
+    debug_assertions: bool = True,
 ) -> bool:
     expr = expr.strip()
     if not expr:
@@ -1617,19 +1618,19 @@ def _eval_cfg_expr(
         args = _split_cfg_top_level_commas(m.group(2))
         if op == "all":
             return all(
-                _eval_cfg_expr(a, test_flag, target_os, target_arch, enabled_features)
+                _eval_cfg_expr(a, test_flag, target_os, target_arch, enabled_features, debug_assertions)
                 for a in args
             )
         if op == "any":
             return any(
-                _eval_cfg_expr(a, test_flag, target_os, target_arch, enabled_features)
+                _eval_cfg_expr(a, test_flag, target_os, target_arch, enabled_features, debug_assertions)
                 for a in args
             )
         if op == "not":
             if len(args) != 1:
                 return False
             return not _eval_cfg_expr(
-                args[0], test_flag, target_os, target_arch, enabled_features
+                args[0], test_flag, target_os, target_arch, enabled_features, debug_assertions
             )
     if expr == "test":
         return test_flag
@@ -1638,7 +1639,7 @@ def _eval_cfg_expr(
     if expr == "windows":
         return target_os == "windows"
     if expr == "debug_assertions":
-        return True
+        return debug_assertions
     kv = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"$', expr)
     if kv:
         k, v = kv.group(1), kv.group(2)
@@ -1662,14 +1663,33 @@ def _eval_cfg_expr(
     return False
 
 
+@functools.lru_cache(maxsize=4096)
+def _lane_debug_assertions(view: RepoView, pkg_name: str, lane: str) -> bool:
+    # scripts/lib/test-signed-body.sh builds signed executables with --release.
+    release = lane in ("signed-hvf", "signed-cli")
+    profiles = {}
+    if view.is_file("Cargo.toml"):
+        profiles = tomllib.loads(view.read_text("Cargo.toml")).get("profile", {})
+    profile_names = ["release"] if release else ["dev", "test"]
+    enabled = not release
+    for name in profile_names:
+        profile = profiles.get(name, {})
+        enabled = profile.get("debug-assertions", enabled)
+        overrides = profile.get("package", {})
+        for key in ("*", pkg_name):
+            enabled = overrides.get(key, {}).get("debug-assertions", enabled)
+    return enabled is True
+
+
 def _are_cfgs_active_in_ci(
     view: RepoView, pkg_name: str, lane: str, cfg_exprs: list[str]
 ) -> bool:
     if not cfg_exprs:
         return True
     envs = _ci_environments_for_target(view, pkg_name, lane)
+    debug_assertions = _lane_debug_assertions(view, pkg_name, lane)
     return any(
-        all(_eval_cfg_expr(expr, True, tos, tarch, feats) for expr in cfg_exprs)
+        all(_eval_cfg_expr(expr, True, tos, tarch, feats, debug_assertions) for expr in cfg_exprs)
         for tos, tarch, feats in envs
     )
 
@@ -1875,6 +1895,7 @@ def _find_all_inline_mods(
 
     Returns `([(mod_name, attrs_cs, body_stripped, body_comments_stripped), ...], ok)`.
     """
+    original_s, original_cs = scope_stripped, scope_comments_stripped
     scope_stripped, scope_comments_stripped = _blank_macro_defs(
         scope_stripped, scope_comments_stripped
     )
@@ -1892,8 +1913,8 @@ def _find_all_inline_mods(
                 (
                     m.group(1),
                     attrs_cs,
-                    scope_stripped[open_brace + 1 : close_brace],
-                    scope_comments_stripped[open_brace + 1 : close_brace],
+                    original_s[open_brace + 1 : close_brace],
+                    original_cs[open_brace + 1 : close_brace],
                 )
             )
     return (results, True)
@@ -1983,6 +2004,7 @@ def _extract_top_level_test_fns(
     """
     if _has_should_panic_attr(enclosing_attrs_cs):
         return {}
+    original_cs = scope_comments_stripped
     scope_stripped, scope_comments_stripped = _blank_macro_defs(
         scope_stripped, scope_comments_stripped
     )
@@ -2012,7 +2034,7 @@ def _extract_top_level_test_fns(
         close_brace = _find_matching_brace(scope_stripped, open_brace)
         if close_brace == -1:
             continue
-        fn_body_only = scope_stripped[open_brace : close_brace + 1]
+        fn_body_only = original_cs[open_brace : close_brace + 1]
         results[fn_name] = (is_ignored, fn_cfgs, fn_body_only, attrs_cs)
     return results
 
@@ -2029,6 +2051,7 @@ def _extract_non_test_fns_with_attrs(
 
     Returns `({fn_name: [(cfg_context, fn_body_only_stripped, attrs_cs), ...]}, ok)`.
     """
+    original_cs = scope_comments_stripped
     scope_stripped, scope_comments_stripped = _blank_macro_defs(
         scope_stripped, scope_comments_stripped
     )
@@ -2055,8 +2078,32 @@ def _extract_non_test_fns_with_attrs(
         if close_brace == -1:
             continue
         results.setdefault(fn_name, []).append(
-            (accum_cfgs + fn_cfgs, scope_stripped[open_brace : close_brace + 1], attrs_cs)
+            (accum_cfgs + fn_cfgs, original_cs[open_brace : close_brace + 1], attrs_cs)
         )
+    # Associated functions and methods are executable helpers too. Keep their
+    # implementations in the same call-closure index as free functions.
+    impl_items, impl_ok = _iter_depth0_attributed_items(
+        scope_stripped, scope_comments_stripped, re.compile(r"\bimpl\b")
+    )
+    if not impl_ok:
+        return ({}, False)
+    for impl_match, impl_attrs in impl_items:
+        impl_cfgs = accum_cfgs + _extract_cfg_exprs(impl_attrs)
+        if not _are_cfgs_active_in_ci(view, pkg_name, lane, impl_cfgs):
+            continue
+        opening = scope_stripped.find("{", impl_match.end())
+        closing = _find_matching_brace(scope_stripped, opening) if opening != -1 else -1
+        if closing == -1:
+            return ({}, False)
+        methods, methods_ok = _extract_non_test_fns_with_attrs(
+            scope_stripped[opening + 1 : closing],
+            original_cs[opening + 1 : closing],
+            view, pkg_name, lane, impl_cfgs,
+        )
+        if not methods_ok:
+            return ({}, False)
+        for name, variants in methods.items():
+            results.setdefault(name, []).extend(variants)
     return (results, True)
 
 
@@ -2089,7 +2136,7 @@ def _body_calls_fn(body: str, callee_name: str) -> bool:
         rf"(?:(?<![.\w:])|(?:self|super|crate)::)\b{esc}\s*\("
         rf"|\.\s*(?:map|and_then|or_else|filter|inspect|flat_map)\s*\(\s*(?:[\w:]+::)?{esc}\s*\)"
     )
-    return bool(pat.search(body))
+    return bool(pat.search(strip_rust_comments_and_strings(body)))
 
 
 def _expand_body_with_one_level_helpers(
@@ -2124,6 +2171,8 @@ def _has_early_return_gutting(fn_body: str) -> bool:
     """Return True if `fn_body` constructs `ContractObservation::default()` or contains an unconditional
     top-level (`depth == 1`) `return ...;` statement followed by unreachable statements in the same block.
     """
+    fn_body = strip_rust_comments_and_strings(fn_body)
+    fn_body, _ = _blank_macro_defs(fn_body, fn_body)
     if "ContractObservation::default" in fn_body:
         return True
     depths = _compute_brace_depths(fn_body)
@@ -2185,26 +2234,33 @@ def _extract_file_non_test_fns(
     if not ok:
         view._file_non_test_fns_cache[key] = ({}, False)
         return ({}, False)
-    inline_mods, mods_ok = _find_all_inline_mods(s, cs)
-    if not mods_ok:
+    def collect_modules(ms: str, mcs: str, cfgs: list[str]) -> bool:
+        mods, mods_ok = _find_all_inline_mods(ms, mcs)
+        if not mods_ok:
+            return False
+        for _name, attrs, body, body_cs in mods:
+            inner = _extract_scope_inner_attrs(body, body_cs)
+            if inner == "#![cfg(__invalid_cfg__)]":
+                return False
+            if _has_should_panic_attr(attrs) or _has_should_panic_attr(inner):
+                continue
+            child_cfgs = cfgs + _extract_cfg_exprs(attrs) + _extract_cfg_exprs(inner, inner_only=True)
+            if not _are_cfgs_active_in_ci(view, pkg_name, lane, child_cfgs):
+                continue
+            children, ok = _extract_non_test_fns_with_attrs(
+                body, body_cs, view, pkg_name, lane, child_cfgs
+            )
+            if not ok:
+                return False
+            for name, variants in children.items():
+                fns.setdefault(name, []).extend(variants)
+            if not collect_modules(body, body_cs, child_cfgs):
+                return False
+        return True
+
+    if not collect_modules(s, cs, inner_cfgs):
         view._file_non_test_fns_cache[key] = ({}, False)
         return ({}, False)
-    for _mname, mattrs_cs, ms, mcs in inline_mods:
-        m_inner = _extract_scope_inner_attrs(ms, mcs)
-        if m_inner == "#![cfg(__invalid_cfg__)]":
-            view._file_non_test_fns_cache[key] = ({}, False)
-            return ({}, False)
-        if _has_should_panic_attr(mattrs_cs) or _has_should_panic_attr(m_inner):
-            continue
-        m_cfgs = inner_cfgs + _extract_cfg_exprs(mattrs_cs) + _extract_cfg_exprs(m_inner, inner_only=True)
-        if not _are_cfgs_active_in_ci(view, pkg_name, lane, m_cfgs):
-            continue
-        sub_fns, sub_ok = _extract_non_test_fns_with_attrs(ms, mcs, view, pkg_name, lane, m_cfgs)
-        if not sub_ok:
-            view._file_non_test_fns_cache[key] = ({}, False)
-            return ({}, False)
-        for k, v in sub_fns.items():
-            fns.setdefault(k, []).extend(v)
     view._file_non_test_fns_cache[key] = (fns, True)
     return (fns, True)
 
@@ -2234,9 +2290,17 @@ def _compute_transitive_call_closure(
     for depth in range(1, max_depth + 2):
         called_names: set[str] = set()
         for b in frontier:
-            for cm in _CALLEE_EXTRACT_RE.finditer(b):
+            code = strip_rust_comments_and_strings(b)
+            code, _ = _blank_macro_defs(code, code)
+            for cm in _CALLEE_EXTRACT_RE.finditer(code):
                 cname = cm.group(1) or cm.group(2)
                 if cname and cname not in _RUST_KEYWORDS and cname not in visited:
+                    called_names.add(cname)
+            for cm in re.finditer(
+                r"(?:\.|::)\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^{};]*>\s*)?\(", code
+            ):
+                cname = cm.group(1)
+                if cname not in visited and cname not in _RUST_KEYWORDS:
                     called_names.add(cname)
         if not called_names:
             break
@@ -2289,9 +2353,6 @@ def _scope_valid_test_fn_bodies(
     fingerprint metadata) for `fn_name` (or all in scope if `fn_name` is None), or None if no runnable
     CI-compiled `#[test]` function matches.
     """
-    scope_stripped, scope_comments_stripped = _blank_macro_defs(
-        scope_stripped, scope_comments_stripped
-    )
     scope_inner_attrs = _extract_scope_inner_attrs(scope_stripped, scope_comments_stripped)
     if _has_should_panic_attr(scope_inner_attrs):
         return None
@@ -2433,7 +2494,7 @@ def _crate_has_testable_lib_or_bin(view: RepoView, pkg_name: str) -> bool:
     crate_dir = f"crates/{pkg_name}"
     lib_table = data.get("lib")
     if isinstance(lib_table, dict):
-        if lib_table.get("test") is False:
+        if lib_table.get("test") is False or lib_table.get("harness") is False:
             return False
         lib_path = f"{crate_dir}/{lib_table.get('path', 'src/lib.rs').lstrip('/')}"
         if view.is_file(lib_path):
@@ -2493,6 +2554,9 @@ def get_target_lane(view: RepoView, pkg_name: str, target_name: str) -> str | No
 
     if target_name not in int_targets:
         return None
+    for target in data.get("test", []) or []:
+        if target.get("name") == target_name and target.get("harness") is False:
+            return None
     return parsed_lanes.get(target_name, parsed_lanes.get("*", "host"))
 
 
@@ -2618,6 +2682,44 @@ def _scope_declares_mod(scope_s: str, scope_cs: str, mod_name: str) -> bool:
     )
 
 
+_MACRO_SCOPE_META = "/*__CONTRACT_MACROS__:"
+
+
+def _scope_macro_names(scope_s: str, scope_cs: str, inherited: dict[str, str]) -> dict[str, str]:
+    names = dict(inherited)
+    depths = _compute_brace_depths(scope_s)
+    for m in _MACRO_DECL_RE.finditer(scope_s):
+        if depths[m.start()] == 0:
+            opening = m.end()
+            while opening < len(scope_s) and scope_s[opening].isspace():
+                opening += 1
+            pairs = {"{": "}", "(": ")", "[": "]"}
+            closing = _find_matching_delim(scope_s, opening, scope_s[opening], pairs[scope_s[opening]]) if opening < len(scope_s) and scope_s[opening] in pairs else -1
+            names[m.group(1)] = scope_cs[m.start():closing + 1] if closing != -1 else "__unresolved_macro__"
+    clean, _ = _blank_macro_defs(scope_s, scope_s)
+    depths = _compute_brace_depths(clean)
+    for m in re.finditer(r"\buse\s+([^;]+);", clean):
+        if depths[m.start()] != 0:
+            continue
+        tree = m.group(1).strip()
+        if tree.startswith(("std::", "core::")):
+            continue
+        # Named imports may shadow a standard assertion, even if the origin
+        # is an external macro whose expansion cannot be validated here.
+        for name in _KNOWN_EXEC_MACROS:
+            if re.search(rf"\b{re.escape(name)}\b", tree):
+                names[name] = tree
+    return names
+
+
+def _with_macro_scope(bodies: list[str] | None, macros: dict[str, str]) -> list[str] | None:
+    if bodies is None:
+        return None
+    marker = _MACRO_SCOPE_META + ",".join(sorted(macros)) + "*/"
+    implementations = "\n".join(macros[name] for name in sorted(macros))
+    return [body + "\n" + marker + "\n" + implementations for body in bodies]
+
+
 def _resolve_in_module_tree(
     view: RepoView, pkg_name: str, lane: str, root_files: list[str], segments: list[str],
     require_test_module_for_root: bool, require_leaf: bool = False,
@@ -2635,6 +2737,7 @@ def _resolve_in_module_tree(
         def walk(
             cur_file: str, cur_mod_dir: str, is_file_scope: bool, scope_s: str, scope_cs: str,
             rem_segments: list[str], accum_cfgs: list[str], enclosing_attrs_cs: str, entered_test_mod: bool,
+            inherited_macros: dict[str, str],
         ) -> tuple[str, list[str]] | None:
             if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs):
                 return None
@@ -2643,6 +2746,7 @@ def _resolve_in_module_tree(
                 return None
             visited.add(state_key)
 
+            scope_macros = _scope_macro_names(scope_s, scope_cs, inherited_macros)
             in_test_context = entered_test_mod or not require_test_module_for_root
 
             if not rem_segments:
@@ -2651,14 +2755,14 @@ def _resolve_in_module_tree(
                 bodies = _scope_valid_test_fn_bodies(
                     view, pkg_name, lane, scope_s, scope_cs, None, accum_cfgs, enclosing_attrs_cs,
                 )
-                return (cur_file, bodies) if bodies else None
+                return (cur_file, _with_macro_scope(bodies, scope_macros)) if bodies else None
 
             if len(rem_segments) == 1 and in_test_context:
                 fn_bodies = _scope_valid_test_fn_bodies(
                     view, pkg_name, lane, scope_s, scope_cs, rem_segments[0], accum_cfgs, enclosing_attrs_cs,
                 )
                 if fn_bodies:
-                    return (cur_file, fn_bodies)
+                    return (cur_file, _with_macro_scope(fn_bodies, scope_macros))
 
             seg = rem_segments[0]
             next_rem = rem_segments[1:]
@@ -2676,7 +2780,7 @@ def _resolve_in_module_tree(
                     inline_mod_dir = f"{cur_mod_dir}/{seg}" if cur_mod_dir else seg
                 res = walk(
                     cur_file, inline_mod_dir, False, body_s, body_cs, next_rem,
-                    accum_cfgs + mod_cfgs, enclosing_attrs_cs + "\n" + attrs_cs, mod_is_test,
+                    accum_cfgs + mod_cfgs, enclosing_attrs_cs + "\n" + attrs_cs, mod_is_test, scope_macros,
                 )
                 if res is not None:
                     return res
@@ -2698,7 +2802,7 @@ def _resolve_in_module_tree(
                     child_mod_dir = child_file.rsplit("/", 1)[0] if child_file.endswith("/mod.rs") else child_file[:-3]
                     res = walk(
                         child_file, child_mod_dir, True, child_s, child_cs, next_rem,
-                        accum_cfgs + mod_cfgs + inner_cfgs, enclosing_attrs_cs + "\n" + attrs_cs, child_is_test,
+                        accum_cfgs + mod_cfgs + inner_cfgs, enclosing_attrs_cs + "\n" + attrs_cs, child_is_test, scope_macros,
                     )
                     if res is not None:
                         return res
@@ -2722,12 +2826,12 @@ def _resolve_in_module_tree(
                 if is_crate_root:
                     res = walk(
                         rf, rf_mod_dir, True, rf_s, rf_cs, new_rem,
-                        accum_cfgs + use_cfgs, enclosing_attrs_cs + "\n" + use_attrs_cs, use_is_test,
+                        accum_cfgs + use_cfgs, enclosing_attrs_cs + "\n" + use_attrs_cs, use_is_test, scope_macros,
                     )
                 else:
                     res = walk(
                         cur_file, cur_mod_dir, is_file_scope, scope_s, scope_cs, new_rem,
-                        accum_cfgs + use_cfgs, enclosing_attrs_cs + "\n" + use_attrs_cs, use_is_test,
+                        accum_cfgs + use_cfgs, enclosing_attrs_cs + "\n" + use_attrs_cs, use_is_test, scope_macros,
                     )
                 if res is not None:
                     return res
@@ -2736,7 +2840,7 @@ def _resolve_in_module_tree(
 
         res = walk(
             rf, rf_mod_dir, True, rf_s, rf_cs, segments, rf_inner_cfgs, "",
-            any(_cfg_is_test_only(e) for e in rf_inner_cfgs),
+            any(_cfg_is_test_only(e) for e in rf_inner_cfgs), {},
         )
         if res is not None:
             return res
@@ -2804,8 +2908,8 @@ def _resolve_contract_helper_binding(
             if open_brace != -1:
                 close_brace = _find_matching_brace(s_clean, open_brace)
                 if close_brace != -1:
-                    contract_fn_body = s_clean[open_brace : close_brace + 1]
-                    for helper_m in re.finditer(r"\b(run_[A-Za-z0-9_]*_contract)\s*\(", contract_fn_body):
+                    contract_fn_body = cs[open_brace : close_brace + 1]
+                    for helper_m in re.finditer(r"\b(run_[A-Za-z0-9_]*_contract)\s*\(", strip_rust_comments_and_strings(contract_fn_body)):
                         callee_names.add(helper_m.group(1))
             break
 
@@ -2835,7 +2939,7 @@ def _resolve_contract_helper_binding(
             expanded_test_body = _expand_body_with_one_level_helpers(
                 view, pkg_name, tlane, t_inner_cfgs + fn_cfgs, fn_body, t_helpers
             )
-            if call_in_test_re.search(expanded_test_body):
+            if call_in_test_re.search(strip_rust_comments_and_strings(expanded_test_body)):
                 closure_meta, closure_ok = _compute_transitive_call_closure(
                     view, pkg_name, tlane, t_inner_cfgs + fn_cfgs, [contract_fn_body, fn_body], t_helpers
                 )
@@ -2923,6 +3027,17 @@ def _extract_code_decl_identifiers(code_line: str) -> set[str]:
             if ident and ident not in _RUST_KEYWORDS and ident not in _GENERIC_ITEM_NAMES and not ident.startswith("_"):
                 found.add(ident)
     return found
+
+
+def _fingerprint_tokens(text: str) -> tuple[str, ...]:
+    """Normalize code whitespace while retaining exact Rust literal contents."""
+    token_re = re.compile(
+        r'(?:b?r|cr)(?P<hashes>\#*)"(?s:.*?)"(?P=hashes)'
+        r'|(?:b|c)?"(?:\\[\s\S]|[^"\\])*"'
+        r"|b?'(?:\\.|[^'\\\n])'"
+        r"|[A-Za-z0-9_]+|[^\sA-Za-z0-9_]"
+    )
+    return tuple(m.group(0) for m in token_re.finditer(text))
 
 
 def _tokenize_code_line(code_line: str) -> tuple[str, ...]:
@@ -3069,10 +3184,14 @@ def _strip_non_semantic_ident_occurrences(
     binding names so non-executing identifier mentions do not satisfy surface relevance.
     (Full semantic call-graph / rustc symbol resolution is tracked in #537.)
     """
-    text = text.split(_FINGERPRINT_META_SEP, 1)[0]
+    scope_macros: set[str] = set()
+    for marker in re.findall(re.escape(_MACRO_SCOPE_META) + r"([^*]*)\*/", text):
+        scope_macros.update(filter(None, marker.split(",")))
+    text = strip_rust_comments_and_strings(text.split(_FINGERPRINT_META_SEP, 1)[0])
     defined_macros = set(
         re.findall(r"\bmacro_rules!\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b", text)
     )
+    defined_macros.update(scope_macros)
     if extra_local_macros:
         defined_macros.update(extra_local_macros)
     text, _ = _blank_macro_defs(text, text)
@@ -3593,7 +3712,7 @@ def main():
         return base_binding_cache[b_spec]
 
     def normalize_ref_tokens(ref_texts: list[str]) -> tuple[tuple[str, ...], ...]:
-        return tuple(_tokenize_code_line(t) for t in ref_texts)
+        return tuple(_fingerprint_tokens(t) for t in ref_texts)
 
     active_surfaces_by_cid: dict[str, list[str]] = {}
     active_modified_surfaces: list[str] = []

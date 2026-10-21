@@ -2730,6 +2730,149 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
             )
         )
 
+    def _review_fingerprint_fixture(self, helper, test_body):
+        self.use_single_contract_surface()
+        production = "pub fn surface_answer() -> u64 { 1 }\n"
+        self.guest_file.write_text(production)
+        test_file = self.guest_file.with_name("review_tests.rs")
+        self.guest_file.with_name("mod.rs").write_text(
+            "pub mod futex;\n#[cfg(test)]\nmod review_tests;\n"
+        )
+        test_file.write_text(helper + "\n#[test]\nfn witness() { " + test_body + " }\n")
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::review_tests::witness"\n')
+        base = self._commit_all("seed unchanged grandfathered witness")
+        self.guest_file.write_text(production.replace("1", "2"))
+        return base, test_file
+
+    def test_review1_method_helper_gutting_fails(self):
+        """Invoked methods and associated functions participate in fingerprints."""
+        for call in ("Fixture.check_surface()", "Fixture::check_surface(&Fixture)"):
+            with self.subTest(call=call):
+                helper = (
+                    "struct Fixture;\nimpl Fixture {\n"
+                    "fn check_surface(&self) { assert_eq!(super::futex::surface_answer(), 1); }\n}\n"
+                )
+                base, test_file = self._review_fingerprint_fixture(helper, call + ";")
+                test_file.write_text(test_file.read_text().replace(
+                    "assert_eq!(super::futex::surface_answer(), 1);", ""
+                ))
+                self._commit_all("gut invoked method while changing production")
+                result = self.run_check(base_sha=base)
+                self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+                self.assertIn("does not reference changed surface", result.stderr)
+
+    def test_review2_executable_literals_change_fingerprint(self):
+        """Changing call arguments or helper return literals invalidates old evidence."""
+        for before, after in (
+            ('check_surface("run")', 'check_surface("skip")'),
+            ('check_surface("a b")', 'check_surface("a  b")'),
+            ('check_surface(r##"run"##)', 'check_surface(r##"skip"##)'),
+            ('"ok"', '"broken"'),
+            ("'x'", "'y'"),
+        ):
+            with self.subTest(before=before, after=after):
+                helper = 'fn check_surface(mode: &str) { if mode == "run" { assert!(true); } }'
+                if before == '"ok"':
+                    helper = "fn check_surface(_: &str) -> &'static str { \"ok\" }"
+                    test_body = 'let _ = check_surface("run");'
+                else:
+                    test_body = before + ";"
+                base, test_file = self._review_fingerprint_fixture(helper, test_body)
+                test_file.write_text(test_file.read_text().replace(before, after))
+                self._commit_all("alter executable literal while changing surface")
+                result = self.run_check(base_sha=base)
+                self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+                self.assertIn("does not reference changed surface", result.stderr)
+
+    def test_review3_inherited_assertion_macro_fails(self):
+        """Parent macros, including imported aliases, cannot impersonate assertions."""
+        for parent, child_import in (
+            ("macro_rules! assert_eq { ($($t:tt)*) => {}; }\n", ""),
+            ("macro_rules! discard { ($($t:tt)*) => {}; }\npub(crate) use discard;\n",
+             "use super::discard as assert_eq;\n"),
+            ("macro_rules! discard { ($($t:tt)*) => {}; }\npub(crate) use discard;\n",
+             "use super::{discard as assert_eq};\n"),
+        ):
+            with self.subTest(parent=parent, child_import=child_import):
+                self.use_single_contract_surface()
+                self.guest_file.write_text("pub fn surface_answer() -> u64 { 1 }\n")
+                self._write_futex_contract('docker = "probe:futex"\n')
+                base = self._commit_all("seed inherited macro surface")
+                self.guest_file.write_text("pub fn surface_answer() -> u64 { 2 }\n")
+                self.guest_file.with_name("mod.rs").write_text(
+                    "pub mod futex;\n#[cfg(test)]\nmod parent {\n" + parent
+                    + '#[path = "../review_child.rs"]\nmod child;\n}\n'
+                )
+                (self.guest_file.parent / "parent").mkdir(exist_ok=True)
+                self.guest_file.with_name("review_child.rs").write_text(
+                    child_import + "#[test]\nfn witness() { assert_eq!(crate::dispatch::futex::surface_answer(), 1); }\n"
+                )
+                self._write_futex_contract(
+                    'vm_free = "carrick-kernel::dispatch::parent::child::witness"\n'
+                )
+                self._commit_all("inherit a discarded assertion")
+                result = self.run_check(base_sha=base)
+                self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+
+    def test_review4_signed_release_debug_assertions_fails(self):
+        """Signed release lanes exclude debug-only witnesses and include release ones."""
+        self.use_single_contract_surface()
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base = self._commit_all("seed signed profile surface")
+        pkg = self.repo / "crates/carrick-embed"
+        (pkg / "src").mkdir(parents=True)
+        (pkg / "Cargo.toml").write_text(
+            '[package]\nname = "carrick-embed"\nversion = "0.1.0"\nedition = "2024"\n'
+            '[package.metadata.carrick.test-lanes]\n"*" = "signed-hvf"\n'
+            '[dependencies]\ncarrick-kernel = { path = "../carrick-kernel" }\n'
+        )
+        (pkg / "src/lib.rs").write_text("")
+        with (self.repo / "conformance-contracts/surfaces.toml").open("a") as mapping:
+            mapping.write('\n[[surfaces]]\npath = "crates/carrick-embed/src/lib.rs"\ncontracts = []\n')
+        target = pkg / "tests/witness.rs"
+        target.parent.mkdir()
+        body = (
+            "#[cfg(debug_assertions)]\n#[test]\nfn witness() {\n"
+            "assert_eq!(carrick_kernel::dispatch::futex::surface_answer(), 2);\n}\n"
+        )
+        target.write_text(body)
+        self.guest_file.write_text("pub fn surface_answer() -> u64 { 2 }\n")
+        self._write_futex_contract('embed = "carrick-embed::witness::witness"\n')
+        self._commit_all("bind compiled-out signed release test")
+        result = self.run_check(base_sha=base)
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("does not resolve", result.stderr)
+        target.write_text(body.replace("cfg(debug_assertions)", "cfg(not(debug_assertions))"))
+        self._commit_all("bind signed release witness")
+        result = self.run_check(base_sha=base)
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
+    def test_review5_harness_false_test_fails(self):
+        """A gated custom harness does not execute #[test] functions via libtest."""
+        self.use_single_contract_surface()
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base = self._commit_all("seed custom harness surface")
+        cargo = self.repo / "crates/carrick-kernel/Cargo.toml"
+        cargo.write_text(cargo.read_text() + (
+            '\n[[test]]\nname = "custom"\npath = "tests/custom.rs"\nharness = false\n'
+        ))
+        target = self.repo / "crates/carrick-kernel/tests/custom.rs"
+        target.parent.mkdir()
+        target.write_text(
+            "fn main() {}\n#[test]\nfn witness() {\n"
+            "assert_eq!(carrick_kernel::dispatch::futex::surface_answer(), 2);\n}\n"
+        )
+        self.guest_file.write_text("pub fn surface_answer() -> u64 { 2 }\n")
+        self._write_futex_contract('vm_free = "carrick-kernel::custom::witness"\n')
+        self._commit_all("bind unexecuted custom harness test")
+        result = self.run_check(base_sha=base)
+        self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+        self.assertIn("does not resolve", result.stderr)
+        cargo.write_text(cargo.read_text().replace("harness = false", "harness = true"))
+        self._commit_all("enable libtest harness")
+        result = self.run_check(base_sha=base)
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
