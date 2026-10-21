@@ -933,6 +933,7 @@ fn serve_clone<'a>(
         file_table: state.file_table.load(Ordering::Acquire),
         // The host binds the child's execution generation at adoption.
         generation: 0,
+        affinity_source: child_slot.affinity_source(),
         affinity,
         lifecycle_page: core::ptr::from_ref(page).addr() as u64,
         control_slot: core::ptr::from_ref(child_slot).addr() as u64,
@@ -959,6 +960,7 @@ fn serve_clone<'a>(
         }
         return None;
     }
+    child_slot.set_affinity(carrick_core::affinity::CpuAffinity::from_words(&[affinity]));
     if !outputs.publish(identity.visible_tid, native) {
         native.free_record(record);
         if page.unclaim(claimed).is_err() {
