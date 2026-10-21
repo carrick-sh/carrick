@@ -447,7 +447,13 @@ fn stat_path_copyin(nr: u64) {
     };
     let reporter = crate::compat::CompatReporter::default();
     // SAFETY: this thread exclusively owns the retained fixture bytes.
-    unsafe { std::ptr::copy_nonoverlapping(b"/dev/null\0".as_ptr(), backing.as_ptr(), 10) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            c"/dev/null".to_bytes_with_nul().as_ptr(),
+            backing.as_ptr(),
+            10,
+        )
+    };
     let simple_path =
         nr == nr::CARRICK_PRIVATE_X86_STAT.raw() || nr == nr::CARRICK_PRIVATE_X86_LSTAT.raw();
     let args = if simple_path {
