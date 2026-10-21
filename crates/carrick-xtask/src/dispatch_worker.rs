@@ -303,7 +303,7 @@ fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Res
     }
 }
 
-fn private_environment(command: &mut Command) {
+pub(crate) fn private_environment(command: &mut Command) {
     command
         .env_clear()
         .env("PATH", "/usr/local/bin:/usr/bin:/bin");

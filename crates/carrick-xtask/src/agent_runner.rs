@@ -442,6 +442,64 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     #[test]
+    fn runner_wrapper_configuration_never_reaches_agent_cargo() {
+        // Exercise Cargo's real config selection, without a daemon or uid switch.
+        for filename in ["config", "config.toml"] {
+            let temp =
+                tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"))
+                    .unwrap();
+            let cargo_home = temp.path().join("cargo");
+            let rustup = temp.path().join("rustup");
+            let state = temp.path().join("state");
+            let project = temp.path().join("project");
+            for directory in [&cargo_home, &rustup, &state, &project] {
+                std::fs::create_dir(directory).unwrap();
+            }
+            let marker = temp.path().join("runner-work-executed");
+            let wrapper = temp.path().join("sccache");
+            std::fs::write(
+                &wrapper,
+                format!("#!/bin/sh\ntouch '{}'\nexit 91\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::write(cargo_home.join(filename), format!(
+                "[build]\nrustc-wrapper = '{}'\n[env]\nSCCACHE_SERVER_UDS = '{}'\nRUSTC_WORKSPACE_WRAPPER = '{}'\n",
+                wrapper.display(), temp.path().join("runner.sock").display(), wrapper.display()
+            )).unwrap();
+            std::fs::write(project.join("Cargo.toml"), "[package]\nname = 'isolation-witness'\nversion = '0.0.0'\nedition = '2021'\n[lib]\npath = 'lib.rs'\n").unwrap();
+            std::fs::write(project.join("lib.rs"), "pub fn witness() {}\n").unwrap();
+            let cargo = PathBuf::from(env!("CARGO"));
+            let mut command = std::process::Command::new(&cargo);
+            super::super::dispatch_worker::private_environment(&mut command);
+            command
+                .args(["check", "--offline"])
+                .current_dir(&project)
+                .env("CARGO_BUILD_JOBS", "3")
+                .env("RUSTC", cargo.parent().unwrap().join("rustc"))
+                .env("CARGO_HOME", &cargo_home)
+                .env("RUSTUP_HOME", &rustup);
+            isolate_rust_homes(&mut command, &state).unwrap();
+            let output = command.output().unwrap();
+            assert!(
+                !marker.exists(),
+                "runner wrapper executed via {filename}: {output:?}"
+            );
+            assert!(output.status.success(), "{output:?}");
+            for name in ["config", "config.toml"] {
+                assert!(
+                    !state.join("rust/cargo").join(name).exists(),
+                    "runner Cargo config crossed boundary"
+                );
+            }
+            assert!(
+                !command
+                    .get_envs()
+                    .any(|(key, _)| key.to_string_lossy().starts_with("SCCACHE_"))
+            );
+        }
+    }
+    #[test]
     fn rust_home_child_mutations_leave_original_caches_and_proxies_unchanged() {
         let temp = tempfile::tempdir().unwrap();
         let cargo = temp.path().join("cargo");
