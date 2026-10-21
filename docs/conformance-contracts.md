@@ -1668,3 +1668,13 @@ birth, rejection of the old token after reuse, and no queue links after free.
 Graph-ledger adoption and physical interrupt delivery remain kernel/runtime
 and signed integration bindings; the model counts their effects only under
 real scheduler activation custody.
+
+The final scheduler suite uses preemption bound 3 for focused race pairs and
+bound 2 for the two composed producer/Closing/executor cases, with a 10,000
+branch failure budget and no duration or permutation cap. These ownership
+transfers use CAS and the WFI handshake uses a slot lock, not a Dekker pair.
+`closing_producer_executor_sleep_and_reuse_preserve_delivery` counts returned
+kick receipts and their consumption, while requiring every surviving queued
+WFI record to have owed or delivered wakeup debt. The replacement-Closing
+case also checks release of an internally rejected stale acquisition. The
+nine cases run through `just test-loom` and the existing CI loom job.

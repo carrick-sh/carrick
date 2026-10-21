@@ -320,7 +320,7 @@ jobs:
           tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
-      - name: Loom protocol models (fd, kernel wake, terminal clear, invalidation domain)
+      - name: Loom protocol models (first entry, fd, kernel wake, terminal clear, invalidation domain)
         if: ${{ !cancelled() }}
         run: just test-loom
 

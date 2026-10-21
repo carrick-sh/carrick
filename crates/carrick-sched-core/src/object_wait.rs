@@ -1841,7 +1841,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod host_tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;

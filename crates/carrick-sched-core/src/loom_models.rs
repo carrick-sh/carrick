@@ -7,8 +7,22 @@ use loom::{model::Builder, sync::Arc, thread};
 use std::boxed::Box;
 
 fn model(body: impl Fn() + Send + Sync + 'static) {
+    model_with_bound(3, body);
+}
+
+fn model_composed(body: impl Fn() + Send + Sync + 'static) {
+    model_with_bound(2, body);
+}
+
+fn model_with_bound(bound: usize, body: impl Fn() + Send + Sync + 'static) {
+    // Focused race pairs use 3 preemptions; composed three-actor cases use
+    // 2 (the repository's baseline). These are CAS/slot-lock protocols, not
+    // Dekker pairs. No duration/permutation cap truncates exploration;
+    // exceeding the branch budget fails the test.
     let mut builder = Builder::new();
-    builder.preemption_bound = Some(2);
+    builder.preemption_bound = Some(bound);
+    builder.max_permutations = None;
+    builder.max_duration = None;
     builder.max_branches = 10_000;
     builder.check(body);
 }
@@ -226,7 +240,7 @@ fn finish(zone: &ZoneTables, custody: FirstEntryActivation, deliveries: &AtomicU
 
 #[test]
 fn producer_closing_executor_and_second_birth_complete_once() {
-    model(|| {
+    model_composed(|| {
         let zone = zone();
         {
             let record = birth(&zone);
@@ -313,12 +327,116 @@ fn wfi_entry_races_fallback_publication() {
         let record = birth(&zone);
         let sleeper_zone = zone.clone();
         let sleeper = thread::spawn(move || sleeper_zone.enter_idle(SLOT, true));
-        assert!(zone.requeue_on(SLOT, record.id).is_some());
+        let placement = zone.requeue_on(SLOT, record.id).unwrap();
         let sleeping = sleeper.join().unwrap();
+        assert!(
+            !sleeping || placement.resched,
+            "missing physical-kick receipt"
+        );
         assert!(
             !sleeping || zone.take_resched(SLOT),
             "P1 sleep and fallback publication missed each other"
         );
         assert_eq!(zone.slot(SLOT).len.load(Ordering::Acquire), 1);
+    });
+}
+
+#[test]
+fn closing_producer_executor_sleep_and_reuse_preserve_delivery() {
+    model_composed(|| {
+        let zone = zone();
+        let record = birth(&zone);
+        zone.record(record.id)
+            .last_slot
+            .store(SLOT.plus_one(), Ordering::Relaxed);
+        zone.drive(SLOT, 1);
+        let deliveries = AtomicU32::new(0);
+        let kicks = Arc::new(AtomicU32::new(0));
+        let producer_zone = zone.clone();
+        let producer_kicks = kicks.clone();
+        let producer = thread::spawn(move || {
+            if let Some(custody) = producer_zone.claim_first_entry_placement(record) {
+                match producer_zone.place_first_entry(custody) {
+                    Ok(placement) => {
+                        if placement.resched {
+                            assert!(producer_zone.take_resched(placement.slot));
+                            assert_eq!(producer_kicks.fetch_add(1, Ordering::AcqRel), 0);
+                        }
+                    }
+                    Err(custody) => assert!(producer_zone.release_first_entry_placement(custody)),
+                }
+            }
+        });
+        let closing_zone = zone.clone();
+        let closing = thread::spawn(move || {
+            closing_zone.claim_for_host(record, None, Handback::Control, &SpinForever)
+        });
+        zone.enter_idle(SLOT, true);
+        if let Some(ServiceHead::FirstEntry(custody)) = zone.take_service_head_for_executor(SLOT) {
+            finish(&zone, custody, &deliveries);
+        }
+        producer.join().unwrap();
+        closing.join().unwrap();
+        match zone.record(record.id).claim() {
+            Claim::Queued { slot, .. } => {
+                assert!(
+                    zone.slot(slot).state() != SlotState::IdleWfi
+                        || zone.slot(slot).resched_owed.load(Ordering::Acquire) != 0
+                        || kicks.load(Ordering::Acquire) == 1,
+                    "queued behind WFI with neither owed nor delivered kick"
+                );
+                match zone.take_service_head_for_executor(slot).unwrap() {
+                    ServiceHead::FirstEntry(custody) => finish(&zone, custody, &deliveries),
+                    ServiceHead::Record(_) => panic!("birth escaped activation custody"),
+                }
+            }
+            Claim::Host { .. } => finish(
+                &zone,
+                zone.claim_current_first_entry_activation(record).unwrap(),
+                &deliveries,
+            ),
+            Claim::Free => {}
+            state => panic!("Closing cannot complete from {state:?}"),
+        }
+        assert_eq!(deliveries.load(Ordering::Acquire), 1);
+        let replacement = birth(&zone);
+        assert_ne!(record.incarnation, replacement.incarnation);
+        assert!(zone.claim_current_first_entry_activation(record).is_none());
+        assert!(zone.claim_first_entry_placement(record).is_none());
+        finish(
+            &zone,
+            zone.claim_current_first_entry_activation(replacement)
+                .unwrap(),
+            &AtomicU32::new(0),
+        );
+    });
+}
+
+#[test]
+fn stale_placement_releases_replacement_despite_its_closing_request() {
+    model(|| {
+        let zone = zone();
+        let old = birth(&zone);
+        let stale_zone = zone.clone();
+        let stale = thread::spawn(move || {
+            if let Some(custody) = stale_zone.claim_first_entry_placement(old) {
+                assert_eq!(stale_zone.record(old.id).incarnation(), old.incarnation);
+                assert!(stale_zone.release_first_entry_placement(custody));
+            }
+        });
+        if let Some(custody) = zone.claim_current_first_entry_activation(old) {
+            assert!(zone.free_first_entry_activation(custody));
+            let replacement = birth(&zone);
+            let closing_zone = zone.clone();
+            let closing = thread::spawn(move || {
+                closing_zone.claim_for_host(replacement, None, Handback::Control, &SpinForever)
+            });
+            closing.join().unwrap();
+        }
+        stale.join().unwrap();
+        assert!(
+            matches!(zone.record(old.id).claim(), Claim::Host { .. }),
+            "rejected stale acquisition poisoned replacement custody"
+        );
     });
 }
