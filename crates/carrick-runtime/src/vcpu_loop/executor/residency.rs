@@ -524,6 +524,209 @@ mod tests {
         }
     }
 
+    fn owner_event_within(
+        service: &carrick_kernel::kernel::continuation::CarrierWaitService,
+        token: carrick_kernel::kernel::continuation::ContinuationWakeToken,
+        timeout: std::time::Duration,
+    ) -> Option<
+        Result<
+            carrick_kernel::kernel::continuation::ContinuationEvent,
+            carrick_kernel::kernel::continuation::WaitServiceError,
+        >,
+    > {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct ThreadWaker(std::thread::Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let start = std::time::Instant::now();
+        let mut future = std::pin::pin!(service.event(token));
+        let waker = Waker::from(std::sync::Arc::new(ThreadWaker(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                return Some(value);
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return None;
+            }
+            std::thread::park_timeout(timeout.saturating_sub(elapsed));
+        }
+    }
+
+    #[test]
+    fn fstat_and_wait4_copyout_parks_defer_handlers_until_owner_release_and_kill_wakes() {
+        use carrick_hal::SyscallTrap;
+        use carrick_kernel::kernel::continuation::{
+            CarrierWaitService, ContinuationCapture, ReservedSignal, RestartClass, ZoneWait,
+        };
+
+        for nr in [
+            carrick_abi::syscall::nr::FSTAT.raw(),
+            carrick_abi::syscall::nr::WAIT4.raw(),
+        ] {
+            let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            carrick_kernel::dispatch::resources::with_dirty_captured_resources_for_executor_test(
+                &context,
+                || {
+                    let mm = context.shared().mm().id();
+                    let mut saved = pending_read();
+                    let GuestCpuState::Aarch64V1(cpu) = &mut saved else {
+                        panic!("AArch64 fixture");
+                    };
+                    std::sync::Arc::make_mut(cpu).mm_generation = mm.raw();
+                    let generation = context
+                        .thread()
+                        .publish_initial_task_state(
+                            carrick_kernel::kernel::objects::MigratableTaskState {
+                                cpu: saved,
+                                mm,
+                                asid_generation: 1,
+                            },
+                        )
+                        .unwrap();
+                    let capture = ContinuationCapture::new(
+                        &context,
+                        generation,
+                        carrick_kernel::dispatch::SyscallRequest::new(
+                            nr,
+                            crate::compat::SyscallArgs([3, 0x6000, 1, 0x7000, 0, 0]),
+                        ),
+                        RestartClass::Never,
+                    )
+                    .unwrap();
+                    let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+                    let continuation = crate::vcpu_loop::zone::owner_zone_continuation_for_resume(
+                        &crate::vcpu_loop::binding::OwnedSyscallResume::CopyoutRedispatch,
+                        capture,
+                        wait,
+                    );
+                    let service = CarrierWaitService::new(std::sync::Arc::new(
+                        carrick_kernel::kernel::Scheduler::new(std::sync::Arc::clone(
+                            context.kernel(),
+                        )),
+                    ));
+                    let mut registration = service.prepare_registration(&continuation);
+                    service.enroll(&mut registration).unwrap();
+                    let token = registration.wake_token();
+
+                    let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(
+                        carrick_abi::LINUX_SIGUSR1,
+                    )
+                    .unwrap();
+                    let mut action = carrick_abi::LinuxSigaction::empty();
+                    action.sa_handler = 0x5000;
+                    context.signal_authority().install_action(signal, action);
+                    context
+                        .signal_authority()
+                        .enqueue_thread_standard(signal, None);
+                    context.task().wake();
+                    service.publish_signal_for_thread(context.thread().key());
+                    assert!(
+                        owner_event_within(&service, token, std::time::Duration::from_millis(20))
+                            .is_none(),
+                        "syscall {nr} was interrupted by an ordinary handled signal",
+                    );
+                    assert!(
+                        context
+                            .signal_authority()
+                            .thread_pending()
+                            .contains(carrick_abi::LINUX_SIGUSR1),
+                        "syscall {nr} consumed the signal before completing",
+                    );
+
+                    service.publish_ready(token);
+                    let event =
+                        owner_event_within(&service, token, std::time::Duration::from_secs(1))
+                            .expect("owner release must wake")
+                            .expect("owner release event");
+                    assert!(matches!(
+                        event,
+                        carrick_kernel::kernel::continuation::ContinuationEvent::Ready
+                    ));
+
+                    let dequeued = context
+                        .signal_authority()
+                        .take_lowest_in(carrick_abi::SigSet::EMPTY.with(carrick_abi::LINUX_SIGUSR1))
+                        .unwrap();
+                    let (action_generation, action) =
+                        context.signal_authority().action_with_generation(signal);
+                    let reserved = ReservedSignal::kernel(
+                        context.signal_authority(),
+                        dequeued,
+                        action_generation,
+                        action,
+                        carrick_abi::SigSet::EMPTY,
+                    );
+                    let mut trap = SignalBoundaryTrap::default();
+                    trap.complete_syscall(0).unwrap();
+                    crate::vcpu_loop::signal::deliver_reserved_signal_with_restart(
+                        &mut trap,
+                        &dispatcher,
+                        &context,
+                        crate::vcpu_loop::signal::SignalRestartContext {
+                            last_syscall_retval: Some(0),
+                            interrupted_pc: None,
+                            continuation_restart: None,
+                        },
+                        carrick_hal::ThreadId::synthetic_for_tests(
+                            context.thread().key().tid.raw(),
+                        ),
+                        reserved,
+                    )
+                    .unwrap();
+                    assert_eq!(trap.completed, [0]);
+                    assert_eq!(trap.injected, [(Some(0), None, false)]);
+
+                    let kill_capture = ContinuationCapture::new(
+                        &context,
+                        generation,
+                        carrick_kernel::dispatch::SyscallRequest::new(
+                            nr,
+                            crate::compat::SyscallArgs([3, 0x6000, 1, 0x7000, 0, 0]),
+                        ),
+                        RestartClass::Never,
+                    )
+                    .unwrap();
+                    let kill_wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 2);
+                    let killed = crate::vcpu_loop::zone::owner_zone_continuation_for_resume(
+                        &crate::vcpu_loop::binding::OwnedSyscallResume::CopyoutRedispatch,
+                        kill_capture,
+                        kill_wait,
+                    );
+                    let mut kill_registration = service.prepare_registration(&killed);
+                    service.enroll(&mut kill_registration).unwrap();
+                    let kill_token = kill_registration.wake_token();
+                    context.signal_authority().enqueue_thread_standard(
+                        carrick_kernel::kernel::LinuxSignal::for_signal_number(
+                            carrick_abi::LINUX_SIGKILL,
+                        )
+                        .unwrap(),
+                        None,
+                    );
+                    context.task().wake();
+                    service.publish_signal_for_thread(context.thread().key());
+                    let kill_event =
+                        owner_event_within(&service, kill_token, std::time::Duration::from_secs(1))
+                            .expect("SIGKILL must wake")
+                            .expect("SIGKILL event");
+                    assert!(matches!(
+                        &kill_event,
+                        carrick_kernel::kernel::continuation::ContinuationEvent::ReservedSignal(signal)
+                            if signal.signum() == carrick_abi::LINUX_SIGKILL
+                    ));
+                },
+            );
+        }
+    }
+
     #[test]
     fn signal_during_owner_memory_wait_completes_before_handler_and_keeps_restart_policy() {
         use carrick_hal::SyscallTrap;

@@ -1837,7 +1837,7 @@ where
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
         match resume {
-            binding::OwnedSyscallResume::Redispatch => {
+            binding::OwnedSyscallResume::CopyoutRedispatch => {
                 self.redispatch_threaded_syscall(kernel, engine, host_wait)
             }
             binding::OwnedSyscallResume::PreparedWrite(pending) => {
@@ -3998,7 +3998,7 @@ pub(crate) mod tests {
             .resume_owned_syscall(
                 &kernel,
                 &mut engine,
-                binding::OwnedSyscallResume::Redispatch,
+                binding::OwnedSyscallResume::CopyoutRedispatch,
                 None,
             )
             .unwrap();

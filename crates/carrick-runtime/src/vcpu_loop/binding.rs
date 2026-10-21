@@ -226,7 +226,7 @@ pub(super) enum OwnerSupplyWait {
 /// The syscall operation to resume after an owner-memory dependency.
 /// A retained transfer cannot fall through to numeric syscall redispatch.
 pub(super) enum OwnedSyscallResume {
-    Redispatch,
+    CopyoutRedispatch,
     PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
 }
 
@@ -3316,7 +3316,7 @@ where
             let outcome = self.state.resume_owned_syscall(
                 &self.kernel,
                 engine,
-                resume.unwrap_or(OwnedSyscallResume::Redispatch),
+                resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
                 control.submission.host_wait_context(),
             )?;
             return self.route_outcome(engine, control, frame, outcome);
@@ -3334,7 +3334,7 @@ where
                 control,
                 frame,
                 wait,
-                resume.unwrap_or(OwnedSyscallResume::Redispatch),
+                resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
             );
         }
         if let DispatchOutcome::OwnerPhysicalWait { wait, committed } = outcome {
@@ -3359,14 +3359,14 @@ where
                 let outcome = self.state.resume_owned_syscall(
                     &self.kernel,
                     engine,
-                    resume.unwrap_or(OwnedSyscallResume::Redispatch),
+                    resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
                     control.submission.host_wait_context(),
                 )?;
                 return self.route_outcome(engine, control, frame, outcome);
             }
             self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
                 frame,
-                resume: resume.unwrap_or(OwnedSyscallResume::Redispatch),
+                resume: resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
                 wait,
                 _subscription: subscription,
             };
