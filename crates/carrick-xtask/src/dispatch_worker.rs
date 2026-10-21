@@ -288,7 +288,10 @@ fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Res
             Ok(None) => {
                 // The sudo wrapper and its agent belong to different UIDs.
                 // Stop every agent process before waiting for that wrapper.
-                stop_agent_processes();
+                let (_helper, mut retirement) =
+                    retirement_command().map_err(std::io::Error::other)?;
+                crate::process_helper::run_checked(&mut retirement)
+                    .map_err(std::io::Error::other)?;
                 // A sudo monitor can stop on the agent's job-control notification.
                 // Kill the unreaped child's dedicated group with runner privilege.
                 // SAFETY: the unreaped foreground child owns this dedicated group.
@@ -417,13 +420,14 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         }
     }
     hand_over(&state)?;
+    let logs = crate::agent_runner::state()?;
     isolated
         .arg(command.get_program())
         .args(command.get_args())
         .current_dir("/")
         .stdin(Stdio::null())
-        .stdout(std::fs::File::create(state.join("agent.out"))?)
-        .stderr(std::fs::File::create(state.join("agent.err"))?);
+        .stdout(std::fs::File::create(logs.join("agent.out"))?)
+        .stderr(std::fs::File::create(logs.join("agent.err"))?);
     let outcome = wait_agent(&mut isolated, crate::agent_runner::job_remaining(32)?);
     retire_agent()?;
     let code = outcome?;
@@ -537,17 +541,11 @@ fn hand_over(path: &Path) -> Result<(), ScalerError> {
     let parent = path
         .parent()
         .ok_or(ScalerError::Guard("agent staging parent"))?;
-    for directory in [parent, path] {
-        output(
-            Command::new("/usr/bin/chgrp")
-                .args(["-hR", AGENT_USER])
-                .arg(directory),
-        )?;
-        output(
-            Command::new("/usr/bin/chmod")
-                .args(["-R", "ug+rwX,o-rwx"])
-                .arg(directory),
-        )?;
+    for (program, args) in [
+        ("/usr/bin/chgrp", ["-hR", AGENT_USER]),
+        ("/usr/bin/chmod", ["-R", "ug+rwX,o-rwx"]),
+    ] {
+        output(Command::new(program).args(args).arg(parent))?;
     }
     let owned = parent.join("owned");
     sudo(&[
@@ -566,15 +564,33 @@ fn hand_over(path: &Path) -> Result<(), ScalerError> {
     std::fs::remove_dir_all(old)?;
     Ok(())
 }
-fn stop_agent_processes() {
-    // Linux kill(-1) reaches all other processes of this uid, across sessions.
-    // No root-capable sudo is needed, including for detached double forks.
-    let _ = sudo(&["/bin/kill", "-STOP", "-1"]);
-    let _ = sudo(&["/bin/kill", "-KILL", "-1"]);
+fn retirement_command() -> Result<(tempfile::TempDir, Command), ScalerError> {
+    let helper = tempfile::Builder::new()
+        .prefix("carrick-retire-")
+        .tempdir_in("/var/tmp")?;
+    let executable = std::env::current_exe()?;
+    #[cfg(test)]
+    let executable = executable.with_file_name("../carrick-xtask");
+    let binary = helper.path().join("driver");
+    std::fs::copy(executable, &binary)?;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o555))?;
+    std::fs::set_permissions(helper.path(), std::fs::Permissions::from_mode(0o755))?;
+    let identity = output(Command::new("/usr/bin/id").args(["-u", AGENT_USER]))?;
+    let uid = String::from_utf8_lossy(&identity)
+        .trim()
+        .parse::<libc::uid_t>()
+        .map_err(|_| ScalerError::Guard("invalid agent uid"))?;
+    let mut command = crate::process_helper::command(&binary, AGENT_USER, uid);
+    private_environment(&mut command);
+    Ok((helper, command))
 }
 fn retire_agent() -> Result<(), ScalerError> {
+    let (_helper, mut command) = retirement_command()?;
+    retire_agent_with(&mut command)
+}
+fn retire_agent_with(command: &mut Command) -> Result<(), ScalerError> {
     for _ in 0..100 {
-        stop_agent_processes();
+        crate::process_helper::run_checked(command)?;
         // SAFETY: only completed children adopted by this subreaper are reaped.
         while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
         let mut empty = true;
@@ -903,15 +919,6 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
             ));
         }
         cleanup_agent_user()?;
-        if !Command::new("/usr/bin/id")
-            .args(["-u", AGENT_USER])
-            .status()?
-            .success()
-        {
-            return Err(ScalerError::Guard(
-                "hardened agent template account is absent",
-            ));
-        }
         let outer = tempfile::Builder::new()
             .prefix("carrick-dispatch-")
             .tempdir_in("/var/tmp")?;
@@ -976,18 +983,9 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         cleanup_agent_user()?;
         // Read agent files only as data after verified uid retirement. The
         // pre-created private group lets runner read without becoming root.
-        for program in ["/usr/bin/chgrp", "/usr/bin/chmod"] {
-            let arguments = if program.ends_with("chgrp") {
-                vec!["-hR", AGENT_USER]
-            } else {
-                vec!["-R", "ug+rwX,o-rwx"]
-            };
-            let mut args = arguments;
-            args.push(actor.to_str().ok_or(ScalerError::Guard("agent state"))?);
-            let mut command = vec![program];
-            command.extend(args);
-            sudo(&command)?;
-        }
+        let actor_path = actor.to_str().ok_or(ScalerError::Guard("agent state"))?;
+        sudo(&["/usr/bin/chgrp", "-hR", AGENT_USER, actor_path])?;
+        sudo(&["/usr/bin/chmod", "-R", "ug+rwX,o-rwx", actor_path])?;
         code = result?;
         snapshot(&actor_work, &work, &dispatch.branch)?;
         contract = read_contract(&actor.join("result.json")).unwrap_or(Contract {
@@ -998,7 +996,7 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         });
         for name in ["agent.out", "agent.err"] {
             raw.push_str(&format!("=== {name} ===\n"));
-            raw.push_str(&regular_text(&actor.join(name))?);
+            raw.push_str(&regular_text(&state.join(name))?);
         }
         if checkpoint(&work, dispatch)? {
             contract.status = ContractStatus::Failed;
