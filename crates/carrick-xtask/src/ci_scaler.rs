@@ -1144,7 +1144,11 @@ fn now() -> Result<u64, ScalerError> {
 
 // Capture output in memory, never in a command log or a tempfile. Bounds apply
 // to every external command (including gh and ssh), not just guest readiness.
-fn execute(command: &mut Command, input: &[u8], limit: Duration) -> Result<Vec<u8>, ScalerError> {
+pub(crate) fn execute(
+    command: &mut Command,
+    input: &[u8],
+    limit: Duration,
+) -> Result<Vec<u8>, ScalerError> {
     execute_with_failure(command, input, limit, |_| None)
 }
 
