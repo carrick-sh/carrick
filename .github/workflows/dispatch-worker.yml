@@ -104,9 +104,13 @@ jobs:
           "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode carrick --check-load --
           "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker run --event "$GITHUB_EVENT_PATH"
           --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
+      - name: Verify retirement before credentialed completion
+        id: retire
+        if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
+        run: '"$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker guard --retire --event "$GITHUB_EVENT_PATH"'
       - name: Scan output, push only this run branch and report its draft PR
         id: complete
-        if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.retire.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker complete --event "$GITHUB_EVENT_PATH"'

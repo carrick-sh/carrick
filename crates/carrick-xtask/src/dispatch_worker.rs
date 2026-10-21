@@ -21,6 +21,8 @@ pub enum DispatchAction {
         event: PathBuf,
         #[arg(long)]
         admit: bool,
+        #[arg(long, conflicts_with = "admit")]
+        retire: bool,
     },
     /// Finish this job: scan artifacts, push its branch and report the contract.
     Complete {
@@ -696,21 +698,27 @@ struct Receipt {
 }
 
 pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
-    if matches!(&args.action, DispatchAction::Run { .. })
-        && ["GH_TOKEN", "GITHUB_TOKEN"]
-            .iter()
-            .any(|key| std::env::var_os(key).is_some())
+    if matches!(
+        &args.action,
+        DispatchAction::Run { .. } | DispatchAction::Guard { retire: true, .. }
+    ) && ["GH_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
     {
         return Err(ScalerError::Guard("agent phase received a job token"));
     }
     let root = root.canonicalize()?;
-    let (event_path, setup, complete, admit) = match args.action {
-        DispatchAction::Guard { event, admit } => (event, None, false, admit),
+    let (event_path, setup, complete, admit, retire) = match args.action {
+        DispatchAction::Guard {
+            event,
+            admit,
+            retire,
+        } => (event, None, false, admit, retire),
         DispatchAction::Run {
             event,
             setup_status,
-        } => (event, Some(setup_status), false, false),
-        DispatchAction::Complete { event } => (event, None, true, false),
+        } => (event, Some(setup_status), false, false, false),
+        DispatchAction::Complete { event } => (event, None, true, false, false),
     };
     let event: Value = serde_json::from_slice(&std::fs::read(event_path)?)?;
     let mut dispatch = validate_event(
@@ -720,6 +728,9 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     )?;
     assigned_branch(&mut dispatch)?;
     branch_run(dispatch.issue, &dispatch.branch)?;
+    if retire {
+        return cleanup_agent_user();
+    }
     if admit {
         cleanup_agent_user()?;
         if dispatch.resume {

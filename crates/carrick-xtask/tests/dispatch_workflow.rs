@@ -59,6 +59,18 @@ fn disposable_worker_has_no_publisher_or_artifact_transfer() {
         .iter()
         .position(|s| s["uses"].as_str().unwrap_or("").contains("upload-artifact"))
         .unwrap();
+    let retire = steps
+        .iter()
+        .position(|s| s["id"].as_str() == Some("retire"))
+        .expect("missing token-free retirement step");
+    assert!(agent < retire && retire < complete);
+    assert!(!format!("{:?}", steps[retire]).contains("github.token"));
+    assert!(
+        steps[complete]["if"]
+            .as_str()
+            .unwrap()
+            .contains("steps.retire.outcome == 'success'")
+    );
     assert!(bootstrap < agent && agent < complete && complete < upload);
     assert_eq!(
         steps[bootstrap]["env"]["GH_TOKEN"].as_str(),
