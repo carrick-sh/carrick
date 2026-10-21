@@ -16,15 +16,15 @@ Workflow steps use it for continuation admission, pushing the assigned branch,
 and reporting results. There is no long-lived write token or publisher job.
 Draft-PR review and repository gates establish content correctness.
 
-The driver restores the dedicated dynamic system account
+The hardened agent template pre-creates the dedicated system account
 `carrick-dispatch-agent`: no login shell, sudo rights or runner group membership.
 It enters the agent tree with `sudo -n -u carrick-dispatch-agent -- /usr/bin/env
 -i`. Runner-owned 0700 directories hold the driver, upload population and
 `redaction-secrets.json` outside the agent tree. The agent cannot read runner
 process environments or alter those files. The driver copies only selected
 provider auth, tools and private Rust homes into a separate tree, hands it to
-the account, and supplies an explicit environment without GitHub tokens or
-Actions command-file channels.
+the account through group-readable staging, and supplies an explicit
+environment without GitHub tokens or Actions command-file channels.
 
 `AGENT_DIRECTOR_TOKEN` is a bootstrap-only read credential for the pinned private
 `carrick-sh/agy-director` launcher. Only the selected tier's `CODEX_AUTH_JSON` or
@@ -36,7 +36,9 @@ credential exposure, not a claim that the agent cannot extract that credential.
 After exit or timeout, the driver stops and kills processes by both real and
 effective agent UID, including detached sessions. A subreaper reaps adopted
 children; a fail-closed census must find none before hand-back, scanning,
-completion or upload. Cleanup verifies retirement before deleting the account.
+completion or upload. Retirement runs STOP/KILL against all processes as the
+agent uid, repeats a bounded census and refuses completion if any survive.
+The account remains installed; the driver never creates or deletes users.
 Agent-controlled Git config is discarded when files and objects are copied into
 a fresh runner repository; checkpointing never runs that config as the runner.
 The whole clone is destroyed after the job.
@@ -101,10 +103,19 @@ API reports are bounded and link to the full artifacts. Incomplete contracts
 still produce artifacts and make the final job verdict fail.
 
 Runner-only Linux tests (`--include-ignored --test-threads=1`) exercise real
-account creation, OS permissions, detached-process retirement and completion
-with a fixture launcher and local Git/GitHub stand-ins. They need the runner's
-passwordless sudo access to `/usr/sbin/useradd` and `/usr/sbin/userdel`, as
-provided by template 9000; the account receives no sudo grant. Portable tests
+OS permissions, detached-process retirement and completion with a fixture
+launcher and local Git/GitHub stand-ins. They run on the hardened template
+from `scripts/ci/build-template-debian.sh INPUT_DIR SCRIPT_COMMIT XTASK agent`.
+They skip only when the pre-created account is absent; report those witnesses
+as unrun. The director must rebuild the old worker template before rollout.
+The only runner sudo grant targets `carrick-dispatch-agent`; runner cannot
+become root and the agent has no sudo rights. Portable tests
 cover workflow selection, permissions, auth custody, H1 and branch policy. They do not establish
 live deployed acceptance. The post-landing default-branch trigger and fresh-clone
 trials remain with the director under #634.
+
+Runner belongs to the agent's private group; the agent never belongs to the
+runner group. After verified retirement, the driver reads agent files only
+as data. It never executes or sources agent-written scripts, Git hooks or
+configuration. Git runs against a reconstructed snapshot with hooks and
+configuration disabled, never by changing into the agent tree to run commands.
