@@ -1329,6 +1329,39 @@ mod tests {
         );
     }
     #[test]
+    fn runner_reads_agent_tree_without_executing_hooks_filters_or_scripts() {
+        let temp = tempfile::tempdir().unwrap();
+        let actor = temp.path().join("actor");
+        let target = temp.path().join("snapshot");
+        let marker = temp.path().join("runner-executed-agent-code");
+        std::fs::create_dir(&actor).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        git(&actor, &["init"]).unwrap();
+        git(&actor, &["checkout", "-b", "work/dispatch-42"]).unwrap();
+        std::fs::write(actor.join("data"), "base").unwrap();
+        git(&actor, &["add", "."]).unwrap();
+        git(&actor, &["commit", "-m", "base"]).unwrap();
+        let poison = format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display());
+        for script in [actor.join("poison.sh"), actor.join(".git/hooks/pre-commit")] {
+            std::fs::write(&script, &poison).unwrap();
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        git(&actor, &["config", "filter.poison.clean", "./poison.sh"]).unwrap();
+        std::fs::write(actor.join(".gitattributes"), "data filter=poison\n").unwrap();
+        std::fs::write(actor.join("data"), "agent modification").unwrap();
+        snapshot(&actor, &target, "work/dispatch-42").unwrap();
+        git(&target, &["add", "."]).unwrap();
+        git(&target, &["commit", "-m", "read agent data"]).unwrap();
+        assert!(
+            !marker.exists(),
+            "runner executed agent-written hook, config or script"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("data")).unwrap(),
+            "agent modification"
+        );
+    }
+    #[test]
     fn worker_disables_compiler_servers_for_every_runner_step() {
         let documents = yaml_rust2::YamlLoader::load_from_str(include_str!(
             "../../../.github/workflows/dispatch-worker.yml"

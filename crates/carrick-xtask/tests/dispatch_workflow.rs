@@ -512,3 +512,26 @@ fi
     let outcome = std::fs::read_to_string(outputs).unwrap();
     assert_eq!(outcome.contains("worker_failed=true"), case == "boundary");
 }
+
+#[test]
+fn dispatch_requires_precreated_account_and_agent_only_sudo() {
+    let source = include_str!("../src/dispatch_worker.rs");
+    assert!(
+        !source.contains("/usr/sbin/useradd"),
+        "runtime account creation needs root"
+    );
+    assert!(
+        !source.contains("/usr/sbin/userdel"),
+        "runtime account deletion needs root"
+    );
+    let helper = source
+        .split("fn sudo(args:")
+        .nth(1)
+        .unwrap()
+        .split("fn hand_over")
+        .next()
+        .unwrap();
+    assert!(helper.contains("AGENT_USER"), "sudo helper can run as root");
+    assert!(source.contains("[\"/bin/kill\", \"-STOP\", \"-1\"]"));
+    assert!(source.contains("[\"/bin/kill\", \"-KILL\", \"-1\"]"));
+}
