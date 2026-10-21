@@ -567,6 +567,32 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   preferences and pointers. When a memory note turns out to be a project
   rule, promote it here in a PR and delete the memory copy.
 
+### Multiple director sessions
+
+When more than one director session runs at once, each one can break the
+others through shared state they never see change. On 2026-10-21 that cost
+a signed gate, nine hours of merge queue and a red `main` (#753).
+
+- **Hosts are owned.** Each session uses only the hosts listed for it in
+  the "Director lanes" comment on #231. Borrowing another session's host
+  means asking first, and every gate still takes that host's lease.
+- **Announce shared changes before and after.** This covers repository
+  settings and rulesets, workflows and CI configuration, merges to `main`,
+  the merge queue, Proxmox templates and the controller, and host-lease
+  configuration. Send one message before and one after. The "after" message
+  says how the other session would notice breakage. Test a ruleset against
+  the merge queue itself, not only against human and App pushes.
+- **A merge to `main` is announced at enqueue and at landing.** Name the
+  PR, the merge SHA and the lanes to watch (signed EL1 for ARM work, KVM
+  for x86). Announce a native stack layer by layer.
+- **A main defect you cause is yours to announce.** File a `main-defect`
+  issue and notify the other session immediately, so its red CI isn't
+  misread as its own regression.
+- **The record is on GitHub.** Session-to-session messages are
+  notifications. The #231 "Director lanes" comment (owner, hosts, active
+  PRs, in-flight shared changes) is the record, and each session updates
+  its own section when its lane changes.
+
 ## Landing and personalities
 
 - **Land through the merge queue** (`main-merge-queue`: rebase, all-green,
