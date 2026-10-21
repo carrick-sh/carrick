@@ -11,29 +11,43 @@ remain as documented in [Contabo setup](contabo-kvm.md).
 ## Credentials and execution
 
 The job-scoped `GITHUB_TOKEN` has exactly `contents: write`,
-`pull-requests: write`, `issues: write` and `checks: write`. Workflow steps use it
-for continuation admission, pushing the assigned branch, and reporting results.
-There is no long-lived write token, publisher job, bundle transfer, repository
-credential gate, agent UID split or separate dispatch environment.
-Draft-PR review and the repository gates establish content correctness.
+`pull-requests: write` and `issues: write`; it cannot create check runs.
+Workflow steps use it for continuation admission, pushing the assigned branch,
+and reporting results. There is no long-lived write token or publisher job.
+Draft-PR review and repository gates establish content correctness.
 
-`AGENT_DIRECTOR_TOKEN` remains a bootstrap-only **read** credential for the
-pinned private `carrick-sh/agy-director` launcher. It is supplied only to the
-bootstrap step before agent execution; dispatch does not depend on the Mac's
-App-token refresher. The job token cannot read that separate private repository.
-The existing digest-pinned codex, agy and just bootstrap remains in place.
-Provider credentials (`CODEX_AUTH_JSON`, `AGY_OAUTH_TOKEN`) are materialized only
-for the selected tier, in 0600 files in the private 0700 home. Cleanup removes
-provider, launcher and worktree state after completion.
+The driver restores the dedicated dynamic system account
+`carrick-dispatch-agent`: no login shell, sudo rights or runner group membership.
+It enters the agent tree with `sudo -n -u carrick-dispatch-agent -- /usr/bin/env
+-i`. Runner-owned 0700 directories hold the driver, upload population and
+`redaction-secrets.json` outside the agent tree. The agent cannot read runner
+process environments or alter those files. The driver copies only selected
+provider auth, tools and private Rust homes into a separate tree, hands it to
+the account, and supplies an explicit environment without GitHub tokens or
+Actions command-file channels.
 
-The foreground agent command uses `env_clear` and an explicit environment.
-`GITHUB_TOKEN`, `GH_TOKEN`, `AGENT_DIRECTOR_TOKEN`, Git credential configuration
-and Actions command-file channels are absent. The agent commits its work; a
-later workflow step pushes and reports. Private `HOME`, `CARGO_HOME` and
-`RUSTUP_HOME` are hygiene on a disposable runner, not a security boundary.
-There is no separate agent account or UID hand-over/retirement protocol.
-The foreground process group is killed on completion or timeout; disposal owns
-any detached descendants.
+`AGENT_DIRECTOR_TOKEN` is a bootstrap-only read credential for the pinned private
+`carrick-sh/agy-director` launcher. Only the selected tier's `CODEX_AUTH_JSON` or
+`AGY_OAUTH_TOKEN` reaches the auth step; the other provider secret is neither
+materialized nor captured. The selected provider credential is intentionally
+readable by the agent and may include a refresh token. This is a residual
+credential exposure, not a claim that the agent cannot extract that credential.
+
+After exit or timeout, the driver stops and kills processes by both real and
+effective agent UID, including detached sessions. A subreaper reaps adopted
+children; a fail-closed census must find none before hand-back, scanning,
+completion or upload. Cleanup verifies retirement before deleting the account.
+Agent-controlled Git config is discarded when files and objects are copied into
+a fresh runner repository; checkpointing never runs that config as the runner.
+The whole clone is destroyed after the job.
+
+For at most 40 minutes, the job token can write issues/PRs and any
+`work/dispatch-*` branch, including branches belonging to other runs. Driver
+branch selection narrows normal publication, not the token's repository grant.
+Rulesets 25522481 and 25523683 block tags and non-dispatch branches. The issue
+must be owner-authored, but collaborators may have edited its brief before
+labeling; the owner must review it. Provider credential trust and review of
+agent changes remain necessary.
 
 ## H1 compiler isolation
 
@@ -46,8 +60,8 @@ process census fails; it never contacts that service. Templates must not
 prestart one.
 
 Rust homes are physical private copies. Both Cargo home configuration files
-(`config` and `config.toml`), including symlinks and their `[env]` entries, are
-excluded. The agent command sets both Rust wrappers explicitly empty and
+(`config` and `config.toml`), including symlinks and their `[env]` entries, and
+Cargo registry `credentials`/`credentials.toml` are excluded. The agent command sets both Rust wrappers explicitly empty and
 `CARRICK_SCCACHE=0` and inherits no `SCCACHE_*` variables. The unchanged H1
 witness plants a marker-writing wrapper in each Cargo config filename, runs
 real Cargo against a dependency-free fixture, and checks successful compilation,
@@ -59,7 +73,11 @@ witness exercises runner-UID admission for present, absent and failed censuses.
 A fresh job uses only `work/dispatch-<issue>-<run_id>`, derived from the admitted
 issue and Actions run ID. Completion refuses a different current branch and
 pushes only `HEAD:refs/heads/<assigned branch>`, with an explicit tip lease,
-without tags or submodules. A fresh branch must be absent remotely.
+without tags or submodules. A fresh branch must be absent remotely. A rerun reports an existing owned
+branch/PR without replacing it; an identical already-pushed tip can finish
+creating a missing PR. Workflow-file changes under `.github/workflows/*` are
+refused with an issue/summary report and artifacts instead of attempting a
+push the job token cannot authorize.
 The workflow creates a draft PR as `github-actions[bot]`, using the repository
 PR template, `Closes #N` and its workflow-run URL.
 
@@ -82,7 +100,11 @@ The workflow posts the run summary and issue/PR comments after the agent exits;
 API reports are bounded and link to the full artifacts. Incomplete contracts
 still produce artifacts and make the final job verdict fail.
 
-Host-portable tests exercise the real agent-command construction and completion
-with a fixture launcher and local Git/GitHub stand-ins. They do not establish
+Runner-only Linux tests (`--include-ignored --test-threads=1`) exercise real
+account creation, OS permissions, detached-process retirement and completion
+with a fixture launcher and local Git/GitHub stand-ins. They need the runner's
+passwordless sudo access to `/usr/sbin/useradd` and `/usr/sbin/userdel`, as
+provided by template 9000; the account receives no sudo grant. Portable tests
+cover workflow selection, permissions, auth custody, H1 and branch policy. They do not establish
 live deployed acceptance. The post-landing default-branch trigger and fresh-clone
 trials remain with the director under #634.

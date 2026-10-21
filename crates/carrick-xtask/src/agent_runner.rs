@@ -145,7 +145,10 @@ pub(crate) fn isolate_rust_homes(
             private_dir(&destination)?;
             for entry in std::fs::read_dir(&source)? {
                 let entry = entry?;
-                if entry.file_name() == "config" || entry.file_name() == "config.toml" {
+                if matches!(
+                    entry.file_name().to_str(),
+                    Some("config" | "config.toml" | "credentials" | "credentials.toml")
+                ) {
                     continue;
                 }
                 copy_rust_home(
@@ -423,6 +426,7 @@ pub fn run(root: &Path, args: Args) -> Result<(), ScalerError> {
         Action::Bootstrap => bootstrap(root),
         Action::Auth { event } => auth(&event),
         Action::Cleanup => {
+            crate::dispatch_worker::cleanup_agent_user()?;
             let state = state()?;
             match std::fs::symlink_metadata(&state) {
                 Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {

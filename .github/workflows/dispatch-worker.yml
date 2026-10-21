@@ -16,12 +16,15 @@ jobs:
   guard:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      backend: ${{ steps.tier.outputs.backend }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Validate actor, tier and brief before requesting a worker
+        id: tier
         run: cargo run --locked --release -p carrick-xtask -- dispatch-worker guard --event "$GITHUB_EVENT_PATH"
 
   worker:
@@ -31,7 +34,6 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
-      checks: write
     # H1: no runner-owned compiler server may execute agent-selected builds.
     # Environment overrides runner Cargo config for every step.
     env:
@@ -76,7 +78,7 @@ jobs:
         timeout-minutes: 10
         run: |
           cargo build --locked --release -p carrick-xtask
-          cp target/release/carrick-xtask "$RUNNER_TEMP/carrick-dispatch-driver"
+          install -m 0700 target/release/carrick-xtask "$RUNNER_TEMP/carrick-dispatch-driver"
       - uses: actions/cache/restore@v4
         with:
           path: ~/.rustup/toolchains
@@ -90,8 +92,8 @@ jobs:
       - name: Materialize selected provider credentials
         id: auth
         env:
-          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
-          AGY_OAUTH_TOKEN: ${{ secrets.AGY_OAUTH_TOKEN }}
+          CODEX_AUTH_JSON: ${{ needs.guard.outputs.backend == 'codex' && secrets.CODEX_AUTH_JSON || '' }}
+          AGY_OAUTH_TOKEN: ${{ needs.guard.outputs.backend == 'agy' && secrets.AGY_OAUTH_TOKEN || '' }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner auth --event "$GITHUB_EVENT_PATH"'
       - name: Run foreground agent and collect output
         id: worker
