@@ -75,7 +75,7 @@ curl -fSL "https://github.com/actions/runner/releases/download/v${runner_version
 printf '%s  %s\n' "$runner_sha256" seed/runner.tar.gz | sha256sum -c -
 curl -fSL "https://github.com/mozilla/sccache/releases/download/v${sccache_version}/sccache-v${sccache_version}-x86_64-unknown-linux-musl.tar.gz" -o seed/sccache.tar.gz
 printf '%s  %s\n' "$sccache_sha256" seed/sccache.tar.gz | sha256sum -c -
-curl -fSL https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init -o seed/rustup-init
+curl -fSL https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init -o seed/rustup-init
 printf '%s  %s\n' "$rustup_sha256" seed/rustup-init | sha256sum -c -
 cp "$xtask" seed/carrick-xtask
 cp "$inputs/rust-toolchain.toml" "$inputs/Cargo.lock" seed/
