@@ -50,7 +50,7 @@ impl SchedVenue for Venue {
     fn get_affinity(&self, _: u32) -> AffinityResult {
         Err(carrick_syscall_abi::LINUX_ESRCH)
     }
-    fn set_affinity(&mut self, _: u32, _: carrick_core::affinity::CpuAffinity) -> AffinityResult {
+    fn set_affinity(&mut self, _: u32, _: CpuAffinity) -> AffinityResult {
         Err(carrick_syscall_abi::LINUX_ESRCH)
     }
 }
@@ -85,7 +85,7 @@ fn existing_child_and_absent_pid_use_the_namespace_authority() {
 
 struct AffinityVenue {
     args: [u64; 3],
-    affinity: carrick_core::affinity::CpuAffinity,
+    affinity: CpuAffinity,
     in_buf: [u8; 128],
     out_buf: [u8; 128],
     out_len: usize,
@@ -99,7 +99,7 @@ impl Default for AffinityVenue {
     fn default() -> Self {
         Self {
             args: [0; 3],
-            affinity: carrick_core::affinity::CpuAffinity::default(),
+            affinity: CpuAffinity::default(),
             in_buf: [0; 128],
             out_buf: [0; 128],
             out_len: 0,
@@ -146,15 +146,11 @@ impl SchedVenue for AffinityVenue {
             Ok(self.affinity)
         }
     }
-    fn set_affinity(
-        &mut self,
-        _pid: u32,
-        mask: carrick_core::affinity::CpuAffinity,
-    ) -> AffinityResult {
+    fn set_affinity(&mut self, _pid: u32, mask: CpuAffinity) -> AffinityResult {
         if self.esrch {
             Err(carrick_syscall_abi::LINUX_ESRCH)
         } else {
-            let online = carrick_core::affinity::CpuAffinity::all(self.ncpu);
+            let online = CpuAffinity::all(self.ncpu);
             let effective = carrick_core::affinity::compute_effective_affinity(&mask, &online)
                 .ok_or(carrick_syscall_abi::LINUX_EINVAL)?;
             self.affinity = effective;
@@ -176,7 +172,7 @@ fn sched_getaffinity_validation_and_success() {
             args,
             copy_fail,
             esrch,
-            affinity: carrick_core::affinity::CpuAffinity::single(1),
+            affinity: CpuAffinity::single(1),
             ..Default::default()
         };
         assert_eq!(
@@ -197,6 +193,8 @@ fn sched_getaffinity_validation_and_success() {
 fn sched_setaffinity_validation_and_success() {
     for (args, mask, ncpu, copy_fail, esrch, errno) in [
         ([0, 0, 0x1000], 0u64, 64, false, false, -22), // empty input
+        ([0, 0, 0], 0, 64, true, false, -22),          // empty input must not copy
+        ([9999, 0, 0], 0, 64, true, true, -3),         // missing target precedes empty/copy
         ([0, 8, 0], 0, 64, false, false, -14),         // null input
         ([0, 8, 0x1000], 0, 64, true, false, -14),     // failed copy-in
         ([0, 8, 0x1000], 0, 64, false, false, -22),    // empty intersection
@@ -261,22 +259,6 @@ fn missing_affinity_targets_precede_buffer_failures() {
             FamilyCompletion::Complete(-3)
         );
         assert_eq!(venue.out_len, 0);
-    }
-}
-
-#[test]
-fn empty_setaffinity_never_dereferences_the_mask_pointer() {
-    for (pid, expected) in [(0, -22), (9999, -3)] {
-        let mut venue = AffinityVenue {
-            args: [pid, 0, 0],
-            copy_fail: true,
-            esrch: pid != 0,
-            ..Default::default()
-        };
-        assert_eq!(
-            serve_sched(SchedCall::SetAffinity, &mut venue),
-            FamilyCompletion::Complete(expected),
-        );
     }
 }
 
