@@ -3883,8 +3883,8 @@ pub(crate) mod tests {
 
         let region = Box::leak(Box::new(Region::new()));
         let zone = region.zone();
-        let mm = admit_notified(&region, root.shared().mm().id().raw(), ROOT, 1, 0);
-        let view = Box::leak(Box::new(nodes(&region)));
+        let mm = admit_notified(region, root.shared().mm().id().raw(), ROOT, 1, 0);
+        let view = Box::leak(Box::new(nodes(region)));
         let portal = Box::leak(Box::new(
             MmPortal::new(
                 NonZeroU64::new(712).unwrap(),
