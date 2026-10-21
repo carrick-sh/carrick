@@ -743,7 +743,8 @@ fn pending_el1_grant_publications_match_only_the_exact_grant() {
     use super::*;
     let mut ledger = PendingEl1GrantPublications::default();
     let first = replacement(0x10_0000, 3);
-    assert!(ledger.insert(first.clone()));
+    let first_grant = first.grant;
+    assert!(ledger.insert(first));
     assert!(ledger.overlaps(0x10_3000, 0x1000));
     assert!(!ledger.overlaps(0x10_4000, 0x1000));
     assert!(!ledger.overlaps(0x0f_c000, 0x4000));
@@ -754,8 +755,11 @@ fn pending_el1_grant_publications_match_only_the_exact_grant() {
     // Same span, another owner incarnation: not this grant.
     assert_eq!(ledger.take(&replacement(0x10_0000, 4).grant), None);
     assert!(ledger.insert(replacement(0x20_0000, 3)));
-    assert_eq!(ledger.take(&first.grant), Some(first.clone()));
-    assert_eq!(ledger.take(&first.grant), None, "taken exactly once");
+    assert_eq!(
+        ledger.take(&first_grant).map(|pending| pending.grant),
+        Some(first_grant)
+    );
+    assert!(ledger.take(&first_grant).is_none(), "taken exactly once");
     assert!(!ledger.overlaps(0x10_0000, 0x4000));
     assert!(ledger.take(&replacement(0x20_0000, 3).grant).is_some());
 }

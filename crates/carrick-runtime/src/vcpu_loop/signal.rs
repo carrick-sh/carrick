@@ -1483,8 +1483,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     return Ok(true);
                 };
                 let fault_page = plan.fault_page();
-                let plan_shape = (plan.start(), plan.len(), plan.prot());
-                let deferred_to_guest = std::cell::Cell::new(false);
+                let committed_by_guest = std::cell::Cell::new(false);
                 let residency_identity = carrick_el1_abi::FrameGrantResidencyIdentity {
                     mm_key: request.mm_key,
                     semantic_base: service.semantic_base,
@@ -1519,43 +1518,83 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             fault_va: fault_page,
                             permissions: grant.permissions,
                             ready,
-                        })? {
-                            El1FrameGrantPublished::OnHost => Ok::<bool, TrapError>(true),
+                        }).unwrap_or_else(|error| carrick_fatal::carrick_fatal!(
+                            "hvpatch::physical_grant",
+                            "prepared frame grant cannot publish descriptor: {error}"
+                        )) {
+                            El1FrameGrantPublished::OnHost => {
+                                engine.complete_el1_frame_grant(
+                                    carrick_hal::threaded::El1FrameGrantRollback {
+                                        mm_key: service.mm_key,
+                                        semantic_base: service.semantic_base,
+                                        len: service.len,
+                                        ready,
+                                    },
+                                ).unwrap_or_else(|error| carrick_fatal::carrick_fatal!(
+                                    "hvpatch::physical_grant",
+                                    "host descriptor cannot complete physical grant: {error}"
+                                ));
+                                Ok::<bool, TrapError>(true)
+                            }
                             El1FrameGrantPublished::Unsupported
                             | El1FrameGrantPublished::Refused(_) => Ok(false),
-                            // Guest-owned lane: EL1 publishes. The mailbox
-                            // slot is released now; residency is committed
-                            // only when the verified receipt settles, and a
-                            // fault in the span retries until then.
+                            // Keep the physical producer inside this bounded
+                            // mutation scope. EL1's descriptor service and
+                            // exact settlement finish before this executor
+                            // can return to a job-control or ptrace stop.
                             El1FrameGrantPublished::Submit(txn) => {
-                                let pending = PendingGuestGrant {
-                                    txn,
-                                    fault_va: address,
-                                    plan: plan_shape,
-                                    residency: residency_identity,
-                                };
-                                let submitted = match (
-                                    carrick_el1_abi::descriptor_txn_slots_host(),
-                                    engine.mailbox_slot(),
+                                let slots = carrick_el1_abi::descriptor_txn_slots_host()
+                                    .unwrap_or_else(|| carrick_fatal::carrick_fatal!(
+                                        "hvpatch::physical_grant",
+                                        "prepared frame grant has no descriptor slots"
+                                    ));
+                                let verified = match apply_guest_descriptor_txns_now(
+                                    &mut EngineDrainVenue(&mut *engine), slots, &[txn],
                                 ) {
-                                    (Some(slots), Some(slot)) => {
-                                        GUEST_GRANT_LEDGER.submit(slots, slot, pending)
+                                    Ok(mut receipts) => receipts.pop().unwrap_or_else(|| {
+                                        carrick_fatal::carrick_fatal!(
+                                            "hvpatch::physical_grant",
+                                            "descriptor service returned no frame grant receipt"
+                                        )
+                                    }),
+                                    Err(carrick_aarch64::descriptor_drain::GuestPublishError::NotApplied { .. }) => {
+                                        return Ok(false);
                                     }
-                                    _ => false,
+                                    Err(carrick_aarch64::descriptor_drain::GuestPublishError::Unsettled(error)) => {
+                                        carrick_fatal::carrick_fatal!(
+                                            "hvpatch::physical_grant",
+                                            "frame grant descriptor outcome is unsettled: {error}"
+                                        );
+                                    }
                                 };
-                                if submitted {
-                                    deferred_to_guest.set(true);
-                                    Ok(true)
-                                } else {
-                                    engine.abandon_el1_descriptor_txn(&txn)?;
-                                    Ok(false)
-                                }
+                                engine.complete_el1_frame_grant(
+                                    carrick_hal::threaded::El1FrameGrantRollback {
+                                        mm_key: service.mm_key,
+                                        semantic_base: service.semantic_base,
+                                        len: service.len,
+                                        ready,
+                                    },
+                                ).unwrap_or_else(|error| carrick_fatal::carrick_fatal!(
+                                    "hvpatch::physical_grant",
+                                    "applied descriptor cannot complete physical grant: {error}"
+                                ));
+                                let permit = mutation.host_alias_permit();
+                                let protection = carrick_abi::LinuxProtFlags::from_bits_truncate(service.permissions);
+                                let settled_plan = dispatcher.published_frame_grant_plan(
+                                    &permit, residency_identity, protection, &verified,
+                                ).unwrap_or_else(|refusal| carrick_fatal::carrick_fatal!(
+                                    "hvpatch::physical_grant",
+                                    "applied descriptor cannot settle faulting page at 0x{address:x}: {refusal:?}"
+                                ));
+                                dispatcher.commit_published_frame_grant(settled_plan, residency_identity);
+                                committed_by_guest.set(true);
+                                Ok(true)
                             }
                         }
                     },
                     || {
-                        if deferred_to_guest.get() {
-                            // Committed by `settle_guest_frame_grants`.
+                        if committed_by_guest.get() {
+                            // Committed after synchronous descriptor settlement.
                             return;
                         }
                         // A full journal is safe: prepared leaves still use
@@ -1563,18 +1602,26 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         // after stage-1, stage-2 and inventory are live.
                         dispatcher.commit_published_frame_grant(plan, residency_identity);
                     },
-                )?;
+                ).unwrap_or_else(|error| carrick_fatal::carrick_fatal!(
+                    "hvpatch::physical_grant",
+                    "frame grant mailbox could not complete publication: {error}"
+                ));
                 if !completed {
                     // Nothing exposed the prepared backing: undo exactly what
                     // `prepare_el1_frame_grant` published before refusing.
-                    EngineGrantBackend(&mut *engine).roll_back(
-                        carrick_hal::threaded::El1FrameGrantRollback {
+                    EngineGrantBackend(&mut *engine)
+                        .roll_back(carrick_hal::threaded::El1FrameGrantRollback {
                             mm_key: service.mm_key,
                             semantic_base: service.semantic_base,
                             len: service.len,
                             ready,
-                        },
-                    )?;
+                        })
+                        .unwrap_or_else(|error| {
+                            carrick_fatal::carrick_fatal!(
+                                "hvpatch::physical_grant",
+                                "refused frame grant cannot roll back backing: {error}"
+                            )
+                        });
                     publish_frame_grant_refusal(
                         mailbox,
                         request,
@@ -4717,6 +4764,17 @@ mod guest_descriptor_lane_tests {
         assert!(
             !fault.contains("GUEST_GRANT_LEDGER.submit("),
             "a stopped fault executor cannot retain physical readiness in the ledger"
+        );
+        let backing = include_str!("../../../carrick-vmm-hvf/src/trap/cow_engine.rs");
+        assert!(backing.contains("completion: published.completion,"));
+        assert!(!backing.contains("published.completion.clone()"));
+        assert!(
+            fault
+                .split("El1FrameGrantPublished::OnHost =>")
+                .nth(1)
+                .and_then(|tail| tail.split("El1FrameGrantPublished::Unsupported").next())
+                .is_some_and(|host| host.contains("complete_el1_frame_grant(")),
+            "host-owned leaves must settle before releasing physical readiness"
         );
     }
 }
