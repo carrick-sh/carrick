@@ -38,22 +38,16 @@ pub(super) enum OwnerMemoryAction {
 }
 
 enum ZoneWaitPolicy {
-    Ordinary(Option<std::time::Duration>),
+    Ordinary {
+        timeout: Option<std::time::Duration>,
+        restart: carrick_kernel::kernel::continuation::RestartClass,
+    },
 }
 
 impl ZoneWaitPolicy {
-    fn for_owner_resume(resume: &OwnedSyscallResume) -> Self {
-        let _ = resume;
-        Self::Ordinary(None)
-    }
-
-    fn restart_class(
-        &self,
-        resume: &OwnedSyscallResume,
-        request: SyscallRequest,
-    ) -> carrick_kernel::kernel::continuation::RestartClass {
+    fn for_owner_resume(resume: &OwnedSyscallResume, request: SyscallRequest) -> Self {
         use carrick_kernel::kernel::continuation::RestartClass;
-        match resume {
+        let restart = match resume {
             OwnedSyscallResume::PreparedCopyout(
                 carrick_kernel::dispatch::PreparedCopyoutRestart::NoIntr,
             ) => RestartClass::RestartNoIntr,
@@ -63,6 +57,10 @@ impl ZoneWaitPolicy {
             OwnedSyscallResume::Redispatch | OwnedSyscallResume::PreparedWrite(_) => {
                 RestartClass::for_syscall(request.number.raw())
             }
+        };
+        Self::Ordinary {
+            timeout: None,
+            restart,
         }
     }
 }
@@ -72,9 +70,13 @@ pub(super) fn owner_zone_continuation_for_resume(
     capture: carrick_kernel::kernel::continuation::ContinuationCapture,
     wait: carrick_kernel::kernel::continuation::ZoneWait,
 ) -> carrick_kernel::kernel::continuation::BlockedContinuation {
-    let policy = ZoneWaitPolicy::for_owner_resume(resume);
+    let _ = resume;
+    let policy = ZoneWaitPolicy::Ordinary {
+        timeout: None,
+        restart: carrick_kernel::kernel::continuation::RestartClass::Never,
+    };
     match policy {
-        ZoneWaitPolicy::Ordinary(timeout) => {
+        ZoneWaitPolicy::Ordinary { timeout, .. } => {
             carrick_kernel::kernel::continuation::BlockedContinuation::from_zone_park(
                 capture, wait, timeout,
             )
@@ -101,23 +103,25 @@ mod owner_copyout_policy_tests {
         );
         for resume in [&nointr, &sys, &ordinary] {
             assert!(matches!(
-                ZoneWaitPolicy::for_owner_resume(resume),
-                ZoneWaitPolicy::Ordinary(None)
+                ZoneWaitPolicy::for_owner_resume(resume, request),
+                ZoneWaitPolicy::Ordinary { timeout: None, .. }
             ));
         }
-        let policy = ZoneWaitPolicy::Ordinary(None);
+        let restart = |resume| match ZoneWaitPolicy::for_owner_resume(resume, request) {
+            ZoneWaitPolicy::Ordinary { restart, .. } => restart,
+        };
         assert_eq!(
-            policy.restart_class(&nointr, request),
+            restart(&nointr),
             carrick_kernel::kernel::continuation::RestartClass::RestartNoIntr
         );
         assert_eq!(
-            policy.restart_class(&sys, request),
+            restart(&sys),
             carrick_kernel::kernel::continuation::RestartClass::RestartSyscall
         );
         assert_eq!(
-            policy.restart_class(&ordinary, request),
+            restart(&ordinary),
             carrick_kernel::kernel::continuation::RestartClass::RestartSyscall,
-            "an unprepared host pipe read keeps main's ordinary restart class",
+            "an unprepared host pipe read keeps main's ordinary restart class"
         );
     }
 }
@@ -503,9 +507,11 @@ where
             state,
             own,
             seq,
-            ZoneWaitPolicy::Ordinary(timeout),
+            ZoneWaitPolicy::Ordinary {
+                timeout,
+                restart: carrick_kernel::kernel::continuation::RestartClass::Never,
+            },
             request,
-            carrick_kernel::kernel::continuation::RestartClass::Never,
         )?;
         Ok(Some(exit))
     }
@@ -585,7 +591,6 @@ where
         seq: u32,
         policy: ZoneWaitPolicy,
         request: SyscallRequest,
-        restart: carrick_kernel::kernel::continuation::RestartClass,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let context = self
             .kernel
@@ -595,13 +600,16 @@ where
                 RuntimeError::Configuration(format!("EL1 zone settle lost Kernel context: {error}"))
             })?;
         let lease = control.execution_lease_mut().map_err(RuntimeError::Trap)?;
+        let restart = match policy {
+            ZoneWaitPolicy::Ordinary { restart, .. } => restart,
+        };
         let capture = carrick_kernel::kernel::continuation::ContinuationCapture::from_lease(
             &context, lease, request, restart,
         )
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let wait = carrick_kernel::kernel::continuation::ZoneWait::new(record, seq);
         let continuation = match policy {
-            ZoneWaitPolicy::Ordinary(timeout) => {
+            ZoneWaitPolicy::Ordinary { timeout, .. } => {
                 carrick_kernel::kernel::continuation::BlockedContinuation::from_zone_park(
                     capture, wait, timeout,
                 )
@@ -726,9 +734,11 @@ where
             state,
             record,
             seq,
-            ZoneWaitPolicy::Ordinary(timeout),
+            ZoneWaitPolicy::Ordinary {
+                timeout,
+                restart: carrick_kernel::kernel::continuation::RestartClass::Never,
+            },
             request,
-            carrick_kernel::kernel::continuation::RestartClass::Never,
         )
     }
 
@@ -843,8 +853,7 @@ where
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match (action, syscall_state) {
                     (OwnerMemoryAction::Syscall { frame, resume }, Some((state, _, request))) => {
-                        let policy = ZoneWaitPolicy::for_owner_resume(&resume);
-                        let restart = policy.restart_class(&resume, request);
+                        let policy = ZoneWaitPolicy::for_owner_resume(&resume, request);
                         let exit = self.settle_into_zone(
                             control,
                             state,
@@ -852,7 +861,6 @@ where
                             seq,
                             policy,
                             request,
-                            restart,
                         )?;
                         self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame, resume };
                         Ok(exit)
@@ -1431,9 +1439,11 @@ where
                     state,
                     record,
                     seq,
-                    ZoneWaitPolicy::Ordinary(None),
+                    ZoneWaitPolicy::Ordinary {
+                        timeout: None,
+                        restart: carrick_kernel::kernel::continuation::RestartClass::Never,
+                    },
                     request,
-                    carrick_kernel::kernel::continuation::RestartClass::Never,
                 )
                 .map(IpcParkAttempt::Parked)
             }
