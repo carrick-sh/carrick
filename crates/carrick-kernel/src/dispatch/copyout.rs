@@ -197,8 +197,8 @@ pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
 ) -> Result<PreparedCopyout<'_, M, N>, CopyoutRefusal> {
     let slots = slots.map(|slot| slot.filter(|slot| slot.capacity > 0));
     // The legacy venue has no permit and prepares nothing: a guest-sized
-    // output (a getdents64 batch under a huge `count`) commits exactly as
-    // the direct write it replaces and never meets the owner bound below.
+    // output commits exactly as the direct write it replaces and never meets
+    // the owner bound below.
     if memory.user_memory_venue() == UserMemoryVenue::Legacy {
         return Ok(PreparedCopyout {
             slots,
