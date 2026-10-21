@@ -158,6 +158,23 @@ fn foreground(case: &str) {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+    let account = Command::new("/usr/bin/id")
+        .args(["-u", "carrick-dispatch-agent"])
+        .output()
+        .unwrap();
+    if account.status.code() == Some(1) {
+        eprintln!("UNRUN: pre-created carrick-dispatch-agent account absent");
+        return;
+    }
+    assert!(account.status.success());
+    assert!(
+        !Command::new("/usr/bin/sudo")
+            .args(["-n", "-u", "root", "--", "/usr/bin/true"])
+            .status()
+            .unwrap()
+            .success(),
+        "runner can become root"
+    );
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("checkout");
     let state = temp.path().join("carrick-agent-42-1");
@@ -264,7 +281,7 @@ facts = dict(uid=os.getuid() != runner_uid, user=pwd.getpwuid(os.getuid()).pw_na
     auth=(pathlib.Path(os.environ['HOME']) / '.codex/auth.json').read_text() == 'selected-provider-refresh',
     shell=pwd.getpwuid(os.getuid()).pw_shell == '/usr/sbin/nologin',
     groups=runner_gid != os.getgid() and runner_gid not in os.getgroups(),
-    sudo=subprocess.run(['/usr/bin/sudo', '-n', '/usr/bin/true'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0)
+    sudo=subprocess.run(['/usr/bin/sudo', '-n', '-l', '-U', 'carrick-dispatch-agent'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0)
 print('BOUNDARY ' + json.dumps(facts), flush=True)
 if fixture_case == 'retirement':
     child = subprocess.Popen(['/usr/bin/setsid', '/bin/sleep', '120'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -386,7 +403,15 @@ fi
         if alive {
             assert!(
                 Command::new("/usr/bin/sudo")
-                    .args(["-n", "/bin/kill", "-KILL", &pid.to_string()])
+                    .args([
+                        "-n",
+                        "-u",
+                        "carrick-dispatch-agent",
+                        "--",
+                        "/bin/kill",
+                        "-KILL",
+                        &pid.to_string()
+                    ])
                     .status()
                     .unwrap()
                     .success()

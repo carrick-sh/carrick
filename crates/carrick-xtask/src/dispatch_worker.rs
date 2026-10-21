@@ -291,7 +291,10 @@ fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Res
                 stop_agent_processes();
                 // A sudo monitor can stop on the agent's job-control notification.
                 // Kill the unreaped child's dedicated group with runner privilege.
-                let _ = sudo(&["/usr/bin/kill", "-KILL", "--", &format!("-{pgid}")]);
+                // SAFETY: the unreaped foreground child owns this dedicated group.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 loop {
                     if child.try_wait()?.is_some() {
@@ -413,6 +416,7 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
             isolated.arg(assignment);
         }
     }
+    hand_over(&state)?;
     isolated
         .arg(command.get_program())
         .args(command.get_args())
@@ -420,7 +424,6 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(state.join("agent.out"))?)
         .stderr(std::fs::File::create(state.join("agent.err"))?);
-    hand_over(&state)?;
     let outcome = wait_agent(&mut isolated, crate::agent_runner::job_remaining(32)?);
     retire_agent()?;
     let code = outcome?;
@@ -525,35 +528,59 @@ fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
         .map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
 }
 fn sudo(args: &[&str]) -> Result<(), ScalerError> {
-    output(Command::new("/usr/bin/sudo").arg("-n").args(args))?;
+    let mut command = Command::new("/usr/bin/sudo");
+    private_environment(&mut command);
+    output(command.args(["-n", "-u", AGENT_USER, "--"]).args(args))?;
     Ok(())
 }
 fn hand_over(path: &Path) -> Result<(), ScalerError> {
+    let parent = path
+        .parent()
+        .ok_or(ScalerError::Guard("agent staging parent"))?;
+    for directory in [parent, path] {
+        output(
+            Command::new("/usr/bin/chgrp")
+                .args(["-hR", AGENT_USER])
+                .arg(directory),
+        )?;
+        output(
+            Command::new("/usr/bin/chmod")
+                .args(["-R", "ug+rwX,o-rwx"])
+                .arg(directory),
+        )?;
+    }
+    let owned = parent.join("owned");
     sudo(&[
-        "/usr/bin/chown",
-        "-hR",
-        AGENT_USER,
+        "/usr/bin/cp",
+        "-a",
+        "--no-preserve=ownership",
+        "--",
         path.to_str().ok_or(ScalerError::Guard("agent path"))?,
-    ])
+        owned
+            .to_str()
+            .ok_or(ScalerError::Guard("agent staging path"))?,
+    ])?;
+    let old = parent.join("runner-staging");
+    std::fs::rename(path, &old)?;
+    std::fs::rename(owned, path)?;
+    std::fs::remove_dir_all(old)?;
+    Ok(())
 }
 fn stop_agent_processes() {
-    // Include real and effective UIDs (setuid tools), regardless of sessions.
-    for selector in ["-u", "-U"] {
-        let _ = sudo(&["/usr/bin/pkill", "-STOP", selector, AGENT_USER]);
-        let _ = sudo(&["/usr/bin/pkill", "-KILL", selector, AGENT_USER]);
-    }
+    // Linux kill(-1) reaches all other processes of this uid, across sessions.
+    // No root-capable sudo is needed, including for detached double forks.
+    let _ = sudo(&["/bin/kill", "-STOP", "-1"]);
+    let _ = sudo(&["/bin/kill", "-KILL", "-1"]);
 }
 fn retire_agent() -> Result<(), ScalerError> {
-    stop_agent_processes();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        // SAFETY: the driver is a subreaper and has already waited for its
-        // foreground child. Reap only completed adopted children.
+    for _ in 0..100 {
+        stop_agent_processes();
+        // SAFETY: only completed children adopted by this subreaper are reaped.
         while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
         let mut empty = true;
         for selector in ["-u", "-U"] {
-            let status = Command::new("/usr/bin/sudo")
-                .args(["-n", "/usr/bin/pgrep", selector, AGENT_USER])
+            let status = Command::new("/usr/bin/pgrep")
+                .args([selector, AGENT_USER])
                 .output()?;
             match status.status.code() {
                 Some(1) if status.stdout.is_empty() && status.stderr.is_empty() => {}
@@ -564,13 +591,11 @@ fn retire_agent() -> Result<(), ScalerError> {
         if empty {
             return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
-            return Err(ScalerError::Guard(
-                "agent user still has processes; packaging refused",
-            ));
-        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    Err(ScalerError::Guard(
+        "agent user still has processes; packaging refused",
+    ))
 }
 pub(crate) fn cleanup_agent_user() -> Result<(), ScalerError> {
     let status = Command::new("/usr/bin/id")
@@ -581,14 +606,14 @@ pub(crate) fn cleanup_agent_user() -> Result<(), ScalerError> {
             .trim()
             .parse::<libc::uid_t>()
             .map_err(|_| ScalerError::Guard("invalid agent account identity"))?;
-        // Auth fixtures also run inside the worker. Only its separate runner
-        // retires the account; a worker may clean its own credential state.
+        // Nested auth fixtures may clean their files, never their own uid.
         // SAFETY: geteuid has no preconditions.
-        if uid == unsafe { libc::geteuid() } {
-            return Ok(());
+        if uid == 0 {
+            return Err(ScalerError::Guard("agent account must not be root"));
         }
-        retire_agent()?;
-        sudo(&["/usr/sbin/userdel", AGENT_USER])?;
+        if uid != unsafe { libc::geteuid() } {
+            retire_agent()?;
+        }
     } else if status.status.code() != Some(1) {
         return Err(ScalerError::Guard("cannot verify agent account cleanup"));
     }
@@ -762,6 +787,12 @@ fn copy_tree(
     Ok(())
 }
 fn snapshot(source: &Path, target: &Path, branch: &str) -> Result<(), ScalerError> {
+    if !std::fs::symlink_metadata(source)?.is_dir()
+        || !std::fs::symlink_metadata(source.parent().ok_or(ScalerError::Guard("agent root"))?)?
+            .is_dir()
+    {
+        return Err(ScalerError::Guard("agent worktree redirected"));
+    }
     let dotgit = source.join(".git");
     if !std::fs::symlink_metadata(&dotgit)?.is_dir() {
         return Err(ScalerError::Guard("agent git directory redirected"));
@@ -860,16 +891,27 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        let identity = output(Command::new("/usr/bin/id").args(["-u", AGENT_USER]))?;
+        let uid = String::from_utf8_lossy(&identity)
+            .trim()
+            .parse::<libc::uid_t>()
+            .map_err(|_| ScalerError::Guard("invalid pre-created agent uid"))?;
+        // SAFETY: geteuid has no preconditions.
+        if uid == 0 || uid == unsafe { libc::geteuid() } {
+            return Err(ScalerError::Guard(
+                "agent uid must be separate and unprivileged",
+            ));
+        }
         cleanup_agent_user()?;
-        sudo(&[
-            "/usr/sbin/useradd",
-            "--system",
-            "--user-group",
-            "--no-create-home",
-            "--shell",
-            "/usr/sbin/nologin",
-            AGENT_USER,
-        ])?;
+        if !Command::new("/usr/bin/id")
+            .args(["-u", AGENT_USER])
+            .status()?
+            .success()
+        {
+            return Err(ScalerError::Guard(
+                "hardened agent template account is absent",
+            ));
+        }
         let outer = tempfile::Builder::new()
             .prefix("carrick-dispatch-")
             .tempdir_in("/var/tmp")?;
@@ -932,18 +974,20 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         let result = agent(&actor_work, dispatch);
         // This is mandatory even on launcher failure, before scanning or hand-back.
         cleanup_agent_user()?;
-        sudo(&[
-            "/usr/bin/chmod",
-            "700",
-            actor.to_str().ok_or(ScalerError::Guard("agent state"))?,
-        ])?;
-        // SAFETY: geteuid has no preconditions.
-        sudo(&[
-            "/usr/bin/chown",
-            "-hR",
-            &unsafe { libc::geteuid() }.to_string(),
-            actor.to_str().ok_or(ScalerError::Guard("agent state"))?,
-        ])?;
+        // Read agent files only as data after verified uid retirement. The
+        // pre-created private group lets runner read without becoming root.
+        for program in ["/usr/bin/chgrp", "/usr/bin/chmod"] {
+            let arguments = if program.ends_with("chgrp") {
+                vec!["-hR", AGENT_USER]
+            } else {
+                vec!["-R", "ug+rwX,o-rwx"]
+            };
+            let mut args = arguments;
+            args.push(actor.to_str().ok_or(ScalerError::Guard("agent state"))?);
+            let mut command = vec![program];
+            command.extend(args);
+            sudo(&command)?;
+        }
         code = result?;
         snapshot(&actor_work, &work, &dispatch.branch)?;
         contract = read_contract(&actor.join("result.json")).unwrap_or(Contract {
@@ -1267,17 +1311,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[ignore = "runner-only OS account witness; run with --include-ignored"]
     fn serial_host_timeout_retires_detached_and_signal_resistant_agent() {
+        let account = Command::new("/usr/bin/id")
+            .args(["-u", AGENT_USER])
+            .output()
+            .unwrap();
+        if account.status.code() == Some(1) {
+            eprintln!("UNRUN: pre-created carrick-dispatch-agent account absent");
+            return;
+        }
+        assert!(account.status.success());
         cleanup_agent_user().unwrap();
-        sudo(&[
-            "/usr/sbin/useradd",
-            "--system",
-            "--user-group",
-            "--no-create-home",
-            "--shell",
-            "/usr/sbin/nologin",
-            AGENT_USER,
-        ])
-        .unwrap();
         // SAFETY: this serial runner-only fixture owns its foreground/adopted children.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
         let temp = tempfile::tempdir().unwrap();
@@ -1335,7 +1378,6 @@ mod tests {
         let target = temp.path().join("snapshot");
         let marker = temp.path().join("runner-executed-agent-code");
         std::fs::create_dir(&actor).unwrap();
-        std::fs::create_dir(&target).unwrap();
         git(&actor, &["init"]).unwrap();
         git(&actor, &["checkout", "-b", "work/dispatch-42"]).unwrap();
         std::fs::write(actor.join("data"), "base").unwrap();
