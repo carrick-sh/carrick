@@ -1117,3 +1117,16 @@ pub trait AnonymousDescriptorDecode {
     fn next_table(descriptor: u64, level: usize) -> Option<FrameGpa>;
     fn private_state(descriptor: u64) -> El1PrivateLeafState;
 }
+
+#[cfg(test)]
+mod sgi_encoding_tests {
+    #[test]
+    fn architectural_sgi_target_encodes_every_affinity_level() {
+        assert_eq!(crate::sgi_target_of(0), 1);
+        assert_eq!(
+            crate::sgi_target_of(0x12_0034_5678),
+            (1 << 8) | (7 << 44) | (0x56 << 16) | (0x34 << 32) | (0x12 << 48)
+        );
+        assert_eq!(crate::sgi_target_of(0xff), (1 << 15) | (15 << 44));
+    }
+}
