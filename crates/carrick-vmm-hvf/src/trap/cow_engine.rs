@@ -299,16 +299,16 @@ fn is_exactly_el1_frame_grant(
     )
 }
 
-/// One guest-lane EL1 frame grant, fresh or replacing a private predecessor,
-/// between its preparation and the settlement of EL1's receipt for it.
+/// One EL1 frame grant, fresh or replacing a private predecessor, between
+/// physical preparation and descriptor settlement in the same holder scope.
 ///
 /// The grant's backing, inventory mapping and stage-2 owner are published at
 /// preparation (the descriptor transaction must name them), but the old owner
-/// may be retired only after EL1's verified completion. Its alias therefore
-/// stays unregistered until then: the process alias registry holds exactly
+/// may be retired only after EL1's verified completion. On the guest lane its
+/// alias therefore stays unregistered until then: the registry holds exactly
 /// one owner per span, and retiring the predecessor by span must not take the
 /// replacement with it.
-#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub(crate) struct PendingEl1GrantPublication {
     pub(crate) completion: global_frame::PhysicalGrantCompletion,
     /// The exact grant, as settlement names it to completion or rollback.
@@ -320,9 +320,9 @@ pub(crate) struct PendingEl1GrantPublication {
     pub(crate) alias: AliasBacking,
 }
 
-/// MM-owned ledger of [`PendingEl1GrantPublication`]s. Settlement may run on
-/// any vCPU bound to the MM, so this lives in the MM's access state, not in
-/// an engine. A leaf lock: never held while taking another.
+/// MM-owned ledger of [`PendingEl1GrantPublication`]s. The sole producer is
+/// inserted during preparation and removed by completion or rollback before
+/// the holder returns. A leaf lock: never held while taking another.
 #[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct PendingEl1GrantPublications {
     entries: Vec<PendingEl1GrantPublication>,
@@ -1592,25 +1592,26 @@ impl HvfVmState {
         if predecessor_leases.is_none() {
             register_shared_alias(published.alias);
         }
-        if guest_lane {
-            let pending = PendingEl1GrantPublication {
-                completion: published.completion.clone(),
-                grant: carrick_hal::threaded::El1FrameGrantRollback {
-                    mm_key: request.mm_key,
-                    semantic_base: request.semantic_base,
-                    len: request.len,
-                    ready: published.ready,
-                },
-                predecessor_leases: predecessor_leases.unwrap_or_default(),
-                alias: published.alias,
-            };
-            let recorded = self.el1_grant_publications.lock().insert(pending);
-            if !recorded {
-                carrick_fatal!(
-                    "hvpatch::physical_grant",
-                    "publication escaped prior overlap check"
-                );
-            }
+        // Both descriptor lanes retain the sole readiness producer until the
+        // caller has stored and settled the leaf. The host lane used to drop
+        // it here, before `publish_el1_frame_grant` stored its descriptor.
+        let pending = PendingEl1GrantPublication {
+            completion: published.completion,
+            grant: carrick_hal::threaded::El1FrameGrantRollback {
+                mm_key: request.mm_key,
+                semantic_base: request.semantic_base,
+                len: request.len,
+                ready: published.ready,
+            },
+            predecessor_leases: predecessor_leases.unwrap_or_default(),
+            alias: published.alias,
+        };
+        let recorded = self.el1_grant_publications.lock().insert(pending);
+        if !recorded {
+            carrick_fatal!(
+                "hvpatch::physical_grant",
+                "publication escaped prior overlap check"
+            );
         }
         drop(registry);
         let physical_grant = (

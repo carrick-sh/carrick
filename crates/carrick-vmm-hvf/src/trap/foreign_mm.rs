@@ -400,8 +400,8 @@ pub(crate) struct MmAccessState {
     >,
     pub(crate) mm_root_stage2: parking_lot::Mutex<Option<MmRootStage2Authority>>,
     pub(crate) mutation_coordinator: parking_lot::Mutex<()>,
-    /// Guest-lane EL1 frame grants that replace a predecessor, awaiting the
-    /// settlement of EL1's receipt (see `PendingEl1GrantPublication`).
+    /// First-touch producers held only through synchronous descriptor
+    /// publication and completion (see `PendingEl1GrantPublication`).
     pub(crate) el1_grant_publications: parking_lot::Mutex<PendingEl1GrantPublications>,
     pub(crate) cow_runtime: parking_lot::RwLock<Option<MmCowRuntimeBinding>>,
     pub(crate) cow_rollback_scratch:

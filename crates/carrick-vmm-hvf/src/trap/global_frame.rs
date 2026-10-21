@@ -1221,7 +1221,7 @@ impl Drop for PhysicalGrantProducer {
 }
 /// Last producer release signals completion. Keep it beyond rollback and all
 /// inventory/alias guards; callbacks may reenter physical preparation.
-#[derive(::core::clone::Clone, ::core::fmt::Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct PhysicalGrantCompletion(std::sync::Arc<PhysicalGrantProducer>);
 impl PhysicalGrantCompletion {
     pub(crate) fn new() -> Self {
