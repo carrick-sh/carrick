@@ -4751,6 +4751,7 @@ mod kernel_process_dispatch_tests {
     const LINUX_WNOHANG: u64 = 1;
     const LINUX_WSTOPPED: u64 = 2;
     const LINUX_WEXITED: u64 = 4;
+    const LINUX_WCONTINUED: u64 = 8;
     const LINUX_WNOWAIT: u64 = 0x0100_0000;
     const LOCAL_IOV: u64 = 0x1800;
     const REMOTE_IOV: u64 = 0x1810;
@@ -5227,6 +5228,158 @@ mod kernel_process_dispatch_tests {
                 assert_eq!(signo, 17, "SIGCHLD siginfo");
             }
         }
+    }
+
+    #[test]
+    fn wait4_state_changes_survive_owner_refusal() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        const STATUS: u64 = INFO_ADDR;
+
+        for (case, continued) in [(61_420, false), (61_430, true)] {
+            let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(case);
+            let child = fork_child(&root, case + 1);
+            let child_id = child.task().key().id;
+            let stop = crate::kernel::LinuxSignal::for_signal_number(LINUX_SIGSTOP).unwrap();
+            assert!(
+                root.kernel()
+                    .stop_task_for_job_control(child_id, stop, None)
+            );
+            let mut root = refreshed(&root);
+            if continued {
+                let mut scratch = LinearMemory::new(INFO_ADDR, vec![0; 0x100]);
+                assert_eq!(
+                    dispatch_with_lease(
+                        &mut dispatcher,
+                        &root,
+                        &mut scratch,
+                        SYS_WAIT4,
+                        [child_id.raw() as u64, STATUS, LINUX_WSTOPPED, 0, 0, 0,],
+                        Some(&lease),
+                    ),
+                    DispatchOutcome::Returned {
+                        value: i64::from(child_id.raw())
+                    },
+                );
+                let cont =
+                    crate::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGCONT)
+                        .unwrap();
+                assert!(root.kernel().post_signal_to_task(child_id, cont, None));
+                root = refreshed(&root);
+            }
+            let options = if continued {
+                LINUX_WCONTINUED
+            } else {
+                LINUX_WSTOPPED
+            };
+            let mut memory = OwnerRefusingMemory::new(INFO_ADDR, 0x100, 0xa5);
+            let wait = memory.refuse_next();
+            let args = [child_id.raw() as u64, STATUS, options, 0, 0, 0];
+            assert_eq!(
+                dispatcher
+                    .dispatch_with_lease(
+                        &root,
+                        SyscallRequest::new(SYS_WAIT4, SyscallArgs::from(args)),
+                        &mut memory,
+                        &CompatReporter::default(),
+                        Some(&lease),
+                    )
+                    .unwrap(),
+                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            );
+            assert_eq!(memory.read_bytes(STATUS, 4).unwrap(), [0xa5; 4]);
+            assert_eq!(
+                dispatcher
+                    .dispatch_with_lease(
+                        &root,
+                        SyscallRequest::new(SYS_WAIT4, SyscallArgs::from(args)),
+                        &mut memory,
+                        &CompatReporter::default(),
+                        Some(&lease),
+                    )
+                    .unwrap(),
+                DispatchOutcome::Returned {
+                    value: i64::from(child_id.raw())
+                },
+                "the state-change report must remain waitable after refusal",
+            );
+            let status =
+                i32::from_ne_bytes(memory.read_bytes(STATUS, 4).unwrap().try_into().unwrap());
+            assert_eq!(
+                status,
+                if continued {
+                    0xffff
+                } else {
+                    LINUX_SIGSTOP << 8 | 0x7f
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn waitid_nohang_and_null_infop_preserve_owner_refusal() {
+        use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+        const SIGINFO: u64 = INFO_ADDR;
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_440);
+        let child = fork_child(&root, 61_441);
+        let child_id = child.task().key().id;
+        let root = refreshed(&root);
+        let mut memory = OwnerRefusingMemory::new(INFO_ADDR, 0x100, 0xa5);
+        let wait = memory.refuse_next();
+        let null_args = [
+            LINUX_P_PID,
+            child_id.raw() as u64,
+            0,
+            LINUX_WEXITED | LINUX_WNOHANG,
+            0,
+            0,
+        ];
+        assert_eq!(
+            dispatcher
+                .dispatch_with_lease(
+                    &root,
+                    SyscallRequest::new(SYS_WAITID, SyscallArgs::from(null_args)),
+                    &mut memory,
+                    &CompatReporter::default(),
+                    Some(&lease),
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 },
+            "NULL infop has no copyout to refuse",
+        );
+        let info_args = [
+            LINUX_P_PID,
+            child_id.raw() as u64,
+            SIGINFO,
+            LINUX_WEXITED | LINUX_WNOHANG,
+            0,
+            0,
+        ];
+        assert_eq!(
+            dispatcher
+                .dispatch_with_lease(
+                    &root,
+                    SyscallRequest::new(SYS_WAITID, SyscallArgs::from(info_args)),
+                    &mut memory,
+                    &CompatReporter::default(),
+                    Some(&lease),
+                )
+                .unwrap(),
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+        );
+        assert_eq!(memory.read_bytes(SIGINFO, 28).unwrap(), [0xa5; 28]);
+        assert_eq!(
+            dispatcher
+                .dispatch_with_lease(
+                    &root,
+                    SyscallRequest::new(SYS_WAITID, SyscallArgs::from(info_args)),
+                    &mut memory,
+                    &CompatReporter::default(),
+                    Some(&lease),
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 },
+        );
+        assert_eq!(memory.read_bytes(SIGINFO, 28).unwrap(), [0; 28]);
     }
 
     #[test]
