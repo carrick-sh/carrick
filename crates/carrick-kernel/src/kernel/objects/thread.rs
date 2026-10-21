@@ -3101,12 +3101,9 @@ impl Thread {
         affinity: CpuAffinity,
     ) -> super::ThreadControlLease {
         let slot = task.allocate_thread_control(key);
-        slot.set_affinity(carrick_core::affinity::CpuAffinity::from_words(
+        slot.initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(
             affinity.words(),
-        ))
-        .unwrap_or_else(|_| {
-            carrick_fatal!("thread::control", "new control has live affinity residency")
-        });
+        ));
         slot.init_blocked(BlockedMask(seed.blocked().raw()));
         slot.write_altstack(altstack_to_slot(seed.altstack()));
         slot
@@ -3246,24 +3243,24 @@ impl Thread {
         caller_affinity: CpuAffinity,
     ) -> ThreadRef {
         let (_, key) = control.identity();
-        if !task.owns_thread_control(&control) {
-            carrick_fatal!("thread::control", "adoption crossed control owner");
-        }
-        if control.entry().is_some() {
-            control.initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(
-                caller_affinity.words(),
-            ));
-        } else {
-            control
-                .set_affinity(carrick_core::affinity::CpuAffinity::from_words(
+        let prepared = task.owns_thread_control(&control)
+            && if control.entry().is_some() {
+                control.initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(
                     caller_affinity.words(),
-                ))
-                .unwrap_or_else(|_| {
-                    carrick_fatal!(
-                        "thread::control",
-                        "clone control has live affinity residency"
-                    )
-                });
+                ));
+                true
+            } else {
+                control
+                    .set_affinity(carrick_core::affinity::CpuAffinity::from_words(
+                        caller_affinity.words(),
+                    ))
+                    .is_ok()
+            };
+        if !prepared {
+            carrick_fatal!(
+                "thread::control",
+                "adoption crossed control owner or live affinity residency"
+            );
         }
         Arc::new(Thread {
             key,
