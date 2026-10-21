@@ -4413,6 +4413,28 @@ where
                     wait,
                     _subscription,
                 } => {
+                    let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                        RuntimeError::Configuration("physical owner resume lost context".to_owned())
+                    })?;
+                    if let Some(reserved) =
+                        carrick_kernel::kernel::continuation::reserve_killable_wait_signal(context)
+                    {
+                        if let Some(outcome) = service_signals_threaded(
+                            &self.kernel,
+                            context,
+                            engine,
+                            self.state.this_tid,
+                            self.state.fatal_image_generation,
+                            None,
+                            None,
+                            None,
+                            Some(reserved),
+                            self.traps,
+                        )? {
+                            drop(_subscription);
+                            return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                        }
+                    }
                     if !wait.0.is_ready() {
                         self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
                             frame,
