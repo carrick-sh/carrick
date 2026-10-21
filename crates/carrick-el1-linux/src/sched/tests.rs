@@ -2084,11 +2084,19 @@ fn switched_admission_rechecks_affinity_before_loading_its_frame() {
     let mut frame = TrapFrame::default();
     frame.x[0] = 703;
     let mut scheduler = Sched {
-        zone: &zone, slot: SLOT, task: &task, cpu: &mut cpu,
-        user: &HardwareUserWord, counters: counters(), handoff: None,
+        zone: &zone,
+        slot: SLOT,
+        task: &task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters: counters(),
+        handoff: None,
     };
     assert_eq!(scheduler.run_ready(&mut frame), Some(Served::Idle));
     assert_eq!(frame.x[0], 703);
     assert_eq!(zone.slot(SLOT).current(), None);
-    assert_eq!(zone.record(record).claim(), carrick_sched_core::Claim::Queued { slot: SLOT, seq: 1 });
+    assert_eq!(
+        zone.record(record).claim(),
+        carrick_sched_core::Claim::Queued { slot: SLOT, seq: 1 }
+    );
 }

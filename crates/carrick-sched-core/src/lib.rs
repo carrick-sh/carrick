@@ -3554,8 +3554,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// the running claim, or admission sees the new mask before loading it.
     pub fn affinity_change_effects(&self, reference: RecordRef, effects: &mut WakeEffects) {
         core::sync::atomic::fence(Ordering::SeqCst);
-        let Some(record) = self.live(reference) else { return };
-        let (Claim::OnCpu { slot, .. } | Claim::OnCpuRequested { slot, .. }) = record.claim() else {
+        let Some(record) = self.live(reference) else {
+            return;
+        };
+        let (Claim::OnCpu { slot, .. } | Claim::OnCpuRequested { slot, .. }) = record.claim()
+        else {
             return;
         };
         if !record.allows_cpu(self.slot(slot).cpu.load(Ordering::Acquire))
