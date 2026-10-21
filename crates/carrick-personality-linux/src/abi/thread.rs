@@ -3215,3 +3215,26 @@ mod layout_manifest {
         );
     }
 }
+
+#[cfg(test)]
+mod affinity_seed_tests {
+    #[test]
+    fn quiescent_affinity_seed_refuses_live_residency_without_panicking() {
+        let slot = super::ThreadControlSlot::new();
+        slot.initialize_affinity(carrick_core::affinity::CpuAffinity::all(2));
+        struct Quiet;
+        impl carrick_core::affinity::AffinityNotifier for Quiet {
+            fn notify(&mut self, _: carrick_core::affinity::AffinityNotification) {}
+        }
+        let token = slot.affinity_authority().bind(0, &mut Quiet).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            slot.set_affinity(carrick_core::affinity::CpuAffinity::single(1))
+        }));
+        assert!(
+            result.is_ok(),
+            "live storage misuse must return a typed refusal"
+        );
+        assert_eq!(slot.affinity().words(), &[3]);
+        assert!(slot.affinity_authority().unbind(token));
+    }
+}
