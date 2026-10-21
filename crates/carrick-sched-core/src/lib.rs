@@ -2056,11 +2056,27 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     pub fn release_first_entry_placement(&self, custody: FirstEntryPlacement) -> bool {
-        self.live(custody.record).is_some_and(|rec| {
-            let current = rec.claim();
-            first_entry_transition(current, FirstEntryOperation::Release)
-                .is_some_and(|next| rec.cas(current, next))
-        })
+        let Some(rec) = self.live(custody.record) else {
+            return false;
+        };
+        let seq = custody.seq;
+        // The producer keeps custody if Closing changes the request bit.
+        // That is the only competing transition while it owns Placing, so
+        // these two strong CASes exhaust the finite race without dropping
+        // the token or waiting for the requester to do the producer's work.
+        rec.cas(
+            Claim::Placing {
+                seq,
+                host_requested: false,
+            },
+            Claim::Host { seq },
+        ) || rec.cas(
+            Claim::Placing {
+                seq,
+                host_requested: true,
+            },
+            Claim::Host { seq },
+        )
     }
 
     /// Whether `record`'s affinity allows the guest CPU `slot` is bound to.
