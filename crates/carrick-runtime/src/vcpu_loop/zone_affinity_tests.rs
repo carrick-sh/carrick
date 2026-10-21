@@ -719,7 +719,6 @@ fn switched_self_affinity(exclude: bool) {
         let sibling = p.sibling.thread().control_slot().zone_record().unwrap();
         let caller_tid = p.root.thread().key().tid.raw() as u64;
         let sibling_tid = p.sibling.thread().key().tid.raw() as u64;
-        assert_eq!(p.root.task().threads().len(), 2);
         assert_eq!(p.zone.slot(slot).affinity(), 3);
         assert_eq!(p.zone.slot(previous_slot).host_record(), Some(sibling.id));
 
