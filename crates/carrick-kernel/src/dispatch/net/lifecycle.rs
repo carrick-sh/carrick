@@ -21,6 +21,14 @@ use carrick_vfs::errno::HostSyscallError;
 
 use super::support::*;
 use super::*;
+
+pub struct AcceptedAddressRecord {
+    pub(in crate::dispatch) socket_key: crate::network::SocketKey,
+    pub(in crate::dispatch) guest_local: Option<GuestSocketAddr>,
+    pub(in crate::dispatch) host_local: Option<HostSocketAddr>,
+    pub(in crate::dispatch) guest_peer: Option<GuestSocketAddr>,
+    pub(in crate::dispatch) protocol: carrick_spec::PortProtocol,
+}
 use crate::dispatch::net::{recverr, reuseport, scm_rights};
 use crate::dispatch::{
     CurrentMmMemory, DispatchOutcome, Fd, GuestPtr, HostFd, OpenDescription, SyscallCtx,
@@ -1356,6 +1364,49 @@ impl<'a> NetView<'a> {
             .map(|addr| addr.0)
     }
 
+    pub(in crate::dispatch) fn finish_owned_accept<M: CurrentMmMemory>(
+        &self,
+        open_file: crate::dispatch::fd_table::OpenFile,
+        sockaddr: Option<Vec<u8>>,
+        addr: u64,
+        addrlen: u64,
+        record: Option<AcceptedAddressRecord>,
+        memory: &mut M,
+    ) -> DispatchOutcome {
+        if let Some(bytes) = sockaddr.as_ref() {
+            let out = match prepare_linux_sockaddr(memory, addr, addrlen, bytes.len()) {
+                Ok(out) => out,
+                Err(refusal) => {
+                    return refusal.suspend(crate::dispatch::OwnedCopyoutOperation::Accept {
+                        open_file,
+                        sockaddr,
+                        addr,
+                        addrlen,
+                        record,
+                    });
+                }
+            };
+            if out.commit(bytes).is_err() {
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            }
+        }
+        let linux_fd = match self.install_fd_at_or_above(3, open_file) {
+            Ok(fd) => fd,
+            Err(_) => return DispatchOutcome::errno(linux_errno::EMFILE),
+        };
+        if let Some(record) = record {
+            let _ = self.network.provider.record_socket_addresses(
+                self.network.spec.namespace_id.as_ref(),
+                record.socket_key,
+                record.guest_local,
+                record.host_local,
+                record.guest_peer,
+                record.protocol,
+            );
+        }
+        DispatchOutcome::returned_i32(linux_fd)
+    }
+
     pub(in crate::dispatch) fn accept_common(
         &self,
         fd: Fd,
@@ -1416,38 +1467,19 @@ impl<'a> NetView<'a> {
             }
         };
 
-        // Prepare the peer-address output before dequeuing or accepting a
-        // connection: an owner refusal parks and retries this syscall, which
-        // is only clean while the connection is still queued (#711).
-        let expected_addr_len = match family {
-            LINUX_AF_INET => 16,
-            LINUX_AF_INET6 => 28,
-            LINUX_AF_UNIX => host_fd
-                .and_then(support::peek_pending_unix_client_addr_len)
-                .unwrap_or(2),
-            _ => LINUX_SOCKADDR_STORAGE_SIZE,
-        };
-        let mut addr_out = if addr_addr != 0 && addrlen_addr != 0 {
-            match prepare_linux_sockaddr(memory, addr_addr, addrlen_addr, expected_addr_len) {
-                Ok(out) => Some(out),
-                Err(refusal) => return refusal.into_outcome(),
-            }
-        } else {
-            None
-        };
         if let Some(listener) = &inzone_listener {
             if let Some(server_half) = listener.dequeue() {
-                if let Some(out) = addr_out.take() {
-                    let linux_bytes = server_half
+                let linux_bytes = if addr_addr != 0 && addrlen_addr != 0 {
+                    match server_half
                         .peer_addr()
-                        .and_then(socket_addr_to_linux_sockaddr);
-                    let Some(linux_bytes) = linux_bytes else {
-                        return DispatchOutcome::errno(carrick_abi::LINUX_EFAULT);
-                    };
-                    if out.commit(&linux_bytes).is_err() {
-                        return DispatchOutcome::errno(carrick_abi::LINUX_EFAULT);
+                        .and_then(socket_addr_to_linux_sockaddr)
+                    {
+                        Some(bytes) => Some(bytes),
+                        None => return DispatchOutcome::errno(carrick_abi::LINUX_EFAULT),
                     }
-                }
+                } else {
+                    None
+                };
                 let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
                 let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
                 let status_flags = carrick_abi::LINUX_O_RDWR
@@ -1463,14 +1495,13 @@ impl<'a> NetView<'a> {
                 };
                 let in_memory_id = Arc::as_ptr(&server_half) as usize as u64;
                 let socket_key = crate::network::SocketKey::for_in_memory(in_memory_id);
-                let _ = self.network.provider.record_socket_addresses(
-                    self.network.spec.namespace_id.as_ref(),
+                let record = AcceptedAddressRecord {
                     socket_key,
-                    server_half.local_addr().map(GuestSocketAddr),
-                    None,
-                    server_half.peer_addr().map(GuestSocketAddr),
-                    carrick_spec::PortProtocol::Tcp,
-                );
+                    guest_local: server_half.local_addr().map(GuestSocketAddr),
+                    host_local: None,
+                    guest_peer: server_half.peer_addr().map(GuestSocketAddr),
+                    protocol: carrick_spec::PortProtocol::Tcp,
+                };
                 let mut base = OpenDescriptionBase::new(status_flags);
                 base.set_connected(true);
                 let open_desc = OpenDescription::InMemorySocket {
@@ -1483,11 +1514,14 @@ impl<'a> NetView<'a> {
                         status_flags,
                         fd_flags,
                     );
-                let linux_fd = match self.install_fd_at_or_above(3, open_file) {
-                    Ok(n) => n,
-                    Err(_) => return DispatchOutcome::errno(carrick_abi::LINUX_EMFILE),
-                };
-                return DispatchOutcome::returned_i32(linux_fd);
+                return self.finish_owned_accept(
+                    open_file,
+                    linux_bytes,
+                    addr_addr,
+                    addrlen_addr,
+                    Some(record),
+                    memory,
+                );
             }
         }
         let Some(host_fd) = host_fd else {
@@ -1497,6 +1531,12 @@ impl<'a> NetView<'a> {
             }
             return self.wait_in_memory_slot(fd, libc::POLLIN, recv_timeout);
         };
+        let unix_accept_lock =
+            (family == LINUX_AF_UNIX).then(|| support::unix_accept_lock(host_fd));
+        let _unix_accept_guard = unix_accept_lock.as_ref().map(|lock| {
+            lock.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         // accept(2) has no per-call non-blocking flag, but listen() already put
         // the host listen socket in non-blocking mode, so this never blocks.
         // Whether EAGAIN becomes a wait or an EAGAIN to the guest is decided by
@@ -1617,8 +1657,13 @@ impl<'a> NetView<'a> {
                         })
                 })
         });
-        if let Some(out) = addr_out {
-            let linux_bytes = guest_peer
+        let peer_info = if family == LINUX_AF_UNIX {
+            support::pop_pending_unix_client(host_fd)
+        } else {
+            None
+        };
+        let linux_bytes = if addr_addr != 0 && addrlen_addr != 0 {
+            let bytes = guest_peer
                 .and_then(|addr| socket_addr_to_linux_sockaddr(addr.0))
                 .or_else(|| accepted_host_source.and_then(socket_addr_to_linux_sockaddr))
                 .or_else(|| {
@@ -1629,7 +1674,7 @@ impl<'a> NetView<'a> {
                 .or_else(|| {
                     (family == libc::AF_UNIX).then(|| (LINUX_AF_UNIX as u16).to_ne_bytes().to_vec())
                 });
-            let Some(linux_bytes) = linux_bytes else {
+            let Some(bytes) = bytes else {
                 crate::event_ring::rec(
                     crate::event_ring::ACCEPTERR,
                     host_fd,
@@ -1639,17 +1684,14 @@ impl<'a> NetView<'a> {
                 unsafe { libc::close(new_host) };
                 return DispatchOutcome::errno(LINUX_EFAULT);
             };
-            if out.commit(&linux_bytes).is_err() {
-                crate::event_ring::rec(
-                    crate::event_ring::ACCEPTERR,
-                    host_fd,
-                    new_host,
-                    LINUX_EFAULT.get(),
-                );
-                unsafe { libc::close(new_host) };
-                return DispatchOutcome::errno(LINUX_EFAULT);
+            let mut bytes = bytes;
+            if let Some((_, _, peer_addr_len)) = peer_info.as_ref() {
+                bytes.resize(*peer_addr_len, 0);
             }
-        }
+            Some(bytes)
+        } else {
+            None
+        };
         let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
         let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
         // Keep the host socket non-blocking; Linux-visible blocking intent is
@@ -1668,13 +1710,8 @@ impl<'a> NetView<'a> {
         }
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-        let peer_info = if family == LINUX_AF_UNIX {
-            support::pop_pending_unix_client(host_fd)
-        } else {
-            None
-        };
         let (peer_cred, peer_flows) = match peer_info {
-            Some((cred, flows)) => (Some(cred), flows),
+            Some((cred, flows, _)) => (Some(cred), flows),
             None => (None, None),
         };
         let mut base = OpenDescriptionBase::new(status_flags);
@@ -1706,19 +1743,7 @@ impl<'a> NetView<'a> {
                 .common()
                 .init_socket_flows(server_flows);
         }
-        let linux_fd = match self.install_fd_at_or_above(3, open_file) {
-            Ok(fd) => fd,
-            Err(_) => {
-                crate::event_ring::rec(
-                    crate::event_ring::ACCEPTERR,
-                    host_fd,
-                    new_host,
-                    linux_errno::EMFILE.get(),
-                );
-                return DispatchOutcome::errno(linux_errno::EMFILE);
-            }
-        };
-        if let Some(protocol) = accept_protocol {
+        let record = accept_protocol.map(|protocol| {
             let guest_local = self
                 .network
                 .provider
@@ -1726,16 +1751,22 @@ impl<'a> NetView<'a> {
                 .ok()
                 .flatten();
             let host_local = host_socket_addr(new_host, family, false);
-            let _ = self.network.provider.record_socket_addresses(
-                self.network.spec.namespace_id.as_ref(),
-                crate::network::SocketKey::for_host_fd(new_host),
+            AcceptedAddressRecord {
+                socket_key: crate::network::SocketKey::for_host_fd(new_host),
                 guest_local,
-                host_local.map(HostSocketAddr),
+                host_local: host_local.map(HostSocketAddr),
                 guest_peer,
                 protocol,
-            );
-        }
-        DispatchOutcome::returned_i32(linux_fd)
+            }
+        });
+        self.finish_owned_accept(
+            open_file,
+            linux_bytes,
+            addr_addr,
+            addrlen_addr,
+            record,
+            memory,
+        )
     }
 
     /// connect(2) core with always-wait-on-block semantics, for the io_uring
