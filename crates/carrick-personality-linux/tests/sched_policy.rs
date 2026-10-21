@@ -253,37 +253,15 @@ fn sched_setaffinity_validation_and_success() {
 }
 
 #[test]
-fn arm_affinity_ordinals_route_exactly_to_ring_scheduler() {
-    use carrick_personality_linux::dispatch::route_aarch64;
-    assert_eq!(route_aarch64(122, 0), Family::Sched(SchedCall::SetAffinity));
-    assert_eq!(route_aarch64(123, 0), Family::Sched(SchedCall::GetAffinity));
-}
-
-#[test]
-fn missing_affinity_target_precedes_empty_mask_validation() {
-    let mut venue = AffinityVenue {
-        args: [9999, 8, 0x1000],
-        esrch: true,
-        ..Default::default()
-    };
-    assert_eq!(
-        serve_sched(SchedCall::SetAffinity, &mut venue),
-        FamilyCompletion::Complete(-3)
-    );
-}
-
-#[test]
-fn missing_getaffinity_target_precedes_null_output() {
-    let mut venue = AffinityVenue {
-        args: [9999, 8, 0],
-        esrch: true,
-        ..Default::default()
-    };
-    assert_eq!(
-        serve_sched(SchedCall::GetAffinity, &mut venue),
-        FamilyCompletion::Complete(-3)
-    );
-    assert_eq!(venue.out_len, 0);
+fn missing_affinity_targets_precede_buffer_failures() {
+    for (call, args) in [
+        (SchedCall::SetAffinity, [9999, 8, 0x1000]),
+        (SchedCall::GetAffinity, [9999, 8, 0]),
+    ] {
+        let mut venue = AffinityVenue { args, esrch: true, ..Default::default() };
+        assert_eq!(serve_sched(call, &mut venue), FamilyCompletion::Complete(-3));
+        assert_eq!(venue.out_len, 0);
+    }
 }
 
 #[test]
@@ -305,9 +283,9 @@ fn empty_setaffinity_never_dereferences_the_mask_pointer() {
 #[test]
 fn arm_affinity_routes_in_ring_and_x86_stays_unported() {
     for nr in [122, 123] {
-        assert_ne!(
+        assert_eq!(
             carrick_personality_linux::dispatch::route_aarch64(nr, 0),
-            Family::Unported
+            Family::Sched(if nr == 122 { SchedCall::SetAffinity } else { SchedCall::GetAffinity })
         );
         assert_eq!(route_x86(nr, 0), Family::Unported);
     }

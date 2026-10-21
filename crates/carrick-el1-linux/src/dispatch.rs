@@ -1482,6 +1482,7 @@ impl<
         route: carrick_personality_linux::dispatch::CompletionRoute,
     ) -> carrick_personality_linux::dispatch::CompletionRoute {
         use carrick_personality_linux::dispatch::CompletionRoute;
+        // Completion already installed x0: argument 0 here is the result, not pid.
         if !matches!(route, CompletionRoute::Served | CompletionRoute::WithWork)
             || self.frame.canonical_ordinal() != carrick_syscall_abi::nr::SCHED_SETAFFINITY
             || self.frame.argument(0) != Some(0)
