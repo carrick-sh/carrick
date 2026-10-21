@@ -2667,12 +2667,12 @@ pub trait FrameCowAuthority: Send + Sync {
     /// Bounded byte service for an owner-selected retained host source. No
     /// guest VA or permission decision crosses this physical boundary.
     /// Authenticate physical handle custody without consulting mapping policy.
-    fn retains_host_backing(
+    fn retain_host_backing(
         &self,
         _handle: std::num::NonZeroU64,
         _generation: std::num::NonZeroU64,
-    ) -> bool {
-        false
+    ) -> Option<std::sync::Arc<dyn crate::fork_stock::HostBackingRetention>> {
+        None
     }
 
     fn read_host_backing(

@@ -418,7 +418,7 @@ impl HvfAarch64Vmm {
     /// handles only, without projecting guest mappings or permissions.
     pub fn owner_fork_custody(
         &self,
-        source: Arc<dyn Fn(core::num::NonZeroU64, core::num::NonZeroU64) -> bool + Send + Sync>,
+        source: crate::trap::RetainHostBacking,
     ) -> crate::trap::ForkPhysicalCustody {
         crate::trap::ForkPhysicalCustody::new(
             Arc::clone(&self.state.carrier_foreign_mm_transport.custody),

@@ -14,6 +14,9 @@
  * birth reservation/publication, child lifecycle claim/control reset).
  * ParentLifecycleGate carries the exact observed GateState from the admission
  * read; AwaitingExecBinding is legal for a process fork on a distinct page.
+ * Reserve follows a successful stock Loan. Reserve: Inventory names table
+ * resolution or inherited custody validation; empty reusable stock refuses
+ * Capacity during Loan, before preparation reaches Reserve.
  * Service-boundary stages apply only when that service returned untyped Busy;
  * an existing typed owner refusal is never replaced or emitted twice.
  * LifecycleNative::process_fork venue=unavailable records None/fallback,

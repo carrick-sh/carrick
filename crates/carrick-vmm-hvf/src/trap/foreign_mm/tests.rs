@@ -5898,7 +5898,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
     if owner_selected {
         let physical = super::super::owner_fork::ForkPhysicalCustody::new(
             Arc::clone(&transport.custody),
-            Arc::new(|_, _| false),
+            Arc::new(|_, _| None),
         );
         let source_owners = std::collections::BTreeMap::from([(
             (vvar_ipa, vvar_len as usize),
@@ -6337,7 +6337,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
         // not user VMA rows for the legacy fork projection to reconstruct.
         let physical = super::super::owner_fork::ForkPhysicalCustody::new(
             Arc::clone(&transport.custody),
-            Arc::new(|_, _| false),
+            Arc::new(|_, _| None),
         );
         super::super::owner_fork::project_owner_fork_frames(
             &physical,
