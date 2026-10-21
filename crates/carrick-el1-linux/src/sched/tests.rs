@@ -2030,3 +2030,28 @@ fn switched_thread_affinity_exclusion_migrates_without_a_tick() {
     assert_eq!(zone.switch_in_full(other).unwrap().record, record);
     assert_eq!(cpu.now, before);
 }
+
+#[test]
+fn affinity_reschedule_without_sgi_route_reaches_host_transport_once() {
+    let zone = zone();
+    let target = SlotId::new(4);
+    assert_eq!(zone.slot(target).sgi_target(), 0);
+    let mut effects = carrick_sched_core::WakeEffects::default();
+    effects.request_reschedule(target);
+    let mut deliveries = std::vec::Vec::new();
+    object_wait::deliver_effects_with(
+        &zone,
+        Some(SLOT),
+        carrick_sched_core::Waker::El1 { slot: SLOT },
+        effects,
+        false,
+        |slot, route| deliveries.push((slot, route)),
+        (|_| {}, || {}),
+    );
+    assert_eq!(
+        deliveries.len(),
+        1,
+        "a missing SGI cannot consume the notification latch"
+    );
+    assert_eq!(deliveries[0].0, target);
+}
