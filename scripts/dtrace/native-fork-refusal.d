@@ -12,6 +12,8 @@
  * retain their existing owner record without a duplicate boundary record.
  * Busy refusals retain their exact NativeForkStage (parent gate/edit/readiness,
  * birth reservation/publication, child lifecycle claim/control reset).
+ * ParentLifecycleGate carries the exact observed GateState from the admission
+ * read; AwaitingExecBinding is legal for a process fork on a distinct page.
  * Service-boundary stages apply only when that service returned untyped Busy;
  * an existing typed owner refusal is never replaced or emitted twice.
  * LifecycleNative::process_fork venue=unavailable records None/fallback,

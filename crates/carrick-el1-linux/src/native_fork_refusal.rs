@@ -4,7 +4,9 @@ use carrick_core::mm::{fork::ForkError, reservation::Refusal, transaction::MmErr
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeForkStage {
-    ParentLifecycleGate,
+    ParentLifecycleGate {
+        observed: carrick_el1_abi::GateState,
+    },
     BirthReservation,
     ParentSpaceEdit,
     ParentForkReady,
@@ -275,6 +277,42 @@ mod tests {
         assert_eq!(error.errno(), -14);
         assert_ne!(error, refused(NativeForkStage::Prepare, ForkError::Core));
         assert_ne!(error, refused(NativeForkStage::Census, ForkError::Stale));
+    }
+
+    #[test]
+    fn parent_gate_refusal_preserves_observed_state_and_busy_policy() {
+        use carrick_el1_abi::GateState;
+        for observed in [
+            GateState::Open,
+            GateState::ForkClosing,
+            GateState::Closed,
+            GateState::AwaitingExecBinding,
+            GateState::HostOnly,
+        ] {
+            let stage = NativeForkStage::ParentLifecycleGate { observed };
+            let error = busy(stage);
+            assert_eq!(
+                error,
+                NativeProcessError::ForkRefused(NativeForkRefusal {
+                    stage,
+                    cause: NativeForkCause::Busy,
+                })
+            );
+            assert_eq!(error.errno(), -11);
+            assert_eq!(
+                error.run_failure_reason(),
+                carrick_core_abi::NativeRunFailureReason::NativeBusy
+            );
+            let NativeProcessError::ForkRefused(refusal) = error else {
+                unreachable!()
+            };
+            let mut diagnostic = carrick_el1_abi::NativeForkDiagnostic::new();
+            core::fmt::write(&mut diagnostic, format_args!("{refusal:?}")).unwrap();
+            let expected = std::format!(
+                "NativeForkRefusal {{ stage: ParentLifecycleGate {{ observed: {observed:?} }}, cause: Busy }}"
+            );
+            assert_eq!(diagnostic.message(), Some(expected.as_str()));
+        }
     }
 
     #[test]
