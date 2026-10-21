@@ -284,14 +284,26 @@ fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Res
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            result => {
-                // SAFETY: the unreaped foreground child owns this process group.
-                // UID-wide retirement follows before any scan or later step.
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
+            Err(error) => return Err(error),
+            Ok(None) => {
+                // The sudo wrapper and its agent belong to different UIDs.
+                // Stop every agent process before waiting for that wrapper.
+                stop_agent_processes();
+                // A sudo monitor can stop on the agent's job-control notification.
+                // Kill the unreaped child's dedicated group with runner privilege.
+                let _ = sudo(&["/usr/bin/kill", "-KILL", "--", &format!("-{pgid}")]);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    if child.try_wait()?.is_some() {
+                        return Ok(124);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::other(
+                            "agent foreground wrapper did not retire",
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
-                child.wait()?;
-                return result.map(|_| 124);
             }
         }
     }
@@ -524,12 +536,15 @@ fn hand_over(path: &Path) -> Result<(), ScalerError> {
         path.to_str().ok_or(ScalerError::Guard("agent path"))?,
     ])
 }
-fn retire_agent() -> Result<(), ScalerError> {
+fn stop_agent_processes() {
     // Include real and effective UIDs (setuid tools), regardless of sessions.
     for selector in ["-u", "-U"] {
         let _ = sudo(&["/usr/bin/pkill", "-STOP", selector, AGENT_USER]);
         let _ = sudo(&["/usr/bin/pkill", "-KILL", selector, AGENT_USER]);
     }
+}
+fn retire_agent() -> Result<(), ScalerError> {
+    stop_agent_processes();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         // SAFETY: the driver is a subreaper and has already waited for its
