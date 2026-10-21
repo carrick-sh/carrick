@@ -1773,6 +1773,94 @@ fn fork_reserve_refusal_retains_diagnostic_stage_and_retryable_errno() {
 }
 
 #[test]
+fn native_fork_busy_diagnostic_names_parent_space_editor() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let crossing = TestStockCrossing::new(&[]);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let owner = super::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    );
+    let index = fixture.zone.spaces.find(1).unwrap();
+    let access = owner.space_access(0).unwrap();
+    let editor = access.try_begin_edit(index, 1, NonZeroU64::MIN).unwrap();
+    let error = service
+        .prepare_mm(
+            &fixture.address,
+            &parked,
+            MmGeneration::new(NonZeroU64::new(2).unwrap()),
+        )
+        .expect_err("an outstanding editor must retain its exclusion");
+    drop(editor);
+    assert_eq!(error.errno(), -11);
+    assert_eq!(
+        error.run_failure_reason(),
+        NativeProcessError::Busy.run_failure_reason()
+    );
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 0);
+    let NativeProcessError::ForkRefused(refusal) = error else {
+        panic!("space edit refusal lost its site: {error:?}");
+    };
+    assert_eq!(format!("{:?}", refusal.stage), "ParentSpaceEdit");
+}
+
+#[test]
+fn native_fork_busy_diagnostic_names_unsettled_parent_fork() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let crossing = TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ]);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let prepared = service
+        .prepare_mm(
+            &fixture.address,
+            &parked,
+            MmGeneration::new(NonZeroU64::new(2).unwrap()),
+        )
+        .unwrap();
+    let error = service
+        .prepare_mm(
+            &fixture.address,
+            &parked,
+            MmGeneration::new(NonZeroU64::new(3).unwrap()),
+        )
+        .expect_err("a prepared fork must retain parent publication custody");
+    service.abort_mm(prepared).unwrap();
+    assert_eq!(error.errno(), -11);
+    assert_eq!(
+        error.run_failure_reason(),
+        NativeProcessError::Busy.run_failure_reason()
+    );
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
+    assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 1);
+    let NativeProcessError::ForkRefused(refusal) = error else {
+        panic!("parent readiness refusal lost its site: {error:?}");
+    };
+    assert_eq!(format!("{:?}", refusal.stage), "ParentForkReady");
+}
+
+#[test]
 fn fork_commit_refusal_after_admitted_reservation_fails_closed_without_opening_child_space() {
     assert_commit_fault_keeps_child_closed(CommitFault::Refusal);
 }
