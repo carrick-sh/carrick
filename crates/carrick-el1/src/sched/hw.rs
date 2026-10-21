@@ -460,7 +460,8 @@ pub fn fatal_entry_binding() -> ! {
     unsafe {
         core::arch::asm!("hvc #3",
             in("x0") carrick_el1_abi::PANIC_SENTINEL,
-            in("x1") 0u64, in("x2") 0u64, in("x3") 0u64,
+            in("x1") carrick_el1_abi::ENTRY_BINDING_FATAL_TAG,
+            in("x2") 0u64, in("x3") 0u64,
             options(nostack));
     }
     loop {

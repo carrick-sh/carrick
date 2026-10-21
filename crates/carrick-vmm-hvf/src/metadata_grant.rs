@@ -1916,6 +1916,35 @@ fn stopped_records<'a>(
     Some(unsafe { (&*task, &*zone) })
 }
 
+/// Terminal-only observation. Do not require the execution binding whose
+/// failure brought us here, and never read a live scheduler context.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn entry_binding_fatal_diagnostic(
+    custody: &crate::trap::CarrierVmCustody,
+    cpu: carrick_guest_arch::CpuId,
+    registers: carrick_el1_abi::ArmEntryFatalRegisters,
+) -> Option<carrick_el1_abi::ArmEntryBindingFatal> {
+    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
+    let region = retained_abi_region(custody)?;
+    let pointer = abi_stack_ptr::<carrick_el1_abi::TrapFrame>(
+        region,
+        cpu,
+        carrick_guest_arch::KernelVa::new(carrick_el1_abi::el1_slot_frame_va(cpu.raw() as usize)),
+    )?;
+    let (task, zone) = stopped_records(region, cpu)?;
+    // SAFETY: abi_stack_ptr checked the complete aligned vector frame on
+    // this synchronously stopped CPU's retained stack. Other CPUs use
+    // disjoint stacks; scheduler record observations below use only atomics.
+    let frame = unsafe { &*pointer };
+    Some(carrick_el1_abi::ArmEntryBindingFatal::capture(
+        registers,
+        frame,
+        carrick_core::entry::binding(&task.execution, &task.mm),
+        zone,
+        slot,
+    ))
+}
+
 /// Observation-only identity of a stopped lane. Unlike terminal custody,
 /// diagnostics need not have a published root incarnation.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

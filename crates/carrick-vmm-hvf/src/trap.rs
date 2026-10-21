@@ -8472,6 +8472,33 @@ impl HvfInner {
                 }
                 if x0 == carrick_el1_abi::PANIC_SENTINEL {
                     let source_line = vcpu.get_reg(Reg::X1).unwrap_or(0);
+                    if carrick_el1_abi::is_entry_binding_fatal(x0, source_line) {
+                        let registers = carrick_el1_abi::ArmEntryFatalRegisters {
+                            pc: Some(pc),
+                            lr: vcpu.get_reg(Reg::X30).ok(),
+                            fp: vcpu.get_reg(Reg::X29).ok(),
+                            sp_el0: vcpu.get_sys_reg(SysReg::SP_EL0).ok(),
+                            sp_el1: vcpu.get_sys_reg(SysReg::SP_EL1).ok(),
+                            esr_el1: vcpu.get_sys_reg(SysReg::ESR_EL1).ok(),
+                            far_el1: vcpu.get_sys_reg(SysReg::FAR_EL1).ok(),
+                            elr_el1: vcpu.get_sys_reg(SysReg::ELR_EL1).ok(),
+                            spsr_el1: vcpu.get_sys_reg(SysReg::SPSR_EL1).ok(),
+                        };
+                        let diagnostic = mailbox.leased_slot().and_then(|slot| {
+                            crate::metadata_grant::entry_binding_fatal_diagnostic(
+                                custody,
+                                carrick_guest_arch::CpuId::new(u32::from(slot.raw())),
+                                registers,
+                            )
+                        });
+                        if let Some(diagnostic) = diagnostic {
+                            carrick_fatal!("el1", "{diagnostic}");
+                        }
+                        carrick_fatal!(
+                            "el1",
+                            "entry_binding retained_entry=unavailable registers={registers:?}"
+                        );
+                    }
                     let source_column = vcpu.get_reg(Reg::X2).unwrap_or(0);
                     let publication_detail = vcpu.get_reg(Reg::X3).unwrap_or(0);
                     carrick_fatal!(
