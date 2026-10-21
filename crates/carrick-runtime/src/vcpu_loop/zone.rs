@@ -37,9 +37,53 @@ pub(super) enum OwnerMemoryAction {
     Retained,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ZoneWaitPolicy {
     Ordinary(Option<std::time::Duration>),
-    KillableOwnerWrite,
+    KillableOwnerMemory,
+}
+
+impl ZoneWaitPolicy {
+    fn for_owner_resume(resume: &OwnedSyscallResume) -> Self {
+        match resume {
+            OwnedSyscallResume::CopyoutRedispatch | OwnedSyscallResume::PreparedWrite(_) => {
+                Self::KillableOwnerMemory
+            }
+        }
+    }
+}
+
+pub(super) fn owner_zone_continuation_for_resume(
+    resume: &OwnedSyscallResume,
+    capture: carrick_kernel::kernel::continuation::ContinuationCapture,
+    wait: carrick_kernel::kernel::continuation::ZoneWait,
+) -> carrick_kernel::kernel::continuation::BlockedContinuation {
+    let policy = ZoneWaitPolicy::for_owner_resume(resume);
+    match policy {
+        ZoneWaitPolicy::KillableOwnerMemory => {
+            carrick_kernel::kernel::continuation::BlockedContinuation::from_killable_owner_zone_park(
+                capture, wait,
+            )
+        }
+        ZoneWaitPolicy::Ordinary(timeout) => {
+            carrick_kernel::kernel::continuation::BlockedContinuation::from_zone_park(
+                capture, wait, timeout,
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_copyout_policy_tests {
+    use super::{OwnedSyscallResume, ZoneWaitPolicy};
+
+    #[test]
+    fn copyout_redispatch_is_killable_only_not_ordinary_signal_interruptible() {
+        assert_eq!(
+            ZoneWaitPolicy::for_owner_resume(&OwnedSyscallResume::CopyoutRedispatch),
+            ZoneWaitPolicy::KillableOwnerMemory,
+        );
+    }
 }
 
 thread_local! {
@@ -522,8 +566,12 @@ where
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let wait = carrick_kernel::kernel::continuation::ZoneWait::new(record, seq);
         let continuation = match policy {
-            ZoneWaitPolicy::KillableOwnerWrite => carrick_kernel::kernel::continuation::BlockedContinuation::from_killable_owner_zone_park(capture, wait),
-            ZoneWaitPolicy::Ordinary(timeout) => carrick_kernel::kernel::continuation::BlockedContinuation::from_zone_park(capture, wait, timeout),
+            ZoneWaitPolicy::KillableOwnerMemory => {
+                carrick_kernel::kernel::continuation::BlockedContinuation::from_killable_owner_zone_park(capture, wait)
+            }
+            ZoneWaitPolicy::Ordinary(timeout) => {
+                carrick_kernel::kernel::continuation::BlockedContinuation::from_zone_park(capture, wait, timeout)
+            }
         };
         let binding = control.binding.ok_or_else(|| {
             RuntimeError::Configuration("EL1 zone settle without a task binding".to_owned())
@@ -765,11 +813,7 @@ where
                             state,
                             zone.record_ref(record),
                             seq,
-                            if matches!(resume, OwnedSyscallResume::PreparedWrite(_)) {
-                                ZoneWaitPolicy::KillableOwnerWrite
-                            } else {
-                                ZoneWaitPolicy::Ordinary(None)
-                            },
+                            ZoneWaitPolicy::for_owner_resume(&resume),
                             request,
                         )?;
                         self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame, resume };
