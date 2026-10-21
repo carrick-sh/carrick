@@ -1118,6 +1118,16 @@ pub trait AnonymousDescriptorDecode {
     fn private_state(descriptor: u64) -> El1PrivateLeafState;
 }
 
+/// `ICC_SGI1R_EL1` routing bits for a CPU with affinity `mpidr`: Aff3, Aff2
+/// and Aff1 in place, the target-list bit and range selector of Aff0.
+pub const fn sgi_target_of(mpidr: u64) -> u64 {
+    let aff0 = mpidr & 0xff;
+    let aff1 = (mpidr >> 8) & 0xff;
+    let aff2 = (mpidr >> 16) & 0xff;
+    let aff3 = (mpidr >> 32) & 0xff;
+    (1 << (aff0 & 0xf)) | ((aff0 >> 4) << 44) | (aff1 << 16) | (aff2 << 32) | (aff3 << 48)
+}
+
 #[cfg(test)]
 mod sgi_encoding_tests {
     #[test]

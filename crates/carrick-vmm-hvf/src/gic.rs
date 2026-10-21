@@ -448,7 +448,7 @@ pub fn reschedule_target(vcpu: u64) -> Result<u64, TrapError> {
         unsafe { sys::hv_vcpu_get_sys_reg(vcpu, sys::hv_sys_reg_t::MPIDR_EL1, &mut mpidr) },
         "read MPIDR_EL1 for reschedule route",
     )?;
-    Ok(carrick_el1::substrate::sched::sgi_target_of(mpidr))
+    Ok(carrick_guest_arch::sgi_target_of(mpidr))
 }
 
 /// Withdraw an owed kick that some exit surfaced.
