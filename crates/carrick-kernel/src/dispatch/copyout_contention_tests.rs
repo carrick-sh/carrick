@@ -292,9 +292,12 @@ fn pipe2_copyout_waits_for_live_sibling_editor_and_commits_once() {
     });
     assert_eq!(
         refused,
-        DispatchOutcome::OwnerMemoryWait {
-            wait: observed,
-            committed: 0
+        DispatchOutcome::PreparedCopyoutWait {
+            wait: Box::new(DispatchOutcome::OwnerMemoryWait {
+                wait: observed,
+                committed: 0,
+            }),
+            restart: super::PreparedCopyoutRestart::NoIntr,
         },
         "a live sibling's editor must suspend the syscall, never return errno 14"
     );
