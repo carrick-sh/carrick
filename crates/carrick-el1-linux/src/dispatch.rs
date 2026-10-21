@@ -1483,7 +1483,7 @@ impl<
     ) -> carrick_personality_linux::dispatch::CompletionRoute {
         use carrick_personality_linux::dispatch::CompletionRoute;
         if !matches!(route, CompletionRoute::Served | CompletionRoute::WithWork)
-            || self.frame.canonical_ordinal().raw() != 122
+            || self.frame.canonical_ordinal() != carrick_syscall_abi::nr::SCHED_SETAFFINITY
             || self.frame.argument(0) != Some(0)
         {
             return route;

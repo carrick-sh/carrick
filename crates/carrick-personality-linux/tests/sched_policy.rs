@@ -172,182 +172,84 @@ impl SchedVenue for AffinityVenue {
 
 #[test]
 fn sched_getaffinity_validation_and_success() {
-    // 1. size too small (4 < 8) -> EINVAL (-22)
-    let mut v = AffinityVenue {
-        args: [0, 4, 0x1000],
-        affinity: carrick_core::affinity::CpuAffinity::single(1),
-        ..Default::default()
-    };
-    assert_eq!(
-        serve_sched(SchedCall::GetAffinity, &mut v),
-        FamilyCompletion::Complete(-22)
-    );
-
-    // 2. null mask pointer -> EFAULT (-14)
-    let mut v = AffinityVenue {
-        args: [0, 8, 0],
-        affinity: carrick_core::affinity::CpuAffinity::single(1),
-        ..Default::default()
-    };
-    assert_eq!(
-        serve_sched(SchedCall::GetAffinity, &mut v),
-        FamilyCompletion::Complete(-14)
-    );
-
-    // 3. copy_out failure -> exact EFAULT (-14), never Forward
-    let mut v = AffinityVenue {
-        args: [0, 8, 0x1000],
-        affinity: carrick_core::affinity::CpuAffinity::single(1),
-        copy_fail: true,
-        ..Default::default()
-    };
-    assert_eq!(
-        serve_sched(SchedCall::GetAffinity, &mut v),
-        FamilyCompletion::Complete(-14)
-    );
-
-    // 4. unknown pid -> ESRCH (-3)
-    let mut v = AffinityVenue {
-        args: [9999, 8, 0x1000],
-        affinity: carrick_core::affinity::CpuAffinity::single(1),
-        esrch: true,
-        ..Default::default()
-    };
-    assert_eq!(
-        serve_sched(SchedCall::GetAffinity, &mut v),
-        FamilyCompletion::Complete(-3)
-    );
-
-    // 5. success -> returns 8, out_buf has mask written
-    let mut v = AffinityVenue {
-        args: [0, 8, 0x1000],
-        affinity: carrick_core::affinity::CpuAffinity::single(1),
-        ..Default::default()
-    };
-    assert_eq!(
-        serve_sched(SchedCall::GetAffinity, &mut v),
-        FamilyCompletion::Complete(8)
-    );
-    assert_eq!(v.out_len, 8);
-    assert_eq!(&v.out_buf[..8], &(2u64).to_le_bytes());
+    for (args, copy_fail, esrch, expected) in [
+        ([0, 4, 0x1000], false, false, -22),  // short GET
+        ([0, 8, 0], false, false, -14),       // null output
+        ([0, 8, 0x1000], true, false, -14),   // failed copy-out
+        ([9999, 8, 0x1000], false, true, -3), // absent thread
+        ([0, 8, 0x1000], false, false, 8),
+    ] {
+        let mut venue = AffinityVenue {
+            args,
+            copy_fail,
+            esrch,
+            affinity: carrick_core::affinity::CpuAffinity::single(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            serve_sched(SchedCall::GetAffinity, &mut venue),
+            FamilyCompletion::Complete(expected),
+            "args={args:?}, copy_fail={copy_fail}"
+        );
+        if expected == 8 {
+            assert_eq!(venue.out_len, 8);
+            assert_eq!(&venue.out_buf[..8], &2u64.to_le_bytes());
+        } else {
+            assert_eq!(venue.out_len, 0);
+        }
+    }
 }
 
 #[test]
 fn sched_setaffinity_validation_and_success() {
-    // 1. size == 0 -> EINVAL (-22)
-    let mut v = AffinityVenue {
-        args: [0, 0, 0x1000],
-        ..Default::default()
-    };
-    assert_eq!(
-        serve_sched(SchedCall::SetAffinity, &mut v),
-        FamilyCompletion::Complete(-22)
-    );
-
-    // 2. null mask pointer -> EFAULT (-14)
-    let mut v = AffinityVenue {
-        args: [0, 8, 0],
-        ..Default::default()
-    };
-    assert_eq!(
-        serve_sched(SchedCall::SetAffinity, &mut v),
-        FamilyCompletion::Complete(-14)
-    );
-
-    // 3. copy_in failure -> exact EFAULT (-14), never Forward
-    let mut v = AffinityVenue {
-        args: [0, 8, 0x1000],
-        copy_fail: true,
-        ..Default::default()
-    };
-    assert_eq!(
-        serve_sched(SchedCall::SetAffinity, &mut v),
-        FamilyCompletion::Complete(-14)
-    );
-
-    // 4. empty intersection (all zeros in mask) -> EINVAL (-22)
-    let mut v = AffinityVenue {
-        args: [0, 8, 0x1000],
-        ..Default::default()
-    };
-    assert_eq!(
-        serve_sched(SchedCall::SetAffinity, &mut v),
-        FamilyCompletion::Complete(-22)
-    );
-
-    // 5. mask containing only absent CPUs (4-CPU carrier, requesting CPU 5) -> EINVAL (-22)
-    let mut v = AffinityVenue {
-        args: [0, 8, 0x1000],
-        ncpu: 4,
-        ..Default::default()
-    };
-    v.in_buf[..8].copy_from_slice(&(1u64 << 5).to_le_bytes());
-    assert_eq!(
-        serve_sched(SchedCall::SetAffinity, &mut v),
-        FamilyCompletion::Complete(-22)
-    );
-
-    // 6. unknown pid -> ESRCH (-3)
-    let mut v = AffinityVenue {
-        args: [9999, 8, 0x1000],
-        esrch: true,
-        ..Default::default()
-    };
-    v.in_buf[..8].copy_from_slice(&(1u64).to_le_bytes());
-    assert_eq!(
-        serve_sched(SchedCall::SetAffinity, &mut v),
-        FamilyCompletion::Complete(-3)
-    );
-
-    // 7. A one-byte mask is zero-extended to the kernel mask.
-    let mut v = AffinityVenue {
-        args: [0, 1, 0x1000],
-        ncpu: 4,
-        ..Default::default()
-    };
-    v.in_buf[0] = 0x02; // CPU 1
-    assert_eq!(
-        serve_sched(SchedCall::SetAffinity, &mut v),
-        FamilyCompletion::Complete(0)
-    );
-    assert_eq!(v.affinity, carrick_core::affinity::CpuAffinity::single(1));
-
-    // 8. A four-byte mask is also accepted and zero-extended.
-    let mut v = AffinityVenue {
-        args: [0, 4, 0x1000],
-        ncpu: 4,
-        ..Default::default()
-    };
-    v.in_buf[..4].copy_from_slice(&(1u32).to_le_bytes()); // CPU 0
-    assert_eq!(
-        serve_sched(SchedCall::SetAffinity, &mut v),
-        FamilyCompletion::Complete(0)
-    );
-    assert_eq!(v.affinity, carrick_core::affinity::CpuAffinity::single(0));
-
-    // 9. success standard size (8 bytes) -> updates affinity and returns 0
-    let mut v = AffinityVenue {
-        args: [0, 8, 0x1000],
-        ncpu: 4,
-        ..Default::default()
-    };
-    v.in_buf[..8].copy_from_slice(&(2u64).to_le_bytes());
-    assert_eq!(
-        serve_sched(SchedCall::SetAffinity, &mut v),
-        FamilyCompletion::Complete(0)
-    );
-    assert_eq!(v.affinity, carrick_core::affinity::CpuAffinity::single(1));
-
-    // 10. excluded running CPU: caller running on CPU 0 sets affinity to CPU 1 -> yields/migrates
-    let mut v = AffinityVenue {
+    for (args, mask, ncpu, copy_fail, esrch, errno) in [
+        ([0, 0, 0x1000], 0u64, 64, false, false, -22), // empty input
+        ([0, 8, 0], 0, 64, false, false, -14),         // null input
+        ([0, 8, 0x1000], 0, 64, true, false, -14),     // failed copy-in
+        ([0, 8, 0x1000], 0, 64, false, false, -22),    // empty intersection
+        ([0, 8, 0x1000], 1 << 5, 4, false, false, -22), // absent CPU
+        ([9999, 8, 0x1000], 1, 64, false, true, -3),   // absent thread
+    ] {
+        let mut venue = AffinityVenue {
+            args,
+            ncpu,
+            copy_fail,
+            esrch,
+            ..Default::default()
+        };
+        venue.in_buf[..8].copy_from_slice(&mask.to_le_bytes());
+        let before = venue.affinity;
+        assert_eq!(
+            serve_sched(SchedCall::SetAffinity, &mut venue),
+            FamilyCompletion::Complete(errno),
+            "args={args:?}, mask={mask}"
+        );
+        assert_eq!(venue.affinity, before);
+    }
+    for (size, mask) in [(1, 2u64), (4, 1), (8, 2)] {
+        let mut venue = AffinityVenue {
+            args: [0, size, 0x1000],
+            ncpu: 4,
+            ..Default::default()
+        };
+        venue.in_buf[..8].copy_from_slice(&mask.to_le_bytes());
+        assert_eq!(
+            serve_sched(SchedCall::SetAffinity, &mut venue),
+            FamilyCompletion::Complete(0)
+        );
+        assert_eq!(venue.affinity.words(), &[mask]);
+    }
+    let mut venue = AffinityVenue {
         args: [0, 8, 0x1000],
         ncpu: 4,
         current_cpu: Some(0),
         ..Default::default()
     };
-    v.in_buf[..8].copy_from_slice(&(2u64).to_le_bytes()); // CPU 1
-    let completion = serve_sched(SchedCall::SetAffinity, &mut v);
-    assert_eq!(completion, FamilyCompletion::CompleteWithWork(0));
+    venue.in_buf[..8].copy_from_slice(&2u64.to_le_bytes());
+    assert_eq!(
+        serve_sched(SchedCall::SetAffinity, &mut venue),
+        FamilyCompletion::CompleteWithWork(0)
+    );
 }
 
 #[test]
