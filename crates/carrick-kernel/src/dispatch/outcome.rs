@@ -497,6 +497,11 @@ pub enum FdWaitCompletion {
 #[derive(Debug, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
+    /// A copyout retains the exact operation authority while the runtime
+    /// parks on the reported owner-memory dependency.  Resumption must use
+    /// this value, never re-resolve a numeric descriptor from the saved
+    /// syscall arguments.
+    CopyoutSuspended(#[serde(skip_serializing)] Box<super::OwnedCopyout>),
     /// A write retains its exact destination and owner copy-in transfer while
     /// the runtime parks the syscall completion on the reported memory wait.
     WriteCopyInSuspended(#[serde(skip_serializing)] Box<super::OwnedWriteCopyIn>),

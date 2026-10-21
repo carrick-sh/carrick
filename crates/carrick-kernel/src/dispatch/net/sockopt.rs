@@ -505,6 +505,70 @@ fn getsockopt_in_memory<M: CurrentMmMemory>(
     }
 }
 
+impl NetView<'_> {
+    pub(in crate::dispatch) fn socket_error_from_open_file<M: CurrentMmMemory>(
+        &self,
+        open_file: crate::dispatch::fd_table::OpenFile,
+        optval_addr: u64,
+        optlen_addr: u64,
+        memory: &mut M,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let prepared =
+            match super::support::prepare_sockopt_value(memory, optval_addr, optlen_addr, 4) {
+                Ok(Ok(prepared)) => prepared,
+                Ok(Err(fault)) => return Ok(fault.outcome()),
+                Err(refusal) => {
+                    let Some(lease) = open_file.description.retain_fd_lease() else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    return Ok(refusal.suspend(
+                        crate::dispatch::OwnedCopyoutOperation::SocketError {
+                            open_file,
+                            lease,
+                            optval_addr,
+                            optlen_addr,
+                        },
+                    ));
+                }
+            };
+        let mut open = crate::kernel::FileDescription::write_for_io(&open_file.description)
+            .ok_or(DispatchError::Errno(LINUX_ENOTSOCK))?;
+        let value = match &mut *open {
+            OpenDescription::InMemorySocket { base, socket } => base
+                .take_pending_socket_error()
+                .unwrap_or_else(|| socket.take_so_error().unwrap_or(0)),
+            OpenDescription::HostSocket { host_fd, base, .. } => {
+                if let Some(error) = base.take_pending_socket_error() {
+                    error
+                } else {
+                    let mut host_error = 0i32;
+                    let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+                    let rc = unsafe {
+                        libc::getsockopt(
+                            host_fd.raw(),
+                            libc::SOL_SOCKET,
+                            libc::SO_ERROR,
+                            (&mut host_error as *mut i32).cast(),
+                            &mut len,
+                        )
+                    };
+                    if let Err(errno) = rc.host_syscall_errno() {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    if host_error == 0 {
+                        0
+                    } else {
+                        crate::host_to_linux_errno(host_error).get()
+                    }
+                }
+            }
+            _ => return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK)),
+        };
+        drop(open);
+        Ok(prepared.commit(&value.to_ne_bytes()))
+    }
+}
+
 impl<'a> NetView<'a> {
     define_syscall! {
         fn setsockopt(this, cx, fd: Fd, level: u64, optname: u64, optval: GuestPtr, optlen: u64) {
@@ -964,6 +1028,23 @@ impl<'a> NetView<'a> {
                     let Some(desc) = crate::kernel::FileDescription::inspect(&of.description) else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
                     };
+                    if level == LINUX_SOL_SOCKET && optname == LINUX_SO_ERROR {
+                        let socket = matches!(
+                            &*desc,
+                            OpenDescription::InMemorySocket { .. }
+                                | OpenDescription::HostSocket { .. }
+                        );
+                        drop(desc);
+                        if socket {
+                            return this.socket_error_from_open_file(
+                                of,
+                                optval_addr,
+                                optlen_addr,
+                                memory,
+                            );
+                        }
+                        return Ok(DispatchOutcome::errno(LINUX_ENOTSOCK));
+                    }
                     if let OpenDescription::InMemorySocket { socket, .. } = &*desc {
                         let socket = Arc::clone(socket);
                         drop(desc);

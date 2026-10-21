@@ -1765,7 +1765,32 @@ where
             binding::OwnedSyscallResume::PreparedWrite(pending) => {
                 self.resume_write_copy_in(kernel, engine, pending, host_wait)
             }
+            binding::OwnedSyscallResume::PreparedCopyout(pending) => {
+                self.resume_copyout(kernel, engine, *pending, host_wait)
+            }
         }
+    }
+
+    fn resume_copyout(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+        pending: carrick_kernel::dispatch::OwnedCopyoutOperation,
+        _host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
+    ) -> Result<DispatchOutcome, RuntimeError> {
+        let request = self
+            .syscall_completion
+            .guest("copyout lost syscall completion")?
+            .syscall()
+            .request;
+        let context = self
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Configuration("copyout lost context".to_owned()))?
+            .retain_exact();
+        Ok(kernel
+            .dispatcher
+            .resume_owned_copyout(&context, request, pending, engine)?)
     }
 
     fn redispatch_threaded_syscall_for_executor(
