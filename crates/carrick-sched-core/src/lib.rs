@@ -2723,7 +2723,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// pause of it is raised, or it is retiring), which its executor loads.
     fn needs_executor(&self, slot: SlotId, rec: &ZoneRecord<C>) -> bool {
         let mm = rec.mm.load(Ordering::Relaxed);
-        rec.needs_host() || (self.installed_space(slot) != mm && !self.may_switch_to(slot, mm))
+        rec.needs_host()
+            || rec.is_unadopted_birth()
+            || (self.installed_space(slot) != mm && !self.may_switch_to(slot, mm))
     }
 
     /// The address space installed on `slot`'s vCPU, by the occupancy

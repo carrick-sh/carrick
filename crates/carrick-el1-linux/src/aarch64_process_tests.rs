@@ -3867,7 +3867,9 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
             "no new thread may be born into an exited group"
         );
         if let Some((control, record)) = pooled {
-            assert!(fixture.zone.record(record.id).is_cancelled());
+            assert!(control.host_exit_requested());
+            assert!(fixture.zone.live(record).is_some());
+            assert!(!fixture.zone.record(record.id).is_cancelled());
             let retirement = fixture.page.reserve_cancelled_member_exit().unwrap();
             if matches!(
                 fixture.page.state(control.entry().unwrap().index()),
@@ -3890,6 +3892,13 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
             fixture
                 .page
                 .publish_exact_host_retirement(control, receipt.retirement());
+            let _ = fixture.zone.claim_for_host(
+                record,
+                None,
+                carrick_el1_abi::Handback::Cancelled,
+                &carrick_sched_core::ShortLockSpin,
+            );
+            assert!(fixture.zone.record(record.id).is_cancelled());
         }
         if let Some(control) = adopted_control {
             let stale = carrick_core::terminal::ThreadBirthIdentity::from_parts(
@@ -4606,7 +4615,7 @@ fn arm_graph_pool_member_without_execution_binding_uses_page_identity() {
 fn arm_graph_pool_host_retirement(unbound: bool) {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let (control, _record) = imported_thread_with_identity(fixture, |identity| {
+    let (control, record) = imported_thread_with_identity(fixture, |identity| {
         if unbound {
             identity.generation = 0;
         }
@@ -4627,6 +4636,13 @@ fn arm_graph_pool_host_retirement(unbound: bool) {
         .page
         .retire_published_host_member(entry, control, retirement)
         .unwrap();
+    let _ = fixture.zone.claim_for_host(
+        record,
+        None,
+        carrick_el1_abi::Handback::Cancelled,
+        &carrick_sched_core::ShortLockSpin,
+    );
+    assert!(fixture.zone.record(record.id).is_cancelled());
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[0] = 7;
     frame.x[8] = 94;
@@ -5029,7 +5045,7 @@ fn arm_host_birth_adoption_racing_closing_has_one_cancel_owner() {
     );
     let adopted = worker.join().unwrap();
     let cancelled = if adopted {
-        fixture.zone.record(record).is_cancelled()
+        control.host_exit_requested()
     } else {
         fixture.page.host_birth_requested(birth_identity)
     };
@@ -5591,7 +5607,7 @@ fn arm_exit_group_under_gate(state: carrick_el1_abi::GateState) {
             5,
             arena.lifecycle(),
         )));
-        let (sibling, _) = imported_thread(fixture);
+        let (sibling, sibling_record) = imported_thread(fixture);
         let mut service = fixture.process_service();
         fixture
             .enter(
@@ -5651,6 +5667,13 @@ fn arm_exit_group_under_gate(state: carrick_el1_abi::GateState) {
         fixture
             .page
             .publish_exact_host_retirement(sibling, receipt.retirement());
+        let _ = fixture.zone.claim_for_host(
+            sibling_record,
+            None,
+            carrick_el1_abi::Handback::Cancelled,
+            &carrick_sched_core::ShortLockSpin,
+        );
+        assert!(fixture.zone.record(sibling_record.id).is_cancelled());
         drop(admission);
         assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Closed);
         assert!(matches!(

@@ -1298,12 +1298,37 @@ impl KernelState {
         let mut woken = 0;
         for thread in context.task().threads() {
             let control = thread.control_slot();
-            if thread.execution_state().generation().is_none()
-                || !(control.host_exit_requested()
-                    || control
-                        .host_birth_identity()
-                        .is_some_and(|identity| page.host_birth_requested(identity)))
+            if !(control.host_exit_requested()
+                || control
+                    .host_birth_identity()
+                    .is_some_and(|identity| page.host_birth_requested(identity)))
             {
+                continue;
+            }
+            if thread.execution_state().generation().is_none() {
+                // A ledger-published EL1 birth has no host continuation yet.
+                // Preserve its exact record and offer it to the existing
+                // first-entry activation route. A vCPU/producer owns any
+                // deferred handback; retiring the record would lose that wake.
+                let Some(record) = control.zone_record().filter(|record| {
+                    carrick_kernel::el1_zone::thread_key_of(*record) == Some(thread.key())
+                }) else {
+                    continue;
+                };
+                match carrick_kernel::el1_zone::claim(
+                    record,
+                    None,
+                    carrick_el1_abi::Handback::Control,
+                ) {
+                    carrick_el1_abi::HostClaim::Claimed
+                    | carrick_el1_abi::HostClaim::AlreadyHost => {
+                        carrick_kernel::el1_zone::hand_back(&[record]);
+                    }
+                    carrick_el1_abi::HostClaim::Deferred
+                    | carrick_el1_abi::HostClaim::El1Held { .. }
+                    | carrick_el1_abi::HostClaim::Stale => {}
+                }
+                woken += 1;
                 continue;
             }
             if let Err(error) = scheduler.wake_control(thread.key())

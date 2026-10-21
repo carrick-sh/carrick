@@ -1087,81 +1087,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
     }
 
-    fn cancel_members(
-        &self,
-        runtime: &NativeProcessRuntime<'a, M, C>,
-        page: &ThreadLifecyclePage,
-        members: &carrick_core::terminal::MemberSet,
-        adopted: &[(
-            carrick_core::terminal::ThreadBirthIdentity,
-            &'a ThreadControlSlot,
-            RecordRef,
-        )],
-    ) {
-        let wait = NativeBucketWait {
-            lifetime: core::marker::PhantomData,
-            #[cfg(test)]
-            probe: None,
-        };
-        for identity in members.host() {
-            if let Some((_, control, record)) =
-                adopted.iter().find(|(birth, _, _)| identity == birth)
-            {
-                if control.host_retirement().is_some()
-                    || control.entry().is_some_and(|entry| {
-                        carrick_el1_abi::Lifecycle::expected_exit_receipt(
-                            page,
-                            *control,
-                            Some(entry),
-                        ) == carrick_core::lifecycle::ExpectedExitReceipt::AlreadyExited
-                    })
-                {
-                    continue;
-                }
-                if runtime.zone.live(*record).is_some() {
-                    let _ = runtime
-                        .zone
-                        .claim_for_host(*record, None, Handback::Cancelled, &wait);
-                }
-            } else if let Some(index) = (0..carrick_el1_abi::THREAD_POOL_ENTRIES)
-                .find(|&index| page.host_birth_identity(index) == Some(*identity))
-            {
-                page.request_host_birth_cancel(index);
-            }
-        }
-        for entry in members.pool() {
-            let Some(address) = page.control_address(*entry) else {
-                continue;
-            };
-            // SAFETY: a live page entry pins its control allocation through
-            // terminal settlement; the entry generation authenticates reuse.
-            let control = unsafe { &*(address as *const ThreadControlSlot) };
-            if control.host_retirement().is_some()
-                || carrick_el1_abi::Lifecycle::expected_exit_receipt(page, control, Some(*entry))
-                    == carrick_core::lifecycle::ExpectedExitReceipt::AlreadyExited
-            {
-                continue;
-            }
-            let Some(record) = control.zone_record() else {
-                continue;
-            };
-            let Some(owned) = runtime.zone.live(record) else {
-                continue;
-            };
-            let Some(identity) = page.identity(*entry) else {
-                continue;
-            };
-            if owned.identity().tid != u64::from(identity.tid)
-                || owned.identity().serial != identity.thread_serial
-            {
-                continue;
-            }
-            let _ = runtime
-                .zone
-                .claim_for_host(record, None, Handback::Cancelled, &wait);
-        }
-    }
-
     /// Entry-less members that owe a host receipt, each with the exact birth
     /// identity its control slot records. A member whose slot records no
     /// birth identity cannot be owed an exact receipt: refuse the snapshot.
@@ -2081,17 +2006,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             if binding.issued() {
                 control.request_host_exit();
             }
-            let wait = NativeBucketWait {
-                lifetime: core::marker::PhantomData,
-                #[cfg(test)]
-                probe: None,
-            };
-            let _ = source.zone.claim_for_host(
-                source.zone.record_ref(record),
-                None,
-                Handback::Cancelled,
-                &wait,
-            );
+            // This member is still live and owes a host receipt. Preserve its
+            // record for the host control wake rather than retiring it here.
+            current.linux.mark_pending_host_work();
         }
         Ok(runtime)
     }
@@ -4683,17 +4600,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 hook();
             }
         }
-        if first_close && let Some(registry) = registry {
-            let members = self
-                .runtime
-                .graph
-                .lock()
-                .pending_exit
-                .get(&self.key)
-                .ok_or(NativeProcessError::Quarantined)?
-                .members
-                .clone();
-            registry.cancel_members(self.runtime, page, &members, &adopted);
+        if first_close {
+            // Closing requests host retirement; it does not retire live zone
+            // records. A deferred control wake is owned by that record's vCPU
+            // or producer until its handback reaches the host continuation.
+            // Force the boundary that dispatches the one-shot member wakes.
+            self.current.linux.mark_pending_host_work();
         }
         if let Some(notification) = member_notification {
             let service = &mut self.service;

@@ -7046,130 +7046,164 @@ mod tests {
     #[test]
     fn serial_host_native_terminal_wake_routes_uninitialized_parked_member() {
         use carrick_el1_abi::Lifecycle;
-        use carrick_kernel::kernel::objects::ThreadExecutionState;
-        let (_, scheduler, kernel, root, _, _) =
-            test_carrier_graph_with_dispatcher!(72_433, SyscallDispatcher::new());
-        root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
-        // A real host clone replenishes executable thread identities. Commit
-        // a subsequent in-zone birth, then let the production ledger publish it.
-        let _sibling = root
-            .kernel()
-            .reserve_thread_clone(
-                &root,
-                carrick_kernel::kernel::ClonePlan::from_flags(
-                    carrick_abi::LinuxCloneFlags::THREAD
+        for already_host in [true, false] {
+            use carrick_kernel::kernel::objects::ThreadExecutionState;
+            let (_, scheduler, kernel, root, _, _) =
+                test_carrier_graph_with_dispatcher!(72_433, SyscallDispatcher::new());
+            root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+            // A real host clone replenishes executable thread identities. Commit
+            // a subsequent in-zone birth, then let the production ledger publish it.
+            let _sibling = root
+                .kernel()
+                .reserve_thread_clone(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::THREAD
+                            | carrick_abi::LinuxCloneFlags::SIGHAND
+                            | carrick_abi::LinuxCloneFlags::VM
+                            | carrick_abi::LinuxCloneFlags::FILES
+                            | carrick_abi::LinuxCloneFlags::FS,
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+                .prepare(ThreadId::synthetic_for_tests(72_434))
+                .unwrap()
+                .commit_for_el1()
+                .unwrap()
+                .start_thread()
+                .unwrap()
+                .into_context();
+            let page = root.lifecycle_page();
+            let claim = page.claim_any().unwrap();
+            let entry = claim.entry();
+            let identity = page.identity(entry).unwrap();
+            let region = carrick_test_support::TestEl1Region::zeroed();
+            struct Restore(usize);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    carrick_el1_abi::record_el1_region_host_ptr(self.0);
+                }
+            }
+            let _restore = Restore(carrick_el1_abi::get_el1_region_host_ptr());
+            carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
+            let zone = carrick_el1_abi::zone_tables().unwrap();
+            let slot = carrick_el1_abi::SlotId::new(0);
+            let mm = root.shared().mm().id().raw();
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, mm, Some(0), 1);
+            zone.enter_guest(slot);
+            zone.enter_idle(slot, true);
+            let space = zone.spaces.publish_closed(mm, 0x10000, 0x10000).unwrap();
+            zone.spaces.open(space);
+            zone.install_space(slot, mm).unwrap();
+            page.thread_born().unwrap();
+            page.record_born(
+                claim,
+                carrick_el1_abi::BornRecord {
+                    caller_task: root.thread().key().tid.raw() as u64,
+                    caller_serial: root.thread().key().serial.raw(),
+                    clone_flags: (carrick_abi::LinuxCloneFlags::THREAD
                         | carrick_abi::LinuxCloneFlags::SIGHAND
                         | carrick_abi::LinuxCloneFlags::VM
                         | carrick_abi::LinuxCloneFlags::FILES
-                        | carrick_abi::LinuxCloneFlags::FS,
+                        | carrick_abi::LinuxCloneFlags::FS)
+                        .bits(),
+                    clear_child_tid: 0,
+                    blocked: carrick_el1_abi::BlockedMask(0),
+                },
+            )
+            .unwrap();
+            root.kernel().settle_thread_ledger();
+            let born = root
+                .kernel()
+                .context(
+                    root.task().key().id,
+                    carrick_kernel::kernel::LinuxTid::from_abi_positive(identity.tid as i32)
+                        .unwrap(),
                 )
-                .unwrap(),
-                None,
-            )
-            .unwrap()
-            .prepare(ThreadId::synthetic_for_tests(72_434))
-            .unwrap()
-            .commit_for_el1()
-            .unwrap()
-            .start_thread()
-            .unwrap()
-            .into_context();
-        let page = root.lifecycle_page();
-        let claim = page.claim_any().unwrap();
-        let entry = claim.entry();
-        let identity = page.identity(entry).unwrap();
-        let region = carrick_test_support::TestEl1Region::zeroed();
-        struct Restore(usize);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                carrick_el1_abi::record_el1_region_host_ptr(self.0);
+                .unwrap();
+            let control = born.thread().control_slot();
+            let address = control as *const _ as u64;
+            let record = zone
+                .alloc_record(carrick_el1_abi::ThreadIdentity {
+                    tid: u64::from(identity.tid),
+                    serial: identity.thread_serial,
+                    mm,
+                    file_table: root.resources().files().id().raw(),
+                    generation: 0,
+                    affinity: 1,
+                    lifecycle_page: &*page as *const _ as u64,
+                    control_slot: address,
+                })
+                .unwrap();
+            let record = zone.record_ref(record);
+            control.bind_zone_record(record);
+            let wait_address = 0x8800;
+            let guard = zone.short_lock(
+                carrick_el1_abi::ZoneTables::bucket_of_with_context(mm, wait_address),
+                &carrick_sched_core::ShortLockSpin,
+            );
+            let seq = zone.next_seq(record.id);
+            zone.enqueue(&guard, record.id, seq, mm, wait_address, u32::MAX, 0)
+                .unwrap();
+            zone.publish_park(record.id, seq);
+            drop(guard);
+            assert_eq!(
+                born.thread().execution_state(),
+                ThreadExecutionState::Uninitialized
+            );
+            assert_eq!(
+                page.state(entry.index()),
+                Some((entry.generation(), carrick_el1_abi::EntryState::Published))
+            );
+            if already_host {
+                assert_eq!(
+                    zone.claim_for_host(
+                        record,
+                        None,
+                        carrick_el1_abi::Handback::Control,
+                        &carrick_kernel::el1_zone::HostLockWait
+                    ),
+                    carrick_el1_abi::HostClaim::Claimed
+                );
             }
+            control.request_host_exit();
+            page.publish_exit_wait(carrick_core_abi::EntryMmKey::from_raw(mm), 0x9900);
+            // This is the existing runtime batch, not a duplicate wake algorithm.
+            assert_eq!(
+                carrick_kernel::el1_zone::with_test_zone(zone, || kernel
+                    .wake_native_terminal_members(&root)
+                    .unwrap()),
+                1
+            );
+            assert_eq!(zone.record(record.id).entry_count(), 0);
+            assert!(!zone.record(record.id).is_cancelled());
+            let carrick_el1_abi::Claim::Queued {
+                slot: service_slot, ..
+            } = zone.record(record.id).claim()
+            else {
+                panic!(
+                    "first-entry control handback left claim {:?}, handback {:?}, unadopted {}",
+                    zone.record(record.id).claim(),
+                    zone.record(record.id).handback(),
+                    zone.record(record.id).is_unadopted_birth()
+                );
+            };
+            assert_eq!(
+                zone.record(record.id).handback(),
+                Some(carrick_el1_abi::Handback::Control)
+            );
+            assert_eq!(zone.runnable_head(service_slot), Some(record.id));
+            assert_eq!(
+                zone.take_service_head(service_slot),
+                Some(record),
+                "Closing must offer a parked birth once, including one already host-owned"
+            );
+            assert_eq!(kernel.wake_native_terminal_members(&root).unwrap(), 0);
+            scheduler.close();
         }
-        let _restore = Restore(carrick_el1_abi::get_el1_region_host_ptr());
-        carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
-        let zone = carrick_el1_abi::zone_tables().unwrap();
-        let slot = carrick_el1_abi::SlotId::new(0);
-        let mm = root.shared().mm().id().raw();
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, mm, Some(0), 1);
-        zone.enter_guest(slot);
-        page.thread_born().unwrap();
-        page.record_born(
-            claim,
-            carrick_el1_abi::BornRecord {
-                caller_task: root.thread().key().tid.raw() as u64,
-                caller_serial: root.thread().key().serial.raw(),
-                clone_flags: (carrick_abi::LinuxCloneFlags::THREAD
-                    | carrick_abi::LinuxCloneFlags::SIGHAND
-                    | carrick_abi::LinuxCloneFlags::VM
-                    | carrick_abi::LinuxCloneFlags::FILES
-                    | carrick_abi::LinuxCloneFlags::FS)
-                    .bits(),
-                clear_child_tid: 0,
-                blocked: carrick_el1_abi::BlockedMask(0),
-            },
-        )
-        .unwrap();
-        root.kernel().settle_thread_ledger();
-        let born = root
-            .kernel()
-            .context(
-                root.task().key().id,
-                carrick_kernel::kernel::LinuxTid::from_abi_positive(identity.tid as i32).unwrap(),
-            )
-            .unwrap();
-        let control = born.thread().control_slot();
-        let address = control as *const _ as u64;
-        let record = zone
-            .alloc_record(carrick_el1_abi::ThreadIdentity {
-                tid: u64::from(identity.tid),
-                serial: identity.thread_serial,
-                mm,
-                file_table: root.resources().files().id().raw(),
-                generation: 0,
-                affinity: 1,
-                lifecycle_page: &*page as *const _ as u64,
-                control_slot: address,
-            })
-            .unwrap();
-        let record = zone.record_ref(record);
-        control.bind_zone_record(record);
-        let wait_address = 0x8800;
-        let guard = zone.short_lock(
-            carrick_el1_abi::ZoneTables::bucket_of_with_context(mm, wait_address),
-            &carrick_sched_core::ShortLockSpin,
-        );
-        let seq = zone.next_seq(record.id);
-        zone.enqueue(&guard, record.id, seq, mm, wait_address, u32::MAX, 0)
-            .unwrap();
-        zone.publish_park(record.id, seq);
-        drop(guard);
-        assert_eq!(
-            born.thread().execution_state(),
-            ThreadExecutionState::Uninitialized
-        );
-        assert_eq!(
-            page.state(entry.index()),
-            Some((entry.generation(), carrick_el1_abi::EntryState::Published))
-        );
-        control.request_host_exit();
-        page.publish_exit_wait(carrick_core_abi::EntryMmKey::from_raw(mm), 0x9900);
-        // This is the existing runtime batch, not a duplicate wake algorithm.
-        assert_eq!(
-            carrick_kernel::el1_zone::with_test_zone(zone, || kernel
-                .wake_native_terminal_members(&root)
-                .unwrap()),
-            1
-        );
-        assert_eq!(zone.record(record.id).entry_count(), 0);
-        assert!(!zone.record(record.id).is_cancelled());
-        assert_eq!(
-            zone.take_service_head(slot),
-            Some(record),
-            "Closing must offer a parked birth to its owned first-entry activation"
-        );
-        assert_eq!(kernel.wake_native_terminal_members(&root).unwrap(), 0);
-        scheduler.close();
     }
 
     #[test]
