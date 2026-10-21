@@ -565,7 +565,10 @@ impl<'a> FsView<'a> {
             let pathname = pathname.0;
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
-            let path = read_guest_c_string(memory, pathname)?;
+            let path = match read_guest_c_string_before_effects(memory, pathname) {
+                Ok(path) => path,
+                Err(error) => return Ok(error.into_outcome()),
+            };
             match this.path_stat_record(cx.kernel, dirfd, &path, flags) {
                 Ok(record) => Ok(write_stat_record(memory, statbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -578,7 +581,10 @@ impl<'a> FsView<'a> {
             let pathname = pathname.0;
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
-            let path = read_guest_c_string(memory, pathname)?;
+            let path = match read_guest_c_string_before_effects(memory, pathname) {
+                Ok(path) => path,
+                Err(error) => return Ok(error.into_outcome()),
+            };
             match this.path_stat_record(cx.kernel, LINUX_AT_FDCWD, &path, 0) {
                 Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -602,7 +608,10 @@ impl<'a> FsView<'a> {
             let pathname = pathname.0;
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
-            let path = read_guest_c_string(memory, pathname)?;
+            let path = match read_guest_c_string_before_effects(memory, pathname) {
+                Ok(path) => path,
+                Err(error) => return Ok(error.into_outcome()),
+            };
             match this.path_stat_record(
                 cx.kernel,
                 LINUX_AT_FDCWD,
@@ -628,7 +637,10 @@ impl<'a> FsView<'a> {
             let pathname = pathname.0;
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
-            let path = read_guest_c_string(memory, pathname)?;
+            let path = match read_guest_c_string_before_effects(memory, pathname) {
+                Ok(path) => path,
+                Err(error) => return Ok(error.into_outcome()),
+            };
             match this.path_stat_record(cx.kernel, dirfd, &path, flags) {
                 Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -657,7 +669,10 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
 
-            let path = read_guest_c_string(memory, pathname)?;
+            let path = match read_guest_c_string_before_effects(memory, pathname) {
+                Ok(path) => path,
+                Err(error) => return Ok(error.into_outcome()),
+            };
             if path.is_empty() {
                 if flags & LINUX_AT_EMPTY_PATH == 0 {
                     return Ok(DispatchOutcome::errno(LINUX_ENOENT));

@@ -517,33 +517,106 @@ fn read_guest_exec_string_bytes(
     read_guest_c_string_bytes_bounded(memory, address, MAX_EXEC_STRING_BYTES, LINUX_E2BIG)
 }
 
+/// Pathname reads in redispatch-safe output handlers preserve exact owner
+/// refusals. No filesystem operation has started when this error is returned.
+pub(super) enum PathReadError {
+    Errno(LinuxErrno),
+    Refused(super::copyout::CopyoutRefusal),
+}
+
+impl PathReadError {
+    pub(super) fn into_outcome(self) -> DispatchOutcome {
+        match self {
+            Self::Errno(errno) => DispatchOutcome::errno(errno),
+            Self::Refused(refusal) => refusal.into_outcome(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PathReadPolicy {
+    ErrnoOnly,
+    BeforeEffects,
+}
+
+fn read_path_chunk(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+    bytes: &mut [u8],
+    policy: PathReadPolicy,
+) -> Result<bool, PathReadError> {
+    match memory.read_into(address, bytes) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            if matches!(policy, PathReadPolicy::BeforeEffects)
+                && let Some(refusal) = super::copyout::CopyoutRefusal::from_read_error(error)
+            {
+                return Err(PathReadError::Refused(refusal));
+            }
+            Ok(false)
+        }
+    }
+}
+
 fn read_guest_c_string_bytes_bounded(
     memory: &impl CurrentMmMemory,
     address: u64,
     max_bytes_including_nul: usize,
     too_long: LinuxErrno,
 ) -> Result<Vec<u8>, LinuxErrno> {
+    read_guest_c_string_bytes_bounded_with_policy(
+        memory,
+        address,
+        max_bytes_including_nul,
+        too_long,
+        PathReadPolicy::ErrnoOnly,
+    )
+    .map_err(|error| match error {
+        PathReadError::Errno(errno) => errno,
+        PathReadError::Refused(_) => LINUX_EFAULT,
+    })
+}
+
+pub(super) fn read_guest_c_string_before_effects(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+) -> Result<String, PathReadError> {
+    read_guest_c_string_bytes_bounded_with_policy(
+        memory,
+        address,
+        MAX_GUEST_PATH,
+        LINUX_ENAMETOOLONG,
+        PathReadPolicy::BeforeEffects,
+    )
+    .map(|bytes| carrick_vfs::pathcodec::encode_bytes(&bytes))
+}
+
+fn read_guest_c_string_bytes_bounded_with_policy(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+    max_bytes_including_nul: usize,
+    too_long: LinuxErrno,
+    policy: PathReadPolicy,
+) -> Result<Vec<u8>, PathReadError> {
     const CHUNK: usize = 256;
     let mut bytes = Vec::new();
     let mut offset = 0usize;
     let mut stack_chunk = [0u8; CHUNK];
     while offset < max_bytes_including_nul {
-        let current_address = address.checked_add(offset as u64).ok_or(too_long)?;
+        let current_address = address
+            .checked_add(offset as u64)
+            .ok_or(PathReadError::Errno(too_long))?;
         let to_read = CHUNK.min(max_bytes_including_nul - offset);
-        let read_len = if memory
-            .read_into(current_address, &mut stack_chunk[..to_read])
-            .is_ok()
-        {
-            to_read
-        } else if to_read > 1
-            && memory
-                .read_into(current_address, &mut stack_chunk[..1])
-                .is_ok()
-        {
-            1
-        } else {
-            return Err(LINUX_EFAULT);
-        };
+        let read_len =
+            if read_path_chunk(memory, current_address, &mut stack_chunk[..to_read], policy)? {
+                to_read
+            } else if to_read > 1
+                && read_path_chunk(memory, current_address, &mut stack_chunk[..1], policy)?
+            {
+                1
+            } else {
+                return Err(PathReadError::Errno(LINUX_EFAULT));
+            };
         let slice = &stack_chunk[..read_len];
         if let Some(nul) = slice.iter().position(|&byte| byte == 0) {
             bytes.extend_from_slice(&slice[..nul]);
@@ -552,7 +625,7 @@ fn read_guest_c_string_bytes_bounded(
         offset += read_len;
         bytes.extend_from_slice(slice);
     }
-    Err(too_long)
+    Err(PathReadError::Errno(too_long))
 }
 
 /// As [`read_guest_c_string_bytes`], carried into a Rust `String` for the paths

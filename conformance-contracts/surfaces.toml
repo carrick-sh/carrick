@@ -1704,3 +1704,11 @@ contracts = ["kernel.copyout.owner-refusal"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/continuation/readiness.rs"
 contracts = ["kernel.copyout.owner-refusal"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/rootfs_helpers.rs"
+contracts = ["kernel.copyout.owner-refusal"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/stat.rs"
+contracts = ["kernel.copyout.owner-refusal"]
