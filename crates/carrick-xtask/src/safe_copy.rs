@@ -143,74 +143,6 @@ fn read_text(path: &Path, limit: u64, hook: impl FnOnce()) -> io::Result<String>
     Ok(value)
 }
 
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used)]
-    use super::*;
-    #[test]
-    fn text_swap_does_not_read_replacement() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("data");
-        let secret = temp.path().join("secret");
-        std::fs::write(&path, "ordinary").unwrap();
-        std::fs::write(&secret, "SENTINEL-SECRET").unwrap();
-        let value = read_text(&path, 100, || {
-            std::fs::remove_file(&path).unwrap();
-            std::os::unix::fs::symlink(&secret, &path).unwrap();
-        })
-        .unwrap();
-        assert_eq!(value, "ordinary");
-    }
-    #[test]
-    fn packed_refs_are_resolved_without_candidate_configuration() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source");
-        let target = tmp.path().join("copy");
-        std::fs::create_dir(&source).unwrap();
-        git(&source, &["init"]).unwrap();
-        git(&source, &["checkout", "-b", "work/test"]).unwrap();
-        std::fs::write(source.join("data"), "ordinary").unwrap();
-        git(&source, &["add", "."]).unwrap();
-        git(&source, &["commit", "-m", "base"]).unwrap();
-        git(&source, &["pack-refs", "--all", "--prune"]).unwrap();
-        assert!(!source.join(".git/refs/heads/work/test").exists());
-        let marker = tmp.path().join("executed");
-        let script = source.join(".git/hooks/post-checkout");
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        repository(&source, &target, "work/test").unwrap();
-        assert_eq!(
-            git(&source, &["rev-parse", "HEAD"]).unwrap(),
-            git(&target, &["rev-parse", "HEAD"]).unwrap()
-        );
-        assert!(!marker.exists());
-    }
-    #[test]
-    fn swapped_file_never_reads_sentinel() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = tmp.path().join("source");
-        std::fs::create_dir(&source).unwrap();
-        let entry = source.join("file");
-        std::fs::write(&entry, "ordinary").unwrap();
-        let sentinel = tmp.path().join("secret");
-        std::fs::write(&sentinel, "SENTINEL-SECRET").unwrap();
-        let target = tmp.path().join("copy");
-        let _ = copy(&source, &target, &mut 0, Links::Refuse, &mut || {
-            std::fs::remove_file(&entry).unwrap();
-            std::os::unix::fs::symlink(&sentinel, &entry).unwrap();
-        });
-        assert!(
-            !target.join("file").exists()
-                || std::fs::read(target.join("file")).unwrap() != b"SENTINEL-SECRET"
-        );
-    }
-}
-
 pub fn git_command(root: &Path, args: &[&str]) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     // Repository-local config still applies; use a fresh repository for untrusted input.
@@ -317,4 +249,72 @@ pub fn repository(
     git(target, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     git(target, &["read-tree", "HEAD"])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    #[test]
+    fn text_swap_does_not_read_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("data");
+        let secret = temp.path().join("secret");
+        std::fs::write(&path, "ordinary").unwrap();
+        std::fs::write(&secret, "SENTINEL-SECRET").unwrap();
+        let value = read_text(&path, 100, || {
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&secret, &path).unwrap();
+        })
+        .unwrap();
+        assert_eq!(value, "ordinary");
+    }
+    #[test]
+    fn packed_refs_are_resolved_without_candidate_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("copy");
+        std::fs::create_dir(&source).unwrap();
+        git(&source, &["init"]).unwrap();
+        git(&source, &["checkout", "-b", "work/test"]).unwrap();
+        std::fs::write(source.join("data"), "ordinary").unwrap();
+        git(&source, &["add", "."]).unwrap();
+        git(&source, &["commit", "-m", "base"]).unwrap();
+        git(&source, &["pack-refs", "--all", "--prune"]).unwrap();
+        assert!(!source.join(".git/refs/heads/work/test").exists());
+        let marker = tmp.path().join("executed");
+        let script = source.join(".git/hooks/post-checkout");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        repository(&source, &target, "work/test").unwrap();
+        assert_eq!(
+            git(&source, &["rev-parse", "HEAD"]).unwrap(),
+            git(&target, &["rev-parse", "HEAD"]).unwrap()
+        );
+        assert!(!marker.exists());
+    }
+    #[test]
+    fn swapped_file_never_reads_sentinel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let entry = source.join("file");
+        std::fs::write(&entry, "ordinary").unwrap();
+        let sentinel = tmp.path().join("secret");
+        std::fs::write(&sentinel, "SENTINEL-SECRET").unwrap();
+        let target = tmp.path().join("copy");
+        let _ = copy(&source, &target, &mut 0, Links::Refuse, &mut || {
+            std::fs::remove_file(&entry).unwrap();
+            std::os::unix::fs::symlink(&sentinel, &entry).unwrap();
+        });
+        assert!(
+            !target.join("file").exists()
+                || std::fs::read(target.join("file")).unwrap() != b"SENTINEL-SECRET"
+        );
+    }
 }
