@@ -19,3 +19,5 @@ pub use personality::{
 
 #[cfg(test)]
 extern crate std;
+
+pub mod affinity;

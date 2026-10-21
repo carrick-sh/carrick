@@ -328,3 +328,25 @@ fn affinity_permission_uses_the_named_threads_credentials() {
     assert_eq!(caller.thread().affinity().words()[0], 3);
     assert_eq!(sibling.thread().affinity().words()[0], 2);
 }
+
+#[test]
+fn host_and_control_share_the_only_affinity_mask() {
+    let f = Fixture::new();
+    for thread in [f.root.thread(), f.sibling.thread()] {
+        assert_eq!(
+            thread.control_slot().affinity().words(),
+            thread.affinity().words()
+        );
+        struct NoResidency;
+        impl carrick_core::affinity::AffinityNotifier for NoResidency {
+            fn notify(&mut self, _: carrick_core::affinity::AffinityNotification) {
+                panic!("fixture has no running residency");
+            }
+        }
+        thread.control_slot().change_affinity(
+            carrick_core::affinity::CpuAffinity::single(1),
+            &mut NoResidency,
+        );
+        assert_eq!(thread.affinity().words(), &[2]);
+    }
+}

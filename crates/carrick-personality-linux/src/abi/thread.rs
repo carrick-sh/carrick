@@ -500,9 +500,35 @@ pub struct ThreadControlSlot {
     non_interrupting: AtomicU64,
     native_pending: PendingSummary,
     native_pending_writer: AtomicU32,
+    /// The exact thread's sole affinity authority, shared by ring and host.
+    affinity: carrick_core::affinity::AffinityAuthority,
 }
 
 impl ThreadControlSlot {
+    pub fn affinity(&self) -> carrick_core::affinity::CpuAffinity {
+        carrick_core::affinity::CpuAffinity::from_words(&[self.affinity.load()])
+    }
+    /// Seed exclusively retained pre-birth storage; live writes must use
+    /// change_affinity so residency notification cannot be omitted.
+    pub fn set_affinity(&self, mask: carrick_core::affinity::CpuAffinity) {
+        assert!(
+            self.affinity.initialize_quiescent(mask.words()[0]),
+            "live affinity mutation bypassed its notification authority"
+        );
+    }
+    pub fn change_affinity(
+        &self,
+        mask: carrick_core::affinity::CpuAffinity,
+        notifier: &mut impl carrick_core::affinity::AffinityNotifier,
+    ) {
+        self.affinity.change(mask.words()[0], notifier);
+    }
+    pub fn affinity_authority(&self) -> &carrick_core::affinity::AffinityAuthority {
+        &self.affinity
+    }
+    pub fn initialize_affinity(&self, mask: carrick_core::affinity::CpuAffinity) {
+        self.affinity.initialize(mask.words()[0]);
+    }
     pub fn recorded_exit_kind(
         &self,
         entry: Option<EntryRef>,
@@ -512,6 +538,7 @@ impl ThreadControlSlot {
 
     pub const fn new() -> Self {
         Self {
+            affinity: carrick_core::affinity::AffinityAuthority::new(),
             visible_tid: AtomicU32::new(0),
             blocked: AtomicU64::new(0),
             forwarded_saved_mask: AtomicU64::new(0),
@@ -629,6 +656,7 @@ impl ThreadControlSlot {
         self.retired_birth.clear(Ordering::Relaxed);
         self.zone_incarnation.store(0, Ordering::Relaxed);
         self.zone_seq.store(0, Ordering::Relaxed);
+        self.affinity.reset_exclusive();
         self.pending.clear(PendingSignals(u64::MAX));
         self.blocked.store(blocked.0, Ordering::Relaxed);
         self.birth_thread.store(0, Ordering::Relaxed);
@@ -1354,7 +1382,7 @@ impl LifecycleHatches {
             | (if self.sigmask { SERVING_SIGMASK } else { 0 })
     }
 }
-const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 192);
+const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 256);
 const _: () = assert!(core::mem::size_of::<PoolEntry>() == 80);
 
 /// Linux keeps the last thread's exit with the terminal runtime owner.
@@ -1951,7 +1979,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 42] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 44] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::offset_of!(PoolEntry, birth) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, terminal) as u64,
@@ -1994,6 +2022,8 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 42] = [
     ::core::mem::size_of::<HostBornMember>() as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, closing_verdict) as u64,
     ::core::mem::size_of::<ClosingVerdictRecord>() as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, affinity) as u64,
+    ::core::mem::size_of::<carrick_core::affinity::AffinityAuthority>() as u64,
 ];
 
 #[cfg(test)]
@@ -2947,7 +2977,7 @@ mod layout_manifest {
                 size_of::<ThreadControlSlot>(),
                 align_of::<ThreadControlSlot>()
             ),
-            (192, 64)
+            (256, 64)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |ThreadControlSlot {
@@ -2977,6 +3007,7 @@ mod layout_manifest {
                      non_interrupting: _,
                      native_pending: _,
                      native_pending_writer: _,
+                     affinity: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
@@ -3031,6 +3062,14 @@ mod layout_manifest {
             184,
             4,
             4
+        );
+        field!(
+            ThreadControlSlot,
+            affinity,
+            carrick_core::affinity::AffinityAuthority,
+            192,
+            32,
+            8
         );
     }
 
