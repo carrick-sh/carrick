@@ -20,7 +20,7 @@ use super::{
 use crate::dispatch::format_time::{BlockingTimerFdRead, TimerFdPollSource, TimerFdReadPlan};
 use crate::dispatch::{BlockingMqueue, BlockingSemop};
 use crate::dispatch::{BlockingRecordLock, BlockingWrite, DispatchOutcome};
-use crate::kernel::{Kernel, Task};
+use crate::kernel::{Kernel, KernelContext, Task};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResumeContext {
@@ -553,7 +553,6 @@ impl SignalReadinessProbe {
                 .then_some(ContinuationEvent::Signal);
         }
         let authority = context.signal_authority();
-        let host_signum = self.host_signal.take_pending_for(self.thread.tid.raw());
         if self.family.is_kill_only_wait() {
             // A ptrace request waiting out its tracee's stop settlement is
             // killable-only for the same reason: it has performed nothing,
@@ -564,31 +563,9 @@ impl SignalReadinessProbe {
             // gate releases the parent. Reserve SIGKILL as a typed signal
             // event so the delivery tail terminates the parent without ever
             // manufacturing a successful vfork return.
-            if host_signum != 0 && host_signum != crate::linux_abi::LINUX_SIGKILL {
-                self.host_signal
-                    .publish_pending_for(self.thread.tid.raw(), host_signum);
-            }
-            let kill_only = WaitSigMask::Replace(
-                SigSet::EMPTY
-                    .complement()
-                    .without(crate::linux_abi::LINUX_SIGKILL),
-            );
-            let reservation = if host_signum == crate::linux_abi::LINUX_SIGKILL {
-                authority.reserve_deliverable_for_wait_with_host_slot(
-                    kill_only,
-                    self.thread.tid.raw(),
-                    host_signum,
-                )
-            } else {
-                authority.reserve_deliverable_for_wait(kill_only)
-            };
-            return reservation.map(|reservation| {
-                ContinuationEvent::ReservedSignal(ReservedSignal::from_kernel_reservation(
-                    authority,
-                    reservation,
-                ))
-            });
+            return reserve_killable_wait_signal(&context).map(ContinuationEvent::ReservedSignal);
         }
+        let host_signum = self.host_signal.take_pending_for(self.thread.tid.raw());
         if let Some(wait_set) = self.wait_set {
             if host_signum != 0 && wait_set.contains(host_signum) {
                 self.host_signal
@@ -1042,4 +1019,30 @@ impl ReadinessProbe {
             Self::Passive { deadline } => deadline_event(*deadline),
         }
     }
+}
+
+/// Reserve only SIGKILL at an internal kernel lock wait. Ordinary host and
+/// kernel signals remain pending until the syscall's return boundary.
+pub fn reserve_killable_wait_signal(context: &KernelContext) -> Option<ReservedSignal> {
+    let host_signal = context.kernel().host_signal();
+    let authority = context.signal_authority();
+    let host_signum = host_signal.take_pending_for(context.thread().key().tid.raw());
+    if host_signum != 0 && host_signum != crate::linux_abi::LINUX_SIGKILL {
+        host_signal.publish_pending_for(context.thread().key().tid.raw(), host_signum);
+    }
+    let kill_only = WaitSigMask::Replace(
+        SigSet::EMPTY
+            .complement()
+            .without(crate::linux_abi::LINUX_SIGKILL),
+    );
+    let reservation = if host_signum == crate::linux_abi::LINUX_SIGKILL {
+        authority.reserve_deliverable_for_wait_with_host_slot(
+            kill_only,
+            context.thread().key().tid.raw(),
+            host_signum,
+        )
+    } else {
+        authority.reserve_deliverable_for_wait(kill_only)
+    };
+    reservation.map(|reservation| ReservedSignal::from_kernel_reservation(authority, reservation))
 }

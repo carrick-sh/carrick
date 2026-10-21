@@ -60,8 +60,8 @@ pub mod readiness;
 pub mod wait_service;
 
 pub(crate) use self::readiness::ReadinessProbe;
-pub use self::readiness::SignalReadinessProbe;
 pub use self::readiness::{ContinuationWakeToken, ReservedSignal, ResumeContext, StaleThreadCause};
+pub use self::readiness::{SignalReadinessProbe, reserve_killable_wait_signal};
 pub use self::wait_service::{
     CarrierWaitService, ContinuationEventFuture, WaitServiceError, WaitServiceTopology,
     WakePublishReceipt,
