@@ -487,6 +487,13 @@ pub(crate) mod owner_fixture {
             wait
         }
 
+        /// Refuse the next guest read with an Editor wait.
+        pub(crate) fn refuse_next_read(&self) -> PortalOwnerWait {
+            let wait = editor_wait();
+            self.refuse_read.set(Some(wait));
+            wait
+        }
+
         /// Mark `[address, address + len)` readable but not writable (`PROT_READ`).
         pub(crate) fn protect_readonly(&mut self, address: u64, len: usize) {
             self.readonly.push((address, len));
