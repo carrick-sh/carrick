@@ -7345,6 +7345,119 @@ mod tests {
         scheduler.close();
     }
 
+    #[test]
+    fn physical_owner_wait_sigkill_enters_production_terminal_without_readiness() {
+        #[derive(Debug)]
+        struct NotReady;
+        impl carrick_guest_mem::PhysicalMemoryWait for NotReady {
+            fn is_ready(&self) -> bool {
+                false
+            }
+            fn enroll(
+                &self,
+                _: Arc<dyn Fn() + Send + Sync>,
+            ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+                (Box::new(()), false)
+            }
+        }
+        let dispatcher = SyscallDispatcher::new();
+        let (_runtime, scheduler, kernel, root, process, _generation) =
+            test_carrier_graph_with_dispatcher!(72_431, dispatcher);
+        let tid = ThreadId::synthetic_for_tests(72_431);
+        let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            Arc::new(ThreadRegistry::new(tid)),
+            Arc::new(FutexTable::new()),
+            Arc::new(NoopPlatformFutex),
+            Arc::new(|_| Arc::new(NoopPlatformFutex)),
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(root.thread())),
+            Some(process.pid()),
+            root.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            tid,
+            Arc::new(Mutex::new(Vec::new())),
+            kicker,
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(root.retain_exact());
+        state.guest_execution = Some(
+            kernel
+                .dispatcher
+                .enter_mm_executor_for_thread(
+                    Some(Arc::clone(root.thread())),
+                    Arc::clone(&state.kicker),
+                    tid,
+                    test_execution_slot(),
+                )
+                .unwrap(),
+        );
+        let mut engine = CrashCaptureTestEngine {
+            prepare_dependency: Some(carrick_guest_mem::OwnedMemoryWait(Arc::new(NotReady))),
+            ..Default::default()
+        };
+        let frame = carrick_hal::RawSyscall {
+            current_guest_sp: None,
+            number: carrick_abi::syscall::nr::PIPE2,
+            args: [0x2000, 0, 0, 0, 0, 0],
+            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+            native_number: carrick_abi::NativeNr(carrick_abi::syscall::nr::PIPE2.raw()),
+        };
+        let outcome = state
+            .service_threaded_syscall(&kernel, &mut engine, frame, None)
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::OwnerPhysicalWait { .. }));
+        let mut job =
+            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+        let registration = scheduler
+            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+            .unwrap();
+        let mut running = scheduler.take(&registration).unwrap();
+        let reject_descendant = |_, _| unreachable!();
+        let mut submission = executor::ExecutorSubmissionContext {
+            registration: Some(&registration),
+            scheduler: &scheduler,
+            publish_test_descendant: &reject_descendant,
+            current: None,
+            authority: executor::ExecutionLeaseAuthoritySlot::new(Some(running.take_lease())),
+            exec_replacement: None,
+        };
+        let need_resched = std::sync::atomic::AtomicBool::new(false);
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+        assert!(matches!(
+            job.route_outcome(&mut engine, &mut control, frame, outcome)
+                .unwrap(),
+            executor::ExecutorExit::Blocked(_)
+        ));
+        root.signal_authority().enqueue_thread_standard(
+            carrick_kernel::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGKILL)
+                .unwrap(),
+            None,
+        );
+        root.task().wake();
+        assert!(
+            !kernel.process_exiting(),
+            "posting SIGKILL alone is not group exit"
+        );
+        job.poll_with_engine(&mut engine, &mut control).unwrap();
+        assert!(
+            job.phase.is_terminal_transition(),
+            "SIGKILL must enter production termination while physical backing is unready"
+        );
+        assert!(kernel.process_exiting());
+        assert!(
+            engine.completed_syscalls.is_empty(),
+            "SIGKILL must not fabricate a syscall return"
+        );
+        assert_eq!(root.resources().files().slot_count(), 0);
+        let lease = submission.take_execution_lease().unwrap();
+        running.restore_lease(lease).unwrap();
+        scheduler.settle_runnable_successor(running).unwrap();
+        scheduler.close();
+    }
+
     /// The forkexecstorm wedge: the parked executor's barrier callback woke
     /// only on `Released`, while `publish_quiesce_event` consumes every
     /// one-shot listener on ANY event. A `Raised` from the next fork on a
