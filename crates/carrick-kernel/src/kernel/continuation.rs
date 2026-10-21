@@ -1705,8 +1705,9 @@ impl BlockedContinuation {
         })
     }
 
-    /// An owned write waits for its page owner without consuming ordinary
-    /// signals. Only SIGKILL can end this zone park before owner release.
+    /// An owned memory operation waits for its page owner without consuming
+    /// ordinary signals. Only SIGKILL can end this zone park before owner
+    /// release.
     pub fn from_killable_owner_zone_park(capture: ContinuationCapture, wait: ZoneWait) -> Self {
         let Self::ZoneFutexWait(state) = Self::from_zone_park(capture, wait, None) else {
             unreachable!()
