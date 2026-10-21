@@ -1986,6 +1986,15 @@ fn idle_resched_keeps_an_affinity_excluded_home_record_queued() {
 
 #[test]
 fn switched_thread_affinity_exclusion_migrates_without_a_tick() {
+    switched_affinity_boundary(false);
+}
+
+#[test]
+fn switched_thread_affinity_migrates_at_return_without_an_irq() {
+    switched_affinity_boundary(true);
+}
+
+fn switched_affinity_boundary(at_return: bool) {
     let zone = zone();
     let other = SlotId::new(4);
     host_publish(&zone, SLOT, MM, Some(1), 3);
@@ -2015,7 +2024,7 @@ fn switched_thread_affinity_exclusion_migrates_without_a_tick() {
     let mut cpu = FakeCpu::default();
     let before = cpu.now;
     let mut frame = TrapFrame::default();
-    let action = Sched {
+    let mut scheduler = Sched {
         zone: &zone,
         slot: SLOT,
         task: &task,
@@ -2023,9 +2032,15 @@ fn switched_thread_affinity_exclusion_migrates_without_a_tick() {
         user: &HardwareUserWord,
         counters: counters(),
         handoff: None,
+    };
+    if at_return {
+        assert_eq!(scheduler.run_ready(&mut frame), Some(Served::Idle));
+    } else {
+        assert_eq!(
+            scheduler.interrupt(&mut frame, ETIMEDOUT_RESULT),
+            carrick_el1_abi::Action::Idle
+        );
     }
-    .interrupt(&mut frame, ETIMEDOUT_RESULT);
-    assert_eq!(action, carrick_el1_abi::Action::Idle);
     assert_eq!(zone.slot(SLOT).current(), None);
     assert_eq!(zone.switch_in_full(other).unwrap().record, record);
     assert_eq!(cpu.now, before);
