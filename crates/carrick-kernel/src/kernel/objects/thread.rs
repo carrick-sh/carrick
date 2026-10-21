@@ -3103,7 +3103,10 @@ impl Thread {
         let slot = task.allocate_thread_control(key);
         slot.set_affinity(carrick_core::affinity::CpuAffinity::from_words(
             affinity.words(),
-        ));
+        ))
+        .unwrap_or_else(|_| {
+            carrick_fatal!("thread::control", "new control has live affinity residency")
+        });
         slot.init_blocked(BlockedMask(seed.blocked().raw()));
         slot.write_altstack(altstack_to_slot(seed.altstack()));
         slot
@@ -3251,9 +3254,16 @@ impl Thread {
                 caller_affinity.words(),
             ));
         } else {
-            control.set_affinity(carrick_core::affinity::CpuAffinity::from_words(
-                caller_affinity.words(),
-            ));
+            control
+                .set_affinity(carrick_core::affinity::CpuAffinity::from_words(
+                    caller_affinity.words(),
+                ))
+                .unwrap_or_else(|_| {
+                    carrick_fatal!(
+                        "thread::control",
+                        "clone control has live affinity residency"
+                    )
+                });
         }
         Arc::new(Thread {
             key,

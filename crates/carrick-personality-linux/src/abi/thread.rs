@@ -508,17 +508,24 @@ pub struct ThreadControlSlot {
     affinity_guest_alias: AtomicU64,
 }
 
+/// Quiescent initialization was attempted on a live execution authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AffinitySeedRefused;
+
 impl ThreadControlSlot {
     pub fn affinity(&self) -> carrick_core::affinity::CpuAffinity {
         carrick_core::affinity::CpuAffinity::from_words(&[self.affinity.load()])
     }
     /// Seed exclusively retained pre-birth storage; live writes must use
     /// change_affinity so residency notification cannot be omitted.
-    pub fn set_affinity(&self, mask: carrick_core::affinity::CpuAffinity) {
-        assert!(
-            self.affinity.initialize_quiescent(mask.words()[0]),
-            "live affinity mutation bypassed its notification authority"
-        );
+    pub fn set_affinity(
+        &self,
+        mask: carrick_core::affinity::CpuAffinity,
+    ) -> Result<(), AffinitySeedRefused> {
+        self.affinity
+            .initialize_quiescent(mask.words()[0])
+            .then_some(())
+            .ok_or(AffinitySeedRefused)
     }
     pub fn change_affinity(
         &self,
@@ -3236,6 +3243,7 @@ mod affinity_seed_tests {
             result.is_ok(),
             "live storage misuse must return a typed refusal"
         );
+        assert_eq!(result.unwrap(), Err(super::AffinitySeedRefused));
         assert_eq!(slot.affinity().words(), &[3]);
         assert!(slot.affinity_authority().unbind(token));
     }

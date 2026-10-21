@@ -172,7 +172,8 @@ impl World {
         let venue = Venue::new(hatches);
         venue
             .leader_slot()
-            .set_affinity(carrick_core::affinity::CpuAffinity::single(SLOT_IDX as u32));
+            .set_affinity(carrick_core::affinity::CpuAffinity::single(SLOT_IDX as u32))
+            .unwrap();
         Self {
             zone,
             tasks,
@@ -2186,7 +2187,8 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
         .unwrap();
     w.venue
         .child_slot(1)
-        .set_affinity(carrick_core::affinity::CpuAffinity::single(SLOT_IDX as u32));
+        .set_affinity(carrick_core::affinity::CpuAffinity::single(SLOT_IDX as u32))
+        .unwrap();
     w.task().set(
         El1TaskId::from_linux_tid(70),
         carrick_el1_abi::SnapshotGeneration::from_raw(1),

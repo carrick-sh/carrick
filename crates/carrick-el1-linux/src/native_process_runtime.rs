@@ -5327,7 +5327,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .map_err(|_| NativeProcessError::Quarantined)?;
                 return Err(NativeProcessError::Busy);
             }
-            control.set_affinity(parent_affinity);
+            if control.set_affinity(parent_affinity).is_err() {
+                page.unclaim(claim)
+                    .map_err(|_| NativeProcessError::Quarantined)?;
+                return Err(NativeProcessError::Invalid);
+            }
             if !control.publish_visible_tid(visible.get()) {
                 page.unclaim(claim)
                     .map_err(|_| NativeProcessError::Quarantined)?;

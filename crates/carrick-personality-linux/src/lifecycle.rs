@@ -950,6 +950,9 @@ fn serve_clone<'a>(
     if child_slot
         .reset_for_birth(blocked, clear_child_tid, entry)
         .is_err()
+        || child_slot
+            .set_affinity(carrick_core::affinity::CpuAffinity::from_words(&[affinity]))
+            .is_err()
     {
         native.free_record(record);
         if page.unclaim(claimed).is_err() {
@@ -960,7 +963,6 @@ fn serve_clone<'a>(
         }
         return None;
     }
-    child_slot.set_affinity(carrick_core::affinity::CpuAffinity::from_words(&[affinity]));
     if !outputs.publish(identity.visible_tid, native) {
         native.free_record(record);
         if page.unclaim(claimed).is_err() {
