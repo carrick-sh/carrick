@@ -133,6 +133,8 @@ pub enum SchedCall {
     GetPriorityMax,
     GetPriorityMin,
     RrGetInterval,
+    SetAffinity,
+    GetAffinity,
 }
 
 /// Execution venue and guest memory access for in-ring scheduling operations.
@@ -152,10 +154,23 @@ pub trait SchedVenue {
             .filter(|current| *current == pid)
             .map(|_| true)
     }
-    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
-        let _ = (dst, src);
-        false
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool;
+    fn copy_in(&mut self, src: UserVa, dst: &mut [u8]) -> bool;
+    fn guest_cpu_count(&self) -> usize;
+    fn current_cpu(&self) -> Option<u32> {
+        None
     }
+    fn current_tid(&self) -> Option<u32> {
+        None
+    }
+    fn get_affinity(&self, pid: u32) -> Result<carrick_core::affinity::CpuAffinity, LinuxErrno>;
+    /// Resolve and authorize the target before intersecting the requested mask.
+    /// Return the effective mask installed by the task owner.
+    fn set_affinity(
+        &mut self,
+        pid: u32,
+        mask: carrick_core::affinity::CpuAffinity,
+    ) -> Result<carrick_core::affinity::CpuAffinity, LinuxErrno>;
 }
 
 pub fn sched_priority_min(policy: i32) -> Result<i64, LinuxErrno> {
@@ -213,6 +228,61 @@ pub fn serve_sched(call: SchedCall, venue: &mut dyn SchedVenue) -> FamilyComplet
                 return FamilyCompletion::Forward;
             }
             FamilyCompletion::Complete(0)
+        }
+        SchedCall::GetAffinity => {
+            let pid_raw = venue.argument(0);
+            let size = venue.argument(1) as usize;
+            let mask_ptr = venue.argument(2);
+            if (pid_raw as i64) < 0 || pid_raw > u32::MAX as u64 {
+                return FamilyCompletion::Complete(LINUX_ESRCH.guest_retval());
+            }
+            let pid = pid_raw as u32;
+            let ncpu = venue.guest_cpu_count();
+            let kernel_bytes = carrick_core::affinity::kernel_cpumask_bytes(ncpu);
+            if !carrick_core::affinity::validate_getaffinity_size(size, ncpu) {
+                return FamilyCompletion::Complete(LINUX_EINVAL.guest_retval());
+            }
+            let mask = match venue.get_affinity(pid) {
+                Ok(m) => m,
+                Err(err) => return FamilyCompletion::Complete(err.guest_retval()),
+            };
+            let mut buf = [0u8; 128];
+            let write_len = kernel_bytes.min(buf.len());
+            carrick_core::affinity::affinity_write_bytes(mask.words(), &mut buf[..write_len]);
+            if !venue.copy_out(UserVa::new(mask_ptr), &buf[..write_len]) {
+                return FamilyCompletion::Complete(LINUX_EFAULT.guest_retval());
+            }
+            FamilyCompletion::Complete(kernel_bytes as i64)
+        }
+        SchedCall::SetAffinity => {
+            let pid_raw = venue.argument(0);
+            let size = venue.argument(1) as usize;
+            let mask_ptr = venue.argument(2);
+            if (pid_raw as i64) < 0 || pid_raw > u32::MAX as u64 {
+                return FamilyCompletion::Complete(LINUX_ESRCH.guest_retval());
+            }
+            let pid = pid_raw as u32;
+            let ncpu = venue.guest_cpu_count();
+            let kernel_bytes = carrick_core::affinity::kernel_cpumask_bytes(ncpu);
+            let read_len = size.min(kernel_bytes);
+            let mut buf = [0u8; 128];
+            if read_len != 0 && !venue.copy_in(UserVa::new(mask_ptr), &mut buf[..read_len]) {
+                return FamilyCompletion::Complete(LINUX_EFAULT.guest_retval());
+            }
+            let requested = carrick_core::affinity::CpuAffinity::from_bytes(&buf[..read_len]);
+            match venue.set_affinity(pid, requested) {
+                Ok(effective) => {
+                    let is_caller = pid == 0 || venue.current_tid() == Some(pid);
+                    if is_caller
+                        && let Some(cpu) = venue.current_cpu()
+                        && !effective.is_allowed(cpu)
+                    {
+                        return FamilyCompletion::CompleteWithWork(0);
+                    }
+                    FamilyCompletion::Complete(0)
+                }
+                Err(err) => FamilyCompletion::Complete(err.guest_retval()),
+            }
         }
     }
 }

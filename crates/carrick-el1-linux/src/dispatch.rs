@@ -1162,6 +1162,11 @@ impl<
         Some(self)
     }
     fn sched_venue(&mut self) -> Option<&mut dyn carrick_personality_linux::sched::SchedVenue> {
+        if matches!(self.frame.canonical_ordinal().raw(), 122 | 123)
+            && (self.process.is_none() || self.zone.as_ref()?.tables.carrier_cpu_count().is_none())
+        {
+            return None;
+        }
         Some(self)
     }
     fn signal_native(
@@ -1943,6 +1948,60 @@ impl<
             src,
         )
     }
+    fn copy_in(&mut self, src: carrick_guest_arch::UserVa, dst: &mut [u8]) -> bool {
+        #[cfg(test)]
+        if let Some(user) = &mut self.lifecycle_user {
+            return user.copy_in(dst, src.raw());
+        }
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
+            return false;
+        };
+        crate::file::UserCopy::copy_in(
+            &mut crate::file::ValidatedCopy {
+                task,
+                validator: &crate::file::HardwareValidator,
+            },
+            dst,
+            src.raw(),
+        )
+    }
+    fn guest_cpu_count(&self) -> usize {
+        self.zone
+            .as_ref()
+            .and_then(|z| z.tables.carrier_cpu_count())
+            .unwrap_or(0)
+    }
+    fn current_tid(&self) -> Option<u32> {
+        let task = self.current_tasks.get(self.frame.task_index())?;
+        let (_, control) = task.lifecycle_refs()?;
+        control.visible_tid()
+    }
+    fn current_cpu(&self) -> Option<u32> {
+        let slot = self.frame.slot()?;
+        let zone = self.zone.as_ref()?;
+        zone.tables.slot(slot).bound_cpu()
+    }
+    fn get_affinity(
+        &self,
+        pid: u32,
+    ) -> Result<carrick_core::affinity::CpuAffinity, carrick_syscall_abi::LinuxErrno> {
+        let process = self
+            .process
+            .as_ref()
+            .ok_or(carrick_syscall_abi::LINUX_ESRCH)?;
+        process.get_affinity(pid)
+    }
+    fn set_affinity(
+        &mut self,
+        pid: u32,
+        mask: carrick_core::affinity::CpuAffinity,
+    ) -> Result<carrick_core::affinity::CpuAffinity, carrick_syscall_abi::LinuxErrno> {
+        let process = self
+            .process
+            .as_deref_mut()
+            .ok_or(carrick_syscall_abi::LINUX_ESRCH)?;
+        process.set_affinity(pid, mask)
+    }
 }
 
 impl<
@@ -2684,5 +2743,121 @@ mod tests {
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
         assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 0);
         assert_eq!(counters.served[172].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn affinity_without_process_authority_uses_counted_refusal() {
+        use carrick_personality_linux::dispatch::CompletionRoute;
+        let tasks = [CurrentTask::new()];
+        tasks[0].set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            5,
+        );
+        for (ordinal, pid) in [(122, 0), (122, 41), (123, 0), (123, 41)] {
+            let counters = Counters::default();
+            let mut mask = 1u64;
+            let mut frame = TrapFrame::default();
+            frame.x[8] = ordinal;
+            frame.x[0] = pid;
+            frame.x[1] = 8;
+            frame.x[2] = (&mut mask as *mut u64) as u64;
+            let route = dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                &tasks,
+                &[],
+                &[],
+                &[],
+                &[],
+                &InotifyNameCache::new(),
+                None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
+                None,
+                None,
+                None::<&mut dyn lifecycle::ProcessNative<carrick_sched_core::ThreadCtx>>,
+                None,
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            assert_eq!(route, CompletionRoute::Served);
+            assert_eq!(frame.x[0] as i64, -38, "ordinal {ordinal}, pid {pid}");
+            assert_eq!(
+                counters.refused[ordinal as usize].load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(counters.served[ordinal as usize].load(Ordering::Relaxed), 0);
+            assert_eq!(mask, 1);
+        }
+    }
+
+    #[test]
+    fn el1_sched_venue_carrier_topology_and_missing_authority() {
+        use carrick_personality_linux::sched::SchedVenue;
+
+        let layout = std::alloc::Layout::new::<ZoneTables>();
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+            assert!(!ptr.is_null());
+            std::boxed::Box::from_raw(ptr)
+        };
+        zone.publish_carrier_cpu_count(4);
+        // Executor occupancy is not the installed carrier topology.
+        for cpu in 0..4 {
+            let slot = SlotId::new(cpu);
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, 1, Some(cpu as u32), 0);
+        }
+        assert_eq!(zone.carrier_cpu_count(), Some(4));
+        assert_eq!(zone.carrier_affinity_mask(), Some(0x0f));
+        zone.publish_slot(SlotId::new(3), 0, None, 0);
+        assert_eq!(zone.carrier_cpu_count(), Some(4));
+        assert_eq!(zone.carrier_affinity_mask(), Some(0x0f));
+
+        let counters = Counters::default();
+        let mut cpu = sched::FakeCpu::default();
+        let tasks = [CurrentTask::new()];
+        let mut frame = TrapFrame::default();
+        let mut pending = El1PendingFamilies {
+            handoff: None,
+            #[cfg(test)]
+            lifecycle_user: None,
+            frame: &mut frame,
+            counters: &counters,
+            current_tasks: &tasks,
+            fd_map: &[],
+            object_table: &[],
+            open_table: &[],
+            inotify_table: &[],
+            name_cache: &InotifyNameCache::new(),
+            zone: Some(Zone {
+                tables: &zone,
+                cpu: &mut cpu,
+                user: &sched::HardwareUserWord,
+            }),
+            ipc: None,
+            lifecycle: None,
+            process: None::<
+                &mut dyn carrick_personality_linux::lifecycle::ProcessNative<
+                    carrick_sched_core::ThreadCtx,
+                >,
+            >,
+            source: None,
+            anonymous: None,
+            cache_lookup: |_| core::ptr::null_mut(),
+        };
+
+        // Venue reports the installed count despite an unpublished executor.
+        assert_eq!(pending.guest_cpu_count(), 4);
+
+        // No process authority must decline before interpreting affinity args.
+        for ordinal in [122, 123] {
+            pending.frame.x[8] = ordinal;
+            pending.frame.x[0] = 0;
+            pending.frame.x[1] = 8;
+            pending.frame.x[2] = 0x2000;
+            assert!(PendingFamilies::sched_venue(&mut pending).is_none());
+        }
+        pending.frame.x[8] = 124;
+        assert!(PendingFamilies::sched_venue(&mut pending).is_some());
     }
 }

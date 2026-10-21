@@ -182,6 +182,19 @@ pub fn compute_effective_affinity(
     }
 }
 
+/// Linux sched_setaffinity ownership check. The caller's effective UID may
+/// match either of the target's real and effective UIDs. UID zero alone does
+/// not bypass ownership: cross-owner access requires CAP_SYS_NICE.
+#[inline]
+pub const fn sched_cross_owner_ok(
+    target_ruid: u32,
+    target_euid: u32,
+    caller_euid: u32,
+    caller_has_sys_nice: bool,
+) -> bool {
+    caller_euid == target_ruid || caller_euid == target_euid || caller_has_sys_nice
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +261,16 @@ mod tests {
             compute_effective_affinity(&empty, &CpuAffinity::all(4)),
             None
         );
+    }
+
+    #[test]
+    fn test_sched_cross_owner_ok() {
+        assert!(sched_cross_owner_ok(1000, 0, 1000, false)); // Real UID match
+        assert!(sched_cross_owner_ok(0, 1000, 1000, false)); // Effective UID match
+        assert!(!sched_cross_owner_ok(1000, 1000, 0, false)); // Root without capability
+        assert!(sched_cross_owner_ok(1000, 1000, 0, true)); // Privileged root
+        assert!(sched_cross_owner_ok(1000, 1000, 1001, true)); // Privileged nonroot
+        assert!(!sched_cross_owner_ok(1000, 1000, 1001, false));
     }
 
     #[test]

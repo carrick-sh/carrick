@@ -56,6 +56,8 @@ pub mod nr {
     pub const CAPSET: CanonicalNr = CanonicalNr(91);
     pub const PERSONALITY: CanonicalNr = CanonicalNr(92);
     pub const EXIT_GROUP: CanonicalNr = CanonicalNr(94);
+    pub const SCHED_SETAFFINITY: CanonicalNr = CanonicalNr(122);
+    pub const SCHED_GETAFFINITY: CanonicalNr = CanonicalNr(123);
     pub const SCHED_GET_PRIORITY_MAX: CanonicalNr = CanonicalNr(125);
     pub const SCHED_GET_PRIORITY_MIN: CanonicalNr = CanonicalNr(126);
     pub const SCHED_RR_GET_INTERVAL: CanonicalNr = CanonicalNr(127);

@@ -624,6 +624,12 @@ fn serve_family<'a, C: EntryContext + 'a>(
 pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
     // Native ARM signal calls share the process owner used by x86.
     match ordinal {
+        nr if nr == carrick_syscall_abi::nr::SCHED_SETAFFINITY.raw() => {
+            Family::Sched(SchedCall::SetAffinity)
+        }
+        nr if nr == carrick_syscall_abi::nr::SCHED_GETAFFINITY.raw() => {
+            Family::Sched(SchedCall::GetAffinity)
+        }
         132 => Family::Lifecycle(LifecycleCall::SigAltStack),
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
         134 => Family::Signal(crate::signal::SignalCall::RtSigaction),
@@ -1156,6 +1162,26 @@ mod ring_first_tests {
         EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
     use core::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn affinity_routes_are_arm_only_even_after_x86_canonicalization() {
+        for (native, canonical) in [(203, 122), (204, 123)] {
+            let translated = carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
+                carrick_syscall_abi::NativeNr(native),
+            )
+            .unwrap();
+            assert_eq!(translated.raw(), canonical);
+            assert_eq!(route_x86(canonical, u64::MAX), Family::Unported);
+        }
+        assert_eq!(
+            route_aarch64(122, u64::MAX),
+            Family::Sched(SchedCall::SetAffinity)
+        );
+        assert_eq!(
+            route_aarch64(123, u64::MAX),
+            Family::Sched(SchedCall::GetAffinity)
+        );
+    }
 
     #[test]
     fn retained_owner_is_checked_before_unadmitted_forward() {

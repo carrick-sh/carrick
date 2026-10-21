@@ -5753,6 +5753,110 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             false
         }
     }
+    #[inline(never)]
+    fn get_affinity(
+        &self,
+        pid: u32,
+    ) -> Result<carrick_core::affinity::CpuAffinity, carrick_syscall_abi::LinuxErrno> {
+        let graph = self.runtime.graph.lock();
+        let caller = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_syscall_abi::LINUX_ESRCH)?;
+        let tid = if pid == 0 { self.calling_tid } else { pid };
+        let target = if caller.has_thread(tid) {
+            caller
+        } else {
+            graph
+                .owner
+                .find_task_by_thread(caller.metadata().container, tid)
+                .ok_or(carrick_syscall_abi::LINUX_ESRCH)?
+        };
+        target
+            .native()
+            .resources()
+            .affinity_control(tid)
+            .map(ThreadControlSlot::affinity)
+            .ok_or(carrick_syscall_abi::LINUX_ESRCH)
+    }
+    #[inline(never)]
+    fn set_affinity(
+        &mut self,
+        pid: u32,
+        mask: carrick_core::affinity::CpuAffinity,
+    ) -> Result<carrick_core::affinity::CpuAffinity, carrick_syscall_abi::LinuxErrno> {
+        let mut graph = self.runtime.graph.lock();
+        let caller = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| carrick_syscall_abi::LINUX_ESRCH)?;
+        let caller_tid = self.calling_tid;
+        let caller_creds = caller
+            .credentials_for(caller_tid)
+            .map_err(|_| carrick_syscall_abi::LINUX_ESRCH)?;
+        let caller_euid = caller_creds.euid.raw();
+        let caller_has_sys_nice = caller_creds
+            .cap_effective
+            .contains(carrick_personality_linux::identity::LinuxCapabilitySet::CAP_SYS_NICE);
+        let container = caller.metadata().container;
+
+        let target_tid = if pid == 0 { caller_tid } else { pid };
+        let target_key = if caller.has_thread(target_tid) {
+            self.key
+        } else {
+            graph
+                .owner
+                .find_task_by_thread(container, target_tid)
+                .ok_or(carrick_syscall_abi::LINUX_ESRCH)?
+                .metadata()
+                .key
+        };
+        let target = graph
+            .owner
+            .task_mut(target_key)
+            .map_err(|_| carrick_syscall_abi::LINUX_ESRCH)?;
+        let target_creds = target
+            .credentials_for(target_tid)
+            .map_err(|_| carrick_syscall_abi::LINUX_ESRCH)?;
+        if !carrick_core::affinity::sched_cross_owner_ok(
+            target_creds.ruid.raw(),
+            target_creds.euid.raw(),
+            caller_euid,
+            caller_has_sys_nice,
+        ) {
+            return Err(carrick_syscall_abi::LINUX_EPERM);
+        }
+        let online = carrick_core::affinity::CpuAffinity::from_words(&[self
+            .source
+            .zone
+            .carrier_affinity_mask()
+            .ok_or(carrick_syscall_abi::LINUX_ENOSYS)?]);
+        let effective = carrick_core::affinity::compute_effective_affinity(&mask, &online)
+            .ok_or(carrick_syscall_abi::LINUX_EINVAL)?;
+        let control = target
+            .native()
+            .resources()
+            .affinity_control(target_tid)
+            .ok_or(carrick_syscall_abi::LINUX_ESRCH)?;
+        struct RingAffinityNotification(WakeEffects);
+        impl carrick_core::affinity::AffinityNotifier for RingAffinityNotification {
+            fn notify(&mut self, notification: carrick_core::affinity::AffinityNotification) {
+                if let Some(slot) = notification.slot {
+                    self.0.request_reschedule(slot);
+                }
+            }
+        }
+        let mut notification = RingAffinityNotification(WakeEffects::default());
+        // Both venues publish and notify through this one shared operation.
+        // Placement reads the exact retained authority; no slot or record copy
+        // is rewritten by a guest-switched caller.
+        control.change_affinity(effective, &mut notification);
+        drop(graph);
+        if notification.0.sgi_slots().next().is_some() {
+            self.service.wake_effects(notification.0);
+        }
+        Ok(effective)
+    }
     fn read_robust_list(
         &self,
         tid: u32,
@@ -11702,7 +11806,7 @@ mod tests {
     }
 
     #[test]
-    fn two_threads_raw_setresuid_on_one_leaves_other_unchanged() {
+    fn two_threads_keep_credentials_comm_and_affinity_independent() {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         let zone = unsafe {
             let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
@@ -11867,12 +11971,36 @@ mod tests {
         let mut comm_leader = [0u8; 16];
         let mut comm_worker = [0u8; 16];
         entry.set_calling_tid(41);
+        use carrick_core::affinity::CpuAffinity;
+        assert_eq!(entry.get_affinity(0).unwrap(), CpuAffinity::all(2));
+        entry.set_affinity(0, CpuAffinity::single(0)).unwrap();
         entry.prctl_set_name(b"leader\0\0\0\0\0\0\0\0\0\0");
-        let inherited = control.affinity();
+        let inherited = entry.get_affinity(41).unwrap();
         entry
             .thread_spawned(41, 42, &mut || publish_birth(0, 42, inherited, 41, 101))
             .unwrap();
+        assert_eq!(entry.get_affinity(42).unwrap(), CpuAffinity::single(0));
         entry.set_calling_tid(42);
+        entry.set_affinity(0, CpuAffinity::single(1)).unwrap();
+        assert_eq!(entry.get_affinity(0).unwrap(), CpuAffinity::single(1));
+        assert_eq!(
+            entry.set_affinity(0, CpuAffinity::single(2)),
+            Err(carrick_syscall_abi::LINUX_EINVAL)
+        );
+        assert_eq!(entry.get_affinity(0).unwrap(), CpuAffinity::single(1));
+        assert_eq!(entry.get_affinity(41).unwrap(), CpuAffinity::single(0));
+        assert_eq!(
+            entry.get_affinity(999),
+            Err(carrick_syscall_abi::LINUX_ESRCH)
+        );
+        assert_eq!(
+            entry.set_affinity(999, CpuAffinity::single(0)),
+            Err(carrick_syscall_abi::LINUX_ESRCH)
+        );
+        assert_eq!(
+            entry.set_affinity(999, CpuAffinity::from_words(&[0])),
+            Err(carrick_syscall_abi::LINUX_ESRCH)
+        );
         entry.prctl_set_name(b"worker\0\0\0\0\0\0\0\0\0\0");
 
         entry.set_calling_tid(41);
@@ -11889,6 +12017,15 @@ mod tests {
             .set_resuid(Some(1000), Some(1000), Some(1000))
             .unwrap();
         assert_eq!(entry.get_uids().unwrap(), (1000, 1000, 1000, 1000));
+        assert_eq!(
+            entry.set_affinity(41, CpuAffinity::single(1)),
+            Err(carrick_syscall_abi::LINUX_EPERM)
+        );
+        assert_eq!(entry.get_affinity(41).unwrap(), CpuAffinity::single(0));
+        assert_eq!(
+            entry.set_affinity(41, CpuAffinity::from_words(&[0])),
+            Err(carrick_syscall_abi::LINUX_EPERM)
+        );
 
         // Calling from thread 41 (leader): UIDs must still be root (0, 0, 0, 0)
         entry.set_calling_tid(41);
@@ -11899,11 +12036,12 @@ mod tests {
         );
 
         // Spawn thread 43 from thread 42: inherits thread 42's credentials and comm
-        let inherited = sibling_controls[0].affinity();
+        let inherited = entry.get_affinity(42).unwrap();
         entry
             .thread_spawned(42, 43, &mut || publish_birth(1, 43, inherited, 42, 142))
             .unwrap();
         entry.set_calling_tid(43);
+        assert_eq!(entry.get_affinity(0).unwrap(), CpuAffinity::single(1));
         assert_eq!(entry.get_uids().unwrap(), (1000, 1000, 1000, 1000));
         let mut comm_child = [0u8; 16];
         entry.prctl_get_name(&mut comm_child).unwrap();
@@ -11924,6 +12062,15 @@ mod tests {
             .flatten()
             .and_then(|key| graph.owner.task(key).ok())
             .expect("child task found");
+        assert_eq!(
+            child_task
+                .native()
+                .resources()
+                .affinity_control(child_pid)
+                .unwrap()
+                .affinity(),
+            CpuAffinity::single(1)
+        );
         let child_creds = child_task.credentials_for(child_pid).unwrap();
         assert_eq!(
             (

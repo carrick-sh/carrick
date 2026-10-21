@@ -262,6 +262,19 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn has_thread(&self, _tid: u32) -> bool {
         false
     }
+    fn get_affinity(
+        &self,
+        _pid: u32,
+    ) -> Result<carrick_core::affinity::CpuAffinity, carrick_syscall_abi::LinuxErrno> {
+        Err(carrick_syscall_abi::LINUX_ESRCH)
+    }
+    fn set_affinity(
+        &mut self,
+        _pid: u32,
+        _mask: carrick_core::affinity::CpuAffinity,
+    ) -> Result<carrick_core::affinity::CpuAffinity, carrick_syscall_abi::LinuxErrno> {
+        Err(carrick_syscall_abi::LINUX_ESRCH)
+    }
     fn read_robust_list(
         &self,
         _tid: u32,
