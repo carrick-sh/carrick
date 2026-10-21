@@ -1180,7 +1180,19 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             );
             let controls = loan.lifecycle.controls.raw() as *mut ThreadControlSlot;
             for index in 0..=carrick_el1_abi::THREAD_POOL_ENTRIES {
-                controls.add(index).write(ThreadControlSlot::new());
+                // The accepted loan already carries the owner's retained aliases.
+                if (&*controls.add(index))
+                    .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+                    .is_err()
+                {
+                    return Err(abandon_loan(
+                        &self.crossing,
+                        self.worker(),
+                        &loan,
+                        None,
+                        NativeProcessError::Stale,
+                    ));
+                }
             }
         }
         let Some(asid) = loan.asid else {

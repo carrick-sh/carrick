@@ -11709,8 +11709,50 @@ mod tests {
             assert!(!ptr.is_null());
             Box::from_raw(ptr)
         };
+        zone.publish_carrier_cpu_count(2);
         let page = Box::new(ThreadLifecyclePage::new());
         let control = Box::new(ThreadControlSlot::new());
+        let sibling_controls = [ThreadControlSlot::new(), ThreadControlSlot::new()];
+        let publish_birth = |index: usize,
+                             tid: u32,
+                             mask: carrick_core::affinity::CpuAffinity,
+                             caller_task: u64,
+                             caller_serial: u64| {
+            let entry = page
+                .stock(
+                    index,
+                    EntryIdentity {
+                        tid,
+                        visible_tid: tid,
+                        thread_serial: u64::from(tid) + 100,
+                        birth: control.host_birth_identity().unwrap().birth(),
+                        uid_credit: 0,
+                    },
+                )
+                .unwrap();
+            let slot = &sibling_controls[index];
+            page.bind_control_address(entry, slot as *const _ as u64)
+                .unwrap();
+            slot.reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+                .unwrap();
+            slot.set_affinity(mask).unwrap();
+            assert!(slot.publish_visible_tid(tid));
+            let claim = page.claim(entry).unwrap();
+            page.record_born(
+                claim,
+                carrick_el1_abi::BornRecord {
+                    caller_task,
+                    caller_serial,
+                    clone_flags: 0x10f00,
+                    clear_child_tid: 0,
+                    blocked: carrick_el1_abi::BlockedMask(0),
+                },
+            )
+            .unwrap();
+            page.thread_born().unwrap();
+            page.publish(entry).unwrap();
+            Ok(())
+        };
         let child_page = Box::new(ThreadLifecyclePage::new());
         let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
             ThreadControlSlot::new()
@@ -11826,7 +11868,10 @@ mod tests {
         let mut comm_worker = [0u8; 16];
         entry.set_calling_tid(41);
         entry.prctl_set_name(b"leader\0\0\0\0\0\0\0\0\0\0");
-        entry.thread_spawned(41, 42, &mut || Ok(())).unwrap();
+        let inherited = control.affinity();
+        entry
+            .thread_spawned(41, 42, &mut || publish_birth(0, 42, inherited, 41, 101))
+            .unwrap();
         entry.set_calling_tid(42);
         entry.prctl_set_name(b"worker\0\0\0\0\0\0\0\0\0\0");
 
@@ -11854,7 +11899,10 @@ mod tests {
         );
 
         // Spawn thread 43 from thread 42: inherits thread 42's credentials and comm
-        entry.thread_spawned(42, 43, &mut || Ok(())).unwrap();
+        let inherited = sibling_controls[0].affinity();
+        entry
+            .thread_spawned(42, 43, &mut || publish_birth(1, 43, inherited, 42, 142))
+            .unwrap();
         entry.set_calling_tid(43);
         assert_eq!(entry.get_uids().unwrap(), (1000, 1000, 1000, 1000));
         let mut comm_child = [0u8; 16];
