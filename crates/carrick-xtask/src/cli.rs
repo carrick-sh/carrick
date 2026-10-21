@@ -39,6 +39,10 @@ pub enum Commands {
     CiScaler(crate::ci_scaler::ScalerArgs),
     #[command(about = "Retire all other processes of the calling non-root uid")]
     RetireProcesses(crate::process_helper::RetireArgs),
+    #[command(about = "Run an owner/App issue-label worker on an ephemeral clone")]
+    DispatchWorker(crate::dispatch_worker::DispatchArgs),
+    #[command(about = "Bootstrap job-scoped agent tools and credentials")]
+    AgentRunner(crate::agent_runner::Args),
     #[command(about = "Compare trusted-runner accept receipts against a per-SHA baseline")]
     CiReceipt(crate::ci_receipt::ReceiptArgs),
     #[command(about = "Authorize, execute and publish the on-demand signed Actions gate")]
@@ -431,6 +435,16 @@ where
             Ok(())
         }
         Commands::RetireProcesses(args) => Ok(crate::process_helper::retire(args)?),
+        Commands::AgentRunner(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::agent_runner::run(&root, args)?;
+            Ok(())
+        }
+        Commands::DispatchWorker(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::dispatch_worker::run(&root, args)?;
+            Ok(())
+        }
         Commands::CiScaler(args) => {
             crate::ci_scaler::run(args)?;
             Ok(())

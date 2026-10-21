@@ -1162,8 +1162,8 @@ fn execute_with_failure(
     let program = Path::new(command.get_program())
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("command")
-        .to_owned();
+        .unwrap_or("command");
+    let program = crate::dispatch_redaction::redact(program.as_bytes());
     // External host tools (curl, gh, ssh, lvs, bash) must resolve shared
     // libraries via the system dynamic linker cache rather than scanning
     // Cargo's target/debug/deps directory when xtask or its test binary runs
@@ -1185,7 +1185,7 @@ fn execute_with_failure(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     let pgid = i32::try_from(child.id()).map_err(|_| ScalerError::External("process group ID"))?;
     let input_thread = if has_input {
@@ -1205,13 +1205,47 @@ fn execute_with_failure(
             .map(|_| bytes);
         let _ = output_tx.send(result);
     });
+    let mut stderr = child.stderr.take().ok_or(ScalerError::External("stderr"))?;
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    let stderr_thread = std::thread::spawn(move || {
+        // Retain a bounded prefix, but drain the entire pipe so a verbose
+        // child neither blocks nor receives SIGPIPE before its real status.
+        let result = (|| -> std::io::Result<Vec<u8>> {
+            const LIMIT: usize = 16 * 1024;
+            let mut bytes = Vec::new();
+            let mut truncated = false;
+            let mut chunk = [0; 4096];
+            loop {
+                let count = stderr.read(&mut chunk)?;
+                if count == 0 {
+                    if truncated {
+                        // A credential cut at the bound may no longer match
+                        // its complete value. Publish only complete lines.
+                        let end = bytes
+                            .iter()
+                            .rposition(|byte| *byte == b'\n')
+                            .map_or(0, |index| index + 1);
+                        bytes.truncate(end);
+                        bytes.extend_from_slice(b"[stderr truncated]\n");
+                    }
+                    return Ok(bytes);
+                }
+                let retain = count.min(LIMIT.saturating_sub(bytes.len()));
+                bytes.extend_from_slice(&chunk[..retain]);
+                truncated |= retain != count;
+            }
+        })();
+        let _ = stderr_tx.send(result);
+    });
     let (wait_tx, wait_rx) = std::sync::mpsc::channel();
     let wait_thread = std::thread::spawn(move || {
         let _ = wait_tx.send(child.wait());
     });
     let status = wait_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     let output = output_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
-    if status.is_err() || output.is_err() {
+    let mut stderr = stderr_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    let stderr_timed_out = stderr.is_err();
+    if status.is_err() || output.is_err() || stderr.is_err() {
         // This invocation owns a fresh process group, including pipe holders.
         unsafe {
             libc::kill(-pgid, libc::SIGKILL);
@@ -1223,6 +1257,29 @@ fn execute_with_failure(
     output_thread
         .join()
         .map_err(|_| ScalerError::External("output reader"))?;
+    stderr_thread
+        .join()
+        .map_err(|_| ScalerError::External("stderr reader"))?;
+    if stderr_timed_out {
+        // Killing the invocation closes descendant pipe holders; preserve
+        // the diagnostics drained during timeout cleanup as well.
+        stderr = stderr_rx
+            .try_recv()
+            .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected);
+    }
+    let failure = |reason: String| {
+        let diagnostic = stderr
+            .as_ref()
+            .ok()
+            .and_then(|result| result.as_ref().ok())
+            .map(|bytes| crate::dispatch_redaction::redact(bytes))
+            .unwrap_or_default();
+        ScalerError::CommandFailed(if diagnostic.is_empty() {
+            reason
+        } else {
+            format!("{reason}; stderr: {diagnostic}")
+        })
+    };
     let write = match input_thread {
         Some(thread) => thread
             .join()
@@ -1244,29 +1301,42 @@ fn execute_with_failure(
             } else {
                 format!("{program} exited unsuccessfully")
             };
-            return Err(ScalerError::CommandFailed(reason));
+            return Err(failure(reason));
         }
         Ok(Err(err)) => {
-            return Err(ScalerError::CommandFailed(format!(
-                "{program} wait error: {err}"
-            )));
+            return Err(failure(format!("{program} wait error: {err}")));
         }
         Err(_) => {
-            return Err(ScalerError::CommandFailed(format!(
+            return Err(failure(format!(
                 "{program} timed out after {}ms",
                 limit.as_millis()
             )));
         }
     }
     write?;
-    output
+    if stderr_timed_out {
+        return Err(failure(format!(
+            "{program} stderr timed out after {}ms",
+            limit.as_millis()
+        )));
+    }
+    let output = output
         .map_err(|_| {
-            ScalerError::CommandFailed(format!(
+            failure(format!(
                 "{program} stdout timed out after {}ms",
                 limit.as_millis()
             ))
         })?
-        .map_err(ScalerError::Io)
+        .map_err(ScalerError::Io)?;
+    stderr
+        .map_err(|_| {
+            ScalerError::CommandFailed(format!(
+                "{program} stderr timed out after {}ms",
+                limit.as_millis()
+            ))
+        })?
+        .map_err(ScalerError::Io)?;
+    Ok(output)
 }
 
 #[cfg(test)]

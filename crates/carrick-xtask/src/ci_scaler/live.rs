@@ -894,6 +894,14 @@ fn boot_and_register(
             ));
         }
     }
+    if matches!(admission, Admission::Agent) {
+        // Agent policy parsing and assignment authorization shipped with this
+        // command. Old template binaries must fail before minting a runner.
+        pve.agent(
+            row,
+            &["/usr/local/bin/carrick-xtask", "agent-runner", "--help"],
+        )?;
+    }
     // Re-vet the reserved run now and bind the runner to it: the hook admits
     // this run, attempt, SHA and owner-only dispatch actors. A standing clone that
     // GitHub assigns another job asks the controller to re-vet that one.
