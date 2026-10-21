@@ -1614,14 +1614,14 @@ fn test_fork_prepared_box_allocation_failure_allows_index_reuse_without_collisio
     {
         let _fault_guard = super::native_process_runtime::InjectTryReserveFailure::activate();
         let err = service
-            .prepare_mm(&fixture.address, parked, child_mm)
+            .prepare_mm(&fixture.address, &parked, child_mm)
             .expect_err("prepare_mm must fail when FallibleBox::try_reserve fails");
         assert_eq!(err, NativeProcessError::Exhausted);
     }
 
     // Second fork reuses the exact same index and must not fail with Collision.
     let prepared = service
-        .prepare_mm(&fixture.address, parked, child_mm)
+        .prepare_mm(&fixture.address, &parked, child_mm)
         .expect("second fork reusing the same index must succeed without Collision");
 
     service.abort_mm(prepared).expect("abort_mm should succeed");
