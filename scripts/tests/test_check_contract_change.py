@@ -2760,6 +2760,16 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
                 result = self.run_check(base_sha=base)
                 self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
                 self.assertIn("does not reference changed surface", result.stderr)
+                # A different impl's same-named method is not in this call graph.
+                test_file.write_text(
+                    "struct Fixture; impl Fixture { fn check_surface(&self) {} }\n"
+                    "struct Other; impl Other { fn check_surface(&self) { return; assert!(false); } }\n"
+                    "#[test]\nfn witness() { " + call + "; "
+                    "assert_eq!(super::futex::surface_answer(), 2); }\n"
+                )
+                self._commit_all("keep unrelated method implementation outside the witness")
+                result = self.run_check(base_sha=base)
+                self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
 
     def test_review2_executable_literals_change_fingerprint(self):
         """Changing call arguments or helper return literals invalidates old evidence."""

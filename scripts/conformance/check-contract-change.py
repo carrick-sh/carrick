@@ -3,6 +3,7 @@
 
 import argparse
 import functools
+import hashlib
 import os
 import re
 import subprocess
@@ -2080,30 +2081,6 @@ def _extract_non_test_fns_with_attrs(
         results.setdefault(fn_name, []).append(
             (accum_cfgs + fn_cfgs, original_cs[open_brace : close_brace + 1], attrs_cs)
         )
-    # Associated functions and methods are executable helpers too. Keep their
-    # implementations in the same call-closure index as free functions.
-    impl_items, impl_ok = _iter_depth0_attributed_items(
-        scope_stripped, scope_comments_stripped, re.compile(r"\bimpl\b")
-    )
-    if not impl_ok:
-        return ({}, False)
-    for impl_match, impl_attrs in impl_items:
-        impl_cfgs = accum_cfgs + _extract_cfg_exprs(impl_attrs)
-        if not _are_cfgs_active_in_ci(view, pkg_name, lane, impl_cfgs):
-            continue
-        opening = scope_stripped.find("{", impl_match.end())
-        closing = _find_matching_brace(scope_stripped, opening) if opening != -1 else -1
-        if closing == -1:
-            return ({}, False)
-        methods, methods_ok = _extract_non_test_fns_with_attrs(
-            scope_stripped[opening + 1 : closing],
-            original_cs[opening + 1 : closing],
-            view, pkg_name, lane, impl_cfgs,
-        )
-        if not methods_ok:
-            return ({}, False)
-        for name, variants in methods.items():
-            results.setdefault(name, []).extend(variants)
     return (results, True)
 
 
@@ -2265,6 +2242,28 @@ def _extract_file_non_test_fns(
     return (fns, True)
 
 
+def _method_dependency_fingerprint(view: RepoView, pkg_name: str) -> str:
+    """Conservatively cover local method implementations and all their helpers.
+
+    Receiver inference is incomplete without rustc. A token digest of the local
+    implementation corpus includes every possible local callee, without
+    pretending same-named methods on unrelated types form one execution path.
+    This may invalidate unchanged evidence after an unrelated implementation
+    edit; it cannot grandfather a gutted helper. It does not supply relevance.
+    """
+    cache = getattr(view, "_method_dependency_fingerprints", None)
+    if cache is None:
+        cache = {}
+        view._method_dependency_fingerprints = cache
+    if pkg_name not in cache:
+        digest = hashlib.sha256()
+        for rel_path in view.glob_files(f"crates/{pkg_name}", ".rs"):
+            tokens = _fingerprint_tokens(view.read_comments_stripped_rust(rel_path))
+            digest.update(repr((rel_path, tokens)).encode("utf-8"))
+        cache[pkg_name] = "method-dependencies:" + digest.hexdigest()
+    return cache[pkg_name]
+
+
 def _compute_transitive_call_closure(
     view: RepoView,
     pkg_name: str,
@@ -2286,21 +2285,24 @@ def _compute_transitive_call_closure(
     closure_parts: list[str] = []
     frontier = list(start_bodies)
     visited: set[str] = set()
+    needs_method_snapshot = False
 
     for depth in range(1, max_depth + 2):
         called_names: set[str] = set()
         for b in frontier:
             code = strip_rust_comments_and_strings(b)
             code, _ = _blank_macro_defs(code, code)
+            if any(
+                match.group(1) in crate_fn_files
+                for match in re.finditer(
+                    r"(?:\.|::)\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^{};]*>\s*)?\(",
+                    code,
+                )
+            ):
+                needs_method_snapshot = True
             for cm in _CALLEE_EXTRACT_RE.finditer(code):
                 cname = cm.group(1) or cm.group(2)
                 if cname and cname not in _RUST_KEYWORDS and cname not in visited:
-                    called_names.add(cname)
-            for cm in re.finditer(
-                r"(?:\.|::)\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^{};]*>\s*)?\(", code
-            ):
-                cname = cm.group(1)
-                if cname not in visited and cname not in _RUST_KEYWORDS:
                     called_names.add(cname)
         if not called_names:
             break
@@ -2336,6 +2338,8 @@ def _compute_transitive_call_closure(
             break
         frontier = next_frontier
 
+    if needs_method_snapshot:
+        closure_parts.append(_method_dependency_fingerprint(view, pkg_name))
     return ("\n".join(closure_parts), True)
 
 

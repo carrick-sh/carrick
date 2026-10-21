@@ -162,6 +162,10 @@ test's relevance check, the same one-level expansion includes directly called
 local helpers, but never uncalled helpers, disabled helpers, or recursive
 helper chains. Conditional helper implementations must be active in the same
 CI environment as the bound test; declaration order does not select a helper.
+For potentially local method calls, fingerprints conservatively include a token
+digest of the crate's implementation corpus, covering associated functions and
+transitive helpers without inventing call chains between unrelated receiver
+types. An unrelated implementation edit may therefore require fresh relevance.
 Fingerprinting retains literal contents and whitespace inside literals, while
 identifier relevance still excludes literals. Parent module macro definitions
 and named macro imports accompany resolved child modules, so a shadowed
