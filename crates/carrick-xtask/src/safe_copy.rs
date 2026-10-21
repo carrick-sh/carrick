@@ -114,10 +114,53 @@ fn read_link(parent: &File, name: &std::ffi::OsStr) -> io::Result<std::path::Pat
     Ok(std::ffi::OsString::from_vec(bytes).into())
 }
 
+pub fn text(path: &Path, limit: u64) -> io::Result<String> {
+    read_text(path, limit, || {})
+}
+fn read_text(path: &Path, limit: u64, hook: impl FnOnce()) -> io::Result<String> {
+    use std::io::Read;
+    let parent = open_root(
+        path.parent()
+            .ok_or_else(|| io::Error::other("text parent"))?,
+    )?;
+    let file = crate::prune_fs::open(
+        &parent,
+        path.file_name()
+            .ok_or_else(|| io::Error::other("text name"))?,
+        false,
+    )?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > limit {
+        return Err(io::Error::other("unsafe or oversized text"));
+    }
+    hook();
+    let mut value = String::new();
+    file.take(limit.saturating_add(1))
+        .read_to_string(&mut value)?;
+    if value.len() as u64 > limit {
+        return Err(io::Error::other("text grew beyond limit"));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn text_swap_does_not_read_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("data");
+        let secret = temp.path().join("secret");
+        std::fs::write(&path, "ordinary").unwrap();
+        std::fs::write(&secret, "SENTINEL-SECRET").unwrap();
+        let value = read_text(&path, 100, || {
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&secret, &path).unwrap();
+        })
+        .unwrap();
+        assert_eq!(value, "ordinary");
+    }
     #[test]
     fn packed_refs_are_resolved_without_candidate_configuration() {
         use std::os::unix::fs::PermissionsExt;
