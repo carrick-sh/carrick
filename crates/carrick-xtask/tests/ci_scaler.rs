@@ -101,13 +101,13 @@ fn exact_labels_reject_extra_missing_and_duplicate_labels() {
 
 #[test]
 fn cpu_admission_enforces_director_eighty_percent_ceiling_and_headroom() {
-    assert!(admit_resources(0.675, 16, 11 << 30));
-    assert!(!admit_resources(0.676, 16, 11 << 30));
-    assert!(!admit_resources(0.725, 16, 11 << 30));
-    assert!(!admit_resources(0.75, 16, 11 << 30));
-    assert!(!admit_resources(f64::NAN, 16, 11 << 30));
-    assert!(!admit_resources(0.1, 0, 11 << 30));
-    assert!(!admit_resources(0.1, 16, 9 << 30));
+    assert!(admit_resources(0.675, 16, 11 << 30, 2, 4096));
+    assert!(!admit_resources(0.676, 16, 11 << 30, 2, 4096));
+    assert!(!admit_resources(0.725, 16, 11 << 30, 2, 4096));
+    assert!(!admit_resources(0.75, 16, 11 << 30, 2, 4096));
+    assert!(!admit_resources(f64::NAN, 16, 11 << 30, 2, 4096));
+    assert!(!admit_resources(0.1, 0, 11 << 30, 2, 4096));
+    assert!(!admit_resources(0.1, 16, 9 << 30, 2, 4096));
 }
 
 #[test]
@@ -975,4 +975,131 @@ fn owner_dispatch_requires_both_original_and_triggering_actor() {
         );
     }
     assert!(Admission::Standing.admits_run(&standing_run("push", "main")));
+}
+
+#[test]
+fn four_agent_clones_and_one_kvm_have_separate_durable_budgets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.json");
+    let mut ledger = Ledger::default();
+    let inventory = [300, 9000].map(|id| PoolMember {
+        id,
+        pool: POOL.into(),
+        template: true,
+    });
+    let mut ids = std::collections::BTreeSet::new();
+    for n in 1..=4 {
+        let row = ledger
+            .reserve_lane(job(n), &inventory, n, Concurrency::ONE, CloneLane::Agent)
+            .unwrap();
+        assert!(ids.insert(row.vm.get()));
+    }
+    ledger.save(&path).unwrap();
+    let mut ledger = Ledger::load(&path).unwrap();
+    assert!(
+        ledger
+            .reserve_lane(job(5), &inventory, 5, Concurrency::ONE, CloneLane::Agent)
+            .is_err()
+    );
+    let kvm = ledger
+        .reserve(job(6), &inventory, 6, Concurrency::ONE)
+        .unwrap();
+    assert!(ids.insert(kvm.vm.get()));
+    assert!(
+        ledger
+            .reserve(job(7), &inventory, 7, Concurrency::ONE)
+            .is_err()
+    );
+    ledger.rows[0].state = State::Destroyed;
+    assert!(
+        ledger
+            .reserve_lane(job(8), &inventory, 8, Concurrency::ONE, CloneLane::Agent)
+            .is_ok()
+    );
+    let unknown = [PoolMember {
+        id: 345,
+        pool: POOL.into(),
+        template: false,
+    }];
+    ledger.rows[1].state = State::Destroyed;
+    assert!(
+        ledger
+            .reserve_lane(job(9), &unknown, 9, Concurrency::ONE, CloneLane::Agent)
+            .is_err()
+    );
+}
+
+#[test]
+fn dispatch_demand_and_hook_are_bound_to_owner_main_workflow_run() {
+    let mut run = standing_run("issues", "main");
+    run["path"] = DISPATCH_WORKFLOW.into();
+    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    run["triggering_actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    assert!(Admission::Agent.admits_run(&run));
+    assert!(!Admission::Standing.admits_run(&run));
+    for field in ["actor", "triggering_actor"] {
+        let mut bad = run.clone();
+        bad[field]["login"] = "outsider".into();
+        assert!(!Admission::Agent.admits_run(&bad));
+    }
+    let mut context = standing_context("issues", "refs/heads/main");
+    context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/heads/main");
+    let policy = JobPolicy::Agent(RunBinding {
+        run: RunId(context.run_id),
+        attempt: context.run_attempt,
+        sha: context.sha.clone(),
+    });
+    assert_eq!(JobPolicy::parse(&policy.render()).unwrap(), policy);
+    assert!(policy.authorize(&context).is_ok());
+    context.run_id += 1;
+    assert!(policy.authorize(&context).is_err());
+    context.workflow_ref = format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/main");
+    assert!(policy.authorize(&context).is_err());
+}
+
+#[test]
+fn dispatch_demand_refuses_worker_app_actor_and_triggering_actor() {
+    let mut run = standing_run("issues", "main");
+    run["path"] = DISPATCH_WORKFLOW.into();
+    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    run["triggering_actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    for field in ["actor", "triggering_actor"] {
+        let mut app_run = run.clone();
+        app_run[field]["login"] = "carrick-workers[bot]".into();
+        assert!(
+            !Admission::Agent.admits_run(&app_run),
+            "worker App in {field} admitted a credentialed agent clone"
+        );
+    }
+}
+
+#[test]
+fn dispatch_demand_refuses_nonuser_or_missing_actor_types() {
+    let mut run = standing_run("issues", "main");
+    run["path"] = DISPATCH_WORKFLOW.into();
+    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    run["triggering_actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    assert!(Admission::Agent.admits_run(&run));
+    for field in ["actor", "triggering_actor"] {
+        for account_type in [Some("Bot"), Some("Organization"), None] {
+            let mut spoofed = run.clone();
+            match account_type {
+                Some(value) => spoofed[field]["type"] = value.into(),
+                None => {
+                    spoofed[field].as_object_mut().unwrap().remove("type");
+                }
+            }
+            assert!(
+                !Admission::Agent.admits_run(&spoofed),
+                "{field} with type {account_type:?} admitted an owner-spoofed run"
+            );
+        }
+    }
+}
+
+#[test]
+fn agent_resource_admission_uses_eight_cores_and_twenty_gib_plus_host_reserve() {
+    assert!(admit_resources(0.63, 48, 26 << 30, 8, 20480));
+    assert!(!admit_resources(0.64, 48, 26 << 30, 8, 20480));
+    assert!(!admit_resources(0.1, 48, (26 << 30) - 1, 8, 20480));
 }

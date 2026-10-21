@@ -129,7 +129,11 @@ impl Github {
             if !admission.admits_run(run) {
                 continue;
             }
-            for job in jobs(run)? {
+            let run_jobs = jobs(run)?;
+            if !guard_ready(admission, &run_jobs) {
+                continue;
+            }
+            for job in run_jobs {
                 let job_labels: Vec<&str> = job["labels"]
                     .as_array()
                     .ok_or(ScalerError::External("job labels"))?
@@ -285,7 +289,20 @@ impl Github {
     }
 
     pub(super) fn vet_assignment(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
-        self.vet(&Admission::Standing, key)
+        let run = self.request(
+            "GET",
+            &format!("repos/{REPOSITORY}/actions/runs/{}", key.run.0),
+            None,
+            false,
+        )?;
+        self.vet(
+            &if run["path"] == DISPATCH_WORKFLOW {
+                Admission::Agent
+            } else {
+                Admission::Standing
+            },
+            key,
+        )
     }
 
     fn vet_inner(
@@ -305,12 +322,31 @@ impl Github {
         {
             return Err(ScalerError::Guard("reserved run is no longer admitted"));
         }
+        if matches!(admission, Admission::Agent) {
+            let data = request(
+                "GET",
+                &format!(
+                    "repos/{REPOSITORY}/actions/runs/{}/attempts/{}/jobs?per_page=100",
+                    key.run.0, key.attempt
+                ),
+                None,
+                true,
+            )?;
+            if !guard_ready(admission, &pages(&data, "jobs")?) {
+                return Err(ScalerError::Guard("dispatch guard has not succeeded"));
+            }
+        }
         let sha = run["head_sha"]
             .as_str()
             .ok_or(ScalerError::External("run head SHA"))?
             .to_ascii_lowercase();
         Ok(match admission {
             Admission::Pilot { sha } => JobPolicy::Pilot { sha: sha.clone() },
+            Admission::Agent => JobPolicy::Agent(RunBinding {
+                run: key.run,
+                attempt: key.attempt,
+                sha,
+            }),
             Admission::Standing => JobPolicy::Bound(RunBinding {
                 run: key.run,
                 attempt: key.attempt,
@@ -440,11 +476,52 @@ fn pages(data: &Value, field: &str) -> Result<Vec<Value>, ScalerError> {
     Ok(result)
 }
 
+/// A blocked `needs: guard` job must never consume a credentialed clone.
+/// Demand and the final pre-JIT/reassignment vet both check this attempt.
+fn guard_ready(admission: &Admission, jobs: &[Value]) -> bool {
+    !matches!(admission, Admission::Agent)
+        || jobs.iter().any(|job| {
+            job["name"] == "guard" && job["status"] == "completed" && job["conclusion"] == "success"
+        })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    #[test]
+    fn dispatch_vet_requires_this_attempts_successful_hosted_guard() {
+        let run = json!({"id":42,"run_attempt":2,"head_sha":"a".repeat(40), "head_branch":"main", "event":"issues",
+            "path":DISPATCH_WORKFLOW,"repository":{"full_name":REPOSITORY}, "head_repository":{"full_name":REPOSITORY},
+            "actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"}});
+        let key = JobKey {
+            run: RunId(42),
+            attempt: 2,
+            job: JobId(9),
+        };
+        for (status, conclusion, permitted) in [
+            ("queued", "success", false),
+            ("completed", "failure", false),
+            ("completed", "success", true),
+        ] {
+            let policy = Github::vet_inner(&Admission::Agent, key, |_, endpoint, _, paginated| {
+                if endpoint.ends_with("/42") {
+                    return Ok(run.clone());
+                }
+                assert_eq!(
+                    endpoint,
+                    "repos/carrick-sh/carrick/actions/runs/42/attempts/2/jobs?per_page=100"
+                );
+                assert!(paginated);
+                Ok(json!([{"jobs":[{"name":"guard", "status":status,"conclusion":conclusion}]}]))
+            });
+            assert_eq!(policy.is_ok(), permitted);
+            if permitted {
+                assert!(matches!(policy.unwrap(), JobPolicy::Agent(_)));
+            }
+        }
+    }
     #[test]
     fn reservations_and_assignments_accept_main_push_and_dispatch_only() {
         let key = JobKey {

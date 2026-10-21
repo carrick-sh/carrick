@@ -4,6 +4,47 @@ use super::*;
 
 const SYNTHETIC_SECRET: &str = "synthetic-never-a-real-credential";
 
+#[test]
+fn template_9000_destructive_permissions_are_rejected_in_every_site_profile() {
+    for lane in [CloneLane::Kvm, CloneLane::Agent] {
+        let site = site::CONTABO.for_lane(lane).unwrap();
+        let result = verify_protected_vms(site, |vm| {
+            Ok(if vm == 9000 {
+                serde_json::json!({"/vms/9000": {"VM.PowerMgmt": 1}})
+            } else {
+                serde_json::json!({})
+            })
+        });
+        assert!(
+            result.is_err(),
+            "destructive template rights admitted for {lane:?}"
+        );
+    }
+}
+
+#[test]
+fn template_9000_clone_rights_never_license_other_protected_workers() {
+    for lane in [CloneLane::Kvm, CloneLane::Agent] {
+        let site = site::CONTABO.for_lane(lane).unwrap();
+        assert!(
+            verify_protected_vms(site, |vm| {
+                Ok(if vm == 9000 {
+                    serde_json::json!({"/vms/9000": {"VM.Audit": 1, "VM.Clone": 1}})
+                } else {
+                    serde_json::json!({})
+                })
+            })
+            .is_ok()
+        );
+        assert!(
+            verify_protected_vms(site, |vm| {
+                Ok(serde_json::json!({format!("/vms/{vm}"): {"VM.Clone": 1}}))
+            })
+            .is_err()
+        );
+    }
+}
+
 fn request_complete(request: &[u8]) -> Option<usize> {
     let header_end = request.windows(4).position(|part| part == b"\r\n\r\n")? + 4;
     let headers = std::str::from_utf8(&request[..header_end]).ok()?;

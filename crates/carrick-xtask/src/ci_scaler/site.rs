@@ -36,6 +36,7 @@ pub(super) enum Network {
 /// in pool `carrick-ci` are the same on every site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Site {
+    pub lane: super::CloneLane,
     /// Physical-host clone admission, held in-process from reservation through
     /// destruction. Guests do not recursively acquire this exclusive lease.
     pub host_lease: Option<&'static str>,
@@ -60,6 +61,7 @@ pub(super) struct Site {
 }
 
 pub(super) const WILLOW: Site = Site {
+    lane: super::CloneLane::Kvm,
     host_lease: None,
     node: "willow",
     api_host: "willow.atxconsulting.com",
@@ -77,7 +79,8 @@ pub(super) const WILLOW: Site = Site {
 /// The dedicated Contabo host (issue #287): NAT bridge `vmbr1` (no DHCP),
 /// directory storage, and the agent-worker VMs/template protected.
 pub(super) const CONTABO: Site = Site {
-    host_lease: Some(crate::host_lease::broker::LOCK_PATH),
+    lane: super::CloneLane::Kvm,
+    host_lease: None,
     node: "carrick-ctb",
     api_host: "carrick-ctb.turkey-moth.ts.net",
     api_ca: Some("/etc/pve/pve-root-ca.pem"),
@@ -99,6 +102,19 @@ pub(super) const CONTABO: Site = Site {
 pub(super) const SITES: [Site; 2] = [WILLOW, CONTABO];
 
 impl Site {
+    pub(super) fn for_lane(self, lane: super::CloneLane) -> Result<Self, ScalerError> {
+        let mut site = Self::for_hostname(self.node)?;
+        if lane == super::CloneLane::Agent {
+            if site.node != CONTABO.node {
+                return Err(ScalerError::Guard("agent clones require Contabo"));
+            }
+            site.cores = 8;
+            site.memory_mib = 20480;
+        }
+        site.lane = lane;
+        Ok(site)
+    }
+
     pub(super) fn for_hostname(hostname: &str) -> Result<Site, ScalerError> {
         let hostname = hostname.trim();
         SITES
@@ -135,10 +151,10 @@ impl Site {
                 gateway,
                 ..
             } => {
-                if !(300..=349).contains(&vmid) {
+                if !(300..=349).contains(&vmid) && vmid != 9000 {
                     return Err(ScalerError::Guard("static address outside CI VMIDs"));
                 }
-                let host = vmid - 200;
+                let host = if vmid == 9000 { 150 } else { vmid - 200 };
                 Ok(format!("ip={a}.{b}.{c}.{host}/24,gw={a}.{b}.{c}.{gateway}"))
             }
         }
@@ -225,10 +241,13 @@ impl Site {
             Network::Static {
                 subnet: [a, b, c], ..
             } => {
-                if !(300..=349).contains(&vmid) {
+                if !(300..=349).contains(&vmid) && vmid != 9000 {
                     return Err(ScalerError::Guard("static address outside CI VMIDs"));
                 }
-                Ok(Some(format!("{a}.{b}.{c}.{}", vmid - 200)))
+                Ok(Some(format!(
+                    "{a}.{b}.{c}.{}",
+                    if vmid == 9000 { 150 } else { vmid - 200 }
+                )))
             }
         }
     }
@@ -353,6 +372,7 @@ mod tests {
         assert_eq!(
             WILLOW,
             Site {
+                lane: super::super::CloneLane::Kvm,
                 host_lease: None,
                 node: "willow",
                 api_host: "willow.atxconsulting.com",
@@ -385,7 +405,8 @@ mod tests {
         assert_eq!(
             CONTABO,
             Site {
-                host_lease: Some(crate::host_lease::broker::LOCK_PATH),
+                lane: super::super::CloneLane::Kvm,
+                host_lease: None,
                 node: "carrick-ctb",
                 api_host: "carrick-ctb.turkey-moth.ts.net",
                 api_ca: Some("/etc/pve/pve-root-ca.pem"),
@@ -429,6 +450,28 @@ OUT DROP -dest 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0
 OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n"
         );
         assert_eq!(CONTABO.qemu(308), "/nodes/carrick-ctb/qemu/308");
+    }
+    #[test]
+    fn agent_lane_uses_approved_contabo_resources_and_template_firewall_address() {
+        let site = CONTABO.for_lane(super::super::CloneLane::Agent).unwrap();
+        assert!(CONTABO.host_lease.is_none());
+        assert!(site.host_lease.is_none());
+        assert_eq!(
+            site.for_lane(super::super::CloneLane::Kvm).unwrap(),
+            CONTABO
+        );
+        assert_eq!(site.cores, 8);
+        assert_eq!(site.memory_mib, 20480);
+        assert_eq!(site.lane.template(), 9000);
+        assert_eq!(site.protected, &[101, 102, 103, 104, 9000]);
+        assert_eq!(site.static_address(9000).unwrap().unwrap(), "10.77.0.150");
+        assert!(
+            site.vm_firewall_file(9000)
+                .unwrap()
+                .unwrap()
+                .contains("10.77.0.150")
+        );
+        assert!(WILLOW.for_lane(super::super::CloneLane::Agent).is_err());
     }
     #[test]
     fn template_builder_inputs_are_bare_tokens() {
