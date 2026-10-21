@@ -327,6 +327,9 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// leaves the caller's host handoff intact, so its execution capacity can
     /// be released without sending a native child to a host-task adopter.
     pub fn run_ready(&mut self, frame: &mut TrapFrame) -> Option<Served> {
+        if let Some(served) = self.enforce_affinity(frame) {
+            return Some(served);
+        }
         loop {
             if let Some(switched) = self.zone.switch_in_full(self.slot) {
                 match self.load(frame, switched) {
@@ -341,6 +344,19 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return Some(self.service_exit());
         }
         None
+    }
+
+    /// Enforce the current record's placement at an IRQ or completed-entry
+    /// boundary. Syscall callers consume completion authority first, so the
+    /// saved frame contains the completed result before publication.
+    pub fn enforce_affinity(&mut self, frame: &mut TrapFrame) -> Option<Served> {
+        if !self.zone.current_affinity_excludes_cpu(self.slot) || !self.park_preempted(frame) {
+            return None;
+        }
+        let mut effects = WakeEffects::default();
+        self.zone.migrate_queued(self.slot, &mut effects);
+        self.send_sgis(&effects);
+        Some(self.service_exit())
     }
 
     /// A thread EL1 just created (`clone`), unpublished and with the context
@@ -617,15 +633,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 .fetch_add(1, Ordering::Relaxed);
             return carrick_el1_abi::Action::Forward;
         }
-        if self.zone.current_affinity_excludes_cpu(self.slot) {
-            if self.park_preempted(frame) {
-                let mut effects = WakeEffects::default();
-                self.zone.migrate_queued(self.slot, &mut effects);
-                self.send_sgis(&effects);
-                self.service_exit();
-                return carrick_el1_abi::Action::Idle;
-            }
-            return carrick_el1_abi::Action::Forward;
+        if self.enforce_affinity(frame).is_some() {
+            return carrick_el1_abi::Action::Idle;
         }
         if self.task.linux.has_pending_host_work() {
             self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
