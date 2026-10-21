@@ -226,11 +226,15 @@ pub(super) enum OwnerSupplyWait {
 /// The syscall operation to resume after an owner-memory dependency.
 /// A retained transfer cannot fall through to numeric syscall redispatch.
 pub(super) enum OwnedSyscallResume {
-    CopyoutRedispatch,
+    Redispatch,
+    PreparedCopyout(carrick_kernel::dispatch::PreparedCopyoutRestart),
     PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
 }
 
 fn owner_copyin_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
+    if let DispatchOutcome::PreparedCopyoutWait { wait, restart } = outcome {
+        return (*wait, Some(OwnedSyscallResume::PreparedCopyout(restart)));
+    }
     let DispatchOutcome::WriteCopyInSuspended(pending) = outcome else {
         return (outcome, None);
     };
@@ -3324,7 +3328,7 @@ where
             let outcome = self.state.resume_owned_syscall(
                 &self.kernel,
                 engine,
-                resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
+                resume.unwrap_or(OwnedSyscallResume::Redispatch),
                 control.submission.host_wait_context(),
             )?;
             return self.route_outcome(engine, control, frame, outcome);
@@ -3342,7 +3346,7 @@ where
                 control,
                 frame,
                 wait,
-                resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
+                resume.unwrap_or(OwnedSyscallResume::Redispatch),
             );
         }
         if let DispatchOutcome::OwnerPhysicalWait { wait, committed } = outcome {
@@ -3367,14 +3371,14 @@ where
                 let outcome = self.state.resume_owned_syscall(
                     &self.kernel,
                     engine,
-                    resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
+                    resume.unwrap_or(OwnedSyscallResume::Redispatch),
                     control.submission.host_wait_context(),
                 )?;
                 return self.route_outcome(engine, control, frame, outcome);
             }
             self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
                 frame,
-                resume: resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
+                resume: resume.unwrap_or(OwnedSyscallResume::Redispatch),
                 wait,
                 _subscription: subscription,
             };

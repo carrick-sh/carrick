@@ -1613,6 +1613,7 @@ impl BlockedContinuation {
             DispatchOutcome::Returned { .. }
             | DispatchOutcome::SchedulerYield
             | DispatchOutcome::Errno { .. }
+            | DispatchOutcome::PreparedCopyoutWait { .. }
             | DispatchOutcome::WriteCopyInSuspended(_)
             | DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }
@@ -2585,22 +2586,21 @@ impl BlockedContinuation {
                             mqueue.cancel();
                         }
                     }
-                    let restart = if family == ContinuationFamily::WaitOnSignals
-                        || partial_write_progress
-                    {
-                        RestartDecision::NoRestart
-                    } else {
-                        match restart_class {
-                            RestartClass::RestartNoIntr => RestartDecision::Restart,
-                            RestartClass::RestartSyscall if action_requests_restart => {
-                                RestartDecision::Restart
+                    let restart =
+                        if family == ContinuationFamily::WaitOnSignals || partial_write_progress {
+                            RestartDecision::NoRestart
+                        } else {
+                            match restart_class {
+                                RestartClass::RestartNoIntr => RestartDecision::Restart,
+                                RestartClass::RestartSyscall if action_requests_restart => {
+                                    RestartDecision::Restart
+                                }
+                                RestartClass::Never
+                                | RestartClass::RestartSyscall
+                                | RestartClass::RestartNoHand
+                                | RestartClass::RestartBlock => RestartDecision::NoRestart,
                             }
-                            RestartClass::Never
-                            | RestartClass::RestartSyscall
-                            | RestartClass::RestartNoHand
-                            | RestartClass::RestartBlock => RestartDecision::NoRestart,
-                        }
-                    };
+                        };
                     let completion = if family == ContinuationFamily::BlockingWrite {
                         let offset = match &self.state().detail {
                             ContinuationDetail::BlockingWrite(write) => {

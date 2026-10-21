@@ -494,9 +494,23 @@ pub enum FdWaitCompletion {
 /// task that would wake them, and a wait that re-parks must keep the exact
 /// description, offset and completion authority it started with — restarting a
 /// partially completed operation from zero corrupts the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ::serde::Serialize)]
+pub enum PreparedCopyoutRestart {
+    NoIntr,
+    Sys,
+}
+
 #[derive(Debug, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
+    /// A side-effect-free prepared copyout was refused by its memory owner.
+    /// The typed restart class controls signal delivery while the saved
+    /// syscall remains safe to redispatch from its first instruction.
+    PreparedCopyoutWait {
+        #[serde(skip_serializing)]
+        wait: Box<DispatchOutcome>,
+        restart: PreparedCopyoutRestart,
+    },
     /// A write retains its exact destination and owner copy-in transfer while
     /// the runtime parks the syscall completion on the reported memory wait.
     WriteCopyInSuspended(#[serde(skip_serializing)] Box<super::OwnedWriteCopyIn>),

@@ -1759,7 +1759,8 @@ where
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
         match resume {
-            binding::OwnedSyscallResume::CopyoutRedispatch => {
+            binding::OwnedSyscallResume::Redispatch
+            | binding::OwnedSyscallResume::PreparedCopyout(_) => {
                 self.redispatch_threaded_syscall(kernel, engine, host_wait)
             }
             binding::OwnedSyscallResume::PreparedWrite(pending) => {
@@ -3267,6 +3268,7 @@ pub(crate) mod tests {
     pub(crate) struct CrashCaptureTestEngine {
         pub(crate) next_syscall: Option<carrick_hal::RawSyscall>,
         pub(crate) completed_syscalls: Vec<i64>,
+        pub(crate) injected_signals: usize,
         pub(crate) completion_events: Option<Arc<Mutex<Vec<&'static str>>>>,
         pub(crate) execve_installs: usize,
         pub(crate) exec_inventory_arms: usize,
@@ -3556,6 +3558,7 @@ pub(crate) mod tests {
             &mut self,
             _signal: carrick_hal::SignalInjection,
         ) -> Result<(), TrapError> {
+            self.injected_signals += 1;
             Ok(())
         }
 
@@ -3958,7 +3961,10 @@ pub(crate) mod tests {
                         .unwrap();
                     assert_eq!(
                         first,
-                        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                        DispatchOutcome::PreparedCopyoutWait {
+                            wait: Box::new(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }),
+                            restart: carrick_kernel::dispatch::PreparedCopyoutRestart::NoIntr,
+                        },
                         "the production service must park on the sibling's editor, never return EFAULT",
                     );
                     assert_eq!(engine.prepared_commits, 0);
@@ -4042,7 +4048,9 @@ pub(crate) mod tests {
                             &mut control,
                             frame,
                             wait,
-                            binding::OwnedSyscallResume::CopyoutRedispatch,
+                            binding::OwnedSyscallResume::PreparedCopyout(
+                                carrick_kernel::dispatch::PreparedCopyoutRestart::NoIntr,
+                            ),
                         )
                         .unwrap();
                     let executor::ExecutorExit::BlockedContinuation {
@@ -4107,7 +4115,9 @@ pub(crate) mod tests {
                             &mut engine,
                             &mut resumed_control,
                             frame,
-                            binding::OwnedSyscallResume::CopyoutRedispatch,
+                            binding::OwnedSyscallResume::PreparedCopyout(
+                                carrick_kernel::dispatch::PreparedCopyoutRestart::NoIntr,
+                            ),
                         )
                         .unwrap();
                     assert!(matches!(completed, executor::ExecutorExit::Syscall));

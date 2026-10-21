@@ -39,14 +39,29 @@ pub(super) enum OwnerMemoryAction {
 
 enum ZoneWaitPolicy {
     Ordinary(Option<std::time::Duration>),
-    KillableOwnerMemory,
 }
 
 impl ZoneWaitPolicy {
     fn for_owner_resume(resume: &OwnedSyscallResume) -> Self {
+        let _ = resume;
+        Self::Ordinary(None)
+    }
+
+    fn restart_class(
+        &self,
+        resume: &OwnedSyscallResume,
+        request: SyscallRequest,
+    ) -> carrick_kernel::kernel::continuation::RestartClass {
+        use carrick_kernel::kernel::continuation::RestartClass;
         match resume {
-            OwnedSyscallResume::CopyoutRedispatch | OwnedSyscallResume::PreparedWrite(_) => {
-                Self::KillableOwnerMemory
+            OwnedSyscallResume::PreparedCopyout(
+                carrick_kernel::dispatch::PreparedCopyoutRestart::NoIntr,
+            ) => RestartClass::RestartNoIntr,
+            OwnedSyscallResume::PreparedCopyout(
+                carrick_kernel::dispatch::PreparedCopyoutRestart::Sys,
+            ) => RestartClass::RestartSyscall,
+            OwnedSyscallResume::Redispatch | OwnedSyscallResume::PreparedWrite(_) => {
+                RestartClass::for_syscall(request.number.raw())
             }
         }
     }
@@ -59,11 +74,6 @@ pub(super) fn owner_zone_continuation_for_resume(
 ) -> carrick_kernel::kernel::continuation::BlockedContinuation {
     let policy = ZoneWaitPolicy::for_owner_resume(resume);
     match policy {
-        ZoneWaitPolicy::KillableOwnerMemory => {
-            carrick_kernel::kernel::continuation::BlockedContinuation::from_killable_owner_zone_park(
-                capture, wait,
-            )
-        }
         ZoneWaitPolicy::Ordinary(timeout) => {
             carrick_kernel::kernel::continuation::BlockedContinuation::from_zone_park(
                 capture, wait, timeout,
@@ -77,11 +87,38 @@ mod owner_copyout_policy_tests {
     use super::{OwnedSyscallResume, ZoneWaitPolicy};
 
     #[test]
-    fn copyout_redispatch_is_killable_only_not_ordinary_signal_interruptible() {
-        assert!(matches!(
-            ZoneWaitPolicy::for_owner_resume(&OwnedSyscallResume::CopyoutRedispatch),
-            ZoneWaitPolicy::KillableOwnerMemory
-        ));
+    fn copyout_redispatch_uses_an_ordinary_signal_interruptible_wait() {
+        let nointr = OwnedSyscallResume::PreparedCopyout(
+            carrick_kernel::dispatch::PreparedCopyoutRestart::NoIntr,
+        );
+        let sys = OwnedSyscallResume::PreparedCopyout(
+            carrick_kernel::dispatch::PreparedCopyoutRestart::Sys,
+        );
+        let ordinary = OwnedSyscallResume::Redispatch;
+        let request = carrick_kernel::dispatch::SyscallRequest::new(
+            carrick_abi::syscall::nr::READ.raw(),
+            crate::compat::SyscallArgs([0; 6]),
+        );
+        for resume in [&nointr, &sys, &ordinary] {
+            assert!(matches!(
+                ZoneWaitPolicy::for_owner_resume(resume),
+                ZoneWaitPolicy::Ordinary(None)
+            ));
+        }
+        let policy = ZoneWaitPolicy::Ordinary(None);
+        assert_eq!(
+            policy.restart_class(&nointr, request),
+            carrick_kernel::kernel::continuation::RestartClass::RestartNoIntr
+        );
+        assert_eq!(
+            policy.restart_class(&sys, request),
+            carrick_kernel::kernel::continuation::RestartClass::RestartSyscall
+        );
+        assert_eq!(
+            policy.restart_class(&ordinary, request),
+            carrick_kernel::kernel::continuation::RestartClass::RestartSyscall,
+            "an unprepared host pipe read keeps main's ordinary restart class",
+        );
     }
 }
 
@@ -468,6 +505,7 @@ where
             seq,
             ZoneWaitPolicy::Ordinary(timeout),
             request,
+            carrick_kernel::kernel::continuation::RestartClass::Never,
         )?;
         Ok(Some(exit))
     }
@@ -547,6 +585,7 @@ where
         seq: u32,
         policy: ZoneWaitPolicy,
         request: SyscallRequest,
+        restart: carrick_kernel::kernel::continuation::RestartClass,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let context = self
             .kernel
@@ -557,19 +596,15 @@ where
             })?;
         let lease = control.execution_lease_mut().map_err(RuntimeError::Trap)?;
         let capture = carrick_kernel::kernel::continuation::ContinuationCapture::from_lease(
-            &context,
-            lease,
-            request,
-            carrick_kernel::kernel::continuation::RestartClass::Never,
+            &context, lease, request, restart,
         )
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
         let wait = carrick_kernel::kernel::continuation::ZoneWait::new(record, seq);
         let continuation = match policy {
-            ZoneWaitPolicy::KillableOwnerMemory => {
-                carrick_kernel::kernel::continuation::BlockedContinuation::from_killable_owner_zone_park(capture, wait)
-            }
             ZoneWaitPolicy::Ordinary(timeout) => {
-                carrick_kernel::kernel::continuation::BlockedContinuation::from_zone_park(capture, wait, timeout)
+                carrick_kernel::kernel::continuation::BlockedContinuation::from_zone_park(
+                    capture, wait, timeout,
+                )
             }
         };
         let binding = control.binding.ok_or_else(|| {
@@ -693,6 +728,7 @@ where
             seq,
             ZoneWaitPolicy::Ordinary(timeout),
             request,
+            carrick_kernel::kernel::continuation::RestartClass::Never,
         )
     }
 
@@ -807,13 +843,16 @@ where
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match (action, syscall_state) {
                     (OwnerMemoryAction::Syscall { frame, resume }, Some((state, _, request))) => {
+                        let policy = ZoneWaitPolicy::for_owner_resume(&resume);
+                        let restart = policy.restart_class(&resume, request);
                         let exit = self.settle_into_zone(
                             control,
                             state,
                             zone.record_ref(record),
                             seq,
-                            ZoneWaitPolicy::for_owner_resume(&resume),
+                            policy,
                             request,
+                            restart,
                         )?;
                         self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame, resume };
                         Ok(exit)
@@ -889,9 +928,13 @@ where
         resume: OwnedSyscallResume,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let mut result = self.consume_owner_zone(control)?;
-        let reserved_signum = result.reserved_signal().map(|signal| signal.signum());
         let interruption = owner_wait_interruption(&result.completion);
-        let reserved = result.take_reserved_signal();
+        let effects = result.take_resume_effects();
+        let reserved_signum = effects
+            .reserved_signal
+            .as_ref()
+            .map(|signal| signal.signum());
+        let reserved = effects.reserved_signal;
         // The restored CPU still owns the pending syscall's EL1 trap frame.
         // Carry the reservation to common completion, which publishes the
         // actual return value before signal delivery at the EL0 boundary.
@@ -903,7 +946,7 @@ where
         } else {
             previous.or(reserved)
         };
-        self.state.continuation_restart = None;
+        self.state.continuation_restart = effects.restart;
         let outcome = match interruption {
             Some(outcome) => outcome,
             None => self.state.resume_owned_syscall(
@@ -1390,6 +1433,7 @@ where
                     seq,
                     ZoneWaitPolicy::Ordinary(None),
                     request,
+                    carrick_kernel::kernel::continuation::RestartClass::Never,
                 )
                 .map(IpcParkAttempt::Parked)
             }

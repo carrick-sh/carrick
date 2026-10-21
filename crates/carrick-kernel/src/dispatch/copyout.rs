@@ -32,7 +32,7 @@ use carrick_guest_mem::{
     CurrentMmMemory, GuestVa, GuestWriteRange, PreparedGuestWrite, UserMemoryVenue,
 };
 
-use super::{DispatchError, DispatchOutcome};
+use super::{DispatchError, DispatchOutcome, PreparedCopyoutRestart};
 
 /// The largest total output one copyout prepares: one owner portal permit.
 /// Fixed records are checked at compile time; variable outputs must clamp
@@ -78,11 +78,17 @@ impl UserSlot {
 #[derive(Debug, Eq, PartialEq)]
 #[must_use = "a refused copyout must be returned before any side effect"]
 /// Boxed: a refusal is the rare path, and the outcome is large.
-pub(crate) struct CopyoutRefusal(Box<DispatchOutcome>);
+pub(crate) struct CopyoutRefusal {
+    wait: Box<DispatchOutcome>,
+    restart: PreparedCopyoutRestart,
+}
 
 impl CopyoutRefusal {
     pub(crate) fn into_outcome(self) -> DispatchOutcome {
-        *self.0
+        DispatchOutcome::PreparedCopyoutWait {
+            wait: self.wait,
+            restart: self.restart,
+        }
     }
 
     pub(crate) fn from_read_error(error: carrick_guest_mem::MemoryError) -> Option<Self> {
@@ -124,7 +130,10 @@ impl CopyoutRefusal {
             },
             _ => return None,
         };
-        Some(Self(Box::new(outcome)))
+        Some(Self {
+            wait: Box::new(outcome),
+            restart: PreparedCopyoutRestart::NoIntr,
+        })
     }
 }
 
@@ -194,6 +203,14 @@ pub(crate) struct PreparedCopyout<'m, M: CurrentMmMemory, const N: usize> {
 pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
     memory: &mut M,
     slots: [Option<UserSlot>; N],
+) -> Result<PreparedCopyout<'_, M, N>, CopyoutRefusal> {
+    prepare_with_restart(memory, slots, PreparedCopyoutRestart::NoIntr)
+}
+
+pub(crate) fn prepare_with_restart<M: CurrentMmMemory, const N: usize>(
+    memory: &mut M,
+    slots: [Option<UserSlot>; N],
+    restart: PreparedCopyoutRestart,
 ) -> Result<PreparedCopyout<'_, M, N>, CopyoutRefusal> {
     let slots = slots.map(|slot| slot.filter(|slot| slot.capacity > 0));
     // The legacy venue has no permit and prepares nothing: a guest-sized
@@ -284,7 +301,12 @@ pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
                     faulted = true;
                     prefix -= 1;
                 }
-                outcome => return Err(CopyoutRefusal(Box::new(outcome))),
+                outcome => {
+                    return Err(CopyoutRefusal {
+                        wait: Box::new(outcome),
+                        restart,
+                    });
+                }
             },
         }
     }
@@ -616,7 +638,10 @@ mod tests {
             .expect("first prepare is refused");
         assert_eq!(
             refused.into_outcome(),
-            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+            DispatchOutcome::PreparedCopyoutWait {
+                wait: Box::new(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }),
+                restart: PreparedCopyoutRestart::NoIntr,
+            }
         );
         assert_eq!(memory.read_bytes(BASE + 0x10, 16).unwrap(), [0xa5; 16]);
 

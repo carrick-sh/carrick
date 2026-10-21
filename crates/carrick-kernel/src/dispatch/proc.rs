@@ -3176,12 +3176,17 @@ impl<'a> ProcView<'a> {
                 // Prepare `infop` before the wait consumes a child event: an
                 // owner refusal parks and retries with the zombie, stop or
                 // continue report still waitable (#711).
-                let infop_out = match super::copyout::prepare(
+                let infop_out = match super::copyout::prepare_with_restart(
                     &mut *cx.memory,
                     [super::copyout::UserSlot::optional(
                         infop_addr.0,
                         crate::linux_abi::LINUX_SIGINFO_SIZE,
                     )],
+                    if guest_nohang {
+                        super::PreparedCopyoutRestart::NoIntr
+                    } else {
+                        super::PreparedCopyoutRestart::Sys
+                    },
                 ) {
                     Ok(out) => out,
                     Err(refusal) => return Ok(refusal.into_outcome()),
@@ -3287,12 +3292,18 @@ impl<'a> ProcView<'a> {
                 // still waitable (#711).
                 let rusage_size =
                     <carrick_abi::LinuxRusage as carrick_abi::KernelAbi>::ABI_SIZE;
-                let outputs = match super::copyout::prepare(
+                let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
+                let outputs = match super::copyout::prepare_with_restart(
                     &mut *cx.memory,
                     [
                         super::copyout::UserSlot::optional(wstatus_addr.0, 4),
                         super::copyout::UserSlot::optional(rusage_addr.0, rusage_size),
                     ],
+                    if guest_nohang {
+                        super::PreparedCopyoutRestart::NoIntr
+                    } else {
+                        super::PreparedCopyoutRestart::Sys
+                    },
                 ) {
                     Ok(out) => out,
                     Err(refusal) => return Ok(refusal.into_outcome()),
@@ -3352,7 +3363,6 @@ impl<'a> ProcView<'a> {
                         }
                     }
                 };
-                let guest_nohang = options.contains(LinuxWaitOptions::WNOHANG);
                 match waited {
                     crate::kernel::WaitResult::Exited(exit)
                     | crate::kernel::WaitResult::StateChanged(exit) => {
@@ -5199,7 +5209,10 @@ mod kernel_process_dispatch_tests {
             let wait = memory.refuse_next();
             assert_eq!(
                 call(&mut memory),
-                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                DispatchOutcome::PreparedCopyoutWait {
+                    wait: Box::new(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }),
+                    restart: PreparedCopyoutRestart::Sys,
+                },
                 "syscall {number}: a transient owner refusal is a wait, not EFAULT",
             );
             assert_eq!(
@@ -5284,7 +5297,10 @@ mod kernel_process_dispatch_tests {
                         Some(&lease),
                     )
                     .unwrap(),
-                DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                DispatchOutcome::PreparedCopyoutWait {
+                    wait: Box::new(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }),
+                    restart: PreparedCopyoutRestart::Sys,
+                },
             );
             assert_eq!(memory.read_bytes(STATUS, 4).unwrap(), [0xa5; 4]);
             assert_eq!(
@@ -5364,7 +5380,10 @@ mod kernel_process_dispatch_tests {
                     Some(&lease),
                 )
                 .unwrap(),
-            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            DispatchOutcome::PreparedCopyoutWait {
+                wait: Box::new(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }),
+                restart: PreparedCopyoutRestart::NoIntr,
+            },
         );
         assert_eq!(memory.read_bytes(SIGINFO, 28).unwrap(), [0xa5; 28]);
         assert_eq!(

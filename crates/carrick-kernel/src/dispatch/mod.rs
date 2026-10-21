@@ -735,7 +735,7 @@ pub(crate) use wait_authority::{InternalWaitKind, WaitFdAuthority};
 pub mod outcome;
 pub use outcome::{
     BlockingRecordLock, BlockingWrite, DispatchError, DispatchOutcome, FdWaitCompletion,
-    LinearMemory, SharedFutexTarget,
+    LinearMemory, PreparedCopyoutRestart, SharedFutexTarget,
 };
 #[allow(unused_imports)]
 pub(crate) use outcome::{

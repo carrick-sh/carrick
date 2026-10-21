@@ -30,6 +30,13 @@ struct Guest {
 }
 
 impl Guest {
+    fn nointr_wait(wait: carrick_el1_abi::PortalOwnerWait) -> DispatchOutcome {
+        DispatchOutcome::PreparedCopyoutWait {
+            wait: Box::new(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }),
+            restart: PreparedCopyoutRestart::NoIntr,
+        }
+    }
+
     fn new() -> Self {
         Self {
             dispatcher: SyscallDispatcher::new(),
@@ -69,7 +76,7 @@ impl Guest {
         let refused = self.call(number, args);
         assert_eq!(
             refused,
-            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            Self::nointr_wait(wait),
             "syscall {number}: a transient owner refusal is a wait, not EFAULT",
         );
         for &(address, len) in untouched {
@@ -103,7 +110,7 @@ fn pipe2_waits_for_an_owner_refused_copyout_instead_of_efault() {
     let wait = g.memory.refuse_next();
     assert_eq!(
         g.call(nr::PIPE2.raw(), [OUT, 0, 0, 0, 0, 0]),
-        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        Guest::nointr_wait(wait)
     );
     assert!(
         g.dispatcher.open_file(3).is_none() && g.dispatcher.open_file(4).is_none(),
@@ -245,10 +252,7 @@ fn socketpair_waits_for_an_owner_refused_copyout_instead_of_efault() {
     let mut g = Guest::new();
     let args = [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, OUT, 0, 0];
     let wait = g.memory.refuse_next();
-    assert_eq!(
-        g.call(nr::SOCKETPAIR.raw(), args),
-        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
-    );
+    assert_eq!(g.call(nr::SOCKETPAIR.raw(), args), Guest::nointr_wait(wait),);
     assert!(
         g.dispatcher.host_fd_for_poll(3).is_none() && g.dispatcher.host_fd_for_poll(4).is_none(),
         "nothing is installed before the output is prepared",
@@ -287,7 +291,7 @@ fn sockaddr_addrlen_read_suspension_waits_before_copyout() {
         let wait = g.memory.refuse_next_read();
         assert_eq!(
             g.call(number, [left as u64, OUT, LEN_ADDR, 0, 0, 0]),
-            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            Guest::nointr_wait(wait),
             "syscall {number}: addrlen read suspension must retain its owner wait",
         );
         assert_eq!(g.memory.read_bytes(OUT, 16).unwrap(), [FILL; 16]);
