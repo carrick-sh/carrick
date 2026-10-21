@@ -490,20 +490,50 @@ fn frame_grant_root_matches(
     Some(request.reservation_incarnation) == current
 }
 
-fn publish_frame_grant_refusal(
+enum FrameGrantResponse<T> {
+    Refuse(u64, T),
+    Fail(String),
+}
+
+impl From<u64> for FrameGrantResponse<()> {
+    fn from(status: u64) -> Self {
+        Self::Refuse(status, ())
+    }
+}
+
+fn publish_frame_grant_refusal<T>(
     mailbox: &carrick_el1_abi::FrameGrantMailbox,
     request: carrick_el1_abi::FrameGrantRequest,
-    status: u64,
-) {
-    if !mailbox.publish_refusal(status) {
+    response: impl Into<FrameGrantResponse<T>>,
+) -> T {
+    let result = match response.into() {
+        FrameGrantResponse::Refuse(status, value) if mailbox.publish_refusal(status) => Ok(value),
+        FrameGrantResponse::Refuse(status, _) => Err(format!(
+            "claimed frame-grant request could not publish backend refusal: mm={} generation={} status={}",
+            request.mm_key, request.request_generation, status
+        )),
+        FrameGrantResponse::Fail(error) => Err(error),
+    };
+    result.unwrap_or_else(|error| {
         carrick_fatal::carrick_fatal!(
             "hvpatch::el1_frame_grant",
-            "claimed frame-grant request could not publish backend refusal: mm={} generation={} status={}",
-            request.mm_key,
-            request.request_generation,
-            status
-        );
-    }
+            "frame-grant publication failed: {error}"
+        )
+    })
+}
+
+/// Funnel an uncertain prepared grant into the same fail-stop authority as
+/// mailbox refusal failure. Its response never returns to the fault handler.
+fn fail_frame_grant_publication<T>(
+    mailbox: &carrick_el1_abi::FrameGrantMailbox,
+    request: carrick_el1_abi::FrameGrantRequest,
+    error: impl std::fmt::Display,
+) -> T {
+    publish_frame_grant_refusal(
+        mailbox,
+        request,
+        FrameGrantResponse::Fail(error.to_string()),
+    )
 }
 
 /// Drop an exact EL1 request when the host resolved or delivered the fault
@@ -1524,9 +1554,8 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             fault_va: fault_page,
                             permissions: grant.permissions,
                             ready,
-                        }).unwrap_or_else(|error| carrick_fatal::carrick_fatal!(
-                            "hvpatch::physical_grant",
-                            "prepared frame grant cannot publish descriptor: {error}"
+                        }).unwrap_or_else(|error| fail_frame_grant_publication(
+                            mailbox, request, format!("prepared frame grant cannot publish descriptor: {error}")
                         )) {
                             El1FrameGrantPublished::OnHost => {
                                 engine.complete_el1_frame_grant(
@@ -1536,9 +1565,8 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                                         len: service.len,
                                         ready,
                                     },
-                                ).unwrap_or_else(|error| carrick_fatal::carrick_fatal!(
-                                    "hvpatch::physical_grant",
-                                    "host descriptor cannot complete physical grant: {error}"
+                                ).unwrap_or_else(|error| fail_frame_grant_publication(
+                                    mailbox, request, format!("host descriptor cannot complete physical grant: {error}")
                                 ));
                                 Ok::<bool, TrapError>(true)
                             }
@@ -1550,28 +1578,21 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             // can return to a job-control or ptrace stop.
                             El1FrameGrantPublished::Submit(txn) => {
                                 let slots = carrick_el1_abi::descriptor_txn_slots_host()
-                                    .unwrap_or_else(|| carrick_fatal::carrick_fatal!(
-                                        "hvpatch::physical_grant",
-                                        "prepared frame grant has no descriptor slots"
+                                    .unwrap_or_else(|| fail_frame_grant_publication(
+                                        mailbox, request, "prepared frame grant has no descriptor slots"
                                     ));
                                 let verified = match apply_guest_descriptor_txns_now(
                                     &mut EngineDrainVenue(&mut *engine), slots, &[txn],
                                 ) {
-                                    Ok(mut receipts) => receipts.pop().unwrap_or_else(|| {
-                                        carrick_fatal::carrick_fatal!(
-                                            "hvpatch::physical_grant",
-                                            "descriptor service returned no frame grant receipt"
-                                        )
-                                    }),
+                                    Ok(mut receipts) => receipts.pop().unwrap_or_else(|| fail_frame_grant_publication(
+                                        mailbox, request, "descriptor service returned no frame grant receipt"
+                                    )),
                                     Err(carrick_aarch64::descriptor_drain::GuestPublishError::NotApplied { .. }) => {
                                         return Ok(false);
                                     }
-                                    Err(carrick_aarch64::descriptor_drain::GuestPublishError::Unsettled(error)) => {
-                                        carrick_fatal::carrick_fatal!(
-                                            "hvpatch::physical_grant",
-                                            "frame grant descriptor outcome is unsettled: {error}"
-                                        );
-                                    }
+                                    Err(carrick_aarch64::descriptor_drain::GuestPublishError::Unsettled(error)) => fail_frame_grant_publication(
+                                        mailbox, request, format!("frame grant descriptor outcome is unsettled: {error}")
+                                    ),
                                 };
                                 engine.complete_el1_frame_grant(
                                     carrick_hal::threaded::El1FrameGrantRollback {
@@ -1580,17 +1601,15 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                                         len: service.len,
                                         ready,
                                     },
-                                ).unwrap_or_else(|error| carrick_fatal::carrick_fatal!(
-                                    "hvpatch::physical_grant",
-                                    "applied descriptor cannot complete physical grant: {error}"
+                                ).unwrap_or_else(|error| fail_frame_grant_publication(
+                                    mailbox, request, format!("applied descriptor cannot complete physical grant: {error}")
                                 ));
                                 let permit = mutation.host_alias_permit();
                                 let protection = carrick_abi::LinuxProtFlags::from_bits_truncate(service.permissions);
                                 let settled_plan = dispatcher.published_frame_grant_plan(
                                     &permit, residency_identity, protection, &verified,
-                                ).unwrap_or_else(|refusal| carrick_fatal::carrick_fatal!(
-                                    "hvpatch::physical_grant",
-                                    "applied descriptor cannot settle faulting page at 0x{address:x}: {refusal:?}"
+                                ).unwrap_or_else(|refusal| fail_frame_grant_publication(
+                                    mailbox, request, format!("applied descriptor cannot settle faulting page at 0x{address:x}: {refusal:?}")
                                 ));
                                 dispatcher.commit_published_frame_grant(settled_plan, residency_identity);
                                 committed_by_guest.set(true);
@@ -1608,9 +1627,8 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         // after stage-1, stage-2 and inventory are live.
                         dispatcher.commit_published_frame_grant(plan, residency_identity);
                     },
-                ).unwrap_or_else(|error| carrick_fatal::carrick_fatal!(
-                    "hvpatch::physical_grant",
-                    "frame grant mailbox could not complete publication: {error}"
+                ).unwrap_or_else(|error| fail_frame_grant_publication(
+                    mailbox, request, format!("frame grant mailbox could not complete publication: {error}")
                 ));
                 if !completed {
                     // Nothing exposed the prepared backing: undo exactly what
@@ -1623,9 +1641,10 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                             ready,
                         })
                         .unwrap_or_else(|error| {
-                            carrick_fatal::carrick_fatal!(
-                                "hvpatch::physical_grant",
-                                "refused frame grant cannot roll back backing: {error}"
+                            fail_frame_grant_publication(
+                                mailbox,
+                                request,
+                                format!("refused frame grant cannot roll back backing: {error}"),
                             )
                         });
                     publish_frame_grant_refusal(
