@@ -4474,6 +4474,9 @@ pub(crate) mod tests {
 
         let (kernel, context, mut state) =
             typed_completion_fixture(72_424, SyscallDispatcher::new());
+        // Native ingress authenticates the live execution generation, just as
+        // it does for an executor-bound task in production.
+        carrick_kernel::kernel::continuation::test_support::publish(&context, 0x700);
         let control = context.thread().control_slot();
         control.bind_zone_record(carrick_sched_core::RecordRef {
             id: carrick_sched_core::RecordId::from_raw(4).unwrap(),
