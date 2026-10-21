@@ -2064,12 +2064,13 @@ where
                 last_syscall_retval == Some(crate::linux_abi::LINUX_EINTR.guest_retval());
             let handler_wants_restart = sa_flags.contains(carrick_abi::LinuxSaFlags::RESTART);
             let syscall_restartable = trap.last_syscall_nr().is_some_and(is_restartable_syscall);
-            let restart_syscall = continuation_restart.unwrap_or({
-                at_syscall_boundary
-                    && retval_is_eintr
-                    && handler_wants_restart
-                    && syscall_restartable
-            });
+            // A continuation restart decision describes only an interrupted
+            // completion. Positive partial-I/O results are final even when the
+            // handler requested SA_RESTART.
+            let restart_syscall = retval_is_eintr
+                && continuation_restart.unwrap_or({
+                    at_syscall_boundary && handler_wants_restart && syscall_restartable
+                });
             // Publish WHICH predicate decided. All four live in one boolean, so
             // from outside "the guest saw EINTR under SA_RESTART" is otherwise a
             // dead end — you cannot tell a missing syscall from the restartable
@@ -2716,6 +2717,37 @@ mod tests {
             assert_eq!(delivered.term_signal, None);
             assert_eq!(trap.restart, expected);
         }
+    }
+
+    #[test]
+    fn continuation_restart_cannot_replay_a_positive_partial_result() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.exact_signal_context_for_test();
+        let tid = ThreadId::main_from_host_pid();
+        let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(
+            crate::linux_abi::LINUX_SIGUSR1,
+        )
+        .expect("SIGUSR1");
+        let mut action = carrick_abi::LinuxSigaction::empty();
+        action.sa_handler = 0x1234;
+        action.sa_flags = carrick_abi::LINUX_SA_RESTART;
+        context.signal_authority().install_action(signal, action);
+        dispatcher.mark_signal_pending(&context, tid, crate::linux_abi::LINUX_SIGUSR1);
+        let mut trap = NoopTrap::default();
+        deliver_pending_signal_with_restart(
+            &mut trap,
+            &dispatcher,
+            &context,
+            SignalRestartContext {
+                last_syscall_retval: Some(7),
+                interrupted_pc: None,
+                continuation_restart: Some(true),
+            },
+            tid,
+        )
+        .expect("handler injection")
+        .expect("pending handler");
+        assert!(!trap.restart, "a seven-byte prefix is a completed syscall");
     }
 }
 
