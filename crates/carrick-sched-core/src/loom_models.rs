@@ -258,10 +258,10 @@ fn producer_closing_executor_and_second_birth_complete_once() {
             let deliveries = Arc::new(AtomicU32::new(0));
             let producer_zone = zone.clone();
             let producer = thread::spawn(move || {
-                if let Some(custody) = producer_zone.claim_first_entry_placement(record) {
-                    if let Err(custody) = producer_zone.place_first_entry(custody) {
-                        assert!(producer_zone.release_first_entry_placement(custody));
-                    }
+                if let Some(custody) = producer_zone.claim_first_entry_placement(record)
+                    && let Err(custody) = producer_zone.place_first_entry(custody)
+                {
+                    assert!(producer_zone.release_first_entry_placement(custody));
                 }
             });
             let closing_zone = zone.clone();
@@ -449,5 +449,63 @@ fn stale_placement_releases_replacement_despite_its_closing_request() {
             matches!(zone.record(old.id).claim(), Claim::Host { .. }),
             "rejected stale acquisition poisoned replacement custody"
         );
+    });
+}
+
+#[test]
+fn closing_republishes_while_producer_and_executor_contend() {
+    model_composed(|| {
+        let zone = zone();
+        let record = birth(&zone);
+        zone.drive(SLOT, 1);
+        zone.record(record.id)
+            .last_slot
+            .store(SLOT.plus_one(), Ordering::Relaxed);
+        let deliveries = AtomicU32::new(0);
+        let producer_zone = zone.clone();
+        let producer = thread::spawn(move || {
+            if let Some(custody) = producer_zone.claim_first_entry_placement(record)
+                && let Err(custody) = producer_zone.place_first_entry(custody)
+            {
+                assert!(producer_zone.release_first_entry_placement(custody));
+            }
+        });
+        let closing_zone = zone.clone();
+        let closing = thread::spawn(move || {
+            let claim = closing_zone.claim_for_host(record, None, Handback::Control, &SpinForever);
+            // The real handback adapter routes Claimed/AlreadyHost records
+            // through first-entry admission; Deferred belongs to its owner.
+            if matches!(claim, HostClaim::Claimed | HostClaim::AlreadyHost)
+                && let Some(custody) = closing_zone.claim_first_entry_placement(record)
+                && let Err(custody) = closing_zone.place_first_entry(custody)
+            {
+                assert!(closing_zone.release_first_entry_placement(custody));
+            }
+        });
+        if let Some(ServiceHead::FirstEntry(custody)) = zone.take_service_head_for_executor(SLOT) {
+            finish(&zone, custody, &deliveries);
+        } else if let Some(custody) = zone.claim_current_first_entry_activation(record) {
+            finish(&zone, custody, &deliveries);
+        }
+        producer.join().unwrap();
+        closing.join().unwrap();
+        match zone.record(record.id).claim() {
+            Claim::Queued { slot, .. } => {
+                match zone.take_service_head_for_executor(slot).unwrap() {
+                    ServiceHead::FirstEntry(custody) => finish(&zone, custody, &deliveries),
+                    ServiceHead::Record(_) => panic!("republished birth lost activation custody"),
+                }
+            }
+            Claim::Host { .. } => finish(
+                &zone,
+                zone.claim_current_first_entry_activation(record).unwrap(),
+                &deliveries,
+            ),
+            Claim::Free => {}
+            state => panic!("Closing left an ineligible record: {state:?}"),
+        }
+        assert_eq!(deliveries.load(Ordering::Acquire), 1);
+        assert_eq!(zone.slot(SLOT).head.load(Ordering::Acquire), NIL);
+        assert_eq!(zone.slot(SLOT).tail.load(Ordering::Acquire), NIL);
     });
 }

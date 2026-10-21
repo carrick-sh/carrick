@@ -155,7 +155,7 @@ pub const ZONE_ENTRIES: usize = 2;
 #[cfg(not(all(test, feature = "loom")))]
 pub const ZONE_BUCKETS: usize = 1024;
 #[cfg(all(test, feature = "loom"))]
-pub const ZONE_BUCKETS: usize = 1;
+pub const ZONE_BUCKETS: usize = 2;
 /// vCPU slots (one per syscall-mailbox slot).
 #[cfg(not(all(test, feature = "loom")))]
 pub const ZONE_SLOTS: usize = 256;
