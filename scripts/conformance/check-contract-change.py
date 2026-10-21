@@ -1666,8 +1666,9 @@ def _eval_cfg_expr(
 
 @functools.lru_cache(maxsize=4096)
 def _lane_debug_assertions(view: RepoView, pkg_name: str, lane: str) -> bool:
-    # scripts/lib/test-signed-body.sh builds signed executables with --release.
-    release = lane in ("signed-hvf", "signed-cli")
+    # test-signed-body.sh uses --release for signed-hvf executables.
+    # signed-cli harnesses use the test profile and launch a signed carrier.
+    release = lane == "signed-hvf"
     profiles = {}
     if view.is_file("Cargo.toml"):
         profiles = tomllib.loads(view.read_text("Cargo.toml")).get("profile", {})

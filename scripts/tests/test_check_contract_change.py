@@ -2857,6 +2857,25 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         result = self.run_check(base_sha=base)
         self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
 
+        # signed-cli signs the launched carrier, while Cargo builds its
+        # harness with the ordinary test profile (justfile conformance recipe).
+        cli = self.repo / "crates/carrick-cli"
+        (cli / "src").mkdir(parents=True)
+        (cli / "src/lib.rs").write_text("")
+        (cli / "tests").mkdir()
+        (cli / "tests/witness.rs").write_text(body)
+        (cli / "Cargo.toml").write_text(
+            '[package]\nname = "carrick-cli"\nversion = "0.1.0"\nedition = "2024"\n'
+            '[package.metadata.carrick.test-lanes]\n"*" = "signed-cli"\n'
+            '[dependencies]\ncarrick-kernel = { path = "../carrick-kernel" }\n'
+        )
+        with (self.repo / "conformance-contracts/surfaces.toml").open("a") as mapping:
+            mapping.write('\n[[surfaces]]\npath = "crates/carrick-cli/src/lib.rs"\ncontracts = []\n')
+        self._write_futex_contract('vm_free = "carrick-cli::witness::witness"\n')
+        self._commit_all("bind CLI harness using the ordinary Cargo test profile")
+        result = self.run_check(base_sha=base)
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
     def test_review5_harness_false_test_fails(self):
         """A gated custom harness does not execute #[test] functions via libtest."""
         self.use_single_contract_surface()

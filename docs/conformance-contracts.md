@@ -171,9 +171,9 @@ identifier relevance still excludes literals. Parent module macro definitions
 and macro imports accompany resolved child modules, so a shadowed
 assertion cannot supply relevance. Globs conservatively carry every local
 macro definition and re-export candidate; an unresolved expansion cannot
-impersonate a built-in assertion. Signed lanes evaluate `debug_assertions`
-using the release profile built by `test-signed-body.sh`; host, KVM and
-integration lanes use the test profile. Workspace profile overrides apply.
+impersonate a built-in assertion. The signed-HVF lane evaluates `debug_assertions`
+using the release profile built by `test-signed-body.sh`; signed-CLI, host,
+KVM and integration harnesses use the test profile. Workspace profile overrides apply.
 Targets with `harness = false` cannot supply ordinary libtest evidence.
 Contract-function bindings still use only the contract
 function's body for relevance. Identifier matching is textual (after stripping
