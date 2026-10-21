@@ -899,6 +899,31 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         cpu_plus_one == 0 || mask == 0 || cpu_plus_one > 64 || mask & (1 << (cpu_plus_one - 1)) != 0
     }
 
+    fn release_first_entry_claim(&self, owned: Claim) -> bool {
+        let Some(next) = first_entry_transition(owned, FirstEntryOperation::Release) else {
+            return false;
+        };
+        if self.cas(owned, next) {
+            return true;
+        }
+        // Only Closing's false -> true request can interfere with Placing
+        // custody. Keep the acquisition through this one finite transition.
+        if let Claim::Placing {
+            seq,
+            host_requested: false,
+        } = owned
+        {
+            return self.cas(
+                Claim::Placing {
+                    seq,
+                    host_requested: true,
+                },
+                next,
+            );
+        }
+        false
+    }
+
     fn cas(&self, current: Claim, next: Claim) -> bool {
         self.claim
             .compare_exchange(
@@ -1995,16 +2020,40 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         &self,
         record: RecordRef,
     ) -> Option<FirstEntryActivation> {
-        let rec = self.live(record)?;
-        if !rec.is_unadopted_birth() {
+        self.acquire_first_entry(record, FirstEntryOperation::MintActivation)?;
+        Some(FirstEntryActivation { record })
+    }
+
+    fn acquire_first_entry(
+        &self,
+        record: RecordRef,
+        operation: FirstEntryOperation,
+    ) -> Option<Claim> {
+        let rec = self.record(record.id);
+        let current = rec.claim();
+        let owned = first_entry_transition(current, operation)?;
+        #[cfg(all(test, not(feature = "loom")))]
+        if operation == FirstEntryOperation::MintActivation {
+            tests::pause_activation_mint(self as *const Self as usize, record);
+        }
+        if !rec.cas(current, owned) {
             return None;
         }
-        let current = rec.claim();
-        let next = first_entry_transition(current, FirstEntryOperation::MintActivation)?;
-        #[cfg(all(test, not(feature = "loom")))]
-        tests::pause_activation_mint(self as *const Self as usize, record);
-        rec.cas(current, next)
-            .then_some(FirstEntryActivation { record })
+        // The successful CAS pins this incarnation and its birth metadata.
+        // Authentication BEFORE it is merely a racy hint: another executor
+        // can retire the record and publish a replacement Host in between.
+        // No public token exists until validation under custody succeeds.
+        if rec.incarnation() == record.incarnation
+            && rec.is_unadopted_birth()
+            && (operation != FirstEntryOperation::AdmitPlacement || !rec.is_cancelled())
+        {
+            Some(owned)
+        } else {
+            // This may be a different birth. Restore its eligible Host claim
+            // through the acquired word, not through the stale RecordRef.
+            let _ = rec.release_first_entry_claim(owned);
+            None
+        }
     }
 
     /// Retire an exclusively owned first-entry record. Refuse if any run
@@ -2028,17 +2077,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     pub fn claim_first_entry_placement(&self, record: RecordRef) -> Option<FirstEntryPlacement> {
-        let rec = self.live(record)?;
-        if !rec.is_unadopted_birth() || rec.is_cancelled() {
-            return None;
-        }
-        let current = rec.claim();
-        let next = first_entry_transition(current, FirstEntryOperation::AdmitPlacement)?;
-        let Claim::Placing { seq, .. } = next else {
-            return None;
-        };
-        rec.cas(current, next)
-            .then_some(FirstEntryPlacement { record, seq })
+        let owned = self.acquire_first_entry(record, FirstEntryOperation::AdmitPlacement)?;
+        Some(FirstEntryPlacement {
+            record,
+            seq: owned.seq(),
+        })
     }
 
     pub fn place_first_entry(
@@ -2072,27 +2115,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     pub fn release_first_entry_placement(&self, custody: FirstEntryPlacement) -> bool {
-        let Some(rec) = self.live(custody.record) else {
-            return false;
-        };
-        let seq = custody.seq;
-        // The producer keeps custody if Closing changes the request bit.
-        // That is the only competing transition while it owns Placing, so
-        // these two strong CASes exhaust the finite race without dropping
-        // the token or waiting for the requester to do the producer's work.
-        rec.cas(
-            Claim::Placing {
-                seq,
+        self.live(custody.record).is_some_and(|rec| {
+            rec.release_first_entry_claim(Claim::Placing {
+                seq: custody.seq,
                 host_requested: false,
-            },
-            Claim::Host { seq },
-        ) || rec.cas(
-            Claim::Placing {
-                seq,
-                host_requested: true,
-            },
-            Claim::Host { seq },
-        )
+            })
+        })
     }
 
     /// Whether `record`'s affinity allows the guest CPU `slot` is bound to.
