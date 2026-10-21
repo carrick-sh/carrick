@@ -108,20 +108,26 @@ impl Fixture {
         pid: u64,
         bytes: &[u8],
     ) -> DispatchOutcome {
+        let address = self.memory.put(bytes).unwrap();
+        self.call(caller, nr, [pid, bytes.len() as u64, address, 0, 0, 0])
+    }
+
+    fn call(
+        &mut self,
+        caller: &KernelContext,
+        nr: carrick_abi::CanonicalNr,
+        args: [u64; 6],
+    ) -> DispatchOutcome {
         let caller = caller
             .task_binding()
             .capture(caller.thread().key().tid)
             .unwrap();
-        let address = self.memory.put(bytes).unwrap();
         let mut executor = self.dispatcher.enter_mm_executor().unwrap();
         self.dispatcher
             .dispatch_threaded_with_mm_executor(
                 &mut executor,
                 &caller,
-                SyscallRequest::new(
-                    nr.raw(),
-                    SyscallArgs::from([pid, bytes.len() as u64, address, 0, 0, 0]),
-                ),
+                SyscallRequest::new(nr.raw(), SyscallArgs::from(args)),
                 &mut self.memory.linear,
                 &CompatReporter::default(),
                 ThreadCtx::new(caller.thread().registry_id(), &self.registry, &self.futex),
@@ -327,6 +333,130 @@ fn affinity_permission_uses_the_named_threads_credentials() {
     );
     assert_eq!(caller.thread().affinity().words()[0], 3);
     assert_eq!(sibling.thread().affinity().words()[0], 2);
+}
+
+#[test]
+fn short_setaffinity_zero_extends_and_changes_only_the_named_thread() {
+    let mut f = Fixture::new();
+    let caller = f.root.retain_exact();
+    let sibling = f.sibling.retain_exact();
+    for bytes in [&[2][..], &2u32.to_le_bytes()[..]] {
+        let result = f.dispatch(
+            &caller,
+            nr::SCHED_SETAFFINITY,
+            sibling.thread().key().tid.raw() as u64,
+            bytes,
+        );
+        assert!(
+            matches!(result, DispatchOutcome::Returned { value: 0 }),
+            "size {} must succeed: {result:?}",
+            bytes.len()
+        );
+        assert_eq!(sibling.thread().affinity().words()[0], 2);
+        assert_eq!(caller.thread().affinity().words()[0], 3);
+    }
+    let empty = f.dispatch(
+        &caller,
+        nr::SCHED_SETAFFINITY,
+        sibling.thread().key().tid.raw() as u64,
+        &[],
+    );
+    assert!(
+        matches!(empty, DispatchOutcome::Errno { errno } if errno == carrick_abi::LINUX_EINVAL)
+    );
+    assert_eq!(sibling.thread().affinity().words()[0], 2);
+}
+
+#[test]
+fn affinity_set_allows_target_real_uid_match() {
+    let mut f = Fixture::new();
+    let caller = f.root.retain_exact();
+    let peer = f.sibling.retain_exact();
+    assert!(matches!(
+        f.call(&peer, nr::SETRESUID, [100, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    ));
+    assert!(matches!(
+        f.dispatch(&caller, nr::SETUID, 100, &[]),
+        DispatchOutcome::Returned { value: 0 }
+    ));
+    let outcome = f.dispatch(
+        &caller,
+        nr::SCHED_SETAFFINITY,
+        peer.thread().key().tid.raw() as u64,
+        &2u64.to_le_bytes(),
+    );
+    assert!(
+        matches!(outcome, DispatchOutcome::Returned { value: 0 }),
+        "real UID match: {outcome:?}"
+    );
+    assert_eq!(peer.thread().affinity().words()[0], 2);
+}
+
+#[test]
+fn root_without_sys_nice_cannot_set_another_owners_affinity() {
+    let mut f = Fixture::new();
+    let caller = f.root.retain_exact();
+    let peer = f.sibling.retain_exact();
+    assert!(matches!(
+        f.dispatch(&peer, nr::SETUID, 200, &[]),
+        DispatchOutcome::Returned { value: 0 }
+    ));
+    caller.task().with_caps(|caps| caps.effective = 0);
+    let outcome = f.dispatch(
+        &caller,
+        nr::SCHED_SETAFFINITY,
+        peer.thread().key().tid.raw() as u64,
+        &2u64.to_le_bytes(),
+    );
+    assert!(
+        matches!(outcome, DispatchOutcome::Errno { errno } if errno == carrick_abi::LINUX_EPERM),
+        "root without capability: {outcome:?}"
+    );
+    assert_eq!(peer.thread().affinity().words()[0], 1);
+}
+
+#[test]
+fn sys_nice_allows_nonroot_to_set_another_owners_affinity() {
+    let mut f = Fixture::new();
+    let caller = f.root.retain_exact();
+    let peer = f.peer.retain_exact();
+    assert!(matches!(
+        f.dispatch(&caller, nr::SETUID, 100, &[]),
+        DispatchOutcome::Returned { value: 0 }
+    ));
+    caller
+        .task()
+        .with_caps(|caps| caps.effective |= 1 << carrick_kernel::namespace::process::CAP_SYS_NICE);
+    let outcome = f.dispatch(
+        &caller,
+        nr::SCHED_SETAFFINITY,
+        peer.thread().key().tid.raw() as u64,
+        &2u64.to_le_bytes(),
+    );
+    assert!(
+        matches!(outcome, DispatchOutcome::Returned { value: 0 }),
+        "effective CAP_SYS_NICE: {outcome:?}"
+    );
+    assert_eq!(peer.thread().affinity().words()[0], 2);
+}
+
+#[test]
+fn empty_setaffinity_does_not_read_the_host_mask_pointer() {
+    let mut fixture = Fixture::new();
+    let caller = fixture.root.retain_exact();
+    for (pid, expected) in [
+        (0, carrick_abi::LINUX_EINVAL),
+        (u32::MAX as u64, carrick_abi::LINUX_ESRCH),
+    ] {
+        let outcome = fixture.call(&caller, nr::SCHED_SETAFFINITY, [pid, 0, 0, 0, 0, 0]);
+        assert!(
+            matches!(outcome, DispatchOutcome::Errno { errno } if errno == expected),
+            "zero bytes, pid {pid}: {outcome:?}"
+        );
+    }
+    assert_eq!(caller.thread().affinity().words()[0], 3);
+    assert_eq!(fixture.sibling.thread().affinity().words()[0], 1);
 }
 
 #[test]
