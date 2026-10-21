@@ -1633,3 +1633,38 @@ exhaustion without child publication. Existing kernel bootstrap/handoff/export
 and retained physical-source controls cover the owner and revocation protocol.
 No receiver authentication, wait4 behavior, work budget or graph-lock scope is
 weakened. See the carrier issuer handoff for custody and per-ticket costs.
+
+### First-entry claim custody under Closing
+
+`kernel.el1.thread-lifecycle` has production-code loom bindings in
+`carrick-sched-core::loom_models`. The scheduler's atomics (including run-queue
+locks, incarnation, eligibility and kick debt) use loom storage in this test
+build. A single usable index and slot bound the population, not the protocol;
+ordinary tests keep the shared-memory layout and full-capacity bindings.
+Object waits and address-space edits are outside these first-entry models.
+
+The initial RED exploration at preemption bound 2 exposed these schedules:
+
+- `release_races_closing_without_losing_custody`: producer reads
+  `Placing(false)` for release; Closing CASes it to `Placing(true)` and
+  returns Deferred; producer's release CAS fails and consumes the sole token.
+  Both actors end with `Placing(true)` and no future owner.
+- `requested_fallback_on_wfi_owes_a_kick`: producer admits placement; the
+  previous slot enters WFI; Closing requests the placement and returns
+  Deferred; producer cannot place, releases to Host, then requeues on the
+  previous slot. The queue is nonempty but `take_resched` returns false.
+- `mint_rejects_recycled_incarnation` and
+  `placement_rejects_recycled_incarnation`: stale admission validates
+  incarnation 1; an executor activates, retires and frees that birth; the
+  allocator reuses the same index as incarnation 3; stale admission reads its
+  Host claim and CASes it to Activating/Placing, returning an incarnation-1
+  token for incarnation-3 storage.
+
+Each focused RED test exited 101. These are assertions over the shipping
+scheduler methods, not replicas of the transition function. The lifecycle
+composition and competing-executor models additionally assert eligible or
+terminal final ownership, one adapter delivery/adoption and retirement per
+birth, rejection of the old token after reuse, and no queue links after free.
+Graph-ledger adoption and physical interrupt delivery remain kernel/runtime
+and signed integration bindings; the model counts their effects only under
+real scheduler activation custody.

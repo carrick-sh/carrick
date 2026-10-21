@@ -17,3 +17,7 @@ zerocopy.workspace = true
 
 [features]
 host-test = []
+loom = []
+
+[dev-dependencies]
+loom = { version = "=0.7.2", features = ["checkpoint"] }

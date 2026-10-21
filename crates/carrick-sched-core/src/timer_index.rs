@@ -4,7 +4,7 @@ use super::{RecordId, RecordRef, SlotId, ThreadCtx, ZONE_RECORDS, ZONE_SLOTS, Zo
 #[cfg(test)]
 std::thread_local! { static NODE_READS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) }; }
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use super::{AtomicU32, AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Ticket {
@@ -14,6 +14,7 @@ pub(super) struct Ticket {
     pub deadline: u64,
 }
 #[repr(C)]
+#[cfg_attr(all(test, feature = "loom"), derive(Default))]
 struct Node {
     parent: AtomicU32,
     left: AtomicU32,
@@ -24,23 +25,26 @@ struct Node {
     deadline: AtomicU64,
 }
 #[repr(C)]
+#[cfg_attr(all(test, feature = "loom"), derive(Default))]
 struct Tree {
     lock: AtomicU32,
     root: AtomicU32,
     len: AtomicU32,
 }
 #[repr(C)]
+#[cfg_attr(all(test, feature = "loom"), derive(Default))]
 struct Lease {
     slot: AtomicU32,
     node: AtomicU32,
     active: AtomicU32,
 }
 #[repr(C)]
+#[cfg_attr(all(test, feature = "loom"), derive(Default))]
 pub(super) struct Index {
     trees: [Tree; ZONE_SLOTS],
     nodes: [Node; ZONE_RECORDS],
     leases: [Lease; ZONE_RECORDS],
-    map: [AtomicU64; ZONE_RECORDS / 64],
+    map: [AtomicU64; ZONE_RECORDS.div_ceil(64)],
 }
 struct Guard<'a> {
     index: &'a Index,
@@ -372,7 +376,7 @@ impl Index {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;

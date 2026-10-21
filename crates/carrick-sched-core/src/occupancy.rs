@@ -43,6 +43,7 @@ pub const EXECUTION_SLOTS: usize = ZONE_SLOTS + HOST_EXECUTION_SLOTS;
 const OCCUPIED_WORDS: usize = EXECUTION_SLOTS / 64;
 const HOST_WORDS: usize = HOST_EXECUTION_SLOTS / 64;
 
+#[cfg(not(all(test, feature = "loom")))]
 const _: () = assert!(ZONE_SLOTS.is_multiple_of(64));
 const _: () = assert!(HOST_EXECUTION_SLOTS.is_multiple_of(64));
 

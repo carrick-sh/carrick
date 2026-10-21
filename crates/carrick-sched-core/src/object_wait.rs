@@ -13,6 +13,8 @@
 //! the notification found no waiters. No lock crosses a switch or SGI delivery.
 
 use super::*;
+// Object waits are outside the first-entry loom model.
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 mod delegated;
 pub use delegated::{
     DELEGATED_FILE_WAIT_QUEUES, DelegatedFileWaitIndex, DelegatedLockRelease, DelegatedReleaseVenue,

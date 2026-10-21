@@ -1003,6 +1003,7 @@ name = "carrick-sched-core"
 version = "0.1.0"
 dependencies = [
  "carrick-guest-arch",
+ "loom",
  "zerocopy",
 ]
 
@@ -2492,6 +2493,8 @@ dependencies = [
  "cfg-if",
  "generator",
  "scoped-tls",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

@@ -135,19 +135,34 @@ pub use spaces::{
 };
 
 use core::cell::UnsafeCell;
+#[cfg(not(all(test, feature = "loom")))]
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(all(test, feature = "loom"))]
+use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Parked-thread records (index 0 is reserved as "none").
+#[cfg(not(all(test, feature = "loom")))]
 pub const ZONE_RECORDS: usize = 4096;
+#[cfg(all(test, feature = "loom"))]
+pub const ZONE_RECORDS: usize = 2;
 /// Futex wait-queue entries (index 0 is reserved as "none"). A plain wait
 /// uses one; a `futex_waitv` uses one per futex.
+#[cfg(not(all(test, feature = "loom")))]
 pub const ZONE_ENTRIES: usize = 8192;
+#[cfg(all(test, feature = "loom"))]
+pub const ZONE_ENTRIES: usize = 2;
 /// Futex hash buckets.
+#[cfg(not(all(test, feature = "loom")))]
 pub const ZONE_BUCKETS: usize = 1024;
+#[cfg(all(test, feature = "loom"))]
+pub const ZONE_BUCKETS: usize = 1;
 /// vCPU slots (one per syscall-mailbox slot).
+#[cfg(not(all(test, feature = "loom")))]
 pub const ZONE_SLOTS: usize = 256;
+#[cfg(all(test, feature = "loom"))]
+pub const ZONE_SLOTS: usize = 1;
 /// Words of a per-slot bitmap.
-pub const ZONE_SLOT_WORDS: usize = ZONE_SLOTS / 64;
+pub const ZONE_SLOT_WORDS: usize = ZONE_SLOTS.div_ceil(64);
 
 /// How long a thread queued behind a running one waits before the virtual
 /// timer preempts the running thread (the bound the 1b run-queue guard gave
@@ -730,6 +745,7 @@ pub struct ZoneRecord<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     ctx: UnsafeCell<C>,
 }
 
+#[cfg(not(all(test, feature = "loom")))]
 const _: () = {
     assert!(core::mem::offset_of!(ZoneRecord, ctx) == 192);
     assert!(core::mem::size_of::<ZoneRecord>() == 1024);
@@ -897,6 +913,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
 
 /// One futex wait-queue entry: a record waiting on `(mm, uaddr)`.
 #[repr(C, align(64))]
+#[cfg_attr(all(test, feature = "loom"), derive(Default))]
 pub struct ZoneEntry {
     next: AtomicU32,
     prev: AtomicU32,
@@ -914,6 +931,7 @@ pub struct ZoneEntry {
 
 /// A futex hash bucket: a lock and a doubly linked FIFO of entries.
 #[repr(C, align(16))]
+#[cfg_attr(all(test, feature = "loom"), derive(Default))]
 pub struct ZoneBucket {
     lock: AtomicU32,
     head: AtomicU32,
@@ -974,6 +992,7 @@ pub enum TerminalPhase {
 /// guest (see the crate docs), and read `state`, `mm`, `cpu`, `len` and
 /// `sgi_target`.
 #[repr(C, align(64))]
+#[cfg_attr(all(test, feature = "loom"), derive(Default))]
 pub struct ZoneSlot {
     /// The record EL1 switched in (0: the thread the host loaded is running).
     current: AtomicU32,
@@ -1117,6 +1136,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SlotGuard<'_, C> {
 
 /// Zone event counters (carrier-wide, for tests and diagnostics).
 #[repr(C)]
+#[cfg_attr(all(test, feature = "loom"), derive(Default))]
 pub struct ZoneCounters {
     /// Threads parked by EL1 with a switch to another thread.
     pub el1_parks: AtomicU64,
@@ -1207,14 +1227,14 @@ pub struct ZoneCounters {
 pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     buckets: [ZoneBucket; ZONE_BUCKETS],
     slots: [ZoneSlot; ZONE_SLOTS],
-    record_map: [AtomicU64; ZONE_RECORDS / 64],
-    entry_map: [AtomicU64; ZONE_ENTRIES / 64],
+    record_map: [AtomicU64; ZONE_RECORDS.div_ceil(64)],
+    entry_map: [AtomicU64; ZONE_ENTRIES.div_ceil(64)],
     /// One bit per slot that is idle in EL1 (a hint; the slot's lock and
     /// state decide).
-    idle_map: [AtomicU64; ZONE_SLOTS / 64],
+    idle_map: [AtomicU64; ZONE_SLOTS.div_ceil(64)],
     /// One bit per slot whose run queue is not empty (a hint for stealing;
     /// the slot's lock decides).
-    queued_map: [AtomicU64; ZONE_SLOTS / 64],
+    queued_map: [AtomicU64; ZONE_SLOTS.div_ceil(64)],
     pub counters: ZoneCounters,
     entries: [ZoneEntry; ZONE_ENTRIES],
     records: [ZoneRecord<C>; ZONE_RECORDS],
@@ -1981,7 +2001,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
         let current = rec.claim();
         let next = first_entry_transition(current, FirstEntryOperation::MintActivation)?;
-        #[cfg(test)]
+        #[cfg(all(test, not(feature = "loom")))]
         tests::pause_activation_mint(self as *const Self as usize, record);
         rec.cas(current, next)
             .then_some(FirstEntryActivation { record })
@@ -4774,17 +4794,21 @@ struct SpinForever;
 
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> LockWait<C> for SpinForever {
     fn wait(&self, _attempt: u32) -> bool {
+        #[cfg(all(test, feature = "loom"))]
+        loom::thread::yield_now();
         core::hint::spin_loop();
         true
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "loom"))]
+mod loom_models;
+#[cfg(all(test, not(feature = "loom")))]
 mod tests;
 
 // Literal wire layout captured from 3fd7862be on a 64-bit host.
 // Keep these values fixed when moving the shared kernel implementation.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod layout_manifest {
     use super::*;
     use core::mem::{align_of, offset_of, size_of};

@@ -439,7 +439,10 @@ fn first_entry_mint_witness(concurrent: bool) {
         .unwrap();
     let record = zone.record_ref(record);
     assert!(zone.place_from_host(record.id).is_some());
-    assert_eq!(zone.first_entry_links_clear_for_test(record, &HostWait), Some(false));
+    assert_eq!(
+        zone.first_entry_links_clear_for_test(record, &HostWait),
+        Some(false)
+    );
     // Deliver through the real service queue before minting current-record
     // custody. Retirement must leave that previously linked queue empty.
     assert_eq!(zone.take_service_head(SLOT), Some(record));
@@ -493,7 +496,10 @@ fn first_entry_mint_witness(concurrent: bool) {
         zone.claim_for_host(record, None, Handback::Control, &HostWait),
         HostClaim::Deferred
     );
-    assert_eq!(zone.first_entry_links_clear_for_test(record, &HostWait), Some(true));
+    assert_eq!(
+        zone.first_entry_links_clear_for_test(record, &HostWait),
+        Some(true)
+    );
     assert!(zone.free_first_entry_activation(custody));
     assert!(zone.live(record).is_none());
     assert_eq!(zone.record(record.id).claim(), Claim::Free);
