@@ -557,6 +557,12 @@ fn dispatch_requires_precreated_account_and_agent_only_sudo() {
         .next()
         .unwrap();
     assert!(helper.contains("AGENT_USER"), "sudo helper can run as root");
-    assert!(source.contains("[\"/bin/kill\", \"-STOP\", \"-1\"]"));
-    assert!(source.contains("[\"/bin/kill\", \"-KILL\", \"-1\"]"));
+    assert!(
+        !source.contains("let _ = sudo(&[\"/bin/kill\""),
+        "retirement discards signaling errors"
+    );
+    assert!(
+        !source.contains("File::create(state.join(\"agent.out\"))"),
+        "runner-owned output handed to agent metadata repair"
+    );
 }
