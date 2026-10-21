@@ -10,7 +10,7 @@ use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Token {
     #[serde(rename = "full-tokenid")]
     id: String,
@@ -50,7 +50,9 @@ const GUEST_SCRIPTS: [GuestScript; 2] = [
 /// hook admits only its approved SHA.
 fn guest_script_source(script: &GuestScript, admission: &Admission) -> Result<String, ScalerError> {
     match admission {
-        Admission::Standing if script.path == HOOK_PATH => standing_hook_script(),
+        Admission::Standing | Admission::Agent if script.path == HOOK_PATH => {
+            standing_hook_script()
+        }
         _ => Ok(script.source.to_owned()),
     }
 }
@@ -218,6 +220,14 @@ fn pve_curl(call: &PveCall, resolve: &str, ca: Option<&str>, url: &str) -> Comma
     command
 }
 impl Pve {
+    fn for_lane(&self, lane: CloneLane) -> Result<Self, ScalerError> {
+        Ok(Self {
+            site: self.site.for_lane(lane)?,
+            token: self.token.clone(),
+            deadline: std::cell::Cell::new(None),
+        })
+    }
+
     fn local() -> Result<Self, ScalerError> {
         // Fails closed on any host that is not a known clone site.
         let site = Site::local()?;
@@ -456,11 +466,11 @@ fn task_id(value: Value) -> Result<String, ScalerError> {
         .ok_or(ScalerError::External("missing PVE task ID"))
 }
 
-fn enforce_cpu_ceiling(busy: f64, threads: u32) -> Result<(), ScalerError> {
+fn enforce_cpu_ceiling(busy: f64, threads: u32, cores: u32) -> Result<(), ScalerError> {
     if !busy.is_finite() || busy < 0.0 || threads == 0 {
         return Err(ScalerError::Guard("CPU sample unavailable"));
     }
-    let projected = busy + 2.0 / f64::from(threads);
+    let projected = busy + f64::from(cores) / f64::from(threads);
     if projected > 0.80 {
         Err(ScalerError::CpuCeiling {
             projected: projected * 100.0,
@@ -517,14 +527,18 @@ fn resource_admission(pve: &Pve) -> Result<bool, ScalerError> {
         "/proc/loadavg:1m-per-cpu"
     };
     println!(
-        "admission utilization={utilization:.3} utilization_source=/proc/stat:5s-delta load_per_cpu={load:.3} load_source=/proc/loadavg:1m-per-cpu online_cpus={threads} limiting_source={limiting_source} busy={busy:.3} projected={:.3} reserved_vcpus=2 memory_available={available}",
-        busy + 2.0 / threads as f64
+        "admission utilization={utilization:.3} utilization_source=/proc/stat:5s-delta load_per_cpu={load:.3} load_source=/proc/loadavg:1m-per-cpu online_cpus={threads} limiting_source={limiting_source} busy={busy:.3} projected={:.3} reserved_vcpus={} memory_available={available}",
+        busy + f64::from(pve.site.cores) / threads as f64,
+        pve.site.cores
     );
-    enforce_cpu_ceiling(busy, u32::try_from(threads).unwrap_or(0))?;
-    Ok(
-        admit_resources(busy, u32::try_from(threads).unwrap_or(0), available)
-            && storage_headroom(pve)?,
-    )
+    enforce_cpu_ceiling(busy, u32::try_from(threads).unwrap_or(0), pve.site.cores)?;
+    Ok(admit_resources(
+        busy,
+        u32::try_from(threads).unwrap_or(0),
+        available,
+        pve.site.cores,
+        pve.site.memory_mib,
+    ) && storage_headroom(pve)?)
 }
 /// Storage headroom for one more linked clone: 150 GiB free, and for an LVM
 /// thin pool also metadata below 80%. Read-only; never mutates storage.
@@ -691,7 +705,7 @@ fn provision(
             "newid":row.vm.get(), "pool":POOL, "name":row.name, "full":false,
             "description":format!("Carrick pilot ledger identity {}", row.name)
         })),
-        &format!("{}/clone", pve.site.qemu(300)),
+        &format!("{}/clone", pve.site.qemu(row.lane.template())),
     )?)?);
     update(ledger, row, path)?;
     pve.wait_task(
@@ -861,7 +875,7 @@ fn boot_and_register(
         row,
         &["/bin/sh", "-c", "rm -f /usr/local/bin/carrick-ci-admit-job"],
     )?;
-    let standing = matches!(admission, Admission::Standing);
+    let standing = matches!(admission, Admission::Standing | Admission::Agent);
     if standing {
         // The re-vet half of the hook runs the template's own xtask; refuse a
         // template whose xtask predates it rather than fail a job at set-up.
@@ -879,6 +893,14 @@ fn boot_and_register(
                 "template xtask lacks admit-job --controller; rebuild template 300",
             ));
         }
+    }
+    if matches!(admission, Admission::Agent) {
+        // Agent policy parsing and assignment authorization shipped with this
+        // command. Old template binaries must fail before minting a runner.
+        pve.agent(
+            row,
+            &["/usr/local/bin/carrick-xtask", "agent-runner", "--help"],
+        )?;
     }
     // Re-vet the reserved run now and bind the runner to it: the hook admits
     // this run, attempt, SHA and owner-only dispatch actors. A standing clone that
@@ -907,7 +929,7 @@ fn boot_and_register(
     // Write registration intent before asking GitHub. No JIT material in ledger.
     row.state = State::Registered;
     update(ledger, row, path)?;
-    let (runner, jit) = gh.generate_jit(&row.name, group, &LABELS)?;
+    let (runner, jit) = gh.generate_jit(&row.name, group, row.lane.labels())?;
     row.runner = Some(runner);
     update(ledger, row, path)?;
     let mut input = jit.into_bytes();
@@ -1060,7 +1082,8 @@ struct Pass {
     frozen: Option<ScalerError>,
 }
 /// Reconcile every active clone. One row's error does not starve the others.
-/// Only the director's CPU ceiling stops the controller outright.
+/// KVM CPU-ceiling stops retain their existing policy. Agent admission
+/// pressure freezes new work while reconciliation continues for live agents.
 fn reconcile_all(
     pve: &Pve,
     gh: &Github,
@@ -1079,10 +1102,13 @@ fn reconcile_all(
     let mut finished = 0;
     let mut first_error = None;
     for row in active {
+        let lane = row.lane;
         match reconcile_one(pve, gh, ledger, dir, path, approval, row, lease_ready) {
             Ok(true) => finished += 1,
             Ok(false) => {}
-            Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
+            Err(error @ ScalerError::CpuCeiling { .. }) if lane == CloneLane::Kvm => {
+                return Err(error);
+            }
             Err(error) => {
                 first_error.get_or_insert(error);
             }
@@ -1105,6 +1131,14 @@ fn reconcile_one(
     mut row: Record,
     lease_ready: bool,
 ) -> Result<bool, ScalerError> {
+    let lane_pve = pve.for_lane(row.lane)?;
+    let pve = &lane_pve;
+    let lane_admission = row.lane.admission();
+    let approval = if row.lane == CloneLane::Agent {
+        (approval.0, &lane_admission)
+    } else {
+        approval
+    };
     let present = pve.inventory()?.iter().any(|v| v.id == row.vm.get());
     let task = match &row.task {
         Some(task) => pve.task_state(task)?,
@@ -1216,7 +1250,7 @@ fn pending_owned_job(row: &Record, job: &Value, run: &Value, admission: &Admissi
         .unwrap_or_default();
     job["id"].as_u64() == Some(row.key.job.0)
         && job["status"] == "queued"
-        && eligible_labels(&labels)
+        && labels_match(row.lane.labels(), &labels)
         && run["id"].as_u64() == Some(row.key.run.0)
         && run["run_attempt"].as_u64() == Some(u64::from(row.key.attempt))
         && admission.admits_run(run)
@@ -1382,9 +1416,18 @@ fn qualified_template(config: &Value, site: &Site) -> bool {
     config["cpu"] == "host"
         && config["cores"] == site.cores
         && memory_mib == Some(site.memory_mib)
-        && config["scsi0"]
-            .as_str()
-            .is_some_and(|s| s.starts_with(&storage) && s.contains(&size))
+        && config["scsi0"].as_str().is_some_and(|s| {
+            s.starts_with(&storage)
+                && (s.contains(&size)
+                    || (site.lane == CloneLane::Agent
+                        && s.split(',').any(|field| {
+                            field
+                                .strip_prefix("size=")
+                                .and_then(|v| v.strip_suffix('G'))
+                                .and_then(|v| v.parse::<u32>().ok())
+                                .is_some_and(|gib| gib >= site.disk_gib)
+                        })))
+        })
         && config["net0"].as_str().is_some_and(|s| {
             s.contains(&bridge) && (!site.isolates_bridge() || s.contains("firewall=1"))
         })
@@ -1518,7 +1561,7 @@ fn revet_assignments(
         let outcome = assignment::serve_assignment(
             gh,
             &mut exchange,
-            &LABELS,
+            row.lane.labels(),
             runner,
             ledger,
             path,
@@ -1618,6 +1661,35 @@ impl CloneLease {
     }
 }
 
+fn verify_protected_vms(
+    site: site::Site,
+    mut permissions: impl FnMut(u16) -> Result<Value, ScalerError>,
+) -> Result<(), ScalerError> {
+    // Protection follows the site, independently of controller mode or
+    // whether agent clone demand is enabled. Only the source template may
+    // carry the non-mutating rights needed to inspect and clone it.
+    for vm in site.protected {
+        let source_template = site.node == site::CONTABO.node && *vm == 9000;
+        let protected = permissions(*vm)?;
+        if protected.as_object().is_none_or(|map| {
+            map.values().any(|v| {
+                v.as_object().is_none_or(|rights| {
+                    rights.iter().any(|(name, value)| {
+                        !source_template
+                            || !matches!(name.as_str(), "VM.Audit" | "VM.Clone")
+                            || value.as_u64() != Some(1)
+                    })
+                })
+            })
+        }) {
+            return Err(ScalerError::Guard(
+                "token has unexpected protected-VM rights",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Foreground Willow controller. The pilot admission always runs with one
 /// clone; standing mode is bounded by `limit` (at most two clones).
 pub(super) fn controller(
@@ -1644,36 +1716,41 @@ pub(super) fn controller(
         return Err(ScalerError::Guard("another controller owns this ledger"));
     }
     let inventory = pve.inventory()?;
-    let template =
-        inventory
-            .iter()
-            .find(|v| v.id == 300 && v.template)
-            .ok_or(ScalerError::Guard(
-                "qualified template 300 not in carrick-ci",
-            ))?;
-    if template.pool != POOL {
-        return Err(ScalerError::Guard("template pool mismatch"));
-    }
-    let config = pve.request(PveCall::Get, &format!("{}/config", pve.site.qemu(300)))?;
-    if !qualified_template(&config, &pve.site) {
+    let contabo_standing =
+        pve.site.node == site::CONTABO.node && matches!(admission, Admission::Standing);
+    let agents = contabo_standing && std::env::var("CARRICK_AGENT_CLONES").as_deref() != Ok("0");
+    if contabo_standing && limit != Concurrency::ONE {
         return Err(ScalerError::Guard(
-            "template does not match approved size/storage/bridge",
+            "Contabo reserves one KVM clone beside four agent clones",
         ));
     }
-    pve.verify_vm_firewall(300)?;
-    // Read-only privilege proof. Never probe a denied destructive operation.
-    for vm in pve.site.protected {
-        let protected =
-            pve.request(PveCall::Get, &format!("/access/permissions?path=/vms/{vm}"))?;
-        if protected.as_object().is_none_or(|map| {
-            map.values()
-                .any(|v| v.as_object().is_none_or(|m| !m.is_empty()))
-        }) {
+    let lanes = if agents {
+        vec![CloneLane::Kvm, CloneLane::Agent]
+    } else {
+        vec![CloneLane::Kvm]
+    };
+    for lane in &lanes {
+        let lane_pve = pve.for_lane(*lane)?;
+        let template = lane.template();
+        if !inventory
+            .iter()
+            .any(|v| v.id == template && v.template && v.pool == POOL)
+        {
             return Err(ScalerError::Guard(
-                "token has unexpected protected-VM rights",
+                "qualified lane template missing from carrick-ci",
             ));
         }
+        let config = pve.request(PveCall::Get, &format!("{}/config", pve.site.qemu(template)))?;
+        if !qualified_template(&config, &lane_pve.site) {
+            return Err(ScalerError::Guard(
+                "template does not match approved size/storage/bridge",
+            ));
+        }
+        pve.verify_vm_firewall(template)?;
     }
+    verify_protected_vms(pve.site, |vm| {
+        pve.request(PveCall::Get, &format!("/access/permissions?path=/vms/{vm}"))
+    })?;
     let gh = Github;
     let path = dir.join("ledger.json");
     let mut ledger = Ledger::load(&path)?;
@@ -1753,7 +1830,10 @@ pub(super) fn controller(
             .iter()
             .filter(|r| r.state != State::Destroyed)
             .count();
-        if !frozen && active < usize::from(limit.get()) && Instant::now() >= admit_after {
+        if !frozen
+            && active < usize::from(limit.get()) + if agents { 4 } else { 0 }
+            && Instant::now() >= admit_after
+        {
             match demand.and_then(|demand| {
                 admit_one(
                     &pve,
@@ -1766,7 +1846,14 @@ pub(super) fn controller(
                 )
             }) {
                 Ok(()) => backoff.reset(),
-                Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
+                Err(error @ ScalerError::CpuCeiling { .. })
+                    if !ledger
+                        .rows
+                        .iter()
+                        .any(|r| r.lane == CloneLane::Agent && r.state != State::Destroyed) =>
+                {
+                    return Err(error);
+                }
                 Err(error) => {
                     // Transient GitHub/PVE/lease contention failures never end the controller.
                     eprintln!("admission pass failed: {error}; backing off");
@@ -1810,7 +1897,7 @@ fn reserve_admitted_clone(
     ledger: &mut Ledger,
     path: &Path,
     job: JobKey,
-    limit: Concurrency,
+    capacity: (Concurrency, CloneLane),
     clone_lease: &mut CloneLease,
     admit: impl FnOnce() -> Result<bool, ScalerError>,
     inventory: impl FnOnce() -> Result<Vec<PoolMember>, ScalerError>,
@@ -1824,10 +1911,11 @@ fn reserve_admitted_clone(
         if ledger.served(job) {
             return Ok(None);
         }
-        // Acquire the physical-host lock only immediately before ledger.reserve.
-        clone_lease.acquire()?;
-        let row = ledger.reserve(job, &inventory, now()?, limit)?;
-        ledger.save(path)?; // Must reach durable storage before clone.
+        if capacity.1 == CloneLane::Kvm {
+            clone_lease.acquire()?;
+        }
+        let row = ledger.reserve_lane(job, &inventory, now()?, capacity.0, capacity.1)?;
+        ledger.save(path)?;
         Ok(Some(row))
     })();
     if !matches!(result, Ok(Some(_))) {
@@ -1846,22 +1934,66 @@ fn admit_one(
     capacity: (Concurrency, &mut CloneLease),
 ) -> Result<(), ScalerError> {
     let (limit, clone_lease) = capacity;
-    let (group, admission, demand) = demand;
-    let Some(job) = select_demand(ledger, path, demand, |job| {
-        gh.vet(admission, job).map(|_| job)
-    })?
-    else {
+    let (group, original_admission, kvm_demand) = demand;
+    let agents = pve.site.node == site::CONTABO.node
+        && matches!(original_admission, Admission::Standing)
+        && std::env::var("CARRICK_AGENT_CLONES").as_deref() != Ok("0");
+    let mut selected = None;
+    for lane in [CloneLane::Kvm, CloneLane::Agent] {
+        if lane == CloneLane::Agent && !agents {
+            continue;
+        }
+        let cap = if lane == CloneLane::Agent {
+            4
+        } else {
+            usize::from(limit.get())
+        };
+        if ledger
+            .rows
+            .iter()
+            .filter(|r| r.state != State::Destroyed && r.lane == lane)
+            .count()
+            >= cap
+        {
+            continue;
+        }
+        let policy = if lane == CloneLane::Agent {
+            Admission::Agent
+        } else {
+            original_admission.clone()
+        };
+        if let Some(job) = select_demand(
+            ledger,
+            path,
+            if lane == CloneLane::Kvm {
+                kvm_demand.clone()
+            } else {
+                gh.demand(&policy, lane.labels())?
+            },
+            |job| gh.vet(&policy, job).map(|_| job),
+        )? {
+            selected = Some((lane, policy, job));
+            break;
+        }
+    }
+    let Some((lane, admission, job)) = selected else {
         return Ok(());
     };
+    let lane_pve = pve.for_lane(lane)?;
+    let pve = &lane_pve;
+    let admission = &admission;
     let Some(mut row) = reserve_admitted_clone(
         ledger,
         path,
         job,
-        limit,
+        (limit, lane),
         clone_lease,
         || {
             gh.vet(admission, job)?;
-            resource_admission(pve)
+            match resource_admission(pve) {
+                Err(ScalerError::CpuCeiling { .. }) if lane == CloneLane::Agent => Ok(false),
+                result => result,
+            }
         },
         || pve.inventory(),
     )?
@@ -1943,7 +2075,7 @@ mod tests {
             &mut ledger,
             &path,
             job,
-            Concurrency::ONE,
+            (Concurrency::ONE, CloneLane::Kvm),
             &mut lease,
             || Ok(false),
             || panic!("inventory must not be queried when resource_admission is false"),
@@ -1958,7 +2090,7 @@ mod tests {
             &mut ledger,
             &path,
             job,
-            Concurrency::ONE,
+            (Concurrency::ONE, CloneLane::Kvm),
             &mut lease,
             || Ok(false),
             || Ok(Vec::new()),
@@ -1982,7 +2114,7 @@ mod tests {
             &mut ledger,
             &path,
             job,
-            Concurrency::ONE,
+            (Concurrency::ONE, CloneLane::Kvm),
             &mut lease,
             || Ok(true),
             || Ok(Vec::new()),
@@ -1997,7 +2129,7 @@ mod tests {
             &mut ledger,
             &path,
             job,
-            Concurrency::ONE,
+            (Concurrency::ONE, CloneLane::Kvm),
             &mut lease,
             || Ok(true),
             || Ok(Vec::new()),
@@ -2018,7 +2150,7 @@ mod tests {
             &mut ledger,
             &path,
             job,
-            Concurrency::ONE,
+            (Concurrency::ONE, CloneLane::Kvm),
             &mut lease,
             || Ok(true),
             || Ok(Vec::new()),
@@ -2055,6 +2187,9 @@ mod tests {
             file.try_lock().unwrap();
             locked_tx.send(()).unwrap();
             release_rx.recv().unwrap();
+            // Other tests may fork while this descriptor is live. Explicit
+            // unlock releases the shared open-file description in those children.
+            file.unlock().unwrap();
             drop(file);
             released_tx.send(()).unwrap();
         });
@@ -2104,7 +2239,7 @@ mod tests {
     fn serial_host_guest_payload_installs_exact_bytes_without_expansion() {
         let dir = tempfile::tempdir().unwrap();
         let pilot = Admission::pilot(&"a".repeat(40)).unwrap();
-        for admission in [pilot, Admission::Standing] {
+        for admission in [pilot, Admission::Standing, Admission::Agent] {
             for (i, script) in GUEST_SCRIPTS.iter().enumerate() {
                 let source = guest_script_source(script, &admission).unwrap();
                 let path = dir.path().join(format!("payload-{i}"));
@@ -2122,7 +2257,8 @@ mod tests {
                     0o755
                 );
                 // Only a standing clone's hook may fall back to a re-vet.
-                let revet = script.path == HOOK_PATH && admission == Admission::Standing;
+                let revet = script.path == HOOK_PATH
+                    && matches!(admission, Admission::Standing | Admission::Agent);
                 assert_eq!(source.contains("admit-job --controller"), revet);
             }
         }
@@ -2362,9 +2498,9 @@ mod tests {
     }
     #[test]
     fn director_cpu_ceiling_is_a_stop_condition_above_eighty_percent() {
-        assert!(enforce_cpu_ceiling(0.675, 16).is_ok());
+        assert!(enforce_cpu_ceiling(0.675, 16, 2).is_ok());
         assert!(matches!(
-            enforce_cpu_ceiling(0.676, 16),
+            enforce_cpu_ceiling(0.676, 16, 2),
             Err(ScalerError::CpuCeiling { .. })
         ));
     }
