@@ -254,8 +254,10 @@ fn agent_auth_is_job_scoped_private_and_always_cleanable() {
         };
         let output = invoke(&["agent-runner", "auth", "--event", event.to_str().unwrap()]);
         assert!(output.status.success(), "{output:?}");
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-secret"));
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-secret"));
+        for secret in ["codex-only-secret", "agy-only-secret"] {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        }
         let auth = if backend == "codex" {
             home.join(".codex/auth.json")
         } else {
