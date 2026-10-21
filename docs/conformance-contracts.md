@@ -1678,3 +1678,13 @@ kick receipts and their consumption, while requiring every surviving queued
 WFI record to have owed or delivered wakeup debt. The replacement-Closing
 case also checks release of an internally rejected stale acquisition. The
 ten cases run through `just test-loom` and the existing CI loom job.
+
+`stale_mint_cannot_consume_reused_service_head_delivery` adds a stronger P3
+RED control. A stale incarnation-1 call is suspended until an executor retires
+that birth, allocates incarnation 3 on the same index and queues it. The real
+service-head take removes incarnation 3 and publishes Host. The stale caller
+wins Host -> Activating, the legitimate executor fails to mint and returns no
+delivery, and stale validation restores an unqueued Host record. There is no
+remaining delivery event. This fails at focused bound 3 even with validation
+under exclusive custody: eligibility alone is not delivery. The acquisition
+CAS must reject a different incarnation without taking its ownership.

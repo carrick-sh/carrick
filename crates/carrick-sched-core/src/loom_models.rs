@@ -509,3 +509,35 @@ fn closing_republishes_while_producer_and_executor_contend() {
         assert_eq!(zone.slot(SLOT).tail.load(Ordering::Acquire), NIL);
     });
 }
+
+#[test]
+fn stale_mint_cannot_consume_reused_service_head_delivery() {
+    model(|| {
+        let zone = zone();
+        let old = birth(&zone);
+        zone.drive(SLOT, 1);
+        let stale_zone = zone.clone();
+        let stale = thread::spawn(move || {
+            if let Some(custody) = stale_zone.claim_current_first_entry_activation(old) {
+                assert_eq!(stale_zone.record(old.id).incarnation(), old.incarnation);
+                assert!(stale_zone.release_first_entry_activation(custody));
+            }
+        });
+        if let Some(custody) = zone.claim_current_first_entry_activation(old) {
+            assert!(zone.free_first_entry_activation(custody));
+            let replacement = birth(&zone);
+            assert_eq!(replacement.id, old.id);
+            assert!(zone.place_from_host(replacement.id).is_some());
+            // A stale caller owns no adoption of the replacement. Taking its
+            // real service head therefore owes a real first-entry delivery,
+            // not merely an unqueued Host state that nobody will rediscover.
+            match zone.take_service_head_for_executor(SLOT) {
+                Some(ServiceHead::FirstEntry(custody)) => {
+                    finish(&zone, custody, &AtomicU32::new(0));
+                }
+                _ => panic!("stale mint consumed the replacement's service delivery"),
+            }
+        }
+        stale.join().unwrap();
+    });
+}
