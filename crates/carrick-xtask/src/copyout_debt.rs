@@ -7,8 +7,13 @@
 //! pointer. `dispatch::copyout` prepares every output before side effects;
 //! this counter records the direct writes that remain, per file. Ceilings are
 //! exact: a migration must lower its file's entry, a zero entry is deleted, and
-//! the total may never rise against the change base. At zero the ratchet
-//! itself is deleted.
+//! no file may rise against the change base. At zero the ratchet itself is
+//! deleted.
+//!
+//! Known syntactic limits: an unlisted wrapper around a direct write and a
+//! direct-write method called through a function-pointer alias are not visible
+//! to this scanner. Keep those limits explicit until a later scanner slice
+//! represents call graphs and aliases rather than expanding this change.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -360,6 +365,22 @@ fn total(counts: &BTreeMap<String, usize>) -> usize {
     counts.values().sum()
 }
 
+fn validate_base_delta(
+    found: &BTreeMap<String, usize>,
+    previous: &BTreeMap<String, usize>,
+    base: &str,
+) -> Result<(), String> {
+    for (path, count) in found {
+        let before = previous.get(path).copied().unwrap_or(0);
+        if *count > before {
+            return Err(format!(
+                "copyout debt increase against {base} in {path}: {before} -> {count}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn base_counts(root: &Path, base: &str) -> Result<BTreeMap<String, usize>, String> {
     let exists = crate::command::run_checked("git", ["ls-tree", base, "--", CEILINGS], Some(root))
         .map_err(|error| error.to_string())?;
@@ -402,14 +423,12 @@ fn check_policy(root: &Path, base: Option<&str>) -> Result<(), String> {
         );
     }
     if let Some(base) = base {
-        let previous = total(&base_counts(root, base)?);
-        if total(&found) > previous {
-            return Err(format!(
-                "copyout debt increase against {base}: {previous} -> {}",
-                total(&found)
-            ));
-        }
-        println!("copyout debt PR-base ratchet passed ({base}: {previous})");
+        let previous = base_counts(root, base)?;
+        validate_base_delta(&found, &previous, base)?;
+        println!(
+            "copyout debt PR-base ratchet passed ({base}: {})",
+            total(&previous)
+        );
     } else {
         println!("copyout debt delta: no base provided; delta ratchet not applicable");
     }
@@ -528,5 +547,14 @@ mod tests {
                 .unwrap_err()
                 .contains("delete")
         );
+    }
+
+    #[test]
+    fn per_file_increase_is_rejected_even_when_total_falls() {
+        let previous = BTreeMap::from([(format!("{SCOPE}/a.rs"), 5), (format!("{SCOPE}/b.rs"), 1)]);
+        let found = BTreeMap::from([(format!("{SCOPE}/a.rs"), 2), (format!("{SCOPE}/b.rs"), 2)]);
+        let error = validate_base_delta(&found, &previous, "base").unwrap_err();
+        assert!(error.contains("b.rs: 1 -> 2"));
+        assert!(total(&found) < total(&previous));
     }
 }
