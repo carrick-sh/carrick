@@ -12,7 +12,7 @@ mod common;
 use carrick_conformance_next::{PullPolicy, ResultAssert, TestContainer};
 
 #[test]
-fn rt_sigprocmask_alias_and_validation() {
+fn case_rt_sigprocmask_alias_and_validation() {
     let _guard = common::guest_lock();
     let script = include_str!("fixtures/sigmask_alias.py");
     let container = TestContainer::new("python:3.12-slim").pull_policy(PullPolicy::Missing);

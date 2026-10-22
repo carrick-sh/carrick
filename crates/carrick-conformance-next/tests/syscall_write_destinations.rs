@@ -5,7 +5,7 @@ mod common;
 use carrick_conformance_next::{PullPolicy, TestContainer};
 
 #[test]
-fn syscall_write_destinations_preserve_bytes_permissions_and_cow() {
+fn case_syscall_write_destinations_preserve_bytes_permissions_and_cow() {
     let _lock = common::guest_lock();
     let directory = tempfile::TempDir::new().unwrap();
     std::fs::write(
