@@ -261,3 +261,12 @@ two sleep witnesses and residency tests pass. No scheduler interleaving or
 sched-core code changed. Dedicated runtime supply/physical refusal and
 owner-to-empty-pipe re-park schedules remain outside these witnesses; the
 existing typed wait machinery serves those paths.
+
+After #739 landed, the branch was rebased onto GitHub main. Every scheduler,
+kernel, runtime, fixture and contract file in this fix was byte-for-byte
+unchanged by that rebase: all fixes were kept, none dropped, and no code move
+required a port. Main added only agent-dispatch/tooling changes outside this
+slice. The earlier follow-up gate run passed kernel, Clippy, Linux Clippy and
+formatting, then was stopped during domain lint for this rebase. Fresh gates
+on the landed dependency are required; the interrupted run does not certify
+the final branch. The earlier agent trailers now include the exact model name.
