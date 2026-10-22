@@ -739,7 +739,7 @@ fn pending_host_work_gettid_forwards_without_completion() {
             assert_eq!(frame.x[0], 0xfeed);
             assert_eq!(
                 w.task().linux.take_served_boundary(),
-                Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0: 0xfeed })
+                Some(carrick_el1_abi::ServedBoundary::ForwardOriginal { x0: 0xfeed })
             );
         }
         assert_eq!(w.served(SYS_GETTID), 0);
