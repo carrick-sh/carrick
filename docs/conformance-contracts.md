@@ -1854,5 +1854,13 @@ PREPARE refusal and the dispatcher converts it to ENOMEM (12). This is a
 production registry plus production admission reproduction, without a fake
 memory backend. The trace carries only four mmap arguments and no backend
 refusal message, so exact-offset/branch live confirmation remains for the Mac.
+The fallback first requests writable physical protection, which can itself
+refuse before the bounded copy is reached; the component witness establishes
+the incompatible fallback, not which downstream ENOMEM exit the Mac took.
 The signed static case reads the actual immutable OCI libpython file; a new
 mutable /tmp file would not bind the original lowering path.
+
+Run the signed selectors with
+`CARRICK_RUN_ID=759-libpython-map env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just test-conformance-next case_libpython_ --nocapture`.
+The [fixture instructions](../crates/carrick-conformance-next/tests/fixtures/libpython-map/README.md)
+describe source and executable identity and the pending native ARM64 bless.
