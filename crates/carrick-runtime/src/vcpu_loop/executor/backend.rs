@@ -1395,6 +1395,34 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         let exit =
             carrick_vmm_hvf::hvf_aarch64_engine::run_worker_idle_entry(lifecycle, vcpu, frame);
         zone.leave_guest(slot, &carrick_kernel::el1_zone::HostLockWait);
+        if let Ok(ref outcome) = exit
+            && !matches!(outcome, carrick_aarch64::Aarch64Exit::Halt)
+        {
+            // The idle executor has no host graph thread to service an EL0
+            // exit. Preserve the stopped native record and syndrome before
+            // the worker returns its error; the next capture can distinguish
+            // a COW miss, translation fault, and host-only syscall.
+            let record = zone.slot(slot).current();
+            let native_owned = record.is_some_and(|id| zone.record(id).is_native_owned());
+            let (kind, syndrome, far) = match outcome {
+                carrick_aarch64::Aarch64Exit::Syscall { .. } => (1, 0, 0),
+                carrick_aarch64::Aarch64Exit::EL0Fault { syndrome, far, .. } => {
+                    (2, *syndrome, *far)
+                }
+                carrick_aarch64::Aarch64Exit::Stage1CowFault { syndrome, far } => {
+                    (3, *syndrome, *far)
+                }
+                _ => (4, 0, 0),
+            };
+            carrick_kernel::event_ring::rec_zone_idle_exit(
+                u32::from(slot.raw()),
+                record.map_or(0, carrick_el1_abi::RecordId::raw),
+                kind,
+                native_owned,
+                syndrome,
+                far,
+            );
+        }
         match exit? {
             carrick_aarch64::Aarch64Exit::Halt => Ok(GuestIdleExit::Idle),
             other => Err(TrapError::Hypervisor(format!(

@@ -331,6 +331,16 @@ pub const MMOCC_REFUSE: u8 = 80;
 /// caller's kernel task/thread IDs (not namespace projections); `c` is the
 /// typed producer below. This is diagnostic history, not identity authority.
 pub const CLONE_REFUSAL: u8 = 81;
+/// An idle vCPU left at EL0 without a host task binding. `a` is the vCPU
+/// slot, `b` its current zone record (0 if absent), and `c` packs the exit
+/// class in the low byte and whether the record is native-owned in bit 8.
+/// The full syndrome and fault address follow in [`ZONE_IDLE_ESR`] and
+/// [`ZONE_IDLE_FAR`]. This is a cold failure receipt, not dispatch telemetry.
+pub const ZONE_IDLE_EXIT: u8 = 82;
+/// Full-width syndrome for [`ZONE_IDLE_EXIT`]; `c` is the vCPU slot.
+pub const ZONE_IDLE_ESR: u8 = 83;
+/// Full-width fault address for [`ZONE_IDLE_EXIT`]; `c` is the vCPU slot.
+pub const ZONE_IDLE_FAR: u8 = 84;
 
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,7 +375,7 @@ fn clone_refusal_label(producer: i32) -> &'static str {
 }
 
 /// Highest event kind a reader accepts.
-const LAST_KIND: u8 = CLONE_REFUSAL;
+const LAST_KIND: u8 = ZONE_IDLE_FAR;
 
 /// At most this many [`FAULTSIG_MBOX`] records follow one fault signal, so a
 /// census of all mailboxes never floods the ring.
@@ -732,6 +742,37 @@ pub fn rec_hvpatch_settle_object(address: usize, step: i32) {
 #[inline]
 pub fn rec_sched_dispatch(tid: i32, executor: u32, cpu: usize) {
     rec(SCHED_DISPATCH, tid, executor as i32, cpu as i32);
+}
+
+/// Preserve the first unowned idle-lane EL0 exit before its executor returns
+/// an error. `kind`: 1 syscall, 2 EL0 fault, 3 EL1 COW fault, 4 other.
+#[inline]
+pub fn rec_zone_idle_exit(
+    slot: u32,
+    record: u32,
+    kind: u8,
+    native_owned: bool,
+    syndrome: u64,
+    far: u64,
+) {
+    rec(
+        ZONE_IDLE_EXIT,
+        slot as i32,
+        record as i32,
+        i32::from(kind) | (i32::from(native_owned) << 8),
+    );
+    rec(
+        ZONE_IDLE_ESR,
+        syndrome as u32 as i32,
+        (syndrome >> 32) as u32 as i32,
+        slot as i32,
+    );
+    rec(
+        ZONE_IDLE_FAR,
+        far as u32 as i32,
+        (far >> 32) as u32 as i32,
+        slot as i32,
+    );
 }
 
 #[inline]
@@ -1716,6 +1757,20 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         SCHED_PREEMPT => format!("SCHED_PREEMPT tid={a} executor={b} reasons={:#x}", c as u32),
         SCHED_BUDGET => format!("SCHED_BUDGET executor={a} budget_ms={b} generation={c}"),
         SCHED_DEADLINE => format!("SCHED_DEADLINE executor={a} deadline_ms={b} ticket={c}"),
+        ZONE_IDLE_EXIT => {
+            let kind = match (c as u32) & 0xff {
+                1 => "syscall",
+                2 => "el0-fault",
+                3 => "el1-cow-fault",
+                _ => "other",
+            };
+            format!(
+                "ZONE_IDLE_EXIT slot={a} record={b} kind={kind} native={}",
+                ((c as u32) & 0x100) != 0
+            )
+        }
+        ZONE_IDLE_ESR => format!("ZONE_IDLE_ESR slot={c} esr={:#018x}", join_u64(a, b)),
+        ZONE_IDLE_FAR => format!("ZONE_IDLE_FAR slot={c} far={:#018x}", join_u64(a, b)),
         EL1GRANT_CLAIM => {
             let packed = c as u32;
             format!(
@@ -2540,6 +2595,31 @@ mod tests {
         assert_eq!(
             decode(SCHED_DEADLINE, 3, 4, 1),
             "SCHED_DEADLINE executor=3 deadline_ms=4 ticket=1"
+        );
+    }
+
+    #[test]
+    fn idle_zone_exit_records_native_custody_and_full_fault() {
+        rec_zone_idle_exit(1, 17, 2, true, 0x9600_004f, 0x60_dead_5000);
+        assert!(contains_event(ZONE_IDLE_EXIT, 1, 17, 0x102));
+        assert!(contains_event(ZONE_IDLE_ESR, 0x9600_004f_u32 as i32, 0, 1));
+        assert!(contains_event(
+            ZONE_IDLE_FAR,
+            0xdead_5000_u32 as i32,
+            0x60,
+            1
+        ));
+        assert_eq!(
+            decode(ZONE_IDLE_EXIT, 1, 17, 0x102),
+            "ZONE_IDLE_EXIT slot=1 record=17 kind=el0-fault native=true"
+        );
+        assert_eq!(
+            decode(ZONE_IDLE_ESR, 0x9600_004f_u32 as i32, 0, 1),
+            "ZONE_IDLE_ESR slot=1 esr=0x000000009600004f"
+        );
+        assert_eq!(
+            decode(ZONE_IDLE_FAR, 0xdead_5000_u32 as i32, 0x60, 1),
+            "ZONE_IDLE_FAR slot=1 far=0x00000060dead5000"
         );
     }
 

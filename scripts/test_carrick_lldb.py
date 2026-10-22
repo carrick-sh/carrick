@@ -191,7 +191,22 @@ class CarrickLldbHelperTests(unittest.TestCase):
         # Kinds 68..80 must all be known: an unknown kind reads as ERROR.
         for kind in range(68, 81):
             self.assertIn(kind, PLUGIN._EVENTRING_KINDS)
-        self.assertNotIn(82, PLUGIN._EVENTRING_KINDS)
+        for kind in range(82, 85):
+            self.assertIn(kind, PLUGIN._EVENTRING_KINDS)
+
+    def test_eventring_preserves_unowned_native_idle_exit_fault(self):
+        self.assertEqual(
+            self._fmt(82, 1, 17, 0x102),
+            "ZONE_IDLE_EXIT slot=1 record=17 kind=el0-fault native=true",
+        )
+        self.assertEqual(
+            self._fmt(83, 0x9600004F, 0, 1),
+            "ZONE_IDLE_ESR slot=1 esr=0x000000009600004f",
+        )
+        self.assertEqual(
+            self._fmt(84, 0xDEAD5000, 0x60, 1),
+            "ZONE_IDLE_FAR slot=1 far=0x00000060dead5000",
+        )
 
     def test_eventring_formats_el1_frame_grant_claim_and_decision(self):
         # Same packed words the Rust round-trip test publishes.
