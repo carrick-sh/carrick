@@ -2127,6 +2127,60 @@ mod tests {
         }
     }
 
+    /// Even an eligible peer can enter another inline host wait before
+    /// consuming its service head. A captured service row must leave zone
+    /// custody instead of bouncing between those drivers indefinitely.
+    #[test]
+    fn service_capture_does_not_bounce_between_eligible_drivers() {
+        for peer_cpu in [0, 1] {
+            let zone = heap_zone();
+            let slots = [SlotId::new(0), SlotId::new(1)];
+            for (index, slot) in slots.into_iter().enumerate() {
+                zone.drive(slot, index as u64 + 1);
+                zone.publish_slot(slot, 0, Some(if index == 0 { 0 } else { peer_cpu }), 0);
+            }
+            let record = zone
+                .alloc_host_runnable(ThreadIdentity {
+                    affinity: 1 | (1 << peer_cpu),
+                    ..identity(1)
+                })
+                .unwrap();
+            let reference = zone.record_ref(record);
+            assert!(zone.requeue_on(slots[0], record).is_some());
+            let mut captures = Vec::new();
+            let mut published = Vec::new();
+            for turn in 0..8 {
+                let index = turn % 2;
+                let slot = slots[index];
+                let driver = index as u64 + 1;
+                let mut records = Vec::new();
+                let mut placements = Vec::new();
+                assert!(zone.step_away(
+                    slot,
+                    driver,
+                    &mut |record| records.push(record),
+                    &mut |placement| placements.push(placement),
+                ));
+                settle_vacated(
+                    &zone,
+                    Some(slot),
+                    records,
+                    placements,
+                    &mut |record| published.push(record),
+                    &mut |records| captures.extend_from_slice(records),
+                );
+                zone.step_back(slot, driver);
+            }
+            assert_eq!(captures, [reference], "peer_cpu={peer_cpu}");
+            assert_eq!(published, [reference]);
+            assert_eq!(
+                zone.slot(slots[0]).queued() + zone.slot(slots[1]).queued(),
+                0
+            );
+            zone.free_record(record);
+        }
+    }
+
     #[cfg(all(feature = "test-support", feature = "deferred-capture-test-control"))]
     mod serial_host_deferred_capture_control {
         use super::*;
