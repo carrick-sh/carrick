@@ -1130,6 +1130,9 @@ fn agent_template_profile_preserves_hardening_without_root_sudo() {
 }
 
 #[test]
+// The builder runs only as root on the Linux PVE host and relies on bash 4
+// associative arrays; macOS /bin/bash is 3.2, so execute it where it runs.
+#[cfg(target_os = "linux")]
 fn template_create_pool_is_profile_specific() {
     // Execute only the creation fragment with qm captured, never the builder.
     let source = include_str!("../../../scripts/ci/build-template-debian.sh");
