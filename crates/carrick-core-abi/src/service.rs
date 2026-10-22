@@ -1,0 +1,400 @@
+//! Exact native service operations. The ring retains semantic custody until
+//! an exact completion or cancellation acknowledgment is consumed.
+use crate::{El1MmHandle, EntryThreadGeneration, SnapshotGeneration};
+use carrick_guest_arch::{Access, FaultInfo, NativeOrdinal};
+use carrick_sched_core::{RecordRef, process::TaskKey};
+use core::num::NonZeroU64;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceBirth {
+    pub process: TaskKey,
+    pub thread: EntryThreadGeneration,
+    pub record: RecordRef,
+    pub mm: El1MmHandle,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceIdentity {
+    pub birth: ServiceBirth,
+    pub execution: SnapshotGeneration,
+    pub sequence: NonZeroU64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceOperation {
+    Fault(FaultInfo),
+    Crossing { ordinal: NativeOrdinal },
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceRequest {
+    pub identity: ServiceIdentity,
+    pub operation: ServiceOperation,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceResult {
+    Supplied,
+    Refused,
+    Cancelled,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceError {
+    Busy,
+    Stale,
+    Exhausted,
+}
+
+const UNBOUND: u64 = 0;
+const IDLE: u64 = 1;
+const WRITING: u64 = 2;
+const REQUESTED: u64 = 3;
+const SERVICING: u64 = 4;
+const CANCEL_REQUESTED: u64 = 5;
+const COMPLETED: u64 = 6;
+const CANCELLED: u64 = 7;
+
+/// A member owns this cell, not the execution slot. Its enclosing allocation
+/// and semantic MM claim must remain retained through acknowledgment. All
+/// fields are atomic because rejected readers may overlap a later publication.
+#[repr(C, align(64))]
+#[derive(Debug)]
+pub struct ServiceCell {
+    state: AtomicU64,
+    sequence: AtomicU64,
+    words: [AtomicU64; 12],
+    result: AtomicU64,
+}
+impl ServiceCell {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU64::new(UNBOUND),
+            sequence: AtomicU64::new(0),
+            words: [const { AtomicU64::new(0) }; 12],
+            result: AtomicU64::new(0),
+        }
+    }
+    // Binding/publication must use authenticated lifecycle and admitted-MM
+    // owners. Identity decoding grants no authority by itself.
+}
+impl Default for ServiceCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl ServiceBirth {
+    fn words(self) -> [u64; 8] {
+        [
+            self.mm.carrier().get(),
+            self.process.id.raw() as u64,
+            self.process.serial.raw(),
+            self.thread.raw(),
+            u64::from(self.record.id.raw()),
+            self.record.incarnation,
+            self.mm.mm().raw(),
+            self.mm.incarnation().get(),
+        ]
+    }
+}
+impl ServiceCell {
+    /// Publish only after the native owner has authenticated the complete
+    /// lifecycle birth and admitted MM. No execution slot is part of custody.
+    pub fn bind(&self, birth: ServiceBirth) -> Result<(), ServiceError> {
+        if birth.thread.raw() == 0 || birth.record.incarnation == 0 {
+            return Err(ServiceError::Stale);
+        }
+        self.state
+            .compare_exchange(UNBOUND, WRITING, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ServiceError::Busy)?;
+        for (word, value) in self.words.iter().zip(birth.words()) {
+            word.store(value, Ordering::Relaxed);
+        }
+        self.state.store(IDLE, Ordering::Release);
+        Ok(())
+    }
+    /// Caller holds the member reset reservation. An outstanding request
+    /// refuses reset even if a physical metadata pin keeps its bytes mapped.
+    pub fn reset_unpublished(&self) -> Result<(), ServiceError> {
+        let state = self.state.load(Ordering::Acquire);
+        if !matches!(state, UNBOUND | IDLE) {
+            return Err(ServiceError::Busy);
+        }
+        self.state
+            .compare_exchange(state, UNBOUND, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| ServiceError::Busy)?;
+        Ok(())
+    }
+    pub fn publish(
+        &self,
+        birth: ServiceBirth,
+        execution: SnapshotGeneration,
+        operation: ServiceOperation,
+    ) -> Result<ServiceRequest, ServiceError> {
+        self.state
+            .compare_exchange(IDLE, WRITING, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ServiceError::Busy)?;
+        if !execution.issued() || !self.same_birth(birth) {
+            self.state.store(IDLE, Ordering::Release);
+            return Err(ServiceError::Stale);
+        }
+        let Some(next) = self
+            .sequence
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+        else {
+            self.state.store(IDLE, Ordering::Release);
+            return Err(ServiceError::Exhausted);
+        };
+        let (kind, first, second) = match operation {
+            ServiceOperation::Fault(fault) => (1, fault_bits(fault), fault.address.raw()),
+            ServiceOperation::Crossing { ordinal } => (2, ordinal.raw(), 0),
+        };
+        for (index, value) in [(8, execution.raw()), (9, kind), (10, first), (11, second)] {
+            self.words[index].store(value, Ordering::Relaxed);
+        }
+        self.sequence.store(next.get(), Ordering::Relaxed);
+        self.state.store(REQUESTED, Ordering::Release);
+        Ok(ServiceRequest {
+            identity: ServiceIdentity {
+                birth,
+                execution,
+                sequence: next,
+            },
+            operation,
+        })
+    }
+    fn same_birth(&self, birth: ServiceBirth) -> bool {
+        self.words
+            .iter()
+            .zip(birth.words())
+            .all(|(word, value)| word.load(Ordering::Relaxed) == value)
+    }
+    fn same(&self, identity: ServiceIdentity) -> bool {
+        self.same_birth(identity.birth)
+            && self.words[8].load(Ordering::Relaxed) == identity.execution.raw()
+            && self.sequence.load(Ordering::Relaxed) == identity.sequence.get()
+    }
+    fn lock_exact(&self, expected: u64, identity: ServiceIdentity) -> Result<(), ServiceError> {
+        self.state
+            .compare_exchange(expected, WRITING, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ServiceError::Busy)?;
+        if self.same(identity) {
+            return Ok(());
+        }
+        self.state.store(expected, Ordering::Release);
+        Err(ServiceError::Stale)
+    }
+    /// The transport supplies the immutable copied request; claiming validates
+    /// it under the cell transition before giving out one non-cloneable ticket.
+    pub fn claim(&self, request: ServiceRequest) -> Result<ServiceTicket<'_>, ServiceError> {
+        self.lock_exact(REQUESTED, request.identity)?;
+        let operation_matches = match request.operation {
+            ServiceOperation::Fault(fault) => {
+                self.words[9].load(Ordering::Relaxed) == 1
+                    && self.words[10].load(Ordering::Relaxed) == fault_bits(fault)
+                    && self.words[11].load(Ordering::Relaxed) == fault.address.raw()
+            }
+            ServiceOperation::Crossing { ordinal } => {
+                self.words[9].load(Ordering::Relaxed) == 2
+                    && self.words[10].load(Ordering::Relaxed) == ordinal.raw()
+            }
+        };
+        if !operation_matches {
+            self.state.store(REQUESTED, Ordering::Release);
+            return Err(ServiceError::Stale);
+        }
+        self.state.store(SERVICING, Ordering::Release);
+        Ok(ServiceTicket {
+            cell: self,
+            request,
+        })
+    }
+    /// Return true only when no host operation remains. Cancellation of an
+    /// active ticket needs the ticket's acknowledgment, retaining all custody.
+    pub fn cancel(&self, identity: ServiceIdentity) -> Result<bool, ServiceError> {
+        let state = self.state.load(Ordering::Acquire);
+        match state {
+            REQUESTED | SERVICING | CANCEL_REQUESTED | COMPLETED | CANCELLED => {
+                self.lock_exact(state, identity)?;
+                let acknowledged = matches!(state, REQUESTED | COMPLETED | CANCELLED);
+                self.state.store(
+                    if acknowledged {
+                        CANCELLED
+                    } else {
+                        CANCEL_REQUESTED
+                    },
+                    Ordering::Release,
+                );
+                Ok(acknowledged)
+            }
+            _ => Err(ServiceError::Busy),
+        }
+    }
+    /// The ring consumes exactly one acknowledged operation before releasing
+    /// its retained MM/member capabilities or deciding a guest-visible result.
+    pub fn consume(&self, identity: ServiceIdentity) -> Result<ServiceResult, ServiceError> {
+        let state = self.state.load(Ordering::Acquire);
+        if !matches!(state, COMPLETED | CANCELLED) {
+            return Err(ServiceError::Busy);
+        }
+        self.lock_exact(state, identity)?;
+        let result = if state == CANCELLED {
+            ServiceResult::Cancelled
+        } else if self.result.load(Ordering::Relaxed) == 1 {
+            ServiceResult::Supplied
+        } else {
+            ServiceResult::Refused
+        };
+        self.state.store(IDLE, Ordering::Release);
+        Ok(result)
+    }
+}
+/// Dropping a transport handle is not completion: it leaves the operation and
+/// its retained resources outstanding. Only explicit acknowledgment releases it.
+#[must_use]
+pub struct ServiceTicket<'a> {
+    cell: &'a ServiceCell,
+    request: ServiceRequest,
+}
+impl ServiceTicket<'_> {
+    pub fn request(&self) -> ServiceRequest {
+        self.request
+    }
+    pub fn complete(self, supplied: bool) -> Result<(), (ServiceError, Self)> {
+        let state = self.cell.state.load(Ordering::Acquire);
+        if !matches!(state, SERVICING | CANCEL_REQUESTED) {
+            return Err((
+                if state == WRITING {
+                    ServiceError::Busy
+                } else {
+                    ServiceError::Stale
+                },
+                self,
+            ));
+        }
+        if let Err(error) = self.cell.lock_exact(state, self.request.identity) {
+            return Err((error, self));
+        }
+        self.cell
+            .result
+            .store(u64::from(supplied), Ordering::Relaxed);
+        self.cell.state.store(
+            if state == CANCEL_REQUESTED {
+                CANCELLED
+            } else {
+                COMPLETED
+            },
+            Ordering::Release,
+        );
+        Ok(())
+    }
+}
+
+fn fault_bits(fault: FaultInfo) -> u64 {
+    let access = match fault.access {
+        Access::Read => 0,
+        Access::Write => 1,
+        Access::Execute => 2,
+    };
+    access | (u64::from(fault.present) << 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carrick_guest_arch::UserVa;
+    use carrick_sched_core::{
+        RecordId,
+        process::{TaskId, TaskSerial},
+    };
+    use core::num::NonZeroI32;
+
+    fn birth(id: u32, generation: u64) -> ServiceBirth {
+        let generation = NonZeroU64::new(generation).unwrap();
+        ServiceBirth {
+            process: TaskKey {
+                id: TaskId::from_registry_allocation(NonZeroI32::new(id as i32).unwrap()),
+                serial: TaskSerial::from_registry_allocation(generation),
+            },
+            thread: EntryThreadGeneration::from_raw(generation.get()),
+            record: RecordRef {
+                id: RecordId::from_raw(id).unwrap(),
+                incarnation: generation.get(),
+            },
+            // SAFETY: this wire-protocol fixture owns an immutable, never-reused
+            // synthetic MM identity. It does not authorize a memory operation.
+            mm: unsafe {
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::MIN,
+                    crate::ReservationMm::new(u64::from(id)).unwrap(),
+                    generation,
+                )
+            },
+        }
+    }
+    fn fault() -> ServiceOperation {
+        ServiceOperation::Fault(FaultInfo {
+            address: UserVa::new(0x6000000fd8),
+            access: Access::Write,
+            present: true,
+        })
+    }
+
+    #[test]
+    fn two_service_cells_cancel_one_without_consuming_the_other() {
+        let first = ServiceCell::new();
+        let second = ServiceCell::new();
+        let first_birth = birth(1, 1);
+        let second_birth = birth(2, 1);
+        first.bind(first_birth).unwrap();
+        second.bind(second_birth).unwrap();
+        let a = first
+            .publish(first_birth, SnapshotGeneration::INITIAL, fault())
+            .unwrap();
+        let b = second
+            .publish(second_birth, SnapshotGeneration::INITIAL, fault())
+            .unwrap();
+        let a_ticket = first.claim(a).unwrap();
+        let b_ticket = second.claim(b).unwrap();
+        assert!(!first.cancel(a.identity).unwrap());
+        assert_eq!(first.consume(a.identity), Err(ServiceError::Busy));
+        assert_eq!(first.reset_unpublished(), Err(ServiceError::Busy));
+        assert!(b_ticket.complete(true).is_ok());
+        assert_eq!(second.consume(b.identity), Ok(ServiceResult::Supplied));
+        assert_eq!(first.consume(a.identity), Err(ServiceError::Busy));
+        assert!(a_ticket.complete(true).is_ok());
+        assert_eq!(first.consume(a.identity), Ok(ServiceResult::Cancelled));
+        assert_eq!(first.consume(a.identity), Err(ServiceError::Busy));
+        assert_eq!(second.consume(b.identity), Err(ServiceError::Busy));
+    }
+
+    #[test]
+    fn recycled_birth_rejects_old_request_and_keeps_monotone_sequence() {
+        let cell = ServiceCell::new();
+        let old_birth = birth(1, 1);
+        cell.bind(old_birth).unwrap();
+        let old = cell
+            .publish(old_birth, SnapshotGeneration::INITIAL, fault())
+            .unwrap();
+        assert!(cell.cancel(old.identity).unwrap());
+        assert_eq!(cell.consume(old.identity), Ok(ServiceResult::Cancelled));
+        cell.reset_unpublished().unwrap();
+        let new_birth = birth(1, 2);
+        cell.bind(new_birth).unwrap();
+        let new = cell
+            .publish(new_birth, SnapshotGeneration::INITIAL, fault())
+            .unwrap();
+        assert!(new.identity.sequence > old.identity.sequence);
+        assert!(matches!(cell.claim(old), Err(ServiceError::Stale)));
+        let mut wrong = new;
+        wrong.identity.execution = SnapshotGeneration::from_raw(2);
+        assert!(matches!(cell.claim(wrong), Err(ServiceError::Stale)));
+        wrong = new;
+        wrong.operation = ServiceOperation::Crossing {
+            ordinal: NativeOrdinal::new(57),
+        };
+        assert!(matches!(cell.claim(wrong), Err(ServiceError::Stale)));
+        let ticket = cell.claim(new).unwrap();
+        assert!(ticket.complete(false).is_ok());
+        assert_eq!(cell.consume(old.identity), Err(ServiceError::Stale));
+        assert_eq!(cell.consume(new.identity), Ok(ServiceResult::Refused));
+    }
+}

@@ -111,13 +111,13 @@ impl<C> ProcessPhysicalPublication<C> {
 #[derive(::core::fmt::Debug, ::core::default::Default)]
 pub struct ProcessExitCustody {
     begun: core::sync::atomic::AtomicU32,
-    fork_publications: core::sync::atomic::AtomicU32,
+    external_work: core::sync::atomic::AtomicU32,
 }
 impl ProcessExitCustody {
     pub const fn new() -> Self {
         Self {
             begun: core::sync::atomic::AtomicU32::new(0),
-            fork_publications: core::sync::atomic::AtomicU32::new(0),
+            external_work: core::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -140,18 +140,18 @@ impl ProcessExitCustody {
 }
 
 impl ProcessExitCustody {
-    pub(crate) fn fork_publications(&self) -> usize {
-        self.fork_publications
+    pub(crate) fn external_work(&self) -> usize {
+        self.external_work
             .load(core::sync::atomic::Ordering::SeqCst) as usize
     }
 }
 
 /// An admitted host fork publication, retained until publication or rollback
 /// completes. It is an outstanding claim, never a parent thread membership.
-pub struct ForkPublicationClaim<P: core::ops::Deref>(P)
+struct ExternalWorkClaim<P: core::ops::Deref>(P)
 where
     P::Target: Lifecycle;
-impl<P: core::ops::Deref> ForkPublicationClaim<P>
+impl<P: core::ops::Deref> ExternalWorkClaim<P>
 where
     P::Target: Lifecycle,
 {
@@ -159,7 +159,7 @@ where
         use carrick_core_abi::lifecycle::GateState;
         use core::sync::atomic::Ordering;
         page.process_exit_custody()
-            .fork_publications
+            .external_work
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 count.checked_add(1)
             })
@@ -172,15 +172,67 @@ where
         !self.0.gate().is_terminal()
     }
 }
-impl<P: core::ops::Deref> Drop for ForkPublicationClaim<P>
+impl<P: core::ops::Deref> Drop for ExternalWorkClaim<P>
 where
     P::Target: Lifecycle,
 {
     fn drop(&mut self) {
         self.0
             .process_exit_custody()
-            .fork_publications
+            .external_work
             .fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// An admitted host fork publication retained until publication or rollback.
+/// It is outstanding work, never a parent thread membership.
+pub struct ForkPublicationClaim<P: core::ops::Deref>(ExternalWorkClaim<P>)
+where
+    P::Target: Lifecycle;
+impl<P: core::ops::Deref> ForkPublicationClaim<P>
+where
+    P::Target: Lifecycle,
+{
+    pub fn acquire(page: P) -> Result<Self, carrick_core_abi::lifecycle::GateState> {
+        ExternalWorkClaim::acquire(page).map(Self)
+    }
+    pub fn admitted(&self) -> bool {
+        self.0.admitted()
+    }
+}
+
+/// Outstanding native service custody, distinct from a member or fork.
+/// Abandonment leaves the claim outstanding; only an explicit acknowledgment
+/// (including admission rollback) releases it and owes the terminal wake.
+#[must_use]
+pub struct NativeServiceClaim<P: core::ops::Deref>(P)
+where
+    P::Target: Lifecycle;
+impl<P: core::ops::Deref> NativeServiceClaim<P>
+where
+    P::Target: Lifecycle,
+{
+    pub fn acquire(page: P) -> Result<Self, carrick_core_abi::lifecycle::GateState> {
+        use core::sync::atomic::Ordering;
+        page.process_exit_custody()
+            .external_work
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| carrick_core_abi::lifecycle::GateState::ForkClosing)?;
+        Ok(Self(page))
+    }
+    pub fn admitted(&self) -> bool {
+        !self.0.gate().is_terminal()
+    }
+    /// Claim release precedes sampling the wake published by closing. If
+    /// close has not published yet, its later readiness check sees the release.
+    pub fn acknowledge<R>(self, notify: impl FnOnce(Option<TerminalNotification>) -> R) -> R {
+        self.0
+            .process_exit_custody()
+            .external_work
+            .fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+        notify(self.0.terminal_notification())
     }
 }
 
@@ -936,6 +988,30 @@ mod tests {
         drop(second);
         assert_eq!(page.claimed_count(), 0);
         assert_eq!(peer.gate(), GateState::Open);
+    }
+
+    #[test]
+    fn native_service_ack_releases_claim_before_notifying_without_consuming_member() {
+        let page = Page {
+            terminal: ProcessExitCustody::new(),
+            gate: AtomicU32::new(0),
+            live: AtomicU32::new(2),
+        };
+        let first = NativeServiceClaim::acquire(&page).unwrap();
+        let second = NativeServiceClaim::acquire(&page).unwrap();
+        assert!(first.admitted());
+        assert_eq!(page.claimed_count(), 2);
+        let _closing = TerminalCustody::<Process, Live>::close_admission(&page);
+        assert!(!first.admitted());
+        first.acknowledge(|_| {
+            assert_eq!(page.claimed_count(), 1);
+            assert_eq!(page.live(), 2);
+        });
+        second.acknowledge(|_| {
+            assert_eq!(page.claimed_count(), 0);
+            assert_eq!(page.live(), 2);
+        });
+        assert!(page.gate().is_terminal());
     }
 
     #[test]

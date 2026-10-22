@@ -506,6 +506,8 @@ pub struct ThreadControlSlot {
     // publishing this control to EL1. Never dereference the other venue's VA.
     affinity_host_alias: AtomicU64,
     affinity_guest_alias: AtomicU64,
+    /// Exact native service custody survives execution-slot reuse.
+    pub service: carrick_core_abi::service::ServiceCell,
 }
 
 /// Quiescent initialization was attempted on a live execution authority.
@@ -609,6 +611,7 @@ impl ThreadControlSlot {
             non_interrupting: AtomicU64::new(0),
             native_pending: PendingSummary::new(),
             native_pending_writer: AtomicU32::new(0),
+            service: carrick_core_abi::service::ServiceCell::new(),
         }
     }
 
@@ -691,6 +694,9 @@ impl ThreadControlSlot {
         entry: Option<EntryRef>,
     ) -> Result<(), TransitionError> {
         let _reset = self.host_exit_requested.reserve_reset()?;
+        self.service
+            .reset_unpublished()
+            .map_err(|_| TransitionError::GateClosed(GateState::Closed))?;
         if entry.is_none() {
             self.visible_tid.store(0, Ordering::Relaxed);
         }
@@ -1426,7 +1432,7 @@ impl LifecycleHatches {
             | (if self.sigmask { SERVING_SIGMASK } else { 0 })
     }
 }
-const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 256);
+const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 384);
 const _: () = assert!(core::mem::size_of::<PoolEntry>() == 80);
 
 /// Linux keeps the last thread's exit with the terminal runtime owner.

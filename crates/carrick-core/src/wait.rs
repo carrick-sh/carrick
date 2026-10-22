@@ -71,6 +71,8 @@ where
         Ok(guard) => guard,
         Err(error) => return Err((error, request.operation)),
     };
+    let snapshot = request.observed().unwrap_or_else(|| guard.snapshot());
+    let owner_entry = request.owner_entry();
     let (record, fresh) = match save_context() {
         Ok(pair) => pair,
         Err(err) => {
@@ -99,9 +101,13 @@ where
         return Err((ObjectWaitError::Occupied, request.operation));
     }
     let deadline_ticks = request.deadline.unwrap_or_default();
-    if let Err(error) =
-        guard.park_until(request.snapshot, record, request.operation, deadline_ticks)
-    {
+    let parked = match owner_entry {
+        Some(entry) => {
+            guard.park_owner_until(snapshot, record, request.operation, deadline_ticks, entry)
+        }
+        None => guard.park_until(snapshot, record, request.operation, deadline_ticks),
+    };
+    if let Err(error) = parked {
         zone.cancel_timer_admission(zone.record_ref(record));
         drop(guard);
         if fresh {

@@ -469,7 +469,7 @@ pub trait Lifecycle {
     /// Clone and exit admissions a host must drain after `close_for_fork`.
     /// `SeqCst` scan (second half of both claim/gate pairs).
     fn claimed_count(&self) -> usize {
-        self.process_exit_custody().fork_publications()
+        self.process_exit_custody().external_work()
             + self.host_claimed_count()
             + (0..self.entry_count())
                 .filter(|&index| {
