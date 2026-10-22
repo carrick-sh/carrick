@@ -295,7 +295,7 @@ impl carrick_kernel::kernel::scheduler::DiscardRecorder for ReceiptLog {
 
 /// The destination owned by one executor wait. A zone mailbox follows its
 /// current lease, while a physical idle lane uses the worker's hardware route.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) enum GuestIdleTarget {
     Physical,
     Zone(carrick_el1_abi::SlotId),
