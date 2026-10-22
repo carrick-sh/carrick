@@ -2054,6 +2054,70 @@ mod tests {
         assert_eq!(batches, [vec![reference]]);
     }
 
+    /// A pinned service row cannot wait behind a driver doing consecutive
+    /// inline host calls. Its first evacuation must transfer readiness to
+    /// the host queue when there is no other eligible executor slot.
+    #[test]
+    fn unplaceable_service_is_captured_once_across_repeated_step_aways() {
+        for steps in [1, 8, 32] {
+            for affinity in [0b01, 0b11] {
+                let zone = heap_zone();
+                let (away, other) = (SlotId::new(0), SlotId::new(1));
+                zone.drive(away, 7);
+                zone.drive(other, 8);
+                zone.publish_slot(away, 0, Some(0), 0);
+                zone.publish_slot(other, 0, Some(1), 0);
+                let record = zone
+                    .alloc_host_runnable(ThreadIdentity {
+                        affinity,
+                        ..identity(1)
+                    })
+                    .unwrap();
+                let reference = zone.record_ref(record);
+                assert!(zone.requeue_on(away, record).is_some());
+                let mut captures = Vec::new();
+                let mut published = Vec::new();
+                for _ in 0..steps {
+                    let mut records = Vec::new();
+                    let mut placements = Vec::new();
+                    assert!(zone.step_away(
+                        away,
+                        7,
+                        &mut |record| records.push(record),
+                        &mut |placement| placements.push(placement),
+                    ));
+                    settle_vacated(
+                        &zone,
+                        Some(away),
+                        records,
+                        placements,
+                        &mut |record| {
+                            assert!(matches!(
+                                zone.live(record).unwrap().claim(),
+                                Claim::Host { .. }
+                            ));
+                            published.push(record);
+                        },
+                        &mut |records| captures.extend_from_slice(records),
+                    );
+                    // An inline completion returns to the same actor; it need
+                    // not pass through the executor's service-head take.
+                    zone.step_back(away, 7);
+                }
+                assert_eq!(captures, [reference], "steps={steps} affinity={affinity}");
+                assert_eq!(zone.slot(away).queued(), 0);
+                if affinity == 0b01 {
+                    assert_eq!(published, [reference]);
+                    assert_eq!(zone.take_service_head(other), None);
+                } else {
+                    assert!(published.is_empty());
+                    assert_eq!(zone.take_service_head(other), Some(reference));
+                }
+                zone.free_record(record);
+            }
+        }
+    }
+
     #[cfg(all(feature = "test-support", feature = "deferred-capture-test-control"))]
     mod serial_host_deferred_capture_control {
         use super::*;
@@ -2117,6 +2181,14 @@ mod tests {
                     // Held: not queued where the guest could run it.
                     assert_eq!(zone.slot(slot).queued(), 0);
                     step_away_from_slot(slot, 7);
+                    // The independent actor can finish its inline host call
+                    // and enter another before taking scheduler work. A held
+                    // service row must not wait behind that actor or be
+                    // captured again each time it lends the same CPU.
+                    for _ in 0..2 {
+                        come_back_to_slot(slot, 7);
+                        step_away_from_slot(slot, 7);
+                    }
                     outcome = hold.finish();
                 });
             });
