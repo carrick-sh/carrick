@@ -459,10 +459,11 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         .env("CODEX_HOME", home.join(".codex"))
         .env("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
         .env("AGY_BIN", state.join("bin/agy"))
-        .env("AGY_DIRECTOR_CODEX_SDK_BIN", state.join("bin/codex"))
-        // The template's read-only, hash-locked SDK (#773). The tier table
-        // names the backend, so the launcher's own route default must not
-        // report the dispatch as overriding an owner pause.
+        // The template's read-only, hash-locked SDK (#773) carries the whole
+        // codex package (codex, codex-code-mode-host, rg, bwrap); a lone
+        // codex binary override cannot run tools. The tier table names the
+        // backend, so the launcher's own route default must not report the
+        // dispatch as overriding an owner pause.
         .env("AGY_DIRECTOR_CODEX_VENV", CODEX_SDK_VENV)
         .env("AGY_DIRECTOR_ROUTES", "default")
         .current_dir(root);

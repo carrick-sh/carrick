@@ -4,12 +4,6 @@
   "platforms": {
     "linux-x86_64": [
       {
-        "name": "codex",
-        "url": "https://github.com/openai/codex/releases/download/rust-v0.163.0/codex-x86_64-unknown-linux-musl.tar.gz",
-        "sha256": "beb339e8ecd9ba057a6bb2dc81ad8ca474812edfbf0fc5056ca818797648dde4",
-        "member": "codex-x86_64-unknown-linux-musl"
-      },
-      {
         "name": "just",
         "url": "https://github.com/casey/just/releases/download/1.58.0/just-1.58.0-x86_64-unknown-linux-musl.tar.gz",
         "sha256": "4a5cc2f53e6f0f8c59092a6cc38291eb729d46a7dd95d3ae582008881b84931d",
@@ -23,12 +17,6 @@
       }
     ],
     "linux-aarch64": [
-      {
-        "name": "codex",
-        "url": "https://github.com/openai/codex/releases/download/rust-v0.163.0/codex-aarch64-unknown-linux-musl.tar.gz",
-        "sha256": "a7261e65f4a96d8f4ca65a069c6cf2dc2c33defc341e48078acefda9461fffe4",
-        "member": "codex-aarch64-unknown-linux-musl"
-      },
       {
         "name": "just",
         "url": "https://github.com/casey/just/releases/download/1.58.0/just-1.58.0-aarch64-unknown-linux-musl.tar.gz",
@@ -44,12 +32,6 @@
     ],
     "macos-x86_64": [
       {
-        "name": "codex",
-        "url": "https://github.com/openai/codex/releases/download/rust-v0.163.0/codex-x86_64-apple-darwin.tar.gz",
-        "sha256": "562a1aea0e5686283a467687d268ae33705f02fd4d40f1bc4110a415c5c1c7b1",
-        "member": "codex-x86_64-apple-darwin"
-      },
-      {
         "name": "just",
         "url": "https://github.com/casey/just/releases/download/1.58.0/just-1.58.0-x86_64-apple-darwin.tar.gz",
         "sha256": "9a09cfef66aaa79da58203970103a0684307716caaabd3e9844cacc4dc0f4023",
@@ -63,12 +45,6 @@
       }
     ],
     "macos-aarch64": [
-      {
-        "name": "codex",
-        "url": "https://github.com/openai/codex/releases/download/rust-v0.163.0/codex-aarch64-apple-darwin.tar.gz",
-        "sha256": "61c4d9a92521bdb42b0c1d9f87c673f6da628a06de5945cbdd9a0010632f6d10",
-        "member": "codex-aarch64-apple-darwin"
-      },
       {
         "name": "just",
         "url": "https://github.com/casey/just/releases/download/1.58.0/just-1.58.0-aarch64-apple-darwin.tar.gz",
