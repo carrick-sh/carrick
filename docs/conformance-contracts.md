@@ -1910,3 +1910,19 @@ The source lease is secured before physical retirement and physical retirement
 is the final fallible owner-file step. Signed first touch, private-store/fork
 integration, the exact observed ENOMEM attribution, Python startup, native
 ARM64 oracle and full artifact promotion remain required.
+
+The local signed trace records reservation flags **0x822**, including
+MAP_ANONYMOUS; file text and data use **0x812**. The fixture now covers both
+that anonymous reservation and the requested file-backed variant. The
+production-component binding `libpython_old_deferred_recipe_and_owner_copy_refusals`
+registers the RX file view, applies the derived alignment trims, and proves
+that a fixed data overlap is refused by `reserve_private_file` with
+`InvalidRange`. Both tested data offsets then exceed `PreparedStreamRanges`'s
+unchanged 4096-byte limit. In the old dispatcher the lowering error selects
+whole-map snapshot fallback; `write_bytes_unchecked` reaches that owner
+PREPARE refusal and the dispatcher converts it to ENOMEM (12). This is a
+production registry plus production admission reproduction, without a fake
+memory backend. The trace carries only four mmap arguments and no backend
+refusal message, so exact-offset/branch live confirmation remains for the Mac.
+The signed static case reads the actual immutable OCI libpython file; a new
+mutable /tmp file would not bind the original lowering path.
