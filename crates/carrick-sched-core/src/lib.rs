@@ -1431,6 +1431,8 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     space_cause_waits: [object_wait::ObjectQueue; object_wait::EXTRA_CAUSE_QUEUES],
     /// Exact delegated-inode completion domain, appended after MM causes.
     delegated_file_waits: [object_wait::ObjectQueue; object_wait::DELEGATED_FILE_WAIT_QUEUES],
+    /// Native external service operations retain their own exact-member queue.
+    native_service_waits: [object_wait::ObjectQueue; ZONE_RECORDS],
     /// Saved host enrollment attempts handed back by the actual queue release.
     object_admission_handbacks:
         [completion_queue::CompletionQueue; object_wait::OBJECT_WAIT_QUEUES],

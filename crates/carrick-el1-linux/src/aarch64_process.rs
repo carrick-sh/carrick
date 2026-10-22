@@ -1024,6 +1024,17 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     // paths; by value each move held another copy on the EL1 stack (#705).
     type PreparedMm = Box<Prepared<'a>>;
     type Born = Born;
+    fn service_mm_handle(
+        &self,
+        mm: &Mm,
+    ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+        self.portal()?
+            .admitted_handle(
+                ReservationMm::new(mm.mm.raw().get()).ok_or(NativeProcessError::Stale)?,
+                u32::from(self.slot.raw()),
+            )
+            .map_err(|_| NativeProcessError::Stale)
+    }
 
     /// The HVC root exit crossing becomes the host's whole-process terminal
     /// (`TrapError::NativeRootExit`), which ends every host and zone thread.

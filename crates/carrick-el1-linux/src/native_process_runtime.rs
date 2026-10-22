@@ -2,6 +2,7 @@
 //! Root admission adopts the existing execution incarnation as a local process
 //! incarnation; it does not import a host TaskSerial or launcher credentials.
 extern crate alloc;
+mod service;
 use super::{
     native_fork_refusal::{NativeForkStage, at_busy_site, busy},
     native_process_custody::{ProcessResources, ProcessWake, RetainedProcessCustody},
@@ -299,6 +300,22 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     type Mm: Clone;
     type PreparedMm;
     type Born;
+    /// Authenticate the admitted MM incarnation, never the address generation.
+    fn service_mm_handle(
+        &self,
+        mm: &Self::Mm,
+    ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError>;
+    fn intake_service(
+        &mut self,
+        request: carrick_core_abi::service::ServiceRequest,
+        control: &'a ThreadControlSlot,
+    ) -> Result<(), NativeProcessError>;
+    fn complete_service(
+        &mut self,
+        request: carrick_core_abi::service::ServiceRequest,
+        result: carrick_core_abi::service::ServiceResult,
+        words: &mut C,
+    ) -> Result<NativeResume, NativeProcessError>;
     fn prepare_mm(
         &mut self,
         parent: &Self::Mm,
@@ -887,6 +904,7 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     serials: SerialAllocator,
     pending: BTreeMap<TaskKey, PendingContinuation>,
     pending_exit: BTreeMap<TaskKey, PendingExit<'a>>,
+    services: BTreeMap<RecordRef, service::PendingService<'a>>,
     signal_waits: BTreeMap<RecordRef, PendingSignalWait>,
     suspend_masks: BTreeMap<RecordRef, carrick_signal_core::policy::SigBlockMask>,
     _root_roles: NativeClaim,
@@ -1646,6 +1664,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let signals = resources.signals().clone();
         let channel = resources.channel.clone();
         let wake_record = member.record;
+        let service_runtime = member.runtime.clone();
         let info = match event.source() {
             carrick_el1_abi::ExternalSignalSource::IntervalTimer => Some(
                 carrick_syscall_abi::LinuxSiginfo::kernel(event.signal().number()),
@@ -1702,6 +1721,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             )?;
         }
         if interrupt {
+            service_runtime.cancel_service(wake_record, publishing_slot, service)?;
             request_signal_reschedule(zone, service, wake_record);
         }
         if let Some(channel) = channel {
@@ -2667,6 +2687,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 serials,
                 pending: BTreeMap::new(),
                 pending_exit: BTreeMap::new(),
+                services: BTreeMap::new(),
                 signal_waits: BTreeMap::new(),
                 suspend_masks: BTreeMap::new(),
                 _root_roles: root_roles,
@@ -3308,6 +3329,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     // retain their pending signals until their owner resumes; an IPI does not
     // cancel their operation or release its queue/timer custody.
     fn interrupt_signal_record(&mut self, record: RecordRef) {
+        if let Err(error) = self
+            .runtime
+            .cancel_service(record, self.source.slot, self.service)
+        {
+            self.run_failure = Some(error.run_failure_reason());
+        }
         request_signal_reschedule(self.source.zone, self.service, record);
     }
 
@@ -4170,6 +4197,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn resume_checkpoint(
         &mut self,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+        if let Some(result) = self.resume_service() {
+            match result.map_err(NativeProcessError::run_failure_reason)? {
+                NativeResume::NoPending => {}
+                NativeResume::Left(status) => {
+                    if self.take_handoff_receipt().is_none() {
+                        return Ok(NativeResume::Invalid);
+                    }
+                    return Ok(NativeResume::Left(status));
+                }
+                resumed => return Ok(resumed),
+            }
+        }
         // CLONE_CHILD_SETTID is an effect in the child's MM. The selected
         // record now owns that MM, and no EL0 instruction has resumed yet.
         let pending = {
@@ -4663,6 +4702,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
         if first_close {
+            let service_records: Vec<_> = {
+                let graph = self.runtime.graph.lock();
+                graph
+                    .owner
+                    .task(self.key)
+                    .map_err(|_| NativeProcessError::Quarantined)?
+                    .native()
+                    .resources()
+                    .members
+                    .iter()
+                    .map(|member| member.record)
+                    .collect()
+            };
+            for record in service_records {
+                self.runtime
+                    .cancel_service(record, self.source.slot, self.service)?;
+            }
             // Closing requests host retirement; it does not retire live zone
             // records. A deferred control wake is owned by that record's vCPU
             // or producer until its handback reaches the host continuation.
@@ -5580,6 +5636,35 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.service.quarantine_born(born);
             return Err(NativeProcessError::Quarantined);
         }
+        let child_mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(child_key)
+            .map_err(|_| NativeProcessError::Quarantined)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        let handle = self.service.service_mm_handle(&child_mm)?;
+        let service_wait = carrick_sched_core::object_wait::ObjectWaitKey::native_service(
+            self.source.zone.record_ref(record),
+        )
+        .ok_or(NativeProcessError::Stale)?;
+        self.source
+            .zone
+            .bind_object_wait(service_wait, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| NativeProcessError::Quarantined)?;
+        control
+            .service
+            .bind(carrick_core_abi::service::ServiceBirth {
+                process: child_key,
+                thread: carrick_core_abi::EntryThreadGeneration::from_raw(thread_serial.get()),
+                record: self.source.zone.record_ref(record),
+                mm: handle,
+            })
+            .map_err(|_| NativeProcessError::Quarantined)?;
         if let Some(registry) = *self.runtime.registry.lock() {
             registry
                 .register_child(
@@ -13658,6 +13743,24 @@ mod tests {
         type Mm = AddressContext<RootGpa>;
         type PreparedMm = AddressContext<RootGpa>;
         type Born = AddressContext<RootGpa>;
+        fn service_mm_handle(
+            &self,
+            mm: &Self::Mm,
+        ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+            self.zone
+                .spaces
+                .find(mm.mm.raw().get())
+                .ok_or(NativeProcessError::Stale)?;
+            // SAFETY: this test venue owns these never-reused synthetic MM roots.
+            Ok(unsafe {
+                carrick_core_abi::El1MmHandle::from_admitted_owner(
+                    NonZeroU64::MIN,
+                    carrick_core_abi::ReservationMm::new(mm.mm.raw().get())
+                        .ok_or(NativeProcessError::Stale)?,
+                    NonZeroU64::MIN,
+                )
+            })
+        }
 
         fn prepare_mm(
             &mut self,

@@ -30,6 +30,25 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     type Mm = AddressContext<RootGpa>;
     type PreparedMm = AddressContext<RootGpa>;
     type Born = AddressContext<RootGpa>;
+    fn service_mm_handle(
+        &self,
+        mm: &Self::Mm,
+    ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+        self.zone
+            .spaces
+            .find(mm.mm.raw().get())
+            .ok_or(NativeProcessError::Stale)?;
+        // SAFETY: this test venue owns these never-reused synthetic MM roots.
+        Ok(unsafe {
+            carrick_core_abi::El1MmHandle::from_admitted_owner(
+                NonZeroU64::MIN,
+                carrick_core_abi::ReservationMm::new(mm.mm.raw().get())
+                    .ok_or(NativeProcessError::Stale)?,
+                NonZeroU64::MIN,
+            )
+        })
+    }
+
     fn prepare_mm(
         &mut self,
         parent: &Self::Mm,

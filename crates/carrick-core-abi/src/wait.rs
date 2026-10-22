@@ -132,7 +132,8 @@ pub enum EditWaitOutcome<T> {
 #[derive(Debug)]
 pub struct ObjectParkRequest {
     pub key: ObjectWaitKey,
-    pub snapshot: ObjectWaitSnapshot,
+    snapshot: Option<ObjectWaitSnapshot>,
+    owner_entry: Option<carrick_sched_core::object_wait::OwnerEntry>,
     pub operation: OperationToken,
     pub deadline: Option<u64>,
 }
@@ -146,10 +147,32 @@ impl ObjectParkRequest {
     ) -> Self {
         Self {
             key,
-            snapshot,
+            snapshot: Some(snapshot),
+            owner_entry: None,
             operation,
             deadline,
         }
+    }
+    /// The owner checks readiness from save_context while the object guard is
+    /// held. The request and its native entry remain one scheduler operation.
+    pub const fn owner(
+        key: ObjectWaitKey,
+        operation: OperationToken,
+        entry: carrick_sched_core::object_wait::OwnerEntry,
+    ) -> Self {
+        Self {
+            key,
+            snapshot: None,
+            owner_entry: Some(entry),
+            operation,
+            deadline: None,
+        }
+    }
+    pub const fn observed(&self) -> Option<ObjectWaitSnapshot> {
+        self.snapshot
+    }
+    pub const fn owner_entry(&self) -> Option<carrick_sched_core::object_wait::OwnerEntry> {
+        self.owner_entry
     }
 }
 
