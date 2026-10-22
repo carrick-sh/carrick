@@ -36,6 +36,10 @@ RAW_SYSCALL_BOUNDARIES = frozenset(
         PurePosixPath("crates/carrick-host-linux/src/epoll_mux.rs"),
         PurePosixPath("crates/carrick-host/src/shared_word.rs"),
         PurePosixPath("crates/carrick-vmm-nvmm/src/nvmm.rs"),
+        # Guest-only static ELF exercises getdents64 directly; no host service.
+        PurePosixPath(
+            "crates/carrick-conformance-next/tests/fixtures/directory-copyout/src/main.rs"
+        ),
         PurePosixPath("crates/carrick-vmm-bhyve/fixtures/bhyve-asyncsig/src/main.rs"),
         PurePosixPath("crates/carrick-vmm-bhyve/fixtures/bhyve-fork-raw/src/main.rs"),
         PurePosixPath("crates/carrick-vmm-bhyve/fixtures/bhyve-vfork-exec/src/main.rs"),

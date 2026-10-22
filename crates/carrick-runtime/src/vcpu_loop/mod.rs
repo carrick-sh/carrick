@@ -1772,16 +1772,16 @@ where
         result
     }
 
-    fn resume_write_copy_in(
+    fn resume_owned_io(
         &mut self,
         kernel: &Kernel,
         engine: &mut E,
-        pending: Box<carrick_kernel::dispatch::OwnedWriteCopyIn>,
+        pending: binding::OwnedIoResume,
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
         let request = self
             .syscall_completion
-            .guest("write copy-in lost syscall completion")?
+            .guest("owned I/O lost syscall completion")?
             .syscall()
             .request;
         let nr = request.number.raw();
@@ -1808,11 +1808,12 @@ where
         let context = self
             .service_kernel_context
             .as_ref()
-            .ok_or_else(|| RuntimeError::Configuration("write copy-in lost context".to_owned()))?
+            .ok_or_else(|| RuntimeError::Configuration("owned I/O lost context".to_owned()))?
             .retain_exact();
-        let mut executor = self.guest_execution.take().ok_or_else(|| {
-            RuntimeError::Configuration("write copy-in lost MM executor".to_owned())
-        })?;
+        let mut executor = self
+            .guest_execution
+            .take()
+            .ok_or_else(|| RuntimeError::Configuration("owned I/O lost MM executor".to_owned()))?;
         let lease_guard = self.execution_lease.lock();
         let lease = lease_guard.as_ref();
         let work_scope = kernel.dispatcher.work_scope();
@@ -1822,19 +1823,35 @@ where
         } else {
             thread
         };
-        let result = kernel.dispatcher.resume_owned_write_copy_in(
-            &context,
-            request,
-            pending,
-            engine,
-            &kernel.reporter,
-            Some(thread),
-            OrdinaryDispatchRoute {
-                host_wait,
-                lease,
-                mm_executor: Some(&mut executor),
-            },
-        );
+        let route = OrdinaryDispatchRoute {
+            host_wait,
+            lease,
+            mm_executor: Some(&mut executor),
+        };
+        let result = match pending {
+            binding::OwnedIoResume::PreparedWrite(pending) => {
+                kernel.dispatcher.resume_owned_write_copy_in(
+                    &context,
+                    request,
+                    pending,
+                    engine,
+                    &kernel.reporter,
+                    Some(thread),
+                    route,
+                )
+            }
+            binding::OwnedIoResume::DirectoryRead(pending) => {
+                kernel.dispatcher.resume_owned_directory_read(
+                    &context,
+                    request,
+                    pending,
+                    engine,
+                    &kernel.reporter,
+                    Some(thread),
+                    route,
+                )
+            }
+        };
         self.guest_execution = Some(executor);
         if let Some(start) = census_start {
             crate::el1_census::record_redispatch(nr, start);
@@ -1853,8 +1870,8 @@ where
             binding::OwnedSyscallResume::CopyoutRedispatch => {
                 self.redispatch_threaded_syscall(kernel, engine, host_wait)
             }
-            binding::OwnedSyscallResume::PreparedWrite(pending) => {
-                self.resume_write_copy_in(kernel, engine, pending, host_wait)
+            binding::OwnedSyscallResume::Io(pending) => {
+                self.resume_owned_io(kernel, engine, pending, host_wait)
             }
             binding::OwnedSyscallResume::Sleep(pending) => Ok(pending.resume(engine)),
             binding::OwnedSyscallResume::RecvfromAddress(pending) => {

@@ -228,9 +228,14 @@ pub(super) enum OwnerSupplyWait {
 pub(super) enum OwnedSyscallResume {
     CopyoutRedispatch,
     Ipc(carrick_kernel::kernel::continuation::ipc::RetainedIpcOperation),
-    PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
+    Io(OwnedIoResume),
     Sleep(Box<carrick_kernel::dispatch::OwnedSleepCopyIn>),
     RecvfromAddress(Box<carrick_kernel::dispatch::OwnedRecvfromAddress>),
+}
+
+pub(super) enum OwnedIoResume {
+    PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
+    DirectoryRead(Box<carrick_kernel::dispatch::OwnedDirectoryRead>),
 }
 
 pub(super) fn owner_copyin_route(
@@ -239,7 +244,11 @@ pub(super) fn owner_copyin_route(
     let (wait, resume) = match outcome {
         DispatchOutcome::WriteCopyInSuspended(pending) => (
             pending.wait().clone(),
-            OwnedSyscallResume::PreparedWrite(pending),
+            OwnedSyscallResume::Io(OwnedIoResume::PreparedWrite(pending)),
+        ),
+        DispatchOutcome::DirectoryReadSuspended(pending) => (
+            pending.wait().clone(),
+            OwnedSyscallResume::Io(OwnedIoResume::DirectoryRead(pending)),
         ),
         DispatchOutcome::SleepCopyInSuspended(pending) => {
             (pending.wait().clone(), OwnedSyscallResume::Sleep(pending))
@@ -7061,7 +7070,7 @@ mod tests {
             wait_outcome,
             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
         );
-        let Some(OwnedSyscallResume::PreparedWrite(pending)) = resume else {
+        let Some(OwnedSyscallResume::Io(OwnedIoResume::PreparedWrite(pending))) = resume else {
             panic!("owner route lost the exact transfer");
         };
         assert_eq!(pending.wait(), &MemoryReadWait::Owner(wait));
