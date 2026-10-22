@@ -1802,3 +1802,13 @@ The old requester resumes its untagged Control write before its failed CAS,
 overwriting the replacement's Service handback despite returning Stale.
 This is RED on the under-custody repair at focused bound 3; publishing tagged
 intent and applying payload only under exact owner custody preserves Service.
+
+### Private fixed file segment replacement
+
+`kernel.mm.private-file-fixed-replacement` covers the libpython loader shape
+reported in #759: a real file mapped PROT_NONE over `0x65ee48` bytes, fixed
+RX text over `0x64ee48`, then fixed RW data at `+0x47a000` over `0x1d4000`.
+Linux `mmap(2)` requires replacement and private stores, including guest-page
+aligned addresses and offsets that are not host-page aligned. Internal copy
+bounds and host-page congruence cannot introduce ENOMEM. The descriptor records
+open reproduction and signed/oracle bindings explicitly until demonstrated.
