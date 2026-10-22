@@ -25,11 +25,11 @@ class ClosureProbeScenarioTest(unittest.TestCase):
             (ROOT / "conformance-probes/probe-inventory.json").read_text(encoding="utf-8")
         )
 
-    def test_plan_selects_exactly_twenty_three_dedicated_sources_and_seventeen_runners(self):
+    def test_plan_selects_exactly_twenty_four_dedicated_sources_and_eighteen_runners(self):
         plan = scenarios.build_plan(self.inventory)
 
-        self.assertEqual(len(plan.sources), 23)
-        self.assertEqual(len(plan.commands), 17)
+        self.assertEqual(len(plan.sources), 24)
+        self.assertEqual(len(plan.commands), 18)
         self.assertEqual(
             {
                 (command.package, command.test_target, command.transport)
@@ -42,6 +42,11 @@ class ClosureProbeScenarioTest(unittest.TestCase):
                     "ptrace_poketext_signed",
                     "test-signed",
                 ),
+                (
+                    "carrick-conformance-next",
+                    "sched_affinity_threads",
+                    "test-signed",
+                ),
             },
         )
         self.assertEqual(
@@ -52,7 +57,7 @@ class ClosureProbeScenarioTest(unittest.TestCase):
         plan = scenarios.build_plan(self.inventory)
         rows = scenarios.expected_rows(plan)
 
-        self.assertEqual(len(rows), 46)
+        self.assertEqual(len(rows), 48)
         self.assertEqual({row.libc for row in rows}, {"musl", "gnu"})
         for source in plan.sources:
             self.assertEqual(
@@ -177,9 +182,9 @@ class ClosureProbeScenarioTest(unittest.TestCase):
         with redirect_stdout(StringIO()):
             rows = scenarios.run_plan(ROOT, plan, command_runner=fake_runner)
 
-        self.assertEqual(len(calls), 34)
+        self.assertEqual(len(calls), 36)
         self.assertEqual({libc for libc, _runner in calls}, {"gnu", "musl"})
-        self.assertEqual(len(rows), 46)
+        self.assertEqual(len(rows), 48)
         self.assertEqual(
             sum(row.status == "FAIL" for row in rows),
             len(plan.commands[0].sources),

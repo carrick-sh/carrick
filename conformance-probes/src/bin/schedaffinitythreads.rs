@@ -112,6 +112,7 @@ fn main() {
 
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
 
     let main_mask_for_worker = main_mask;
     let worker = thread::spawn(move || {
@@ -124,11 +125,21 @@ fn main() {
         let (t_get_res, t_get_err, t_mask) = getaffinity(0);
         let reflected = is_single_cpu_set(&t_mask, worker_cpu);
 
-        let _ = ready_tx.send((inherited, t_set_res, t_set_err, t_get_res, t_get_err, reflected));
-        assert!(
-            release_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
-            "main thread did not release worker"
-        );
+        if ready_tx
+            .send((inherited, t_set_res, t_set_err, t_get_res, t_get_err, reflected))
+            .is_err()
+        {
+            eprintln!("failed to send worker readiness");
+            std::process::exit(1);
+        }
+        if release_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            eprintln!("main thread did not release worker");
+            std::process::exit(1);
+        }
+        if done_tx.send(()).is_err() {
+            eprintln!("failed to send worker done signal");
+            std::process::exit(1);
+        }
     });
 
     let (
@@ -138,9 +149,13 @@ fn main() {
         thread_get_res,
         thread_get_err,
         thread_mask_reflected,
-    ) = ready_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("worker did not publish affinity");
+    ) = match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(vals) => vals,
+        Err(_) => {
+            eprintln!("timed out waiting for worker affinity publication");
+            std::process::exit(1);
+        }
+    };
 
     // Both threads are alive when the caller checks its independent mask.
     let (main_post_res, main_post_err, main_post_mask) = getaffinity(0);
@@ -148,8 +163,18 @@ fn main() {
         && main_post_err == 0
         && main_post_mask == main_mask;
 
-    let _ = release_tx.send(());
-    assert!(worker.join().is_ok(), "worker thread panicked");
+    if release_tx.send(()).is_err() {
+        eprintln!("failed to signal worker release");
+        std::process::exit(1);
+    }
+    if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+        eprintln!("timed out waiting for worker thread completion");
+        std::process::exit(1);
+    }
+    if worker.join().is_err() {
+        eprintln!("worker thread panicked");
+        std::process::exit(1);
+    }
 
     report!(
         main_setaffinity_res = main_set_res,

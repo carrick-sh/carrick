@@ -2190,7 +2190,7 @@
   "schedaffinitythreads": {
     "class": "conformance",
     "excluded": false,
-    "runner": "generic"
+    "runner": "case_sched_affinity_threads_mask_reflection"
   },
   "schedgetattr": {
     "class": "conformance",

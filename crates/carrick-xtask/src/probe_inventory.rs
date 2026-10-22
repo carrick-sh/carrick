@@ -102,6 +102,10 @@ pub const DEDICATED_PROBE_RUNNERS: &[(&str, &str)] = &[
         "conformance_native_multi_network_roles",
     ),
     (
+        "schedaffinitythreads",
+        "case_sched_affinity_threads_mask_reflection",
+    ),
+    (
         "sidecar_loopback_client",
         "docker_compose_shared_network_namespace_smoke",
     ),
