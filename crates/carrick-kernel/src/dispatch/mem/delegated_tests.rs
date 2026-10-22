@@ -5436,3 +5436,108 @@ fn delegated_first_touch_observation_under_held_root_returns_no_plan_without_abo
     );
     assert_eq!(contended_touched, vec![1u8]);
 }
+
+/// The production AddressSpace is deliberately sparse, as in HVPatch. No VMM
+/// double or simulated ENOMEM participates: inspect actual initialized bytes
+/// and the production reservation root's retained file source.
+#[test]
+fn libpython_fixed_file_segments_use_owner_source_without_eager_copy() {
+    use carrick_abi::LINUX_PROT_EXEC;
+    use carrick_mem::elf::SegmentPerms;
+    use carrick_mem::memory::{AddressSpace, AddressSpaceMetadata, MemoryRegionMetadata};
+    const RESERVE: u64 = 0x65ee48;
+    const TEXT: u64 = 0x64ee48;
+    const DATA: u64 = 0x47a000;
+    const LENGTH: u64 = 0x1d4000;
+    const END: u64 = 0x65f000;
+    for offset in [DATA, DATA - PAGE] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let contents: Vec<_> = (0..END)
+            .map(|i| ((i / PAGE * 17 + i % PAGE) % 251) as u8)
+            .collect();
+        install_host_file_fd(&dispatcher, FILE_FD, &contents);
+        let root = Root::admit(&dispatcher);
+        let mut memory = AddressSpace::from_metadata(AddressSpaceMetadata {
+            entry: GuestVa::new(LINUX_MMAP_BASE),
+            initial_stack_pointer: GuestVa::new(LINUX_MMAP_BASE),
+            linux_auxv_image: Vec::new(),
+            regions: vec![MemoryRegionMetadata {
+                start: GuestVa::new(LINUX_MMAP_BASE),
+                end: GuestVa::new(LINUX_MMAP_BASE + END),
+                perms: SegmentPerms {
+                    read: true,
+                    write: true,
+                    execute: false,
+                },
+                shared: false,
+            }],
+            ro_spans: Vec::new(),
+        })
+        .unwrap();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let mut syscall = |number, args| {
+            returned(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(number, SyscallArgs(args)),
+                        &mut memory,
+                        &CompatReporter::default(),
+                    )
+                    .unwrap(),
+            )
+        };
+        let flags = LINUX_MAP_PRIVATE | carrick_abi::LINUX_MAP_DENYWRITE;
+        let base = syscall(SYS_MMAP, [0, RESERVE, 0, flags, FILE_FD as u64, 0]) as u64;
+        assert_eq!(
+            syscall(
+                SYS_MMAP,
+                [
+                    base,
+                    TEXT,
+                    LINUX_PROT_READ | LINUX_PROT_EXEC,
+                    flags | LINUX_MAP_FIXED,
+                    FILE_FD as u64,
+                    0
+                ]
+            ),
+            base as i64
+        );
+        for delta in [0x65e000, 0x65d000] {
+            assert_eq!(syscall(SYS_MUNMAP, [base + delta, PAGE, 0, 0, 0, 0]), 0);
+        }
+        assert_eq!(syscall(SYS_MPROTECT, [base + DATA, LENGTH, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            syscall(
+                SYS_MMAP,
+                [
+                    base + DATA,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    flags | LINUX_MAP_FIXED,
+                    FILE_FD as u64,
+                    offset
+                ]
+            ),
+            (base + DATA) as i64
+        );
+        let mapping = root.lock().mapping(base + DATA).unwrap();
+        assert_eq!(mapping.protection, ReservationProtection::READ_WRITE);
+        let source = mapping.host_backing.unwrap();
+        assert_eq!(source.offset(), offset);
+        for delta in [0, LENGTH / 2, LENGTH - PAGE] {
+            let page = dispatcher
+                .mem_view()
+                .read_host_backing(source.advance(delta).unwrap(), PAGE as usize)
+                .unwrap();
+            assert_eq!(
+                page,
+                contents[(offset + delta) as usize..(offset + delta + PAGE) as usize]
+            );
+        }
+        assert!(
+            memory.regions()[0].shared_initialized_bytes().1.is_empty(),
+            "owner-backed file mapping eagerly copied into the compatibility image; large owner PREPARE is bounded to 4096 bytes"
+        );
+    }
+}
