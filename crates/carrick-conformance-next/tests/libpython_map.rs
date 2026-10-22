@@ -22,10 +22,14 @@ fn case_libpython_private_fixed_file_segments() {
         oracle["status"]
     );
     let (result, _) = common::run_or_fail(
-        TestContainer::new(common::SMOKE_IMAGE)
+        TestContainer::new("python:3.12-slim")
             .pull_policy(PullPolicy::Missing)
             .mount_readonly(probe.display().to_string(), "/tmp/libpython-map")
-            .run_with_audit(["/bin/sh", "-c", "exec /tmp/libpython-map"]),
+            .run_with_audit([
+                "/bin/sh",
+                "-c",
+                "exec /tmp/libpython-map /usr/local/lib/libpython3.12.so.1.0",
+            ]),
     );
     eprintln!("LIBPYTHON_MAP observed:\n{}", result.stdout_utf8());
     result.assert_success();
