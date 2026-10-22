@@ -599,19 +599,27 @@ pub(crate) trait PersistentExecutor: 'static {
 }
 
 /// How an executor's wait in the guest ended ([`PersistentExecutor::wait_in_guest`]).
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
+#[derive(Debug)]
 pub(crate) enum GuestIdleExit {
     /// The vCPU left for the host: host work (a control request, a kick), or
     /// a queued thread that needs this executor.
     Idle,
+    /// A parked native continuation; physical backing custody survives the lane.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    Service(carrick_vmm_hvf::metadata_grant::NativeService),
     /// No guest scheduler on this backend or carrier.
     Unsupported,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn finish_native_service(
+    service: carrick_vmm_hvf::metadata_grant::NativeService,
+) -> Result<(), TrapError> {
+    let effects = service.refuse()?;
+    for target in effects.sgi_slots() {
+        carrick_kernel::el1_zone::resched_slot(target);
+    }
+    Ok(())
 }
 
 pub struct ExactHardwareKick {
@@ -953,7 +961,18 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             .current
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("HVPatch executor lost loaded engine".into()))?;
-        Ok(quantum.poll_quantum_with_engine(engine, &mut control))
+        let exit = quantum.poll_quantum_with_engine(engine, &mut control);
+        if let Some(slot) = engine
+            .mailbox_slot()
+            .and_then(carrick_el1_abi::SlotId::from_index)
+        {
+            if let Some(service) =
+                carrick_vmm_hvf::hvf_aarch64_engine::take_worker_native_service(engine.vm(), slot)?
+            {
+                finish_native_service(service)?;
+            }
+        }
+        Ok(exit)
     }
 
     fn take_cpu_receipt(&mut self) -> ExecutorCpuReceipt {
@@ -1410,6 +1429,12 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 syndrome,
                 far,
             );
+        }
+        if let Some(service) =
+            carrick_vmm_hvf::hvf_aarch64_engine::take_worker_native_service(lifecycle, slot)?
+        {
+            exit?;
+            return Ok(GuestIdleExit::Service(service));
         }
         match exit? {
             carrick_aarch64::Aarch64Exit::Halt => Ok(GuestIdleExit::Idle),

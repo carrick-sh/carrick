@@ -13,7 +13,7 @@ pub(super) struct PendingService<'a> {
 }
 
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
-    pub(super) fn cancel_service<S: NativeProcessService<'a, C>>(
+    pub(crate) fn cancel_service<S: NativeProcessService<'a, C>>(
         &self,
         record: RecordRef,
         slot: SlotId,
@@ -161,12 +161,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .zone
                 .object_wait(key, &carrick_sched_core::ShortLockSpin)
                 .map_err(|_| NativeProcessError::Quarantined)?;
-            let acknowledged = self
-                .control
-                .service
-                .cancel(request.identity)
+            // SAFETY: notice publication failed, so no transport can hold
+            // this identity. The queue also excludes concurrent cancellation.
+            unsafe { self.control.service.abort_unpublished(request.identity) }
                 .map_err(service_error)?;
-            if acknowledged {
+            {
                 self.control
                     .service
                     .consume(request.identity)
@@ -186,6 +185,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.park_service(request)
     }
 
+    #[inline(never)]
     fn park_service(
         &mut self,
         request: ServiceRequest,

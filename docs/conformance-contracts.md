@@ -265,6 +265,19 @@ establish absence of the hang under a successful fork. Signed acceptance
 of both properties remains open.
 
 `kernel.scheduler.runnable-progress` also covers pool admission and guest CPU affinity.
+Native service custody extends this contract: two real fork children can publish
+simultaneous requests through the fixture's sole execution slot. Each park must
+release that slot. The witness rejects a stale execution generation, cancels one
+request before physical acknowledgment, completes the other first, and requires
+one ring consumption per request before its terminal claim is released. Host
+records retain backing and observe exact identities; they do not adopt children
+into another process graph. The binding is
+`two_native_children_service_waits_release_the_only_execution_slot` in
+`carrick-el1-linux`. This is transport and continuation evidence; fault supply,
+the default host executor population, and signed child syscall acceptance require
+separate witnesses. Unsupported native requests return to the ring for its errno
+or signal decision; no generic host syscall dispatcher is introduced.
+
 Linux authority: `sched_setaffinity(2)` restricts a runnable thread to the
 allowed CPUs; `sched_getaffinity(2)` and `nproc` must describe CPUs that can
 execute it. Every scheduler CPU requires at least one bound executor; spares
