@@ -1824,6 +1824,10 @@ It also asks the old root/placeholder for write permission before replacement
 has committed. The trace's backend refusal and omitted offset still need Mac
 attribution; this finding alone cannot certify the recorded ARM failure.
 
+The binding also forces a real nonroot `RLIMIT_MEMLOCK` refusal on a fixed
+LOCKED replacement. It requires errno 12 while retaining the predecessor's
+file source and permissions; the pre-fix implementation removes that mapping.
+
 Admitted regular private host files now retain one source in the existing
 owner root and retire old physical backing before committing new metadata.
 First touch uses the existing private frame-grant service; no VA is reused as
