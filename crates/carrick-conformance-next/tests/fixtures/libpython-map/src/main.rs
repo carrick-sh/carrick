@@ -149,6 +149,13 @@ fn run(offset: usize, anonymous_reservation: bool, source: Option<&str>) -> io::
     let mut observed = vec![0; contents.len()];
     file.read_exact_at(&mut observed, 0)?;
     assert_eq!(observed, contents, "private stores reached the file");
+    for i in (0..DATA_LEN).step_by(PAGE) {
+        assert_eq!(
+            bytes[i],
+            contents[offset + i] ^ 0xff,
+            "private store was lost"
+        );
+    }
     assert_eq!(
         unsafe { *base.byte_add(DATA_DELTA - 1).cast::<u8>() },
         contents[DATA_DELTA - 1]
