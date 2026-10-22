@@ -1815,6 +1815,46 @@ mod tests {
     }
 
     #[test]
+    fn resumed_pipe_read_copy_refusal_preserves_the_byte_and_operation() {
+        let mut w = world();
+        let a = w.table(w.a_tid);
+        let (read, write, object) = w.pipe(a, BLOCK);
+        let (other_read, _, _) = w.pipe(a, BLOCK);
+        w.fork_table(a, 202);
+        let address = 0x300000; // Destination cannot be authorized on resumption.
+        w.mem.write(OTHER_MM, 0x10000, &[7]);
+        let b_write = syscall(SYS_WRITE, write, 0x10000, 1, B_SVC);
+        w.queue(202, OTHER_MM, &b_write, B_SVC);
+        let mut frame = syscall(SYS_READ, read, address, 1, A_SVC);
+        assert_eq!(w.call(&mut frame), SWITCHED, "A parks on the empty pipe");
+        frame = b_write;
+        assert_eq!((w.call(&mut frame), frame.x[0]), (RETURNED, 1));
+        let mut resume = syscall(SYS_READ, other_read, 0x10000, 1, B_SVC);
+        assert_eq!(w.call(&mut resume), SWITCHED, "B parks; A resumes");
+        reenter(&mut resume, A_SVC);
+        assert_eq!(
+            w.call(&mut resume),
+            IpcServed::Handback,
+            "a copy refusal is not EOF; retain the exact resumed operation"
+        );
+        let operation = handed_back(&w, &resume);
+        assert_eq!(operation.handback, IpcHandback::Continue);
+        assert_eq!(operation.progress.written, 0);
+        assert_eq!(operation.orig_x0, read as u64);
+        assert_eq!(operation.nr, SYS_READ as u32);
+        assert_eq!(
+            w.region
+                .lock(object, &HostWait)
+                .unwrap()
+                .pipe()
+                .unwrap()
+                .unread_bytes(),
+            1,
+            "undelivered byte remains available to the retained read"
+        );
+    }
+
+    #[test]
     fn el1_ipc_io_copy_faults_forward_before_effects_and_keep_prefixes() {
         let mut w = world();
         let t = w.table(w.a_tid);
