@@ -3499,6 +3499,18 @@ pub(crate) mod tests {
             address: u64,
             length: usize,
         ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            if let Some(probe) = self.copyout_owner_probe
+                && let Some(wait) = probe.wait_if_busy()
+            {
+                return Err(carrick_guest_mem::MemoryError::ReadSuspended(Box::new(
+                    carrick_guest_mem::MemoryReadSuspension {
+                        wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
+                        continuation: carrick_guest_mem::OwnedReadContinuation::new((
+                            address, length,
+                        )),
+                    },
+                )));
+            }
             if self.fail_read_at == Some(address) {
                 return Err(carrick_guest_mem::MemoryError::OutOfBounds { address, length });
             }
@@ -3511,6 +3523,14 @@ pub(crate) mod tests {
                 .filter(|bytes| bytes.len() == length)
                 .cloned()
                 .unwrap_or_else(|| vec![0; length]))
+        }
+
+        fn resume_read(
+            &self,
+            continuation: carrick_guest_mem::OwnedReadContinuation,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            let (address, length) = continuation.take::<(u64, usize)>().unwrap();
+            self.read_bytes_raw(address, length)
         }
 
         fn write_bytes_raw(
@@ -4121,6 +4141,25 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn serial_host_sleep_copyin_wait_preserves_handled_signal_until_completion() {
+        for nr in [
+            carrick_abi::syscall::nr::NANOSLEEP,
+            carrick_abi::syscall::nr::CLOCK_NANOSLEEP,
+        ] {
+            exercise_owner_wait(nr, Some(carrick_abi::LINUX_SIGUSR1), false);
+        }
+    }
+
+    #[test]
+    fn serial_host_sleep_copyin_wait_remains_killable() {
+        exercise_owner_wait(
+            carrick_abi::syscall::nr::NANOSLEEP,
+            Some(carrick_abi::LINUX_SIGKILL),
+            false,
+        );
+    }
+
     fn exercise_owner_wait(nr: carrick_abi::CanonicalNr, signum: Option<i32>, native: bool) {
         exercise_owner_wait_schedule(nr, signum, native, false);
     }
@@ -4140,6 +4179,7 @@ pub(crate) mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
+        let sleep = nr == nr::NANOSLEEP || nr == nr::CLOCK_NANOSLEEP;
         let (process, _) = crate::hvpatch::process_context_for_tests(71_102);
         let dispatcher = SyscallDispatcher::new();
         dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
@@ -4325,7 +4365,11 @@ pub(crate) mod tests {
         let frame = carrick_hal::RawSyscall {
             current_guest_sp: None,
             number: nr,
-            args: if nr == nr::PIPE2 {
+            args: if nr == nr::NANOSLEEP {
+                [0x71_1000, 0x71_1020, 0, 0, 0, 0]
+            } else if nr == nr::CLOCK_NANOSLEEP {
+                [1, 0, 0x71_1000, 0x71_1020, 0, 0]
+            } else if nr == nr::PIPE2 {
                 [0x71_1020, 0, 0, 0, 0, 0]
             } else if nr == nr::FSTAT {
                 [0, 0x71_1020, 0, 0, 0, 0]
@@ -4408,6 +4452,8 @@ pub(crate) mod tests {
                     let first = state
                         .service_threaded_syscall(&kernel, &mut engine, frame, None)
                         .unwrap();
+                    let (first, resume) = binding::owner_copyin_route(first);
+                    let resume = resume.unwrap_or(binding::OwnedSyscallResume::CopyoutRedispatch);
                     assert_eq!(
                         first,
                         DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
@@ -4489,13 +4535,7 @@ pub(crate) mod tests {
                         cow_invalidation_observer: None,
                     };
                     let parked = job
-                        .owner_memory_park(
-                            &mut engine,
-                            &mut control,
-                            frame,
-                            wait,
-                            binding::OwnedSyscallResume::CopyoutRedispatch,
-                        )
+                        .owner_memory_park(&mut engine, &mut control, frame, wait, resume)
                         .unwrap();
                     let executor::ExecutorExit::BlockedContinuation {
                         continuation,
@@ -4616,10 +4656,6 @@ pub(crate) mod tests {
                         peer.join().unwrap();
                     }
                     carrick_kernel::el1_zone::hand_back_completions();
-                    let deadline = std::time::Instant::now() + Duration::from_millis(200);
-                    while scheduler.queued_len() == 0 && std::time::Instant::now() < deadline {
-                        std::thread::yield_now();
-                    }
                     assert_ne!(
                         scheduler.queued_len(),
                         0,
@@ -4655,13 +4691,13 @@ pub(crate) mod tests {
                         &mut resumed_submission,
                     );
                     resumed_control.binding = Some(&binding);
+                    let HvpatchProductionPhase::ResumeOwnerZone { resume, .. } =
+                        std::mem::replace(&mut job.phase, HvpatchProductionPhase::Resident)
+                    else {
+                        panic!("owner park lost its retained syscall");
+                    };
                     let mut completed = job
-                        .resume_owner_zone(
-                            &mut engine,
-                            &mut resumed_control,
-                            frame,
-                            binding::OwnedSyscallResume::CopyoutRedispatch,
-                        )
+                        .resume_owner_zone(&mut engine, &mut resumed_control, frame, resume)
                         .unwrap();
                     if release_wins {
                         let executor::ExecutorExit::BlockedContinuation {
@@ -4772,7 +4808,10 @@ pub(crate) mod tests {
                     resumed.restore_lease(lease).unwrap();
                     scheduler.settle_runnable_successor(resumed).unwrap();
                     if !killing {
-                        assert_eq!(engine.prepared_commits, usize::from(nr != nr::WAIT4));
+                        assert_eq!(
+                            engine.prepared_commits,
+                            usize::from(nr != nr::WAIT4 && !sleep)
+                        );
                         if nr == nr::PIPE2 {
                             assert_eq!(engine.guest_memory[&0x71_1020].len(), 8);
                             assert_eq!(root.resources().files().slot_count(), 2);

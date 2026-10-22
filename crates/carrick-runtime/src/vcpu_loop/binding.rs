@@ -231,7 +231,9 @@ pub(super) enum OwnedSyscallResume {
     Sleep(Box<carrick_kernel::dispatch::OwnedSleepCopyIn>),
 }
 
-fn owner_copyin_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
+pub(super) fn owner_copyin_route(
+    outcome: DispatchOutcome,
+) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
     let (wait, resume) = match outcome {
         DispatchOutcome::WriteCopyInSuspended(pending) => (
             pending.wait().clone(),

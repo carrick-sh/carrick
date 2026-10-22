@@ -45,9 +45,9 @@ enum ZoneWaitPolicy {
 impl ZoneWaitPolicy {
     fn for_owner_resume(resume: &OwnedSyscallResume) -> Self {
         match resume {
-            OwnedSyscallResume::CopyoutRedispatch | OwnedSyscallResume::PreparedWrite(_) => {
-                Self::KillableOwnerMemory
-            }
+            OwnedSyscallResume::CopyoutRedispatch
+            | OwnedSyscallResume::PreparedWrite(_)
+            | OwnedSyscallResume::Sleep(_) => Self::KillableOwnerMemory,
         }
     }
 }
