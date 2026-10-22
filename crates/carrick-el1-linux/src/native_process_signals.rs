@@ -802,6 +802,26 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_member_projection_must_preserve_pending() {
+        let control = carrick_el1_abi::ThreadControlSlot::new();
+        let custody =
+            Arc::new(carrick_core::lifecycle::MemberControlCustody::retain(&control).unwrap());
+        let signals = NativeProcessSignals::<()>::fresh_root(key(41, 11));
+        let record = carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+            incarnation: 1,
+        };
+        let projection = signals.project_member(record, custody.clone());
+        signals.enqueue_thread(record, Signal::KILL, None);
+        let duplicate = signals.project_member(record, custody);
+        drop(duplicate);
+        assert_eq!(control.pending().load().0, Signal::KILL.bit());
+        assert!(signals.pending_set(record).contains(Signal::KILL));
+        drop(projection);
+        assert_eq!(control.pending().load().0, 0);
+    }
+
+    #[test]
     fn process_sigint_waits_for_unblocked_worker_and_survives_exec() {
         let task = key(41, 11);
         let signals = NativeProcessSignals::<u32>::fresh_root(task);
