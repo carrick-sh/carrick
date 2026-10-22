@@ -277,16 +277,34 @@ jobs:
         id: runner-image
         if: ${{ !cancelled() }}
         run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
-      - name: Cache cross toolchain packages
+      - name: Restore cross toolchain packages
         if: ${{ !cancelled() }}
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ runner.temp }}/apt-cross
           key: apt-ci-install-linux-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}
+          restore-keys: apt-ci-install-linux-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-
       - name: Install Linux C cross toolchain
         if: ${{ !cancelled() }}
         timeout-minutes: 12
         run: just ci-install-linux-cross
+      # Saved even when the download timed out, so a throttled mirror's
+      # progress carries to the next run; only a complete set takes the key.
+      - name: Choose the cross toolchain package cache key
+        id: apt-cross-key
+        if: ${{ !cancelled() }}
+        run: |
+          if [[ -f "$RUNNER_TEMP/apt-cross/complete" ]]; then
+            echo "key=apt-ci-install-linux-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "key=apt-ci-install-linux-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save cross toolchain packages
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/apt-cross
+          key: ${{ steps.apt-cross-key.outputs.key }}
       - name: Portable kernel compile (aarch64-linux lib, tests and semantics)
         if: ${{ !cancelled() }}
         env:
@@ -712,16 +730,34 @@ jobs:
         id: runner-image
         if: ${{ !cancelled() }}
         run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
-      - name: Cache cross toolchain packages
+      - name: Restore cross toolchain packages
         if: ${{ !cancelled() }}
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ runner.temp }}/apt-cross
           key: apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}
+          restore-keys: apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-
       - name: Install FreeBSD C cross toolchain
         if: ${{ !cancelled() }}
         timeout-minutes: 12
         run: just ci-install-freebsd-cross
+      # Saved even when the download timed out, so a throttled mirror's
+      # progress carries to the next run; only a complete set takes the key.
+      - name: Choose the cross toolchain package cache key
+        id: apt-cross-key
+        if: ${{ !cancelled() }}
+        run: |
+          if [[ -f "$RUNNER_TEMP/apt-cross/complete" ]]; then
+            echo "key=apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "key=apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save cross toolchain packages
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/apt-cross
+          key: ${{ steps.apt-cross-key.outputs.key }}
       - name: Cache FreeBSD sysroot
         id: fbsd-sysroot
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -784,16 +820,34 @@ jobs:
         id: runner-image
         if: ${{ !cancelled() }}
         run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
-      - name: Cache cross toolchain packages
+      - name: Restore cross toolchain packages
         if: ${{ !cancelled() }}
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ runner.temp }}/apt-cross
           key: apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}
+          restore-keys: apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-
       - name: Install BSD C cross toolchain
         if: ${{ !cancelled() }}
         timeout-minutes: 12
         run: just ci-install-freebsd-cross
+      # Saved even when the download timed out, so a throttled mirror's
+      # progress carries to the next run; only a complete set takes the key.
+      - name: Choose the cross toolchain package cache key
+        id: apt-cross-key
+        if: ${{ !cancelled() }}
+        run: |
+          if [[ -f "$RUNNER_TEMP/apt-cross/complete" ]]; then
+            echo "key=apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "key=apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save cross toolchain packages
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/apt-cross
+          key: ${{ steps.apt-cross-key.outputs.key }}
       - name: Cache NetBSD sysroot
         id: nbsd-sysroot
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -847,16 +901,34 @@ jobs:
         id: runner-image
         if: ${{ !cancelled() }}
         run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
-      - name: Cache cross toolchain packages
+      - name: Restore cross toolchain packages
         if: ${{ !cancelled() }}
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ runner.temp }}/apt-cross
           key: apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}
+          restore-keys: apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-
       - name: Install Clang C cross toolchain
         if: ${{ !cancelled() }}
         timeout-minutes: 12
         run: just ci-install-freebsd-cross
+      # Saved even when the download timed out, so a throttled mirror's
+      # progress carries to the next run; only a complete set takes the key.
+      - name: Choose the cross toolchain package cache key
+        id: apt-cross-key
+        if: ${{ !cancelled() }}
+        run: |
+          if [[ -f "$RUNNER_TEMP/apt-cross/complete" ]]; then
+            echo "key=apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "key=apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save cross toolchain packages
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/apt-cross
+          key: ${{ steps.apt-cross-key.outputs.key }}
       - name: Cross-check and clippy macOS closure (including tests)
         if: ${{ !cancelled() }}
         run: just cross-check-macos

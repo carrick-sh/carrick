@@ -99,18 +99,18 @@ fn cross_toolchain_installs_restore_their_package_cache_first() {
                 continue;
             };
             installs += 1;
-            let cache = &steps[index - 1];
+            let restore = &steps[index - 1];
             assert!(
-                cache["uses"]
+                restore["uses"]
                     .as_str()
-                    .is_some_and(|uses| uses.starts_with("actions/cache@")),
+                    .is_some_and(|uses| uses.starts_with("actions/cache/restore@")),
                 "{job:?}: {recipe} must follow its package cache"
             );
             assert_eq!(
-                cache["with"]["path"].as_str(),
+                restore["with"]["path"].as_str(),
                 Some("${{ runner.temp }}/apt-cross")
             );
-            let key = cache["with"]["key"].as_str().unwrap();
+            let key = restore["with"]["key"].as_str().unwrap();
             assert!(key.starts_with(&format!("apt-{recipe}-")), "{key}");
             assert!(
                 key.contains("${{ steps.runner-image.outputs.id }}"),
@@ -118,6 +118,32 @@ fn cross_toolchain_installs_restore_their_package_cache_first() {
             );
             assert!(key.contains("hashFiles('scripts/ci/apt-cached-install.sh')"));
             assert_eq!(steps[index - 2]["id"].as_str(), Some("runner-image"));
+            // A throttled mirror's partial progress resumes on the next run.
+            let partial = format!("{key}-partial-");
+            assert_eq!(
+                restore["with"]["restore-keys"].as_str(),
+                Some(partial.as_str())
+            );
+            let choose = &steps[index + 1];
+            assert_eq!(choose["id"].as_str(), Some("apt-cross-key"));
+            let choose = choose["run"].as_str().unwrap();
+            assert!(choose.contains(&format!("echo \"key={key}\"")), "{choose}");
+            assert!(
+                choose.contains(&format!("key={partial}${{{{ github.run_id }}}}")),
+                "{choose}"
+            );
+            let save = &steps[index + 2];
+            assert!(
+                save["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
+            );
+            // Saved after a failed install too: only cancellation skips it.
+            assert_eq!(save["if"].as_str(), Some("${{ !cancelled() }}"));
+            assert_eq!(
+                save["with"]["key"].as_str(),
+                Some("${{ steps.apt-cross-key.outputs.key }}")
+            );
         }
     }
     assert_eq!(installs, 4, "every cross toolchain install is cached");
@@ -140,7 +166,7 @@ fn warm_apt_cache_installs_without_contacting_the_mirror() {
         (
             "apt-get",
             format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$*\" in *--download-only*)\n  for a in \"$@\"; do case \"$a\" in Dir::Cache::archives=*) touch \"${{a#Dir::Cache::archives=}}/pkg_1.0_amd64.deb\";; esac; done;;\nesac\n",
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$*\" in *--download-only*)\n  [ -n \"$APT_STUB_FAIL_DOWNLOAD\" ] && exit 100\n  for a in \"$@\"; do case \"$a\" in Dir::Cache::archives=*) touch \"${{a#Dir::Cache::archives=}}/pkg_1.0_amd64.deb\";; esac; done;;\nesac\n",
                 log.display()
             ),
         ),
@@ -180,4 +206,23 @@ fn warm_apt_cache_installs_without_contacting_the_mirror() {
         changed.contains("update"),
         "a different package set must refetch: {changed}"
     );
+
+    // A download that dies part-way keeps what it fetched and is not marked
+    // complete; the next run resumes instead of starting over.
+    let partial = temp.path().join("partial-cache");
+    std::fs::create_dir(&partial).unwrap();
+    std::fs::write(partial.join("kept_1.0_amd64.deb"), "").unwrap();
+    let failed = std::process::Command::new(&script)
+        .arg(&partial)
+        .arg("gcc-aarch64-linux-gnu")
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("APT_STUB_FAIL_DOWNLOAD", "1")
+        .status()
+        .unwrap();
+    assert!(!failed.success());
+    assert!(partial.join("kept_1.0_amd64.deb").exists());
+    assert!(!partial.join("complete").exists());
 }
