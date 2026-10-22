@@ -1765,3 +1765,11 @@ contracts = ["kernel.scheduler.runnable-progress"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/time.rs"
 contracts = ["kernel.sleep.owner-copyin"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/continuation/ipc.rs"
+contracts = ["kernel.el1.ipc-lifecycle", "kernel.copyout.owner-refusal"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs"
+contracts = ["kernel.el1.ipc-lifecycle", "kernel.copyout.owner-refusal"]

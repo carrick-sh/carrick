@@ -1075,3 +1075,118 @@ fn serial_host_el1_ipc_mixed_venue_readv_wakes_on_el1_write_after_enroll() {
 fn serial_host_el1_ipc_mixed_venue_readv_wakes_on_el1_write_before_enroll() {
     mixed_venue_readv_wakes_on_el1_write(true);
 }
+
+#[test]
+fn el1_ipc_read_owner_refusal_keeps_bytes_until_destination_is_secured() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    let w = world();
+    let (r, writer, object) = w.pipe();
+    {
+        let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+        guard.pipe().unwrap().try_write(b"retain");
+    }
+    let token = w.operation(r, IpcOpKind::PipeRead, 6, 63);
+    w.hand_back(&token, IpcHandback::Continue, 0, 0);
+    let mut memory = OwnerRefusingMemory::new(BUF, 4096, 0xa5);
+    memory.refuse_next();
+    let outcome =
+        complete_handback(w.region, token, MM, &mut memory, None, &Wakes::default()).unwrap();
+    assert_eq!(
+        w.unread(object),
+        6,
+        "copyout refusal must consume no pipe bytes: {outcome:?}"
+    );
+    assert_eq!(memory.inner.read_bytes(BUF, 6).unwrap(), [0xa5; 6]);
+    let IpcHostOutcome::OwnerMemory { token, outcome } = outcome else {
+        panic!("transient destination refusal must retain the read");
+    };
+    assert!(matches!(
+        *outcome,
+        crate::dispatch::DispatchOutcome::OwnerMemoryWait { committed: 0, .. }
+    ));
+    let raw = token.into_raw();
+    let token = IpcOpToken::from_raw(raw);
+    let saved = w.region.operation(&token).unwrap();
+    assert_eq!(saved.progress.written, 0);
+    let pin = OfdPin::from_raw(saved.pin);
+    assert_eq!(w.region.fd(HostIpcWait).holds(&pin).unwrap(), (1, 1));
+    let _ = pin.into_raw();
+    let outcome =
+        complete_handback(w.region, token, MM, &mut memory, None, &Wakes::default()).unwrap();
+    assert_eq!(
+        outcome,
+        IpcHostOutcome::Complete {
+            result: 6,
+            sigpipe: false
+        }
+    );
+    assert_eq!(memory.inner.read_bytes(BUF, 6).unwrap(), b"retain");
+    assert_eq!(w.unread(object), 0);
+    assert_eq!(w.holds(r), 1);
+    assert_eq!(
+        take_handback(w.region, raw.pack()).err(),
+        Some(IpcError::Stale)
+    );
+    let description = w
+        .region
+        .fd(HostIpcWait)
+        .close(w.table, writer)
+        .unwrap()
+        .unwrap();
+    w.region
+        .release_backing(description.backing, &HostIpcWait)
+        .unwrap();
+    let token = w.operation(r, IpcOpKind::PipeRead, 6, 63);
+    w.hand_back(&token, IpcHandback::Continue, 0, 0);
+    assert_eq!(
+        complete_handback(w.region, token, MM, &mut memory, None, &Wakes::default()).unwrap(),
+        IpcHostOutcome::Complete {
+            result: 0,
+            sigpipe: false
+        }
+    );
+}
+
+#[test]
+fn el1_ipc_owner_copyout_fault_and_page_prefix_preserve_unread_bytes() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    for fault in [false, true] {
+        let w = world();
+        let (reader, _writer, object) = w.pipe();
+        {
+            let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+            guard.pipe().unwrap().try_write(b"abcdef");
+        }
+        let token = w.operation(reader, IpcOpKind::PipeRead, 6, 63);
+        w.hand_back(&token, IpcHandback::Continue, 0, 0);
+        let mut op = w.region.operation(&token).unwrap();
+        op.buf = IpcUserVa(BUF + 4093);
+        w.region.update_operation(&token, op).unwrap();
+        let mut memory = OwnerRefusingMemory::new(BUF, 8192, 0xa5);
+        if fault {
+            memory.protect_readonly(BUF, 8192);
+        }
+        let result =
+            complete_handback(w.region, token, MM, &mut memory, None, &Wakes::default()).unwrap();
+        assert_eq!(
+            result,
+            IpcHostOutcome::Complete {
+                result: if fault {
+                    LINUX_EFAULT.guest_retval()
+                } else {
+                    3
+                },
+                sigpipe: false,
+            }
+        );
+        assert_eq!(w.unread(object), if fault { 6 } else { 3 });
+        assert_eq!(
+            memory.inner.read_bytes(BUF + 4093, 6).unwrap(),
+            if fault {
+                vec![0xa5; 6]
+            } else {
+                vec![b'a', b'b', b'c', 0xa5, 0xa5, 0xa5]
+            }
+        );
+    }
+}

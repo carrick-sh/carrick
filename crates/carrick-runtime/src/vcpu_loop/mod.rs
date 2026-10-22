@@ -975,6 +975,10 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// An IPC operation this boundary's handback left waiting: the syscall
     /// service parks the thread on its object queue ([`zone`]).
     pub(super) pending_ipc_park: Option<zone::IpcPark>,
+    pub(super) pending_ipc_owner:
+        Option<carrick_kernel::kernel::continuation::ipc::RetainedIpcOperation>,
+    /// A resumed in-zone IPC call returns at EL0, without a host trap frame.
+    pub(super) ipc_user_return: Option<SyscallRequest>,
     #[cfg(test)]
     pub(in crate::vcpu_loop) exec_terminal_context_failpoint:
         Option<exec::ExecTerminalContextFailpoint>,
@@ -1090,6 +1094,8 @@ where
             external_signals: signal_ingress_producer::HostSignalIngressProducer::new(),
             zone_mm: None,
             pending_ipc_park: None,
+            pending_ipc_owner: None,
+            ipc_user_return: None,
             #[cfg(test)]
             exec_terminal_context_failpoint: None,
             #[cfg(test)]
@@ -1629,6 +1635,10 @@ where
                 &mut request,
             )? {
                 zone::IpcHandbackRoute::Complete(outcome) => ipc_prepared = Some(outcome),
+                zone::IpcHandbackRoute::OwnerMemory { pending, outcome } => {
+                    self.pending_ipc_owner = Some(pending);
+                    ipc_prepared = Some(outcome);
+                }
                 zone::IpcHandbackRoute::Restart => {}
                 zone::IpcHandbackRoute::Park(park) => {
                     self.pending_ipc_park = Some(park);
@@ -1844,6 +1854,9 @@ where
                 self.resume_write_copy_in(kernel, engine, pending, host_wait)
             }
             binding::OwnedSyscallResume::Sleep(pending) => Ok(pending.resume(engine)),
+            binding::OwnedSyscallResume::Ipc(pending) => {
+                self.resume_ipc_copyout(kernel, engine, pending)
+            }
         }
     }
 
@@ -2340,6 +2353,18 @@ where
         kernel: &KernelState,
         value: i64,
     ) -> Result<i64, RuntimeError> {
+        if self.ipc_user_return.take().is_some() {
+            // This operation was loaded at its original SVC from an IPC
+            // wait record, rather than forwarded through an EL1 trap frame.
+            let pc = engine.current_pc()?;
+            engine
+                .set_reg(carrick_hal::Reg::X(0), value as u64)
+                .map_err(|error| RuntimeError::Configuration(format!("IPC return x0: {error}")))?;
+            engine
+                .set_reg(carrick_hal::Reg::Pc, pc.wrapping_add(4))
+                .map_err(|error| RuntimeError::Configuration(format!("IPC return pc: {error}")))?;
+            return Ok(value);
+        }
         if !matches!(
             self.syscall_completion,
             SyscallCompletionOwnership::Guest(_)
@@ -3376,6 +3401,7 @@ pub(crate) mod tests {
         pub(crate) native_owner: Option<Arc<carrick_el1_linux::native_process_runtime::host_test_support::NativeOwnerSignalFixture>>,
         pub(crate) native_owner_cancellations: usize,
         pub(crate) completed_syscalls: Vec<i64>,
+        pub(crate) written_registers: Vec<(carrick_hal::Reg, u64)>,
         pub(crate) completion_events: Option<Arc<Mutex<Vec<&'static str>>>>,
         pub(crate) execve_installs: usize,
         pub(crate) exec_inventory_arms: usize,
@@ -3557,9 +3583,10 @@ pub(crate) mod tests {
 
         fn set_reg(
             &mut self,
-            _register: carrick_hal::Reg,
-            _value: u64,
+            register: carrick_hal::Reg,
+            value: u64,
         ) -> Result<(), carrick_hal::OsError> {
+            self.written_registers.push((register, value));
             Ok(())
         }
 
@@ -4160,6 +4187,24 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn serial_host_ipc_copyout_wait_resumes_without_losing_bytes() {
+        exercise_owner_wait(
+            carrick_abi::syscall::nr::READ,
+            Some(carrick_abi::LINUX_SIGUSR1),
+            false,
+        );
+    }
+
+    #[test]
+    fn serial_host_ipc_copyout_wait_cancellation_releases_its_pin() {
+        exercise_owner_wait(
+            carrick_abi::syscall::nr::READ,
+            Some(carrick_abi::LINUX_SIGKILL),
+            false,
+        );
+    }
+
     fn exercise_owner_wait(nr: carrick_abi::CanonicalNr, signum: Option<i32>, native: bool) {
         exercise_owner_wait_schedule(nr, signum, native, false);
     }
@@ -4180,6 +4225,7 @@ pub(crate) mod tests {
         use std::time::Duration;
 
         let sleep = nr == nr::NANOSLEEP || nr == nr::CLOCK_NANOSLEEP;
+        let ipc_read = nr == nr::READ;
         let (process, _) = crate::hvpatch::process_context_for_tests(71_102);
         let dispatcher = SyscallDispatcher::new();
         dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
@@ -4380,6 +4426,56 @@ pub(crate) mod tests {
             native_number: carrick_abi::NativeNr(nr.raw()),
         };
 
+        let ipc = ipc_read.then(|| {
+            use carrick_el1_abi::ipc::fd::{AccessMode, Description, Fd, StatusFlags};
+            use carrick_el1_abi::ipc::{
+                End, IpcBacking, IpcHandback, IpcMmKey, IpcOpKind, IpcOperation, IpcUserVa,
+                WriteProgress,
+            };
+            use carrick_kernel::kernel::continuation::ipc::HostIpcWait;
+            let owner = root.kernel().ipc().unwrap();
+            let object = owner.create_pipe(65536).unwrap();
+            let region = owner.region();
+            let pin = region
+                .fd(HostIpcWait)
+                .create_pinned(Description::new(
+                    IpcBacking::Pipe {
+                        object,
+                        end: End::Reader,
+                    }
+                    .encode(),
+                    AccessMode::ReadOnly,
+                    StatusFlags::default(),
+                ))
+                .unwrap();
+            let table = owner.create_table(1024, 64).unwrap();
+            region
+                .fd(HostIpcWait)
+                .install_pin(table, Fd(3), &pin, false)
+                .unwrap();
+            {
+                let mut guard = region.lock(object, &HostIpcWait).unwrap();
+                guard.provide_ring_from_stock().unwrap();
+                assert_eq!(guard.pipe().unwrap().try_write(b"retain").result, Ok(6));
+            }
+            let token = region
+                .begin_operation(IpcOperation {
+                    kind: IpcOpKind::PipeRead,
+                    pin: pin.into_raw(),
+                    object: object.to_raw(),
+                    mm: IpcMmKey(mm.raw()),
+                    buf: IpcUserVa(0x71_1020),
+                    progress: WriteProgress::new(6),
+                    orig_x0: 3,
+                    nr: 63,
+                    handback: IpcHandback::Continue,
+                    ..IpcOperation::EMPTY
+                })
+                .unwrap()
+                .into_raw();
+            (owner, object, table, token)
+        });
+
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let mut engine = CrashCaptureTestEngine {
@@ -4449,11 +4545,50 @@ pub(crate) mod tests {
                         wait,
                         zone: zone as *const _ as usize,
                     });
-                    let first = state
-                        .service_threaded_syscall(&kernel, &mut engine, frame, None)
+                    let (first, resume) = if let Some((owner, object, _, raw)) = &ipc {
+                        use carrick_kernel::kernel::continuation::ipc as host_ipc;
+                        let request = SyscallRequest::new(
+                            63,
+                            carrick_kernel::compat::SyscallArgs::from([3, 0x71_1020, 6, 0, 0, 0]),
+                        );
+                        state.ipc_user_return = Some(request);
+                        state.service_kernel_context = Some(root.retain_exact());
+                        let outcome = host_ipc::complete_handback(
+                            &owner.region(),
+                            carrick_el1_abi::ipc::IpcOpToken::from_raw(*raw),
+                            carrick_el1_abi::ipc::IpcMmKey(mm.raw()),
+                            &mut engine,
+                            None,
+                            &host_ipc::ZoneHostServices::new(root.kernel()).unwrap(),
+                        )
                         .unwrap();
-                    let (first, resume) = binding::owner_copyin_route(first);
-                    let resume = resume.unwrap_or(binding::OwnedSyscallResume::CopyoutRedispatch);
+                        assert_eq!(
+                            owner
+                                .region()
+                                .lock(*object, &host_ipc::HostIpcWait)
+                                .unwrap()
+                                .pipe()
+                                .unwrap()
+                                .unread_bytes(),
+                            6
+                        );
+                        let zone::IpcHandbackRoute::OwnerMemory { pending, outcome } =
+                            zone::ipc_route(&kernel.dispatcher, &root, this_tid, outcome, None)
+                                .unwrap()
+                        else {
+                            panic!("read must retain its exact operation on refusal");
+                        };
+                        (outcome, binding::OwnedSyscallResume::Ipc(pending))
+                    } else {
+                        let first = state
+                            .service_threaded_syscall(&kernel, &mut engine, frame, None)
+                            .unwrap();
+                        let (first, resume) = binding::owner_copyin_route(first);
+                        (
+                            first,
+                            resume.unwrap_or(binding::OwnedSyscallResume::CopyoutRedispatch),
+                        )
+                    };
                     assert_eq!(
                         first,
                         DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
@@ -4489,6 +4624,9 @@ pub(crate) mod tests {
                             resume_x16: 0x1616,
                             resume_x17: 0x1717,
                         });
+                    if ipc_read {
+                        cpu.syscall_continuation = None;
+                    }
                     engine.exec_support = true;
                     engine.snapshot_cpu = Some(snapshot);
                     let mut job = suffix_failure_test_job(
@@ -4789,12 +4927,31 @@ pub(crate) mod tests {
                         // The scoped peer is joined when this scope ends.
                     } else {
                         assert!(matches!(completed, executor::ExecutorExit::Syscall));
-                        let result = if nr == nr::WAIT4 { -10 } else { 0 };
-                        assert_eq!(engine.completed_syscalls, [result]);
+                        let result = if ipc_read {
+                            6
+                        } else if nr == nr::WAIT4 {
+                            -10
+                        } else {
+                            0
+                        };
+                        if ipc_read {
+                            assert!(
+                                engine.completed_syscalls.is_empty(),
+                                "EL0 IPC return has no trap to complete"
+                            );
+                            assert!(
+                                engine
+                                    .written_registers
+                                    .contains(&(carrick_hal::Reg::X(0), 6))
+                            );
+                            assert_eq!(engine.guest_memory[&0x71_1020], b"retain");
+                        } else {
+                            assert_eq!(engine.completed_syscalls, [result]);
+                        }
                         if signum.is_some() && !native {
                             assert_eq!(
                                 engine.injected_signals,
-                                [(Some(result), Some(result), false)]
+                                [(Some(result), (!ipc_read).then_some(result), false)]
                             );
                             assert!(
                                 !root
@@ -4803,6 +4960,33 @@ pub(crate) mod tests {
                                     .contains(carrick_abi::LINUX_SIGUSR1)
                             );
                         }
+                    }
+                    if let Some((owner, object, table, raw)) = &ipc {
+                        use carrick_kernel::kernel::continuation::ipc::HostIpcWait;
+                        let region = owner.region();
+                        assert!(matches!(
+                            region.operation(&carrick_el1_abi::ipc::IpcOpToken::from_raw(*raw)),
+                            Err(carrick_el1_abi::ipc::IpcError::Stale)
+                        ));
+                        let (check_pin, _) = region
+                            .fd(HostIpcWait)
+                            .pin(*table, carrick_el1_abi::ipc::fd::Fd(3))
+                            .unwrap();
+                        assert_eq!(
+                            region.fd(HostIpcWait).holds(&check_pin).unwrap(),
+                            (1, 1),
+                            "only the inspection pin remains"
+                        );
+                        region.fd(HostIpcWait).unpin(check_pin).unwrap();
+                        assert_eq!(
+                            region
+                                .lock(*object, &HostIpcWait)
+                                .unwrap()
+                                .pipe()
+                                .unwrap()
+                                .unread_bytes(),
+                            if killing { 6 } else { 0 }
+                        );
                     }
                     let lease = resumed_submission.take_execution_lease().unwrap();
                     resumed.restore_lease(lease).unwrap();

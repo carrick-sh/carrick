@@ -227,6 +227,7 @@ pub(super) enum OwnerSupplyWait {
 /// A retained transfer cannot fall through to numeric syscall redispatch.
 pub(super) enum OwnedSyscallResume {
     CopyoutRedispatch,
+    Ipc(carrick_kernel::kernel::continuation::ipc::RetainedIpcOperation),
     PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
     Sleep(Box<carrick_kernel::dispatch::OwnedSleepCopyIn>),
 }
@@ -3288,7 +3289,16 @@ where
         frame: carrick_hal::RawSyscall,
         outcome: DispatchOutcome,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        if let Some(park) = self.state.pending_ipc_park.take() {
+            return self.ipc_park(engine, control, frame, park);
+        }
         let (outcome, resume) = owner_copyin_route(outcome);
+        let resume = resume.or_else(|| {
+            self.state
+                .pending_ipc_owner
+                .take()
+                .map(OwnedSyscallResume::Ipc)
+        });
         self.service_outcome(engine, control, frame, outcome, resume)
     }
 

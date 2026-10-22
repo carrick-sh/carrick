@@ -198,3 +198,46 @@ fix, or run with reduced test concurrency.
 HVF execution, five-of-five signed qualification, refreshed Docker evidence
 and signed promotion remain outstanding. The unreceipted backend refusal
 above also remains outside the proven fix. This is not issue closure.
+
+
+## Independent review follow-up
+
+The two P1 findings on the first handoff were valid. Sleep retained the input
+but selected an ordinary interruptible owner wait. The pipe witness stopped
+at EL1 handback; host completion still consumed bytes after a writability
+check and before the actual copy. A typed transient refusal at that last copy
+was collapsed to EFAULT.
+
+The branch was rebased onto the fetched #739 branch while that PR remained
+open. Its owner-wait policy, single killable-wake query and prepared-copyout
+API are the only wait/copy mechanism used here. All original fixes were kept;
+the owner-resume enum and contract surfaces were ported to the new base.
+The scheduler test rewrite and guest fixture were unchanged by this rebase.
+
+The extended sleep witness enters the real production owner park with a
+second live thread holding the editor. With the old policy, handled SIGUSR1
+queues the waiter before editor release (1 instead of 0). With the fix,
+nanosleep and clock_nanosleep complete their retained zero-duration input
+after release, then deliver the handler; SIGKILL still terminates before
+release. The existing nonzero-duration input/prefix witness remains separate.
+
+The host pipe completion witness initially consumed all six bytes and
+returned EFAULT. The fix prepares a page-bounded destination permit before
+the object transfer; only bytes secured by that permit can be consumed.
+A refused prepare retains the original token and endpoint pin. Host
+completion resumes it through #739's owner-memory wait, without an fd lookup
+or replay. Cancellation drops the exact pin. The runtime witness holds a real
+sibling editor, posts handled SIGUSR1, releases the editor, and verifies all
+six bytes and the EL0 return. Its fatal variant verifies cancellation and pin
+release without consuming data. Kernel witnesses also check the next EOF,
+exact count, invalid-pointer EFAULT without consumption, and an unaligned
+page-prefix read that leaves the suffix in the pipe.
+
+The direct EL0 completion origin is retained explicitly: a read resumed from
+an IPC wait record has no host syscall trap frame to complete. Its owner wait
+uses that saved EL0 state and returns at the original SVC only after the
+secured copy commits.
+
+The broad copy-in/EFAULT sweep remains #711 slice 2, outside this change.
+The signed commands above remain the required Mac qualification; portable
+results from the earlier handoff do not certify this new artifact.

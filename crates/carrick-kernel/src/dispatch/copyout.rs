@@ -308,6 +308,22 @@ impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
             .map_or(0, UserSlot::capacity)
     }
 
+    /// Capacity already secured for a consuming operation. A faulted owner
+    /// slot accepts no bytes: the source must not consume on a failed copy.
+    pub(crate) fn secured_capacity(&self, index: usize) -> usize {
+        match &self.venue {
+            Venue::Owner { valid_present, .. } => {
+                let present = self.slots.iter().take(index + 1).flatten().count();
+                if present > *valid_present {
+                    0
+                } else {
+                    self.capacity(index)
+                }
+            }
+            Venue::Legacy(_) => self.capacity(index),
+        }
+    }
+
     /// Write one prefix per slot; the output for an absent slot (a NULL
     /// optional pointer) is ignored. On both venues the first invalid pointer
     /// stops the commit with [`CopyoutFault`] after any earlier valid slots
