@@ -20,11 +20,18 @@ It never reads the following symbol's prologue into a tail wrapper's frame.
 the maximum compiled frame across all matching monomorphizations; mutually
 exclusive branches take their maximum. Inlined leaves need no additional
 frame. Retained entry functions are mandatory and cannot disappear silently.
-The envelopes cover native admission, fork preparation/publication, wait status
-copy, signal delivery/return/terminal exit, anonymous munmap, metadata grant,
-backing retirement and descriptor draining. They deliberately include callees
+The envelopes cover native admission, fork preparation, publication and
+settlement, wait status copy, signal delivery/return/terminal exit, anonymous
+munmap, metadata grant, backing retirement and descriptor draining. They include
+callees
 reached through trait objects and copy callbacks: a direct `bl`-only call graph
 would omit those frames.
+
+Fork settlement includes the retained `fork_owned` owner and the compiled
+`settle_mm` frame, where the 128-byte Commit record is copied to the stopped
+CPU's stack. It also charges allocator and notification work that opening the
+child's space gate can trigger. An inlined `consume` is included in its caller's
+compiled frame.
 
 The descriptor envelope charges four table/entry levels and four descent
 frames, plus journal/store/unlink and allocator service work. Signal delivery
