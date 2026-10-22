@@ -50,3 +50,16 @@ fn case_libpython_private_fixed_file_segments() {
         "fixture ran provisionally; native ARM64 Docker bless is required for acceptance"
     );
 }
+
+#[test]
+fn case_libpython_slim_python_startup() {
+    let _guard = common::guest_lock();
+    let (result, _) = common::run_or_fail(
+        TestContainer::new("python:3.12-slim")
+            .pull_policy(PullPolicy::Missing)
+            .run_with_audit(["/bin/sh", "-c", "python3 -c 'print(1)'"]),
+    );
+    result.assert_success();
+    assert_eq!(result.stdout_utf8(), "1\n");
+    assert!(result.stderr.is_empty(), "{}", result.stderr_utf8());
+}

@@ -11,7 +11,7 @@ rationale = "A file-backed PROT_NONE reservation of 0x65ee48 bytes, fixed RX tex
 vm_free = "carrick-kernel::dispatch::mem::delegated_tests::{libpython_fixed_file_segments_use_owner_source_without_eager_copy,libpython_old_deferred_recipe_and_owner_copy_refusals}; real file, production AddressSpace, root, deferred registry and bounded PREPARE admission. RED: eager file copy and premature predecessor retirement. Component reproduction: overlapping deferred file recipe -> InvalidRange -> whole-map owner copy exceeds 4096 -> ENOMEM lowering. Retirement classification: carrick-aarch64::descriptor_drain::retirement_tests::retirement_refusals_are_clean_only_before_any_chunk_commits. Signed branch confirmation remains open."
 
 [bindings.unresolved]
-embed_structural = "case_libpython_private_fixed_file_segments is a registered signed-hvf target, with an automatically rebuilt static fixture. Execution remains open: HVF is unavailable on ctb-w4."
+embed_structural = "case_libpython_private_fixed_file_segments and case_libpython_slim_python_startup are registered signed-hvf targets, with an automatically rebuilt static fixture. Execution remains open: HVF is unavailable on ctb-w4."
 docker = "Director must bless the exact fixture source and native ARM64 output; no Docker is available on ctb-w4."
 embed_timing = "Paired uninstrumented same-image Docker ratio and final signed promotion remain director-owned."
 

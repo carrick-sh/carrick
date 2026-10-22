@@ -5,7 +5,7 @@ mod common;
 use carrick_conformance_next::{PullPolicy, ResultAssert, TestContainer};
 
 #[test]
-fn deferred_anonymous_epoll_copyout() {
+fn case_deferred_anonymous_epoll_copyout() {
     let _guard = common::guest_lock();
     let script = r#"
 import ctypes as c
@@ -64,7 +64,7 @@ assert lib.close(fd) == 0 and lib.close(ep) == 0
 }
 
 #[test]
-fn deferred_anonymous_foreign_copyout() {
+fn case_deferred_anonymous_foreign_copyout() {
     let _guard = common::guest_lock();
     let script = r#"
 import ctypes as c, os, select, sys
@@ -137,7 +137,7 @@ print('foreign_pristine_copyout=ok')
 }
 
 #[test]
-fn deferred_private_file_foreign_copyout() {
+fn case_deferred_private_file_foreign_copyout() {
     let _guard = common::guest_lock();
     let script = r#"
 import ctypes as c, os, select
@@ -215,7 +215,7 @@ print('foreign_immutable_private_file_copyout=ok')
 }
 
 #[test]
-fn deferred_anonymous_pristine_scrub_semantics() {
+fn case_deferred_anonymous_pristine_scrub_semantics() {
     let _guard = common::guest_lock();
     let container = TestContainer::new("localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30")
         .pull_policy(PullPolicy::Missing);
@@ -237,7 +237,7 @@ fn deferred_anonymous_pristine_scrub_semantics() {
 }
 
 #[test]
-fn deferred_anonymous_unaligned_discard() {
+fn case_deferred_anonymous_unaligned_discard() {
     let _guard = common::guest_lock();
     let container = TestContainer::new("localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30")
         .pull_policy(PullPolicy::Missing);
