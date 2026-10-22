@@ -362,6 +362,8 @@ _FINGERPRINT_META_SEP = "\n/*__CONTRACT_FINGERPRINT_META__*/\n"
 
 GATED_TEST_LANES = {"host", "kvm", "integration", "signed-cli", "signed-hvf"}
 KNOWN_TEST_LANES = GATED_TEST_LANES | {"manual"}
+BINDING_CLAUSE_PREFIXES = ("carrick-",)
+NON_RUST_BINDING_PREFIXES = ("probe:", "ltp:", "go:", "cpython:", "node:")
 
 _RUST_KEYWORDS = set(
     "as async await break const continue crate dyn else enum extern false fn for gen if impl in "
@@ -370,7 +372,14 @@ _RUST_KEYWORDS = set(
 )
 _GENERIC_ITEM_NAMES = set(
     "new default from into try_from try_into drop fmt clone eq ne cmp partial_cmp hash deref "
-    "deref_mut index index_mut next poll run main test tests".split()
+    "deref_mut index index_mut next poll run main test tests add sub mul div rem bitand bitor "
+    "bitxor shl shr not neg get get_mut set len is_empty read write insert remove iter iter_mut "
+    "into_iter lock try_lock as_ptr as_mut_ptr as_ref as_mut as_slice as_bytes as_str into_inner "
+    "unwrap expect map and_then or_else filter collect push pop clear contains contains_key entry "
+    "take replace swap split join wake wait notify step build parse open close flush seek stat "
+    "bind listen accept connect send recv shutdown id kind name value count size capacity reset "
+    "init finish check validate load store fetch_add fetch_sub ok err some none is_ok is_err "
+    "is_some is_none borrow borrow_mut to_owned to_string".split()
 )
 
 _VIS_MOD_PREFIX = r"(?:\bpub(?:\s*\([^)]*\))?\s+)?"
@@ -789,7 +798,7 @@ def _is_cfg_expr_decidable(expr: str) -> bool:
         if op == "not" and len(args) != 1:
             return False
         return all(_is_cfg_expr_decidable(a) for a in args)
-    if expr in ("test", "unix", "windows", "debug_assertions"):
+    if expr in ("test", "doctest", "unix", "windows", "debug_assertions"):
         return True
     kv = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"$', expr)
     if kv:
@@ -1083,7 +1092,7 @@ def _split_top_level_semicolons(raw: str) -> list[str]:
             depth += 1
         elif ch in ")}":
             depth = max(0, depth - 1)
-        if ch == ";" and depth == 0:
+        if ch in ";," and depth == 0:
             parts.append("".join(cur).strip())
             cur = []
         else:
@@ -1095,13 +1104,16 @@ def _split_top_level_semicolons(raw: str) -> list[str]:
 
 def _expand_single_binding_clause(clause: str) -> list[str]:
     clause = clause.strip()
-    if not clause or clause.startswith(("probe:", "ltp:", "go:", "cpython:", "node:")):
+    if not clause or clause.startswith(NON_RUST_BINDING_PREFIXES):
         return []
 
-    idx = clause.find("carrick-")
+    idxs = [clause.find(p) for p in BINDING_CLAUSE_PREFIXES if clause.find(p) >= 0]
+    if not idxs:
+        return []
+    idx = min(idxs)
     if idx > 0:
         clause = clause[idx:].strip()
-    if not clause.startswith("carrick-") or "::" not in clause:
+    if not clause.startswith(BINDING_CLAUSE_PREFIXES) or "::" not in clause:
         return []
 
     # Check trailing `(...)`: either a list of Rust test identifiers or a prose annotation
@@ -1130,7 +1142,7 @@ def _expand_single_binding_clause(clause: str) -> list[str]:
             expanded.extend(_expand_single_binding_clause(f"{prefix}{item}{suffix}"))
         return expanded
 
-    # Strip trailing prose after `(something)` if followed by `, plus ...`
+    # Strip trailing prose after `(something)` if followed by `including ...`
     if "(" in clause:
         prefix, annotation = clause.split("(", 1)
         expanded = _expand_single_binding_clause(prefix.strip().rstrip(":"))
@@ -1142,7 +1154,8 @@ def _expand_single_binding_clause(clause: str) -> list[str]:
         return expanded
 
     cleaned = re.sub(r"\s+", "", clause)
-    if re.match(r"^carrick-[A-Za-z0-9_-]+(?:::[A-Za-z0-9_]+)+$", cleaned):
+    prefix_alt = "|".join(re.escape(p) for p in BINDING_CLAUSE_PREFIXES)
+    if re.match(rf"^(?:{prefix_alt})[A-Za-z0-9_-]+(?:::[A-Za-z0-9_]+)+$", cleaned):
         return [cleaned]
     return []
 
@@ -1160,9 +1173,17 @@ def expand_binding_spec(raw: str) -> list[str]:
             and "tests" in last_module.split("::")
             and "conformance-metrics" not in clause
         ):
-            control = re.match(r"^([a-z][a-z0-9_]*_[a-z0-9_]+)\b", clause)
-            if control:
-                out.append(f"{last_module}::{control.group(1)}")
+            inc_controls = [
+                c for c in re.findall(r"\bincluding\s+([A-Za-z_][A-Za-z0-9_]*)\b", clause)
+                if "_" in c
+            ]
+            if inc_controls:
+                for c in inc_controls:
+                    out.append(f"{last_module}::{c}")
+            else:
+                control = re.match(r"^([a-z][a-z0-9_]*_[a-z0-9_]+)\b", clause)
+                if control:
+                    out.append(f"{last_module}::{control.group(1)}")
     return out
 
 
@@ -1635,6 +1656,8 @@ def _eval_cfg_expr(
             )
     if expr == "test":
         return test_flag
+    if expr == "doctest":
+        return False
     if expr == "unix":
         return target_os in ("macos", "linux", "freebsd", "netbsd")
     if expr == "windows":
@@ -3083,22 +3106,201 @@ def _tokenize_code_line(code_line: str) -> tuple[str, ...]:
     return tuple(re.findall(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]", code_line))
 
 
+def _extract_impl_self_type(header: str) -> str | None:
+    cleaned: list[str] = []
+    angle = 0
+    paren = 0
+    bracket = 0
+    for ch in header:
+        if ch == "<" and paren == 0 and bracket == 0:
+            angle += 1
+            cleaned.append(" ")
+        elif ch == ">" and paren == 0 and bracket == 0 and angle > 0:
+            angle -= 1
+            cleaned.append(" ")
+        elif ch == "(" and angle == 0 and bracket == 0:
+            paren += 1
+            cleaned.append(" ")
+        elif ch == ")" and angle == 0 and bracket == 0 and paren > 0:
+            paren -= 1
+            cleaned.append(" ")
+        elif ch == "[" and angle == 0 and paren == 0:
+            bracket += 1
+            cleaned.append(" ")
+        elif ch == "]" and angle == 0 and paren == 0 and bracket > 0:
+            bracket -= 1
+            cleaned.append(" ")
+        elif angle == 0 and paren == 0 and bracket == 0:
+            cleaned.append(ch)
+        else:
+            cleaned.append(" ")
+    top = re.split(r"\bwhere\b", "".join(cleaned), maxsplit=1)[0]
+    if re.search(r"\bfor\b", top):
+        top = re.split(r"\bfor\b", top)[-1]
+    idents = [
+        tok[2:] if tok.startswith("r#") else tok
+        for tok in re.findall(r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*", top)
+    ]
+    idents = [i for i in idents if i not in _RUST_KEYWORDS and i not in _GENERIC_ITEM_NAMES]
+    return idents[-1] if idents else None
+
+
+def _compute_enclosing_fn_spans(stripped_src: str) -> list[tuple[int, int, str]]:
+    """Return `(start_line, end_line, fn_spec)` (1-indexed inclusive) for each function body
+    in `stripped_src` outside `macro_rules!`, excluding generic item names (`new`, `add`, `get`, etc.).
+    Methods inside `impl TypeName` are qualified as `TypeName::fn_ident`.
+    """
+    if not stripped_src:
+        return []
+    stripped_src = _blank_macro_defs(stripped_src, stripped_src)[0]
+    line_starts = [0]
+    for idx, ch in enumerate(stripped_src):
+        if ch == "\n":
+            line_starts.append(idx + 1)
+
+    def offset_to_line(offset: int) -> int:
+        lo, hi = 0, len(line_starts) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if line_starts[mid] <= offset:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return hi + 1
+
+    raw_fns: list[tuple[int, int, int, str]] = []
+    n = len(stripped_src)
+    for m in _FN_DECL_RE.finditer(stripped_src):
+        ident = m.group(1)
+        if not ident or ident in _RUST_KEYWORDS:
+            continue
+        # Advance past parameter list `( ... )` and return type / where clause to the function body `{`.
+        pos = m.end()
+        brace_open = -1
+        paren_depth = 0
+        angle_depth = 0
+        while pos < n:
+            ch = stripped_src[pos]
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")":
+                if paren_depth > 0:
+                    paren_depth -= 1
+            elif ch == "<" and paren_depth == 0:
+                angle_depth += 1
+            elif ch == ">" and paren_depth == 0 and angle_depth > 0:
+                angle_depth -= 1
+            elif ch == ";" and paren_depth == 0 and angle_depth == 0:
+                break
+            elif ch == "{" and paren_depth == 0 and angle_depth == 0:
+                brace_open = pos
+                break
+            pos += 1
+        if brace_open == -1:
+            continue
+        brace_close = _find_matching_brace(stripped_src, brace_open)
+        if brace_close == -1:
+            continue
+        raw_fns.append((m.start(), brace_open, brace_close, ident))
+
+    impl_spans: list[tuple[int, int, str | None]] = []
+    for m_impl in re.finditer(r"\bimpl\b", stripped_src):
+        istart = m_impl.start()
+        if any(f_start <= istart <= f_open for f_start, f_open, _, _ in raw_fns):
+            continue
+        before = re.sub(r"\bunsafe\s*$", "", stripped_src[:istart]).rstrip()
+        if before and before[-1] in "(,:=>":
+            continue
+        pos = m_impl.end()
+        impl_open = -1
+        paren_depth = 0
+        angle_depth = 0
+        bracket_depth = 0
+        while pos < n:
+            ch = stripped_src[pos]
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")" and paren_depth > 0:
+                paren_depth -= 1
+            elif ch == "<" and paren_depth == 0 and bracket_depth == 0:
+                angle_depth += 1
+            elif ch == ">" and paren_depth == 0 and bracket_depth == 0 and angle_depth > 0:
+                angle_depth -= 1
+            elif ch == "[" and paren_depth == 0 and angle_depth == 0:
+                bracket_depth += 1
+            elif ch == "]" and paren_depth == 0 and angle_depth == 0 and bracket_depth > 0:
+                bracket_depth -= 1
+            elif ch == ";" and paren_depth == 0 and angle_depth == 0 and bracket_depth == 0:
+                break
+            elif ch == "{" and paren_depth == 0 and angle_depth == 0 and bracket_depth == 0:
+                impl_open = pos
+                break
+            pos += 1
+        if impl_open == -1:
+            continue
+        impl_close = _find_matching_brace(stripped_src, impl_open)
+        if impl_close == -1:
+            continue
+        self_type = _extract_impl_self_type(stripped_src[m_impl.end() : impl_open])
+        impl_spans.append((impl_open, impl_close, self_type))
+
+    spans: list[tuple[int, int, str]] = []
+    for f_start, f_open, f_close, ident in raw_fns:
+        if ident in _GENERIC_ITEM_NAMES or ident.startswith("_"):
+            continue
+        enclosing_impl: tuple[int, str | None] | None = None
+        for i_open, i_close, self_type in impl_spans:
+            if i_open < f_start and f_close <= i_close:
+                if any(
+                    i_open < o_open < f_start and f_close <= o_close
+                    for _, o_open, o_close, _ in raw_fns
+                ):
+                    continue
+                span_len = i_close - i_open
+                if enclosing_impl is None or span_len <= enclosing_impl[0]:
+                    enclosing_impl = (span_len, self_type)
+        if enclosing_impl is not None:
+            recv_type = enclosing_impl[1]
+            if not recv_type:
+                continue
+            spans.append((offset_to_line(f_start), offset_to_line(f_close), f"{recv_type}::{ident}"))
+        else:
+            spans.append((offset_to_line(f_start), offset_to_line(f_close), ident))
+    return spans
+
+
+def _innermost_fn_at_line(spans: list[tuple[int, int, str]], line_no: int) -> str | None:
+    best: tuple[int, str] | None = None
+    for start_line, end_line, ident in spans:
+        if start_line <= line_no <= end_line:
+            length = end_line - start_line
+            if best is None or length <= best[0]:
+                best = (length, ident)
+    return best[1] if best is not None else None
+
+
 def extract_changed_surface_items(
     root: Path, base_view: RepoView, head_view: RepoView, base_sha: str, head_sha: str,
     surface_path: str, old_surface_path: str | None = None,
 ) -> set[str]:
     """Extract item identifiers defined or modified by actual CODE token changes in `surface_path`'s diff."""
     base_path = old_surface_path or surface_path
+    base_stripped_src = ""
     base_stripped_lines: list[str] = []
     if base_view.is_file(base_path):
-        base_stripped_lines = strip_cfg_test_blocks(
+        base_stripped_src = strip_cfg_test_blocks(
             base_view.read_stripped_rust(base_path), base_view.read_comments_stripped_rust(base_path),
-        ).splitlines()
+        )
+        base_stripped_lines = base_stripped_src.splitlines()
+    head_stripped_src = ""
     head_stripped_lines: list[str] = []
     if head_view.is_file(surface_path):
-        head_stripped_lines = strip_cfg_test_blocks(
+        head_stripped_src = strip_cfg_test_blocks(
             head_view.read_stripped_rust(surface_path), head_view.read_comments_stripped_rust(surface_path),
-        ).splitlines()
+        )
+        head_stripped_lines = head_stripped_src.splitlines()
+    base_fn_spans = _compute_enclosing_fn_spans(base_stripped_src)
+    head_fn_spans = _compute_enclosing_fn_spans(head_stripped_src)
 
     if old_surface_path and old_surface_path != surface_path and base_view.is_file(old_surface_path):
         diff_cmd = [
@@ -3118,8 +3320,8 @@ def extract_changed_surface_items(
     old_line_no = 0
     new_line_no = 0
     in_hunk = False
-    hunk_old_lines: list[str] = []
-    hunk_new_lines: list[str] = []
+    hunk_old_lines: list[tuple[int, str]] = []
+    hunk_new_lines: list[tuple[int, str]] = []
 
     def flush_hunk():
         nonlocal hunk_old_lines, hunk_new_lines
@@ -3127,43 +3329,53 @@ def extract_changed_surface_items(
             return
         old_toks_flat: list[str] = []
         new_toks_flat: list[str] = []
-        old_by_norm: list[tuple[tuple[str, ...], str]] = []
-        new_by_norm: list[tuple[tuple[str, ...], str]] = []
-        for oline in hunk_old_lines:
+        old_by_norm: list[tuple[tuple[str, ...], int, str]] = []
+        new_by_norm: list[tuple[tuple[str, ...], int, str]] = []
+        for lno, oline in hunk_old_lines:
             toks = _tokenize_code_line(oline)
             old_toks_flat.extend(toks)
-            old_by_norm.append((toks, oline))
-        for nline in hunk_new_lines:
+            old_by_norm.append((toks, lno, oline))
+        for lno, nline in hunk_new_lines:
             toks = _tokenize_code_line(nline)
             new_toks_flat.extend(toks)
-            new_by_norm.append((toks, nline))
+            new_by_norm.append((toks, lno, nline))
 
         hunk_old_lines = []
         hunk_new_lines = []
         if old_toks_flat == new_toks_flat:
             return
 
-        old_counts = Counter(toks for toks, _ in old_by_norm if toks)
-        new_counts = Counter(toks for toks, _ in new_by_norm if toks)
+        old_counts = Counter(toks for toks, _, _ in old_by_norm if toks)
+        new_counts = Counter(toks for toks, _, _ in new_by_norm if toks)
         common = old_counts & new_counts
 
         rem_skip = Counter(common)
-        for toks, oline in old_by_norm:
+        for toks, lno, oline in old_by_norm:
             if not toks:
                 continue
             if rem_skip[toks] > 0:
                 rem_skip[toks] -= 1
                 continue
-            items.update(_extract_code_decl_identifiers(oline))
+            decls = _extract_code_decl_identifiers(oline)
+            items.update(decls)
+            if not decls:
+                fn_name = _innermost_fn_at_line(base_fn_spans, lno)
+                if fn_name:
+                    items.add(f"fn:{fn_name}")
 
         add_skip = Counter(common)
-        for toks, nline in new_by_norm:
+        for toks, lno, nline in new_by_norm:
             if not toks:
                 continue
             if add_skip[toks] > 0:
                 add_skip[toks] -= 1
                 continue
-            items.update(_extract_code_decl_identifiers(nline))
+            decls = _extract_code_decl_identifiers(nline)
+            items.update(decls)
+            if not decls:
+                fn_name = _innermost_fn_at_line(head_fn_spans, lno)
+                if fn_name:
+                    items.add(f"fn:{fn_name}")
 
     for raw_line in res.stdout.splitlines():
         if raw_line.startswith("@@ "):
@@ -3178,15 +3390,15 @@ def extract_changed_surface_items(
             continue
         if raw_line.startswith("-"):
             if 1 <= old_line_no <= len(base_stripped_lines):
-                hunk_old_lines.append(base_stripped_lines[old_line_no - 1])
+                hunk_old_lines.append((old_line_no, base_stripped_lines[old_line_no - 1]))
             else:
-                hunk_old_lines.append(strip_rust_comments_and_strings(raw_line[1:]))
+                hunk_old_lines.append((old_line_no, strip_rust_comments_and_strings(raw_line[1:])))
             old_line_no += 1
         elif raw_line.startswith("+"):
             if 1 <= new_line_no <= len(head_stripped_lines):
-                hunk_new_lines.append(head_stripped_lines[new_line_no - 1])
+                hunk_new_lines.append((new_line_no, head_stripped_lines[new_line_no - 1]))
             else:
-                hunk_new_lines.append(strip_rust_comments_and_strings(raw_line[1:]))
+                hunk_new_lines.append((new_line_no, strip_rust_comments_and_strings(raw_line[1:])))
             new_line_no += 1
 
     flush_hunk()
@@ -3216,7 +3428,7 @@ _KNOWN_EXEC_MACROS = frozenset({
 
 
 def _strip_non_semantic_ident_occurrences(
-    text: str, extra_local_macros: set[str] | None = None
+    text: str, extra_local_macros: set[str] | None = None, preserve_bindings: bool = False
 ) -> str:
     """Blank out non-executing macro invocations (such as `stringify!(...)` or `nop!{ assert!(...) }`),
     `if false { ... }` / `while false { ... }` blocks, uncalled closures, and local `let [mut] <ident>`
@@ -3352,6 +3564,8 @@ def _strip_non_semantic_ident_occurrences(
         pos = closure_end
 
     s = "".join(chars)
+    if preserve_bindings:
+        return s
     # Blank out simple local variable pattern names in `let [mut] <ident>` (not followed by `::`, `{`, or `(`).
     let_pat_re = re.compile(r"\blet\s+(?:mut\s+)?((?:r#)?[A-Za-z_][A-Za-z0-9_]*)\b(?!\s*(?:::|\{|\())")
     chars = list(s)
@@ -3359,6 +3573,167 @@ def _strip_non_semantic_ident_occurrences(
         for i in range(m.start(1), m.end(1)):
             chars[i] = " "
     return "".join(chars)
+
+
+def _crate_pkg_for_path(view: RepoView, rel_path: str) -> str | None:
+    parts = Path(rel_path).parts
+    if len(parts) < 2 or parts[0] != "crates":
+        return None
+    crate_dir = parts[1]
+    cargo_rel = f"crates/{crate_dir}/Cargo.toml"
+    if view.is_file(cargo_rel):
+        try:
+            data = tomllib.loads(view.read_text(cargo_rel))
+            name = data.get("package", {}).get("name")
+            if isinstance(name, str) and name:
+                return name
+        except Exception:
+            pass
+    return crate_dir
+
+
+def _extract_cargo_dep_names(cargo_data: dict) -> tuple[set[str], bool]:
+    """Return `(dep_pkg_names, has_any_dep_section)` from a parsed Cargo.toml."""
+    deps: set[str] = set()
+    has_section = False
+
+    def collect_table(tbl: object) -> None:
+        nonlocal has_section
+        if not isinstance(tbl, dict):
+            return
+        has_section = True
+        for key, val in tbl.items():
+            if isinstance(val, dict) and isinstance(val.get("package"), str):
+                deps.add(val["package"])
+            else:
+                deps.add(key)
+
+    for sec in ("dependencies", "dev-dependencies", "build-dependencies"):
+        if sec in cargo_data:
+            collect_table(cargo_data.get(sec))
+    targets = cargo_data.get("target")
+    if isinstance(targets, dict):
+        for tcfg in targets.values():
+            if isinstance(tcfg, dict):
+                for sec in ("dependencies", "dev-dependencies", "build-dependencies"):
+                    if sec in tcfg:
+                        collect_table(tcfg.get(sec))
+    return deps, has_section
+
+
+def _crate_depends_on(view: RepoView, test_pkg: str, surface_pkg: str, strict: bool = False) -> bool:
+    """Return True if `test_pkg == surface_pkg` or `test_pkg` transitively depends on `surface_pkg`."""
+    if test_pkg == surface_pkg:
+        return True
+    test_cargo_rel = f"crates/{test_pkg}/Cargo.toml"
+    if not view.is_file(test_cargo_rel):
+        return False
+    try:
+        test_data = tomllib.loads(view.read_text(test_cargo_rel))
+    except Exception:
+        return False
+    direct_deps, has_dep_section = _extract_cargo_dep_names(test_data)
+    if not strict and not has_dep_section and not view.is_file("Cargo.toml"):
+        return True
+    visited: set[str] = {test_pkg}
+    queue: list[str] = list(direct_deps)
+    while queue:
+        cur = queue.pop(0)
+        if cur == surface_pkg:
+            return True
+        if cur in visited:
+            continue
+        visited.add(cur)
+        cur_cargo = f"crates/{cur}/Cargo.toml"
+        if view.is_file(cur_cargo):
+            try:
+                cur_data = tomllib.loads(view.read_text(cur_cargo))
+                more_deps, _ = _extract_cargo_dep_names(cur_data)
+                for d in more_deps:
+                    if d not in visited:
+                        queue.append(d)
+            except Exception:
+                pass
+    return False
+
+
+def _method_call_uses_receiver(text: str, receiver_type: str, method: str) -> bool:
+    """Require each method call's own receiver to have the changed impl type.
+
+    Support explicit associated paths, constructors, unit values and local
+    bindings with an explicit type or constructor. Unknown receiver types fail
+    closed; an unrelated type mention elsewhere never supplies call authority.
+    """
+    type_path = rf"(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*{re.escape(receiver_type)}"
+    generics = r"(?:\s*::\s*<[^;{}]*>)?"
+    if re.search(rf"\b{type_path}{generics}\s*::\s*{re.escape(method)}\s*\(", text):
+        return True
+
+    def scopes_at(pos: int) -> tuple[int, ...]:
+        stack: list[int] = []
+        for index, char in enumerate(text[:pos]):
+            if char == "{":
+                stack.append(index)
+            elif char == "}" and stack:
+                stack.pop()
+        return tuple(stack)
+
+    def constructor(expr: str) -> bool:
+        expr = re.sub(r"^(?:\s*&\s*(?:mut\s+)?)*", "", expr.strip())
+        return bool(re.match(rf"^{type_path}{generics}\s*(?:\(|\{{|$)", expr))
+
+    def local_has_type(name: str, before: int, seen: set[str]) -> bool | None:
+        if name in seen:
+            return False
+        seen = seen | {name}
+        pattern = re.compile(
+            rf"(?<![.\w])\b(?:let\s+(?:mut\s+)?)?{re.escape(name)}\s*"
+            r"(?::\s*([^=;]+))?\s*=(?!=)\s*"
+        )
+        call_scopes = scopes_at(before)
+        visible = [
+            match for match in pattern.finditer(text, 0, before)
+            if call_scopes[:len(scopes_at(match.start()))] == scopes_at(match.start())
+        ]
+        if not visible:
+            return None
+        declaration = visible[-1]
+        annotation = declaration.group(1)
+        if annotation and re.fullmatch(rf"\s*&?\s*(?:mut\s+)?{type_path}\s*", annotation):
+            return True
+        expr = text[declaration.end():before].split(";", 1)[0].strip()
+        if constructor(expr):
+            return True
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", expr):
+            return local_has_type(expr, declaration.start(), seen) is True
+        return False
+
+    for call in re.finditer(rf"\.\s*{re.escape(method)}\s*\(", text):
+        prefix = text[:call.start()].rstrip()
+        if prefix.endswith((")", "}")):
+            closing = prefix[-1]
+            opening = "(" if closing == ")" else "{"
+            depth = 0
+            for index in range(len(prefix) - 1, -1, -1):
+                if prefix[index] == closing:
+                    depth += 1
+                elif prefix[index] == opening:
+                    depth -= 1
+                    if depth == 0:
+                        if re.search(rf"\b{type_path}{generics}\s*$", prefix[:index]):
+                            return True
+                        break
+        else:
+            value = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)$", prefix)
+            if value:
+                name = value.group(1)
+                qualifier = prefix[:value.start()].rstrip()
+                if qualifier.endswith(".") or (qualifier.endswith("::") and name != receiver_type):
+                    continue
+                local_type = local_has_type(name, call.start(), set())
+                if local_type is True or (name == receiver_type and local_type is None):
+                    return True
+    return False
 
 
 def bound_test_references_surface(
@@ -3387,6 +3762,12 @@ def bound_test_references_surface(
     items = surface_items_cache[surface_path]
     if not items or not ref_texts:
         return False
+    surface_pkg = _crate_pkg_for_path(head_view, surface_path) or _crate_pkg_for_path(
+        base_view, renamed_modified_paths.get(surface_path, surface_path)
+    )
+    test_pkg = _crate_pkg_for_path(head_view, test_file)
+    if test_pkg and surface_pkg and not _crate_depends_on(head_view, test_pkg, surface_pkg, strict=False):
+        return False
     file_macros: set[str] = set()
     if head_view.is_file(test_file):
         file_macros.update(
@@ -3396,10 +3777,28 @@ def bound_test_references_surface(
             )
         )
     cleaned_texts = [_strip_non_semantic_ident_occurrences(txt, file_macros) for txt in ref_texts]
+    receiver_texts = [
+        _strip_non_semantic_ident_occurrences(txt, file_macros, preserve_bindings=True)
+        for txt in ref_texts
+    ]
     for ident in items:
-        pat = re.compile(rf"\b{re.escape(ident)}\b")
-        if any(pat.search(txt) for txt in cleaned_texts):
-            return True
+        if ident.startswith("fn:"):
+            if test_pkg and surface_pkg and not _crate_depends_on(head_view, test_pkg, surface_pkg, strict=True):
+                continue
+            fn_spec = ident[3:]
+            if "::" in fn_spec:
+                recv_type, fn_ident = fn_spec.split("::", 1)
+                if any(_method_call_uses_receiver(txt, recv_type, fn_ident) for txt in receiver_texts):
+                    return True
+            else:
+                # Free function: require non-dot call (`name(` or `path::name(`, never `.name(`).
+                pat = re.compile(rf"(?<!\.)\b{re.escape(fn_spec)}\s*\(")
+                if any(pat.search(txt) for txt in cleaned_texts):
+                    return True
+        else:
+            pat = re.compile(rf"\b{re.escape(ident)}\b")
+            if any(pat.search(txt) for txt in cleaned_texts):
+                return True
     return False
 
 

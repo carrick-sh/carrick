@@ -197,3 +197,86 @@ fn connect_publication_does_not_wake_a_newly_accepted_rdhup_wait() {
         "EOF while the child retains the half-closed client"
     );
 }
+
+#[test]
+fn timed_connect_and_accept_propagate_socket_timeouts_and_einprogress() {
+    use std::time::Duration;
+
+    let mut peer = Peer {
+        dispatcher: SyscallDispatcher::new(),
+        memory: LinearMemory::new(0x1000, vec![0; 0x1000]),
+        accepted: None,
+    };
+    let client_fd = peer.returned(nr::SOCKET, [2, 1, 0, 0, 0, 0]);
+    assert_eq!(
+        peer.dispatcher
+            .net_view()
+            .socket_connect_in_progress(client_fd as i32),
+        (false, None)
+    );
+
+    // Configure SO_SNDTIMEO = 250ms (SOL_SOCKET = 1, SO_SNDTIMEO = 21).
+    let mut snd_timeval = [0u8; 16];
+    snd_timeval[8..16].copy_from_slice(&250_000_i64.to_ne_bytes());
+    peer.memory.write_bytes(0x1000, &snd_timeval).unwrap();
+    assert_eq!(
+        peer.returned(nr::SETSOCKOPT, [client_fd, 1, 21, 0x1000, 16, 0]),
+        0
+    );
+    assert_eq!(
+        peer.dispatcher
+            .net_view()
+            .socket_connect_in_progress(client_fd as i32),
+        (false, Some(Duration::from_millis(250)))
+    );
+
+    peer.dispatcher
+        .net_view()
+        .update_socket_connection_state(client_fd as i32, Some(true), None);
+    let (in_progress, connect_timeout) = peer
+        .dispatcher
+        .net_view()
+        .socket_connect_in_progress(client_fd as i32);
+    assert!(in_progress);
+    assert_eq!(connect_timeout, Some(Duration::from_millis(250)));
+    assert_eq!(
+        carrick_signal_core::wait::SocketWaitTimeout::for_fd_wait(
+            nr::CONNECT.raw(),
+            [0; 6],
+            connect_timeout.is_some(),
+        ),
+        carrick_signal_core::wait::SocketWaitTimeout::Timed
+    );
+    assert_eq!(carrick_abi::LINUX_EINPROGRESS.guest_retval(), -115);
+
+    // Configure SO_RCVTIMEO = 125ms (SOL_SOCKET = 1, SO_RCVTIMEO = 20) on a listening socket
+    // and verify blocking accept propagates the timeout into WaitOnFds.
+    let listener_fd = peer.returned(nr::SOCKET, [2, 1, 0, 0, 0, 0]);
+    let mut addr = [0u8; 16];
+    addr[..2].copy_from_slice(&2_u16.to_ne_bytes());
+    addr[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    peer.memory.write_bytes(0x1040, &addr).unwrap();
+    assert_eq!(
+        peer.returned(nr::BIND, [listener_fd, 0x1040, 16, 0, 0, 0]),
+        0
+    );
+    assert_eq!(peer.returned(nr::LISTEN, [listener_fd, 1, 0, 0, 0, 0]), 0);
+    let mut rcv_timeval = [0u8; 16];
+    rcv_timeval[8..16].copy_from_slice(&125_000_i64.to_ne_bytes());
+    peer.memory.write_bytes(0x1080, &rcv_timeval).unwrap();
+    assert_eq!(
+        peer.returned(nr::SETSOCKOPT, [listener_fd, 1, 20, 0x1080, 16, 0]),
+        0
+    );
+    match peer.call(nr::ACCEPT, [listener_fd, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::WaitOnFds {
+            timeout,
+            completion: FdWaitCompletion::Fd { on_timeout },
+            ..
+        } => {
+            assert_eq!(timeout, Some(Duration::from_millis(125)));
+            assert_eq!(on_timeout, carrick_abi::LINUX_EAGAIN.guest_retval());
+        }
+        other => panic!("expected timed WaitOnFds from accept, got {other:?}"),
+    }
+}

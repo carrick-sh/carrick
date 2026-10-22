@@ -2949,6 +2949,274 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
         self.assertIn("does not reference changed surface", result.stderr)
 
+    def test_n1_body_only_edit_uses_only_innermost_fn_call_shape_and_rejects_workscope_add_and_impl_iterator(self):
+        """N1: body-only edits use only the innermost enclosing non-generic fn name with a call-shaped match; WorkScope/.add and impl Iterator must not satisfy relevance."""
+        self.use_single_contract_surface()
+        self.guest_file.write_text(
+            "pub struct WorkScope;\n"
+            "impl WorkScope {\n"
+            "    pub fn add(&mut self, n: u64) -> u64 {\n"
+            "        n + 1\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base_a = self._commit_all("seed WorkScope::add surface")
+        self.guest_file.write_text(
+            "pub struct WorkScope;\n"
+            "impl WorkScope {\n"
+            "    pub fn add(&mut self, n: u64) -> u64 {\n"
+            "        n + 2\n"
+            "    }\n"
+            "}\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    #[test]\n"
+            "    fn unrelated_alloc_test() { let _ = super::WorkScope; let mut x = 0u64; x = x.wrapping_add(1); let _ = x; }\n"
+            "    #[test]\n"
+            "    fn calls_dot_add() { let mut w = super::WorkScope; let _ = w.add(1); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::calls_dot_add"\n')
+        self._commit_all("edit WorkScope::add body and bind test calling .add(1)")
+        res_a = self.run_check(base_sha=base_a)
+        self.assertEqual(res_a.returncode, 1, msg=f"WorkScope/.add stdout: {res_a.stdout}\nstderr: {res_a.stderr}")
+        self.assertIn("does not reference changed surface", res_a.stderr)
+
+        # (b) impl Iterator argument shape in enclosing fn signature must not make Iterator relevant, and non-call mention of walk must fail
+        self.guest_file.write_text(
+            "pub fn walk(xs: impl Iterator<Item = u32>) -> u32 {\n"
+            "    xs.sum()\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base_b = self._commit_all("seed fn walk(xs: impl Iterator)")
+        self.guest_file.write_text(
+            "pub fn walk(xs: impl Iterator<Item = u32>) -> u32 {\n"
+            "    xs.count() as u32\n"
+            "}\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    fn helper<I: Iterator<Item = u32>>(it: I) -> usize { it.count() }\n"
+            "    #[test]\n"
+            "    fn mentions_iterator_and_non_call_walk() {\n"
+            "        let _ = helper(core::iter::empty());\n"
+            "        let _fn_item = super::walk;\n"
+            "    }\n"
+            "    #[test]\n"
+            "    fn calls_walk() {\n"
+            "        assert_eq!(super::walk(core::iter::empty()), 0);\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::mentions_iterator_and_non_call_walk"\n')
+        self._commit_all("edit walk body and bind test mentioning Iterator and non-call walk")
+        res_b = self.run_check(base_sha=base_b)
+        self.assertEqual(res_b.returncode, 1, msg=f"impl Iterator stdout: {res_b.stdout}\nstderr: {res_b.stderr}")
+        self.assertIn("does not reference changed surface", res_b.stderr)
+
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::calls_walk"\n')
+        self._commit_all("bind test calling walk(...)")
+        res_c = self.run_check(base_sha=base_b)
+        self.assertEqual(res_c.returncode, 0, msg=f"call walk stdout: {res_c.stdout}\nstderr: {res_c.stderr}")
+
+    def test_n5_comma_separated_bindings_and_cfg_not_doctest_and_data_driven_prefixes(self):
+        """N5: comma-separated bindings, cfg(not(doctest)), and data-driven prefix constants."""
+        spec = importlib.util.spec_from_file_location("check_contract_change", SCRIPT_PATH)
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        self.assertTrue(isinstance(getattr(checker, "BINDING_CLAUSE_PREFIXES", None), tuple))
+        self.assertTrue(isinstance(getattr(checker, "NON_RUST_BINDING_PREFIXES", None), tuple))
+
+        self.use_single_contract_surface()
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base_sha = self._commit_all("seed base for n5", allow_empty=True)
+        self.guest_file.write_text(
+            "pub fn futex_n5_item() -> i32 { 3 }\n"
+            "#[cfg(all(test, not(doctest)))]\n"
+            "mod tests {\n"
+            "    #[test]\n"
+            "    fn first_test() { assert_eq!(super::futex_n5_item(), 3); }\n"
+            "    #[test]\n"
+            "    fn second_test() { assert_eq!(super::futex_n5_item(), 3); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract(
+            'vm_free = "carrick-kernel::dispatch::futex::tests::first_test, carrick-kernel::dispatch::futex::tests::second_test"\n'
+        )
+        self._commit_all("add comma-separated bindings in cfg(all(test, not(doctest))) module")
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}\nstderr: {res.stderr}")
+
+    def test_new2_body_only_generic_method_receiver_type_and_unrelated_crate_fail(self):
+        """NEW-2: body-only edits on generic method names (WorkMeter::get, len, read, write, insert, iter, lock, as_ptr), non-generic methods called on unrelated receiver types, or bindings in crates not depending on the surface crate must fail."""
+        self.use_single_contract_surface()
+        self.guest_file.write_text(
+            "pub struct WorkMeter(u64);\n"
+            "impl WorkMeter {\n"
+            "    pub fn get(&self) -> u64 {\n"
+            "        self.0\n"
+            "    }\n"
+            "    pub fn sample_units(&self) -> u64 {\n"
+            "        self.0\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base_a = self._commit_all("seed WorkMeter::get and WorkMeter::sample_units")
+
+        # (a) Changing the body of WorkMeter::get and binding an unrelated test that calls .get( must fail
+        self.guest_file.write_text(
+            "pub struct WorkMeter(u64);\n"
+            "impl WorkMeter {\n"
+            "    pub fn get(&self) -> u64 {\n"
+            "        self.0 + 1\n"
+            "    }\n"
+            "    pub fn sample_units(&self) -> u64 {\n"
+            "        self.0\n"
+            "    }\n"
+            "}\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    #[test]\n"
+            "    fn unrelated_slice_get() {\n"
+            "        let xs = [10u64, 20u64];\n"
+            "        assert_eq!(xs.get(0), Some(&10));\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::unrelated_slice_get"\n')
+        self._commit_all("edit WorkMeter::get body and bind unrelated test calling .get(0)")
+        res_a = self.run_check(base_sha=base_a)
+        self.assertEqual(res_a.returncode, 1, msg=f"WorkMeter::get stdout: {res_a.stdout}\nstderr: {res_a.stderr}")
+        self.assertIn("does not reference changed surface", res_a.stderr)
+
+        # (b) Changing the body of non-generic WorkMeter::sample_units and binding a test that calls .sample_units() on an unrelated receiver without WorkMeter must fail
+        self.guest_file.write_text(
+            "pub struct WorkMeter(u64);\n"
+            "impl WorkMeter {\n"
+            "    pub fn get(&self) -> u64 {\n"
+            "        self.0\n"
+            "    }\n"
+            "    pub fn sample_units(&self) -> u64 {\n"
+            "        self.0 + 5\n"
+            "    }\n"
+            "}\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    struct UnrelatedReceiver;\n"
+            "    impl UnrelatedReceiver { fn sample_units(&self) -> u64 { 5 } }\n"
+            "    #[test]\n"
+            "    fn calls_sample_units_on_wrong_receiver() {\n"
+            "        let u = UnrelatedReceiver;\n"
+            "        assert_eq!(u.sample_units(), 5);\n"
+            "    }\n"
+            "    #[test]\n"
+            "    fn calls_work_meter_sample_units() {\n"
+            "        let m = super::WorkMeter(10);\n"
+            "        assert_eq!(m.sample_units(), 15);\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::calls_sample_units_on_wrong_receiver"\n')
+        self._commit_all("edit WorkMeter::sample_units and bind test calling sample_units on unrelated receiver")
+        res_b = self.run_check(base_sha=base_a)
+        self.assertEqual(res_b.returncode, 1, msg=f"wrong receiver stdout: {res_b.stdout}\nstderr: {res_b.stderr}")
+        self.assertIn("does not reference changed surface", res_b.stderr)
+
+        # Binding the test that references WorkMeter and calls .sample_units() in the same crate passes
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::calls_work_meter_sample_units"\n')
+        self._commit_all("bind test calling WorkMeter.sample_units() in same crate")
+        res_b_ok = self.run_check(base_sha=base_a)
+        self.assertEqual(res_b_ok.returncode, 0, msg=f"valid receiver stdout: {res_b_ok.stdout}\nstderr: {res_b_ok.stderr}")
+
+        # (c) Binding a test in another crate that does NOT depend on carrick-kernel must fail even if it names WorkMeter and calls sample_units()
+        other_crate = self.repo / "crates" / "carrick-other"
+        (other_crate / "src").mkdir(parents=True, exist_ok=True)
+        (other_crate / "Cargo.toml").write_text(
+            '[package]\nname = "carrick-other"\nversion = "0.1.0"\nedition = "2024"\n\n'
+            '[package.metadata.carrick.test-lanes]\n"*" = "host"\n',
+            encoding="utf-8",
+        )
+        (other_crate / "src" / "lib.rs").write_text(
+            "pub struct WorkMeter(pub u64);\n"
+            "impl WorkMeter { pub fn sample_units(&self) -> u64 { self.0 } }\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    #[test]\n"
+            "    fn cross_crate_without_dep() {\n"
+            "        let m = super::WorkMeter(15);\n"
+            "        assert_eq!(m.sample_units(), 15);\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        with (self.repo / "conformance-contracts" / "surfaces.toml").open("a", encoding="utf-8") as f:
+            f.write('\n[[surfaces]]\npath = "crates/carrick-other/src/lib.rs"\ncontracts = []\n')
+        self._write_futex_contract('vm_free = "carrick-other::tests::cross_crate_without_dep"\n')
+        self._commit_all("bind test in carrick-other which does not depend on carrick-kernel")
+        res_c = self.run_check(base_sha=base_a)
+        self.assertEqual(res_c.returncode, 1, msg=f"cross-crate without dep stdout: {res_c.stdout}\nstderr: {res_c.stderr}")
+        self.assertIn("does not reference changed surface", res_c.stderr)
+
+        # Once carrick-other declares a dependency on carrick-kernel, the cross-crate binding passes
+        (other_crate / "Cargo.toml").write_text(
+            '[package]\nname = "carrick-other"\nversion = "0.1.0"\nedition = "2024"\n\n'
+            '[dependencies]\ncarrick-kernel = { path = "../carrick-kernel" }\n\n'
+            '[package.metadata.carrick.test-lanes]\n"*" = "host"\n',
+            encoding="utf-8",
+        )
+        self._commit_all("add carrick-kernel dependency to carrick-other")
+        res_c_ok = self.run_check(base_sha=base_a)
+        self.assertEqual(res_c_ok.returncode, 0, msg=f"cross-crate with dep stdout: {res_c_ok.stdout}\nstderr: {res_c_ok.stderr}")
+
+    def test_review6_unrelated_receiver_mention_fails(self):
+        """A type mention cannot license a method call on a different receiver."""
+        self.use_single_contract_surface()
+        production = (
+            "pub struct WorkMeter(u64);\nimpl WorkMeter {\n"
+            "    pub fn sample_units(&self) -> u64 {\n        self.0\n    }\n}\n"
+        )
+        self.guest_file.write_text(production)
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base = self._commit_all("seed receiver provenance")
+        tests = (
+            "#[cfg(test)]\nmod tests {\n"
+            "struct Other;\nimpl Other { fn sample_units(&self) -> u64 { 2 } }\n"
+            "#[test]\nfn witness() {\n"
+            "    let _ = core::mem::size_of::<super::WorkMeter>();\n"
+            "    assert_eq!(Other.sample_units(), 2);\n}\n}\n"
+        )
+        changed = production.replace("        self.0\n", "        self.0 + 1\n")
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::witness"\n')
+        for expression in (
+            "Other.sample_units()",
+            "{ let m = super::WorkMeter(1); let m = Other; m.sample_units() }",
+            "{ let m = Other; let _ = super::WorkMeter(1); m.sample_units() }",
+            "{ let WorkMeter = Other; WorkMeter.sample_units() }",
+            "{ { let m = super::WorkMeter(1); } let m = Other; m.sample_units() }",
+        ):
+            with self.subTest(unrelated=expression):
+                self.guest_file.write_text(changed + tests.replace("Other.sample_units()", expression))
+                self._commit_all("mention WorkMeter but invoke an unrelated receiver")
+                result = self.run_check(base_sha=base)
+                self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
+                self.assertIn("does not reference changed surface", result.stderr)
+
+        for expression in ("super::WorkMeter(1).sample_units()",
+                           "{ let m = super::WorkMeter(1); m.sample_units() }",
+                           "super::WorkMeter::sample_units(&super::WorkMeter(1))",
+                           "{ let m: super::WorkMeter = super::WorkMeter(1); m.sample_units() }",
+                           "{ let m = super::WorkMeter(1); let alias = m; alias.sample_units() }"):
+            with self.subTest(expression=expression):
+                self.guest_file.write_text(changed + tests.replace("Other.sample_units()", expression))
+                self._commit_all("invoke the actual receiver")
+                result = self.run_check(base_sha=base)
+                self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
