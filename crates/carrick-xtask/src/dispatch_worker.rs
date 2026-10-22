@@ -554,6 +554,35 @@ fn git(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
     String::from_utf8(output(&mut git_invocation(root, args))?)
         .map_err(|_| ScalerError::Guard("non-UTF8 git output"))
 }
+fn draft_pr_title(work: &Path, base: &str, issue: u64, token: &str) -> Result<String, ScalerError> {
+    // Only read the runner's reconstructed repository, through the same
+    // hardened Git invocation as completion's other repository operations.
+    let commits = git(
+        work,
+        &[
+            "rev-list",
+            "--reverse",
+            "--topo-order",
+            &format!("{base}..HEAD"),
+        ],
+    )?;
+    let subject = match commits.lines().next() {
+        Some(first) => git(work, &["show", "--no-patch", "--format=%s", first])?,
+        None => String::new(),
+    };
+    // Remove only Git's record terminator; trimming would hide controls.
+    let subject = subject.strip_suffix('\n').unwrap_or(&subject);
+    let title = if subject.trim().is_empty()
+        || subject.chars().count() > 100
+        || subject.chars().any(char::is_control)
+    {
+        format!("chore(ci): work issue {issue}")
+    } else {
+        subject.to_owned()
+    };
+    Ok(title.replace(token, "[REDACTED]"))
+}
+
 fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
     String::from_utf8(output(Command::new("gh").args(args).current_dir(root))?)
         .map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
@@ -1212,7 +1241,7 @@ fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
                         "--head",
                         &dispatch.branch,
                         "--title",
-                        &format!("chore(ci): work issue {}", dispatch.issue),
+                        &draft_pr_title(&work, &receipt.base, dispatch.issue, &token)?,
                         "--body-file",
                         path.to_str().ok_or(ScalerError::Guard("body path"))?,
                     ],
@@ -1270,6 +1299,65 @@ fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn draft_pr_title_uses_the_first_branch_commit_subject() {
+        let temp = tempfile::tempdir().unwrap();
+        fixture_repository(temp.path());
+        let base = git(temp.path(), &["rev-parse", "HEAD"]).unwrap();
+        let subject = "fix(ci): title dispatch drafts from the first commit";
+        git(temp.path(), &["commit", "--allow-empty", "-m", subject]).unwrap();
+        git(
+            temp.path(),
+            &["commit", "--allow-empty", "-m", "test(ci): add coverage"],
+        )
+        .unwrap();
+        assert_eq!(
+            draft_pr_title(temp.path(), base.trim(), 792, "fixture-job-token").unwrap(),
+            subject
+        );
+    }
+
+    #[test]
+    fn draft_pr_title_validates_subjects_and_masks_the_job_token() {
+        let token = "fixture-job-token";
+        let fallback = "chore(ci): work issue 792";
+        for (subject, expected) in [
+            (String::new(), fallback.to_owned()),
+            ("x".repeat(101), fallback.to_owned()),
+            ("fix(ci): reject\tcontrols".into(), fallback.to_owned()),
+            ("fix(ci): reject\u{7f}controls".into(), fallback.to_owned()),
+            ("fix(ci): reject\u{85}controls".into(), fallback.to_owned()),
+            ("é".repeat(100), "é".repeat(100)),
+            (
+                format!("fix(ci): hide {token}"),
+                "fix(ci): hide [REDACTED]".into(),
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fixture_repository(temp.path());
+            let base = git(temp.path(), &["rev-parse", "HEAD"]).unwrap();
+            assert_eq!(
+                draft_pr_title(temp.path(), base.trim(), 792, token).unwrap(),
+                fallback
+            );
+            git(
+                temp.path(),
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "--allow-empty-message",
+                    "--cleanup=verbatim",
+                    "-m",
+                    &subject,
+                ],
+            )
+            .unwrap();
+            let title = draft_pr_title(temp.path(), base.trim(), 792, token).unwrap();
+            assert_eq!(title, expected, "subject: {subject:?}");
+            assert!(!title.contains(token));
+        }
+    }
+
     #[test]
     fn launcher_result_is_kept_as_bounded_evidence() {
         let temp = tempfile::tempdir().unwrap();
@@ -1410,6 +1498,7 @@ mod tests {
         std::fs::write(actor.join("data"), "base").unwrap();
         git(&actor, &["add", "."]).unwrap();
         git(&actor, &["commit", "-m", "base"]).unwrap();
+        let base = git(&actor, &["rev-parse", "HEAD"]).unwrap();
         let poison = format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display());
         for script in [actor.join("poison.sh"), actor.join(".git/hooks/pre-commit")] {
             std::fs::write(&script, &poison).unwrap();
@@ -1422,6 +1511,10 @@ mod tests {
         snapshot(&actor, &target, "work/dispatch-42").unwrap();
         git(&target, &["add", "."]).unwrap();
         git(&target, &["commit", "-m", "read agent data"]).unwrap();
+        assert_eq!(
+            draft_pr_title(&target, base.trim(), 42, "fixture-job-token").unwrap(),
+            "read agent data"
+        );
         assert!(
             !marker.exists(),
             "runner executed agent-written hook, config or script"
