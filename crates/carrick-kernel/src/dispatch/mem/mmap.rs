@@ -169,6 +169,11 @@ fn overlaps_clock_stub(address: u64, length: u64) -> Result<bool, LinuxErrno> {
 impl<'a> MemView<'a> {
     define_syscall! {
         mm_mutation fn mmap_served(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
+            // One fail-stop authority for indeterminate private publication,
+            // whether repointing an overlay or retiring its predecessor.
+            let fail_stop_private_publication = |reason: std::fmt::Arguments<'_>| -> ! {
+                carrick_fatal!("dispatch::mmap_overlay", "{reason}");
+            };
             let user_ceiling = UserVaCeiling::for_abi(cx.guest_abi());
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
@@ -755,10 +760,9 @@ impl<'a> MemView<'a> {
                             // Live translation state is unknown. Retain BOTH the
                             // fresh candidate and prior owners; recycling either
                             // could hand active guest leaves to another mapping.
-                            carrick_fatal!(
-                                "dispatch::mmap_overlay",
+                            fail_stop_private_publication(format_args!(
                                 "private repoint failure entered indeterminate state during overlay"
-                            );
+                            ));
                         }
                     }
                 }
@@ -1303,16 +1307,33 @@ impl<'a> MemView<'a> {
             // full candidate test follows once the grant is known). It also
             // picks the grant's congruence: a page-cache view needs
             // `address ≡ offset (mod host page)`.
-            let file_lowering_eligible = map_sharing == MmapSharing::Private
+            let file_lowering_enabled = map_sharing == MmapSharing::Private
                 && !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
                 && !map_flags.contains(LinuxMmapFlags::GROWSDOWN)
-                && mmap_file_backed_lowering_enabled()
-                && this.open_file(fd.0).is_some_and(|open_file| {
-                    crate::kernel::FileDescription::inspect(&open_file.description)
-                        .as_deref()
-                        .and_then(OpenDescription::shared_alias_host_fd)
-                        .is_some()
-                });
+                && mmap_file_backed_lowering_enabled();
+            let owner_file_eligible = map_sharing == MmapSharing::Private
+                && !map_flags.intersects(
+                    LinuxMmapFlags::ANONYMOUS | LinuxMmapFlags::GROWSDOWN
+                        | LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED,
+                )
+                && this.mem().lock().delegated_root().is_some();
+            // Inspect the description once for both venues. Retaining an owner
+            // source does not introduce another file-description authority.
+            let (file_lowering_eligible, owner_file_candidate_len) = if file_lowering_enabled || owner_file_eligible {
+                this.open_file(fd.0).and_then(|open_file| {
+                    let description = crate::kernel::FileDescription::inspect(&open_file.description)?;
+                    let lowering = file_lowering_enabled && description.shared_alias_host_fd().is_some();
+                    let owner_len = match &*description {
+                        OpenDescription::HostFile { host_fd, metadata, .. }
+                            if owner_file_eligible && metadata.kind == carrick_vfs::rootfs::RootFsEntryKind::File =>
+                                host_fd_file_len(host_fd.raw()),
+                        _ => None,
+                    };
+                    Some((lowering, owner_len))
+                }).unwrap_or((false, None))
+            } else {
+                (false, None)
+            };
             // A plain private anonymous mapping a delegated root can own
             // itself; every other mapping is host-served on a delegated MM.
             let root_eligible = map_flags.contains(LinuxMmapFlags::ANONYMOUS)
@@ -1407,26 +1428,7 @@ impl<'a> MemView<'a> {
             // through UserWrite: that checks the predecessor/placeholder's
             // permissions and accepts at most one bounded stream chunk. Nor
             // does a Linux file offset need host-page congruence in this venue.
-            let owner_file_len = if !address_uses_alias
-                && map_sharing == MmapSharing::Private
-                && !map_flags.intersects(
-                    LinuxMmapFlags::ANONYMOUS | LinuxMmapFlags::GROWSDOWN
-                        | LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED,
-                )
-                && this.mem().lock().delegated_root().is_some()
-            {
-                this.open_file(fd.0).and_then(|open_file| {
-                    let description = crate::kernel::FileDescription::inspect(&open_file.description);
-                    match description.as_deref() {
-                        Some(OpenDescription::HostFile { host_fd, metadata, .. })
-                            if metadata.kind == carrick_vfs::rootfs::RootFsEntryKind::File =>
-                                host_fd_file_len(host_fd.raw()),
-                        _ => None,
-                    }
-                })
-            } else {
-                None
-            };
+            let owner_file_len = if address_uses_alias { None } else { owner_file_candidate_len };
             let owner_file_backed = owner_file_len.is_some();
             let lowering_candidate = file_lowering_eligible && !address_uses_alias
                 && !owner_file_backed;
@@ -2228,10 +2230,9 @@ impl<'a> MemView<'a> {
                         ));
                     }
                     Err(carrick_guest_mem::MappingRetirementError::Indeterminate(error)) => {
-                        carrick_fatal!(
-                            "dispatch::mmap_retirement",
+                        fail_stop_private_publication(format_args!(
                             "private file replacement retirement is indeterminate at {address:#x}+{length:#x}: {error}"
-                        );
+                        ));
                     }
                 }
                 this.remove_mapping_metadata(address, length);
