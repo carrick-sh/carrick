@@ -162,3 +162,18 @@ With agent clones enabled, startup requires exactly `VM.Audit=1` and
 its pool inventory intentionally excludes this source. The root-run builder
 uses `qm` to start and stop the agent template during provisioning; the
 controller token retains only its inspection and clone rights.
+
+### Codex SDK
+
+The agent template builds `/opt/carrick-agent/codex-sdk` once from
+`scripts/ci/inputs/codex-sdk-requirements.txt`. It installs hash-locked wheels
+with `--require-hashes`. The SDK is root-owned and read-only to the agent.
+
+The driver sets `AGY_DIRECTOR_CODEX_VENV` to that path, so no job installs
+packages at run time. It sets `AGY_DIRECTOR_ROUTES=default` because the tier
+table names the backend explicitly.
+
+When the pinned launcher's `CODEX_SDK_VERSION` changes, regenerate the lock
+file for the template's Python (3.13, x86_64) and rebuild template 9000.
+The test `agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses`
+ties the builder, the lock file and the driver together.
