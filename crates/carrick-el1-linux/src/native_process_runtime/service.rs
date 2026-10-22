@@ -22,8 +22,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let pending = self
             .graph
             .lock()
-            .services
-            .get(&record)
+            .service_wait(&record)
             .map(|pending| (pending.request, pending.control.clone()));
         let Some((request, control)) = pending else {
             return Ok(());
@@ -39,8 +38,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         if self
             .graph
             .lock()
-            .services
-            .get(&record)
+            .service_wait(&record)
             .map(|pending| pending.request)
             != Some(request)
         {
@@ -63,6 +61,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'_, 'a, M, C, S>
 {
+    #[inline(never)]
     fn release_service_claim(
         &mut self,
         claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
@@ -94,7 +93,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<NativeResume, NativeProcessError> {
         let (page, mm, control) = {
             let graph = self.runtime.graph.lock();
-            if graph.services.contains_key(&self.record) {
+            if graph.member_waits.contains_key(&self.record) {
                 return Err(NativeProcessError::Busy);
             }
             let resources = graph
@@ -124,7 +123,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         };
         let published = {
             let graph = self.runtime.graph.lock();
-            if !claim.admitted() || graph.services.contains_key(&self.record) {
+            if !claim.admitted() || graph.member_waits.contains_key(&self.record) {
                 Err(NativeProcessError::Busy)
             } else {
                 self.control
@@ -140,13 +139,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(error);
             }
         };
-        self.runtime.graph.lock().services.insert(
+        self.runtime.graph.lock().member_waits.insert(
             self.record,
-            PendingService {
+            MemberWait::Service(Box::new(PendingService {
                 request,
                 claim,
                 control,
-            },
+            })),
         );
         if let Err(error) = self
             .current
@@ -175,8 +174,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .runtime
                     .graph
                     .lock()
-                    .services
-                    .remove(&self.record)
+                    .remove_service_wait(&self.record)
                     .ok_or(NativeProcessError::Quarantined)?;
                 self.release_service_claim(pending.claim)?;
                 return Err(error);
@@ -262,8 +260,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .runtime
             .graph
             .lock()
-            .services
-            .get(&self.record)?
+            .service_wait(&self.record)?
             .request;
         let operation = carrick_core::wait::take_object_operation(
             self.source.zone,
@@ -288,8 +285,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .runtime
             .graph
             .lock()
-            .services
-            .remove(&self.record)
+            .remove_service_wait(&self.record)
             .ok_or(NativeProcessError::Stale)?;
         if pending.request != request {
             return Err(NativeProcessError::Quarantined);
