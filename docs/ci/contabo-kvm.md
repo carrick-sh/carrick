@@ -141,8 +141,8 @@ the first-rollout selector bootstrap requirement.
    `/pool/carrick-ci`, `PVEDatastoreUser` on `/storage/local`, and
    `PVESDNUser` on `/sdn/zones/localnetwork`. Write the token's JSON
    (`full-tokenid`, `value`) to `/root/carrick-ci-token.json`, mode 0600,
-   without printing it. The controller refuses to start if the token has any
-   rights over a protected VM.
+   without printing it. The controller refuses to start if the token has
+   unexpected rights over a protected VM (9000 permits only inspection and cloning).
 2. Build `carrick-xtask` on a Debian 13 x86 worker (glibc at most 2.41), and
    copy it with a `git archive` of `scripts/ci`, `Cargo.lock` and
    `rust-toolchain.toml` to `/root/carrick-ci`. Install `genisoimage`, `jq`
@@ -225,3 +225,26 @@ do not establish deployed acceptance.
 - Ledger: `/root/carrick-ci/state/ledger.json`. Clones are `carrick-ci` pool
   members 308-349: `pvesh get /pools/carrick-ci`.
 - A clone's console: `qm terminal <vmid>` (serial0).
+
+## Agent template pool and ACLs (#762)
+
+Template 9000 is a clone source **outside** the `carrick-ci` pool. Template
+300 stays in the pool, and clones from either source are created in the pool.
+Pool membership grants administrative VM rights and must never be used for
+9000. Changing `carrick-ci` pool membership is a controller-affecting shared
+change: announce it before and after under AGENTS.md's “Multiple director
+sessions” rules.
+
+The owner applies the source ACL to both the user and its privilege-separated
+token; both grants are needed:
+
+```sh
+pveum acl modify /vms/9000 --roles PVETemplateUser --users ci-scaler@pve
+pveum acl modify /vms/9000 --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
+```
+
+With agent clones enabled, startup requires exactly `VM.Audit=1` and
+`VM.Clone=1` on 9000. The controller reads its configuration directly because
+its pool inventory intentionally excludes this source. The root-run builder
+uses `qm` to start and stop the agent template during provisioning; the
+controller token retains only its inspection and clone rights.
