@@ -1786,7 +1786,7 @@ mod tests {
     /// `go build`); a record that predated its lease did the same for the
     /// moved thread.
     #[test]
-    fn a_mailbox_lease_owns_its_el1_current_task_record() {
+    fn serial_host_a_mailbox_lease_owns_its_el1_current_task_record() {
         let region = carrick_test_support::TestEl1Region::zeroed();
         let previous = carrick_el1_abi::get_el1_region_host_ptr();
         carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
@@ -1944,6 +1944,24 @@ mod tests {
             mailbox.state.load(Ordering::Acquire),
             MailboxState::ResponseReady.raw()
         );
+    }
+
+    #[test]
+    fn native_owner_cancel_from_el0_keeps_idle_without_syscall_authority() {
+        let (mut binding, mut mailbox) = binding();
+        assert!(binding.export_task_continuation().unwrap().is_none());
+        mailbox.return_value = 0xfeed_face;
+        binding.publish_native_owner_cancel().unwrap();
+        assert_eq!(mailbox.return_value, 0xfeed_face);
+        assert_eq!(
+            mailbox.response_action,
+            MailboxResponseAction::NativeOwnerCancel.raw()
+        );
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            MailboxState::Idle.raw()
+        );
+        assert!(binding.export_task_continuation().unwrap().is_none());
     }
 
     #[test]
