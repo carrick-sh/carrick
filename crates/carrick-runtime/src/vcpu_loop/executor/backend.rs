@@ -975,12 +975,10 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         if let Some(slot) = engine
             .mailbox_slot()
             .and_then(carrick_el1_abi::SlotId::from_index)
-        {
-            if let Some(service) =
+            && let Some(service) =
                 carrick_vmm_hvf::hvf_aarch64_engine::take_worker_native_service(engine.vm(), slot)?
-            {
-                finish_native_service(service, submission.scheduler.kernel())?;
-            }
+        {
+            finish_native_service(service, submission.scheduler.kernel())?;
         }
         Ok(exit)
     }
@@ -1415,10 +1413,8 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         if let Ok(ref outcome) = exit
             && !matches!(outcome, carrick_aarch64::Aarch64Exit::Halt)
         {
-            // The idle executor has no host graph thread to service an EL0
-            // exit. Preserve the stopped native record and syndrome before
-            // the worker returns its error; the next capture can distinguish
-            // a COW miss, translation fault, and host-only syscall.
+            // Preserve the raw exit before taking an owned service notice.
+            // This also diagnoses exits without an authenticated continuation.
             let record = zone.slot(slot).current();
             let native_owned = record.is_some_and(|id| zone.record(id).is_native_owned());
             let (kind, syndrome, far) = match outcome {

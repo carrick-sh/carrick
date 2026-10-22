@@ -216,18 +216,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_core::wait::ObjectParkRequest::owner(key, token, entry),
             &|_| {},
             || {
-                if self.signal_interrupts_current()
+                if (self.signal_interrupts_current()
                     || self
                         .runtime
                         .graph
                         .lock()
                         .pending_exit
-                        .contains_key(&self.key)
+                        .contains_key(&self.key))
+                    && let Err(error) = self.control.service.cancel(request.identity)
                 {
-                    if let Err(error) = self.control.service.cancel(request.identity) {
-                        failure = Some(service_error(error));
-                        return Err(ObjectWaitError::Stale);
-                    }
+                    failure = Some(service_error(error));
+                    return Err(ObjectWaitError::Stale);
                 }
                 match self.control.service.consume(request.identity) {
                     Ok(result) => {

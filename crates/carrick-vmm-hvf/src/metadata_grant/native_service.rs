@@ -98,16 +98,12 @@ pub(super) fn take(
     let Some(key) = ObjectWaitKey::native_service(selector.record) else {
         return Ok(None);
     };
-    let Ok(_queue) = zone.object_wait(key, &carrick_sched_core::ShortLockSpin) else {
+    let Ok(queue) = zone.object_wait(key, &carrick_sched_core::ShortLockSpin) else {
         return Ok(None);
     };
-    let Some(record) = zone
-        .live(selector.record)
-        .filter(|record| record.is_native_owned())
-    else {
+    let Some(identity) = queue.native_service_member(selector.record) else {
         return Ok(None);
     };
-    let identity = record.identity();
     if identity.generation != selector.execution.raw() {
         return Ok(None);
     }

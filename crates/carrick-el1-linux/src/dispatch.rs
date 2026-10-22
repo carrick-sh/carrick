@@ -666,10 +666,10 @@ pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
 /// Capture only after the final descriptor drain has selected its boundary.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn capture_native_service_exit(frame: &mut TrapFrame, action: Action) -> Action {
-    if matches!(action, Action::Forward | Action::ServedWithWork) {
-        if let Some(owned) = arm_native_service_exit(frame, action) {
-            return owned;
-        }
+    if matches!(action, Action::Forward | Action::ServedWithWork)
+        && let Some(owned) = arm_native_service_exit(frame, action)
+    {
+        return owned;
     }
     action
 }

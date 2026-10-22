@@ -1643,11 +1643,15 @@ fn next_runnable<F: PersistentExecutor>(
             let waited = backend.wait_in_guest();
             backend.disarm_guest_idle();
             drop(idle_wait);
-            if matches!(
-                waited.map_err(|error| NextError::Fatal(error.to_string()))?,
-                GuestIdleExit::Idle
-            ) {
-                return Ok(None);
+            match waited.map_err(|error| NextError::Fatal(error.to_string()))? {
+                GuestIdleExit::Idle => return Ok(None),
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                GuestIdleExit::Service(service) => {
+                    backend::finish_native_service(service, scheduler.kernel())
+                        .map_err(|error| NextError::Fatal(error.to_string()))?;
+                    return Ok(None);
+                }
+                GuestIdleExit::Unsupported => {}
             }
         }
         return Ok(Some(scheduler.take(registration)?));
