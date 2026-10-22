@@ -534,6 +534,15 @@ fn arm_binding_then_native_fork_commits_on_current_stack(exec: bool) {
 /// VM-free transport binding for `kernel.scheduler.runnable-progress`.
 #[test]
 fn two_native_children_service_waits_release_the_only_execution_slot() {
+    two_native_children_service_waits(false);
+}
+
+#[test]
+fn completed_native_service_preserves_result_through_cancellation() {
+    two_native_children_service_waits(true);
+}
+
+fn two_native_children_service_waits(completed_work: bool) {
     use super::super::native_process_runtime::NativeResume;
     use carrick_core::lifecycle::Lifecycle;
     use carrick_core_abi::service::{ServiceCell, ServiceError, ServiceOperation};
@@ -605,7 +614,10 @@ fn two_native_children_service_waits_release_the_only_execution_slot() {
         // SAFETY: the real native owner retains these published allocations.
         let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
         let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
-        let saved = unsafe { *fixture.zone.record(child).ctx_mut() };
+        let mut saved = unsafe { *fixture.zone.record(child).ctx_mut() };
+        if completed_work {
+            saved.native.x[0] = 73;
+        }
         let grant = fixture
             .zone
             .spaces
@@ -621,13 +633,16 @@ fn two_native_children_service_waits_release_the_only_execution_slot() {
             control,
             &mut service,
             |entry| {
-                let result = entry
-                    .begin_service(ServiceOperation::Fault(FaultInfo {
+                let operation = if completed_work {
+                    ServiceOperation::CompletedWork
+                } else {
+                    ServiceOperation::Fault(FaultInfo {
                         address: UserVa::new(0x6000000fd8),
                         access: Access::Write,
                         present: true,
-                    }))
-                    .unwrap();
+                    })
+                };
+                let result = entry.begin_service(operation).unwrap();
                 assert!(entry.take_handoff_receipt().is_some());
                 result
             },
@@ -818,6 +833,12 @@ fn two_native_children_service_waits_release_the_only_execution_slot() {
             NativeResume::NoPending
         ));
         assert_eq!(page.claimed_count(), 0);
+        if completed_work {
+            assert_eq!(
+                unsafe { (*fixture.zone.record(child).ctx_mut()).native.x[0] },
+                73
+            );
+        }
         assert_eq!(
             control.service.consume(request.identity),
             Err(ServiceError::Busy),

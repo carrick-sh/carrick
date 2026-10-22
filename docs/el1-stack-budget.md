@@ -74,3 +74,8 @@ frame gate, red on the combined fork/signals image before these corrections.
 The signed `el1_anonymous_mapping_retirement_returns_and_reuses_frames` witness
 and the complete signed gate remain required on the exact final macOS artifact.
 Linux-only compilation and VM-free tests do not confer signed acceptance.
+
+The native service continuation envelope includes both fresh capture and
+resumption, the exact owner-entry borrow, park/completion, and notification
+allocation tails. The completed-work variant preserves the saved result;
+its carrier acknowledgment cannot replay an already completed syscall.

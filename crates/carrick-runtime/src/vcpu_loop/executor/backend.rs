@@ -614,8 +614,17 @@ pub(crate) enum GuestIdleExit {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn finish_native_service(
     service: carrick_vmm_hvf::metadata_grant::NativeService,
+    kernel: &carrick_kernel::kernel::Kernel,
 ) -> Result<(), TrapError> {
-    let effects = service.refuse()?;
+    let effects = if service.request().operation
+        == carrick_core_abi::service::ServiceOperation::CompletedWork
+    {
+        let doorbell = carrick_el1_abi::take_host_work_doorbell(usize::from(service.slot().raw()));
+        carrick_kernel::el1_delegation::settle_host_work_boundary(kernel, true, doorbell);
+        service.acknowledge_work()?
+    } else {
+        service.refuse()?
+    };
     for target in effects.sgi_slots() {
         carrick_kernel::el1_zone::resched_slot(target);
     }
@@ -969,7 +978,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             if let Some(service) =
                 carrick_vmm_hvf::hvf_aarch64_engine::take_worker_native_service(engine.vm(), slot)?
             {
-                finish_native_service(service)?;
+                finish_native_service(service, submission.scheduler.kernel())?;
             }
         }
         Ok(exit)
