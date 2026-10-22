@@ -1128,3 +1128,49 @@ fn agent_template_profile_preserves_hardening_without_root_sudo() {
     }
     assert!(!source.contains("rm -f /etc/sudoers.d/carrick-dispatch-agent"));
 }
+
+#[test]
+fn template_create_pool_is_profile_specific() {
+    // Execute only the creation fragment with qm captured, never the builder.
+    let source = include_str!("../../../scripts/ci/build-template-debian.sh");
+    let fragment = source
+        .split("net0=\"virtio,bridge=$bridge\"")
+        .nth(1)
+        .unwrap()
+        .split("qm importdisk")
+        .next()
+        .unwrap();
+    for (profile, expected) in [("agent", false), ("kvm", true)] {
+        let script = format!(
+            r#"set -euo pipefail
+profile={profile}
+template=9000
+bridge=vmbr1
+cores=8
+memory_mib=20480
+vm_firewall=0
+net0=virtio,bridge=vmbr1
+declare -A site=([SITE_ALLOW_KSM]=0)
+qm() {{ printf '%s\n' "$@"; }}
+{fragment}"#
+        );
+        let output = std::process::Command::new("bash")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let args = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            args.lines().any(|arg| arg == "--pool"),
+            expected,
+            "{profile}: {args}"
+        );
+        if expected {
+            assert!(args.contains("--pool\ncarrick-ci\n"));
+        }
+    }
+}

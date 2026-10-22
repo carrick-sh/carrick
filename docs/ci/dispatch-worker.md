@@ -125,3 +125,26 @@ runner group. After verified retirement, the driver reads agent files only
 as data. It never executes or sources agent-written scripts, Git hooks or
 configuration. Git runs against a reconstructed snapshot with hooks and
 configuration disabled, never by changing into the agent tree to run commands.
+
+## Agent template pool and ACLs (#762)
+
+Template 9000 is a clone source **outside** the `carrick-ci` pool. Template
+300 stays in the pool, and clones from either source are created in the pool.
+Pool membership grants administrative VM rights and must never be used for
+9000. Changing `carrick-ci` pool membership is a controller-affecting shared
+change: announce it before and after under AGENTS.md's “Multiple director
+sessions” rules.
+
+The owner applies the source ACL to both the user and its privilege-separated
+token; both grants are needed:
+
+```sh
+pveum acl modify /vms/9000 --roles PVETemplateUser --users ci-scaler@pve
+pveum acl modify /vms/9000 --roles PVETemplateUser --tokens 'ci-scaler@pve!elastic'
+```
+
+With agent clones enabled, startup requires exactly `VM.Audit=1` and
+`VM.Clone=1` on 9000. The controller reads its configuration directly because
+its pool inventory intentionally excludes this source. The root-run builder
+uses `qm` to start and stop the agent template during provisioning; the
+controller token retains only its inspection and clone rights.

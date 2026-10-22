@@ -622,3 +622,115 @@ fn serial_host_execute_retains_bounded_redacted_stderr_and_strips_library_paths(
         "execute must strip ambient LD/DYLD library paths for external binaries"
     );
 }
+
+fn startup_fixture(agents: bool, pooled: bool, rights: Value) -> Result<(), ScalerError> {
+    let mut inventory = pool_inventory(
+        &json!({"poolid":"carrick-ci", "members":[
+            {"type":"qemu","node":"carrick-ctb","vmid":300,"template":1}
+        ]}),
+        "carrick-ctb",
+    )
+    .unwrap();
+    if pooled {
+        inventory.push(PoolMember {
+            id: 9000,
+            pool: POOL.into(),
+            template: true,
+        });
+    }
+    let lanes = if agents {
+        vec![CloneLane::Kvm, CloneLane::Agent]
+    } else {
+        vec![CloneLane::Kvm]
+    };
+    let mut firewalls = Vec::new();
+    let result = verify_startup(
+        site::CONTABO,
+        &lanes,
+        &inventory,
+        |path| {
+            Ok(match path {
+                "/nodes/carrick-ctb/qemu/300/config" => json!({
+                    "template":1,"cpu":"host","cores":8,"memory":"16384","allow-ksm":0,
+                    "scsi0":"local:300/base-300-disk-0.qcow2,size=100G",
+                    "net0":"virtio,bridge=vmbr1,firewall=1"
+                }),
+                "/nodes/carrick-ctb/qemu/9000/config" if agents => json!({
+                    "template":1,"cpu":"host","cores":8,"memory":"20480","allow-ksm":0,
+                    "scsi0":"local:9000/base-9000-disk-0.qcow2,size=100G",
+                    "net0":"virtio,bridge=vmbr1,firewall=1"
+                }),
+                "/access/permissions?path=/vms/9000" => rights.clone(),
+                "/access/permissions?path=/vms/101"
+                | "/access/permissions?path=/vms/102"
+                | "/access/permissions?path=/vms/103"
+                | "/access/permissions?path=/vms/104" => json!({}),
+                _ => panic!("unexpected startup request: {path}"),
+            })
+        },
+        |vm| {
+            firewalls.push(vm);
+            Ok(())
+        },
+    );
+    if result.is_ok() {
+        assert_eq!(firewalls, if agents { vec![300, 9000] } else { vec![300] });
+    }
+    result
+}
+
+#[test]
+fn startup_agent_source_outside_pool() {
+    startup_fixture(
+        true,
+        false,
+        json!({"/vms/9000":{"VM.Audit":1,"VM.Clone":1}}),
+    )
+    .unwrap();
+}
+
+#[test]
+fn startup_agent_source_inside_pool_refused() {
+    let error = startup_fixture(
+        true,
+        true,
+        json!({"/vms/9000":{
+            "VM.Audit":1,"VM.Clone":1,"VM.PowerMgmt":1,"VM.Config.CPU":1
+        }}),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ScalerError::Guard("agent template must be outside carrick-ci")
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn startup_kvm_only_unchanged() {
+    startup_fixture(false, false, json!({})).unwrap();
+    startup_fixture(
+        false,
+        false,
+        json!({"/vms/9000":{"VM.Audit":1,"VM.Clone":1}}),
+    )
+    .unwrap();
+}
+
+#[test]
+fn startup_agent_source_requires_both_rights() {
+    for rights in [
+        json!({}),
+        json!({"/vms/9000":{"VM.Audit":1}}),
+        json!({"/vms/9000":{"VM.Clone":1}}),
+    ] {
+        assert!(matches!(
+            startup_fixture(true, false, rights),
+            Err(ScalerError::Guard(
+                "token has unexpected protected-VM rights"
+            ))
+        ));
+    }
+}

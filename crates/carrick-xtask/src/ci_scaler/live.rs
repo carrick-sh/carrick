@@ -1671,22 +1671,73 @@ fn verify_protected_vms(
     for vm in site.protected {
         let source_template = site.node == site::CONTABO.node && *vm == 9000;
         let protected = permissions(*vm)?;
-        if protected.as_object().is_none_or(|map| {
-            map.values().any(|v| {
-                v.as_object().is_none_or(|rights| {
-                    rights.iter().any(|(name, value)| {
-                        !source_template
-                            || !matches!(name.as_str(), "VM.Audit" | "VM.Clone")
-                            || value.as_u64() != Some(1)
+        let source_required = source_template && site.lane == CloneLane::Agent;
+        if (source_required && protected != json!({"/vms/9000": {"VM.Audit": 1, "VM.Clone": 1}}))
+            || protected.as_object().is_none_or(|map| {
+                map.values().any(|v| {
+                    v.as_object().is_none_or(|rights| {
+                        rights.iter().any(|(name, value)| {
+                            !source_template
+                                || !matches!(name.as_str(), "VM.Audit" | "VM.Clone")
+                                || value.as_u64() != Some(1)
+                        })
                     })
                 })
             })
-        }) {
+        {
             return Err(ScalerError::Guard(
                 "token has unexpected protected-VM rights",
             ));
         }
     }
+    Ok(())
+}
+
+fn verify_startup(
+    site: Site,
+    lanes: &[CloneLane],
+    inventory: &[PoolMember],
+    mut request: impl FnMut(&str) -> Result<Value, ScalerError>,
+    mut firewall: impl FnMut(u16) -> Result<(), ScalerError>,
+) -> Result<(), ScalerError> {
+    for lane in lanes {
+        let lane_pve = site.for_lane(*lane)?;
+        let template = lane.template();
+        if *lane == CloneLane::Agent {
+            if inventory.iter().any(|v| v.id == template && v.pool == POOL) {
+                return Err(ScalerError::Guard(
+                    "agent template must be outside carrick-ci",
+                ));
+            }
+        } else if !inventory
+            .iter()
+            .any(|v| v.id == template && v.template && v.pool == POOL)
+        {
+            return Err(ScalerError::Guard(
+                "qualified lane template missing from carrick-ci",
+            ));
+        }
+        // inventory() is /pools/carrick-ci, not /cluster/resources. The
+        // source is deliberately absent there; VM.Audit licenses this lookup.
+        let config = request(&format!("{}/config", site.qemu(template)))?;
+        if *lane == CloneLane::Agent && config["template"].as_u64() != Some(1) {
+            return Err(ScalerError::Guard("agent source is not a template"));
+        }
+        if !qualified_template(&config, &lane_pve) {
+            return Err(ScalerError::Guard(
+                "template does not match approved size/storage/bridge",
+            ));
+        }
+        firewall(template)?;
+    }
+    let protected_site = if lanes.contains(&CloneLane::Agent) {
+        site.for_lane(CloneLane::Agent)?
+    } else {
+        site
+    };
+    verify_protected_vms(protected_site, |vm| {
+        request(&format!("/access/permissions?path=/vms/{vm}"))
+    })?;
     Ok(())
 }
 
@@ -1729,28 +1780,13 @@ pub(super) fn controller(
     } else {
         vec![CloneLane::Kvm]
     };
-    for lane in &lanes {
-        let lane_pve = pve.for_lane(*lane)?;
-        let template = lane.template();
-        if !inventory
-            .iter()
-            .any(|v| v.id == template && v.template && v.pool == POOL)
-        {
-            return Err(ScalerError::Guard(
-                "qualified lane template missing from carrick-ci",
-            ));
-        }
-        let config = pve.request(PveCall::Get, &format!("{}/config", pve.site.qemu(template)))?;
-        if !qualified_template(&config, &lane_pve.site) {
-            return Err(ScalerError::Guard(
-                "template does not match approved size/storage/bridge",
-            ));
-        }
-        pve.verify_vm_firewall(template)?;
-    }
-    verify_protected_vms(pve.site, |vm| {
-        pve.request(PveCall::Get, &format!("/access/permissions?path=/vms/{vm}"))
-    })?;
+    verify_startup(
+        pve.site,
+        &lanes,
+        &inventory,
+        |path| pve.request(PveCall::Get, path),
+        |vm| pve.verify_vm_firewall(vm),
+    )?;
     let gh = Github;
     let path = dir.join("ledger.json");
     let mut ledger = Ledger::load(&path)?;

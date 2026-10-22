@@ -202,6 +202,11 @@ genisoimage -quiet -output /var/lib/vz/template/iso/carrick-template-${template}
 # cannot reach other VMs, the host or any private range (public IPv4 only).
 net0="virtio,bridge=$bridge"
 create_extra=()
+template_pool=
+if [[ $profile == kvm ]]; then
+  template_pool=carrick-ci
+  create_extra+=(--pool "$template_pool")
+fi
 # Sites whose clones share the host with credential-holding VMs keep CI out
 # of KSM page merging (a cross-VM timing side channel); linked clones
 # inherit the setting and the controller checks it before each boot.
@@ -224,7 +229,7 @@ if [[ $vm_firewall == 1 ]]; then
   # its static address there while it provisions from the seed ISO.
   create_extra+=(--ipconfig0 "$ipconfig")
 fi
-qm create "$template" --name "carrick-debian13-$profile" --pool carrick-ci --cores "$cores" --memory "$memory_mib" --balloon 0 --cpulimit "$cores" --cpu host \
+qm create "$template" --name "carrick-debian13-$profile" --cores "$cores" --memory "$memory_mib" --balloon 0 --cpulimit "$cores" --cpu host \
   --net0 "$net0" --scsihw virtio-scsi-pci --serial0 socket --vga serial0 --agent enabled=1 "${create_extra[@]}"
 qm importdisk "$template" "$image" "$storage" --format "$disk_format"
 # The imported volume's name depends on the storage type; attach exactly it.
@@ -248,7 +253,9 @@ busy=$(awk -v a="${before[*]}" -v b="${after[*]}" -v n="$(nproc)" -v loadavg="$(
 }')
 awk -v projected="$busy" 'BEGIN { print "template projected CPU=" projected; exit !(projected<=0.80) }'
 awk '/MemAvailable:/ {exit !($2 >= 10485760)}' /proc/meminfo
-pve_call POST "/nodes/$node/qemu/$template/status/start"
+if [[ $profile == agent ]]; then qm start "$template"; else
+  pve_call POST "/nodes/$node/qemu/$template/status/start"
+fi
 # Provisioning is bounded; the clone readiness deadline is separately five minutes.
 qualified=false
 for ((attempt=0; attempt<180; attempt++)); do
@@ -264,7 +271,9 @@ qm guest exec "$template" -- /bin/cat /var/lib/carrick-ci/qualification.json | j
 qm guest exec "$template" -- /bin/cat /var/lib/carrick-ci/packages.txt | jq -r '."out-data"' > packages.txt
 # Clean clone identities/SSH credentials and shut down from inside the template.
 qm guest exec "$template" -- /bin/bash -c 'cloud-init clean --logs --machine-id; rm -f /etc/ssh/ssh_host_* /home/runner/.ssh/authorized_keys; rm -rf /var/lib/cloud/instances /home/runner/.cache; sync'
-pve_call POST "/nodes/$node/qemu/$template/status/stop"
+if [[ $profile == agent ]]; then qm stop "$template"; else
+  pve_call POST "/nodes/$node/qemu/$template/status/stop"
+fi
 for ((attempt=0; attempt<60; attempt++)); do
   [[ $(qm status "$template") == 'status: stopped' ]] && break
   sleep 2
@@ -278,10 +287,10 @@ jq -n --arg commit "$commit" --arg script_hash "$(sha256sum "$inputs/scripts/ci/
   --arg sccache_sha256 "$sccache_sha256" --arg rustup_sha256 "$rustup_sha256" --arg toolchain_hash "$(sha256sum seed/rust-toolchain.toml | cut -d' ' -f1)" \
   --arg lock_hash "$(sha256sum seed/Cargo.lock | cut -d' ' -f1)" --arg xtask_hash "$(sha256sum seed/carrick-xtask | cut -d' ' -f1)" \
   --arg packages_hash "$(sha256sum packages.txt | cut -d' ' -f1)" --slurpfile qualification qualification.json \
-  --argjson vmid "$template" --arg profile "$profile" --arg node "$node" --arg storage "$storage" --arg bridge "$bridge" \
+  --arg pool "$template_pool" --argjson vmid "$template" --arg profile "$profile" --arg node "$node" --arg storage "$storage" --arg bridge "$bridge" \
   --argjson cores "$cores" --argjson memory_mib "$memory_mib" --argjson disk_gib "$disk_gib" \
   --arg bootstrap_hash "$(sha256sum seed/runner-once.sh | cut -d' ' -f1)" --arg hook_hash "$(sha256sum seed/admit-job.sh | cut -d' ' -f1)" \
-  '{vmid:$vmid,profile:$profile,node:$node,pool:"carrick-ci",cpu:"host",vcpus:$cores,memory_mib:$memory_mib,disk_gib:$disk_gib,storage:$storage,bridge:$bridge,script_commit:$commit,
+  '{vmid:$vmid,profile:$profile,node:$node,pool:$pool,cpu:"host",vcpus:$cores,memory_mib:$memory_mib,disk_gib:$disk_gib,storage:$storage,bridge:$bridge,script_commit:$commit,
     script_sha256:$script_hash,image_url:$image_url,image_sha512:$image_sha512,runner_version:$runner_version,runner_sha256:$runner_sha256,
     sccache_sha256:$sccache_sha256,rustup_sha256:$rustup_sha256,toolchain_sha256:$toolchain_hash,cargo_lock_sha256:$lock_hash,
     xtask_sha256:$xtask_hash,bootstrap_sha256:$bootstrap_hash,hook_sha256:$hook_hash,packages_sha256:$packages_hash,qualification:$qualification[0]}' > manifest.json
