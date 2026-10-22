@@ -1676,8 +1676,17 @@ transfers use CAS and the WFI handshake uses a slot lock, not a Dekker pair.
 `closing_producer_executor_sleep_and_reuse_preserve_delivery` counts returned
 kick receipts and their consumption, while requiring every surviving queued
 WFI record to have owed or delivered wakeup debt. The replacement-Closing
-case also checks that stale admission cannot poison replacement custody. All
-twelve cases run through `just test-loom` and the existing CI loom job.
+case also checks that stale admission cannot poison replacement custody. These
+cases run through `just test-loom` and the existing CI loom job.
+
+`current_handback_preserves_birth_incarnation_for_mint` covers non-cancelled
+`OnCpu` and `OnCpuRequested` handback through the real `HostTransfer`
+publication, racing a minter at bound 3. A generation-zero birth with lifecycle
+and control storage returns to `FirstEntryHost` with the same incarnation;
+an adopted thread returns to `Host` with its park sequence and refuses
+first-entry mint. Born-in-zone entry completion does not supply a host adoption
+generation, so it does not change that distinction. Publishing ordinary `Host`
+for the birth would lose incarnation authentication at the acquisition CAS.
 
 `stale_mint_cannot_consume_reused_service_head_delivery` adds a stronger P3
 RED control. A stale incarnation-1 call is suspended until an executor retires

@@ -197,14 +197,19 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
         matches!(zone.record(record).claim(), carrick_sched_core::Claim::OnCpuRequested { slot: owner, .. } if owner == slot)
     );
     assert_eq!(zone.slot(slot).current(), Some(record));
+    let handed_back = zone.record_ref(record);
     assert_eq!(
         zone.handback_current(slot, record),
         carrick_sched_core::CurrentHandback::HandedBack
     );
-    assert!(matches!(
+    // Entry completion does not adopt this birth into the host graph. Its
+    // frozen host custody must still authenticate the incarnation at mint.
+    assert_eq!(
         zone.record(record).claim(),
-        carrick_sched_core::Claim::Host { .. }
-    ));
+        carrick_sched_core::Claim::FirstEntryHost {
+            incarnation: handed_back.incarnation
+        }
+    );
     let record = zone.alloc_record(id).unwrap();
     zone.requeue_preempted(slot, record);
     assert_eq!(zone.switch_in(slot), Some(record));

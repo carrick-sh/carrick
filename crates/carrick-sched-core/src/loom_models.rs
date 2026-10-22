@@ -1,6 +1,14 @@
 //! Bounded exploration of production first-entry admission, Closing, queues,
 //! retirement and index reuse. Only table capacities and atomic storage differ.
 //! Native-only subordinate tables stay zero/unused (no waits, timers or MM edits).
+//! The handback case installs one fixed MM occupancy before spawning actors.
+//!
+//! Current-record handback transitions (exercised through production methods):
+//!
+//! | Source | Frozen publication after Transferring | Admission |
+//! | --- | --- | --- |
+//! | OnCpu / OnCpuRequested, unadopted birth | FirstEntryHost(incarnation) | mint authenticates the same incarnation |
+//! | OnCpu / OnCpuRequested, adopted thread | Host(park sequence) | first-entry mint refused |
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
 use loom::{model::Builder, sync::Arc, thread};
@@ -111,6 +119,78 @@ fn birth(zone: &ZoneTables) -> RecordRef {
         })
         .unwrap();
     zone.record_ref(id)
+}
+
+#[test]
+fn current_handback_preserves_birth_incarnation_for_mint() {
+    // Returning ordinary Host for generation zero would leave mint without
+    // an incarnation-authenticated acquisition word after this handback.
+    for generation in [0, 1] {
+        for requested in [false, true] {
+            model(move || {
+                let zone = zone();
+                let id = zone
+                    .alloc_record(ThreadIdentity {
+                        tid: 1,
+                        serial: 1,
+                        mm: 7,
+                        file_table: 1,
+                        generation,
+                        lifecycle_page: 1,
+                        control_slot: 1,
+                        affinity: 0,
+                    })
+                    .unwrap();
+                let record = zone.record_ref(id);
+                assert!(
+                    zone.occupancy
+                        .replace(occupancy::ExecutionSlot::zone(SLOT), 0, 7)
+                );
+                zone.requeue_preempted(SLOT, id);
+                assert_eq!(zone.switch_in(SLOT), Some(id));
+                let seq = zone.record(id).claim().seq();
+                if requested {
+                    assert_eq!(
+                        zone.claim_for_host(record, None, Handback::Signal, &SpinForever),
+                        HostClaim::El1Held { slot: SLOT }
+                    );
+                    assert_eq!(
+                        zone.record(id).claim(),
+                        Claim::OnCpuRequested { slot: SLOT, seq }
+                    );
+                } else {
+                    assert_eq!(zone.record(id).claim(), Claim::OnCpu { slot: SLOT, seq });
+                }
+                let mint_zone = zone.clone();
+                let minter = thread::spawn(move || {
+                    if let Some(custody) = mint_zone.claim_current_first_entry_activation(record) {
+                        assert_eq!(generation, 0, "adopted thread admitted as a birth");
+                        assert!(mint_zone.slot(SLOT).current().is_none());
+                        assert_eq!(custody.record(), record);
+                        assert!(mint_zone.release_first_entry_activation(custody));
+                    }
+                });
+                assert_eq!(zone.handback_current(SLOT, id), CurrentHandback::HandedBack);
+                minter.join().unwrap();
+                assert!(zone.slot(SLOT).current().is_none());
+                if generation == 0 {
+                    assert_eq!(
+                        zone.record(id).claim(),
+                        Claim::FirstEntryHost {
+                            incarnation: record.incarnation
+                        }
+                    );
+                    let custody = zone.claim_current_first_entry_activation(record).unwrap();
+                    finish(&zone, custody, &AtomicU32::new(0));
+                } else {
+                    assert_eq!(zone.record(id).claim(), Claim::Host { seq });
+                    assert!(zone.claim_current_first_entry_activation(record).is_none());
+                    zone.free_record(id);
+                    assert_eq!(zone.record(id).claim(), Claim::Free);
+                }
+            });
+        }
+    }
 }
 
 #[test]
