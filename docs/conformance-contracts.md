@@ -1879,3 +1879,12 @@ transport, scheduler enrollment and the complete editor-holder audit remain
 outside these models; the production witnesses bind the modeled protocol to
 its adapters. See [input disposition and scope](design/owner-wait-handoff.md).
 Signed HVF acceptance remains director-owned on this Linux worker.
+### Private fixed file segment replacement
+
+`kernel.mm.private-file-fixed-replacement` covers the libpython loader shape
+reported in #759: a real file mapped PROT_NONE over `0x65ee48` bytes, fixed
+RX text over `0x64ee48`, then fixed RW data at `+0x47a000` over `0x1d4000`.
+Linux `mmap(2)` requires replacement and private stores, including guest-page
+aligned addresses and offsets that are not host-page aligned. Internal copy
+bounds and host-page congruence cannot introduce ENOMEM. The descriptor records
+open reproduction and signed/oracle bindings explicitly until demonstrated.
