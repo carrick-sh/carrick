@@ -5450,7 +5450,12 @@ fn libpython_fixed_file_segments_use_owner_source_without_eager_copy() {
     const DATA: u64 = 0x47a000;
     const LENGTH: u64 = 0x1d4000;
     const END: u64 = 0x65f000;
-    for offset in [DATA, DATA - PAGE] {
+    for (offset, anonymous_reservation) in [
+        (DATA, false),
+        (DATA - PAGE, false),
+        (DATA, true),
+        (DATA - PAGE, true),
+    ] {
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher
             .try_set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000))
@@ -5466,7 +5471,7 @@ fn libpython_fixed_file_segments_use_owner_source_without_eager_copy() {
             linux_auxv_image: Vec::new(),
             regions: vec![MemoryRegionMetadata {
                 start: GuestVa::new(LINUX_MMAP_BASE),
-                end: GuestVa::new(LINUX_MMAP_BASE + END),
+                end: GuestVa::new(LINUX_MMAP_BASE + END + 0x10000),
                 perms: SegmentPerms {
                     read: true,
                     write: true,
@@ -5478,6 +5483,32 @@ fn libpython_fixed_file_segments_use_owner_source_without_eager_copy() {
         })
         .unwrap();
         let context = dispatcher.capture_one_task_context().unwrap();
+        // The trace's earlier 8 KiB anonymous mapping explains the reservation
+        // return at 0x6000002000 and aligned text at 0x6000010000.
+        assert_eq!(
+            returned(
+                dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(
+                            SYS_MMAP,
+                            SyscallArgs([
+                                0,
+                                2 * PAGE,
+                                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                                LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                                u64::MAX,
+                                0
+                            ])
+                        ),
+                        &mut memory,
+                        &CompatReporter::default()
+                    )
+                    .unwrap()
+            ),
+            LINUX_MMAP_BASE as i64
+        );
+        let initialized_before_file = memory.regions()[0].shared_initialized_bytes().1.len();
         let mut syscall = |number, args| {
             returned(
                 dispatcher
@@ -5491,7 +5522,18 @@ fn libpython_fixed_file_segments_use_owner_source_without_eager_copy() {
             )
         };
         let flags = LINUX_MAP_PRIVATE | carrick_abi::LINUX_MAP_DENYWRITE;
-        let base = syscall(SYS_MMAP, [0, RESERVE, 0, flags, FILE_FD as u64, 0]) as u64;
+        let reservation_flags = flags
+            | if anonymous_reservation {
+                LINUX_MAP_ANONYMOUS
+            } else {
+                0
+            };
+        let reservation = syscall(
+            SYS_MMAP,
+            [0, RESERVE, 0, reservation_flags, FILE_FD as u64, 0],
+        ) as u64;
+        let base = (reservation + 0xffff) & !0xffff;
+        assert_eq!(base, 0x6000010000);
         assert_eq!(
             syscall(
                 SYS_MMAP,
@@ -5506,9 +5548,19 @@ fn libpython_fixed_file_segments_use_owner_source_without_eager_copy() {
             ),
             base as i64
         );
-        for delta in [0x65e000, 0x65d000] {
-            assert_eq!(syscall(SYS_MUNMAP, [base + delta, PAGE, 0, 0, 0, 0]), 0);
-        }
+        let reservation_end = reservation + 0x65f000;
+        let text_end = base + 0x64f000;
+        assert_eq!(
+            syscall(SYS_MUNMAP, [reservation, base - reservation, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            syscall(
+                SYS_MUNMAP,
+                [text_end, reservation_end - text_end, 0, 0, 0, 0]
+            ),
+            0
+        );
         assert_eq!(syscall(SYS_MPROTECT, [base + DATA, LENGTH, 0, 0, 0, 0]), 0);
         assert_eq!(
             syscall(
@@ -5576,8 +5628,66 @@ fn libpython_fixed_file_segments_use_owner_source_without_eager_copy() {
         );
         assert_eq!(retained.protection, mapping.protection);
         assert!(
-            memory.regions()[0].shared_initialized_bytes().1.is_empty(),
+            memory.regions()[0].shared_initialized_bytes().1.len() == initialized_before_file,
             "owner-backed file mapping eagerly copied into the compatibility image; large owner PREPARE is bounded to 4096 bytes"
         );
     }
+}
+
+/// Production components from the old ARM path, without an emulated backend:
+/// the text recipe collides with fixed data; fallback then exceeds PREPARE.
+#[test]
+fn libpython_old_deferred_recipe_and_owner_copy_refusals() {
+    use carrick_guest_mem::{
+        DeferredAnonymousError, DeferredAnonymousState, GuestWriteRange, PreparedStreamRanges,
+        PreparedWriteLimit, PrivateFileSource,
+    };
+    use std::os::fd::AsFd;
+    const RESERVATION: u64 = 0x6000002000;
+    const TEXT: u64 = 0x6000010000;
+    const DATA: u64 = 0x600048a000;
+    const LENGTH: usize = 0x1d4000;
+    let file = tempfile::tempfile().unwrap();
+    file.set_len(0x65f000).unwrap();
+    let recipes = DeferredAnonymousState::new();
+    // Trace flags 0x822 are PRIVATE|ANONYMOUS|DENYWRITE. The reservation
+    // therefore installs no file recipe; the RX text is the first file view.
+    recipes
+        .reserve_fresh(GuestVa::new(RESERVATION), 0x65f000)
+        .unwrap();
+    recipes
+        .reserve_private_file(
+            GuestVa::new(TEXT),
+            0x64f000,
+            file.as_fd(),
+            0,
+            PrivateFileSource::ImmutableLower,
+        )
+        .unwrap();
+    // The trace omits munmap arguments; these are the alignment-trim ranges
+    // derived from the recorded reservation and aligned text bounds.
+    recipes.retire(GuestVa::new(RESERVATION), 0xe000).unwrap();
+    recipes
+        .retire(GuestVa::new(TEXT + 0x64f000), 0x2000)
+        .unwrap();
+    // Protection changes do not remove retained byte recipes. Both offsets
+    // are legal Linux file offsets, but the overlap check declines them.
+    for offset in [0x47a000, 0x479000] {
+        assert_eq!(
+            recipes.reserve_private_file(
+                GuestVa::new(DATA),
+                LENGTH,
+                file.as_fd(),
+                offset,
+                PrivateFileSource::ImmutableLower
+            ),
+            Err(DeferredAnonymousError::InvalidRange)
+        );
+        let range = GuestWriteRange::new(GuestVa::new(DATA), LENGTH).unwrap();
+        assert!(matches!(
+            PreparedStreamRanges::new(&[range]),
+            Err(PreparedWriteLimit::ByteCount)
+        ));
+    }
+    assert_eq!(recipes.snapshot().private_file.len(), 1);
 }
