@@ -61,10 +61,12 @@ agent changes remain necessary.
 
 The workflow has no GitHub environment; `AGENT_DIRECTOR_TOKEN`,
 `CODEX_AUTH_JSON` and `AGY_OAUTH_TOKEN` are repository secrets, and only
-`.github/workflows/dispatch-worker.yml` may reference them. They are refreshed
-every 15 minutes from the owner's Mac by a launchd job: the Codex and agy
-logins are copied as-is, and `AGENT_DIRECTOR_TOKEN` is a freshly minted
-one-hour `carrick-workers` App installation token, read-only on
+`.github/workflows/dispatch-worker.yml` may reference them (enforced by
+`only_dispatch_workflow_references_dispatch_secrets` in
+`crates/carrick-xtask/tests/dispatch_workflow.rs`). They are refreshed every 15
+minutes from the owner's Mac by a launchd job: the Codex and agy logins are
+copied as-is, and `AGENT_DIRECTOR_TOKEN` is a freshly minted one-hour
+`carrick-workers` App installation token, read-only on
 `carrick-sh/agy-director`. The App private key never leaves the Mac. No write
 token is minted; all writes use the job's own `GITHUB_TOKEN`. Any new workflow
 that references these names widens their exposure and needs owner review.

@@ -119,6 +119,39 @@ fn provider_workflow_selects_only_the_admitted_backend() {
 }
 
 #[test]
+fn only_dispatch_workflow_references_dispatch_secrets() {
+    let workflows =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+    let secrets = ["AGENT_DIRECTOR_TOKEN", "CODEX_AUTH_JSON", "AGY_OAUTH_TOKEN"];
+    let mut saw_dispatch = false;
+    let mut other_workflows = 0;
+    for entry in std::fs::read_dir(workflows).unwrap() {
+        let path = entry.unwrap().path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        if path.file_name().and_then(|n| n.to_str()) == Some("dispatch-worker.yml") {
+            saw_dispatch = true;
+            for secret in secrets {
+                assert!(
+                    text.contains(secret),
+                    "dispatch-worker.yml missing {secret}"
+                );
+            }
+        } else {
+            other_workflows += 1;
+            for secret in secrets {
+                assert!(
+                    !text.contains(secret),
+                    "{} references dispatch secret {secret}",
+                    path.display()
+                );
+            }
+        }
+    }
+    assert!(saw_dispatch, "missing dispatch-worker.yml");
+    assert!(other_workflows > 0, "no other workflows checked");
+}
+
+#[test]
 fn git_configuration_comment_is_honest() {
     let source = include_str!("../src/dispatch_worker.rs");
     assert!(source.contains("Worktree .gitattributes is honored"));
