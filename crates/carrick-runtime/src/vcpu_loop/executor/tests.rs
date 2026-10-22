@@ -8407,6 +8407,16 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
     assert_eq!(context.thread().affinity().words()[0], 1);
     drop(mm_executor);
 
+    // Complete the scheduling boundary before the next guest syscall.
+    scheduler.settle_runnable(running).unwrap();
+    assert!(scheduler.try_take(&origin).unwrap().is_none());
+    let running = scheduler.take(&destination).unwrap();
+    assert_eq!(running.guest_cpu(), GuestCpuId::new(0));
+    let current = context
+        .task_binding()
+        .capture(context.thread().key().tid)
+        .unwrap();
+
     // Enroll and settle the actual shared-futex continuation; its producer
     // will wake it while the destination is entering its guest idle lane.
     let word = Arc::new(std::sync::atomic::AtomicU32::new(0));
