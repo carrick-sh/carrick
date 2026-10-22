@@ -1197,7 +1197,8 @@ impl NativeServiceCapacityFixture {
                 entry.resume_checkpoint().unwrap(),
                 NativeResume::NoPending
             ));
-            assert!(!fixture.runtime.graph.lock().has_member_wait(&record));
+            let waiting = fixture.runtime.graph.lock().has_member_wait(&record);
+            assert!(!waiting);
             assert!(matches!(
                 entry.exit_group(0),
                 LifecycleOutcome::Transferred { .. }
