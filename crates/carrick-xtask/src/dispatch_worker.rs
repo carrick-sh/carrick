@@ -264,11 +264,44 @@ pub enum ContractStatus {
     Failed,
 }
 
-fn read_contract(result: &Path) -> Result<Contract, ScalerError> {
-    let value: Value = serde_json::from_str(&regular_text(result)?)?;
+/// Bound on the agent's final message kept as `raw.log` evidence.
+const RESULT_RESPONSE_TAIL: usize = 4000;
+
+/// The worker contract plus the launcher verdict as `raw.log` evidence. The
+/// clone is destroyed after the job, so a missing or unparseable contract is
+/// only diagnosable from what this records (#768: an empty agent log).
+fn read_result(result: &Path) -> (Contract, String) {
+    let value = regular_text(result).and_then(|text| Ok(serde_json::from_str::<Value>(&text)?));
     // Preserve a completed work contract even on transport failure. The
     // launcher exit code independently prevents a successful dispatch verdict.
-    Ok(serde_json::from_value(value["structured_output"].clone())?)
+    let contract = value
+        .as_ref()
+        .ok()
+        .and_then(|value| serde_json::from_value(value["structured_output"].clone()).ok())
+        .unwrap_or(Contract {
+            status: ContractStatus::Failed,
+            summary: "No valid worker contract".into(),
+            tests: vec![],
+            risks: vec!["Worker output is incomplete".into()],
+        });
+    let evidence = match value {
+        Ok(mut value) => {
+            if let Some(fields) = value.as_object_mut() {
+                fields.remove("json_schema");
+                fields.remove("structured_output");
+                if let Some(Value::String(response)) = fields.get_mut("response") {
+                    let skip = response
+                        .chars()
+                        .count()
+                        .saturating_sub(RESULT_RESPONSE_TAIL);
+                    *response = response.chars().skip(skip).collect();
+                }
+            }
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        }
+        Err(error) => format!("unreadable: {error}"),
+    };
+    (contract, format!("=== result.json ===\n{evidence}\n"))
 }
 
 fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Result<i32> {
@@ -889,16 +922,13 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         sudo(&["/usr/bin/chmod", "-R", "ug+rwX,o-rwx", actor_path])?;
         code = result?;
         snapshot(&actor_work, &work, &dispatch.branch)?;
-        contract = read_contract(&actor.join("result.json")).unwrap_or(Contract {
-            status: ContractStatus::Failed,
-            summary: "No valid worker contract".into(),
-            tests: vec![],
-            risks: vec!["Worker output is incomplete".into()],
-        });
+        let evidence;
+        (contract, evidence) = read_result(&actor.join("result.json"));
         for name in ["agent.out", "agent.err"] {
             raw.push_str(&format!("=== {name} ===\n"));
             raw.push_str(&regular_text(&state.join(name))?);
         }
+        raw.push_str(&evidence);
         if checkpoint(&work, dispatch)? {
             contract.status = ContractStatus::Failed;
             contract
@@ -1215,6 +1245,45 @@ fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn launcher_result_is_kept_as_bounded_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("result.json");
+        let (contract, evidence) = read_result(&path);
+        assert_eq!(contract.status, ContractStatus::Failed);
+        assert!(evidence.starts_with("=== result.json ===\nunreadable: "));
+
+        let response = format!("{}tail", "x".repeat(RESULT_RESPONSE_TAIL * 2));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"status":"ERROR","structured_output":null,
+                "error":"turn failed","response":response,"json_schema":schema(),
+                "transport":{"exit_code":1,"timed_out":false,"interrupted":false}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (contract, evidence) = read_result(&path);
+        assert_eq!(contract.summary, "No valid worker contract");
+        let kept: Value =
+            serde_json::from_str(evidence.strip_prefix("=== result.json ===\n").unwrap()).unwrap();
+        assert_eq!(kept["error"], "turn failed");
+        assert_eq!(kept["transport"]["exit_code"], 1);
+        assert!(kept.get("json_schema").is_none());
+        let kept_response = kept["response"].as_str().unwrap();
+        assert_eq!(kept_response.chars().count(), RESULT_RESPONSE_TAIL);
+        assert!(kept_response.ends_with("tail"));
+
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"status":"SUCCESS","structured_output":
+                {"status":"done","summary":"ok","tests":["t"],"risks":[]}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (contract, evidence) = read_result(&path);
+        assert_eq!(contract.status, ContractStatus::Done);
+        assert!(!evidence.contains("structured_output"));
+    }
     #[test]
     #[cfg(target_os = "linux")]
     #[ignore = "runner-only OS account witness; run with --include-ignored"]
