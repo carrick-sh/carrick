@@ -1382,7 +1382,7 @@ contracts = ["process.native.short-lock"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/ipc.rs"
-contracts = ["process.native.short-lock"]
+contracts = ["process.native.short-lock", "kernel.el1.ipc-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-x86/src/segments.rs"
