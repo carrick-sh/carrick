@@ -920,11 +920,12 @@ mod tests {
             record: None,
         };
         let expected = format!("{diagnostic}");
+        let report = carrick_el1_abi::ArmEl1FatalReport::Entry(&diagnostic);
         let mut message = [0; carrick_fatal::MAX_MESSAGE_LEN];
         let mut line = [0; 1280];
         let (message_len, line_len) = carrick_fatal::format_fatal_parts(
             "el1",
-            format_args!("{diagnostic}"),
+            format_args!("{report}"),
             &mut message,
             &mut line,
         );
