@@ -1452,11 +1452,30 @@ impl<'a> MemView<'a> {
     pub(crate) fn published_frame_grant_plan<'permit>(
         &self,
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        original: ResidentFrameGrantPlan<'permit>,
         grant: carrick_el1_abi::FrameGrantResidencyIdentity,
         protection: LinuxProtFlags,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
     ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
-        self.classify_published_frame_grant(permit, grant, protection, receipt, None)
+        if !self.owns_host_alias_dispatch(&original.exclusion) {
+            carrick_fatal!(
+                "dispatch::resident_frame_grant",
+                "published frame grant lost its original alias exclusion"
+            );
+        }
+        if (original.start, original.len, original.fault_page)
+            != (grant.semantic_base, grant.len, receipt.resident().va)
+        {
+            return Err(PublishedFrameGrantRefusal::Identity);
+        }
+        self.classify_published_frame_grant(
+            permit,
+            original.exclusion,
+            grant,
+            protection,
+            receipt,
+            None,
+        )
     }
 
     pub(crate) fn reprotected_frame_grant_plan<'permit>(
@@ -1469,6 +1488,7 @@ impl<'a> MemView<'a> {
     ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
         self.classify_published_frame_grant(
             permit,
+            self.begin_host_alias_dispatch(permit),
             grant,
             protection,
             receipt,
@@ -1479,6 +1499,7 @@ impl<'a> MemView<'a> {
     fn classify_published_frame_grant<'permit>(
         &self,
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        exclusion: super::HostAliasDispatchGuard<'permit>,
         grant: carrick_el1_abi::FrameGrantResidencyIdentity,
         protection: LinuxProtFlags,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
@@ -1522,7 +1543,6 @@ impl<'a> MemView<'a> {
         {
             return Err(PublishedFrameGrantRefusal::PublicationProtection);
         }
-        let exclusion = self.begin_host_alias_dispatch(permit);
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
         let owner = mem

@@ -6,6 +6,7 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use super::*;
+pub(crate) use carrick_thread::physical_grant::{PhysicalGrantCompletion, PhysicalGrantWait};
 
 #[derive(::core::fmt::Debug)]
 pub(crate) struct GlobalFrameIpaAllocator {
@@ -1190,61 +1191,6 @@ unsafe impl Send for GlobalFrameSharedMapping {}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl Sync for GlobalFrameSharedMapping {}
 
-/// Completion of one unpublished physical incarnation. Consumers retain only
-/// the wait; producer leases finish after exact descriptor settlement/rollback.
-#[derive(::core::fmt::Debug, ::core::default::Default)]
-struct PhysicalGrantWait {
-    ready: std::sync::atomic::AtomicBool,
-    callbacks: carrick_thread::completion::CompletionCallbacks,
-}
-impl carrick_guest_mem::PhysicalMemoryWait for PhysicalGrantWait {
-    fn is_ready(&self) -> bool {
-        self.ready.load(std::sync::atomic::Ordering::Acquire)
-    }
-    fn enroll(
-        &self,
-        wake: std::sync::Arc<dyn Fn() + Send + Sync>,
-    ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
-        let enrollment = self.callbacks.enroll(move |_| wake());
-        (Box::new(enrollment), self.is_ready())
-    }
-}
-#[derive(::core::fmt::Debug)]
-struct PhysicalGrantProducer(std::sync::Arc<PhysicalGrantWait>);
-impl Drop for PhysicalGrantProducer {
-    fn drop(&mut self) {
-        self.0
-            .ready
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.0.callbacks.publish(0);
-    }
-}
-/// Last producer release signals completion. The token is deliberately
-/// non-`Send`: a shared MM ledger or owned continuation cannot retain the
-/// producer after its faulting holder returns. Keep it beyond rollback and
-/// all inventory/alias guards; callbacks may reenter physical preparation.
-#[derive(::core::fmt::Debug)]
-pub(crate) struct PhysicalGrantCompletion(
-    std::sync::Arc<PhysicalGrantProducer>,
-    std::marker::PhantomData<std::rc::Rc<()>>,
-);
-impl PhysicalGrantCompletion {
-    pub(crate) fn new() -> Self {
-        Self(
-            std::sync::Arc::new(PhysicalGrantProducer(std::sync::Arc::new(
-                PhysicalGrantWait::default(),
-            ))),
-            std::marker::PhantomData,
-        )
-    }
-}
-impl PartialEq for PhysicalGrantCompletion {
-    fn eq(&self, other: &Self) -> bool {
-        std::sync::Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-impl Eq for PhysicalGrantCompletion {}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
 pub(crate) struct GlobalFrameHostOwner {
@@ -1258,11 +1204,7 @@ pub(crate) struct GlobalFrameHostOwner {
 impl GlobalFrameHostOwner {
     pub(crate) fn begin_grant_publication(&self) -> PhysicalGrantCompletion {
         let completion = PhysicalGrantCompletion::new();
-        if self
-            .grant_publication
-            .set(std::sync::Arc::downgrade(&completion.0.0))
-            .is_err()
-        {
+        if self.grant_publication.set(completion.wait_weak()).is_err() {
             carrick_fatal!(
                 "hvpatch::physical_grant",
                 "physical incarnation published twice"

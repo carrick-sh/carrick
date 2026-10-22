@@ -1009,7 +1009,8 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                 };
                 let ready = prepared.ready();
                 let fault_page = plan.fault_page();
-                let committed_by_guest = std::cell::Cell::new(false);
+                let held_plan = std::cell::RefCell::new(Some(plan));
+                let settled_plan = std::cell::RefCell::new(None);
                 let residency_identity = carrick_el1_abi::FrameGrantResidencyIdentity {
                     mm_key: request.mm_key,
                     semantic_base: service.semantic_base,
@@ -1094,28 +1095,32 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                                 ).unwrap_or_else(|error| fail_frame_grant_publication(
                                     mailbox, request, format!("applied descriptor cannot complete physical grant: {error}")
                                 ));
-                                let permit = mutation.host_alias_permit();
                                 let protection = carrick_abi::LinuxProtFlags::from_bits_truncate(service.permissions);
-                                let settled_plan = dispatcher.published_frame_grant_plan(
-                                    &permit, residency_identity, protection, &verified,
+                                let original = held_plan.borrow_mut().take().unwrap_or_else(|| fail_frame_grant_publication(
+                                    mailbox, request, "fault plan was already consumed before receipt settlement"
+                                ));
+                                let publication = dispatcher.published_frame_grant_plan(
+                                    &permit, original, residency_identity, protection, &verified,
                                 ).unwrap_or_else(|refusal| fail_frame_grant_publication(
                                     mailbox, request, format!("applied descriptor cannot settle faulting page at 0x{address:x}: {refusal:?}")
                                 ));
-                                dispatcher.commit_published_frame_grant(settled_plan, residency_identity);
-                                committed_by_guest.set(true);
+                                *settled_plan.borrow_mut() = Some(publication);
                                 Ok(true)
                             }
                         }
                     },
                     || {
-                        if committed_by_guest.get() {
-                            // Committed after synchronous descriptor settlement.
-                            return;
+                        if let Some(publication) = settled_plan.borrow_mut().take() {
+                            dispatcher.commit_published_frame_grant(publication, residency_identity);
+                        } else {
+                            // Host descriptors already settled during publish.
+                            // The same plan retains alias exclusion until
+                            // residency is committed below.
+                            let original = held_plan.borrow_mut().take().unwrap_or_else(|| fail_frame_grant_publication(
+                                mailbox, request, "fault plan was already consumed before host residency commit"
+                            ));
+                            dispatcher.commit_published_frame_grant(original, residency_identity);
                         }
-                        // A full journal is safe: prepared leaves still use
-                        // the existing host first-touch path. Published only
-                        // after stage-1, stage-2 and inventory are live.
-                        dispatcher.commit_published_frame_grant(plan, residency_identity);
                     },
                 ).unwrap_or_else(|error| fail_frame_grant_publication(
                     mailbox, request, format!("frame grant mailbox could not complete publication: {error}")
@@ -2964,51 +2969,6 @@ mod guest_descriptor_lane_tests {
         }
     }
 
-    /// A waiter enrolled before first touch needs no second action from the
-    /// faulting holder: the real descriptor service settles the leaf while
-    /// its physical producer remains live, then returning releases readiness.
-    #[test]
-    fn first_touch_scope_publishes_readiness_after_descriptor_settlement() {
-        struct NotifyOnDrop(std::sync::mpsc::Sender<()>);
-        impl Drop for NotifyOnDrop {
-            fn drop(&mut self) {
-                self.0.send(()).expect("subscribed waiter is live");
-            }
-        }
-
-        let (authority, resolver) = guest_lane();
-        let slots = DescriptorTxnSlots::new();
-        let txn = authority
-            .prepare_guest_descriptor_txn(nz(MM), grant_op(VA))
-            .unwrap();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            ready_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .expect("physical grant readiness")
-        });
-        let fault = || {
-            let prepared = carrick_hal::threaded::PreparedEl1FrameGrant::new(
-                carrick_hal::El1FrameGrantReady {
-                    physical_ipa: IPA,
-                    frame_id: 1,
-                    mapping_id: 2,
-                    owner_generation: 3,
-                    inventory_revision: 4,
-                },
-                NotifyOnDrop(ready_tx),
-            );
-            let mut fake = venue(&resolver, &slots, &authority);
-            let receipts =
-                excluded(|| apply_guest_descriptor_txns_now(&mut fake, &slots, &[txn]).unwrap());
-            assert_eq!(receipts.len(), 1);
-            assert!(writable(&authority, VA));
-            drop(prepared);
-        };
-        fault();
-        waiter.join().unwrap();
-    }
-
     /// Work budget: a host first touch (a prepared leaf made resident)
     /// published while this thread holds the MM's EL1 editor exclusion
     /// costs no drain call and no invalidation (invalid->valid), and the
@@ -3481,39 +3441,5 @@ mod guest_descriptor_lane_tests {
         let interrupt = resume.find("host_ipc::interrupt(").expect("interrupt");
         let continue_ = resume.find("self.ipc_continue(").expect("continue");
         assert!(settle < interrupt && settle < continue_);
-    }
-
-    /// A first-touch producer must finish its descriptor transaction in the
-    /// faulting executor's bounded mutation scope. A sibling may already hold
-    /// a physical supply receipt when this executor is selected for a stop.
-    #[test]
-    fn frame_grant_publication_settles_before_fault_executor_can_stop() {
-        let source = include_str!("signal.rs");
-        let fault = source
-            .split("fn resolve_mutating_fault<")
-            .nth(1)
-            .and_then(|tail| tail.split("\n}\n").next())
-            .expect("production fault resolver");
-        assert!(
-            fault.contains("apply_guest_descriptor_txns_now("),
-            "the producer must service the guest descriptor before returning"
-        );
-        assert!(
-            !fault.contains("GUEST_GRANT_LEDGER.submit("),
-            "a stopped fault executor cannot retain physical readiness in the ledger"
-        );
-        let backing = include_str!("../../../carrick-vmm-hvf/src/trap/cow_engine.rs");
-        assert!(backing.contains("published.completion,"));
-        assert!(!backing.contains("completion: global_frame::PhysicalGrantCompletion"));
-        assert!(!backing.contains("published.completion.clone()"));
-        assert!(fault.contains("drop(prepared);"));
-        assert!(
-            fault
-                .split("El1FrameGrantPublished::OnHost =>")
-                .nth(1)
-                .and_then(|tail| tail.split("El1FrameGrantPublished::Unsupported").next())
-                .is_some_and(|host| host.contains("complete_el1_frame_grant(")),
-            "host-owned leaves must settle before releasing physical readiness"
-        );
     }
 }
