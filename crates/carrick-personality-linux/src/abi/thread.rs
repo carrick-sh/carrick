@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 17;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 18;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
@@ -291,18 +291,55 @@ impl<'a> From<&'a PendingSummary> for PendingRead<'a> {
 
 /// Native signal custody alone can publish the native queue's projection.
 /// The retained exact incarnation excludes slot reset until this writer drops.
+/// Admission is exclusive even across independently retained controls.
+///
+/// Moving the writer transfers custody; it cannot duplicate custody.
+/// ```compile_fail,E0382
+/// use carrick_personality_linux::abi::thread::NativePendingCustody;
+/// fn duplicate(writer: NativePendingCustody<'_>) {
+///     let first = writer;
+///     let second = writer;
+///     drop((first, second));
+/// }
+/// ```
+/// Nor can a writer be cloned.
+/// ```compile_fail,E0599
+/// use carrick_personality_linux::abi::thread::NativePendingCustody;
+/// fn duplicate(writer: NativePendingCustody<'_>) {
+///     let second = writer.clone();
+/// }
+/// ```
 pub struct NativePendingCustody<'a> {
     control: ::alloc::sync::Arc<MemberControlCustody<'a, ThreadControlSlot>>,
 }
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+pub struct NativePendingAlreadyAdmitted;
+
 impl<'a> NativePendingCustody<'a> {
-    pub fn new(control: ::alloc::sync::Arc<MemberControlCustody<'a, ThreadControlSlot>>) -> Self {
-        Self { control }
+    pub fn try_admit(
+        control: ::alloc::sync::Arc<MemberControlCustody<'a, ThreadControlSlot>>,
+    ) -> Result<Self, NativePendingAlreadyAdmitted> {
+        control
+            .control()
+            .native_pending_writer
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| NativePendingAlreadyAdmitted)?;
+        Ok(Self { control })
     }
     pub fn replace_from_locked_queue(&self, pending: PendingSignals) {
         self.control
             .control()
             .native_pending
             .replace_from_locked_queue(pending);
+    }
+}
+impl Drop for NativePendingCustody<'_> {
+    fn drop(&mut self) {
+        let control = self.control.control();
+        control
+            .native_pending
+            .replace_from_locked_queue(PendingSignals(0));
+        control.native_pending_writer.store(0, Ordering::Release);
     }
 }
 
@@ -462,6 +499,7 @@ pub struct ThreadControlSlot {
     /// interrupt a blocking wait on this thread.
     non_interrupting: AtomicU64,
     native_pending: PendingSummary,
+    native_pending_writer: AtomicU32,
 }
 
 impl ThreadControlSlot {
@@ -499,6 +537,7 @@ impl ThreadControlSlot {
             birth_thread: AtomicU64::new(0),
             non_interrupting: AtomicU64::new(0),
             native_pending: PendingSummary::new(),
+            native_pending_writer: AtomicU32::new(0),
         }
     }
 
@@ -591,7 +630,6 @@ impl ThreadControlSlot {
         self.zone_incarnation.store(0, Ordering::Relaxed);
         self.zone_seq.store(0, Ordering::Relaxed);
         self.pending.clear(PendingSignals(u64::MAX));
-        self.native_pending.clear(PendingSignals(u64::MAX));
         self.blocked.store(blocked.0, Ordering::Relaxed);
         self.birth_thread.store(0, Ordering::Relaxed);
         self.birth_task.store(0, Ordering::Relaxed);
@@ -1913,7 +1951,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 41] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 42] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::offset_of!(PoolEntry, birth) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, terminal) as u64,
@@ -1937,6 +1975,7 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 41] = [
     ::core::mem::offset_of!(ThreadControlSlot, entry) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, pending) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, native_pending) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, native_pending_writer) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, zone_seq) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, zone_incarnation) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, zone_id) as u64,
@@ -2215,7 +2254,7 @@ mod tests {
     fn carrier_queue_cleanup_cannot_clear_native_pending_custody() {
         let control = ThreadControlSlot::new();
         let custody = Arc::new(MemberControlCustody::retain(&control).unwrap());
-        let native = NativePendingCustody::new(custody.clone());
+        let native = NativePendingCustody::try_admit(custody.clone()).unwrap();
         native.replace_from_locked_queue(PendingSignals(0x100));
         let _ = control
             .carrier_pending()
@@ -2229,6 +2268,36 @@ mod tests {
         drop(custody);
         control.reset_for_host_birth(BlockedMask(0)).unwrap();
         assert_eq!(control.pending().load(), PendingSignals(0));
+    }
+
+    #[test]
+    fn native_pending_writer_admission_is_exclusive_until_drop() {
+        let control = ThreadControlSlot::new();
+        let custody = Arc::new(MemberControlCustody::retain(&control).unwrap());
+        let writer = NativePendingCustody::try_admit(custody.clone()).unwrap();
+        writer.replace_from_locked_queue(PendingSignals(0x100));
+        // A different retain must encounter the same slot's admission claim.
+        let independent = Arc::new(MemberControlCustody::retain(&control).unwrap());
+        assert_eq!(
+            NativePendingCustody::try_admit(independent).err(),
+            Some(NativePendingAlreadyAdmitted)
+        );
+        assert_eq!(control.pending().load(), PendingSignals(0x100));
+        assert!(control.reset_for_host_birth(BlockedMask(0)).is_err());
+        drop(writer);
+        assert_eq!(control.pending().load(), PendingSignals(0));
+        let successor = NativePendingCustody::try_admit(custody.clone()).unwrap();
+        successor.replace_from_locked_queue(PendingSignals(0x400));
+        assert_eq!(control.pending().load(), PendingSignals(0x400));
+        drop(successor);
+        drop(custody);
+        control.reset_for_host_birth(BlockedMask(0)).unwrap();
+        let next_birth = NativePendingCustody::try_admit(Arc::new(
+            MemberControlCustody::retain(&control).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(control.pending().load(), PendingSignals(0));
+        drop(next_birth);
     }
 
     #[test]
@@ -2907,6 +2976,7 @@ mod layout_manifest {
                      birth_thread: _,
                      non_interrupting: _,
                      native_pending: _,
+                     native_pending_writer: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
@@ -2954,6 +3024,14 @@ mod layout_manifest {
         field!(ThreadControlSlot, birth_thread, AtomicU64, 160, 8, 8);
         field!(ThreadControlSlot, non_interrupting, AtomicU64, 168, 8, 8);
         field!(ThreadControlSlot, native_pending, PendingSummary, 176, 8, 8);
+        field!(
+            ThreadControlSlot,
+            native_pending_writer,
+            AtomicU32,
+            184,
+            4,
+            4
+        );
     }
 
     #[test]

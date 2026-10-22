@@ -282,12 +282,6 @@ impl<T> NativeSignalProjection<'_, T> {
         owner.refresh_summary(&state, ProjectionUpdate::Member(record));
     }
 }
-impl<T> Drop for NativeSignalProjection<'_, T> {
-    fn drop(&mut self) {
-        self.control
-            .replace_from_locked_queue(carrick_el1_abi::PendingSignals(0));
-    }
-}
 /// One actual sighand and pending owner, retained by exact task handles.
 pub struct NativeProcessSignals<'a, T> {
     key: TaskKey,
@@ -324,13 +318,11 @@ impl<'a, T> NativeProcessSignals<'a, T> {
     pub fn project_member(
         &self,
         record: carrick_sched_core::RecordRef,
-        control: Arc<
-            carrick_core::lifecycle::MemberControlCustody<'a, carrick_el1_abi::ThreadControlSlot>,
-        >,
+        control: carrick_el1_abi::NativePendingCustody<'a>,
     ) -> Arc<NativeSignalProjection<'a, T>> {
         let projection = Arc::new(NativeSignalProjection {
             owner: Arc::downgrade(&self.resources),
-            control: carrick_el1_abi::NativePendingCustody::new(control),
+            control,
         });
         let mut resources = self.resources.lock();
         resources
@@ -657,10 +649,11 @@ mod tests {
                 .map(|index| {
                     signals.project_member(
                         record(index),
-                        Arc::new(
+                        carrick_el1_abi::NativePendingCustody::try_admit(Arc::new(
                             carrick_core::lifecycle::MemberControlCustody::retain(&controls[index])
                                 .unwrap(),
-                        ),
+                        ))
+                        .unwrap(),
                     )
                 })
                 .collect();
@@ -721,12 +714,18 @@ mod tests {
         };
         let first_projection = signals.project_member(
             record(1),
-            Arc::new(carrick_core::lifecycle::MemberControlCustody::retain(&first).unwrap()),
+            carrick_el1_abi::NativePendingCustody::try_admit(Arc::new(
+                carrick_core::lifecycle::MemberControlCustody::retain(&first).unwrap(),
+            ))
+            .unwrap(),
         );
         signals.enqueue(task, Signal::KILL, None).unwrap();
         let _second_projection = signals.project_member(
             record(2),
-            Arc::new(carrick_core::lifecycle::MemberControlCustody::retain(&second).unwrap()),
+            carrick_el1_abi::NativePendingCustody::try_admit(Arc::new(
+                carrick_core::lifecycle::MemberControlCustody::retain(&second).unwrap(),
+            ))
+            .unwrap(),
         );
         first_projection.rehome(record(3));
         assert_eq!(first.pending().load().0, Signal::KILL.bit());
@@ -776,8 +775,14 @@ mod tests {
             id: carrick_sched_core::RecordId::from_raw(id).unwrap(),
             incarnation: 1,
         };
-        let first_projection = signals.project_member(record(1), first_custody);
-        let _second_projection = signals.project_member(record(2), second_custody);
+        let first_projection = signals.project_member(
+            record(1),
+            carrick_el1_abi::NativePendingCustody::try_admit(first_custody).unwrap(),
+        );
+        let _second_projection = signals.project_member(
+            record(2),
+            carrick_el1_abi::NativePendingCustody::try_admit(second_custody).unwrap(),
+        );
         signals.enqueue_thread(record(1), Signal::STOP, None);
         assert_eq!(first.pending().load().0, Signal::STOP.bit());
         assert_eq!(second.pending().load().0, 0);
@@ -811,10 +816,18 @@ mod tests {
             id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
             incarnation: 1,
         };
-        let projection = signals.project_member(record, custody.clone());
+        let projection = signals.project_member(
+            record,
+            carrick_el1_abi::NativePendingCustody::try_admit(custody.clone()).unwrap(),
+        );
         signals.enqueue_thread(record, Signal::KILL, None);
-        let duplicate = signals.project_member(record, custody);
-        drop(duplicate);
+        let duplicate = carrick_el1_abi::NativePendingCustody::try_admit(custody);
+        assert_eq!(
+            duplicate.err(),
+            Some(carrick_el1_abi::NativePendingAlreadyAdmitted)
+        );
+        let shared = projection.clone();
+        drop(shared);
         assert_eq!(control.pending().load().0, Signal::KILL.bit());
         assert!(signals.pending_set(record).contains(Signal::KILL));
         drop(projection);
