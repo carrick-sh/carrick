@@ -46,3 +46,105 @@ Applicable contracts: `kernel.el1.guest-scheduler`,
 VM-free witnesses must exercise these production adapters before fixes;
 no change to timing budgets, retries, concurrency or scheduler polling is
 justified by this evidence. HVF and Docker are unavailable on this worker.
+
+## Changes and deterministic proof
+
+The resumed pipe refusal witness failed with `Returned` instead of `Handback`
+before the fix. After the fix all 26 IPC adapter tests pass, including short
+positive reads and descriptor reuse. The signed fixture now reports the
+operation, return value and errno on a failed exchange; this distinguishes
+false EOF from EFAULT without adding production logging.
+
+The sleep witness failed with `LinuxErrno(14)` before the fix. Sleep now owns
+its copied timespec prefix, clock domain, absolute/relative mode and remaining
+pointer through `SleepCopyInSuspended`. Runtime owner-wait routing retains that
+continuation rather than redispatching the numeric syscall. The focused
+witness requires exactly one copy start and two resumptions before a 30 ms
+sleep becomes eligible. Negative controls preserve EFAULT for invalid pointers
+and EINVAL for invalid timespecs; a deterministic clock advanced during input
+suspension proves an expired absolute deadline is not extended.
+
+The old compute-pair window could finish while its host vCPU was descheduled;
+the host-completion assertion similarly counted host scheduling delay against
+100 ms. Neither measures a guest-only scheduling slice. The replacement
+requires both CPU-0 threads to complete 16 atomic turns without syscalls, plus
+at least two actual EL1 preemptions. The atomic observations are intrinsic to
+the compute workload; no scheduler polling, timeout extension or retry is
+introduced. The outer 60 s watchdog remains a failure bound. The exact virtual
+slice boundary remains covered by `the_virtual_timer_preempts_a_compute_loop`
+with a fake clock. The 30 ms nanosleep stays as the original EFAULT regression
+surface; no correctness predicate assumes the peer parked during that sleep.
+
+`host-compute` replaces the obsolete `pipe-compute` fixture spelling and uses
+an AF_UNIX socketpair, whose read crosses to the host. Its test also requires a
+forwarded read and in-guest preemptions (the old test accepted zero). This
+proves host-served completion followed by shared-CPU progress. It does not
+force the exact instant of host wait enrollment; the VM-free host-wake and
+virtual-timer bindings remain the deterministic proof of that boundary.
+
+## Signed commands for the director
+
+Changed fixture inputs require a new Linux-published bundle. On Linux,
+`env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just fixtures-publish "$(git rev-parse HEAD)"`
+produces the archive locally; transfer it to the Mac, then run
+`just fixtures-restore /absolute/path/to/bundle.tar.gz`. No old bundle or
+source hash alone certifies the new executable.
+
+Build/sign once through the established recipe (this initial run also
+qualifies the signer and its unentitled negative control):
+
+```sh
+env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 CARRICK_RUN_ID=735-sign \
+  just test-embed el1_sched_pipe_pingpong_stays_in_guest --exact --nocapture
+```
+
+Then qualify all three tests five times on that exact executable. Do not
+rebuild or re-sign between invocations. This uses the artifact already signed
+by the recipe, retains its complete identity receipt, takes the host gate
+lease and cleans up each run by ID. A failure stops qualification; it is not
+retried to obtain five successes. Run from the repository root on the Mac:
+
+```sh
+just lease gate bash -c '
+set -euo pipefail
+. scripts/lib/test-signed-identity.sh
+receipt=target/test-results/carrick-embed-signed-artifacts.jsonl
+sched_exe=$(jq -sr '\''[.[] | select(.record_type == "executable") |
+  .canonical_path | select(test("/el1_sched-[^/]+$"))] | unique |
+  if length == 1 then .[0] else error("expected one scheduler artifact") end'\'' "$receipt")
+evidence="$PWD/target/735-signed"
+mkdir -p "$evidence"
+cp "$receipt" "$evidence/artifacts.jsonl"
+shasum -a 256 "$sched_exe" > "$evidence/artifact.sha256"
+test_signed_has_entitlement "$sched_exe"
+test_signed_has_dof "$sched_exe"
+test_signed_cdhash "$sched_exe" > "$evidence/cdhash.txt"
+test_signed_lc_uuid "$sched_exe" > "$evidence/lc-uuid.txt"
+test_index=0
+for test_name in \
+  el1_sched_pipe_pingpong_stays_in_guest \
+  el1_sched_preemption_reaches_compute_loops \
+  el1_sched_host_woken_thread_preempts_a_compute_loop
+do
+  test_index=$((test_index + 1))
+  for round in 1 2 3 4 5; do
+    shasum -a 256 -c "$evidence/artifact.sha256"
+    run_id="735-t${test_index}-r${round}"
+    trap '\''scripts/sudo/kill.sh "$run_id"'\'' EXIT
+    rc=0
+    env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 RUST_TEST_THREADS=1 \
+      CARRICK_RUN_ID="$run_id" "$sched_exe" "$test_name" --exact --nocapture \
+      > "$evidence/$run_id.log" 2>&1 || rc=$?
+    scripts/sudo/kill.sh "$run_id"
+    trap - EXIT
+    printf "%s exit=%s\n" "$run_id" "$rc"
+    test "$rc" -eq 0
+  done
+done
+shasum -a 256 -c "$evidence/artifact.sha256"
+'
+```
+
+Each fixture still has its existing 60/120-second embed watchdog. These
+focused runs do not replace the director's full signed acceptance population,
+probe/smoke/full promotion or independent review.

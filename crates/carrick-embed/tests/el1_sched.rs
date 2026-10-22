@@ -1178,16 +1178,17 @@ fn el1_sched_timed_wait_times_out_in_guest() {
 }
 
 /// Part (c): two threads that compute without a syscall share one vCPU (the
-/// main thread wakes a sibling onto its own run queue, then both count).
-/// Both make progress, through EL1 timer preemption at EL0 rather than a
-/// host exit.
+/// threads inherit CPU-0 affinity and exchange 16 counted compute turns).
+/// Completion requires repeated progress by both syscall-free loops; the
+/// in-guest preemption counter must also advance. Host descheduling cannot
+/// expire a sampling window.
 #[test]
 fn el1_sched_preemption_reaches_compute_loops() {
     let _guard = common::guest_lock();
     reset_el1_counters();
     let carrier = carrier_or_fail();
     for _ in 0..3 {
-        let measured = run_fixture(&carrier, &["compute-pair", "300"], Duration::from_secs(60));
+        let measured = run_fixture(&carrier, &["compute-pair", "16"], Duration::from_secs(60));
         let stdout = measured.result.stdout_utf8();
         println!(
             "el1-sched compute-pair exits={} wall_ms={} zone={:?} {}",
@@ -1198,7 +1199,11 @@ fn el1_sched_preemption_reaches_compute_loops() {
         );
         assert!(measured.result.success(), "{}", describe(&measured));
         let (a, b) = (field(&stdout, "a_count"), field(&stdout, "b_count"));
-        assert!(a > 0.0 && b > 0.0, "{stdout:?}");
+        assert_eq!(
+            (a, b),
+            (16.0, 16.0),
+            "all counted compute turns: {stdout:?}"
+        );
         assert!(
             measured.zone.preemptions >= 2,
             "the compute loops were not preempted in-guest: {:?}",
@@ -1832,30 +1837,40 @@ fn el1_sched_two_processes_share_vcpus() {
     }
 }
 
-/// Part (a) continued: a thread whose host-served `read` completes, queued
-/// on a vCPU that runs a thread computing without syscalls (both pinned to
-/// one guest CPU), gets that vCPU within the in-guest scheduler's slice. The
-/// host cannot send the reschedule SGI; its placement forces the vCPU out and
-/// the run loop raises it (with IRQs unmasked at EL0) so the slice starts.
+/// A host-served socket read completes before its thread exchanges 16
+/// syscall-free compute turns with a CPU-0 sibling. Completion plus actual
+/// in-guest preemptions proves shared-CPU progress independent of host wall
+/// time. The virtual slice deadline is checked with the VM-free fake clock
+/// in `the_virtual_timer_preempts_a_compute_loop`.
 #[test]
 fn el1_sched_host_woken_thread_preempts_a_compute_loop() {
     let _guard = common::guest_lock();
     reset_el1_counters();
     let carrier = carrier_or_fail();
     for _ in 0..3 {
-        let measured = run_fixture(&carrier, &["pipe-compute", "300"], Duration::from_secs(60));
+        let measured = run_fixture(&carrier, &["host-compute", "16"], Duration::from_secs(60));
         let stdout = measured.result.stdout_utf8();
         println!(
-            "el1-sched pipe-compute exits={} zone={:?} {}",
+            "el1-sched host-compute exits={} zone={:?} {}",
             measured.exits,
             measured.zone,
             stdout.trim()
         );
         assert!(measured.result.success(), "{}", describe(&measured));
-        let first = field(&stdout, "b_first_ms");
+        assert_eq!(field(&stdout, "a_count"), 16.0, "{stdout:?}");
+        assert_eq!(field(&stdout, "b_count"), 16.0, "{stdout:?}");
         assert!(
-            (0.0..100.0).contains(&first),
-            "the woken thread waited {first} ms behind a computing one"
+            measured.zone.preemptions >= 2,
+            "host-completed thread must share the compute CPU: {:?}",
+            measured.zone
+        );
+        assert!(
+            measured
+                .forwarded_syscalls
+                .iter()
+                .any(|(nr, count)| *nr == 63 && *count > 0),
+            "host read must cross the boundary: {:?}",
+            measured.forwarded_syscalls
         );
     }
 }

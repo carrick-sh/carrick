@@ -25,9 +25,9 @@
 //! - `timed-wait <iters>`: `FUTEX_WAIT_PRIVATE` with a 1 ms relative timeout
 //!   and no waker, `iters` times: every result must be `ETIMEDOUT`; prints the
 //!   lateness past the deadline.
-//! - `compute-pair <ms>`: both threads pinned to guest CPU 0; the main
-//!   thread wakes a sibling parked in a host served wait onto its own vCPU,
-//!   then both compute without a syscall for `<ms>`; prints how far each got.
+//! - `compute-pair <rounds>`: both threads pinned to guest CPU 0; the main
+//!   threads exchange `<rounds>` atomic turns without syscalls. Completion
+//!   requires repeated preemption, independent of a wall-clock sample window.
 //! - `idle-carrier <ms>`: four threads parked in untimed futex waits while the
 //!   main thread waits `<ms>` with a timeout: the carrier has nothing to run.
 //! - `wfi-signal <rounds>`: a thread parked in an untimed futex wait on an
@@ -35,8 +35,7 @@
 //! - `pstate`: the PSTATE a signal handler sees, for a signal delivered at a
 //!   syscall boundary and for one that interrupts a computing thread.
 //! - `pipe-pingpong <iters>` (EL1 plan 1d): two threads hand a byte back and
-//!   forth over two pipes, so every turn blocks one thread in a host-served
-//!   `read` and completes it from the other; prints the round-trip latency.
+//!   forth over two in-zone pipes; prints the round-trip latency.
 //! - `sock-pingpong <iters> [pinned]`: the `pipe-pingpong` hand-off over two
 //!   `AF_UNIX` socketpairs. Sockets are host objects (`IpcBacking::Host`): EL1
 //!   forwards their `read`/`write`, so every turn blocks one thread in a
@@ -49,9 +48,9 @@
 //!   its executor away from CPU 0's zone slot on every operation, whatever
 //!   the pingpong threads are doing. The main thread pins to CPU 0 and waits
 //!   on a host-served read until the actor runs; it prints `stepper ok`.
-//! - `pipe-compute <ms>` (EL1 plan 1d): two threads pinned to one guest CPU;
-//!   one completes the other's host-served pipe `read`, then computes: the
-//!   woken thread must still run within the window.
+//! - `host-compute <rounds>` (EL1 plan 1d): two threads pinned to one guest CPU;
+//!   one completes the other's host-served socket `read`, then both exchange
+//!   counted atomic turns without further syscalls.
 //! - `two-process <iters>` (EL1 plan 1d): `fork`, then each process runs a
 //!   `pingpong` pair pinned to guest CPUs 0 and 1, so threads of the two
 //!   address spaces share those vCPUs; prints each process's round trips.
@@ -128,8 +127,6 @@ const FUTEX_WAKE_PRIVATE: u64 = 129;
 const EINTR: i64 = 4;
 const ETIMEDOUT: i64 = 110;
 const SYS_SCHED_SETAFFINITY: u64 = 122;
-const FUTEX_WAIT_BITSET_PRIVATE: u64 = 128 | 9;
-const FUTEX_BITSET_MATCH_ANY: u64 = 0xffff_ffff;
 
 unsafe fn raw6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
     let ret: i64;
@@ -610,100 +607,48 @@ fn timed_wait(iters: usize) -> i32 {
     i32::from(wrong != 0 || early != 0)
 }
 
-static CP_PARK: AtomicU32 = AtomicU32::new(0);
-static CP_READY: AtomicU32 = AtomicU32::new(0);
-static CP_STOP: AtomicU32 = AtomicU32::new(0);
-static CP_A: AtomicU64Counter = AtomicU64Counter::new();
-static CP_B: AtomicU64Counter = AtomicU64Counter::new();
+// Counted, syscall-free progress requires both threads to be scheduled on
+// CPU 0 repeatedly. These atomic turns are the compute workload, not a
+// scheduler polling fallback. Only the outer embed watchdog bounds a defect.
+static CP_A: AtomicU32 = AtomicU32::new(0);
+static CP_B: AtomicU32 = AtomicU32::new(0);
 
-/// A counter bumped by a compute loop (no syscall anywhere in the loop).
-struct AtomicU64Counter(std::sync::atomic::AtomicU64);
-
-impl AtomicU64Counter {
-    const fn new() -> Self {
-        Self(std::sync::atomic::AtomicU64::new(0))
-    }
-    fn bump(&self) {
-        self.0.fetch_add(1, Ordering::Relaxed);
-    }
-    fn get(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+fn compute_sibling(rounds: u32) {
+    assert_eq!(pin(0), 0, "compute sibling affinity");
+    for turn in 1..=rounds {
+        while CP_A.load(Ordering::Acquire) < turn {
+            std::hint::spin_loop();
+        }
+        CP_B.store(turn, Ordering::Release);
     }
 }
 
-/// `FUTEX_WAIT_BITSET_PRIVATE` with an absolute `CLOCK_MONOTONIC` deadline:
-/// a wait EL1 forwards, so the host parks the thread.
-fn futex_wait_bitset_until(word: &AtomicU32, expected: u32, after: Duration) -> i64 {
-    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
-    let total_ns = now.tv_nsec as u128 + after.subsec_nanos() as u128;
-    let ts = libc::timespec {
-        tv_sec: now.tv_sec + after.as_secs() as i64 + (total_ns / 1_000_000_000) as i64,
-        tv_nsec: (total_ns % 1_000_000_000) as libc::c_long,
-    };
-    unsafe {
-        raw6(
-            SYS_FUTEX,
-            word.as_ptr() as u64,
-            FUTEX_WAIT_BITSET_PRIVATE,
-            u64::from(expected),
-            &ts as *const libc::timespec as u64,
-            0,
-            FUTEX_BITSET_MATCH_ANY,
-        )
+fn compute_main(rounds: u32) {
+    for turn in 1..=rounds {
+        CP_A.store(turn, Ordering::Release);
+        while CP_B.load(Ordering::Acquire) < turn {
+            std::hint::spin_loop();
+        }
     }
 }
 
-/// Two compute loops sharing the main thread's vCPU: the sibling parks in a
-/// host-served wait, the main thread wakes it in-guest (so it is queued on
-/// the main thread's vCPU) and both then count for `ms` without a syscall.
-fn compute_pair(ms: u64) -> i32 {
-    // Both on guest CPU 0: since EL1 increment 2 an idle vCPU installs a
-    // published address space itself and would take the woken sibling, so
-    // the pair shares a vCPU only when pinned.
-    let b = std::thread::spawn(|| {
-        pin(0);
-        CP_READY.store(1, Ordering::Release);
-        let _ = futex_wake(&CP_READY, 1);
-        while CP_PARK.load(Ordering::Acquire) == 0 {
-            let _ = futex_wait_bitset_until(&CP_PARK, 0, Duration::from_secs(20));
-        }
-        while CP_STOP.load(Ordering::Relaxed) == 0 {
-            CP_B.bump();
-        }
-    });
-    pin(0);
-    if !wait_until_changed(&CP_READY, 0, Duration::from_secs(10)) {
-        println!("compute-pair sibling never started");
-        return 1;
-    }
-    // Let the sibling reach its host-served wait.
+/// Each completed turn requires the sibling and main to run. There is no
+/// time window in which the host must deliver a sample or schedule a vCPU.
+fn compute_pair(rounds: u32) -> i32 {
+    assert!(rounds >= 2);
+    assert_eq!(pin(0), 0, "compute main affinity");
+    let b = std::thread::spawn(move || compute_sibling(rounds));
+    // Retain the original valid-timespec regression surface under concurrent
+    // thread setup. Correctness does not assume the sibling parked by now.
     sleep_ms(30);
-    CP_PARK.store(1, Ordering::Release);
-    let _ = futex_wake(&CP_PARK, 1);
-    let freq = cntfrq();
-    let start = cntvct();
-    let window = freq * ms / 1000;
-    let mut b_started_ticks = None;
-    loop {
-        CP_A.bump();
-        let now = cntvct();
-        if b_started_ticks.is_none() && CP_B.get() != 0 {
-            b_started_ticks = Some(now - start);
-        }
-        if now - start >= window {
-            break;
-        }
-    }
-    CP_STOP.store(1, Ordering::Relaxed);
-    let (a, bcount) = (CP_A.get(), CP_B.get());
+    compute_main(rounds);
     b.join().expect("compute-pair sibling exits");
-    let ns = ns_per_tick();
     println!(
-        "compute-pair ms={ms} a_count={a} b_count={bcount} b_first_ms={:.3}",
-        b_started_ticks.map_or(-1.0, |t| t as f64 * ns / 1e6)
+        "compute-pair rounds={rounds} a_count={} b_count={}",
+        CP_A.load(Ordering::Acquire),
+        CP_B.load(Ordering::Acquire)
     );
-    i32::from(a == 0 || bcount == 0)
+    0
 }
 
 static IDLE_WORDS: [AtomicU32; 4] = [
@@ -896,14 +841,25 @@ fn write_byte(fd: i32) -> i64 {
     unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) as i64 }
 }
 
+fn pingpong_byte(operation: &str, round: usize, result: i64) -> bool {
+    if result == 1 {
+        return true;
+    }
+    let errno = if result < 0 { last_errno() } else { 0 };
+    println!("pipe-pingpong failed at {round} op={operation} result={result} errno={errno}");
+    false
+}
+
 fn pipe_pingpong(iters: usize) -> i32 {
     const WARMUP: usize = 200;
     let (to_b_read, to_b_write) = pipe_pair();
     let (to_a_read, to_a_write) = pipe_pair();
     let total = WARMUP + iters;
     let b = std::thread::spawn(move || {
-        for _ in 0..total {
-            if read_byte(to_b_read) != 1 || write_byte(to_a_write) != 1 {
+        for i in 0..total {
+            if !pingpong_byte("read-b", i, read_byte(to_b_read))
+                || !pingpong_byte("write-b", i, write_byte(to_a_write))
+            {
                 return false;
             }
         }
@@ -912,8 +868,9 @@ fn pipe_pingpong(iters: usize) -> i32 {
     let mut samples = Vec::with_capacity(iters);
     for i in 0..total {
         let t0 = cntvct();
-        if write_byte(to_b_write) != 1 || read_byte(to_a_read) != 1 {
-            println!("pipe-pingpong failed at {i}");
+        if !pingpong_byte("write-a", i, write_byte(to_b_write))
+            || !pingpong_byte("read-a", i, read_byte(to_a_read))
+        {
             return 1;
         }
         if i >= WARMUP {
@@ -1229,54 +1186,29 @@ fn epoll_pingpong(iters: usize) -> i32 {
     0
 }
 
-static PC_STOP: AtomicU32 = AtomicU32::new(0);
-static PC_B: AtomicI64 = AtomicI64::new(0);
-
-/// `pipe-compute <ms>`: both threads pinned to guest CPU 0. B blocks in a
-/// host-served pipe `read`; A writes the byte that completes it, then
-/// computes without a syscall for `<ms>`. B must still run: its completed
-/// read is a thread that needs its executor, queued on the vCPU A holds, and
-/// only the in-guest scheduler's slice can give it that vCPU.
-fn pipe_compute(ms: u64) -> i32 {
-    let (read_fd, write_fd) = pipe_pair();
+/// Host-served socket completion followed by counted syscall-free turns on
+/// one vCPU. Pipes are in-zone and cannot exercise host completion here.
+fn host_compute(rounds: u32) -> i32 {
+    assert!(rounds >= 2);
+    assert_eq!(pin(0), 0, "host-compute main affinity");
+    let (read_fd, write_fd) = socket_pair();
     let b = std::thread::spawn(move || {
-        pin(0);
-        if read_byte(read_fd) != 1 {
-            return;
-        }
-        while PC_STOP.load(Ordering::Relaxed) == 0 {
-            PC_B.fetch_add(1, Ordering::Relaxed);
-        }
+        assert_eq!(pin(0), 0, "host-compute sibling affinity");
+        assert_eq!(read_byte(read_fd), 1, "host-compute read");
+        compute_sibling(rounds);
     });
-    pin(0);
+    // This exercises the same nanosleep input as the original reproducer;
+    // neither the turn count nor the preemption assertion uses its duration.
     sleep_ms(30);
-    if write_byte(write_fd) != 1 {
-        println!("pipe-compute write failed");
-        return 1;
-    }
-    let freq = cntfrq();
-    let start = cntvct();
-    let window = freq * ms / 1000;
-    let mut a = 0u64;
-    let mut b_first = None;
-    loop {
-        a += 1;
-        let now = cntvct();
-        if b_first.is_none() && PC_B.load(Ordering::Relaxed) != 0 {
-            b_first = Some(now - start);
-        }
-        if now - start >= window {
-            break;
-        }
-    }
-    PC_STOP.store(1, Ordering::Relaxed);
-    b.join().expect("pipe-compute sibling exits");
-    let bcount = PC_B.load(Ordering::Relaxed);
+    assert_eq!(write_byte(write_fd), 1, "host-compute write");
+    compute_main(rounds);
+    b.join().expect("host-compute sibling exits");
     println!(
-        "pipe-compute ms={ms} a_count={a} b_count={bcount} b_first_ms={:.3}",
-        b_first.map_or(-1.0, |t| t as f64 * ns_per_tick() / 1e6)
+        "host-compute rounds={rounds} a_count={} b_count={}",
+        CP_A.load(Ordering::Acquire),
+        CP_B.load(Ordering::Acquire)
     );
-    i32::from(bcount == 0)
+    0
 }
 
 /// One process's pinned futex ping-pong for `two-process`: returns the round
@@ -2571,10 +2503,20 @@ fn permission_transitions(pages: usize, rounds: usize) -> i32 {
 fn reservation_capacity(count: usize) -> i32 {
     let mut regions = Vec::with_capacity(count);
     for i in 0..count {
-        let prot = if i % 2 == 0 { libc::PROT_READ } else { libc::PROT_READ | libc::PROT_WRITE };
+        let prot = if i % 2 == 0 {
+            libc::PROT_READ
+        } else {
+            libc::PROT_READ | libc::PROT_WRITE
+        };
         let ptr = unsafe {
-            libc::mmap(std::ptr::null_mut(), 4096, prot,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                prot,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
         };
         if ptr == libc::MAP_FAILED {
             println!("reservation-capacity mmap failed at {i}");
@@ -3538,7 +3480,7 @@ fn main() {
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(5),
         ),
         "timed-wait" => timed_wait(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200)),
-        "compute-pair" => compute_pair(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(300)),
+        "compute-pair" => compute_pair(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(16)),
         "idle-carrier" => idle_carrier(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(500)),
         "wfi-signal" => wfi_signal(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(100)),
         "pstate" => pstate_mode(),
@@ -3565,7 +3507,7 @@ fn main() {
         "sock-pingpong-stepper" => {
             sock_pingpong_stepper(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000))
         }
-        "pipe-compute" => pipe_compute(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(300)),
+        "host-compute" => host_compute(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(16)),
         "two-process" => two_process(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000)),
         "mm-occupancy" => mm_occupancy(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200)),
         "first-touch" => match args.get(2) {
@@ -3589,21 +3531,17 @@ fn main() {
         "cross-vcpu-stale" => {
             cross_vcpu_stale(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200))
         }
-        "tlb-edit-budget" => {
-            tlb::edit_budget(
-                &args[0],
-                args.get(2).and_then(|n| n.parse().ok()).unwrap_or(32),
-                args.get(3).is_some_and(|arg| arg == "force-gap-allocation"),
-            )
-        }
+        "tlb-edit-budget" => tlb::edit_budget(
+            &args[0],
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(32),
+            args.get(3).is_some_and(|arg| arg == "force-gap-allocation"),
+        ),
         "tlb-stale-threads" => tlb::stale_threads(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(2),
             args.get(4).is_some_and(|arg| arg == "omit-first-write-ack"),
         ),
-        "tlb-fork-stale" => {
-            tlb::fork_stale(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(50))
-        }
+        "tlb-fork-stale" => tlb::fork_stale(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(50)),
         "tlb-exec-stale" => tlb::exec_stale(&args[0]),
         "tlb-exec-stale-child" => tlb::exec_stale_child(args.get(2).map(String::as_str)),
         "permission-transitions" => permission_transitions(
@@ -3613,7 +3551,9 @@ fn main() {
         "anonymous-reservations" => {
             anonymous_reservations(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(64))
         }
-        "reservation-capacity" => reservation_capacity(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1100)),
+        "reservation-capacity" => {
+            reservation_capacity(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1100))
+        }
         "anonymous-discard-and-exit" => anonymous_discard_and_exit(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(256),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),

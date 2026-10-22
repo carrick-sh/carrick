@@ -535,9 +535,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             // Only a delivered prefix can complete short. A resumed read
             // with no progress still owns its byte and description; a copy
             // refusal must be resolved by that continuation, never as EOF.
-            StepStatus::Fault if op.kind == IpcOpKind::PipeRead && written > 0 => {
-                written as i64
-            }
+            StepStatus::Fault if op.kind == IpcOpKind::PipeRead && written > 0 => written as i64,
             StepStatus::Fault => {
                 return bail(
                     sched,
