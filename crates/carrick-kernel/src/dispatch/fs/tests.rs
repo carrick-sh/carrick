@@ -14116,7 +14116,7 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
         .resume_owned_directory_read(
             &root,
             read,
-            pending,
+            *pending,
             &mut memory,
             &reporter,
             None,
@@ -14221,7 +14221,7 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
         .resume_owned_directory_read(
             &root,
             read,
-            pending,
+            *pending,
             &mut memory,
             &reporter,
             None,
