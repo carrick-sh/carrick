@@ -90,7 +90,7 @@ use crate::timer_personality::build_itimerspec_ns;
 
 /// Sleep input is copied before any timer or remaining-time output exists.
 /// Keep that exact transfer across owner waits, including a copied prefix.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct SleepRequest {
     clock: Arc<crate::kernel::container::ClockDomain>,
     clock_id: u64,
@@ -98,7 +98,7 @@ struct SleepRequest {
     remaining: Option<GuestPtr>,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct OwnedSleepCopyIn {
     request: SleepRequest,
     suspension: carrick_guest_mem::MemoryReadSuspension,
