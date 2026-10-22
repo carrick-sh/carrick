@@ -565,6 +565,18 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         };
         result.raw() as u32
     };
+    // The unported x86 affinity venue has no published carrier topology.
+    // Fork inherits the parent's unpublished control mask, not the fixture's
+    // numeric scheduler mask (3). A live alias must not turn that zero into
+    // an empty allowed-CPU set and strand the child.
+    assert_eq!(zone.carrier_affinity_mask(), None);
+    assert_eq!(control.affinity().words(), &[0]);
+    let child_control = child_controls
+        .iter()
+        .find(|control| control.visible_tid() == Some(child_pid))
+        .unwrap();
+    assert_eq!(child_control.affinity().words(), &[0]);
+    assert_eq!(child_control.affinity_source().load(), Some(0));
     assert!(zone.enter_idle(peer_slot, true));
     let mut effects = WakeEffects::default();
     assert_eq!(zone.migrate_queued(slot, &mut effects), 1);

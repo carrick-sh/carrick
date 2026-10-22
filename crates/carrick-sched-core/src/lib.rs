@@ -966,11 +966,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     /// Whether the thread may run on a slot bound to guest CPU `cpu_plus_one`
     /// (0: the slot's CPU is unknown, which allows any thread).
     fn allows_cpu(&self, cpu_plus_one: u32) -> bool {
-        let mask = self.affinity();
-        cpu_plus_one == 0
-            || (mask == 0 && !self.affinity_source().is_bound())
-            || cpu_plus_one > 64
-            || mask & (1 << (cpu_plus_one - 1)) != 0
+        let source = self.affinity_source();
+        let mask = if source.is_bound() {
+            // A readable zero is unpublished policy (native process admission
+            // may precede affinity topology). A missing venue alias is not:
+            // never use the other venue's pointer or grant placement for it.
+            let Some(mask) = source.load() else {
+                return false;
+            };
+            mask
+        } else {
+            self.affinity.load(Ordering::Relaxed)
+        };
+        cpu_plus_one == 0 || mask == 0 || cpu_plus_one > 64 || mask & (1 << (cpu_plus_one - 1)) != 0
     }
 
     fn ready_host_claim(&self, seq: u32) -> Claim {

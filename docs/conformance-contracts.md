@@ -251,6 +251,20 @@ admission combinations, including a two-CPU policy with two workers, execution
 on the highest CPU, and corrected startup after refusal. CPU publication and
 `sched_setaffinity` validation retain their existing single policy authority.
 
+An unported affinity venue may admit a native process before carrier topology
+or its control mask is published. Fork inherits that unpublished zero mask;
+binding its live authority must not turn absence of policy into an empty CPU
+set. `unpublished_live_affinity_does_not_restrict_placement` checks placement
+before publication and enforcement after a nonempty mask is installed.
+`missing_venue_affinity_alias_refuses_placement` separately requires refusal
+when the current venue cannot read a bound authority. Both paths use at most one
+authority load, without scanning CPUs or substituting another venue's pointer.
+`child_exit_releases_control_custody_before_retire_mm_reclaims_stock` binds
+this to production x86 fork, idle-peer migration and child MM retirement with
+unpublished topology. Published masks still follow Linux fork inheritance;
+empty `sched_setaffinity` requests remain invalid. Signed execution remains
+director-owned.
+
 `kernel.executor.empty-host-steal` covers an executor seeking host-runnable
 work while runnable tasks are held by the in-guest scheduler. Linux blocking
 and wakeup semantics remain the authority: a guest wait releases executor

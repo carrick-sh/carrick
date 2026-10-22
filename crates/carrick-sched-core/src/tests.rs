@@ -3125,6 +3125,56 @@ fn unpublished_carrier_topology_cannot_invent_cpu_zero() {
 }
 
 #[test]
+fn unpublished_live_affinity_does_not_restrict_placement() {
+    let zone = zone();
+    let authority = crate::affinity::AffinityAuthority::new();
+    // SAFETY: the authority remains in place until the record is freed below.
+    let source = unsafe { AffinitySource::from_authority(&authority) };
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            affinity_source: source,
+            ..identity(3)
+        })
+        .unwrap();
+    let rec = zone.record(record);
+    assert_eq!(rec.affinity(), 0);
+    assert!(rec.allows_cpu(1));
+    assert!(rec.allows_cpu(2));
+
+    // A published nonempty mask takes effect through the same live alias.
+    authority.initialize(1);
+    assert!(rec.allows_cpu(1));
+    assert!(!rec.allows_cpu(2));
+    assert!(authority.initialize_quiescent(3));
+    assert!(rec.allows_cpu(2));
+    zone.free_record(record);
+}
+
+#[test]
+fn missing_venue_affinity_alias_refuses_placement() {
+    let zone = zone();
+    let authority = crate::affinity::AffinityAuthority::new();
+    authority.initialize(3);
+    // SAFETY: the guest alias names retained storage, but this host venue has
+    // no alias. Refuse without dereferencing the other venue's address.
+    let source = unsafe {
+        AffinitySource::from_aliases(
+            0,
+            core::ptr::from_ref(&authority).expose_provenance() as u64,
+        )
+    };
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            affinity_source: source,
+            ..identity(3)
+        })
+        .unwrap();
+    assert_eq!(source.load(), None);
+    assert!(!zone.record(record).allows_cpu(2));
+    zone.free_record(record);
+}
+
+#[test]
 fn live_affinity_sources_control_record_placement_and_the_host_loaded_slot() {
     use crate::affinity::{AffinityAuthority, AffinityNotification, AffinityNotifier};
     struct NoResidency;
