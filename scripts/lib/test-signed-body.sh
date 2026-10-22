@@ -433,6 +433,12 @@ if [ "$pkg" = "carrick-conformance-next" ]; then
         CARGO_TARGET_DIR="$PWD/target/libpython-map" \
         cargo build --manifest-path "$libpython_map_fixture/Cargo.toml" \
         --target aarch64-unknown-linux-musl --release --locked
+    directory_fixture="crates/carrick-conformance-next/tests/fixtures/directory-copyout"
+    directory_source_sha256="$(shasum -a 256 "$directory_fixture/src/main.rs" | cut -d ' ' -f 1)"
+    CARRICK_DIRECTORY_COPYOUT_SOURCE_SHA256="$directory_source_sha256" \
+        CARGO_TARGET_DIR="$PWD/target/directory-copyout" \
+        cargo build --manifest-path "$directory_fixture/Cargo.toml" \
+        --target aarch64-unknown-linux-musl --release --locked
     elf_errno_fixture="crates/carrick-conformance-next/tests/fixtures/elf-exec-errno"
     elf_errno_source_sha256="$(shasum -a 256 "$elf_errno_fixture/src/main.rs" | cut -d ' ' -f 1)"
     CARRICK_ELF_FIXTURE_SOURCE_SHA256="$elf_errno_source_sha256" \

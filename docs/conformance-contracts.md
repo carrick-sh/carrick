@@ -1868,3 +1868,27 @@ Run the signed selectors with
 `CARRICK_RUN_ID=759-libpython-map env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just test-conformance-next case_libpython_ --nocapture`.
 The [fixture instructions](../crates/carrick-conformance-next/tests/fixtures/libpython-map/README.md)
 describe source and executable identity and the pending native ARM64 bless.
+
+## Directory copyout into untouched private memory (#759 stage 2)
+
+`kernel.fs.directory-copyout` covers record publication and the selected
+open description across an owner-memory wait. The director's signed Python
+log at `c94769c21` reaches importlib `_fill_cache` and reports EFAULT for
+`/usr/local/lib/python3.12`; that log alone does not identify the syscall.
+The production getdents64 path submits the entire assembled result to
+`write_bytes`; the ARM owner adapter passes it to `prepare_owner_write`,
+whose production `PreparedStreamRanges` admits at most 4096 bytes. Larger
+results become `HostMap`, then the blanket MemoryError conversion lowers
+that internal condition to EFAULT. Untouched pages can also return a typed
+supply/wait through this same unsuitable direct-copy path.
+
+The VM-free RED witnesses use the production directory encoder and bounded
+PREPARE admission, plus an actual immutable HostFs lower directory and sparse
+AddressSpace. The first fault consumed all 402 entries before copyout:
+retry into a never-touched private buffer returned zero (`exit 101`,
+`/tmp/759-directory-red.log`). The bound witness checks the actual encoded
+batch through production admission; it does not simulate an ARM backend.
+The signed `case_libpython_directory_copyout` reports openat/fstat/getdents64
+separately for mmap and malloc buffers. Its pre-fix owner failure, exact
+ARM64 oracle bless, runtime work/timing and Python startup verification remain
+explicit director gates on the Mac; this Linux worker cannot claim them.

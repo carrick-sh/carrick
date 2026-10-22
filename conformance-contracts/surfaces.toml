@@ -1765,3 +1765,15 @@ contracts = ["kernel.scheduler.runnable-progress"]
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs"
 contracts = ["kernel.scheduler.runnable-progress"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/directory.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
+path = "crates/carrick-conformance-next/tests/directory_copyout.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
+path = "crates/carrick-conformance-next/tests/fixtures/directory-copyout/**"
+contracts = ["kernel.fs.directory-copyout"]
