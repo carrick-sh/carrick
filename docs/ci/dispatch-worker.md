@@ -173,6 +173,12 @@ The driver sets `AGY_DIRECTOR_CODEX_VENV` to that path, so no job installs
 packages at run time. It sets `AGY_DIRECTOR_ROUTES=default` because the tier
 table names the backend explicitly.
 
+The SDK's hash-locked wheels carry the complete codex package: `codex`,
+`codex-code-mode-host`, `rg` and `bwrap`. The driver no longer fetches or
+overrides a separate `codex` binary: `AGY_DIRECTOR_CODEX_SDK_BIN` is unset,
+and `scripts/ci/inputs/agent-tools.json` has no codex tool. A lone `codex`
+binary cannot run tools without `codex-code-mode-host`.
+
 When the pinned launcher's `CODEX_SDK_VERSION` changes, regenerate the lock
 file for the template's Python (3.13, x86_64) and rebuild template 9000.
 The test `agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses`
