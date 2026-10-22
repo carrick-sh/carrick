@@ -52,26 +52,6 @@ impl ZoneWaitPolicy {
     }
 }
 
-pub(super) fn owner_zone_continuation_for_resume(
-    resume: &OwnedSyscallResume,
-    capture: carrick_kernel::kernel::continuation::ContinuationCapture,
-    wait: carrick_kernel::kernel::continuation::ZoneWait,
-) -> carrick_kernel::kernel::continuation::BlockedContinuation {
-    let policy = ZoneWaitPolicy::for_owner_resume(resume);
-    match policy {
-        ZoneWaitPolicy::KillableOwnerMemory => {
-            carrick_kernel::kernel::continuation::BlockedContinuation::from_killable_owner_zone_park(
-                capture, wait,
-            )
-        }
-        ZoneWaitPolicy::Ordinary(timeout) => {
-            carrick_kernel::kernel::continuation::BlockedContinuation::from_zone_park(
-                capture, wait, timeout,
-            )
-        }
-    }
-}
-
 #[cfg(test)]
 mod owner_copyout_policy_tests {
     use super::{OwnedSyscallResume, ZoneWaitPolicy};
