@@ -3253,9 +3253,25 @@ fn arm_call(
     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
     frame: &mut carrick_el1_abi::TrapFrame,
 ) -> Result<carrick_personality_linux::dispatch::CompletionRoute, NativeProcessError> {
+    arm_call_with_cpu(
+        fixture,
+        control,
+        service,
+        frame,
+        &mut crate::sched::FakeCpu::default(),
+    )
+}
+
+#[cfg(test)]
+fn arm_call_with_cpu(
+    fixture: &'static Fixture,
+    control: &'static ThreadControlSlot,
+    service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    frame: &mut carrick_el1_abi::TrapFrame,
+    cpu: &mut crate::sched::FakeCpu,
+) -> Result<carrick_personality_linux::dispatch::CompletionRoute, NativeProcessError> {
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
-    let mut cpu = crate::sched::FakeCpu::default();
     super::dispatch::dispatch_arm_syscall_with_native_process(
         frame,
         &counters,
@@ -3267,7 +3283,7 @@ fn arm_call(
         &cache,
         Some(crate::dispatch::Zone {
             tables: fixture.zone,
-            cpu: &mut cpu,
+            cpu,
             user: &crate::sched::HardwareUserWord,
         }),
         None,
