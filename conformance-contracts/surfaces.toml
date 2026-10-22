@@ -1859,6 +1859,14 @@ path = "crates/carrick-kernel/src/dispatch/fs/directory.rs"
 contracts = ["kernel.fs.directory-copyout"]
 
 [[surfaces]]
+path = "crates/carrick-conformance-next/tests/directory_copyout.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
+path = "crates/carrick-conformance-next/tests/fixtures/directory-copyout/src/main.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fs.rs"
 contracts = ["kernel.fs.directory-copyout"]
 

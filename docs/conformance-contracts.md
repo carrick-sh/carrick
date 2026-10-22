@@ -1937,9 +1937,13 @@ refusal message, so exact-offset/branch live confirmation remains for the Mac.
 The fallback first requests writable physical protection, which can itself
 refuse before the bounded copy is reached; the component witness establishes
 the incompatible fallback, not which downstream ENOMEM exit the Mac took.
-Signed loader integration and its native ARM64 oracle are retained in the
-deferred probe layer accompanying #740. The fixes-only layer registers no
-additional signed cases.
+The signed static case reads the actual immutable OCI libpython file; a new
+mutable /tmp file would not bind the original lowering path.
+
+Run the signed selectors with
+`CARRICK_RUN_ID=759-libpython-map env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just test-conformance-next case_libpython_ --nocapture`.
+The [fixture instructions](../crates/carrick-conformance-next/tests/fixtures/libpython-map/README.md)
+describe source and executable identity and the pending native ARM64 bless.
 
 ## Directory copyout into untouched private memory (#759 stage 2)
 
@@ -1960,9 +1964,10 @@ AddressSpace. The first fault consumed all 402 entries before copyout:
 retry into a never-touched private buffer returned zero (`exit 101`,
 `/tmp/759-directory-red.log`). The bound witness checks the actual encoded
 batch through production admission; it does not simulate an ARM backend.
-Signed syscall attribution, native ARM64 oracle comparison, runtime work/timing
-and Python startup verification remain director gates in the deferred probe
-layer; this Linux worker cannot claim them.
+The signed `case_libpython_directory_copyout` reports openat/fstat/getdents64
+separately for mmap and malloc buffers. Its pre-fix owner failure, exact
+ARM64 oracle bless, runtime work/timing and Python startup verification remain
+explicit director gates on the Mac; this Linux worker cannot claim them.
 
 The reviewed stage-2 repair splits complete records at guest-page/transfer
 boundaries, calls the existing owner `prepare_write`, commits bytes, then
@@ -1994,7 +1999,7 @@ They cover unready SIGKILL, a non-leader waiter with a live leader, readiness
 during enrollment, writer release before both retry paths, and cancellation
 during destination re-preparation. None uses a second memory-wait path.
 
-The deferred probe layer retains the native ARM64 oracle and its source
-fingerprint. Fresh signed HVF execution, live sibling-editor contention,
-handled-signal delivery, final runtime ratios and exact-artifact promotion
-remain director-owned. VM-free evidence does not close those integration gates.
+The committed native ARM64 oracle and its source fingerprint are preserved.
+Fresh signed HVF execution, live sibling-editor contention, handled-signal
+delivery, final runtime ratios and exact-artifact promotion remain
+director-owned. VM-free evidence does not close those integration gates.
