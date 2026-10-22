@@ -1,5 +1,10 @@
 {
-  "status": "pending-director-bless",
+  "status": "blessed",
   "source_sha256": "5f85fbacef2477dc16f0abfdbc9d2f00c170cf960c35ee0d4f1b0306337f3989",
-  "stdout": ""
+  "authority": "Director-verified byte-identical signed ARM64 Carrick and native ARM64 Docker stdout",
+  "stdout": "mmap_errno=0\nmmap_openat_errno=0\nmmap_fstat_errno=0\nmmap_getdents64_errno=0\nmmap_entries=203\nmmap_unique=true\nmalloc_errno=0\nmalloc_openat_errno=0\nmalloc_fstat_errno=0\nmalloc_getdents64_errno=0\nmalloc_entries=203\nmalloc_unique=true\nnormal_openat_errno=0\nnormal_fstat_errno=0\nnormal_getdents64_errno=0\nnormal_entries=203\nnormal_unique=true\nlistings_equal=true\n",
+  "image": "python@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2",
+  "platform": "linux/arm64",
+  "kernel": "Linux 7.0.14-linuxkit aarch64",
+  "binary_sha256": "3607bac0fb559c950d453b958d780b0edeb3b3fc2a164045d4c49535a2361d3b"
 }
