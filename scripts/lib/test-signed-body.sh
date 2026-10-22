@@ -427,6 +427,12 @@ if [ "$pkg" = "carrick-conformance-next" ]; then
     # This dedicated numeric ELF witness is not a generic blessed probe.
     # Rebuild it here so the public signed gate never depends on a manual
     # fixture build. Its compiled fingerprint detects a stale executable.
+    libpython_map_fixture="crates/carrick-conformance-next/tests/fixtures/libpython-map"
+    libpython_map_source_sha256="$(shasum -a 256 "$libpython_map_fixture/src/main.rs" | cut -d ' ' -f 1)"
+    CARRICK_LIBPYTHON_MAP_SOURCE_SHA256="$libpython_map_source_sha256" \
+        CARGO_TARGET_DIR="$PWD/target/libpython-map" \
+        cargo build --manifest-path "$libpython_map_fixture/Cargo.toml" \
+        --target aarch64-unknown-linux-musl --release --locked
     elf_errno_fixture="crates/carrick-conformance-next/tests/fixtures/elf-exec-errno"
     elf_errno_source_sha256="$(shasum -a 256 "$elf_errno_fixture/src/main.rs" | cut -d ' ' -f 1)"
     CARRICK_ELF_FIXTURE_SOURCE_SHA256="$elf_errno_source_sha256" \
