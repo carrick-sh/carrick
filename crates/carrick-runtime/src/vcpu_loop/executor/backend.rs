@@ -33,7 +33,7 @@ use carrick_kernel::kernel::objects::{
     ExecutionFailure, ExecutionGeneration, ExecutorId, ThreadExecutionLease, ThreadKey,
 };
 use carrick_kernel::kernel::{Scheduler, SchedulerError};
-pub use residency::*;
+pub use residency::{ResidencyGeneration, TaskCpuResidency};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct HvpatchPersistentExecutorFactory {
