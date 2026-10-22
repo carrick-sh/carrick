@@ -44,8 +44,9 @@ fn case_libpython_private_fixed_file_segments() {
         )
     );
     assert!(result.stderr.is_empty(), "{}", result.stderr_utf8());
-    assert!(matches!(
+    assert_eq!(
         oracle["status"].as_str(),
-        Some("pending-director-bless" | "blessed")
-    ));
+        Some("blessed"),
+        "fixture ran provisionally; native ARM64 Docker bless is required for acceptance"
+    );
 }
