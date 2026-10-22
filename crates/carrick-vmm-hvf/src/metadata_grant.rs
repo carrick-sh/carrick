@@ -1,5 +1,17 @@
 //! Host engine for servicing in-guest EL1 metadata extent grant (`HVC #6`) requests.
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod native_service;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use native_service::NativeService;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn take_native_service(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    cpu: carrick_guest_arch::CpuId,
+) -> Result<Option<NativeService>, TrapError> {
+    native_service::take(custody, cpu)
+}
+
 use crate::host_mapping::{HostMappingKind, OwnedHostMapping};
 use carrick_core_abi::NativeRootExit;
 use carrick_el1_abi::{

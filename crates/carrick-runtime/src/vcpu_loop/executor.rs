@@ -1752,6 +1752,12 @@ fn next_runnable<F: PersistentExecutor>(
     drop(idle_wait);
     match waited.map_err(|error| NextError::Fatal(error.to_string()))? {
         GuestIdleExit::Idle => Ok(None),
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        GuestIdleExit::Service(service) => {
+            backend::finish_native_service(service)
+                .map_err(|error| NextError::Fatal(error.to_string()))?;
+            Ok(None)
+        }
         GuestIdleExit::Unsupported => Ok(Some(scheduler.take(registration)?)),
     }
 }

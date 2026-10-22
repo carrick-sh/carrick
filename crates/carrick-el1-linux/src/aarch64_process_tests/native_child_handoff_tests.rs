@@ -530,3 +530,304 @@ fn arm_binding_then_native_fork_commits_on_current_stack(exec: bool) {
         );
     }
 }
+
+/// VM-free transport binding for `kernel.scheduler.runnable-progress`.
+#[test]
+fn two_native_children_service_waits_release_the_only_execution_slot() {
+    use super::super::native_process_runtime::NativeResume;
+    use carrick_core::lifecycle::Lifecycle;
+    use carrick_core_abi::service::{ServiceCell, ServiceError, ServiceOperation};
+    use carrick_guest_arch::{Access, FaultInfo};
+    use carrick_sched_core::object_wait::ObjectWaitKey;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let pages: Vec<_> = (0..16).map(|index| 0x20000 + index * 4096).collect();
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&pages),
+    )
+    .with_words(words);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let mut cpu = crate::sched::FakeCpu::default();
+    for _ in 0..2 {
+        frame.x[8] = 220;
+        frame.x[0] = 17;
+        arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
+        assert!((frame.x[0] as i64) > 0, "actual native fork must succeed");
+    }
+    fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+    fixture.task.mm.key.store(0, Ordering::Release);
+    let counters = carrick_el1_abi::Counters::new();
+    let mut pending = Vec::new();
+    for _ in 0..2 {
+        let mut handoff = None;
+        let mut zone = crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        };
+        assert_eq!(
+            super::super::dispatch::native_scheduler(
+                &mut zone,
+                &fixture.task,
+                &counters,
+                fixture.slot,
+                &mut handoff
+            )
+            .idle_entry(&mut frame, 0),
+            carrick_el1_abi::Action::Served
+        );
+        let child = fixture.zone.slot(fixture.slot).current().unwrap();
+        let record = fixture.zone.record_ref(child);
+        let identity = fixture.zone.record(child).identity();
+        let owner = registry().for_record(fixture.zone, record).unwrap();
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        assert!(matches!(
+            resume_selected(
+                &owner,
+                registry(),
+                source,
+                &fixture.task,
+                child,
+                &mut service
+            ),
+            NativeResume::NoPending
+        ));
+        // SAFETY: the real native owner retains these published allocations.
+        let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+        let saved = unsafe { *fixture.zone.record(child).ctx_mut() };
+        let grant = fixture
+            .zone
+            .spaces
+            .grant(fixture.zone.spaces.find(identity.mm).unwrap(), identity.mm)
+            .unwrap();
+        assert_eq!(page.claimed_count(), 0);
+        let result = with_process_entry(
+            source,
+            &fixture.task,
+            &saved.native,
+            grant.ttbr0,
+            page,
+            control,
+            &mut service,
+            |entry| {
+                let result = entry
+                    .begin_service(ServiceOperation::Fault(FaultInfo {
+                        address: UserVa::new(0x6000000fd8),
+                        access: Access::Write,
+                        present: true,
+                    }))
+                    .unwrap();
+                assert!(entry.take_handoff_receipt().is_some());
+                result
+            },
+        )
+        .unwrap();
+        assert!(matches!(result, NativeResume::Left(None)));
+        assert!(fixture.zone.slot(fixture.slot).current().is_none());
+        assert!(matches!(
+            fixture.zone.record(child).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+        assert_eq!(page.claimed_count(), 1);
+        let selector = fixture.task.service_notice.take().unwrap().unwrap();
+        assert_eq!(selector.record, record);
+        let key = ObjectWaitKey::native_service(record).unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        let mut stale = selector;
+        stale.execution =
+            carrick_core_abi::SnapshotGeneration::from_raw(selector.execution.raw() + 1);
+        assert!(matches!(
+            unsafe {
+                ServiceCell::claim_notice(&control.service, stale, NonZeroU64::MIN, identity)
+            },
+            Err(ServiceError::Stale)
+        ));
+        drop(queue);
+        pending.push((owner, page, control, selector, identity));
+    }
+    assert!(
+        fixture.zone.runnable_head(fixture.slot).is_none(),
+        "both children wait with the single executor free"
+    );
+    pending[0]
+        .0
+        .cancel_service(pending[0].3.record, fixture.slot, &mut service)
+        .unwrap();
+    assert_eq!(
+        pending[0].1.claimed_count(),
+        1,
+        "queued cancellation retains the MM before intake"
+    );
+    assert_eq!(
+        pending[0].2.service.reset_unpublished(),
+        Err(ServiceError::Busy)
+    );
+    let mut pending: Vec<_> = pending
+        .into_iter()
+        .map(|(owner, page, control, selector, identity)| {
+            let key = ObjectWaitKey::native_service(selector.record).unwrap();
+            let _queue = fixture
+                .zone
+                .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                .unwrap();
+            let ticket = unsafe {
+                ServiceCell::claim_notice(&control.service, selector, NonZeroU64::MIN, identity)
+            }
+            .unwrap();
+            (owner, page, control, ticket)
+        })
+        .collect();
+    assert_ne!(
+        pending[0].3.request().identity.birth.process,
+        pending[1].3.request().identity.birth.process
+    );
+    assert_ne!(
+        pending[0].3.request().identity.birth.mm,
+        pending[1].3.request().identity.birth.mm
+    );
+    let (first_owner, first_page, first_control, first_ticket) = pending.remove(0);
+    let first_request = first_ticket.request();
+    let first_key = ObjectWaitKey::native_service(first_request.identity.birth.record).unwrap();
+    {
+        let queue = fixture
+            .zone
+            .object_wait(first_key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        assert!(
+            !first_control
+                .service
+                .cancel(first_request.identity)
+                .unwrap()
+        );
+        assert_eq!(
+            first_control.service.consume(first_request.identity),
+            Err(ServiceError::Busy)
+        );
+        assert_eq!(
+            first_page.claimed_count(),
+            1,
+            "cancellation is not physical acknowledgment"
+        );
+        queue
+            .notify_object(fixture.slot, &mut Default::default())
+            .unwrap();
+    }
+    // A cancellation wake before physical ACK must repark the exact owner.
+    let mut handoff = None;
+    let mut zone = crate::dispatch::Zone {
+        tables: fixture.zone,
+        cpu: &mut cpu,
+        user: &crate::sched::HardwareUserWord,
+    };
+    assert_eq!(
+        super::super::dispatch::native_scheduler(
+            &mut zone,
+            &fixture.task,
+            &counters,
+            fixture.slot,
+            &mut handoff
+        )
+        .idle_entry(&mut frame, 0),
+        carrick_el1_abi::Action::Served
+    );
+    let child = fixture.zone.slot(fixture.slot).current().unwrap();
+    assert!(matches!(
+        resume_selected(
+            &first_owner,
+            registry(),
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot
+            },
+            &fixture.task,
+            child,
+            &mut service
+        ),
+        NativeResume::Left(None)
+    ));
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    assert_eq!(first_page.claimed_count(), 1);
+    let (second_owner, second_page, second_control, second_ticket) = pending.remove(0);
+    // Complete out of order while the first child's resources remain retained.
+    for (owner, page, control, ticket) in [
+        (second_owner, second_page, second_control, second_ticket),
+        (first_owner, first_page, first_control, first_ticket),
+    ] {
+        let request = ticket.request();
+        let key = ObjectWaitKey::native_service(request.identity.birth.record).unwrap();
+        {
+            let queue = fixture
+                .zone
+                .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                .unwrap();
+            assert!(ticket.complete(true).is_ok());
+            queue
+                .notify_object(fixture.slot, &mut Default::default())
+                .unwrap();
+        }
+        assert_eq!(
+            page.claimed_count(),
+            1,
+            "ring still owes continuation consumption"
+        );
+        let mut handoff = None;
+        let mut zone = crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        };
+        assert_eq!(
+            super::super::dispatch::native_scheduler(
+                &mut zone,
+                &fixture.task,
+                &counters,
+                fixture.slot,
+                &mut handoff
+            )
+            .idle_entry(&mut frame, 0),
+            carrick_el1_abi::Action::Served
+        );
+        let child = fixture.zone.slot(fixture.slot).current().unwrap();
+        assert_eq!(child, request.identity.birth.record.id);
+        assert!(matches!(
+            resume_selected(
+                &owner,
+                registry(),
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot
+                },
+                &fixture.task,
+                child,
+                &mut service
+            ),
+            NativeResume::NoPending
+        ));
+        assert_eq!(page.claimed_count(), 0);
+        assert_eq!(
+            control.service.consume(request.identity),
+            Err(ServiceError::Busy),
+            "exactly one continuation consumed"
+        );
+        assert!(matches!(
+            fixture
+                .zone
+                .release_current(fixture.slot, child, &carrick_sched_core::ShortLockSpin),
+            carrick_sched_core::CurrentRelease::Released
+        ));
+    }
+}

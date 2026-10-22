@@ -43,6 +43,8 @@ pub enum ServiceError {
     Exhausted,
 }
 
+pub const NATIVE_SERVICE_PROTOCOL: u64 = 1;
+
 /// Transport selector only: authority remains in the member's retained cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServiceSelector {
@@ -133,6 +135,7 @@ const SERVICING: u64 = 4;
 const CANCEL_REQUESTED: u64 = 5;
 const COMPLETED: u64 = 6;
 const CANCELLED: u64 = 7;
+const CANCEL_QUEUED: u64 = 8;
 
 /// A member owns this cell, not the execution slot. Its enclosing allocation
 /// and semantic MM claim must remain retained through acknowledgment. All
@@ -265,6 +268,102 @@ impl ServiceCell {
         self.state.store(expected, Ordering::Release);
         Err(ServiceError::Stale)
     }
+    /// Claim a notice against its independently retained native member.
+    ///
+    /// # Safety
+    /// `pin` must retain the exact control allocation of `member.record` in
+    /// `carrier`. The caller holds that record's native-service queue lock.
+    /// The native owner published the cell under its outstanding MM/lifecycle
+    /// claim; cancellation cannot release that claim during this transition.
+    pub unsafe fn claim_notice<P: Deref<Target = Self>>(
+        pin: P,
+        selector: ServiceSelector,
+        carrier: NonZeroU64,
+        member: carrick_sched_core::ThreadIdentity,
+    ) -> Result<ServiceTicket<P>, ServiceError> {
+        let cell = &*pin;
+        let state = cell.state.load(Ordering::Acquire);
+        if !matches!(state, REQUESTED | CANCEL_QUEUED) {
+            return Err(ServiceError::Stale);
+        }
+        cell.state
+            .compare_exchange(state, WRITING, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ServiceError::Stale)?;
+        let decoded = (|| {
+            let incarnation = NonZeroU64::new(cell.words[7].load(Ordering::Relaxed))
+                .ok_or(ServiceError::Stale)?;
+            let mm = crate::ReservationMm::new(member.mm).ok_or(ServiceError::Stale)?;
+            // SAFETY: this is a copy of the admitted handle retained by the
+            // ring's outstanding claim, not admission from a raw host request.
+            let mm = unsafe { El1MmHandle::from_admitted_owner(carrier, mm, incarnation) };
+            let process_id = i32::try_from(cell.words[1].load(Ordering::Relaxed))
+                .ok()
+                .and_then(core::num::NonZeroI32::new)
+                .ok_or(ServiceError::Stale)?;
+            let birth = NonZeroU64::new(cell.words[2].load(Ordering::Relaxed))
+                .ok_or(ServiceError::Stale)?;
+            let process = TaskKey {
+                id: carrick_sched_core::process::TaskId::from_registry_allocation(process_id),
+                serial: carrick_sched_core::process::TaskSerial::from_registry_allocation(birth),
+            };
+            let identity = ServiceIdentity {
+                birth: ServiceBirth {
+                    process,
+                    thread: EntryThreadGeneration::from_raw(member.serial),
+                    record: selector.record,
+                    mm,
+                },
+                execution: selector.execution,
+                sequence: selector.sequence,
+            };
+            if member.generation != selector.execution.raw() || !cell.same(identity) {
+                return Err(ServiceError::Stale);
+            }
+            let first = cell.words[10].load(Ordering::Relaxed);
+            let operation = match cell.words[9].load(Ordering::Relaxed) {
+                1 if first <= 6 && first & 3 != 3 => ServiceOperation::Fault(FaultInfo {
+                    address: carrick_guest_arch::UserVa::new(
+                        cell.words[11].load(Ordering::Relaxed),
+                    ),
+                    access: match first & 3 {
+                        0 => Access::Read,
+                        1 => Access::Write,
+                        _ => Access::Execute,
+                    },
+                    present: first & 4 != 0,
+                }),
+                2 => ServiceOperation::Crossing {
+                    ordinal: NativeOrdinal::new(first),
+                },
+                _ => return Err(ServiceError::Stale),
+            };
+            Ok(ServiceRequest {
+                identity,
+                operation,
+            })
+        })();
+        match decoded {
+            Ok(request) => {
+                cell.state.store(
+                    if state == CANCEL_QUEUED {
+                        CANCEL_REQUESTED
+                    } else {
+                        SERVICING
+                    },
+                    Ordering::Release,
+                );
+                Ok(ServiceTicket {
+                    cell: core::mem::ManuallyDrop::new(pin),
+                    request,
+                })
+            }
+            Err(error) => {
+                cell.state.store(state, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
     /// The transport supplies the immutable copied request; claiming validates
     /// it under the cell transition before giving out one non-cloneable ticket.
     pub fn claim(&self, request: ServiceRequest) -> Result<ServiceTicket<&Self>, ServiceError> {
@@ -278,7 +377,11 @@ impl ServiceCell {
         request: ServiceRequest,
     ) -> Result<ServiceTicket<P>, ServiceError> {
         let cell = &*pin;
-        cell.lock_exact(REQUESTED, request.identity)?;
+        let state = cell.state.load(Ordering::Acquire);
+        if !matches!(state, REQUESTED | CANCEL_QUEUED) {
+            return Err(ServiceError::Busy);
+        }
+        cell.lock_exact(state, request.identity)?;
         let operation_matches = match request.operation {
             ServiceOperation::Fault(fault) => {
                 cell.words[9].load(Ordering::Relaxed) == 1
@@ -291,10 +394,17 @@ impl ServiceCell {
             }
         };
         if !operation_matches {
-            cell.state.store(REQUESTED, Ordering::Release);
+            cell.state.store(state, Ordering::Release);
             return Err(ServiceError::Stale);
         }
-        cell.state.store(SERVICING, Ordering::Release);
+        cell.state.store(
+            if state == CANCEL_QUEUED {
+                CANCEL_REQUESTED
+            } else {
+                SERVICING
+            },
+            Ordering::Release,
+        );
         Ok(ServiceTicket {
             cell: core::mem::ManuallyDrop::new(pin),
             request,
@@ -313,12 +423,14 @@ impl ServiceCell {
                 self.state.store(IDLE, Ordering::Release);
                 Ok(true)
             }
-            REQUESTED | SERVICING | CANCEL_REQUESTED | COMPLETED | CANCELLED => {
+            REQUESTED | CANCEL_QUEUED | SERVICING | CANCEL_REQUESTED | COMPLETED | CANCELLED => {
                 self.lock_exact(state, identity)?;
-                let acknowledged = matches!(state, REQUESTED | COMPLETED | CANCELLED);
+                let acknowledged = matches!(state, COMPLETED | CANCELLED);
                 self.state.store(
                     if acknowledged {
                         CANCELLED
+                    } else if matches!(state, REQUESTED | CANCEL_QUEUED) {
+                        CANCEL_QUEUED
                     } else {
                         CANCEL_REQUESTED
                     },
@@ -329,6 +441,21 @@ impl ServiceCell {
             _ => Err(ServiceError::Busy),
         }
     }
+    /// Roll back a request whose transport publication failed.
+    ///
+    /// # Safety
+    /// No notice or ticket for this identity may have been delivered. Once a
+    /// notice is published, even cancellation must wait for physical intake.
+    pub unsafe fn abort_unpublished(&self, identity: ServiceIdentity) -> Result<(), ServiceError> {
+        let state = self.state.load(Ordering::Acquire);
+        if !matches!(state, REQUESTED | CANCEL_QUEUED) {
+            return Err(ServiceError::Busy);
+        }
+        self.lock_exact(state, identity)?;
+        self.state.store(CANCELLED, Ordering::Release);
+        Ok(())
+    }
+
     /// The ring consumes exactly one acknowledged operation before releasing
     /// its retained MM/member capabilities or deciding a guest-visible result.
     pub fn consume(&self, identity: ServiceIdentity) -> Result<ServiceResult, ServiceError> {
@@ -515,7 +642,9 @@ mod tests {
         let old = cell
             .publish(old_birth, SnapshotGeneration::INITIAL, fault())
             .unwrap();
-        assert!(cell.cancel(old.identity).unwrap());
+        assert!(!cell.cancel(old.identity).unwrap());
+        assert_eq!(cell.consume(old.identity), Err(ServiceError::Busy));
+        assert!(cell.claim(old).unwrap().complete(false).is_ok());
         assert_eq!(cell.consume(old.identity), Ok(ServiceResult::Cancelled));
         cell.reset_unpublished().unwrap();
         let new_birth = birth(1, 2);

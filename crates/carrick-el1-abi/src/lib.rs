@@ -800,6 +800,10 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(CurrentTask, metadata.lifecycle_page) as u64,
         core::mem::offset_of!(CurrentTask, metadata.control_slot) as u64,
         core::mem::offset_of!(CurrentTask, root_generation) as u64,
+        core::mem::offset_of!(CurrentTask, service_notice) as u64,
+        carrick_core_abi::service::NATIVE_SERVICE_PROTOCOL,
+        core::mem::size_of::<carrick_core_abi::service::ServiceNotice>() as u64,
+        core::mem::size_of::<carrick_core_abi::service::ServiceCell>() as u64,
         core::mem::size_of::<MetadataGrantMailbox>() as u64,
         core::mem::align_of::<MetadataGrantMailbox>() as u64,
         core::mem::offset_of!(MetadataGrantMailbox, request_generation) as u64,
@@ -3964,7 +3968,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x92d2425dc725967a);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xc4b0af43445f8173);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
