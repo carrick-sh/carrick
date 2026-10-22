@@ -270,7 +270,7 @@ impl Default for PendingSummary {
 
 /// Read-only pending state, derived from the independently locked queues.
 /// A reader cannot acquire either queue's publication authority through this view.
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub struct PendingRead<'a> {
     carrier: &'a PendingSummary,
     native: Option<&'a PendingSummary>,
