@@ -219,8 +219,6 @@ impl<'a, T> SignalShared<'a, T> {
         let pending = process | resources.thread_pending_set(record).bits();
         projection
             .control
-            .control()
-            .pending()
             .replace_from_locked_queue(carrick_el1_abi::PendingSignals(pending));
         #[cfg(test)]
         self.projection_stores.fetch_add(1, Ordering::Relaxed);
@@ -251,8 +249,7 @@ fn awaits_stop_custody(action: Action, signal: Signal) -> bool {
 /// projection and exact-incarnation control custody before slot reuse.
 pub struct NativeSignalProjection<'a, T> {
     owner: Weak<SignalShared<'a, T>>,
-    control:
-        Arc<carrick_core::lifecycle::MemberControlCustody<'a, carrick_el1_abi::ThreadControlSlot>>,
+    control: carrick_el1_abi::NativePendingCustody<'a>,
 }
 impl<T> NativeSignalProjection<'_, T> {
     pub fn rehome(&self, record: carrick_sched_core::RecordRef) {
@@ -288,8 +285,6 @@ impl<T> NativeSignalProjection<'_, T> {
 impl<T> Drop for NativeSignalProjection<'_, T> {
     fn drop(&mut self) {
         self.control
-            .control()
-            .pending()
             .replace_from_locked_queue(carrick_el1_abi::PendingSignals(0));
     }
 }
@@ -335,7 +330,7 @@ impl<'a, T> NativeProcessSignals<'a, T> {
     ) -> Arc<NativeSignalProjection<'a, T>> {
         let projection = Arc::new(NativeSignalProjection {
             owner: Arc::downgrade(&self.resources),
-            control,
+            control: carrick_el1_abi::NativePendingCustody::new(control),
         });
         let mut resources = self.resources.lock();
         resources

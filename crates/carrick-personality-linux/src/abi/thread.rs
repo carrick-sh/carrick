@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 16;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 17;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
@@ -268,6 +268,44 @@ impl Default for PendingSummary {
     }
 }
 
+/// Read-only pending state, derived from the independently locked queues.
+/// A reader cannot acquire either queue's publication authority through this view.
+#[derive(Clone, Copy)]
+pub struct PendingRead<'a> {
+    carrier: &'a PendingSummary,
+    native: Option<&'a PendingSummary>,
+}
+impl PendingRead<'_> {
+    pub fn load(&self) -> PendingSignals {
+        PendingSignals(self.carrier.load().0 | self.native.map_or(0, |pending| pending.load().0))
+    }
+}
+impl<'a> From<&'a PendingSummary> for PendingRead<'a> {
+    fn from(carrier: &'a PendingSummary) -> Self {
+        Self {
+            carrier,
+            native: None,
+        }
+    }
+}
+
+/// Native signal custody alone can publish the native queue's projection.
+/// The retained exact incarnation excludes slot reset until this writer drops.
+pub struct NativePendingCustody<'a> {
+    control: ::alloc::sync::Arc<MemberControlCustody<'a, ThreadControlSlot>>,
+}
+impl<'a> NativePendingCustody<'a> {
+    pub fn new(control: ::alloc::sync::Arc<MemberControlCustody<'a, ThreadControlSlot>>) -> Self {
+        Self { control }
+    }
+    pub fn replace_from_locked_queue(&self, pending: PendingSignals) {
+        self.control
+            .control()
+            .native_pending
+            .replace_from_locked_queue(pending);
+    }
+}
+
 /// Snapshot of a thread's `sigaltstack`. Size 0 is the disabled stack
 /// (zeroed storage, and what `SS_DISABLE` stores): an enabled one is at least
 /// `MINSIGSTKSZ` bytes.
@@ -423,6 +461,7 @@ pub struct ThreadControlSlot {
     /// Signals whose current action (`SIG_IGN` or default-ignore) cannot
     /// interrupt a blocking wait on this thread.
     non_interrupting: AtomicU64,
+    native_pending: PendingSummary,
 }
 
 impl ThreadControlSlot {
@@ -459,6 +498,7 @@ impl ThreadControlSlot {
             birth_serial: carrick_core_abi::entry::AtomicBirthSerial::new(),
             birth_thread: AtomicU64::new(0),
             non_interrupting: AtomicU64::new(0),
+            native_pending: PendingSummary::new(),
         }
     }
 
@@ -522,7 +562,15 @@ impl ThreadControlSlot {
         (tid != 0).then_some(tid)
     }
 
-    pub fn pending(&self) -> &PendingSummary {
+    pub fn pending(&self) -> PendingRead<'_> {
+        PendingRead {
+            carrier: &self.pending,
+            native: Some(&self.native_pending),
+        }
+    }
+
+    /// Carrier queue mutation never grants access to the native projection.
+    pub fn carrier_pending(&self) -> &PendingSummary {
         &self.pending
     }
 
@@ -543,6 +591,7 @@ impl ThreadControlSlot {
         self.zone_incarnation.store(0, Ordering::Relaxed);
         self.zone_seq.store(0, Ordering::Relaxed);
         self.pending.clear(PendingSignals(u64::MAX));
+        self.native_pending.clear(PendingSignals(u64::MAX));
         self.blocked.store(blocked.0, Ordering::Relaxed);
         self.birth_thread.store(0, Ordering::Relaxed);
         self.birth_task.store(0, Ordering::Relaxed);
@@ -653,16 +702,13 @@ impl ThreadControlSlot {
     /// pending summary. Returns `(old mask, pending)`. If any pending bit is
     /// not in `new`, the caller must serve with work. `SeqCst` on both.
     #[must_use]
-    pub fn store_blocked_then_read_pending(
+    pub fn store_blocked_then_read_pending<'a>(
         &self,
         new: BlockedMask,
-        pending: &PendingSummary,
+        pending: impl Into<PendingRead<'a>>,
     ) -> (BlockedMask, PendingSignals) {
         let old = self.blocked.swap(new.0, Ordering::SeqCst);
-        (
-            BlockedMask(old),
-            PendingSignals(pending.0.load(Ordering::SeqCst)),
-        )
+        (BlockedMask(old), pending.into().load())
     }
 
     /// Plain read of the mask (no ordering pair): the owner's own view, or
@@ -1867,7 +1913,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 40] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 41] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::offset_of!(PoolEntry, birth) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, terminal) as u64,
@@ -1890,6 +1936,7 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 40] = [
     ::core::mem::offset_of!(ThreadControlSlot, clear_child_tid) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, entry) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, pending) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, native_pending) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, zone_seq) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, zone_incarnation) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, zone_id) as u64,
@@ -2165,12 +2212,32 @@ mod tests {
         );
     }
     #[test]
+    fn carrier_queue_cleanup_cannot_clear_native_pending_custody() {
+        let control = ThreadControlSlot::new();
+        let custody = Arc::new(MemberControlCustody::retain(&control).unwrap());
+        let native = NativePendingCustody::new(custody.clone());
+        native.replace_from_locked_queue(PendingSignals(0x100));
+        let _ = control
+            .carrier_pending()
+            .post_then_read_blocked(PendingSignals(0x400), &control);
+        assert_eq!(control.pending().load(), PendingSignals(0x500));
+        control.carrier_pending().clear(PendingSignals(u64::MAX));
+        assert_eq!(control.pending().load(), PendingSignals(0x100));
+        native.replace_from_locked_queue(PendingSignals(0));
+        assert_eq!(control.pending().load(), PendingSignals(0));
+        drop(native);
+        drop(custody);
+        control.reset_for_host_birth(BlockedMask(0)).unwrap();
+        assert_eq!(control.pending().load(), PendingSignals(0));
+    }
+
+    #[test]
     fn control_pending_is_owned_by_the_exact_thread_slot() {
         let first = ThreadControlSlot::new();
         let second = ThreadControlSlot::new();
         first.init_blocked(BlockedMask(0x400));
         let _ = first
-            .pending()
+            .carrier_pending()
             .post_then_read_blocked(PendingSignals(0x400), &first);
         assert_eq!(first.pending().load(), PendingSignals(0x400));
         assert_eq!(second.pending().load(), PendingSignals(0));
@@ -2839,6 +2906,7 @@ mod layout_manifest {
                      birth_serial: _,
                      birth_thread: _,
                      non_interrupting: _,
+                     native_pending: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
@@ -2885,6 +2953,7 @@ mod layout_manifest {
         );
         field!(ThreadControlSlot, birth_thread, AtomicU64, 160, 8, 8);
         field!(ThreadControlSlot, non_interrupting, AtomicU64, 168, 8, 8);
+        field!(ThreadControlSlot, native_pending, PendingSummary, 176, 8, 8);
     }
 
     #[test]

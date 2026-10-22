@@ -768,7 +768,7 @@ fn sigprocmask_unblocking_a_pending_signal_serves_with_work() {
     let seen = w
         .venue
         .leader_slot()
-        .pending()
+        .carrier_pending()
         .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), slot);
     assert_ne!(seen.0 & SIGUSR1_BIT, 0);
     let set = Box::new(SIGUSR1_BIT);
@@ -838,7 +838,7 @@ fn sigprocmask_serves_block_setmask_and_query() {
     let _ = w
         .venue
         .leader_slot()
-        .pending()
+        .carrier_pending()
         .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), w.venue.leader_slot());
     let (action, _) = w.syscall(SYS_RT_SIGPROCMASK, &[SIG_BLOCK, addr(&*set), 0, 8]);
     assert_eq!(action, Action::ServedWithWork);
@@ -876,7 +876,7 @@ fn sigprocmask_oldset_fault_preserves_pending_signal_work() {
     let slot = w.venue.leader_slot();
     slot.init_blocked(BlockedMask(SIGUSR1_BIT));
     let seen = slot
-        .pending()
+        .carrier_pending()
         .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), slot);
     assert_ne!(seen.0 & SIGUSR1_BIT, 0);
     let set = Box::new(SIGUSR1_BIT);
@@ -1002,7 +1002,7 @@ fn run_sigprocmask_dekker_storm(process: bool) {
     let summary = if process {
         venue.page.pending()
     } else {
-        venue.leader_slot().pending()
+        venue.leader_slot().carrier_pending()
     };
     let (start, end) = (Barrier::new(2), Barrier::new(2));
     let (saw_blocked, works) = std::thread::scope(|scope| {

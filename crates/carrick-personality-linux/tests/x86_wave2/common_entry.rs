@@ -404,7 +404,7 @@ fn x86_block_pending_unblock_owes_work_before_return() {
 
     // The forwarded kill(self) has posted a signal while it was blocked.
     let seen = slot
-        .pending()
+        .carrier_pending()
         .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), slot);
     assert_ne!(seen.0 & SIGUSR1_BIT, 0);
     let (unblocked, frame) = w.call(0, sigprocmask(1));

@@ -4524,6 +4524,16 @@ pub(crate) mod tests {
                             1,
                             "release must win Ready before SIGKILL"
                         );
+                        // The renewed editor has a new producer revision. The
+                        // memory test service must return that exact refusal,
+                        // rather than treating the old released receipt as busy.
+                        engine.copyout_owner_probe = Some(CopyoutOwnerProbe {
+                            wait: portal
+                                .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
+                                .unwrap()
+                                .unwrap(),
+                            zone: zone as *const _ as usize,
+                        });
                     }
                     if native && signum == Some(carrick_abi::LINUX_SIGKILL) {
                         let owner = native_owner.as_ref().unwrap();
@@ -4643,7 +4653,8 @@ pub(crate) mod tests {
                         &need_resched,
                         &mut resumed_submission,
                     );
-                    let completed = job
+                    resumed_control.binding = Some(&binding);
+                    let mut completed = job
                         .resume_owner_zone(
                             &mut engine,
                             &mut resumed_control,
@@ -4651,6 +4662,56 @@ pub(crate) mod tests {
                             binding::OwnedSyscallResume::CopyoutRedispatch,
                         )
                         .unwrap();
+                    if release_wins {
+                        let executor::ExecutorExit::BlockedContinuation {
+                            continuation,
+                            vfork_activation: None,
+                        } = completed
+                        else {
+                            panic!(
+                                "renewed editor contention must return a new continuation: {completed:?}"
+                            );
+                        };
+                        let mut renewal = wait_service.prepare_registration(&continuation);
+                        wait_service.enroll(&mut renewal).unwrap();
+                        let lease = resumed_submission.take_execution_lease().unwrap();
+                        resumed.restore_lease(lease).unwrap();
+                        scheduler
+                            .settle_blocked_continuation(resumed, *continuation, renewal)
+                            .unwrap();
+                        assert_eq!(
+                            scheduler.queued_len(),
+                            1,
+                            "settled native SIGKILL must cancel renewed contention without another owner release"
+                        );
+                        resumed = scheduler.try_take(&registration).unwrap().unwrap();
+                        resumed_submission.authority =
+                            executor::ExecutionLeaseAuthoritySlot::new(Some(resumed.take_lease()));
+                        job.state.guest_execution = Some(
+                            kernel
+                                .dispatcher
+                                .enter_mm_executor_for_thread(
+                                    Some(Arc::clone(root.thread())),
+                                    Arc::clone(&job.state.kicker),
+                                    job.state.this_tid,
+                                    test_execution_slot(),
+                                )
+                                .unwrap(),
+                        );
+                        let mut resumed_control = executor::HvpatchQuantumControl::for_test(
+                            &need_resched,
+                            &mut resumed_submission,
+                        );
+                        resumed_control.binding = Some(&binding);
+                        completed = job
+                            .resume_owner_zone(
+                                &mut engine,
+                                &mut resumed_control,
+                                frame,
+                                binding::OwnedSyscallResume::CopyoutRedispatch,
+                            )
+                            .unwrap();
+                    }
                     if killing && native {
                         assert_eq!(engine.native_owner_cancellations, 1);
                         assert!(engine.completed_syscalls.is_empty());
