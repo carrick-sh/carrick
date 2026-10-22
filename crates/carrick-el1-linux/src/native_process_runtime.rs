@@ -886,11 +886,17 @@ struct PendingSignalWait {
     deadline: Option<carrick_guest_arch::Deadline>,
 }
 // One member cannot suspend on a signal and on external service at once.
-// Keep both in the same owner table; a service request retains its larger
-// custody record out of line while signal waits retain their existing shape.
+// Keep both in the same owner table, with one out-of-line continuation
+// allocation per waiting member. Tree nodes only move small custody handles.
 enum MemberWait<'a> {
     Signal(PendingSignalWait),
-    Service(Box<service::PendingService<'a>>),
+    Service(service::PendingService<'a>),
+}
+
+#[derive(Default)]
+struct MemberWaitState<'a> {
+    wait: Option<MemberWait<'a>>,
+    suspend_mask: Option<carrick_signal_core::policy::SigBlockMask>,
 }
 
 struct Graph<'a, M: Clone, C: ProcessContext> {
@@ -901,36 +907,91 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     serials: SerialAllocator,
     pending: BTreeMap<TaskKey, PendingContinuation>,
     pending_exit: BTreeMap<TaskKey, PendingExit<'a>>,
-    member_waits: BTreeMap<RecordRef, MemberWait<'a>>,
-    suspend_masks: BTreeMap<RecordRef, carrick_signal_core::policy::SigBlockMask>,
+    member_waits: BTreeMap<RecordRef, Box<MemberWaitState<'a>>>,
     _root_roles: NativeClaim,
     uts: carrick_personality_linux::sysinfo::LinuxUtsname,
     ipc: Arc<SpinLock<IpcNamespace>>,
 }
 impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
+    fn has_member_wait(&self, record: &RecordRef) -> bool {
+        self.member_waits
+            .get(record)
+            .is_some_and(|state| state.wait.is_some())
+    }
+
+    // Signal-mask restoration and external service share the same retained
+    // member row. Keep allocation/publication in one bounded slow path.
+    #[inline(never)]
+    fn member_wait_state(&mut self, record: RecordRef) -> &mut MemberWaitState<'a> {
+        self.member_waits.entry(record).or_default()
+    }
+
+    #[inline(never)]
+    fn insert_member_wait(&mut self, record: RecordRef, wait: MemberWait<'a>) {
+        self.member_wait_state(record).wait = Some(wait);
+    }
+
+    #[inline(never)]
+    fn take_member_wait(&mut self, record: &RecordRef) -> Option<MemberWait<'a>> {
+        let state = self.member_waits.get_mut(record)?;
+        let wait = state.wait.take();
+        if state.suspend_mask.is_none() {
+            self.member_waits.remove(record);
+        }
+        wait
+    }
+
+    fn has_suspend_mask(&self, record: &RecordRef) -> bool {
+        self.member_waits
+            .get(record)
+            .is_some_and(|state| state.suspend_mask.is_some())
+    }
+
+    #[inline(never)]
+    fn insert_suspend_mask(
+        &mut self,
+        record: RecordRef,
+        mask: carrick_signal_core::policy::SigBlockMask,
+    ) -> Option<carrick_signal_core::policy::SigBlockMask> {
+        self.member_wait_state(record).suspend_mask.replace(mask)
+    }
+
+    #[inline(never)]
+    fn remove_suspend_mask(
+        &mut self,
+        record: &RecordRef,
+    ) -> Option<carrick_signal_core::policy::SigBlockMask> {
+        let state = self.member_waits.get_mut(record)?;
+        let mask = state.suspend_mask.take();
+        if state.wait.is_none() {
+            self.member_waits.remove(record);
+        }
+        mask
+    }
+
     fn service_wait(&self, record: &RecordRef) -> Option<&service::PendingService<'a>> {
-        match self.member_waits.get(record)? {
+        match self.member_waits.get(record)?.wait.as_ref()? {
             MemberWait::Service(pending) => Some(pending),
             MemberWait::Signal(_) => None,
         }
     }
 
-    fn remove_service_wait(
-        &mut self,
-        record: &RecordRef,
-    ) -> Option<Box<service::PendingService<'a>>> {
+    fn remove_service_wait(&mut self, record: &RecordRef) -> Option<service::PendingService<'a>> {
         self.service_wait(record)?;
-        match self.member_waits.remove(record)? {
+        match self.take_member_wait(record)? {
             MemberWait::Service(pending) => Some(pending),
             MemberWait::Signal(_) => unreachable!(),
         }
     }
 
     fn remove_signal_wait(&mut self, record: &RecordRef) -> Option<PendingSignalWait> {
-        if !matches!(self.member_waits.get(record), Some(MemberWait::Signal(_))) {
+        if !matches!(
+            self.member_waits.get(record)?.wait.as_ref(),
+            Some(MemberWait::Signal(_))
+        ) {
             return None;
         }
-        match self.member_waits.remove(record)? {
+        match self.take_member_wait(record)? {
             MemberWait::Signal(pending) => Some(pending),
             MemberWait::Service(_) => unreachable!(),
         }
@@ -938,7 +999,13 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
 }
 impl<'a, M: Clone, C: ProcessContext> Drop for Graph<'a, M, C> {
     fn drop(&mut self) {
-        NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(self.suspend_masks.len(), Ordering::Release);
+        NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(
+            self.member_waits
+                .values()
+                .filter(|state| state.suspend_mask.is_some())
+                .count(),
+            Ordering::Release,
+        );
     }
 }
 pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
@@ -1520,7 +1587,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let Ok(row) = graph.owner.task(member.process) else {
             return true;
         };
-        if graph.suspend_masks.contains_key(&record)
+        if graph.has_suspend_mask(&record)
             || row
                 .native()
                 .resources()
@@ -2713,7 +2780,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 pending: BTreeMap::new(),
                 pending_exit: BTreeMap::new(),
                 member_waits: BTreeMap::new(),
-                suspend_masks: BTreeMap::new(),
                 _root_roles: root_roles,
                 uts,
                 ipc,
@@ -3115,7 +3181,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         let Ok(row) = graph.owner.task(self.key) else {
             return true;
         };
-        if graph.suspend_masks.contains_key(&self.record)
+        if graph.has_suspend_mask(&self.record)
             || row
                 .native()
                 .resources()
@@ -3510,6 +3576,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
     /// Publish a synchronous fault payload through this exact process owner.
+    #[inline(never)]
     pub fn force_sigsegv_info(
         &mut self,
         blocked: carrick_signal_core::policy::SigBlockMask,
@@ -3555,13 +3622,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         observed: carrick_sched_core::process::wait::TaskWakeGeneration,
         deadline: Option<carrick_guest_arch::Deadline>,
     ) -> Result<bool, NativeProcessError> {
-        if self
-            .runtime
-            .graph
-            .lock()
-            .member_waits
-            .contains_key(&self.record)
-        {
+        if self.runtime.graph.lock().has_member_wait(&self.record) {
             return Err(NativeProcessError::Busy);
         }
         let zone = self.source.zone;
@@ -3593,7 +3654,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             })?;
         // SAFETY: this exact record is still authenticated OnCpu under its bucket guard.
         unsafe { *zone.record(record).ctx_mut() = *self.words };
-        self.runtime.graph.lock().member_waits.insert(
+        self.runtime.graph.lock().insert_member_wait(
             self.record,
             MemberWait::Signal(PendingSignalWait {
                 kind,
@@ -7619,8 +7680,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .runtime
             .graph
             .lock()
-            .suspend_masks
-            .insert(self.record, original)
+            .insert_suspend_mask(self.record, original)
             .is_none()
         {
             NATIVE_SIGNAL_CONTINUATIONS.fetch_add(1, Ordering::Release);
@@ -7656,8 +7716,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .runtime
                         .graph
                         .lock()
-                        .suspend_masks
-                        .remove(&self.record)
+                        .remove_suspend_mask(&self.record)
                         .is_some()
                     {
                         NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(1, Ordering::Release);
@@ -7668,7 +7727,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
     fn take_suspend_mask(&mut self) -> Option<carrick_signal_core::policy::SigBlockMask> {
-        let old = self.runtime.graph.lock().suspend_masks.remove(&self.record);
+        let old = self.runtime.graph.lock().remove_suspend_mask(&self.record);
         if old.is_some() {
             NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(1, Ordering::Release);
         }

@@ -256,17 +256,20 @@ impl ServiceCell {
             operation,
         })
     }
+    #[inline(never)]
     fn same_birth(&self, birth: ServiceBirth) -> bool {
         self.words
             .iter()
             .zip(birth.words())
             .all(|(word, value)| word.load(Ordering::Relaxed) == value)
     }
+    #[inline(never)]
     fn same(&self, identity: ServiceIdentity) -> bool {
         self.same_birth(identity.birth)
             && self.words[8].load(Ordering::Relaxed) == identity.execution.raw()
             && self.sequence.load(Ordering::Relaxed) == identity.sequence.get()
     }
+    #[inline(never)]
     fn lock_exact(&self, expected: u64, identity: ServiceIdentity) -> Result<(), ServiceError> {
         self.state
             .compare_exchange(expected, WRITING, Ordering::Acquire, Ordering::Relaxed)

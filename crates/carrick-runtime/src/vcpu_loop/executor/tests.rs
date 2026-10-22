@@ -423,6 +423,8 @@ type InheritedStateRow = (u64, u64, u64, u64, u64);
 
 #[derive(Clone, Default)]
 struct FakeFactory {
+    native_services: Option<Arc<parking_lot::Mutex<carrick_el1_linux::native_process_runtime::host_test_support::NativeServiceCapacityFixture>>>,
+    native_progress: Option<std::sync::mpsc::Sender<usize>>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     topology: Option<Arc<carrick_vmm_hvf::trap::VcpuTopologyTestFixture>>,
     bindings: Arc<parking_lot::Mutex<BTreeMap<ThreadKey, Arc<FakeBinding>>>>,
@@ -931,6 +933,30 @@ impl PersistentExecutor for FakeExecutor {
     }
 
     type TaskBinding = FakeBinding;
+
+    fn has_physical_idle_lane(&self) -> bool {
+        self.factory.native_services.is_some()
+    }
+
+    fn wait_in_guest(&mut self) -> Result<super::GuestIdleExit, TrapError> {
+        let Some(native) = &self.factory.native_services else {
+            return Ok(super::GuestIdleExit::Unsupported);
+        };
+        let progress = native.lock().park_next();
+        if let Some(progress) = progress {
+            self.factory
+                .native_progress
+                .as_ref()
+                .unwrap()
+                .send(progress)
+                .unwrap();
+            // The real ring owner has parked and transferred the ticket to
+            // the external fixture. The idle quantum now releases this worker.
+            Ok(super::GuestIdleExit::Idle)
+        } else {
+            Ok(super::GuestIdleExit::Unsupported)
+        }
+    }
 
     fn load(&mut self, task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError> {
         assert_eq!(thread::current().id(), self.owner);
@@ -8572,4 +8598,58 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
         );
         assert_eq!(scheduler.queued_len(), 0);
     });
+}
+
+/// kernel.scheduler.runnable-progress: more native waits than the default
+/// host pool has workers must leave capacity for another native child.
+#[test]
+fn native_service_waits_do_not_exhaust_the_default_executor_pool() {
+    use carrick_el1_linux::native_process_runtime::host_test_support::NativeServiceCapacityFixture;
+    let (kernel, _root) = bootstrap(19_740);
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let config = ExecutorPoolConfig {
+        bound_workers: super::pool::bound_executors_from_value(1, None),
+        spare_executors: super::pool::spare_executors_from_value(1, None),
+        vcpu_ceiling: 8,
+        reserve: 1,
+    };
+    let workers = config.executor_count().unwrap();
+    assert_eq!(workers, 3);
+    let children = workers + 1;
+    let native = Arc::new(parking_lot::Mutex::new(NativeServiceCapacityFixture::new(
+        children,
+    )));
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let factory = Arc::new(FakeFactory {
+        native_services: Some(Arc::clone(&native)),
+        native_progress: Some(progress_tx),
+        ..FakeFactory::default()
+    });
+    let pool = ExecutorPool::start(
+        config,
+        scheduler,
+        Arc::clone(&factory),
+        Arc::clone(&factory),
+        ExecutorBoundaryAudit::production(),
+    )
+    .unwrap();
+    let progressed: Result<BTreeSet<_>, _> = (0..children)
+        .map(|_| progress_rx.recv_timeout(Duration::from_secs(5)))
+        .collect();
+    // Always release/join the pool before asserting the bounded observation.
+    let report = pool.shutdown().unwrap();
+    assert_eq!(
+        progressed,
+        Ok((1..=children).collect()),
+        "all children must park before any ACK"
+    );
+    assert_eq!(native.lock().outstanding(), children);
+    assert!(
+        factory.bindings.lock().is_empty(),
+        "no host child task adoption"
+    );
+    assert_eq!(report.created(), workers);
+    assert_eq!(report.destroyed(), workers);
+    assert_eq!(report.joined(), workers);
+    native.lock().acknowledge_and_retire();
 }
