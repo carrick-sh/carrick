@@ -1902,16 +1902,15 @@ only the complete records already delivered. Internal preparation failures are
 runtime errors; only `OutOfBounds` becomes EFAULT. EOF does not access the
 buffer. No owner permit or editor guard is stored in `OwnedDirectoryRead`.
 
-`PreparedCopyoutWait` from #739 is **not on this branch**. Directory I/O
-selects the existing killable owner-zone continuation and `resume_owner_zone`.
-The review-round repair adds only a physical readiness source for that same
-continuation. It retains the genuine dependency and subscription, publishes a
-private zone record, enrolls before probing readiness, and claims that exact
-record on release. SIGKILL cancellation uses the existing zone continuation;
-there is no new signal query or physical-wait cancellation policy. Its resume
-drops physical custody before retrying preparation, or drops the entire saved
-directory operation on fatal interruption. Generic `ResumeOwnerPhysical` and
-its other consumers retain their existing behavior for #739.
+After rebasing onto #739, directory physical dependencies use the shared
+killable `ResumeOwnerPhysical` path. It enrolls both physical readiness and
+the task's fatal-signal authority before checking cancellation, and checks
+SIGKILL/group exit before readiness on resume. The round-1 directory-only
+zone record/source adapter is redundant and removed. Owner receipts still
+use the existing killable zone continuation. Both paths retain the selected
+directory operation without a permit or editor guard, then drop it on fatal
+cancellation. Native pending projection and prepared copyout keep #739's
+single-writer authorities; no directory-specific signal query is added.
 
 Before any successful copy, refusal outcomes are:
 
@@ -1919,8 +1918,8 @@ Before any successful copy, refusal outcomes are:
 | --- | --- |
 | `OwnerWait` | Retain selection; authenticate/enroll the owner receipt in the killable zone path. |
 | `Supply(Metadata)` | Retain selection; use its observed owner receipt in the same zone path. |
-| `Supply(Grant)` / `Supply(Cow)` | Supply through the existing owner service, then resume the retained selection; any owner refusal uses the zone path and any physical dependency uses the directory zone source. |
-| `Physical` | Retain the genuine dependency; enroll readiness on a zone record with the existing killable continuation. Never enter `ResumeOwnerPhysical`. |
+| `Supply(Grant)` / `Supply(Cow)` | Supply through the existing owner service, then resume the retained selection; any owner refusal uses the zone path and any physical dependency uses the shared killable physical wait. |
+| `Physical` | Retain the genuine dependency; enroll readiness and fatal cancellation through shared `ResumeOwnerPhysical`. |
 | `Fault(OutOfBounds)` | EFAULT; cursor unchanged. |
 | Other `Fault` / `Limit` | Internal preparation error; cursor unchanged. |
 
@@ -1941,10 +1940,10 @@ The batch witness covers mixed 1/14/255-byte names at 10/100/400/4096 records,
 unaligned output, existing PREPARE admission and page-proportional batch work.
 
 The review-round VM-free witness
-`serial_host_directory_physical_dependency_sigkill_uses_owner_zone_resume`
+`serial_host_directory_physical_dependency_sigkill_uses_owner_physical_resume`
 first failed against unchanged `411190d55`: after SIGKILL, production poll
 returned blocked while the physical dependency stayed unready (exit 101).
-It now runs production directory dispatch, zone continuation enrollment,
+It now runs production directory dispatch, physical owner-wait enrollment,
 scheduler settlement, owner resume, signal delivery and terminal publication.
 The physical dependency is a test-engine stand-in for the retained code
 reader; it stays unready throughout. The witness requires zero output commits,
@@ -1958,6 +1957,6 @@ permit. The same witness verifies completion after the physical source is ready.
 
 Full owner-wait acceptance remains open: live HVF sibling-editor contention,
 handled-signal deferral, SIGKILL/group exit, and the rule-2 holder audit/model.
-Generic physical wait killability still belongs to #739. The director reports
+Generic physical wait killability is supplied by the landed #739. The director reports
 Python and both signed probes matching native ARM64 Docker at `411190d55`;
-the review-round runtime repair still needs signed verification on the Mac.
+the rebased artifact needs fresh signed verification on the Mac.

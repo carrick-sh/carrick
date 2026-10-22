@@ -37,18 +37,6 @@ pub(super) enum OwnerMemoryAction {
     Retained,
 }
 
-/// Both sources use the same killable owner-I/O continuation and resume.
-/// A physical source retains its exact record and subscription rather than
-/// forging a portal receipt for an unrelated owner-release producer.
-pub(super) enum OwnerZoneSource {
-    Portal,
-    DirectoryPhysical {
-        record: RecordRef,
-        _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
-        _wait: carrick_guest_mem::OwnedMemoryWait,
-    },
-}
-
 enum ZoneWaitPolicy {
     Ordinary(Option<std::time::Duration>),
     KillableOwnerMemory,
@@ -713,101 +701,6 @@ where
         )
     }
 
-    /// Directory copyout has not committed bytes or advanced its cursor. Bind
-    /// its physical readiness to a host-owned zone record; the existing owner
-    /// continuation supplies all signal policy, enrollment and cancellation.
-    pub(super) fn park_directory_physical_owner(
-        &mut self,
-        engine: &mut E,
-        control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        frame: carrick_hal::RawSyscall,
-        wait: carrick_guest_mem::OwnedMemoryWait,
-        resume: OwnedSyscallResume,
-    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        let Some((zone, mm)) = zone_for(self.state.zone_mm) else {
-            return Err(RuntimeError::Configuration(
-                "directory physical wait has no exact carrier zone".to_owned(),
-            )
-            .into());
-        };
-        let state = engine.snapshot_guest_state_for_publication()?;
-        let ctx = zone_ctx_from_state(&state, ZoneExit::Syscall { completed: true })?;
-        let request = self
-            .state
-            .syscall_completion
-            .guest("directory physical wait lost completion")?
-            .syscall()
-            .request;
-        let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
-            RuntimeError::Configuration("directory physical wait lost context".to_owned())
-        })?;
-        let identity = ThreadIdentity {
-            tid: carrick_el1_abi::El1TaskId::from_linux_tid(self.state.linux_tid.raw()).raw(),
-            serial: context.thread().key().serial.raw(),
-            mm,
-            file_table: context.resources().files().id().raw(),
-            generation: control
-                .current_submission_key()
-                .map(|(_, g)| g.raw())
-                .unwrap_or(0),
-            affinity: context.thread().affinity().words()[0],
-            lifecycle_page: 0,
-            control_slot: 0,
-        };
-        let parked = parked_context(ctx, &state, identity)?;
-        let id = zone.alloc_record(identity).map_err(|error| {
-            RuntimeError::Configuration(format!("directory physical record: {error:?}"))
-        })?;
-        // SAFETY: the record is private until publish_park below.
-        unsafe { *zone.record(id).ctx_mut() = parked };
-        let seq = zone.next_seq(id);
-        let record = zone.record_ref(id);
-        zone.publish_park(id, seq);
-        zone.counters
-            .host_parks
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let readiness = Arc::downgrade(&wait.0);
-        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            if readiness.upgrade().is_some_and(|wait| wait.is_ready())
-                && carrick_kernel::el1_zone::claim(record, Some(seq), Handback::Woken)
-                    == carrick_el1_abi::HostClaim::Claimed
-            {
-                carrick_kernel::el1_zone::hand_back(&[record]);
-            }
-        });
-        // The subscription precedes the readiness probe. A release before,
-        // during or after enrollment claims this exact record at most once.
-        let (subscription, ready) = wait.0.enroll(Arc::clone(&wake));
-        if ready || wait.0.is_ready() {
-            wake();
-        }
-        let exit = match self.settle_into_zone(
-            control,
-            state,
-            record,
-            seq,
-            ZoneWaitPolicy::KillableOwnerMemory,
-            request,
-        ) {
-            Ok(exit) => exit,
-            Err(error) => {
-                drop(subscription);
-                carrick_kernel::el1_zone::cancel(record);
-                return Err(error);
-            }
-        };
-        self.phase = HvpatchProductionPhase::ResumeOwnerZone {
-            frame,
-            resume,
-            source: OwnerZoneSource::DirectoryPhysical {
-                record,
-                _subscription: subscription,
-                _wait: wait,
-            },
-        };
-        Ok(exit)
-    }
-
     /// Enroll an exact EL1 owner release before surrendering the executor.
     /// The portal checks the producer revision after linking the record, so a
     /// release racing enrollment returns `Changed` and redispatches here.
@@ -928,11 +821,7 @@ where
                             ZoneWaitPolicy::for_owner_resume(&resume),
                             request,
                         )?;
-                        self.phase = HvpatchProductionPhase::ResumeOwnerZone {
-                            frame,
-                            resume,
-                            source: OwnerZoneSource::Portal,
-                        };
+                        self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame, resume };
                         Ok(exit)
                     }
                     (OwnerMemoryAction::Retained, None) => {
@@ -1004,10 +893,8 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         frame: carrick_hal::RawSyscall,
         resume: OwnedSyscallResume,
-        source: OwnerZoneSource,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        let mut result = self.consume_owner_zone(control, &source)?;
-        drop(source);
+        let mut result = self.consume_owner_zone(control)?;
         use carrick_kernel::kernel::continuation::{ContinuationCompletion, OwnerWaitCancellation};
         match &result.completion {
             ContinuationCompletion::OwnerCancelled(OwnerWaitCancellation::NativeFatal) => {
@@ -1057,7 +944,6 @@ where
     pub(super) fn consume_owner_zone(
         &mut self,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        source: &OwnerZoneSource,
     ) -> Result<carrick_kernel::kernel::continuation::ContinuationResult, ProductionHvpatchPollError>
     {
         let context = self
@@ -1096,21 +982,13 @@ where
             RuntimeError::Configuration(format!("owner wait record {record:?} is gone"))
         })?;
         // SAFETY: the host owns this handed-back record and has consumed its
-        // exact completion event. Portal waits carry the metadata-form token;
-        // a directory physical source authenticates its private record instead.
-        // Neither path can consume an IPC operation.
+        // exact completion event. The token is the metadata-form receipt
+        // installed by owner_memory_park, not an IPC operation.
         let token = unsafe { rec.take_object_operation() };
         zone.free_record(record.id);
-        let valid = match source {
-            OwnerZoneSource::Portal => {
-                token.and_then(|token| token.metadata_generation())
-                    == Some(context.thread().key().serial.raw())
-            }
-            OwnerZoneSource::DirectoryPhysical {
-                record: expected, ..
-            } => token.is_none() && record == *expected,
-        };
-        if !valid {
+        if token.and_then(|token| token.metadata_generation())
+            != Some(context.thread().key().serial.raw())
+        {
             return Err(RuntimeError::Configuration(
                 "owner wait wake returned another operation".to_owned(),
             )

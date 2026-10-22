@@ -309,7 +309,6 @@ pub(super) enum HvpatchProductionPhase {
     ResumeOwnerZone {
         frame: carrick_hal::RawSyscall,
         resume: OwnedSyscallResume,
-        source: super::zone::OwnerZoneSource,
     },
     ResumeRetainedOwner {
         action: Box<RetainedMemoryAction>,
@@ -3348,29 +3347,6 @@ where
             );
         }
         if let DispatchOutcome::OwnerPhysicalWait { wait, committed } = outcome {
-            // Directory copyout has consumed nothing. Its physical dependency
-            // belongs to the existing killable owner-zone continuation, never
-            // main's readiness-first ResumeOwnerPhysical phase (#739).
-            if matches!(
-                resume,
-                Some(OwnedSyscallResume::Io(OwnedIoResume::DirectoryRead(_)))
-            ) {
-                if committed != 0 {
-                    return Err(RuntimeError::Configuration(
-                        "directory physical wait consumed an output prefix".to_owned(),
-                    )
-                    .into());
-                }
-                return self.park_directory_physical_owner(
-                    engine,
-                    control,
-                    frame,
-                    wait,
-                    resume.ok_or_else(|| {
-                        RuntimeError::Configuration("directory resume lost".to_owned())
-                    })?,
-                );
-            }
             self.state.owner_read_progress = self
                 .state
                 .owner_read_progress
@@ -4486,12 +4462,8 @@ where
             let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
             match phase {
                 HvpatchProductionPhase::ResumeZone => return self.resume_zone(engine, control),
-                HvpatchProductionPhase::ResumeOwnerZone {
-                    frame,
-                    resume,
-                    source,
-                } => {
-                    return self.resume_owner_zone(engine, control, frame, resume, source);
+                HvpatchProductionPhase::ResumeOwnerZone { frame, resume } => {
+                    return self.resume_owner_zone(engine, control, frame, resume);
                 }
                 HvpatchProductionPhase::ResumeOwnerPhysical {
                     frame,
@@ -4752,8 +4724,7 @@ where
                 }
                 HvpatchProductionPhase::ResumeRetainedOwner { action } => {
                     self.phase = HvpatchProductionPhase::RetainedMemoryRetry { action };
-                    let result =
-                        self.consume_owner_zone(control, &super::zone::OwnerZoneSource::Portal)?;
+                    let result = self.consume_owner_zone(control)?;
                     if !matches!(result.completion, carrick_kernel::kernel::continuation::ContinuationCompletion::ResumeRetainedMemory) {
                         return Err(RuntimeError::Configuration("clear-child-tid resumed as a syscall".to_owned()).into());
                     }
@@ -7028,9 +6999,8 @@ mod tests {
     /// code-reader dependency supplied by the test engine. It remains unready
     /// throughout SIGKILL delivery; no timer or readiness release rescues it.
     #[test]
-    fn serial_host_directory_physical_dependency_sigkill_uses_owner_zone_resume() {
+    fn serial_host_directory_physical_dependency_sigkill_uses_owner_physical_resume() {
         use carrick_guest_mem::{GuestVa, PhysicalMemoryWait};
-        use carrick_kernel::kernel::continuation::CarrierWaitService;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         #[derive(Default)]
@@ -7271,31 +7241,22 @@ mod tests {
                 root.signal_authority().enqueue_task_standard(kill, None);
                 root.task().wake();
             };
-            let executor::ExecutorExit::BlockedContinuation { continuation, .. } = exit else {
-                // Main's physical path re-parks here before signal service.
-                kill();
-                let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
-                assert!(
-                    matches!(exit, executor::ExecutorExit::Exited),
-                    "SIGKILL stayed blocked behind an unready physical reader"
-                );
-                return;
-            };
-            let service = CarrierWaitService::new(scheduler.clone());
-            let mut wait_registration = service.prepare_registration(&continuation);
-            service.enroll(&mut wait_registration).unwrap();
+            assert!(matches!(exit, executor::ExecutorExit::Blocked(_)));
             let lease = control.submission.take_execution_lease().unwrap();
             running.restore_lease(lease).unwrap();
             scheduler
-                .settle_blocked_continuation(running, *continuation, wait_registration)
+                .settle_blocked(
+                    running,
+                    carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                )
                 .unwrap();
             assert_eq!(
                 scheduler.queued_len(),
                 0,
                 "physical dependency must remain blocked"
             );
-            // A partial reader release cannot complete physical readiness.
-            reader.wake.lock().as_ref().unwrap()();
+            // Nonfatal task notifications cannot release the owner wait.
+            root.task().wake();
             assert_eq!(scheduler.queued_len(), 0);
             kill();
             let mut resumed = scheduler
