@@ -270,3 +270,34 @@ slice. The earlier follow-up gate run passed kernel, Clippy, Linux Clippy and
 formatting, then was stopped during domain lint for this rebase. Fresh gates
 on the landed dependency are required; the interrupted run does not certify
 the final branch. The earlier agent trailers now include the exact model name.
+
+## Main-based follow-up verification and remaining gates
+
+The landed-main branch passes the two IPC runtime witnesses, two sleep runtime
+witnesses, five residency tests and eight focused kernel IPC tests. It also
+passes `just test-kernel` (3,110 tests in 40 suites, seven existing ignores),
+`just clippy`, `just clippy-linux` and `just fmt-check`, all with
+`env -u RUSTC_WRAPPER CARRICK_SCCACHE=0`. Logs are
+`/tmp/735-main-<step>.log`; completed exit codes are in
+`/tmp/735-main-gates.status`.
+
+The worker supervisor's total time budget was almost exhausted after the
+required main rebase and fresh gates. Extension requests received no response.
+Domain lint was stopped during its tooling build, and the foreground gate
+script exited 143. This is an interrupted check, not a passing result or a
+reported lint failure. The full `just test` has not run on this follow-up.
+The earlier full host pass predates these review fixes and cannot certify them.
+No load generator or VM was started. The interrupted gate process tree was
+terminated before handoff.
+
+A continuation must finish these gates, keeping the full test last:
+
+```sh
+env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just lint-domains
+env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just test
+```
+
+No sched-core code changed relative to the landed dependency, so Loom is not
+applicable to this slice. Signed HVF qualification remains on the Mac using
+the one-artifact commands above. This branch has not been pushed, and the
+requested verification is not complete.
