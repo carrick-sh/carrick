@@ -1812,3 +1812,25 @@ Linux `mmap(2)` requires replacement and private stores, including guest-page
 aligned addresses and offsets that are not host-page aligned. Internal copy
 bounds and host-page congruence cannot introduce ENOMEM. The descriptor records
 open reproduction and signed/oracle bindings explicitly until demonstrated.
+
+The production-source VM-free binding is
+`libpython_fixed_file_segments_use_owner_source_without_eager_copy`. It uses
+`AddressSpace`, a real host file, the shared dispatcher and the admitted
+reservation root. Its pre-fix RED is eager compatibility-image initialization;
+it does **not** reproduce the ARM ENOMEM return. The code path that makes such
+fallbacks invalid is the whole-length `write_bytes_unchecked` in `mmap.rs`,
+which reaches the admitted owner's UserWrite PREPARE (bounded to 4096 bytes).
+It also asks the old root/placeholder for write permission before replacement
+has committed. The trace's backend refusal and omitted offset still need Mac
+attribution; this finding alone cannot certify the recorded ARM failure.
+
+Admitted regular private host files now retain one source in the existing
+owner root and retire old physical backing before committing new metadata.
+First touch uses the existing private frame-grant service; no VA is reused as
+an IPA and no host-page congruence is imposed on the source offset. Fixed
+host-served placement preserves the predecessor until successful publication.
+POPULATE, LOCKED, GROWSDOWN and nonregular objects keep their existing paths.
+The source lease is secured before physical retirement and physical retirement
+is the final fallible owner-file step. Signed first touch, private-store/fork
+integration, the exact observed ENOMEM attribution, Python startup, native
+ARM64 oracle and full artifact promotion remain required.

@@ -112,6 +112,9 @@ enum HostVenue {
     /// A host-placed mapping's opaque placeholder: settled by mirroring the
     /// host rows of the range, whatever the outcome.
     Reserved(ReservationRange),
+    /// A fixed host-served replacement keeps the predecessor until successful
+    /// publication. The MM mutation gate excludes other editors meanwhile.
+    Replacing(ReservationRange),
 }
 
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
@@ -1135,7 +1138,8 @@ impl MemState {
         }
         // A host-placed range keeps its placeholder until the syscall
         // settles, which mirrors the whole range once.
-        if let Some(HostVenue::Reserved(reserved)) = delegated.venue
+        if let Some(HostVenue::Reserved(reserved) | HostVenue::Replacing(reserved)) =
+            delegated.venue
             && reserved.start() <= start
             && end <= reserved.end()
         {
@@ -1743,20 +1747,27 @@ impl MemView<'_> {
             if placed.end() > range.end() {
                 return Err(Refusal::Limit);
             }
-            // A fixed placement replaces whatever the root held there; the
-            // caller demoted the root-owned part first.
+            // A fixed replacement leaves its predecessor intact until the
+            // served operation commits. Only fresh placements need a placeholder;
+            // the MM mutation gate excludes a competing editor in either case.
             let holes = super::fault::root_holes(model, placed)?;
-            model.retire_opaque(placed)?;
-            model.insert_opaque(
-                placed,
-                ReservationProtection::NONE,
-                ReservationNodeFlags::EMPTY,
-            )?;
+            if !matches!(placement, Placement::Fixed(_)) {
+                model.retire_opaque(placed)?;
+                model.insert_opaque(
+                    placed,
+                    ReservationProtection::NONE,
+                    ReservationNodeFlags::EMPTY,
+                )?;
+            }
             Ok((placed, holes))
         });
         match placed {
             Ok((placed, holes)) => {
-                mem.open_venue(HostVenue::Reserved(placed));
+                mem.open_venue(if matches!(placement, Placement::Fixed(_)) {
+                    HostVenue::Replacing(placed)
+                } else {
+                    HostVenue::Reserved(placed)
+                });
                 mem.retire_stale_first_touch(&holes);
                 Ok(Ok(placed.start()))
             }
@@ -1979,7 +1990,11 @@ impl MemView<'_> {
                 root.with_root(|model| model.refuse(request))
                     .map_err(root_refusal)?;
             }
-            HostVenue::Reserved(range) => {
+            HostVenue::Replacing(_) if !matches!(outcome, Ok(DispatchOutcome::Returned { .. })) => {
+                // Refusal keeps the old source and permissions. An alias outcome
+                // commits its metadata only after the runtime publishes backing.
+            }
+            HostVenue::Reserved(range) | HostVenue::Replacing(range) => {
                 mem.mirror_host_rows(range.start(), range.end());
                 let owned: Vec<_> = MemState::root_mappings(&root, range.start(), range.end())
                     .into_iter()
