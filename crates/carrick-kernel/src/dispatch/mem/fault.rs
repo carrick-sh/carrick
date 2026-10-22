@@ -1458,10 +1458,7 @@ impl<'a> MemView<'a> {
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
     ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
         if !self.owns_host_alias_dispatch(&original.exclusion) {
-            carrick_fatal!(
-                "dispatch::resident_frame_grant",
-                "published frame grant lost its original alias exclusion"
-            );
+            return Err(PublishedFrameGrantRefusal::Identity);
         }
         if (original.start, original.len, original.fault_page)
             != (grant.semantic_base, grant.len, receipt.resident().va)
