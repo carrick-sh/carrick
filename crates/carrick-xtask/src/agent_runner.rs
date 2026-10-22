@@ -323,9 +323,7 @@ fn bootstrap(root: &Path) -> Result<(), ScalerError> {
         .get(&platform)
         .ok_or(ScalerError::Guard("unsupported agent runner platform"))?;
     for tool in tools {
-        if !matches!(tool.name.as_str(), "codex" | "agy" | "just")
-            || !tool.url.starts_with("https://")
-        {
+        if !matches!(tool.name.as_str(), "agy" | "just") || !tool.url.starts_with("https://") {
             return Err(ScalerError::Guard("invalid pinned agent tool"));
         }
         let archive = state.join(format!("{}.tar.gz", tool.name));
@@ -619,17 +617,17 @@ printf '%s\n%s\n' "$CARGO_HOME" "$RUSTUP_HOME"
         tar.append_data(&mut header, "tool", &b"tool"[..]).unwrap();
         tar.into_inner().unwrap().finish().unwrap();
         let mut tool = Tool {
-            name: "codex".into(),
+            name: "just".into(),
             url: "https://fixture".into(),
             sha256: Some("bad".into()),
             sha512: None,
             member: "tool".into(),
         };
         assert!(extract(&tool, &archive, temp.path()).is_err());
-        assert!(!temp.path().join("codex").exists());
+        assert!(!temp.path().join("just").exists());
         tool.sha256 = Some(crate::provision::compute_sha256(&archive).unwrap());
         extract(&tool, &archive, temp.path()).unwrap();
-        assert_eq!(std::fs::read(temp.path().join("codex")).unwrap(), b"tool");
+        assert_eq!(std::fs::read(temp.path().join("just")).unwrap(), b"tool");
     }
     #[test]
     fn credentials_are_private_and_never_overwrite_an_existing_file() {

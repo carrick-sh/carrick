@@ -1165,6 +1165,11 @@ fn agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses() {
     let driver = include_str!("../src/dispatch_worker.rs");
     assert!(driver.contains(".env(\"AGY_DIRECTOR_CODEX_VENV\", CODEX_SDK_VENV)"));
     assert!(driver.contains(".env(\"AGY_DIRECTOR_ROUTES\", \"default\")"));
+    // Codex runs only from the SDK's bundled package; a separately fetched
+    // codex binary lacks codex-code-mode-host (#787, run 39818689543).
+    assert!(!driver.contains("AGY_DIRECTOR_CODEX_SDK_BIN"));
+    let tools = include_str!("../../../scripts/ci/inputs/agent-tools.json");
+    assert!(!tools.contains("\"codex\""));
 }
 
 #[test]
