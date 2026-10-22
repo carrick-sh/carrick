@@ -365,10 +365,20 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// ends (the tick migrates it to an idle vCPU first).
     pub fn enqueue_born(&mut self, record: carrick_el1_abi::RecordId) {
         let (zone, slot) = (self.zone, self.slot);
-        let was_empty = zone.slot(slot).queued() == 0;
         zone.requeue_preempted(slot, record);
-        if was_empty {
-            zone.note_queued_since(slot, self.cpu.now());
+        self.arm_published_runnable();
+    }
+
+    /// A native process fork publishes its child only after physical MM
+    /// settlement. That publication has already queued the record; retain
+    /// the same first-entry timer obligation as an EL1 thread birth.
+    pub fn arm_published_runnable(&mut self) {
+        let slot = self.slot;
+        if self.zone.slot(slot).queued() == 0 {
+            return;
+        }
+        if self.zone.slot(slot).queued_since() == 0 {
+            self.zone.note_queued_since(slot, self.cpu.now());
         }
         self.program_timer(true);
     }
