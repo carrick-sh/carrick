@@ -13928,6 +13928,20 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
         inner: AddressSpace,
         refusal: Option<MemoryPrepareError>,
         commits: usize,
+        released_physical: Option<std::sync::Weak<ReadyPhysical>>,
+    }
+    #[derive(Debug)]
+    struct ReadyPhysical;
+    impl carrick_guest_mem::PhysicalMemoryWait for ReadyPhysical {
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn enroll(
+            &self,
+            _: Arc<dyn Fn() + Send + Sync>,
+        ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+            (Box::new(()), true)
+        }
     }
     struct Prepared<'a> {
         memory: &'a mut PreparationAdapter,
@@ -13962,6 +13976,13 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
             assert_eq!(ranges.len(), 1);
             if let Some(error) = self.refusal.take() {
                 return Err(error);
+            }
+            if let Some(physical) = &self.released_physical {
+                assert_eq!(
+                    physical.strong_count(),
+                    1,
+                    "ready physical exclusion must be dropped before re-preparation"
+                );
             }
             Ok(Box::new(Prepared {
                 memory: self,
@@ -14036,6 +14057,7 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
         inner: memory,
         refusal: None,
         commits: 0,
+        released_physical: None,
     };
     let reporter = CompatReporter::default();
     let request = |nr, args| SyscallRequest::new(nr, SyscallArgs(args));
@@ -14173,4 +14195,43 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
         0,
         "cancellation releases the exact last functional reference"
     );
+    // Physical readiness is a dependency notification, not a prepared permit.
+    // Its writer exclusion must be released before re-preparing the buffer.
+    dispatcher
+        .dispatch(
+            &root,
+            request(56, [LINUX_AT_FDCWD, BASE + 32, LINUX_O_DIRECTORY, 0, 0, 0]),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let physical = Arc::new(ReadyPhysical);
+    memory.released_physical = Some(Arc::downgrade(&physical));
+    memory.refusal = Some(MemoryPrepareError::Physical(
+        carrick_guest_mem::OwnedMemoryWait(physical.clone()),
+    ));
+    let DispatchOutcome::DirectoryReadSuspended(pending) = dispatcher
+        .dispatch(&root, read, &mut memory, &reporter)
+        .unwrap()
+    else {
+        panic!("physical preparation must retain the directory");
+    };
+    assert_eq!(Arc::strong_count(&physical), 2);
+    let result = dispatcher
+        .resume_owned_directory_read(
+            &root,
+            read,
+            pending,
+            &mut memory,
+            &reporter,
+            None,
+            OrdinaryDispatchRoute {
+                host_wait: None,
+                lease: None,
+                mm_executor: None,
+            },
+        )
+        .unwrap();
+    assert!(matches!(result, DispatchOutcome::Returned { value } if value > 0));
+    assert_eq!(Arc::strong_count(&physical), 1);
 }
