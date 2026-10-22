@@ -1130,6 +1130,59 @@ fn agent_template_profile_preserves_hardening_without_root_sudo() {
 }
 
 #[test]
+fn template_installs_every_program_the_dispatch_driver_spawns() {
+    // The runner-only witnesses use Git/GitHub stand-ins, so a program missing
+    // from the template only failed live (#769: no `gh`, bootstrap refused).
+    let source = include_str!("../../../scripts/ci/build-template-debian.sh");
+    let packages: Vec<&str> = source
+        .lines()
+        .find_map(|line| line.strip_prefix("packages: [")?.strip_suffix(']'))
+        .unwrap()
+        .split(", ")
+        .collect();
+    // python3 ships in the cloud image (cloud-init); provision.sh installs rustup.
+    let provided_otherwise = ["python3", "rustup"];
+    let mut spawned = Vec::new();
+    for driver in [
+        include_str!("../src/agent_runner.rs"),
+        include_str!("../src/dispatch_worker.rs"),
+    ] {
+        for marker in ["Command::new(\"", "invoke("] {
+            for (start, _) in driver.match_indices(marker) {
+                let rest = &driver[start + marker.len()..];
+                let rest = if marker == "invoke(" {
+                    let Some(quote) = rest.find('"') else {
+                        continue;
+                    };
+                    if rest[..quote].contains(')') {
+                        continue;
+                    }
+                    &rest[quote + 1..]
+                } else {
+                    rest
+                };
+                let program = &rest[..rest.find('"').unwrap()];
+                if !program.starts_with('/') && !program.is_empty() {
+                    spawned.push(program.to_string());
+                }
+            }
+        }
+    }
+    for required in ["gh", "git", "curl"] {
+        assert!(
+            spawned.iter().any(|p| p == required),
+            "scan lost {required}"
+        );
+    }
+    for program in spawned {
+        assert!(
+            packages.contains(&program.as_str()) || provided_otherwise.contains(&program.as_str()),
+            "agent template does not install {program}"
+        );
+    }
+}
+
+#[test]
 // The builder runs only as root on the Linux PVE host and relies on bash 4
 // associative arrays; macOS /bin/bash is 3.2, so execute it where it runs.
 #[cfg(target_os = "linux")]
