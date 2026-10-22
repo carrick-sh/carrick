@@ -490,6 +490,8 @@ _test-stdio:
 
 [private]
 _test-unit-mm-owner *ARGS:
+    # The workspace lib/bin selection does not execute these doctests.
+    {{_admit}} {{_cargo}} test --locked -p carrick-personality-linux --doc NativePendingCustody
     {{_admit}} {{_cargo}} test -p carrick-el1-linux --doc mm_portal
     # Shared owner witnesses and X1 use host-owned descriptors; no VM/Docker.
     just --justfile {{justfile()}} test-mm-owner {{ARGS}}
