@@ -415,6 +415,10 @@ path = "crates/carrick-runtime/src/vcpu_loop/signal.rs"
 contracts = ["kernel.el1.stage1-publication"]
 
 [[surfaces]]
+path = "crates/carrick-thread/src/physical_grant.rs"
+contracts = ["kernel.el1.stage1-publication"]
+
+[[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/host_writes.rs"
 contracts = ["kernel.mm.syscall-code-write"]
 
