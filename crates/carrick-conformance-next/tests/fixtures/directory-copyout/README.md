@@ -2,8 +2,9 @@
 
 Clean-room getdents(2) fixture. A real lower-layer directory is opened with
 openat(O_DIRECTORY), fstat is reported separately, then raw getdents64 drains
-into a fresh 32 KiB anonymous-private mmap and a fresh malloc allocation.
-Neither payload is touched before the first syscall. Complete names are
+into a fresh 32 KiB anonymous-private mmap, a fresh 2 MiB malloc allocation,
+and an initialized 1 KiB stack buffer.
+The mmap and malloc payloads are untouched before their first syscall. Complete names are
 parsed, sorted, checked for duplicates and compared across destinations.
 The process reports numeric errno values and exits nonzero on a failure.
 Native x86_64 Linux is diagnostic; native ARM64 Docker is the oracle.
@@ -15,7 +16,9 @@ compiled source fingerprint:
 CARRICK_RUN_ID=759-directory-copyout env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just test-conformance-next case_libpython_directory_copyout --nocapture
 ```
 
-Run first at the pre-fix witness commit, then at the candidate. This test
+Run the same fixture source at the pre-fix witness commit and the candidate.
+The candidate adds the normal-buffer control and enlarges malloc; preserve
+those fixture changes when switching the runtime to the pre-fix witness. This test
 prints the actual guest output before requiring a blessed exact oracle, so
 a missing bless cannot conceal which syscall failed. Keep source hash,
 executable SHA-256, image digest, kernel identity and output for both runs.
