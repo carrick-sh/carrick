@@ -4,6 +4,7 @@ use crate::{El1MmHandle, EntryThreadGeneration, SnapshotGeneration};
 use carrick_guest_arch::{Access, FaultInfo, NativeOrdinal};
 use carrick_sched_core::{RecordRef, process::TaskKey};
 use core::num::NonZeroU64;
+use core::ops::Deref;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +41,88 @@ pub enum ServiceError {
     Busy,
     Stale,
     Exhausted,
+}
+
+/// Transport selector only: authority remains in the member's retained cell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceSelector {
+    pub record: RecordRef,
+    pub execution: SnapshotGeneration,
+    pub sequence: NonZeroU64,
+}
+impl From<ServiceIdentity> for ServiceSelector {
+    fn from(identity: ServiceIdentity) -> Self {
+        Self {
+            record: identity.birth.record,
+            execution: identity.execution,
+            sequence: identity.sequence,
+        }
+    }
+}
+
+/// One producer per execution lane. Publication is followed by an owned park
+/// and exit; the host consumes the notice before admitting that lane again.
+/// A notice is not a second task owner and contains no dereferenceable pointer.
+#[repr(C)]
+#[derive(Debug)]
+pub struct ServiceNotice {
+    record: AtomicU64,
+    incarnation: AtomicU64,
+    execution: AtomicU64,
+    sequence: AtomicU64,
+}
+impl ServiceNotice {
+    pub const fn new() -> Self {
+        Self {
+            record: AtomicU64::new(0),
+            incarnation: AtomicU64::new(0),
+            execution: AtomicU64::new(0),
+            sequence: AtomicU64::new(0),
+        }
+    }
+    pub fn publish(&self, selector: ServiceSelector) -> Result<(), ServiceError> {
+        self.record
+            .compare_exchange(0, u64::MAX, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ServiceError::Busy)?;
+        self.incarnation
+            .store(selector.record.incarnation, Ordering::Relaxed);
+        self.execution
+            .store(selector.execution.raw(), Ordering::Relaxed);
+        self.sequence
+            .store(selector.sequence.get(), Ordering::Relaxed);
+        self.record
+            .store(u64::from(selector.record.id.raw()) + 1, Ordering::Release);
+        Ok(())
+    }
+    pub fn take(&self) -> Result<Option<ServiceSelector>, ServiceError> {
+        let record = self.record.load(Ordering::Acquire);
+        if record == 0 {
+            return Ok(None);
+        }
+        if record == u64::MAX {
+            return Err(ServiceError::Busy);
+        }
+        self.record
+            .compare_exchange(record, u64::MAX, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ServiceError::Busy)?;
+        let selector = (|| {
+            Some(ServiceSelector {
+                record: RecordRef {
+                    id: carrick_sched_core::RecordId::from_raw(u32::try_from(record - 1).ok()?)?,
+                    incarnation: self.incarnation.load(Ordering::Relaxed),
+                },
+                execution: SnapshotGeneration::from_raw(self.execution.load(Ordering::Relaxed)),
+                sequence: NonZeroU64::new(self.sequence.load(Ordering::Relaxed))?,
+            })
+        })();
+        self.record.store(0, Ordering::Release);
+        selector.map(Some).ok_or(ServiceError::Stale)
+    }
+}
+impl Default for ServiceNotice {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 const UNBOUND: u64 = 0;
@@ -184,26 +267,36 @@ impl ServiceCell {
     }
     /// The transport supplies the immutable copied request; claiming validates
     /// it under the cell transition before giving out one non-cloneable ticket.
-    pub fn claim(&self, request: ServiceRequest) -> Result<ServiceTicket<'_>, ServiceError> {
-        self.lock_exact(REQUESTED, request.identity)?;
+    pub fn claim(&self, request: ServiceRequest) -> Result<ServiceTicket<&Self>, ServiceError> {
+        Self::claim_owned(self, request)
+    }
+
+    /// Transfer an authenticated mapping pin into the unique operation ticket.
+    /// The pin, unlike the executor's slot, lives through acknowledgment.
+    pub fn claim_owned<P: Deref<Target = Self>>(
+        pin: P,
+        request: ServiceRequest,
+    ) -> Result<ServiceTicket<P>, ServiceError> {
+        let cell = &*pin;
+        cell.lock_exact(REQUESTED, request.identity)?;
         let operation_matches = match request.operation {
             ServiceOperation::Fault(fault) => {
-                self.words[9].load(Ordering::Relaxed) == 1
-                    && self.words[10].load(Ordering::Relaxed) == fault_bits(fault)
-                    && self.words[11].load(Ordering::Relaxed) == fault.address.raw()
+                cell.words[9].load(Ordering::Relaxed) == 1
+                    && cell.words[10].load(Ordering::Relaxed) == fault_bits(fault)
+                    && cell.words[11].load(Ordering::Relaxed) == fault.address.raw()
             }
             ServiceOperation::Crossing { ordinal } => {
-                self.words[9].load(Ordering::Relaxed) == 2
-                    && self.words[10].load(Ordering::Relaxed) == ordinal.raw()
+                cell.words[9].load(Ordering::Relaxed) == 2
+                    && cell.words[10].load(Ordering::Relaxed) == ordinal.raw()
             }
         };
         if !operation_matches {
-            self.state.store(REQUESTED, Ordering::Release);
+            cell.state.store(REQUESTED, Ordering::Release);
             return Err(ServiceError::Stale);
         }
-        self.state.store(SERVICING, Ordering::Release);
+        cell.state.store(SERVICING, Ordering::Release);
         Ok(ServiceTicket {
-            cell: self,
+            cell: core::mem::ManuallyDrop::new(pin),
             request,
         })
     }
@@ -212,6 +305,14 @@ impl ServiceCell {
     pub fn cancel(&self, identity: ServiceIdentity) -> Result<bool, ServiceError> {
         let state = self.state.load(Ordering::Acquire);
         match state {
+            IDLE => {
+                // Consumption and graph removal are separate owner steps.
+                // Under the operation queue lock, cancellation may observe
+                // that acknowledged sequence between those steps.
+                self.lock_exact(IDLE, identity)?;
+                self.state.store(IDLE, Ordering::Release);
+                Ok(true)
+            }
             REQUESTED | SERVICING | CANCEL_REQUESTED | COMPLETED | CANCELLED => {
                 self.lock_exact(state, identity)?;
                 let acknowledged = matches!(state, REQUESTED | COMPLETED | CANCELLED);
@@ -250,16 +351,17 @@ impl ServiceCell {
 /// Dropping a transport handle is not completion: it leaves the operation and
 /// its retained resources outstanding. Only explicit acknowledgment releases it.
 #[must_use]
-pub struct ServiceTicket<'a> {
-    cell: &'a ServiceCell,
+pub struct ServiceTicket<P: Deref<Target = ServiceCell>> {
+    cell: core::mem::ManuallyDrop<P>,
     request: ServiceRequest,
 }
-impl ServiceTicket<'_> {
+impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
     pub fn request(&self) -> ServiceRequest {
         self.request
     }
-    pub fn complete(self, supplied: bool) -> Result<(), (ServiceError, Self)> {
-        let state = self.cell.state.load(Ordering::Acquire);
+    pub fn complete(mut self, supplied: bool) -> Result<(), (ServiceError, Self)> {
+        let cell = &**self.cell;
+        let state = cell.state.load(Ordering::Acquire);
         if !matches!(state, SERVICING | CANCEL_REQUESTED) {
             return Err((
                 if state == WRITING {
@@ -270,13 +372,11 @@ impl ServiceTicket<'_> {
                 self,
             ));
         }
-        if let Err(error) = self.cell.lock_exact(state, self.request.identity) {
+        if let Err(error) = cell.lock_exact(state, self.request.identity) {
             return Err((error, self));
         }
-        self.cell
-            .result
-            .store(u64::from(supplied), Ordering::Relaxed);
-        self.cell.state.store(
+        cell.result.store(u64::from(supplied), Ordering::Relaxed);
+        cell.state.store(
             if state == CANCEL_REQUESTED {
                 CANCELLED
             } else {
@@ -284,6 +384,10 @@ impl ServiceTicket<'_> {
             },
             Ordering::Release,
         );
+        // Only acknowledgment releases the physical mapping pin.
+        // SAFETY: complete consumes this ticket; ManuallyDrop has no drop
+        // glue, and no successful acknowledgment can use this pin again.
+        unsafe { core::mem::ManuallyDrop::drop(&mut self.cell) };
         Ok(())
     }
 }
@@ -364,6 +468,43 @@ mod tests {
         assert_eq!(first.consume(a.identity), Ok(ServiceResult::Cancelled));
         assert_eq!(first.consume(a.identity), Err(ServiceError::Busy));
         assert_eq!(second.consume(b.identity), Err(ServiceError::Busy));
+    }
+
+    #[test]
+    fn consumed_request_cancellation_does_not_cancel_its_successor() {
+        let cell = ServiceCell::new();
+        let owner = birth(1, 1);
+        cell.bind(owner).unwrap();
+        let first = cell
+            .publish(owner, SnapshotGeneration::INITIAL, fault())
+            .unwrap();
+        assert!(cell.claim(first).unwrap().complete(true).is_ok());
+        assert_eq!(cell.consume(first.identity), Ok(ServiceResult::Supplied));
+        assert_eq!(cell.cancel(first.identity), Ok(true));
+        let next = cell
+            .publish(owner, SnapshotGeneration::INITIAL, fault())
+            .unwrap();
+        assert_eq!(cell.cancel(first.identity), Err(ServiceError::Stale));
+        assert!(cell.claim(next).unwrap().complete(true).is_ok());
+        assert_eq!(cell.consume(next.identity), Ok(ServiceResult::Supplied));
+    }
+
+    #[test]
+    fn owned_ticket_keeps_backing_until_acknowledgment() {
+        use alloc::sync::Arc;
+        let cell = Arc::new(ServiceCell::new());
+        let owner = birth(1, 1);
+        cell.bind(owner).unwrap();
+        let request = cell
+            .publish(owner, SnapshotGeneration::INITIAL, fault())
+            .unwrap();
+        let ticket = ServiceCell::claim_owned(cell.clone(), request).unwrap();
+        assert_eq!(Arc::strong_count(&cell), 2);
+        assert!(!cell.cancel(request.identity).unwrap());
+        assert_eq!(Arc::strong_count(&cell), 2);
+        assert!(ticket.complete(true).is_ok());
+        assert_eq!(Arc::strong_count(&cell), 1);
+        assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Cancelled));
     }
 
     #[test]
