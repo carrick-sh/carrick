@@ -1370,9 +1370,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         let frame = carrick_el1_abi::prepare_idle_entry(usize::from(slot.raw()))
             .ok_or_else(|| TrapError::Hypervisor("idle entry without the EL1 region".into()))?;
         carrick_vmm_hvf::vcpu_kick::bind_zone_slot_vcpu(usize::from(slot.raw()), self.raw_vcpu_id);
-        // No address space is installed while it waits: every thread EL1
-        // finds for it (queued here or stolen) leaves the vCPU for this
-        // executor, which loads it.
+        // No address space is installed at entry. A host-owned thread leaves
+        // for this executor to load; a record with a published native owner
+        // may install its own MM and run directly from the zone.
         drive_zone_slot(slot, zone_driver(self.executor_id));
         zone.publish_slot_with_affinity(
             slot,

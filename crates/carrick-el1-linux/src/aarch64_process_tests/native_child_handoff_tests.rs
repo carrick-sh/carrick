@@ -2,6 +2,129 @@
 use super::*;
 
 #[test]
+fn arm_native_fork_child_runs_after_parent_host_handoff() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[
+            0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+        ]),
+    )
+    .with_words(words);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let mut cpu = crate::sched::FakeCpu::default();
+    frame.x[8] = 220;
+    frame.x[0] = 17;
+    arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
+    let child_pid = frame.x[0];
+    let child = fixture.zone.runnable_head(fixture.slot).unwrap();
+    let identity = fixture.zone.record(child).identity();
+    assert!(matches!(
+        fixture.zone.record(child).claim(),
+        carrick_sched_core::Claim::Queued { slot, .. } if slot == fixture.slot
+    ));
+    // The root's host continuation blocked and its executor detached the
+    // loaded task. A native child is the only runnable work left.
+    fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+    fixture.task.mm.key.store(0, Ordering::Release);
+    assert!(
+        fixture
+            .zone
+            .take_service_head_for_executor(fixture.slot)
+            .is_none(),
+        "the executor cannot adopt a child with no host thread"
+    );
+    let counters = carrick_el1_abi::Counters::new();
+    let mut handoff = None;
+    let mut zone = crate::dispatch::Zone {
+        tables: fixture.zone,
+        cpu: &mut cpu,
+        user: &crate::sched::HardwareUserWord,
+    };
+    let action = super::super::dispatch::native_scheduler(
+        &mut zone,
+        &fixture.task,
+        &counters,
+        fixture.slot,
+        &mut handoff,
+    )
+    .idle_entry(&mut frame, 0);
+    assert_eq!(action, carrick_el1_abi::Action::Served);
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
+    assert!(matches!(
+        fixture.zone.record(child).claim(),
+        carrick_sched_core::Claim::OnCpu { slot, .. } if slot == fixture.slot
+    ));
+    assert_eq!(frame.x[0], 0);
+
+    let owner = registry()
+        .for_record(fixture.zone, fixture.zone.record_ref(child))
+        .expect("native child retains its process owner");
+    assert!(matches!(
+        super::super::aarch64_process::resume_selected(
+            &owner,
+            registry(),
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            &fixture.task,
+            child,
+            &mut service,
+        ),
+        super::super::native_process_runtime::NativeResume::NoPending
+            | super::super::native_process_runtime::NativeResume::Returned(_)
+    ));
+    // SAFETY: the child owner retains its lifecycle and control until this
+    // fixture ends, and the selected record is OnCpu on the only slot.
+    let child_page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+    let child_control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+    frame.x[8] = 172; // getpid, the child's first EL0 syscall.
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    let grant = fixture
+        .zone
+        .spaces
+        .grant(fixture.zone.spaces.find(identity.mm).unwrap(), identity.mm)
+        .unwrap();
+    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(fixture),
+        child_page,
+        child_control,
+        &ThreadCtx::ZERO,
+        grant.ttbr0,
+        &mut service,
+        |_| core::ptr::null_mut(),
+    )
+    .unwrap();
+    assert!(matches!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+            | carrick_personality_linux::dispatch::CompletionRoute::WithWork
+    ));
+    assert_eq!(frame.x[0], child_pid);
+}
+
+#[test]
 fn arm_native_fork_timer_delivers_child_without_parent_wait() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);

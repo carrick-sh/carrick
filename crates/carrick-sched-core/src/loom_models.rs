@@ -99,6 +99,7 @@ fn make_zone() -> Arc<Box<ZoneTables>> {
                 cancelled: IncarnationRequest(AtomicU64::new(0)),
                 host_wanted: HostRequest(AtomicU64::new(0)),
                 object: core::mem::zeroed(),
+                native_owned: AtomicU32::new(0),
                 ctx: UnsafeCell::new(zerocopy::FromZeros::new_zeroed()),
             })
         );
