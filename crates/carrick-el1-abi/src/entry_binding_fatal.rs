@@ -61,6 +61,45 @@ pub struct ArmEntryBindingFatal {
     pub loaded: ExecutionBinding,
     pub record: Option<ArmEntryFatalRecord>,
 }
+
+/// Selects terminal context before the carrier's single EL1 fatal sink.
+/// Borrowing the observation avoids another large host-side snapshot copy.
+pub enum ArmEl1FatalReport<'a> {
+    Entry(&'a ArmEntryBindingFatal),
+    EntryUnavailable(&'a ArmEntryFatalRegisters),
+    Panic {
+        sentinel: u64,
+        elr_el1: u64,
+        source_line: u64,
+        source_column: u64,
+        publication_detail: u64,
+    },
+}
+
+impl fmt::Display for ArmEl1FatalReport<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Entry(diagnostic) => diagnostic.fmt(f),
+            Self::EntryUnavailable(registers) => write!(
+                f,
+                "entry_binding retained_entry=unavailable registers={registers:?}"
+            ),
+            Self::Panic {
+                sentinel,
+                elr_el1,
+                source_line,
+                source_column,
+                publication_detail,
+            } => write!(
+                f,
+                "EL1 panic handler invoked: panic sentinel {sentinel:#x} at elr_el1={elr_el1:#x}; \
+                 source_line={source_line} source_column={source_column} \
+                 frame_grant_publication_detail={publication_detail}"
+            ),
+        }
+    }
+}
+
 impl ArmEntryBindingFatal {
     /// Caller supplies the exact stopped CPU's vector frame and banked
     /// registers. Loaded and record identities are reported independently;
@@ -202,6 +241,36 @@ mod tests {
             mm: crate::EntryMmKey::from_raw(7),
             thread_generation: crate::EntryThreadGeneration::from_raw(101),
         }
+    }
+
+    #[test]
+    fn entry_binding_fatal_report_preserves_the_single_terminal_sink() {
+        let registers = ArmEntryFatalRegisters::default();
+        let unavailable = ArmEl1FatalReport::EntryUnavailable(&registers);
+        assert!(format!("{unavailable}").contains("retained_entry=unavailable"));
+        let ordinary = ArmEl1FatalReport::Panic {
+            sentinel: crate::PANIC_SENTINEL,
+            elr_el1: 0x266318,
+            source_line: 12,
+            source_column: 3,
+            publication_detail: 4,
+        };
+        assert_eq!(
+            format!("{ordinary}"),
+            "EL1 panic handler invoked: panic sentinel 0xdeadcafedeadbeef at elr_el1=0x266318; source_line=12 source_column=3 frame_grant_publication_detail=4"
+        );
+        let zone = zone();
+        let capture = ArmEntryBindingFatal::capture(
+            registers,
+            &crate::TrapFrame::default(),
+            binding(),
+            &zone,
+            crate::SlotId::new(0),
+        );
+        assert_eq!(
+            format!("{}", ArmEl1FatalReport::Entry(&capture)),
+            format!("{capture}")
+        );
     }
 
     #[test]

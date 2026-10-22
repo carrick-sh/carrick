@@ -8472,41 +8472,45 @@ impl HvfInner {
                 }
                 if x0 == carrick_el1_abi::PANIC_SENTINEL {
                     let source_line = vcpu.get_reg(Reg::X1).unwrap_or(0);
-                    if carrick_el1_abi::is_entry_binding_fatal(x0, source_line) {
-                        let registers = carrick_el1_abi::ArmEntryFatalRegisters {
-                            pc: Some(pc),
-                            lr: vcpu.get_reg(Reg::X30).ok(),
-                            fp: vcpu.get_reg(Reg::X29).ok(),
-                            sp_el0: vcpu.get_sys_reg(SysReg::SP_EL0).ok(),
-                            sp_el1: vcpu.get_sys_reg(SysReg::SP_EL1).ok(),
-                            esr_el1: vcpu.get_sys_reg(SysReg::ESR_EL1).ok(),
-                            far_el1: vcpu.get_sys_reg(SysReg::FAR_EL1).ok(),
-                            elr_el1: vcpu.get_sys_reg(SysReg::ELR_EL1).ok(),
-                            spsr_el1: vcpu.get_sys_reg(SysReg::SPSR_EL1).ok(),
-                        };
-                        let diagnostic = mailbox.leased_slot().and_then(|slot| {
+                    let registers =
+                        carrick_el1_abi::is_entry_binding_fatal(x0, source_line).then(|| {
+                            carrick_el1_abi::ArmEntryFatalRegisters {
+                                pc: Some(pc),
+                                lr: vcpu.get_reg(Reg::X30).ok(),
+                                fp: vcpu.get_reg(Reg::X29).ok(),
+                                sp_el0: vcpu.get_sys_reg(SysReg::SP_EL0).ok(),
+                                sp_el1: vcpu.get_sys_reg(SysReg::SP_EL1).ok(),
+                                esr_el1: vcpu.get_sys_reg(SysReg::ESR_EL1).ok(),
+                                far_el1: vcpu.get_sys_reg(SysReg::FAR_EL1).ok(),
+                                elr_el1: vcpu.get_sys_reg(SysReg::ELR_EL1).ok(),
+                                spsr_el1: vcpu.get_sys_reg(SysReg::SPSR_EL1).ok(),
+                            }
+                        });
+                    let diagnostic = registers.and_then(|registers| {
+                        mailbox.leased_slot().and_then(|slot| {
                             crate::metadata_grant::entry_binding_fatal_diagnostic(
                                 custody,
                                 carrick_guest_arch::CpuId::new(u32::from(slot.raw())),
                                 registers,
                             )
-                        });
-                        if let Some(diagnostic) = diagnostic {
-                            carrick_fatal!("el1", "{diagnostic}");
+                        })
+                    });
+                    let report = match (registers.as_ref(), diagnostic.as_ref()) {
+                        (_, Some(diagnostic)) => {
+                            carrick_el1_abi::ArmEl1FatalReport::Entry(diagnostic)
                         }
-                        carrick_fatal!(
-                            "el1",
-                            "entry_binding retained_entry=unavailable registers={registers:?}"
-                        );
-                    }
-                    let source_column = vcpu.get_reg(Reg::X2).unwrap_or(0);
-                    let publication_detail = vcpu.get_reg(Reg::X3).unwrap_or(0);
-                    carrick_fatal!(
-                        "el1",
-                        "EL1 panic handler invoked: panic sentinel {x0:#x} at elr_el1={elr_el1:#x}; \
-                         source_line={source_line} source_column={source_column} \
-                         frame_grant_publication_detail={publication_detail}"
-                    );
+                        (Some(registers), None) => {
+                            carrick_el1_abi::ArmEl1FatalReport::EntryUnavailable(registers)
+                        }
+                        (None, None) => carrick_el1_abi::ArmEl1FatalReport::Panic {
+                            sentinel: x0,
+                            elr_el1,
+                            source_line,
+                            source_column: vcpu.get_reg(Reg::X2).unwrap_or(0),
+                            publication_detail: vcpu.get_reg(Reg::X3).unwrap_or(0),
+                        },
+                    };
+                    carrick_fatal!("el1", "{report}");
                 }
                 if is_stage1_cow_write_fault(esr_el1) {
                     vcpu.set_reg(Reg::PC, elr_el1).map_err(hvf_error)?;
