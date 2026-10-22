@@ -2594,16 +2594,17 @@ impl SyscallDispatcher {
             .resident_frame_grant_plan(permit, address, max_len)
     }
 
-    /// Revalidate an already prepared grant using its own authenticated receipt.
+    /// Revalidate an already prepared grant under its original alias exclusion.
     pub fn published_frame_grant_plan<'permit>(
         &self,
         permit: &'permit super::mm_mutation::HostAliasPermit<'_>,
+        original: ResidentFrameGrantPlan<'permit>,
         grant: carrick_el1_abi::FrameGrantResidencyIdentity,
         protection: LinuxProtFlags,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
     ) -> Result<PublishedFrameGrantPlan<'permit>, PublishedFrameGrantRefusal> {
         self.mem_view()
-            .published_frame_grant_plan(permit, grant, protection, receipt)
+            .published_frame_grant_plan(permit, original, grant, protection, receipt)
     }
 
     #[cfg(any(test, feature = "test-support"))]

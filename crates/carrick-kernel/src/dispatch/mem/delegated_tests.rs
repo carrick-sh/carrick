@@ -4885,6 +4885,7 @@ fn delegated_published_grant_settles_after_backing_leaves_pristine() {
 fn delegated_guest_grant_reuses_fault_plan_alias_exclusion() {
     const CHILD: &str = "CARRICK_GRANT_ALIAS_CHILD";
     if std::env::var_os(CHILD).is_some() {
+        use carrick_guest_mem::PhysicalMemoryWait;
         use carrick_mmu_core::aarch64::descriptor_txn::{
             BackingIdentity, DescriptorApplied, DescriptorOp, DescriptorOutcome, DescriptorReceipt,
             DescriptorTxn, DescriptorTxnId, PageSpan, ReclaimedTables, TableGrants,
@@ -4899,75 +4900,105 @@ fn delegated_guest_grant_reuses_fault_plan_alias_exclusion() {
             ReservationProtection::READ_WRITE,
         )
         .unwrap();
-        crate::dispatch::mm_mutation::test_support::with_permit(
-            dispatcher.mm_mutation_coordinator(),
-            |permit| {
-                let plan = dispatcher
-                    .resident_frame_grant_plan(permit, fault, STOCK_WINDOW)
-                    .expect("root first-touch plan");
-                let nz = |value| std::num::NonZeroU64::new(value).unwrap();
-                let grant = carrick_el1_abi::FrameGrantResidencyIdentity {
-                    mm_key: dispatcher.mm_authority().mm_id.raw(),
-                    semantic_base: plan.start(),
-                    physical_ipa: 0x1234_0000,
-                    len: plan.len(),
-                    mapping_id: 1,
-                    frame_id: 1,
-                    owner_generation: 1,
-                    inventory_revision: 1,
-                };
-                let txn = DescriptorTxn {
-                    id: DescriptorTxnId {
-                        mm_key: nz(grant.mm_key),
-                        generation: nz(1),
-                    },
-                    root: SubstrateGpa(0x8800_0000_0000),
-                    op: DescriptorOp::Prepare {
-                        publication: GuestLeafPublication {
-                            va: grant.semantic_base,
-                            ipa: grant.physical_ipa,
-                            len: grant.len,
-                            writable: true,
-                            executable: false,
+        let (wait, enrollment, wake_rx, wake_count) =
+            crate::dispatch::mm_mutation::test_support::with_permit(
+                dispatcher.mm_mutation_coordinator(),
+                |permit| {
+                    let plan = dispatcher
+                        .resident_frame_grant_plan(permit, fault, STOCK_WINDOW)
+                        .expect("root first-touch plan");
+                    let nz = |value| std::num::NonZeroU64::new(value).unwrap();
+                    let grant = carrick_el1_abi::FrameGrantResidencyIdentity {
+                        mm_key: dispatcher.mm_authority().mm_id.raw(),
+                        semantic_base: plan.start(),
+                        physical_ipa: 0x1234_0000,
+                        len: plan.len(),
+                        mapping_id: 1,
+                        frame_id: 1,
+                        owner_generation: 1,
+                        inventory_revision: 1,
+                    };
+                    let txn = DescriptorTxn {
+                        id: DescriptorTxnId {
+                            mm_key: nz(grant.mm_key),
+                            generation: nz(1),
                         },
-                        resident: PageSpan::new(fault, PAGE),
-                        backing: BackingIdentity {
-                            frame_id: nz(1),
-                            mapping_id: nz(1),
-                            owner_generation: nz(1),
-                            inventory_revision: nz(1),
-                        },
-                    },
-                    tables: TableGrants::NONE,
-                };
-                let receipt = txn
-                    .verify_receipt(&DescriptorReceipt {
-                        id: txn.id,
-                        digest: txn.digest(),
-                        outcome: DescriptorOutcome::Applied(DescriptorApplied {
-                            pages: grant.len / PAGE,
-                            live_stores: 1,
-                            flush_required: true,
+                        root: SubstrateGpa(0x8800_0000_0000),
+                        op: DescriptorOp::Prepare {
+                            publication: GuestLeafPublication {
+                                va: grant.semantic_base,
+                                ipa: grant.physical_ipa,
+                                len: grant.len,
+                                writable: true,
+                                executable: false,
+                            },
                             resident: PageSpan::new(fault, PAGE),
-                            tables_linked: 0,
-                            reclaimed: ReclaimedTables::NONE,
-                        }),
-                    })
-                    .unwrap();
-                // The original plan remains live while the production
-                // receipt classifier runs, as it does in the fault resolver.
-                let publication = dispatcher
-                    .published_frame_grant_plan(
-                        permit,
-                        grant,
-                        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-                        &receipt,
-                    )
-                    .unwrap();
-                dispatcher.commit_published_frame_grant(publication, grant);
-                drop(plan);
-            },
-        );
+                            backing: BackingIdentity {
+                                frame_id: nz(1),
+                                mapping_id: nz(1),
+                                owner_generation: nz(1),
+                                inventory_revision: nz(1),
+                            },
+                        },
+                        tables: TableGrants::NONE,
+                    };
+                    let receipt = txn
+                        .verify_receipt(&DescriptorReceipt {
+                            id: txn.id,
+                            digest: txn.digest(),
+                            outcome: DescriptorOutcome::Applied(DescriptorApplied {
+                                pages: grant.len / PAGE,
+                                live_stores: 1,
+                                flush_required: true,
+                                resident: PageSpan::new(fault, PAGE),
+                                tables_linked: 0,
+                                reclaimed: ReclaimedTables::NONE,
+                            }),
+                        })
+                        .unwrap();
+                    let completion = carrick_thread::physical_grant::PhysicalGrantCompletion::new();
+                    let wait = completion.wait_weak().upgrade().unwrap();
+                    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+                    let wake_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let count = wake_count.clone();
+                    let (enrollment, already_ready) = wait.enroll(std::sync::Arc::new(move || {
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        wake_tx.send(()).unwrap();
+                    }));
+                    assert!(!already_ready);
+                    // The original plan remains live while the production
+                    // receipt classifier runs, as it does in the fault resolver.
+                    let publication = dispatcher
+                        .published_frame_grant_plan(
+                            permit,
+                            plan,
+                            grant,
+                            LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+                            &receipt,
+                        )
+                        .unwrap();
+                    assert!(
+                        !wait.is_ready(),
+                        "descriptor verification alone is insufficient"
+                    );
+                    let publication = dispatcher
+                        .mem_view()
+                        .commit_published_frame_grant(Ok(publication));
+                    let table = carrick_el1_abi::FrameGrantResidencyTable::new();
+                    publication.publish(&table, grant);
+                    assert!(table.is_guest_committed(grant.mm_key, fault));
+                    assert!(!wait.is_ready(), "custody survives residency publication");
+                    // The completion is dropped as this bounded first-touch
+                    // scope returns; no further holder action is needed.
+                    (wait, enrollment, wake_rx, wake_count)
+                },
+            );
+        wake_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("subscribed waiter wakes after fault return");
+        assert!(wait.is_ready());
+        assert_eq!(wake_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(enrollment);
         return;
     }
     let module = module_path!().split_once("::").unwrap().1;
@@ -5101,11 +5132,12 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool) {
             wrong_owner.owner_generation += 1;
             assert!(
                 dispatcher
-                    .published_frame_grant_plan(
+                    .reprotected_frame_grant_plan(
                         permit,
                         wrong_owner,
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-                        &receipt
+                        &receipt,
+                        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
                     )
                     .is_err()
             );
@@ -5113,11 +5145,12 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool) {
             wrong_mm.mm_key += 1;
             assert!(
                 dispatcher
-                    .published_frame_grant_plan(
+                    .reprotected_frame_grant_plan(
                         permit,
                         wrong_mm,
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-                        &receipt
+                        &receipt,
+                        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
                     )
                     .is_err()
             );
@@ -5129,11 +5162,12 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool) {
         |permit| {
             assert!(
                 dispatcher
-                    .published_frame_grant_plan(
+                    .reprotected_frame_grant_plan(
                         permit,
                         grant,
                         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
-                        &receipt
+                        &receipt,
+                        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
                     )
                     .is_err(),
                 "a reprotected page cannot settle its old publication"
@@ -5199,7 +5233,7 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool) {
     crate::dispatch::mm_mutation::test_support::with_permit(
         dispatcher.mm_mutation_coordinator(),
         |permit| {
-            let plan = dispatcher.published_frame_grant_plan(permit, grant, LinuxProtFlags::READ | LinuxProtFlags::WRITE, &receipt)
+            let plan = dispatcher.reprotected_frame_grant_plan(permit, grant, LinuxProtFlags::READ | LinuxProtFlags::WRITE, &receipt, LinuxProtFlags::READ | LinuxProtFlags::WRITE)
                 .expect("a verified publication settles after physical preparation and residency reconciliation");
             assert_eq!(
                 matches!(plan, PublishedFrameGrantPlan::Retired(_)),
