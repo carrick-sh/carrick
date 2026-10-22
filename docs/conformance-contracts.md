@@ -271,7 +271,8 @@ release that slot. The witness rejects a stale execution generation, cancels one
 request before physical acknowledgment, completes the other first, and requires
 one ring consumption per request before its terminal claim is released. A member
 retains at most one signal or service wait in the shared continuation table;
-service custody has one retained allocation until consumption. Host
+one retained member allocation also preserves a saved signal mask after its
+wait completes, until signal delivery consumes that mask. Host
 records retain backing and observe exact identities; they do not adopt children
 into another process graph. The binding is
 `two_native_children_service_waits_release_the_only_execution_slot` in
@@ -279,9 +280,13 @@ into another process graph. The binding is
 cancellation, retry an effect-free syscall with its original arguments, and
 resume an interrupted instruction without changing its registers. The shared
 personality receipt distinguishes effect-free deferral from a metadata commit
-already owed. This is transport and continuation evidence; fault supply,
-the default host executor population, and signed child syscall acceptance require
-separate witnesses. Unsupported native requests return to the ring for its errno
+already owed. The runtime binding
+`native_service_waits_do_not_exhaust_the_default_executor_pool` uses the real
+native owner with four fork children and the default one-CPU pool (one bound
+worker, two spares). All four requests must park before any acknowledgment;
+no child gets a host task binding, and every worker must join. Its physical-idle
+test adapter does not exercise HVF metadata pin intake. Fault supply and signed
+child syscall acceptance require separate witnesses. Unsupported native requests return to the ring for its errno
 or signal decision; no generic host syscall dispatcher is introduced.
 
 Linux authority: `sched_setaffinity(2)` restricts a runnable thread to the

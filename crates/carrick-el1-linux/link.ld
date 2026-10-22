@@ -19,7 +19,9 @@ SECTIONS
     }
 
     .rodata : ALIGN(16) {
-        *(.rodata .rodata.*)
+        /* Place page-aligned tables before smaller constants so each table
+           does not introduce another page of padding inside the image. */
+        *(SORT_BY_ALIGNMENT(.rodata*))
     }
 
     .data : ALIGN(16) {

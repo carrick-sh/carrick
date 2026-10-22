@@ -87,13 +87,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
     /// Intake may capture backing, but never waits for another guest. The
     /// owning request is visible to terminal close before its physical intake.
+    #[inline(never)]
     pub fn begin_service(
         &mut self,
         operation: ServiceOperation,
     ) -> Result<NativeResume, NativeProcessError> {
         let (page, mm, control) = {
             let graph = self.runtime.graph.lock();
-            if graph.member_waits.contains_key(&self.record) {
+            if graph.has_member_wait(&self.record) {
                 return Err(NativeProcessError::Busy);
             }
             let resources = graph
@@ -123,7 +124,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         };
         let published = {
             let graph = self.runtime.graph.lock();
-            if !claim.admitted() || graph.member_waits.contains_key(&self.record) {
+            if !claim.admitted() || graph.has_member_wait(&self.record) {
                 Err(NativeProcessError::Busy)
             } else {
                 self.control
@@ -139,13 +140,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(error);
             }
         };
-        self.runtime.graph.lock().member_waits.insert(
+        self.runtime.graph.lock().insert_member_wait(
             self.record,
-            MemberWait::Service(Box::new(PendingService {
+            MemberWait::Service(PendingService {
                 request,
                 claim,
                 control,
-            })),
+            }),
         );
         if let Err(error) = self
             .current
@@ -276,6 +277,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Some(self.park_service(request))
     }
 
+    #[inline(never)]
     fn finish_service(
         &mut self,
         request: ServiceRequest,

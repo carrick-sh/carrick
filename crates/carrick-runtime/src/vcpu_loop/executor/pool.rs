@@ -145,10 +145,16 @@ pub(super) fn bound_executors_from_value(guest_cpus: usize, value: Option<&str>)
 /// hatch (`=0` disables spares for bisection). The backend's vCPU ceiling is
 /// the real bound; this is only the request.
 pub fn configured_spare_executors(guest_cpus: usize) -> usize {
-    match ::std::env::var("CARRICK_SPARE_EXECUTORS") {
-        Ok(raw) => raw.trim().parse::<usize>().unwrap_or(2 * guest_cpus),
-        Err(_) => 2 * guest_cpus,
-    }
+    spare_executors_from_value(
+        guest_cpus,
+        ::std::env::var("CARRICK_SPARE_EXECUTORS").ok().as_deref(),
+    )
+}
+
+pub(super) fn spare_executors_from_value(guest_cpus: usize, value: Option<&str>) -> usize {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(2 * guest_cpus)
 }
 
 #[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
