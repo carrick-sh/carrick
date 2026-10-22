@@ -1684,7 +1684,10 @@ where
             // temporary until mmap-family policy itself moves into EL1.
             if matches!(
                 served_boundary,
-                Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { .. })
+                Some(
+                    carrick_el1_abi::ServedBoundary::ReplayOriginal { .. }
+                        | carrick_el1_abi::ServedBoundary::ForwardOriginal { .. }
+                )
             ) {
                 (syscall, None)
             } else {

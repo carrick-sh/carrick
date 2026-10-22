@@ -273,7 +273,11 @@ one ring consumption per request before its terminal claim is released. Host
 records retain backing and observe exact identities; they do not adopt children
 into another process graph. The binding is
 `two_native_children_service_waits_release_the_only_execution_slot` in
-`carrick-el1-linux`. This is transport and continuation evidence; fault supply,
+`carrick-el1-linux`. Its companion cases preserve a completed result through
+cancellation, retry an effect-free syscall with its original arguments, and
+resume an interrupted instruction without changing its registers. The shared
+personality receipt distinguishes effect-free deferral from a metadata commit
+already owed. This is transport and continuation evidence; fault supply,
 the default host executor population, and signed child syscall acceptance require
 separate witnesses. Unsupported native requests return to the ring for its errno
 or signal decision; no generic host syscall dispatcher is introduced.

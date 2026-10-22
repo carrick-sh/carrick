@@ -625,9 +625,10 @@ pub(super) fn finish_native_service(
     service: carrick_vmm_hvf::metadata_grant::NativeService,
     kernel: &carrick_kernel::kernel::Kernel,
 ) -> Result<(), TrapError> {
-    let effects = if service.request().operation
-        == carrick_core_abi::service::ServiceOperation::CompletedWork
-    {
+    let effects = if matches!(
+        service.request().operation,
+        carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
+    ) {
         let doorbell = carrick_el1_abi::take_host_work_doorbell(usize::from(service.slot().raw()));
         carrick_kernel::el1_delegation::settle_host_work_boundary(kernel, true, doorbell);
         service.acknowledge_work()?

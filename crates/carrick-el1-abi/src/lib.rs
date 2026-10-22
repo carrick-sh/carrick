@@ -49,8 +49,8 @@ pub use carrick_core_abi::{
 };
 pub use carrick_core_abi::{entry::*, lifecycle::*, mm::*, wait::*};
 pub use carrick_personality_linux::abi::entry::{
-    HostWorkDoorbell, LinuxTaskMetadata, LinuxTaskState, SERVED_COMMIT_OWED, SERVED_WAKES_OWED,
-    ServedBoundary,
+    HostWorkDoorbell, LinuxTaskMetadata, LinuxTaskState, SERVED_COMMIT_OWED, SERVED_FORWARD_WORK,
+    SERVED_WAKES_OWED, ServedBoundary,
 };
 pub use mm_portal::*;
 pub use mm_portal_fork::*;
@@ -957,17 +957,18 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         }
         i += 1;
     }
-    let aperture_facts = [
+    let boundary_facts = [
         EL1_APERTURE_CONTROL_OFFSET,
         core::mem::size_of::<ApertureControl>() as u64,
         core::mem::align_of::<ApertureControl>() as u64,
         core::mem::offset_of!(ApertureControl, control) as u64,
         APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT,
-        2, // control encoding: zero is strict; bit 3 opts out.
+        2,                          // control encoding: zero is strict; bit 3 opts out.
+        SERVED_FORWARD_WORK as u64, // effect-free retry differs from an owed commit.
     ];
     let mut a = 0;
-    while a < aperture_facts.len() {
-        let mut word = aperture_facts[a];
+    while a < boundary_facts.len() {
+        let mut word = boundary_facts[a];
         let mut b = 0;
         while b < 8 {
             hash ^= word & 0xff;
@@ -3968,7 +3969,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0xc4b0af43445f8173);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xda423697a34a0f70);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
