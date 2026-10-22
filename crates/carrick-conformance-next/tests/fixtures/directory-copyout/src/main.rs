@@ -2,12 +2,18 @@
 use std::ffi::CString;
 
 const CAPACITY: usize = 32768;
+const LARGE_CAPACITY: usize = 2 * 1024 * 1024;
 
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
 
-unsafe fn list(path: &CString, buffer: *mut u8, kind: &str) -> Option<Vec<Vec<u8>>> {
+unsafe fn list(
+    path: &CString,
+    buffer: *mut u8,
+    capacity: usize,
+    kind: &str,
+) -> Option<Vec<Vec<u8>>> {
     let fd = unsafe {
         libc::openat(
             libc::AT_FDCWD,
@@ -25,7 +31,9 @@ unsafe fn list(path: &CString, buffer: *mut u8, kind: &str) -> Option<Vec<Vec<u8
     let mut names = Vec::new();
     let mut failure = 0;
     for iteration in 0..10000 {
-        let n = unsafe { libc::syscall(libc::SYS_getdents64, fd, buffer, CAPACITY) };
+        // This guest ELF tests the raw ABI; it is not a Carrick host service.
+        #[allow(clippy::disallowed_methods)]
+        let n = unsafe { libc::syscall(libc::SYS_getdents64, fd, buffer, capacity) };
         if n < 0 {
             failure = errno();
             break;
@@ -107,9 +115,9 @@ fn main() {
             std::process::exit(1);
         }
         // Do not touch either output before the first getdents64.
-        let first = list(&path, mapped.cast(), "mmap");
+        let first = list(&path, mapped.cast(), CAPACITY, "mmap");
         libc::munmap(mapped, CAPACITY);
-        let allocated = libc::malloc(CAPACITY);
+        let allocated = libc::malloc(LARGE_CAPACITY);
         println!(
             "malloc_errno={}",
             if allocated.is_null() { errno() } else { 0 }
@@ -117,9 +125,11 @@ fn main() {
         if allocated.is_null() {
             std::process::exit(1);
         }
-        let second = list(&path, allocated.cast(), "malloc");
+        let second = list(&path, allocated.cast(), LARGE_CAPACITY, "malloc");
         libc::free(allocated);
-        let equal = first.is_some() && first == second;
+        let mut normal = [0_u8; 1024];
+        let third = list(&path, normal.as_mut_ptr(), normal.len(), "normal");
+        let equal = first.is_some() && first == second && first == third;
         println!("listings_equal={equal}");
         equal
     };
