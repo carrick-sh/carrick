@@ -228,13 +228,21 @@ pub(super) enum OwnerSupplyWait {
 pub(super) enum OwnedSyscallResume {
     CopyoutRedispatch,
     PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
+    Sleep(Box<carrick_kernel::dispatch::OwnedSleepCopyIn>),
 }
 
 fn owner_copyin_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
-    let DispatchOutcome::WriteCopyInSuspended(pending) = outcome else {
-        return (outcome, None);
+    let (wait, resume) = match outcome {
+        DispatchOutcome::WriteCopyInSuspended(pending) => (
+            pending.wait().clone(),
+            OwnedSyscallResume::PreparedWrite(pending),
+        ),
+        DispatchOutcome::SleepCopyInSuspended(pending) => {
+            (pending.wait().clone(), OwnedSyscallResume::Sleep(pending))
+        }
+        other => return (other, None),
     };
-    let wait_outcome = match pending.wait().clone() {
+    let wait_outcome = match wait {
         carrick_guest_mem::MemoryReadWait::Owner(wait) => {
             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
         }
@@ -246,10 +254,7 @@ fn owner_copyin_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<Owne
             DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
         }
     };
-    (
-        wait_outcome,
-        Some(OwnedSyscallResume::PreparedWrite(pending)),
-    )
+    (wait_outcome, Some(resume))
 }
 
 pub(super) enum HvpatchProductionPhase {
@@ -6984,6 +6989,29 @@ mod tests {
             panic!("owner route lost the exact transfer");
         };
         assert_eq!(pending.wait(), &MemoryReadWait::Owner(wait));
+
+        let sleep = carrick_kernel::dispatch::SyscallRequest::new(
+            carrick_abi::syscall::nr::NANOSLEEP.raw(),
+            carrick_kernel::compat::SyscallArgs::from([0x200120, 0, 0, 0, 0, 0]),
+        );
+        let first = dispatcher
+            .dispatch(&context, sleep, &mut memory, &reporter)
+            .unwrap();
+        let (wait_outcome, resume) = super::owner_copyin_route(first);
+        assert_eq!(
+            wait_outcome,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        let Some(OwnedSyscallResume::Sleep(pending)) = resume else {
+            panic!("sleep route lost the exact transfer");
+        };
+        assert_eq!(pending.wait(), &MemoryReadWait::Owner(wait));
+        // The test backend supplies four bytes, not a complete timespec.
+        // Only this completed malformed input may become EFAULT.
+        assert_eq!(
+            pending.resume(&memory),
+            DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
+        );
     }
 
     #[test]

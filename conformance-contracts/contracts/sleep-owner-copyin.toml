@@ -1,0 +1,18 @@
+schema_version = 1
+id = "kernel.sleep.owner-copyin"
+title = "Sleep timespec copy-in retains ownership across memory waits"
+guest_surfaces = ["syscall:nanosleep", "syscall:clock_nanosleep"]
+semantic_authority = ["man 2 nanosleep: EFAULT denotes inaccessible user memory; EINTR denotes signal interruption", "man 2 clock_nanosleep: TIMER_ABSTIME names an absolute deadline"]
+fixture = "unit:sleep_copyin_owner_wait_is_not_efault; unit:absolute_sleep_samples_clock_after_suspended_copy_finishes"
+scale_points = [1]
+rationale = "A valid 16-byte timespec may suspend on an owner reservation, physical dependency or supply. The exact copy continuation survives; no timer starts and no guest errno completes until that input is available. The VM-free witness copies its seconds prefix once, suspends twice and completes its nanoseconds suffix without rereading. An absolute deadline is evaluated after copy completion. Real bad pointers and invalid nanoseconds remain EFAULT and EINVAL."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::time::owner_sleep_tests; carrick-runtime::vcpu_loop::binding::tests::owner_copyin_route_keeps_the_transfer_for_zone_resume"
+embed = "carrick-embed::el1_sched::{el1_sched_preemption_reaches_compute_loops,el1_sched_host_woken_thread_preempts_a_compute_loop}: valid nanosleep during sibling setup"
+
+[bindings.unresolved]
+embed_structural = "HVF unavailable on ctb-w2; repeated signed runs on one artifact are director-owned. Historical failure attribution still needs those runs."
+docker = "Docker unavailable on ctb-w2. No refreshed differential result is claimed."
+observation = "Exact one-start/two-resume work is asserted directly by the VM-free binding; no WorkObservation emission is registered."

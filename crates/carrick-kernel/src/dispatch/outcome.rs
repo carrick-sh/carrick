@@ -500,6 +500,9 @@ pub enum DispatchOutcome {
     /// A write retains its exact destination and owner copy-in transfer while
     /// the runtime parks the syscall completion on the reported memory wait.
     WriteCopyInSuspended(#[serde(skip_serializing)] Box<super::OwnedWriteCopyIn>),
+    /// Backend: park on the exact memory dependency and resume the retained
+    /// timespec copy before creating the sleep's timed continuation.
+    SleepCopyInSuspended(#[serde(skip_serializing)] Box<super::OwnedSleepCopyIn>),
     /// Backend: write `value` into the guest's syscall return register, service any
     /// signal that became pending during the call, and resume the task.
     Returned { value: i64 },

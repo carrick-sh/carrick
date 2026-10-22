@@ -1843,6 +1843,7 @@ where
             binding::OwnedSyscallResume::PreparedWrite(pending) => {
                 self.resume_write_copy_in(kernel, engine, pending, host_wait)
             }
+            binding::OwnedSyscallResume::Sleep(pending) => Ok(pending.resume(engine)),
         }
     }
 

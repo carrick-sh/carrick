@@ -88,6 +88,110 @@ syscall_table! {
 
 use crate::timer_personality::build_itimerspec_ns;
 
+/// Sleep input is copied before any timer or remaining-time output exists.
+/// Keep that exact transfer across owner waits, including a copied prefix.
+#[derive(Debug)]
+struct SleepRequest {
+    clock: Arc<crate::kernel::container::ClockDomain>,
+    clock_id: u64,
+    absolute: bool,
+    remaining: Option<GuestPtr>,
+}
+
+#[derive(Debug)]
+pub struct OwnedSleepCopyIn {
+    request: SleepRequest,
+    suspension: carrick_guest_mem::MemoryReadSuspension,
+}
+
+impl PartialEq for OwnedSleepCopyIn {
+    fn eq(&self, other: &Self) -> bool {
+        self.suspension.continuation == other.suspension.continuation
+    }
+}
+impl Eq for OwnedSleepCopyIn {}
+
+impl OwnedSleepCopyIn {
+    pub fn wait(&self) -> &carrick_guest_mem::MemoryReadWait {
+        &self.suspension.wait
+    }
+
+    pub fn resume(self, memory: &impl CurrentMmMemory) -> DispatchOutcome {
+        let result = memory.resume_read(self.suspension.continuation);
+        self.request.complete_copy(result)
+    }
+}
+
+impl SleepRequest {
+    fn read(self, memory: &impl CurrentMmMemory, address: GuestPtr) -> DispatchOutcome {
+        if address.0 == 0 {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        }
+        self.complete_copy(memory.read_bytes(address.0, LinuxTimespec::ABI_SIZE))
+    }
+
+    fn complete_copy(self, result: Result<Vec<u8>, MemoryError>) -> DispatchOutcome {
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(MemoryError::ReadSuspended(suspension)) => {
+                return DispatchOutcome::SleepCopyInSuspended(Box::new(OwnedSleepCopyIn {
+                    request: self,
+                    suspension: *suspension,
+                }));
+            }
+            Err(_) => return DispatchOutcome::errno(LINUX_EFAULT),
+        };
+        let Ok(timespec) = LinuxTimespec::read_from_bytes(&bytes) else {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        };
+        let requested = match duration_from_linux_timespec(timespec) {
+            Ok(duration) => duration.unwrap_or(Duration::ZERO),
+            Err(errno) => return DispatchOutcome::errno(errno),
+        };
+        // Sample only after copy-in completes: an absolute deadline is not
+        // extended by time spent waiting for memory ownership.
+        let now = if self.absolute {
+            match linux_clock_nanosleep_now(&self.clock, self.clock_id) {
+                Ok(now) => now,
+                Err(errno) => return DispatchOutcome::errno(errno),
+            }
+        } else {
+            Duration::ZERO
+        };
+        if self.absolute && requested <= now {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        if self.absolute
+            && self.clock.is_frozen()
+            && matches!(
+                self.clock_id,
+                LINUX_CLOCK_REALTIME
+                    | LINUX_CLOCK_REALTIME_COARSE
+                    | LINUX_CLOCK_REALTIME_ALARM
+                    | LINUX_CLOCK_TAI
+            )
+        {
+            return DispatchOutcome::WaitOnSleep {
+                duration: Duration::MAX,
+                remaining: None,
+            };
+        }
+        let duration = self.clock.scale_timeout(if self.absolute {
+            requested.saturating_sub(now)
+        } else {
+            requested
+        });
+        if duration.is_zero() {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        // The runtime owns the timed continuation and EINTR copyout.
+        DispatchOutcome::WaitOnSleep {
+            duration,
+            remaining: self.remaining,
+        }
+    }
+}
+
 impl SyscallDispatcher {
     /// This process's limit for `resource`, from the TASK — the one authority
     /// `getrlimit`, `/proc/<pid>/limits` and every enforcement site share, so
@@ -212,84 +316,29 @@ impl SyscallDispatcher {
         }
 
         fn nanosleep(this, cx, request_address: GuestPtr, rem_ptr: GuestPtr) {
-            let memory = &*cx.memory;
-            let timespec = read_timespec(memory, request_address.0)?;
-            let duration = duration_from_linux_timespec(timespec)?;
-            // Hand the sleep to the run loop (DispatchOutcome::WaitOnSleep) so it
-            // waits via the per-thread waiter instead of a blocking host
-            // nanosleep inside the dispatcher: a synchronous host sleep never
-            // reaches the run-loop top, so a sleeping sibling would deadlock a
-            // multithreaded fork-quiesce. The run loop owns EINTR completion, so
-            // carry the optional `rem` pointer there for remaining-time copyout.
-            let remaining = (rem_ptr.0 != 0).then_some(rem_ptr);
-            let clock = Arc::clone(cx.kernel.task().container().clock());
-            match duration {
-                Some(duration) => {
-                    let scaled_duration = clock.scale_timeout(duration);
-                    Ok(DispatchOutcome::WaitOnSleep {
-                        duration: scaled_duration,
-                        remaining,
-                    })
-                }
-                None => Ok(DispatchOutcome::Returned { value: 0 }),
-            }
+            Ok(SleepRequest {
+                clock: Arc::clone(cx.kernel.task().container().clock()),
+                clock_id: LINUX_CLOCK_MONOTONIC,
+                absolute: false,
+                remaining: (rem_ptr.0 != 0).then_some(rem_ptr),
+            }.read(cx.memory, request_address))
         }
 
         fn clock_nanosleep(this, cx, clock_id: u64, flags: u64, request_address: GuestPtr, rem_ptr: GuestPtr) {
-            let memory = &*cx.memory;
             if flags & !LINUX_TIMER_ABSTIME != 0 {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let clock = Arc::clone(cx.kernel.task().container().clock());
-            let now = match linux_clock_nanosleep_now(&clock, clock_id) {
-                Ok(now) => now,
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
-            let timespec = read_timespec(memory, request_address.0)?;
-            let requested = match duration_from_linux_timespec(timespec) {
-                Ok(duration) => duration.unwrap_or(Duration::ZERO),
-                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-            };
-
-            let is_abstime = flags & LINUX_TIMER_ABSTIME != 0;
-
-            if is_abstime && requested <= now {
-                return Ok(DispatchOutcome::Returned { value: 0 });
+            if let Err(errno) = linux_clock_nanosleep_now(&clock, clock_id) {
+                return Ok(DispatchOutcome::errno(errno));
             }
-
-            if clock.is_frozen()
-                && is_abstime
-                && (clock_id == LINUX_CLOCK_REALTIME
-                    || clock_id == LINUX_CLOCK_REALTIME_COARSE
-                    || clock_id == LINUX_CLOCK_REALTIME_ALARM
-                    || clock_id == LINUX_CLOCK_TAI)
-            {
-                // Frozen absolute realtime deadline in the future never expires on host time!
-                return Ok(DispatchOutcome::WaitOnSleep {
-                    duration: Duration::MAX,
-                    remaining: None,
-                });
-            }
-
-            let sleep_duration = if is_abstime {
-                requested.saturating_sub(now)
-            } else {
-                requested
-            };
-
-            let scaled_duration = clock.scale_timeout(sleep_duration);
-            // See nanosleep: the run loop performs the timed wait (WaitOnSleep)
-            // so it is fork-quiesce-parkable. ABSTIME is pre-converted to the
-            // relative `sleep_duration` here; on a quiesce re-dispatch the run
-            // loop keeps the original deadline, so it stays absolute-correct.
-            let remaining = (!is_abstime && rem_ptr.0 != 0).then_some(rem_ptr);
-            if scaled_duration.is_zero() {
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            Ok(DispatchOutcome::WaitOnSleep {
-                duration: scaled_duration,
-                remaining,
-            })
+            let absolute = flags & LINUX_TIMER_ABSTIME != 0;
+            Ok(SleepRequest {
+                clock,
+                clock_id,
+                absolute,
+                remaining: (!absolute && rem_ptr.0 != 0).then_some(rem_ptr),
+            }.read(cx.memory, request_address))
         }
 
         fn clock_gettime(this, cx, clock_id: u64, address: GuestPtr) {
@@ -1555,6 +1604,7 @@ mod rlimit_tests {
 
 #[cfg(test)]
 mod owner_sleep_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
     use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
     use carrick_guest_mem::{
@@ -1562,16 +1612,35 @@ mod owner_sleep_tests {
     };
     use std::num::NonZeroU64;
 
-    struct SuspendedTimespec(PortalOwnerWait);
+    struct SuspendedTimespec {
+        wait: PortalOwnerWait,
+        starts: std::cell::Cell<usize>,
+        resumes: std::cell::Cell<usize>,
+    }
     impl GuestMemory for SuspendedTimespec {
         fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            self.starts.set(self.starts.get() + 1);
             Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
-                wait: MemoryReadWait::Owner(self.0),
+                wait: MemoryReadWait::Owner(self.wait),
                 continuation: OwnedReadContinuation::new(vec![0u8; 8]),
             })))
         }
         fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
             panic!("sleep input must not write memory")
+        }
+        fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+            let mut bytes = continuation.take::<Vec<u8>>().unwrap();
+            assert_eq!(bytes, vec![0u8; 8], "retain the original seconds prefix");
+            let resumes = self.resumes.get();
+            self.resumes.set(resumes + 1);
+            if resumes == 0 {
+                return Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                    wait: MemoryReadWait::Owner(self.wait),
+                    continuation: OwnedReadContinuation::new(bytes),
+                })));
+            }
+            bytes.extend_from_slice(&30_000_000i64.to_ne_bytes());
+            Ok(bytes)
         }
     }
     impl CurrentMmMemory for SuspendedTimespec {}
@@ -1598,19 +1667,114 @@ mod owner_sleep_tests {
                 [LINUX_CLOCK_MONOTONIC, 0, 0x20000, 0, 0, 0],
             ),
         ] {
+            let mut memory = SuspendedTimespec {
+                wait,
+                starts: std::cell::Cell::new(0),
+                resumes: std::cell::Cell::new(0),
+            };
             let result = dispatcher
                 .dispatch(
                     &context,
                     SyscallRequest::new(number.raw(), SyscallArgs::from(args)),
-                    &mut SuspendedTimespec(wait),
+                    &mut memory,
                     &CompatReporter::default(),
                 )
                 .unwrap();
-            assert_ne!(
-                result,
-                DispatchOutcome::errno(LINUX_EFAULT),
-                "owner reservation contention is not a bad timespec pointer"
+            let DispatchOutcome::SleepCopyInSuspended(first) = result else {
+                panic!("owner reservation contention must retain the sleep: {result:?}");
+            };
+            assert_eq!(first.wait(), &MemoryReadWait::Owner(wait));
+            let second = first.resume(&memory);
+            let DispatchOutcome::SleepCopyInSuspended(second) = second else {
+                panic!("a second owner wait must retain the same prefix: {second:?}");
+            };
+            assert_eq!(second.wait(), &MemoryReadWait::Owner(wait));
+            assert_eq!(
+                second.resume(&memory),
+                DispatchOutcome::WaitOnSleep {
+                    duration: Duration::from_millis(30),
+                    remaining: None,
+                }
             );
+            assert_eq!(memory.starts.get(), 1, "never redispatch the copied prefix");
+            assert_eq!(memory.resumes.get(), 2);
         }
+    }
+
+    #[test]
+    fn sleep_copyin_preserves_real_faults_and_timespec_validation() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        for (address, sec, nsec, expected) in [
+            (0, 0i64, 1i64, DispatchOutcome::errno(LINUX_EFAULT)),
+            (0x30000, 0, 1, DispatchOutcome::errno(LINUX_EFAULT)),
+            (0x20000, -1, 0, DispatchOutcome::errno(LINUX_EINVAL)),
+            (
+                0x20000,
+                0,
+                1_000_000_000,
+                DispatchOutcome::errno(LINUX_EINVAL),
+            ),
+            (0x20000, 0, 0, DispatchOutcome::Returned { value: 0 }),
+        ] {
+            for (number, args) in [
+                (nr::NANOSLEEP, [address, 0, 0, 0, 0, 0]),
+                (
+                    nr::CLOCK_NANOSLEEP,
+                    [LINUX_CLOCK_MONOTONIC, 0, address, 0, 0, 0],
+                ),
+            ] {
+                let bytes = [sec.to_ne_bytes(), nsec.to_ne_bytes()].concat();
+                let result = dispatcher
+                    .dispatch(
+                        &context,
+                        SyscallRequest::new(number.raw(), SyscallArgs::from(args)),
+                        &mut LinearMemory::new(0x20000, bytes),
+                        &CompatReporter::default(),
+                    )
+                    .unwrap();
+                assert_eq!(result, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn absolute_sleep_samples_clock_after_suspended_copy_finishes() {
+        let clock = Arc::new(crate::kernel::container::ClockDomain::deterministic(
+            std::time::UNIX_EPOCH,
+        ));
+        let request = SleepRequest {
+            clock: Arc::clone(&clock),
+            clock_id: LINUX_CLOCK_MONOTONIC,
+            absolute: true,
+            remaining: None,
+        };
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(1).unwrap(),
+                    NonZeroU64::new(3).unwrap(),
+                ),
+                PortalWaitCause::Reservations,
+                7,
+            )
+        };
+        let memory = SuspendedTimespec {
+            wait,
+            starts: std::cell::Cell::new(0),
+            resumes: std::cell::Cell::new(1),
+        };
+        let DispatchOutcome::SleepCopyInSuspended(pending) =
+            request.read(&memory, GuestPtr(0x20000))
+        else {
+            panic!("expected owner suspension");
+        };
+        clock.advance(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            pending.resume(&memory),
+            DispatchOutcome::Returned { value: 0 },
+            "the absolute 30 ms deadline expired during the owner wait"
+        );
     }
 }
