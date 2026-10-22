@@ -267,6 +267,22 @@ pub enum ContractStatus {
     Failed,
 }
 
+/// The contract's schema fields only. agy appends its own tool metadata
+/// (`toolAction`, `toolSummary`) to an otherwise valid structured output, and
+/// the contract type refuses unknown fields (#768, run 39799036716).
+fn schema_fields(output: &Value) -> Value {
+    let schema = schema();
+    let mut kept = serde_json::Map::new();
+    if let (Some(fields), Some(required)) = (output.as_object(), schema["required"].as_array()) {
+        for name in required.iter().filter_map(Value::as_str) {
+            if let Some(value) = fields.get(name) {
+                kept.insert(name.to_owned(), value.clone());
+            }
+        }
+    }
+    Value::Object(kept)
+}
+
 /// Bound on the agent's final message kept as `raw.log` evidence.
 const RESULT_RESPONSE_TAIL: usize = 4000;
 
@@ -280,7 +296,7 @@ fn read_result(result: &Path) -> (Contract, String) {
     let contract = value
         .as_ref()
         .ok()
-        .and_then(|value| serde_json::from_value(value["structured_output"].clone()).ok())
+        .and_then(|value| serde_json::from_value(schema_fields(&value["structured_output"])).ok())
         .unwrap_or(Contract {
             status: ContractStatus::Failed,
             summary: "No valid worker contract".into(),
@@ -1291,6 +1307,31 @@ mod tests {
         let (contract, evidence) = read_result(&path);
         assert_eq!(contract.status, ContractStatus::Done);
         assert!(!evidence.contains("structured_output"));
+
+        // agy's live output: a valid contract plus its own tool metadata.
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({"status":"SUCCESS","structured_output":
+                {"status":"done","summary":"ok","tests":["t"],"risks":["r"],
+                 "toolAction":"Finishing task and reporting contract",
+                 "toolSummary":"Finish task and report contract"}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (contract, _) = read_result(&path);
+        assert_eq!(contract.status, ContractStatus::Done);
+        assert_eq!(contract.risks, vec!["r".to_string()]);
+
+        // A missing schema field still fails closed.
+        std::fs::write(
+            &path,
+            serde_json::to_vec(
+                &json!({"structured_output":{"status":"done","summary":"ok","tests":[]}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_result(&path).0.status, ContractStatus::Failed);
     }
     #[test]
     #[cfg(target_os = "linux")]
