@@ -3029,7 +3029,7 @@ mod layout_manifest {
                 size_of::<ThreadControlSlot>(),
                 align_of::<ThreadControlSlot>()
             ),
-            (256, 64)
+            (384, 64)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |ThreadControlSlot {
@@ -3062,6 +3062,7 @@ mod layout_manifest {
                      affinity: _,
                      affinity_host_alias: _,
                      affinity_guest_alias: _,
+                     service: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
@@ -3133,6 +3134,14 @@ mod layout_manifest {
             232,
             8,
             8
+        );
+        field!(
+            ThreadControlSlot,
+            service,
+            carrick_core_abi::service::ServiceCell,
+            256,
+            128,
+            64
         );
     }
 

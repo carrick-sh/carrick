@@ -1838,7 +1838,10 @@ fn take_production_work_boundary(
     let boundary = state.take_served_boundary();
     if matches!(
         boundary,
-        Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { .. })
+        Some(
+            carrick_el1_abi::ServedBoundary::ReplayOriginal { .. }
+                | carrick_el1_abi::ServedBoundary::ForwardOriginal { .. }
+        )
     ) {
         return Err(fail("x86 work boundary cannot replay a completed syscall"));
     }

@@ -177,9 +177,10 @@ pub(super) fn settle_served_state(
     match boundary {
         None => (state, false),
         Some(carrick_el1_abi::ServedBoundary::Completed) => (state, true),
-        Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0 }) => {
-            (with_original_arg0(state, x0), false)
-        }
+        Some(
+            carrick_el1_abi::ServedBoundary::ReplayOriginal { x0 }
+            | carrick_el1_abi::ServedBoundary::ForwardOriginal { x0 },
+        ) => (with_original_arg0(state, x0), false),
     }
 }
 

@@ -2,7 +2,7 @@
 //! an exact completion or cancellation acknowledgment is consumed.
 use crate::{El1MmHandle, EntryThreadGeneration, SnapshotGeneration};
 use carrick_guest_arch::{Access, FaultInfo, NativeOrdinal};
-use carrick_sched_core::{RecordRef, process::TaskKey};
+use carrick_sched_core::{RecordRef, object_wait::OwnerEntry, process::TaskKey};
 use core::num::NonZeroU64;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -26,8 +26,10 @@ pub enum ServiceOperation {
     Crossing {
         ordinal: NativeOrdinal,
     },
-    /// The instruction completed; only carrier wake/completion delivery remains.
-    CompletedWork,
+    /// Deliver carrier work before resuming the exact saved instruction context.
+    CarrierWork {
+        entry: OwnerEntry,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServiceRequest {
@@ -236,7 +238,9 @@ impl ServiceCell {
         let (kind, first, second) = match operation {
             ServiceOperation::Fault(fault) => (1, fault_bits(fault), fault.address.raw()),
             ServiceOperation::Crossing { ordinal } => (2, ordinal.raw(), 0),
-            ServiceOperation::CompletedWork => (3, 0, 0),
+            ServiceOperation::CarrierWork { entry } => {
+                (3, u64::from(entry == OwnerEntry::Syscall), 0)
+            }
         };
         for (index, value) in [(8, execution.raw()), (9, kind), (10, first), (11, second)] {
             self.words[index].store(value, Ordering::Relaxed);
@@ -340,8 +344,14 @@ impl ServiceCell {
                 2 => ServiceOperation::Crossing {
                     ordinal: NativeOrdinal::new(first),
                 },
-                3 if first == 0 && cell.words[11].load(Ordering::Relaxed) == 0 => {
-                    ServiceOperation::CompletedWork
+                3 if first <= 1 && cell.words[11].load(Ordering::Relaxed) == 0 => {
+                    ServiceOperation::CarrierWork {
+                        entry: if first == 1 {
+                            OwnerEntry::Syscall
+                        } else {
+                            OwnerEntry::Exception
+                        },
+                    }
                 }
                 _ => return Err(ServiceError::Stale),
             };
@@ -400,9 +410,10 @@ impl ServiceCell {
                 cell.words[9].load(Ordering::Relaxed) == 2
                     && cell.words[10].load(Ordering::Relaxed) == ordinal.raw()
             }
-            ServiceOperation::CompletedWork => {
+            ServiceOperation::CarrierWork { entry } => {
                 cell.words[9].load(Ordering::Relaxed) == 3
-                    && cell.words[10].load(Ordering::Relaxed) == 0
+                    && cell.words[10].load(Ordering::Relaxed)
+                        == u64::from(entry == OwnerEntry::Syscall)
                     && cell.words[11].load(Ordering::Relaxed) == 0
             }
         };

@@ -534,19 +534,36 @@ fn arm_binding_then_native_fork_commits_on_current_stack(exec: bool) {
 /// VM-free transport binding for `kernel.scheduler.runnable-progress`.
 #[test]
 fn two_native_children_service_waits_release_the_only_execution_slot() {
-    two_native_children_service_waits(false);
+    two_native_children_service_waits(ServiceWitness::Fault);
 }
 
 #[test]
 fn completed_native_service_preserves_result_through_cancellation() {
-    two_native_children_service_waits(true);
+    two_native_children_service_waits(ServiceWitness::Completed);
 }
 
-fn two_native_children_service_waits(completed_work: bool) {
+#[test]
+fn deferred_native_service_retries_original_instruction_after_carrier_work() {
+    two_native_children_service_waits(ServiceWitness::Retry);
+}
+
+#[test]
+fn interrupted_native_service_preserves_instruction_and_registers() {
+    two_native_children_service_waits(ServiceWitness::Interrupt);
+}
+
+#[derive(Clone, Copy)]
+enum ServiceWitness {
+    Fault,
+    Completed,
+    Retry,
+    Interrupt,
+}
+
+fn two_native_children_service_waits(witness: ServiceWitness) {
     use super::super::native_process_runtime::NativeResume;
     use carrick_core::lifecycle::Lifecycle;
-    use carrick_core_abi::service::{ServiceCell, ServiceError, ServiceOperation};
-    use carrick_guest_arch::{Access, FaultInfo};
+    use carrick_core_abi::service::{ServiceCell, ServiceError};
     use carrick_sched_core::object_wait::ObjectWaitKey;
 
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
@@ -615,9 +632,38 @@ fn two_native_children_service_waits(completed_work: bool) {
         let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
         let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
         let mut saved = unsafe { *fixture.zone.record(child).ctx_mut() };
-        if completed_work {
-            saved.native.x[0] = 73;
-        }
+        frame.x[0] = 73;
+        frame.elr = 0x4004;
+        frame.esr = 0x15 << 26;
+        let action = match witness {
+            ServiceWitness::Completed => {
+                fixture.task.linux.record_completed_with_work();
+                carrick_el1_abi::Action::ServedWithWork
+            }
+            ServiceWitness::Retry => {
+                fixture.task.linux.record_forward_work(42);
+                frame.x[0] = 0xbeef;
+                carrick_el1_abi::Action::ServedWithWork
+            }
+            ServiceWitness::Interrupt => {
+                frame.esr = 0;
+                fixture.task.linux.mark_pending_host_work();
+                carrick_el1_abi::Action::Forward
+            }
+            ServiceWitness::Fault => {
+                frame.esr = 0x9200004f;
+                frame.far = 0x6000000fd8;
+                carrick_el1_abi::Action::Forward
+            }
+        };
+        let operation = super::super::dispatch::native_service_operation(
+            &mut frame,
+            &fixture.task.linux,
+            action,
+        )
+        .unwrap();
+        saved.native.x[0] = frame.x[0];
+        saved.native.pc = frame.elr;
         let grant = fixture
             .zone
             .spaces
@@ -633,15 +679,6 @@ fn two_native_children_service_waits(completed_work: bool) {
             control,
             &mut service,
             |entry| {
-                let operation = if completed_work {
-                    ServiceOperation::CompletedWork
-                } else {
-                    ServiceOperation::Fault(FaultInfo {
-                        address: UserVa::new(0x6000000fd8),
-                        access: Access::Write,
-                        present: true,
-                    })
-                };
                 let result = entry.begin_service(operation).unwrap();
                 assert!(entry.take_handoff_receipt().is_some());
                 result
@@ -656,6 +693,11 @@ fn two_native_children_service_waits(completed_work: bool) {
         ));
         assert_eq!(page.claimed_count(), 1);
         let selector = fixture.task.service_notice.take().unwrap().unwrap();
+        // No real wake sources are attached in this fixture; consume the
+        // announced carrier work before the single lane selects another child.
+        if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
+            doorbell.settled();
+        }
         assert_eq!(selector.record, record);
         let key = ObjectWaitKey::native_service(record).unwrap();
         let queue = fixture
@@ -833,12 +875,12 @@ fn two_native_children_service_waits(completed_work: bool) {
             NativeResume::NoPending
         ));
         assert_eq!(page.claimed_count(), 0);
-        if completed_work {
-            assert_eq!(
-                unsafe { (*fixture.zone.record(child).ctx_mut()).native.x[0] },
-                73
-            );
-        }
+        let retained = unsafe { &(*fixture.zone.record(child).ctx_mut()).native };
+        let expected = match witness {
+            ServiceWitness::Retry => (42, 0x4000),
+            _ => (73, 0x4004),
+        };
+        assert_eq!((retained.x[0], retained.pc), expected);
         assert_eq!(
             control.service.consume(request.identity),
             Err(ServiceError::Busy),

@@ -205,9 +205,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         .ok_or(NativeProcessError::Stale)?;
         let entry = match request.operation {
             ServiceOperation::Fault(_) => OwnerEntry::Exception,
-            ServiceOperation::Crossing { .. } | ServiceOperation::CompletedWork => {
-                OwnerEntry::Syscall
-            }
+            ServiceOperation::Crossing { .. } => OwnerEntry::Syscall,
+            ServiceOperation::CarrierWork { entry } => entry,
         };
         let mut completion = None;
         let mut failure = None;
@@ -311,9 +310,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .record(self.record.id)
                     .publish_owner_continuation(match request.operation {
                         ServiceOperation::Fault(_) => OwnerEntry::Exception,
-                        ServiceOperation::Crossing { .. } | ServiceOperation::CompletedWork => {
-                            OwnerEntry::Syscall
-                        }
+                        ServiceOperation::Crossing { .. } => OwnerEntry::Syscall,
+                        ServiceOperation::CarrierWork { entry } => entry,
                     });
             }
             self.release_service_claim(pending.claim)?;
@@ -328,14 +326,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         let completed = (|| match (request.operation, result) {
             (
-                ServiceOperation::CompletedWork,
+                ServiceOperation::CarrierWork { .. },
                 ServiceResult::Supplied | ServiceResult::Cancelled,
             ) => {
                 // Bytes/results already committed before suspension. Cancellation
                 // cannot turn that completion into a short transfer or EINTR.
                 Ok(NativeResume::NoPending)
             }
-            (ServiceOperation::CompletedWork, ServiceResult::Refused) => {
+            (ServiceOperation::CarrierWork { .. }, ServiceResult::Refused) => {
                 Err(NativeProcessError::Quarantined)
             }
             (ServiceOperation::Crossing { .. }, ServiceResult::Refused) => {

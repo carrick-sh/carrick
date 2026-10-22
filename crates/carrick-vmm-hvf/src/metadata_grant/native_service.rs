@@ -47,7 +47,10 @@ impl NativeService {
     /// The carrier delivered the completed instruction's owed work. Its
     /// result remains exclusively in the ring continuation.
     pub fn acknowledge_work(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
-        if self.request().operation != carrick_core_abi::service::ServiceOperation::CompletedWork {
+        if !matches!(
+            self.request().operation,
+            carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
+        ) {
             return Err(stale());
         }
         self.complete(true)
