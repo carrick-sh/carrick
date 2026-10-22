@@ -4879,12 +4879,12 @@ fn delegated_published_grant_settles_after_backing_leaves_pristine() {
 }
 
 /// A guest-lane fault still owns its first-touch plan when its verified
-/// descriptor receipt arrives. Run the production classifier in a child so
-/// re-acquiring the plan's alias exclusion fails on a bounded deadline.
+/// descriptor receipt arrives. Run the production classifier on a holder
+/// thread so re-acquiring its alias exclusion fails on a bounded deadline.
 #[test]
 fn delegated_guest_grant_reuses_fault_plan_alias_exclusion() {
-    const CHILD: &str = "CARRICK_GRANT_ALIAS_CHILD";
-    if std::env::var_os(CHILD).is_some() {
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
         use carrick_guest_mem::PhysicalMemoryWait;
         use carrick_mmu_core::aarch64::descriptor_txn::{
             BackingIdentity, DescriptorApplied, DescriptorOp, DescriptorOutcome, DescriptorReceipt,
@@ -4904,6 +4904,16 @@ fn delegated_guest_grant_reuses_fault_plan_alias_exclusion() {
             crate::dispatch::mm_mutation::test_support::with_permit(
                 dispatcher.mm_mutation_coordinator(),
                 |permit| {
+                    let completion = carrick_thread::physical_grant::PhysicalGrantCompletion::new();
+                    let wait = completion.wait_weak().upgrade().unwrap();
+                    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+                    let wake_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let count = wake_count.clone();
+                    let (enrollment, already_ready) = wait.enroll(std::sync::Arc::new(move || {
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        wake_tx.send(()).unwrap();
+                    }));
+                    assert!(!already_ready, "waiter enrolled before first touch");
                     let plan = dispatcher
                         .resident_frame_grant_plan(permit, fault, STOCK_WINDOW)
                         .expect("root first-touch plan");
@@ -4956,16 +4966,6 @@ fn delegated_guest_grant_reuses_fault_plan_alias_exclusion() {
                             }),
                         })
                         .unwrap();
-                    let completion = carrick_thread::physical_grant::PhysicalGrantCompletion::new();
-                    let wait = completion.wait_weak().upgrade().unwrap();
-                    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
-                    let wake_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                    let count = wake_count.clone();
-                    let (enrollment, already_ready) = wait.enroll(std::sync::Arc::new(move || {
-                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        wake_tx.send(()).unwrap();
-                    }));
-                    assert!(!already_ready);
                     // The original plan remains live while the production
                     // receipt classifier runs, as it does in the fault resolver.
                     let publication = dispatcher
@@ -4999,27 +4999,15 @@ fn delegated_guest_grant_reuses_fault_plan_alias_exclusion() {
         assert!(wait.is_ready());
         assert_eq!(wake_count.load(std::sync::atomic::Ordering::SeqCst), 1);
         drop(enrollment);
-        return;
-    }
-    let module = module_path!().split_once("::").unwrap().1;
-    let name = format!("{module}::delegated_guest_grant_reuses_fault_plan_alias_exclusion");
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &name, "--nocapture"])
-        .env(CHILD, "1")
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "guest first touch exited {status}");
-            break;
+        finished_tx.send(()).unwrap();
+    });
+    match finished_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            holder.join().unwrap();
         }
-        if std::time::Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             panic!("guest first touch deadlocked on its own alias exclusion");
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
