@@ -1188,9 +1188,23 @@ bsdvm-gate VM STAGE="stage0":
 bsdvm-acceptance:
     python3 scripts/bsdvm.py ladder freebsd-arm64:stage0 netbsd-arm64:stage0 freebsd-arm64:stage1 netbsd-arm64:stage1
 
-# Check that changed guest surfaces have matching conformance contract evidence
+# Check that changed guest surfaces have matching conformance contract evidence.
+# When `head` is a GitHub PR synthetic merge commit (`refs/pull/<N>/merge`, where
+# `head^2` exists), diff `head^1..head`; on a local merge commit, diff from
+# `git merge-base origin/main head` so the branch's own commits are checked;
+# otherwise diff from `git merge-base base head`.
 check-contract-change base head="HEAD":
-    python3 scripts/conformance/check-contract-change.py --root . --base {{base}} --head {{head}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    effective_base="{{base}}"
+    if [[ "${GITHUB_REF:-}" == refs/pull/*/merge ]] && git rev-parse --verify --quiet "{{head}}^2" >/dev/null 2>&1; then
+      effective_base="$(git rev-parse "{{head}}^1")"
+    elif git rev-parse --verify --quiet "{{head}}^2" >/dev/null 2>&1 && git rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+      effective_base="$(git merge-base origin/main "{{head}}")"
+    elif merge_base="$(git merge-base "{{base}}" "{{head}}" 2>/dev/null)" && [ -n "$merge_base" ]; then
+      effective_base="$merge_base"
+    fi
+    python3 scripts/conformance/check-contract-change.py --root . --base "$effective_base" --head "{{head}}"
 
 # Hosted CI setup stays here with the checks it supports. Rustup reads the
 # repository pin, components and targets; no second toolchain version in YAML.

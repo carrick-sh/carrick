@@ -11,3 +11,4 @@
 **/x86_fork_stock.rs                                          @tjfontaine
 /.github/workflows/                                           @tjfontaine
 /.github/pull-claims.toml                                      @tjfontaine
+/conformance-contracts/                                       @tjfontaine
