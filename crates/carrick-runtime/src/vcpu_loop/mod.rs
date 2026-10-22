@@ -3932,6 +3932,104 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn serial_host_native_owner_wait_release_wins_then_tgkill_survives_recontention() {
+        exercise_owner_wait_schedule(
+            carrick_abi::syscall::nr::FSTAT,
+            Some(carrick_abi::LINUX_SIGKILL),
+            true,
+            true,
+        );
+    }
+
+    #[test]
+    fn serial_host_native_owner_wait_fatal_callback_budget() {
+        use carrick_el1_linux::mm_portal::test_support::{ROOT, Region, admit_notified};
+        use carrick_kernel::kernel::continuation::NativeOwnerWaitRegistration;
+        use carrick_kernel::kernel::objects::TaskWakeEnrollment;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ClearRegion;
+        impl Drop for ClearRegion {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(0);
+            }
+        }
+        let _clear = ClearRegion;
+        let mut violations = Vec::new();
+        for n in [1, 8, 32, 128] {
+            let (_runtime, _scheduler, _kernel, root, _process, _generation) =
+                test_carrier_graph_with_dispatcher!(73_900, SyscallDispatcher::new());
+            root.thread()
+                .set_affinity(carrick_hal::CpuAffinity::from_words(&[1]));
+            let region = Box::leak(Box::new(Region::new()));
+            let zone = region.zone();
+            carrick_el1_abi::record_el1_region_host_ptr(region.ptr.as_ptr() as usize);
+            admit_notified(region, root.shared().mm().id().raw(), ROOT, 1, 0);
+            let mut owner = native_owner_fixture(&root, zone);
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let mut waits = Vec::new();
+            let mut subscriptions = Vec::new();
+            for index in 0..n {
+                let sibling = root
+                    .kernel()
+                    .reserve_thread_clone(
+                        &root,
+                        carrick_kernel::kernel::ClonePlan::from_flags(
+                            carrick_abi::LinuxCloneFlags::VM
+                                | carrick_abi::LinuxCloneFlags::SIGHAND
+                                | carrick_abi::LinuxCloneFlags::THREAD,
+                        )
+                        .unwrap(),
+                        None,
+                    )
+                    .unwrap()
+                    .prepare(ThreadId::synthetic_for_tests(73_901 + index))
+                    .unwrap()
+                    .commit_for_el1()
+                    .unwrap()
+                    .into_context()
+                    .unwrap();
+                native_owner_add_sibling(&mut owner, &sibling);
+                assert!(sibling.exact_thread_is_live());
+                assert_eq!(sibling.task().key(), root.task().key());
+                // These are the production physical-wait registry and persistent
+                // task subscriptions. Count callback work, including redundant
+                // invocations that a one-shot runnable latch would hide.
+                waits.push(NativeOwnerWaitRegistration::enroll(&sibling).unwrap());
+                let count = callbacks.clone();
+                let enrollment = sibling.task().subscribe_wake(
+                    sibling.task().wake_generation(),
+                    Arc::new(move |_| {
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }),
+                );
+                let TaskWakeEnrollment::Subscribed(subscription) = enrollment else {
+                    panic!("quiet fixture must enroll without a raced wake");
+                };
+                subscriptions.push(subscription);
+            }
+            let doorbell = owner.kill_from_sibling();
+            assert!(doorbell.is_some());
+            callbacks.store(0, Ordering::Relaxed);
+            carrick_kernel::el1_delegation::settle_host_work_boundary(
+                root.kernel(),
+                false,
+                doorbell,
+            );
+            let work = callbacks.load(Ordering::Relaxed);
+            if work != n as usize {
+                violations.push((n, work));
+            }
+            drop(subscriptions);
+            drop(waits);
+        }
+        assert!(
+            violations.is_empty(),
+            "one task wake must visit each subscription once: {violations:?}"
+        );
+    }
+
     pub(crate) fn native_owner_fixture(
         root: &carrick_kernel::kernel::KernelContext,
         zone: &'static carrick_el1_abi::ZoneTables,
@@ -4023,6 +4121,15 @@ pub(crate) mod tests {
     }
 
     fn exercise_owner_wait(nr: carrick_abi::CanonicalNr, signum: Option<i32>, native: bool) {
+        exercise_owner_wait_schedule(nr, signum, native, false);
+    }
+
+    fn exercise_owner_wait_schedule(
+        nr: carrick_abi::CanonicalNr,
+        signum: Option<i32>,
+        native: bool,
+        release_wins: bool,
+    ) {
         use carrick_abi::{LinuxCloneFlags, syscall::nr};
         use carrick_el1_linux::mm_portal::{
             MmPortal,
@@ -4267,6 +4374,21 @@ pub(crate) mod tests {
                             .unwrap();
                         entered_tx.send(()).unwrap();
                         release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        let editor = if release_wins {
+                            drop(editor);
+                            let editor = access
+                                .try_begin_edit(
+                                    zone.spaces.find(sibling.shared().mm().id().raw()).unwrap(),
+                                    mm.raw(),
+                                    NonZeroU64::new(3).unwrap(),
+                                )
+                                .unwrap();
+                            entered_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            editor
+                        } else {
+                            editor
+                        };
                         if std::env::var_os("CARRICK_TEST_FORGET_OWNER_EDITOR").is_some() {
                             std::mem::forget(editor);
                         } else {
@@ -4393,8 +4515,23 @@ pub(crate) mod tests {
                         .settle_blocked_continuation(running, *continuation, wait_registration)
                         .unwrap();
 
+                    if release_wins {
+                        release_tx.send(()).unwrap();
+                        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        carrick_kernel::el1_zone::hand_back_completions();
+                        assert_eq!(
+                            scheduler.queued_len(),
+                            1,
+                            "release must win Ready before SIGKILL"
+                        );
+                    }
                     if native && signum == Some(carrick_abi::LINUX_SIGKILL) {
-                        let doorbell = native_owner.as_ref().unwrap().kill_from_sibling();
+                        let owner = native_owner.as_ref().unwrap();
+                        let doorbell = if release_wins {
+                            owner.tgkill_from_sibling()
+                        } else {
+                            owner.kill_from_sibling()
+                        };
                         assert!(
                             doorbell.is_some(),
                             "native SIGKILL must publish an event-driven host wake"
