@@ -885,6 +885,14 @@ struct PendingSignalWait {
     channel: Arc<WaitChannel>,
     deadline: Option<carrick_guest_arch::Deadline>,
 }
+// One member cannot suspend on a signal and on external service at once.
+// Keep both in the same owner table; a service request retains its larger
+// custody record out of line while signal waits retain their existing shape.
+enum MemberWait<'a> {
+    Signal(PendingSignalWait),
+    Service(Box<service::PendingService<'a>>),
+}
+
 struct Graph<'a, M: Clone, C: ProcessContext> {
     owner: Owner<'a, M, C>,
     root_key: TaskKey,
@@ -893,12 +901,40 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     serials: SerialAllocator,
     pending: BTreeMap<TaskKey, PendingContinuation>,
     pending_exit: BTreeMap<TaskKey, PendingExit<'a>>,
-    services: BTreeMap<RecordRef, service::PendingService<'a>>,
-    signal_waits: BTreeMap<RecordRef, PendingSignalWait>,
+    member_waits: BTreeMap<RecordRef, MemberWait<'a>>,
     suspend_masks: BTreeMap<RecordRef, carrick_signal_core::policy::SigBlockMask>,
     _root_roles: NativeClaim,
     uts: carrick_personality_linux::sysinfo::LinuxUtsname,
     ipc: Arc<SpinLock<IpcNamespace>>,
+}
+impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
+    fn service_wait(&self, record: &RecordRef) -> Option<&service::PendingService<'a>> {
+        match self.member_waits.get(record)? {
+            MemberWait::Service(pending) => Some(pending),
+            MemberWait::Signal(_) => None,
+        }
+    }
+
+    fn remove_service_wait(
+        &mut self,
+        record: &RecordRef,
+    ) -> Option<Box<service::PendingService<'a>>> {
+        self.service_wait(record)?;
+        match self.member_waits.remove(record)? {
+            MemberWait::Service(pending) => Some(pending),
+            MemberWait::Signal(_) => unreachable!(),
+        }
+    }
+
+    fn remove_signal_wait(&mut self, record: &RecordRef) -> Option<PendingSignalWait> {
+        if !matches!(self.member_waits.get(record), Some(MemberWait::Signal(_))) {
+            return None;
+        }
+        match self.member_waits.remove(record)? {
+            MemberWait::Signal(pending) => Some(pending),
+            MemberWait::Service(_) => unreachable!(),
+        }
+    }
 }
 impl<'a, M: Clone, C: ProcessContext> Drop for Graph<'a, M, C> {
     fn drop(&mut self) {
@@ -2676,8 +2712,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 serials,
                 pending: BTreeMap::new(),
                 pending_exit: BTreeMap::new(),
-                services: BTreeMap::new(),
-                signal_waits: BTreeMap::new(),
+                member_waits: BTreeMap::new(),
                 suspend_masks: BTreeMap::new(),
                 _root_roles: root_roles,
                 uts,
@@ -3520,6 +3555,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         observed: carrick_sched_core::process::wait::TaskWakeGeneration,
         deadline: Option<carrick_guest_arch::Deadline>,
     ) -> Result<bool, NativeProcessError> {
+        if self
+            .runtime
+            .graph
+            .lock()
+            .member_waits
+            .contains_key(&self.record)
+        {
+            return Err(NativeProcessError::Busy);
+        }
         let zone = self.source.zone;
         let record = zone
             .slot(self.source.slot)
@@ -3549,13 +3593,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             })?;
         // SAFETY: this exact record is still authenticated OnCpu under its bucket guard.
         unsafe { *zone.record(record).ctx_mut() = *self.words };
-        self.runtime.graph.lock().signal_waits.insert(
+        self.runtime.graph.lock().member_waits.insert(
             self.record,
-            PendingSignalWait {
+            MemberWait::Signal(PendingSignalWait {
                 kind,
                 channel,
                 deadline,
-            },
+            }),
         );
         let receipt = carrick_core::entry::publish_handoff_park(
             start,
@@ -3563,7 +3607,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_el1_abi::EntryRecordGeneration(sequence),
         );
         if receipt.is_none() {
-            self.runtime.graph.lock().signal_waits.remove(&self.record);
+            self.runtime.graph.lock().remove_signal_wait(&self.record);
             zone.cancel_timer_admission(self.record);
             return Err(NativeProcessError::Busy);
         }
@@ -3635,7 +3679,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// The execution lane calls this before returning a woken saved syscall to
     /// userspace. It consumes the retained wait operation instead of replaying it.
     pub fn resume_pending_wait(&mut self) -> Option<LifecycleOutcome> {
-        let signal_wait = self.runtime.graph.lock().signal_waits.remove(&self.record);
+        let signal_wait = self.runtime.graph.lock().remove_signal_wait(&self.record);
         if let Some(pending) = signal_wait {
             return Some(match self.resume_signal_wait(pending) {
                 Ok(outcome) => outcome,
@@ -9695,7 +9739,7 @@ mod tests {
             !runtime
                 .graph
                 .lock()
-                .signal_waits
+                .member_waits
                 .contains_key(&entry.record)
         );
         assert!(zone.timer_owner(slot).is_none());

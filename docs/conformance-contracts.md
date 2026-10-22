@@ -269,7 +269,9 @@ Native service custody extends this contract: two real fork children can publish
 simultaneous requests through the fixture's sole execution slot. Each park must
 release that slot. The witness rejects a stale execution generation, cancels one
 request before physical acknowledgment, completes the other first, and requires
-one ring consumption per request before its terminal claim is released. Host
+one ring consumption per request before its terminal claim is released. A member
+retains at most one signal or service wait in the shared continuation table;
+service custody has one retained allocation until consumption. Host
 records retain backing and observe exact identities; they do not adopt children
 into another process graph. The binding is
 `two_native_children_service_waits_release_the_only_execution_slot` in
