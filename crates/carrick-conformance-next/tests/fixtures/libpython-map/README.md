@@ -45,5 +45,5 @@ After stopping all Carrick phases, the director can bless the same binary on
 native ARM64 Docker (record the resolved image digest and kernel identity):
 
 ```sh
-docker run --rm --platform linux/arm64 --mount "type=bind,src=$PWD/target/libpython-map/aarch64-unknown-linux-musl/release/libpython-map,dst=/tmp/libpython-map,readonly" python:3.12-slim /tmp/libpython-map /usr/local/lib/libpython3.12.so.1.0
+docker run --rm --platform linux/arm64 --mount "type=bind,src=$PWD/target/libpython-map/aarch64-unknown-linux-musl/release/libpython-map,dst=/tmp/libpython-map,readonly" python:3.12-slim timeout 10 /tmp/libpython-map /usr/local/lib/libpython3.12.so.1.0
 ```
