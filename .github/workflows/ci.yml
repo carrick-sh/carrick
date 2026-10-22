@@ -273,6 +273,16 @@ jobs:
           tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
+      - name: Identify the runner image for the apt cache
+        id: runner-image
+        if: ${{ !cancelled() }}
+        run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Cache cross toolchain packages
+        if: ${{ !cancelled() }}
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/apt-cross
+          key: apt-ci-install-linux-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}
       - name: Install Linux C cross toolchain
         if: ${{ !cancelled() }}
         timeout-minutes: 12
@@ -698,6 +708,16 @@ jobs:
           tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
+      - name: Identify the runner image for the apt cache
+        id: runner-image
+        if: ${{ !cancelled() }}
+        run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Cache cross toolchain packages
+        if: ${{ !cancelled() }}
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/apt-cross
+          key: apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}
       - name: Install FreeBSD C cross toolchain
         if: ${{ !cancelled() }}
         timeout-minutes: 12
@@ -760,6 +780,16 @@ jobs:
           tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
+      - name: Identify the runner image for the apt cache
+        id: runner-image
+        if: ${{ !cancelled() }}
+        run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Cache cross toolchain packages
+        if: ${{ !cancelled() }}
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/apt-cross
+          key: apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}
       - name: Install BSD C cross toolchain
         if: ${{ !cancelled() }}
         timeout-minutes: 12
@@ -813,6 +843,16 @@ jobs:
           tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
+      - name: Identify the runner image for the apt cache
+        id: runner-image
+        if: ${{ !cancelled() }}
+        run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Cache cross toolchain packages
+        if: ${{ !cancelled() }}
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/apt-cross
+          key: apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}
       - name: Install Clang C cross toolchain
         if: ${{ !cancelled() }}
         timeout-minutes: 12
