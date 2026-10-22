@@ -11,6 +11,9 @@ rules:
         - /crates/carrick-host-linux/src/epoll_mux.rs
         - /crates/carrick-host/src/shared_word.rs
         - /crates/carrick-vmm-nvmm/src/nvmm.rs
+        # Guest-only static conformance ELF: raw getdents64 is the operation
+        # under test, never a host service implementation.
+        - /crates/carrick-conformance-next/tests/fixtures/directory-copyout/src/main.rs
         - /crates/carrick-vmm-bhyve/fixtures/bhyve-asyncsig/src/main.rs
         - /crates/carrick-vmm-bhyve/fixtures/bhyve-fork-raw/src/main.rs
         - /crates/carrick-vmm-bhyve/fixtures/bhyve-vfork-exec/src/main.rs

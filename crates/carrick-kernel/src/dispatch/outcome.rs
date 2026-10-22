@@ -497,6 +497,8 @@ pub enum FdWaitCompletion {
 #[derive(Debug, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
+    /// A directory read retains its exact description before first consumption.
+    DirectoryReadSuspended(#[serde(skip_serializing)] Box<super::OwnedDirectoryRead>),
     /// A write retains its exact destination and owner copy-in transfer while
     /// the runtime parks the syscall completion on the reported memory wait.
     WriteCopyInSuspended(#[serde(skip_serializing)] Box<super::OwnedWriteCopyIn>),

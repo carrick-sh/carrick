@@ -1631,6 +1631,7 @@ impl BlockedContinuation {
             | DispatchOutcome::SleepCopyInSuspended(_)
             | DispatchOutcome::RecvfromAddressSuspended(_)
             | DispatchOutcome::OwnerCancelled(_)
+            | DispatchOutcome::DirectoryReadSuspended(_)
             | DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }
             | DispatchOutcome::OwnerPhysicalWait { .. }

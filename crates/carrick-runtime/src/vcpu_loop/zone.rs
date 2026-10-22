@@ -47,7 +47,7 @@ impl ZoneWaitPolicy {
         match resume {
             OwnedSyscallResume::CopyoutRedispatch
             | OwnedSyscallResume::Ipc(_)
-            | OwnedSyscallResume::PreparedWrite(_)
+            | OwnedSyscallResume::Io(_)
             | OwnedSyscallResume::Sleep(_)
             | OwnedSyscallResume::RecvfromAddress(_) => Self::KillableOwnerMemory,
         }

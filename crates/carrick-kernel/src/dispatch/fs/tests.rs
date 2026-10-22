@@ -13804,11 +13804,42 @@ fn getdents64_fault_preserves_cursor_for_untouched_private_destination() {
     };
     let fd = call(56, [LINUX_AT_FDCWD, BASE, LINUX_O_DIRECTORY, 0, 0, 0]);
     assert!(fd >= 0, "openat: {fd}");
+    assert_eq!(call(61, [fd as u64, BASE + 0x10000, 1, 0, 0, 0]), -22);
     assert_eq!(call(61, [fd as u64, 0, 32768, 0, 0, 0]), -14);
     let copied = call(61, [fd as u64, BASE + 0x10000, 32768, 0, 0, 0]);
     assert!(copied > 4096, "fault consumed directory records: {copied}");
     assert_eq!(call(61, [fd as u64, BASE + 0x10000, 32768, 0, 0, 0]), 0);
     let bytes = memory.read_bytes(BASE + 0x10000, copied as usize).unwrap();
+    let mut call = |number, args| match dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(number, SyscallArgs(args)),
+            &mut memory,
+            &CompatReporter::default(),
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value,
+        DispatchOutcome::Errno { errno } => -i64::from(errno.get()),
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    assert_eq!(call(62, [fd as u64, 0, LINUX_SEEK_SET, 0, 0, 0]), 0);
+    assert_eq!(
+        call(61, [fd as u64, BASE + 0x20000 - 48, 32768, 0, 0, 0]),
+        48,
+        "two complete dot records survive the next-page fault"
+    );
+    assert_eq!(
+        call(61, [fd as u64, BASE + 0x10000, 32768, 0, 0, 0]),
+        16000,
+        "retry starts at first uncommitted record"
+    );
+    assert_eq!(
+        call(61, [fd as u64, 0, 32768, 0, 0, 0]),
+        0,
+        "EOF needs no buffer backing"
+    );
+
     let mut names = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
@@ -13827,43 +13858,319 @@ fn getdents64_fault_preserves_cursor_for_untouched_private_destination() {
 
 #[test]
 fn directory_record_batches_fit_production_owner_admission() {
-    let entries: Vec<_> = (0..400)
-        .map(|i| RootFsDirEntry {
-            name: format!("module_{i:04}.py"),
-            ino: 1,
-            metadata: RootFsMetadata {
-                path: "/stdlib".into(),
-                kind: RootFsEntryKind::File,
-                mode: 0o644,
-                size: 0,
-            },
-        })
-        .collect();
-    for address in [0x400000, 0x400064, 0x400ff0] {
-        let mut offset = 0;
-        let mut delivered = 0;
-        while offset < entries.len() {
-            let (bytes, next) = super::directory::directory_record_batch(
-                &entries,
-                offset,
-                address + delivered,
-                32768,
-            )
-            .unwrap();
-            let range = carrick_guest_mem::GuestWriteRange::new(
-                GuestVa::new(address + delivered),
-                bytes.len(),
-            )
-            .unwrap();
+    for count in [10, 100, 400, 4096] {
+        let entries: Vec<_> = (0..count)
+            .map(|i| RootFsDirEntry {
+                name: match i % 3 {
+                    0 => "x".into(),
+                    1 => format!("module_{i:04}.py"),
+                    _ => "x".repeat(255),
+                },
+                ino: 1,
+                metadata: RootFsMetadata {
+                    path: "/stdlib".into(),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o644,
+                    size: 0,
+                },
+            })
+            .collect();
+        let expected: usize = entries.iter().map(dirent64_record_len).sum();
+        for address in [0x400000, 0x400064, 0x400ff0] {
+            let mut offset = 0;
+            let mut delivered = 0;
+            let mut batches = 0;
+            while offset < entries.len() {
+                let (bytes, next) = super::directory::directory_record_batch(
+                    &entries,
+                    offset,
+                    address + delivered,
+                    32768,
+                )
+                .unwrap();
+                let range = carrick_guest_mem::GuestWriteRange::new(
+                    GuestVa::new(address + delivered),
+                    bytes.len(),
+                )
+                .unwrap();
+                assert!(
+                    carrick_guest_mem::PreparedStreamRanges::new(&[range]).is_ok(),
+                    "directory copy exceeds owner PREPARE: {} bytes",
+                    bytes.len()
+                );
+                assert!(next > offset);
+                batches += 1;
+                delivered += bytes.len() as u64;
+                offset = next;
+            }
+            assert_eq!(delivered, expected as u64);
             assert!(
-                carrick_guest_mem::PreparedStreamRanges::new(&[range]).is_ok(),
-                "directory copy exceeds owner PREPARE: {} bytes",
-                bytes.len()
+                batches <= 2 * (expected.div_ceil(4096) + 1),
+                "work must scale with pages, not individual entries: {batches}"
             );
-            assert!(next > offset);
-            delivered += bytes.len() as u64;
-            offset = next;
         }
-        assert_eq!(delivered, 16000);
     }
+}
+
+/// A test-only preparation adapter injects an owner refusal over real sparse
+/// AddressSpace. Production dispatch and resume must retain the selected file
+/// across sibling fd reuse. This tests routing, not live owner enrollment or
+/// runtime signal delivery (those require the signed binding).
+#[test]
+fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop() {
+    use carrick_guest_mem::{
+        CurrentMmMemory, GuestWriteRange, MemoryPrepareError, MemoryReadWait, PreparedGuestWrite,
+        PreparedStreamRanges, UserMemoryVenue,
+    };
+    use carrick_mem::elf::SegmentPerms;
+    use carrick_mem::memory::{AddressSpace, AddressSpaceMetadata, MemoryRegionMetadata};
+    struct PreparationAdapter {
+        inner: AddressSpace,
+        refusal: Option<MemoryPrepareError>,
+        commits: usize,
+    }
+    struct Prepared<'a> {
+        memory: &'a mut PreparationAdapter,
+        range: GuestWriteRange,
+    }
+    impl PreparedGuestWrite for Prepared<'_> {
+        fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].len(), self.range.len());
+            self.memory
+                .inner
+                .write_bytes(self.range.address().raw(), outputs[0])
+                .unwrap();
+            self.memory.commits += 1;
+        }
+    }
+    impl GuestMemory for PreparationAdapter {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.inner.read_bytes(address, length)
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            panic!("owner directory copy must use prepared commit");
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            PreparedStreamRanges::new(ranges).unwrap();
+            assert_eq!(ranges.len(), 1);
+            if let Some(error) = self.refusal.take() {
+                return Err(error);
+            }
+            Ok(Box::new(Prepared {
+                memory: self,
+                range: ranges[0],
+            }))
+        }
+    }
+    impl CurrentMmMemory for PreparationAdapter {}
+    const BASE: u64 = 0x400000;
+    let lower = tempfile::tempdir().unwrap();
+    for (dir, name) in [
+        ("original", "original.py"),
+        ("replacement", "replacement.py"),
+    ] {
+        std::fs::create_dir(lower.path().join(dir)).unwrap();
+        std::fs::write(lower.path().join(dir).join(name), b"").unwrap();
+    }
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_rootfs_layer(RootFs::from_immutable_host_dir(lower.path()).unwrap());
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::FILES,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(1759),
+            None,
+        )
+        .unwrap();
+    assert_ne!(root.thread().key(), sibling.thread().key());
+    let mut memory = AddressSpace::from_metadata(AddressSpaceMetadata {
+        entry: GuestVa::new(BASE),
+        initial_stack_pointer: GuestVa::new(BASE),
+        linux_auxv_image: Vec::new(),
+        regions: vec![MemoryRegionMetadata {
+            start: GuestVa::new(BASE),
+            end: GuestVa::new(BASE + 0x20000),
+            perms: SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+            shared: false,
+        }],
+        ro_spans: Vec::new(),
+    })
+    .unwrap();
+    memory.write_bytes(BASE, b"/original\0").unwrap();
+    memory.write_bytes(BASE + 32, b"/replacement\0").unwrap();
+    // SAFETY: synthetic receipt used only by this adapter and dispatch routing;
+    // never offered to a live owner or the runtime's authenticated wait queue.
+    let wait = unsafe {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use std::num::NonZeroU64;
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(root.shared().mm().id().raw()).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Reservations,
+            7,
+        )
+    };
+    let mut memory = PreparationAdapter {
+        inner: memory,
+        refusal: None,
+        commits: 0,
+    };
+    let reporter = CompatReporter::default();
+    let request = |nr, args| SyscallRequest::new(nr, SyscallArgs(args));
+    let fd = match dispatcher
+        .dispatch(
+            &root,
+            request(56, [LINUX_AT_FDCWD, BASE, LINUX_O_DIRECTORY, 0, 0, 0]),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("open original: {other:?}"),
+    };
+    let target = dispatcher.open_file(fd as i32).unwrap();
+    let description = Arc::clone(&target.description);
+    let read = request(61, [fd as u64, BASE + 0x10000, 32768, 0, 0, 0]);
+    memory.refusal = Some(MemoryPrepareError::OwnerWait(wait));
+    let DispatchOutcome::DirectoryReadSuspended(pending) = dispatcher
+        .dispatch(&root, read, &mut memory, &reporter)
+        .unwrap()
+    else {
+        panic!("transient owner refusal must suspend");
+    };
+    assert_eq!(pending.wait(), &MemoryReadWait::Owner(wait));
+    assert_eq!(memory.commits, 0);
+    assert!(matches!(
+        &*crate::kernel::FileDescription::read_for_io(&description).unwrap(),
+        OpenDescription::Directory { offset: 0, .. }
+    ));
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                request(57, [fd as u64, 0, 0, 0, 0, 0]),
+                &mut memory,
+                &reporter
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                request(56, [LINUX_AT_FDCWD, BASE + 32, LINUX_O_DIRECTORY, 0, 0, 0]),
+                &mut memory,
+                &reporter
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: fd }
+    );
+    assert_eq!(description.fd_ref_count(), 1);
+    let result = dispatcher
+        .resume_owned_directory_read(
+            &root,
+            read,
+            pending,
+            &mut memory,
+            &reporter,
+            None,
+            OrdinaryDispatchRoute {
+                host_wait: None,
+                lease: None,
+                mm_executor: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(memory.commits, 1);
+    let DispatchOutcome::Returned { value } = result else {
+        panic!("retained read: {result:?}");
+    };
+    let bytes = memory
+        .inner
+        .read_bytes(BASE + 0x10000, value as usize)
+        .unwrap();
+    assert!(
+        bytes
+            .windows(b"original.py\0".len())
+            .any(|s| s == b"original.py\0")
+    );
+    assert!(
+        !bytes
+            .windows(b"replacement.py\0".len())
+            .any(|s| s == b"replacement.py\0")
+    );
+    assert_eq!(
+        description.fd_ref_count(),
+        0,
+        "completion releases last functional reference"
+    );
+    let replacement = dispatcher.open_file(fd as i32).unwrap();
+    // Internal preparation failures cannot be disguised as invalid addresses.
+    memory.refusal = Some(MemoryPrepareError::Fault(MemoryError::HostMap(
+        "internal refusal".into(),
+    )));
+    assert!(matches!(
+        dispatcher.dispatch(&root, read, &mut memory, &reporter),
+        Err(DispatchError::MemoryPreparation(_))
+    ));
+    memory.refusal = Some(MemoryPrepareError::Fault(MemoryError::OutOfBounds {
+        address: BASE + 0x10000,
+        length: 32,
+    }));
+    assert_eq!(
+        dispatcher
+            .dispatch(&root, read, &mut memory, &reporter)
+            .unwrap(),
+        DispatchOutcome::errno(LINUX_EFAULT)
+    );
+    memory.refusal = Some(MemoryPrepareError::OwnerWait(wait));
+    let DispatchOutcome::DirectoryReadSuspended(pending) = dispatcher
+        .dispatch(&root, read, &mut memory, &reporter)
+        .unwrap()
+    else {
+        panic!("cancellation must own the pending read");
+    };
+    assert!(matches!(
+        &*crate::kernel::FileDescription::read_for_io(&replacement.description).unwrap(),
+        OpenDescription::Directory { offset: 0, .. }
+    ));
+    dispatcher
+        .dispatch(
+            &sibling,
+            request(57, [fd as u64, 0, 0, 0, 0, 0]),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(replacement.description.fd_ref_count(), 1);
+    drop(pending);
+    assert_eq!(
+        replacement.description.fd_ref_count(),
+        0,
+        "cancellation releases the exact last functional reference"
+    );
 }
