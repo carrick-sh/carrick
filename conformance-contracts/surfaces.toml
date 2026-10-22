@@ -182,7 +182,11 @@ contracts = ["kernel.fork.stage1-image", "kernel.mm.metadata-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "kernel.el1.task-load-entry", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "process.native.arm-admission"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "kernel.el1.task-load-entry", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "process.native.arm-admission", "kernel.mm.private-file-fixed-replacement"]
+
+[[surfaces]]
+path = "crates/carrick-aarch64/src/descriptor_drain.rs"
+contracts = ["kernel.mm.private-file-fixed-replacement"]
 
 [[surfaces]]
 path = "crates/carrick-mmu-core/src/aarch64.rs"
@@ -436,7 +440,7 @@ contracts = ["kernel.mm.syscall-code-write"]
 
 [[surfaces]]
 path = "crates/carrick-guest-mem/src/lib.rs"
-contracts = ["kernel.mm.syscall-code-write"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.mm.private-file-fixed-replacement"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/vmm.rs"

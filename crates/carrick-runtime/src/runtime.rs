@@ -2576,6 +2576,13 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.mem.unmap_range(address, len)
     }
+    fn retire_mapping(
+        &mut self,
+        address: carrick_guest_mem::GuestVa,
+        len: usize,
+    ) -> Result<(), carrick_guest_mem::MappingRetirementError> {
+        self.mem.retire_mapping(address, len)
+    }
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.mem.unmap_alias_range(address, len)
     }
