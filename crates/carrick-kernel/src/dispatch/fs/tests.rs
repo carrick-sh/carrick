@@ -13753,3 +13753,117 @@ fn owner_copyin_writev_bounded_gather_resume_fault_writes_readable_prefix() {
     assert_eq!(n, 6);
     assert_eq!(&read_buf, b"prefix");
 }
+
+/// Real immutable lower directory and sparse production memory: a failed
+/// directory copyout must not consume records before a subsequent untouched
+/// private destination can receive them. No memory backend double is involved.
+#[test]
+fn getdents64_fault_preserves_cursor_for_untouched_private_destination() {
+    use carrick_mem::elf::SegmentPerms;
+    use carrick_mem::memory::{AddressSpace, AddressSpaceMetadata, MemoryRegionMetadata};
+    const BASE: u64 = 0x400000;
+    let lower = tempfile::tempdir().unwrap();
+    std::fs::create_dir(lower.path().join("stdlib")).unwrap();
+    for i in 0..400 {
+        std::fs::write(lower.path().join(format!("stdlib/module_{i:04}.py")), b"").unwrap();
+    }
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_rootfs_layer(RootFs::from_immutable_host_dir(lower.path()).unwrap());
+    let mut memory = AddressSpace::from_metadata(AddressSpaceMetadata {
+        entry: GuestVa::new(BASE),
+        initial_stack_pointer: GuestVa::new(BASE),
+        linux_auxv_image: Vec::new(),
+        regions: vec![MemoryRegionMetadata {
+            start: GuestVa::new(BASE),
+            end: GuestVa::new(BASE + 0x20000),
+            perms: SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+            shared: false,
+        }],
+        ro_spans: Vec::new(),
+    })
+    .unwrap();
+    assert!(memory.regions()[0].shared_initialized_bytes().1.is_empty());
+    memory.write_bytes(BASE, b"/stdlib\0").unwrap();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let mut call = |number, args| match dispatcher
+        .dispatch(
+            &context,
+            SyscallRequest::new(number, SyscallArgs(args)),
+            &mut memory,
+            &CompatReporter::default(),
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value,
+        DispatchOutcome::Errno { errno } => -i64::from(errno.get()),
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    let fd = call(56, [LINUX_AT_FDCWD, BASE, LINUX_O_DIRECTORY, 0, 0, 0]);
+    assert!(fd >= 0, "openat: {fd}");
+    assert_eq!(call(61, [fd as u64, 0, 32768, 0, 0, 0]), -14);
+    let copied = call(61, [fd as u64, BASE + 0x10000, 32768, 0, 0, 0]);
+    assert!(copied > 4096, "fault consumed directory records: {copied}");
+    assert_eq!(call(61, [fd as u64, BASE + 0x10000, 32768, 0, 0, 0]), 0);
+    let bytes = memory.read_bytes(BASE + 0x10000, copied as usize).unwrap();
+    let mut names = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let len = u16::from_le_bytes(bytes[at + 16..at + 18].try_into().unwrap()) as usize;
+        let name = &bytes[at + 19..at + len];
+        let end = name.iter().position(|b| *b == 0).unwrap();
+        names.push(std::str::from_utf8(&name[..end]).unwrap().to_owned());
+        at += len;
+    }
+    assert_eq!(names.len(), 402);
+    assert_eq!(&names[..2], &[".", ".."]);
+    for i in 0..400 {
+        assert!(names.contains(&format!("module_{i:04}.py")));
+    }
+}
+
+#[test]
+fn directory_record_batches_fit_production_owner_admission() {
+    let entries: Vec<_> = (0..400)
+        .map(|i| RootFsDirEntry {
+            name: format!("module_{i:04}.py"),
+            ino: 1,
+            metadata: RootFsMetadata {
+                path: "/stdlib".into(),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 0,
+            },
+        })
+        .collect();
+    for address in [0x400000, 0x400064, 0x400ff0] {
+        let mut offset = 0;
+        let mut delivered = 0;
+        while offset < entries.len() {
+            let (bytes, next) = super::directory::directory_record_batch(
+                &entries,
+                offset,
+                address + delivered,
+                32768,
+            )
+            .unwrap();
+            let range = carrick_guest_mem::GuestWriteRange::new(
+                GuestVa::new(address + delivered),
+                bytes.len(),
+            )
+            .unwrap();
+            assert!(
+                carrick_guest_mem::PreparedStreamRanges::new(&[range]).is_ok(),
+                "directory copy exceeds owner PREPARE: {} bytes",
+                bytes.len()
+            );
+            assert!(next > offset);
+            delivered += bytes.len() as u64;
+            offset = next;
+        }
+        assert_eq!(delivered, 16000);
+    }
+}

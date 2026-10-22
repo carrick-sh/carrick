@@ -1,0 +1,17 @@
+schema_version = 1
+id = "kernel.fs.directory-copyout"
+title = "Directory streams commit complete records into private destinations"
+guest_surfaces = ["syscall:getdents64", "syscall:openat"]
+semantic_authority = ["https://man7.org/linux/man-pages/man2/getdents.2.html: count is capacity, successful calls return bytes read; EFAULT is an invalid result buffer, EINVAL is too small for a record", "Issue #711 owner-wait rule 4: transient owner refusal is not EFAULT"]
+fixture = "unit:real-lower-directory-private-destination"
+scale_points = [10, 100, 400]
+rationale = "Directory records are repeatable until the shared description cursor commits. Each copyout authority is bounded by the existing 4096-byte PREPARE capacity. A batch ends on complete records before a guest-page boundary; a crossing record is prepared separately. Offset publication follows infallible prepared commit. Before progress an owner wait retains the selected description, functional lease and exact thread; after progress a refusal may return only actually delivered complete records, never synthesize EFAULT or replay a numeric fd."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::fs::tests::getdents64_fault_preserves_cursor_for_untouched_private_destination: real immutable HostFs lower and production sparse AddressSpace, no fake backend; owner transfer admission additionally uses production PreparedStreamRanges."
+
+[bindings.unresolved]
+embed_structural = "carrick-conformance-next::directory_copyout::case_libpython_directory_copyout reports openat, fstat and getdents64 errno numbers into fresh mmap and malloc buffers. HVF unavailable on ctb-w4; signed pre-fix RED, candidate output and work/timing remain director-owned."
+docker = "Native ARM64 python:3.12-slim exact-output bless required; no Docker on ctb-w4."
+embed_timing = "Paired same-image uninstrumented runtime ratio and signed promotion remain open."
