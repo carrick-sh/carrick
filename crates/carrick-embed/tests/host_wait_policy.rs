@@ -144,6 +144,9 @@ use carrick_embed::testing::{AdversarialPolicy, RecordReplay};
 struct NoSignalCalls;
 #[allow(clippy::panic)]
 impl carrick_hal::HostSignalBridge for NoSignalCalls {
+    fn claim_pending_in_for(&self, _: i32, _: SigSet) -> bool {
+        panic!("unexpected signal call")
+    }
     fn has_unblocked_pending_for(&self, _: i32, _: SigBlockMask) -> bool {
         panic!("unexpected signal call")
     }

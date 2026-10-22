@@ -889,6 +889,22 @@ where
         resume: OwnedSyscallResume,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let mut result = self.consume_owner_zone(control)?;
+        use carrick_kernel::kernel::continuation::{ContinuationCompletion, OwnerWaitCancellation};
+        match &result.completion {
+            ContinuationCompletion::OwnerCancelled(OwnerWaitCancellation::NativeFatal) => {
+                return self.cancel_native_owner_wait(engine);
+            }
+            ContinuationCompletion::OwnerCancelled(OwnerWaitCancellation::GroupExit) => {
+                return self.drive_thread_exit(engine, control, 0);
+            }
+            ContinuationCompletion::OwnerCancelled(OwnerWaitCancellation::Carrier) => {
+                return Err(RuntimeError::Configuration(
+                    "carrier reservation lost owner-wait delivery path".to_owned(),
+                )
+                .into());
+            }
+            _ => {}
+        }
         let reserved_signum = result.reserved_signal().map(|signal| signal.signum());
         let interruption = owner_wait_interruption(&result.completion);
         let reserved = result.take_reserved_signal();

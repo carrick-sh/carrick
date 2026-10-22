@@ -1354,6 +1354,9 @@ pub fn raise_for_self(signum: i32) {
 pub struct HvfHostSignal;
 
 impl carrick_hal::HostSignalBridge for HvfHostSignal {
+    fn claim_pending_in_for(&self, tid: i32, eligible: carrick_abi::SigSet) -> bool {
+        carrick_signal_linux::claim_pending_in_for(tid, eligible)
+    }
     fn has_unblocked_pending_for(&self, tid: i32, block_mask: carrick_abi::SigBlockMask) -> bool {
         has_unblocked_pending_for(tid, block_mask)
     }

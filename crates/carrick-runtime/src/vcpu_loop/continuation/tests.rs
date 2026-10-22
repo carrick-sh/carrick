@@ -904,7 +904,9 @@ fn serial_host_native_owned_write_park_ignores_caught_sigalrm_until_sigkill() {
     carrick_signal_linux::publish_process_signal(carrick_abi::LINUX_SIGKILL);
     assert_eq!(
         probe.event(),
-        Some(ContinuationEvent::Signal),
+        Some(ContinuationEvent::OwnerCancelled(
+            carrick_kernel::kernel::continuation::OwnerWaitCancellation::NativeFatal
+        )),
         "SIGKILL must wake a parked owned write"
     );
     assert_eq!(

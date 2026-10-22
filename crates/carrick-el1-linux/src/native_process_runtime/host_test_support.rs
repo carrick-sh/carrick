@@ -14,8 +14,8 @@ pub fn take_signal_copies() -> Vec<(UserVa, Vec<u8>)> {
     SIGNAL_COPIES.with(|copies| core::mem::take(&mut *copies.borrow_mut()))
 }
 
-pub struct Physical<'a> {
-    pub zone: &'a ZoneTables<ParkedContextWords>,
+pub struct Physical<'a, C: ProcessContext = ParkedContextWords> {
+    pub zone: &'a ZoneTables<C>,
     pub page: &'a ThreadLifecyclePage,
     pub controls: &'a [ThreadControlSlot],
     pub copies: Vec<LinuxWaitStatus>,
@@ -24,16 +24,16 @@ pub struct Physical<'a> {
     pub tid_writes: Vec<(u64, u64, u32)>,
     pub child_copy_error: Option<NativeProcessError>,
     pub refuse_copy: bool,
-    pub on_signal_clock: Option<Box<dyn FnMut()>>,
+    pub on_signal_clock: Option<Box<dyn FnMut() + 'a>>,
 }
-impl<'a> NativeProcessService<'a, ParkedContextWords> for Physical<'a> {
+impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     type Mm = AddressContext<RootGpa>;
     type PreparedMm = AddressContext<RootGpa>;
     type Born = AddressContext<RootGpa>;
     fn prepare_mm(
         &mut self,
         parent: &Self::Mm,
-        _: &ParkedContextWords,
+        _: &C,
         child: MmGeneration,
     ) -> Result<Self::PreparedMm, NativeProcessError> {
         let address = AddressContext {
@@ -147,10 +147,7 @@ impl<'a> NativeProcessService<'a, ParkedContextWords> for Physical<'a> {
     fn quarantine_prepared(&mut self, _: Self::PreparedMm) {
         panic!("unexpected quarantine")
     }
-    fn quarantine_fork(
-        &mut self,
-        _: NativeForkPreparation<'a, Self::Mm, Self::PreparedMm, ParkedContextWords>,
-    ) {
+    fn quarantine_fork(&mut self, _: NativeForkPreparation<'a, Self::Mm, Self::PreparedMm, C>) {
         panic!("unexpected fork quarantine")
     }
     fn quarantine_born(&mut self, _: Self::Born) {
@@ -680,4 +677,279 @@ pub fn empty_signal_checkpoint_lock_witness() {
     );
     // Leave work pending: fixture teardown must release its signal owner so
     // the next empty checkpoint can use the process-global summary fast path.
+}
+
+/// Production native signal/terminal owner attached to a host test's retained
+/// kernel lifecycle and zone. Only physical memory service is substituted.
+pub struct NativeOwnerSignalFixture {
+    zone: &'static ZoneTables<carrick_sched_core::Aarch64ParkedContext>,
+    registry: &'static NativeProcessRegistry<
+        'static,
+        AddressContext<RootGpa>,
+        carrick_sched_core::Aarch64ParkedContext,
+    >,
+    runtime: Arc<
+        NativeProcessRuntime<
+            'static,
+            AddressContext<RootGpa>,
+            carrick_sched_core::Aarch64ParkedContext,
+        >,
+    >,
+    page: &'static ThreadLifecyclePage,
+    root: &'static CurrentTask,
+    root_control: &'static ThreadControlSlot,
+    address: AddressContext<RootGpa>,
+    words: carrick_sched_core::Aarch64ParkedContext,
+    members: Vec<(
+        &'static CurrentTask,
+        SlotId,
+        carrick_sched_core::Aarch64ParkedContext,
+    )>,
+}
+impl Drop for NativeOwnerSignalFixture {
+    fn drop(&mut self) {
+        let process = self.runtime.graph.lock().root_key;
+        self.registry.unregister_process(&self.runtime, process);
+    }
+}
+impl NativeOwnerSignalFixture {
+    #[allow(clippy::too_many_arguments)]
+    fn install(
+        zone: &'static ZoneTables<carrick_sched_core::Aarch64ParkedContext>,
+        binding: ExecutionBinding,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        file_table: u64,
+        slot: SlotId,
+        words: carrick_sched_core::Aarch64ParkedContext,
+        pid: u32,
+    ) -> &'static CurrentTask {
+        let address = words.address_context().unwrap();
+        let task = Box::leak(Box::new(CurrentTask::new()));
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(binding.task.raw() as i32),
+            binding.generation,
+            file_table,
+        );
+        task.mm.key.store(binding.mm.raw(), Ordering::Release);
+        task.mm
+            .thread_generation
+            .store(binding.thread_generation.raw(), Ordering::Release);
+        task.publish_visible_pid(pid);
+        task.publish_root_generation(address.generation);
+        task.publish_lifecycle(page as *const _ as u64, control as *const _ as u64);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, binding.mm.raw()).unwrap();
+        let record = zone
+            .current_or_new(
+                slot,
+                ThreadIdentity {
+                    tid: binding.task.raw(),
+                    serial: binding.thread_generation.raw(),
+                    mm: binding.mm.raw(),
+                    file_table,
+                    generation: binding.generation.raw(),
+                    affinity: 1,
+                    lifecycle_page: page as *const _ as u64,
+                    control_slot: control as *const _ as u64,
+                },
+            )
+            .unwrap();
+        control.bind_zone_record(zone.record_ref(record));
+        // The physical test service is a stopped host venue. Publishing a
+        // running vCPU here would route host continuations into an undriven
+        // guest service queue instead of their registered executor.
+        zone.leave_guest(slot, &carrick_sched_core::ShortLockSpin);
+        assert!(zone.step_away(
+            slot,
+            1,
+            &mut |_| panic!("fresh host fixture has no queued handback"),
+            &mut |_| panic!("fresh host fixture has no displaced placement")
+        ));
+        task
+    }
+    pub fn new<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
+        zone: &'static ZoneTables<carrick_sched_core::Aarch64ParkedContext>,
+        binding: ExecutionBinding,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        file_table: u64,
+        words: carrick_sched_core::Aarch64ParkedContext,
+    ) -> Self {
+        let address = words.address_context().unwrap();
+        let slot = SlotId::new(0);
+        let root = Self::install(
+            zone,
+            binding,
+            page,
+            control,
+            file_table,
+            slot,
+            words,
+            control.visible_tid().unwrap(),
+        );
+        zone.mm_issuer().observe_existing(address.mm);
+        zone.serial_issuer()
+            .advance_past(NonZeroU64::new(binding.thread_generation.raw()).unwrap());
+        zone.serial_issuer().advance_past(
+            NonZeroU64::new(control.host_birth_identity().unwrap().birth().raw()).unwrap(),
+        );
+        let runtime = Arc::new(
+            NativeProcessRuntime::admit_fresh_root::<B>(
+                BornInZoneSource { zone, slot },
+                root,
+                page,
+                control,
+                address,
+                address,
+                words,
+            )
+            .unwrap(),
+        );
+        let registry = Box::leak(Box::new(NativeProcessRegistry::new()));
+        registry
+            .register_root(
+                runtime.clone(),
+                BornInZoneSource { zone, slot },
+                root,
+                address,
+            )
+            .unwrap();
+        Self {
+            zone,
+            registry,
+            runtime,
+            page,
+            root,
+            root_control: control,
+            address,
+            words,
+            members: Vec::new(),
+        }
+    }
+    pub fn add_sibling(
+        &mut self,
+        binding: ExecutionBinding,
+        control: &'static ThreadControlSlot,
+        words: carrick_sched_core::Aarch64ParkedContext,
+    ) {
+        let slot = SlotId::new(u8::try_from(1 + self.members.len()).unwrap());
+        let task = Self::install(
+            self.zone,
+            binding,
+            self.page,
+            control,
+            self.root.linux.file_table.load(Ordering::Acquire),
+            slot,
+            words,
+            self.root.visible_pid().unwrap(),
+        );
+        self.registry
+            .register_thread(
+                BornInZoneSource {
+                    zone: self.zone,
+                    slot,
+                },
+                task,
+                self.address,
+                self.page,
+                control,
+            )
+            .unwrap();
+        self.members.push((task, slot, words));
+    }
+    fn physical(&self) -> Physical<'static, carrick_sched_core::Aarch64ParkedContext> {
+        Physical {
+            zone: self.zone,
+            page: self.page,
+            controls: &[],
+            copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
+            child_copy_error: None,
+            refuse_copy: false,
+            on_signal_clock: None,
+        }
+    }
+    pub fn kill_from_sibling(&self) -> Option<carrick_el1_abi::HostWorkDoorbell> {
+        self.signal_from_sibling(false)
+    }
+    pub fn tgkill_from_sibling(&self) -> Option<carrick_el1_abi::HostWorkDoorbell> {
+        self.signal_from_sibling(true)
+    }
+    fn signal_from_sibling(
+        &self,
+        thread_directed: bool,
+    ) -> Option<carrick_el1_abi::HostWorkDoorbell> {
+        use carrick_personality_linux::signal::{
+            ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
+        };
+        let (task, slot, words) = *self.members.last().unwrap();
+        let mut physical = self.physical();
+        let mut entry = self
+            .runtime
+            .enter_registered(
+                self.registry,
+                BornInZoneSource {
+                    zone: self.zone,
+                    slot,
+                },
+                task,
+                self.address,
+                &words,
+                &mut physical,
+            )
+            .unwrap();
+        let request = SignalRequest::Deliver(carrick_signal_core::policy::Signal::KILL);
+        let info = SignalInfo::Generated(None);
+        if thread_directed {
+            use carrick_personality_linux::signal::SignalThreadSelector;
+            entry
+                .tgkill(
+                    SignalThreadSelector::from_abi(self.root.visible_pid().unwrap() as u64),
+                    SignalThreadSelector::from_abi(self.root_control.visible_tid().unwrap() as u64),
+                    request,
+                    info,
+                )
+                .unwrap();
+        } else {
+            entry
+                .kill(
+                    SignalProcessSelector::from_abi(self.root.visible_pid().unwrap() as u64),
+                    request,
+                    info,
+                )
+                .unwrap();
+        }
+        task.linux.take_host_work_doorbell()
+    }
+    pub fn cancel_root(&self) {
+        let mut physical = self.physical();
+        let mut entry = self
+            .runtime
+            .enter_registered(
+                self.registry,
+                BornInZoneSource {
+                    zone: self.zone,
+                    slot: SlotId::new(0),
+                },
+                self.root,
+                self.address,
+                &self.words,
+                &mut physical,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.cancel_owner_wait().unwrap(),
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }
+        ));
+        assert!(self.page.process_exit_custody().caller_reserved());
+        assert!(entry.take_handoff_receipt().is_some());
+    }
 }

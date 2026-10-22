@@ -931,6 +931,18 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         result
     }
 
+    fn cancel_native_owner_wait(&mut self) -> Result<(), TrapError> {
+        let live = self.live_mut()?;
+        if live.mailbox.transport() != HvfSyscallTransport::Mailbox {
+            return Err(TrapError::UnsupportedPlatform);
+        }
+        live.mailbox.publish_native_owner_cancel().map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "native owner cancellation publication failed: {error}"
+            ))
+        })
+    }
+
     fn complete_native_signal_return(
         &mut self,
         return_value: i64,

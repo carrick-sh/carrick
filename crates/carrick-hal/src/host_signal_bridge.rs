@@ -91,6 +91,8 @@ pub trait HostSignalBridge: Send + Sync {
     /// signal, and (where the lane has one) an unconsumed cross-process ring
     /// entry. A blocked signal stays pending but must not break a wait.
     fn has_unblocked_pending_for(&self, tid: i32, block_mask: SigBlockMask) -> bool;
+    /// Internal eligibility policy, without guest block-mask normalization.
+    fn claim_pending_in_for(&self, tid: i32, eligible: SigSet) -> bool;
 
     /// Claim a pending signal when this thread will actually interrupt its
     /// wait. A plain eligibility query must not select a process wake owner.
@@ -221,6 +223,9 @@ impl<G: HostSignalGlue> std::fmt::Debug for GenericHostSignalBridge<G> {
 }
 
 impl<G: HostSignalGlue> HostSignalBridge for GenericHostSignalBridge<G> {
+    fn claim_pending_in_for(&self, tid: i32, eligible: SigSet) -> bool {
+        carrick_signal_linux::claim_pending_in_for(tid, eligible)
+    }
     fn has_unblocked_pending_for(&self, tid: i32, block_mask: SigBlockMask) -> bool {
         // A cross-process guest signal may be sitting in the shared xsignal
         // ring: peek it WITHOUT consuming so a temporary ppoll/epoll_pwait mask

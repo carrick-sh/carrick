@@ -76,6 +76,8 @@ enum KickFate {
 enum Image {
     /// Serve the syscall (or interrupt) unless host work is pending.
     Serve,
+    /// A completed native call rings its host signal wake doorbell.
+    ServedNativeWake,
     /// The syscall parks its thread and the idle vCPU leaves for the host
     /// (for an interrupt: the running thread is preempted and the next one
     /// needs its executor, EL1 plan 1d).
@@ -118,6 +120,7 @@ struct Machine {
     fault_frames: usize,
     /// The EL1 image saw a native forwarded-return signal checkpoint frame.
     signal_check_frames: Vec<(u64, u64)>,
+    signal_check_arg0: Vec<u64>,
 }
 
 impl Machine {
@@ -159,6 +162,7 @@ impl Machine {
             irq_frames: 0,
             fault_frames: 0,
             signal_check_frames: Vec::new(),
+            signal_check_arg0: Vec::new(),
         }
     }
 
@@ -184,6 +188,7 @@ impl Machine {
             irq_frames: 0,
             fault_frames: 0,
             signal_check_frames: Vec::new(),
+            signal_check_arg0: Vec::new(),
         }
     }
 
@@ -271,13 +276,14 @@ impl Machine {
         let esr = self.read(frame + 264);
         let far = self.read(frame + 280);
         let irq = esr == 0;
-        let signal_check = matches!(esr, 0xfffe | 0xfffd);
+        let signal_check = matches!(esr, 0xfffc..=0xfffe);
         let is_fault = matches!((esr >> 26) & 0x3F, 0x20 | 0x24);
         if is_fault {
             self.fault_frames += 1;
         }
         if signal_check {
             self.signal_check_frames.push((esr, far));
+            self.signal_check_arg0.push(self.read(frame));
         }
         if irq {
             self.irq_frames += 1;
@@ -288,7 +294,10 @@ impl Machine {
             }
         }
         let pending = self.read(Self::pending_host_work_addr()) != 0;
-        self.regs[0] = if is_fault || pending {
+        self.regs[0] = if self.image == Image::ServedNativeWake {
+            self.mem.insert(Self::pending_host_work_addr(), 2);
+            0
+        } else if is_fault || pending {
             1
         } else if self.image == Image::Idle {
             IDLE
@@ -923,4 +932,42 @@ fn forwarded_return_and_non_svc_sync_trap_on_clock_vector_page() {
         assert_eq!(m.esr, esr_sys64);
         assert_eq!(m.regs, post_return_regs);
     }
+}
+
+#[test]
+fn native_signal_work_cause_never_replays_a_served_syscall() {
+    let mut machine = Machine::syscall(El1IrqMode::Gic);
+    machine.image = Image::ServedNativeWake;
+    assert_eq!(machine.run(None), Exit::Host);
+    assert_eq!(machine.read(Machine::pending_host_work_addr()), 2);
+    assert_eq!(
+        machine.read(Machine::served_with_work_addr()),
+        u64::from(carrick_el1_abi::SERVED_WAKES_OWED)
+    );
+}
+
+#[test]
+fn native_owner_cancel_hook_carries_fatal_obligation_without_result() {
+    let mut machine = Machine::full_clock_vector_page(El1IrqMode::Gic);
+    machine.image = Image::Idle;
+    let arg0 = machine.regs[0];
+    machine.pc = (mailbox_resume_layout().hvc_return - LINUX_EL1_VECTORS_BASE) as usize;
+    machine
+        .mem
+        .insert(machine.sp + AARCH64_SYSCALL_MAILBOX_OFF_STATE, 2);
+    machine
+        .mem
+        .insert(machine.sp + AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION, 6);
+    machine.mem.insert(
+        machine.sp + AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE,
+        0xdead_beef,
+    );
+    assert!(matches!(machine.run(None), Exit::Idle { .. }));
+    assert_eq!(machine.signal_check_frames.len(), 1);
+    assert_eq!(machine.signal_check_frames[0].0, 0xfffc);
+    assert_eq!(
+        machine.signal_check_arg0,
+        [arg0],
+        "fatal checkpoint must not load a fabricated syscall result"
+    );
 }

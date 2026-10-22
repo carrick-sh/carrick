@@ -72,6 +72,7 @@ pub enum RegistrationState {
 pub enum ProducerSubscription {
     Futex(carrick_thread::thread::FutexGenerationSubscription),
     Task(crate::kernel::objects::TaskWakeSubscription),
+    NativeOwner(super::NativeOwnerWaitRegistration),
     Vfork(crate::kernel::core::VforkReleaseSubscription),
     FileSlot(crate::kernel::objects::FileSlotSubscription),
     TimerFd(crate::dispatch::fd_table::TimerFdChangeSubscription),
@@ -87,6 +88,7 @@ impl std::fmt::Debug for ProducerSubscription {
         match self {
             Self::Futex(_) => formatter.write_str("FutexGenerationSubscription"),
             Self::Task(_) => formatter.write_str("TaskWakeSubscription"),
+            Self::NativeOwner(_) => formatter.write_str("NativeOwnerWaitRegistration"),
             Self::Vfork(_) => formatter.write_str("VforkReleaseSubscription"),
             Self::FileSlot(_) => formatter.write_str("FileSlotSubscription"),
             Self::TimerFd(_) => formatter.write_str("TimerFdSubscription"),
@@ -730,9 +732,9 @@ impl CarrierWaitServiceInner {
         }
         let (seq, kind) = match event {
             ContinuationEvent::Timeout => (Some(armed_seq), carrick_el1_abi::Handback::Timeout),
-            ContinuationEvent::Signal | ContinuationEvent::ReservedSignal(_) => {
-                (None, carrick_el1_abi::Handback::Signal)
-            }
+            ContinuationEvent::Signal
+            | ContinuationEvent::ReservedSignal(_)
+            | ContinuationEvent::OwnerCancelled(_) => (None, carrick_el1_abi::Handback::Signal),
             ContinuationEvent::Ready => return false,
         };
         match crate::el1_zone::claim(record, seq, kind) {
@@ -1309,6 +1311,14 @@ impl CarrierWaitService {
                         .attach_subscription(token, ProducerSubscription::Futex(subscription));
                 }
             }
+        }
+        if signal.family == super::ContinuationFamily::KillableOwnerZone
+            && let Some(kernel) = signal.kernel.upgrade()
+            && let Ok(context) = kernel.context(signal.task.id, signal.thread.tid)
+            && let Some(enrollment) = super::NativeOwnerWaitRegistration::enroll(&context)
+        {
+            self.inner
+                .attach_subscription(token, ProducerSubscription::NativeOwner(enrollment));
         }
         if let Some(task) = signal.task_ref.upgrade() {
             let callback_weak = weak.clone();

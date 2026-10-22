@@ -344,6 +344,10 @@ pub trait Aarch64Vcpu {
         self.complete_syscall_return(return_value)
     }
 
+    fn cancel_native_owner_wait(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
     /// Return an ordinary syscall result still owned by a backend response
     /// mailbox. Register-return backends keep the default: x0 is already live.
     fn pending_syscall_return(&self) -> Result<Option<i64>, TrapError> {

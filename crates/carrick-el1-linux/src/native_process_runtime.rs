@@ -535,6 +535,14 @@ pub struct NativeMember<'a, C: ProcessContext> {
     zone: &'a ZoneTables<C>,
     record: RecordRef,
     control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
+    signal_projection: Option<
+        Arc<
+            super::native_process_signals::NativeSignalProjection<
+                'a,
+                carrick_personality_linux::abi::signal::LinuxSiginfo,
+            >,
+        >,
+    >,
     /// The exact birth receipt host retirement owes for this member.
     expected_host: carrick_core::terminal::ThreadBirthIdentity,
 }
@@ -624,7 +632,7 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     interrupted_child_waits: BTreeMap<RecordRef, InterruptedChildWait<C>>,
     /// Consumed on the child's first return to user mode, after its MM split.
     pending_child_tid: Option<UserVa>,
-    signals: NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+    signals: NativeProcessSignals<'a, carrick_personality_linux::abi::signal::LinuxSiginfo>,
     _thread_claim: NativeClaim,
     channel: Option<Arc<WaitChannel>>,
     usage: TaskRusage,
@@ -644,6 +652,7 @@ impl<'a, M: Clone, C: ProcessContext> ProcessResources for NativeResources<'a, M
     type Member = NativeMember<'a, C>;
     type Resources = M;
     type SignalTarget = NativeExitSignals<
+        'a,
         carrick_personality_linux::abi::signal::LinuxSiginfo,
         &'a ThreadControlSlot,
     >;
@@ -893,7 +902,7 @@ pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     zone: &'a ZoneTables<C>,
     ipc_channels: IpcWaitChannels,
     #[cfg(test)]
-    signal_check_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
+    signal_check_hook: SpinLock<Option<Box<dyn FnOnce() + Send + 'a>>>,
     #[cfg(test)]
     closing_race_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -1381,6 +1390,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
         if old_record != reference || old_key != key {
             resources.interrupted_child_waits.remove(&old_record);
+        }
+        if old_record != reference
+            && let Some(projection) = &resources.members[member_index].signal_projection
+        {
+            projection.rehome(reference);
         }
         resources.members[member_index].record = reference;
         resources.members[member_index].thread = key.task;
@@ -1956,6 +1970,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     member.thread != key.task || old_record != source.zone.record_ref(record);
                 member.thread = key.task;
                 member.record = source.zone.record_ref(record);
+                if old_record != member.record
+                    && let Some(projection) = &member.signal_projection
+                {
+                    projection.rehome(member.record);
+                }
                 member.expected_host = host_identity;
                 if replaced {
                     row.native_mut()
@@ -1966,11 +1985,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             } else {
                 let retained = retain_member_control(control)?;
                 retained.commit_registration();
+                let projection = row
+                    .native()
+                    .resources()
+                    .signals
+                    .project_member(source.zone.record_ref(record), retained.clone());
                 row.native_mut().resources_mut().members.push(NativeMember {
                     thread: key.task,
                     process,
                     zone: source.zone,
                     record: source.zone.record_ref(record),
+                    signal_projection: Some(projection),
                     control: retained,
                     expected_host: host_identity,
                 });
@@ -2187,7 +2212,7 @@ fn custody<'a, M: Clone, C: ProcessContext>(
     custody.resources_mut().channel = Some(channel);
     custody
 }
-impl<M, C: ProcessContext> NativeResources<'_, M, C> {
+impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
     pub fn file_table(&self) -> u64 {
         self.file_table
     }
@@ -2196,12 +2221,12 @@ impl<M, C: ProcessContext> NativeResources<'_, M, C> {
     }
     pub fn signals(
         &self,
-    ) -> &NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo> {
+    ) -> &NativeProcessSignals<'a, carrick_personality_linux::abi::signal::LinuxSiginfo> {
         &self.signals
     }
     pub fn signals_mut(
         &mut self,
-    ) -> &mut NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo> {
+    ) -> &mut NativeProcessSignals<'a, carrick_personality_linux::abi::signal::LinuxSiginfo> {
         &mut self.signals
     }
     pub fn sync_non_interrupting_signals(&self) {
@@ -2255,7 +2280,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     pub fn current_signals(
         &self,
         current: &CurrentTask,
-    ) -> Option<NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo>> {
+    ) -> Option<NativeProcessSignals<'a, carrick_personality_linux::abi::signal::LinuxSiginfo>>
+    {
         let binding = super::common_entry::execution_binding(current);
         let page = current.metadata.lifecycle_page.load(Ordering::Acquire);
         let control_address = current.metadata.control_slot.load(Ordering::Acquire);
@@ -2350,6 +2376,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     process,
                     zone,
                     record,
+                    signal_projection: None,
                     control: retain_member_control(control)?,
                     expected_host: member_host_identity(page, control)?,
                 },
@@ -2524,10 +2551,16 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             process: key,
             zone: source.zone,
             record: source.zone.record_ref(record),
+            signal_projection: None,
             control: retain_member_control(control)?,
             expected_host: member_host_identity(page, control)?,
         }];
         members.extend(imported.iter().map(|(member, _, _)| member.clone()));
+        let signals = NativeProcessSignals::fresh_root(key);
+        for member in &mut members {
+            member.signal_projection =
+                Some(signals.project_member(member.record, member.control.clone()));
+        }
         let resources = NativeResources {
             _control_custody: carrick_core::lifecycle::MemberControlCustody::retain(control)
                 .map_err(|_| NativeProcessError::Stale)?,
@@ -2540,7 +2573,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             address,
             interrupted_child_waits: BTreeMap::new(),
             pending_child_tid: None,
-            signals: NativeProcessSignals::fresh_root(key),
+            signals,
             _thread_claim: thread_claim,
             channel: None,
             usage: TaskRusage::default(),
@@ -2943,7 +2976,7 @@ struct ForkReservation<'a, M> {
     identity: TaskIdentity,
     group: u32,
     session: u32,
-    signals: NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo>,
+    signals: NativeProcessSignals<'a, carrick_personality_linux::abi::signal::LinuxSiginfo>,
     parent_creds: carrick_personality_linux::identity::TaskCredentials,
     parent_rlimits: carrick_sched_core::process::RlimitSet,
     parent_umask: u32,
@@ -3095,11 +3128,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             let resources = row.native().resources();
             if visible.get() == row.metadata().namespace_pid {
-                let record = if row.key() == self.key {
-                    self.record
-                } else {
-                    resources.control.zone_record().unwrap_or(resources.record)
-                };
+                // The process leader is not necessarily the caller: a
+                // sibling's tgkill(tgid, leader_tid, ...) names the leader's
+                // exact retained control, never the caller's current record.
+                let record = resources.control.zone_record().unwrap_or(resources.record);
                 if signal_record_exists(self.source.zone, record) {
                     selected = Some((
                         row.key(),
@@ -3191,6 +3223,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
         });
         signals.enqueue_thread(record, signal, Some(info));
+        if signal == carrick_signal_core::policy::Signal::KILL {
+            self.current.linux.mark_native_signal_work();
+        }
         let target = self.source.zone.record(record.id).identity();
         let blocked = graph
             .owner
@@ -4251,22 +4286,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn exit_owned(&mut self, status: u8) -> Result<LifecycleOutcome, NativeProcessError> {
         self.exit_with_status(LinuxWaitStatus::exited(status), OwnerEntry::Syscall)
     }
+    /// Host owner-wait cancellation is an irrevocable native fatal obligation,
+    /// even if a sibling selected the process-directed SIGKILL first.
+    pub fn cancel_owner_wait(&mut self) -> Result<LifecycleOutcome, NativeProcessError> {
+        self.exit_with_signal(carrick_signal_core::policy::Signal::KILL.number() as u8)
+    }
     pub fn exit_with_signal(&mut self, sig: u8) -> Result<LifecycleOutcome, NativeProcessError> {
-        if self
-            .runtime
-            .graph
-            .lock()
-            .owner
-            .task(self.key)
-            .map_err(|_| NativeProcessError::Stale)?
-            .native()
-            .resources()
-            .page
-            .live()
-            != 1
-        {
-            return Err(NativeProcessError::GroupExitCustody);
-        }
         let wait_status = LinuxWaitStatus::signaled(sig, false);
         self.exit_with_status(wait_status, OwnerEntry::Exception)
     }
@@ -5367,30 +5392,35 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // SAFETY: this exact newly allocated record remains Free and unpublished.
         unsafe { *self.source.zone.record(record).ctx_mut() = *child_words };
         let member_registration = member_custody.clone();
-        let resources = NativeResources {
-            _control_custody: leader_custody,
-            zone: self.source.zone,
-            record: self.source.zone.record_ref(record),
-            control,
-            page,
-            members: vec![NativeMember {
-                thread: NativeThreadIdentity::ring_born(child_key.id),
-                process: child_key,
+        let resources =
+            NativeResources {
+                _control_custody: leader_custody,
                 zone: self.source.zone,
                 record: self.source.zone.record_ref(record),
-                control: member_custody,
-                expected_host,
-            }],
-            mm: self.service.prepared_mm(&prepared),
-            address,
-            interrupted_child_waits: BTreeMap::new(),
-            pending_child_tid: child_tid.set.then_some(child_tid.address),
-            signals,
-            _thread_claim: thread_claim,
-            channel: None,
-            usage: TaskRusage::default(),
-            file_table: child_file_table,
-        };
+                control,
+                page,
+                members: vec![NativeMember {
+                    thread: NativeThreadIdentity::ring_born(child_key.id),
+                    process: child_key,
+                    zone: self.source.zone,
+                    record: self.source.zone.record_ref(record),
+                    signal_projection: Some(signals.project_member(
+                        self.source.zone.record_ref(record),
+                        member_custody.clone(),
+                    )),
+                    control: member_custody,
+                    expected_host,
+                }],
+                mm: self.service.prepared_mm(&prepared),
+                address,
+                interrupted_child_waits: BTreeMap::new(),
+                pending_child_tid: child_tid.set.then_some(child_tid.address),
+                signals,
+                _thread_claim: thread_claim,
+                channel: None,
+                usage: TaskRusage::default(),
+                file_table: child_file_table,
+            };
         let mut child = GuestTask::new(
             GuestTaskMetadata {
                 key: child_key,
@@ -7173,6 +7203,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
         drop(graph);
+        if signal == carrick_signal_core::policy::Signal::KILL {
+            self.current.linux.mark_native_signal_work();
+        }
         for record in interrupts {
             self.interrupt_signal_record(record);
         }
@@ -9537,30 +9570,16 @@ mod tests {
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
             .unwrap();
-        assert_eq!(page.thread_born(), Some(2));
-        assert!(
-            matches!(
-                entry.exit_with_signal(15),
-                Err(NativeProcessError::GroupExitCustody)
-            ),
-            "two-live-member signal termination must name its custody dependency"
-        );
-        assert_eq!(
-            page.live(),
-            2,
-            "a refused group exit cannot retire shared memory"
-        );
-        page.release_live(1).unwrap();
         assert!(matches!(
-            entry.exit_group(9),
-            LifecycleOutcome::Transferred {
+            entry.exit_with_signal(15),
+            Ok(LifecycleOutcome::Transferred {
                 progress: carrick_core::Served::Idle,
                 ..
-            }
+            })
         ));
         assert_eq!(
             entry.take_root_exit(),
-            Some(LinuxWaitStatus::from_wait_encoding(9 << 8))
+            Some(LinuxWaitStatus::signaled(15, false))
         );
         assert!(entry.take_handoff_receipt().is_some());
         assert_eq!(page.live(), 0);

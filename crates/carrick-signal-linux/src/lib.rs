@@ -532,6 +532,31 @@ pub fn has_unblocked_pending_for(tid: i32, block_mask: SigBlockMask) -> bool {
     (owner == 0 || owner == tid) && set_is_deliverable(PROC_PENDING.load().bits(), block_mask)
 }
 
+/// Claim eligibility in an exact policy set, without Linux's unblockable-mask
+/// normalization. Internal killable waits must be able to defer SIGSTOP.
+pub fn claim_pending_in_for(tid: i32, eligible: SigSet) -> bool {
+    if THREAD_PENDING_TID_HINT.load(Ordering::SeqCst) & tid_hint_bit(tid) != 0
+        && lock_thread_pending()
+            .as_ref()
+            .and_then(|map| map.get(&tid))
+            .is_some_and(|bits| bits & eligible.raw() != 0)
+    {
+        return true;
+    }
+    if PROC_PENDING.load().bits() & eligible.raw() == 0 {
+        return false;
+    }
+    let _custody = lock_process_custody();
+    if PROC_PENDING.load().bits() & eligible.raw() == 0 {
+        return false;
+    }
+    let owner = PROC_WAKE_OWNER.load(Ordering::SeqCst);
+    if owner == 0 {
+        PROC_WAKE_OWNER.store(tid, Ordering::SeqCst);
+    }
+    owner == 0 || owner == tid
+}
+
 /// Commit one interrupted waiter to a process-directed signal. Other
 /// waiters keep their continuation until this owner consumes or retires.
 pub fn claim_unblocked_pending_for(tid: i32, block_mask: SigBlockMask) -> bool {

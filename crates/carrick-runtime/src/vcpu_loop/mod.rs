@@ -3372,6 +3372,8 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct CrashCaptureTestEngine {
         pub(crate) next_syscall: Option<carrick_hal::RawSyscall>,
+        pub(crate) native_owner: Option<Arc<carrick_el1_linux::native_process_runtime::host_test_support::NativeOwnerSignalFixture>>,
+        pub(crate) native_owner_cancellations: usize,
         pub(crate) completed_syscalls: Vec<i64>,
         pub(crate) completion_events: Option<Arc<Mutex<Vec<&'static str>>>>,
         pub(crate) execve_installs: usize,
@@ -3675,6 +3677,14 @@ pub(crate) mod tests {
     }
 
     impl ThreadedEngine for CrashCaptureTestEngine {
+        fn cancel_native_owner_wait(&mut self) -> Result<(), TrapError> {
+            self.native_owner
+                .as_ref()
+                .expect("real native signal owner")
+                .cancel_root();
+            self.native_owner_cancellations += 1;
+            Ok(())
+        }
         type Arch = carrick_hal::Aarch64GuestArch;
         type KickHandle = CrashCaptureTestKick;
         type SiblingSpec = ();
@@ -3881,7 +3891,7 @@ pub(crate) mod tests {
 
     #[test]
     fn serial_host_pipe2_owner_wait_redispatches_through_production_runtime_once() {
-        exercise_owner_wait(carrick_abi::syscall::nr::PIPE2, None);
+        exercise_owner_wait(carrick_abi::syscall::nr::PIPE2, None, false);
     }
 
     #[test]
@@ -3890,7 +3900,7 @@ pub(crate) mod tests {
             carrick_abi::syscall::nr::FSTAT,
             carrick_abi::syscall::nr::WAIT4,
         ] {
-            exercise_owner_wait(nr, Some(carrick_abi::LINUX_SIGUSR1));
+            exercise_owner_wait(nr, Some(carrick_abi::LINUX_SIGUSR1), false);
         }
     }
 
@@ -3900,11 +3910,119 @@ pub(crate) mod tests {
             carrick_abi::syscall::nr::FSTAT,
             carrick_abi::syscall::nr::WAIT4,
         ] {
-            exercise_owner_wait(nr, Some(carrick_abi::LINUX_SIGKILL));
+            exercise_owner_wait(nr, Some(carrick_abi::LINUX_SIGKILL), false);
         }
     }
 
-    fn exercise_owner_wait(nr: carrick_abi::CanonicalNr, signum: Option<i32>) {
+    #[test]
+    fn serial_host_native_owner_wait_defers_stop_until_fstat_owner_release() {
+        exercise_owner_wait(
+            carrick_abi::syscall::nr::FSTAT,
+            Some(carrick_abi::LINUX_SIGSTOP),
+            true,
+        );
+    }
+
+    #[test]
+    fn serial_host_native_sibling_kill_cancels_zone_owner_wait_with_editor_held() {
+        exercise_owner_wait(
+            carrick_abi::syscall::nr::FSTAT,
+            Some(carrick_abi::LINUX_SIGKILL),
+            true,
+        );
+    }
+
+    pub(crate) fn native_owner_fixture(
+        root: &carrick_kernel::kernel::KernelContext,
+        zone: &'static carrick_el1_abi::ZoneTables,
+    ) -> carrick_el1_linux::native_process_runtime::host_test_support::NativeOwnerSignalFixture
+    {
+        use carrick_guest_arch::{
+            AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+        };
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        assert_ne!(region, 0);
+        // SAFETY: this test exclusively owns the fresh aligned ABI region;
+        // its native producer has not observed the ingress queue yet.
+        unsafe {
+            carrick_el1_abi::SharedSignalIngressQueue::initialize_at(
+                (region + carrick_el1_abi::EL1_SIGNAL_INGRESS_OFFSET as usize) as *mut _,
+            );
+        }
+        let retained = Box::leak(Box::new(root.retain_exact()));
+        assert!(retained.thread().control_slot().publish_visible_tid(
+            carrick_kernel::namespace::pid::ns_visible_thread_tid(root.thread()).unwrap()
+        ));
+        let page = Box::leak(Box::new(root.lifecycle_page()));
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(
+                carrick_el1_linux::mm_portal::test_support::ROOT,
+            ))
+            .unwrap(),
+            mm: MmGeneration::new(
+                std::num::NonZeroU64::new(root.shared().mm().id().raw()).unwrap(),
+            ),
+            generation: ContextGeneration::new(std::num::NonZeroU64::MIN),
+        };
+        let binding = carrick_el1_abi::ExecutionBinding {
+            task: carrick_el1_abi::EntryTaskKey::from_raw(root.thread().key().tid.raw() as u64),
+            generation: carrick_el1_abi::SnapshotGeneration::from_raw(
+                root.thread()
+                    .execution_state()
+                    .generation()
+                    .map_or(1, |g| g.raw()),
+            ),
+            mm: carrick_el1_abi::EntryMmKey::from_raw(root.shared().mm().id().raw()),
+            thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(
+                root.thread().key().serial.raw(),
+            ),
+        };
+        carrick_el1_linux::native_process_runtime::host_test_support::NativeOwnerSignalFixture::new::<
+            carrick_mmu_core::owner_mmu::Aarch64Mmu,
+        >(
+            zone,
+            binding,
+            page,
+            retained.thread().control_slot(),
+            root.resources().files().id().raw(),
+            carrick_sched_core::Aarch64ParkedContext::from_parts(
+                carrick_sched_core::ThreadCtx::ZERO,
+                address,
+            ),
+        )
+    }
+
+    pub(crate) fn native_owner_add_sibling(
+        fixture: &mut carrick_el1_linux::native_process_runtime::host_test_support::NativeOwnerSignalFixture,
+        sibling: &carrick_kernel::kernel::KernelContext,
+    ) {
+        let retained = Box::leak(Box::new(sibling.retain_exact()));
+        assert!(retained.thread().control_slot().publish_visible_tid(
+            carrick_kernel::namespace::pid::ns_visible_thread_tid(sibling.thread()).unwrap()
+        ));
+        let words = carrick_sched_core::Aarch64ParkedContext::from_register(
+            carrick_sched_core::ThreadCtx::ZERO,
+            carrick_el1_linux::mm_portal::test_support::ROOT,
+            sibling.shared().mm().id().raw(),
+            1,
+        );
+        fixture.add_sibling(
+            carrick_el1_abi::ExecutionBinding {
+                task: carrick_el1_abi::EntryTaskKey::from_raw(
+                    sibling.thread().key().tid.raw() as u64
+                ),
+                generation: carrick_el1_abi::SnapshotGeneration::from_raw(1),
+                mm: carrick_el1_abi::EntryMmKey::from_raw(sibling.shared().mm().id().raw()),
+                thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(
+                    sibling.thread().key().serial.raw(),
+                ),
+            },
+            retained.thread().control_slot(),
+            words,
+        );
+    }
+
+    fn exercise_owner_wait(nr: carrick_abi::CanonicalNr, signum: Option<i32>, native: bool) {
         use carrick_abi::{LinuxCloneFlags, syscall::nr};
         use carrick_el1_linux::mm_portal::{
             MmPortal,
@@ -3925,7 +4043,51 @@ pub(crate) mod tests {
             None,
         ));
         let root = kernel.dispatcher.capture_one_task_context().unwrap();
-        let sibling = root
+        root.thread()
+            .set_affinity(carrick_hal::CpuAffinity::from_words(&[1]));
+        let region = Box::leak(Box::new(Region::new()));
+        let zone = region.zone();
+        let mm = admit_notified(region, root.shared().mm().id().raw(), ROOT, 1, 0);
+        let view = Box::leak(Box::new(nodes(region)));
+        let portal = Box::leak(Box::new(
+            MmPortal::new(
+                NonZeroU64::new(712).unwrap(),
+                region.table(),
+                &zone.spaces,
+                view,
+            )
+            .with_zone(zone)
+            .unwrap(),
+        ));
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        assert!(
+            region
+                .portal_slots()
+                .bind_carrier(NonZeroU64::new(712).unwrap())
+        );
+        carrick_el1_abi::record_el1_region_host_ptr(region.ptr.as_ptr() as usize);
+        struct ClearRegion;
+        impl Drop for ClearRegion {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(0);
+            }
+        }
+        let _clear_region = ClearRegion;
+        struct ClearStopBridge(i32);
+        impl Drop for ClearStopBridge {
+            fn drop(&mut self) {
+                for signal in [carrick_abi::LINUX_SIGSTOP, carrick_abi::LINUX_SIGCONT] {
+                    carrick_signal_linux::take_pending_in_for(
+                        self.0,
+                        carrick_abi::SigSet::EMPTY.with(signal),
+                    );
+                }
+            }
+        }
+        let _clear_stop = (native && signum == Some(carrick_abi::LINUX_SIGSTOP))
+            .then_some(ClearStopBridge(root.thread().registry_id().raw()));
+        let mut native_owner = native.then(|| native_owner_fixture(&root, zone));
+        let prepared_sibling = root
             .kernel()
             .reserve_thread_clone(
                 &root,
@@ -3937,11 +4099,48 @@ pub(crate) mod tests {
             )
             .unwrap()
             .prepare(ThreadId::synthetic_for_tests(71_103))
-            .unwrap()
-            .commit()
-            .unwrap()
-            .into_context()
             .unwrap();
+        let sibling = if native {
+            prepared_sibling.commit_for_el1()
+        } else {
+            prepared_sibling.commit()
+        }
+        .unwrap()
+        .into_context()
+        .unwrap();
+        if let Some(owner) = &mut native_owner {
+            native_owner_add_sibling(owner, &sibling);
+        }
+        // A third member sends kill: the editor and signal sender cannot
+        // execute concurrently as the same native execution incarnation.
+        let _killer = if native && signum == Some(carrick_abi::LINUX_SIGKILL) {
+            let current = root
+                .kernel()
+                .context(root.task().key().id, root.thread().key().tid)
+                .unwrap();
+            let killer = current
+                .kernel()
+                .reserve_thread_clone(
+                    &current,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        LinuxCloneFlags::VM | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::THREAD,
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+                .prepare(ThreadId::synthetic_for_tests(71_104))
+                .unwrap()
+                .commit_for_el1()
+                .unwrap()
+                .into_context()
+                .unwrap();
+            native_owner_add_sibling(native_owner.as_mut().unwrap(), &killer);
+            Some(killer)
+        } else {
+            None
+        };
+        let native_owner = native_owner.map(Arc::new);
         let root = root
             .kernel()
             .context(root.task().key().id, root.thread().key().tid)
@@ -4029,37 +4228,12 @@ pub(crate) mod tests {
             native_number: carrick_abi::NativeNr(nr.raw()),
         };
 
-        let region = Box::leak(Box::new(Region::new()));
-        let zone = region.zone();
-        let mm = admit_notified(region, root.shared().mm().id().raw(), ROOT, 1, 0);
-        let view = Box::leak(Box::new(nodes(region)));
-        let portal = Box::leak(Box::new(
-            MmPortal::new(
-                NonZeroU64::new(712).unwrap(),
-                region.table(),
-                &zone.spaces,
-                view,
-            )
-            .with_zone(zone)
-            .unwrap(),
-        ));
-        let handle = portal.admitted_handle(mm, 0).unwrap();
-        assert!(
-            region
-                .portal_slots()
-                .bind_carrier(NonZeroU64::new(712).unwrap())
-        );
-        carrick_el1_abi::record_el1_region_host_ptr(region.ptr.as_ptr() as usize);
-        struct ClearRegion;
-        impl Drop for ClearRegion {
-            fn drop(&mut self) {
-                carrick_el1_abi::record_el1_region_host_ptr(0);
-            }
-        }
-        let _clear_region = ClearRegion;
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
-        let mut engine = CrashCaptureTestEngine::default();
+        let mut engine = CrashCaptureTestEngine {
+            native_owner: native_owner.clone(),
+            ..Default::default()
+        };
 
         let handback_scheduler = Arc::downgrade(&scheduler);
         let handback: carrick_kernel::el1_zone::HandbackPublisher = Arc::new(move |event| {
@@ -4219,7 +4393,40 @@ pub(crate) mod tests {
                         .settle_blocked_continuation(running, *continuation, wait_registration)
                         .unwrap();
 
-                    if let Some(signum) = signum {
+                    if native && signum == Some(carrick_abi::LINUX_SIGKILL) {
+                        let doorbell = native_owner.as_ref().unwrap().kill_from_sibling();
+                        assert!(
+                            doorbell.is_some(),
+                            "native SIGKILL must publish an event-driven host wake"
+                        );
+                        carrick_kernel::el1_delegation::settle_host_work_boundary(
+                            root.kernel(),
+                            false,
+                            doorbell,
+                        );
+                    } else if native && signum == Some(carrick_abi::LINUX_SIGSTOP) {
+                        carrick_signal_linux::publish_pending_for(
+                            root.thread().registry_id().raw(),
+                            carrick_abi::LINUX_SIGSTOP,
+                        );
+                        wait_service.publish_signal_for_thread(root.thread().key());
+                        assert_eq!(
+                            scheduler.queued_len(),
+                            0,
+                            "SIGSTOP must leave fstat parked while its editor is held"
+                        );
+                        assert!(engine.completed_syscalls.is_empty());
+                        carrick_signal_linux::publish_pending_for(
+                            root.thread().registry_id().raw(),
+                            carrick_abi::LINUX_SIGCONT,
+                        );
+                        wait_service.publish_signal_for_thread(root.thread().key());
+                        assert_eq!(
+                            scheduler.queued_len(),
+                            0,
+                            "SIGCONT must not complete the owner wait either"
+                        );
+                    } else if let Some(signum) = signum {
                         let signal =
                             carrick_kernel::kernel::LinuxSignal::for_signal_number(signum).unwrap();
                         if signum == carrick_abi::LINUX_SIGUSR1 {
@@ -4271,7 +4478,10 @@ pub(crate) mod tests {
                         "owner release did not wake the production continuation before the bound",
                     );
 
-                    let mut resumed = scheduler.take(&registration).unwrap();
+                    let mut resumed = scheduler
+                        .try_take(&registration)
+                        .unwrap()
+                        .expect("owner wake must reach the registered host executor");
                     let lease = resumed.take_lease();
                     job.state.guest_execution = Some(
                         kernel
@@ -4304,7 +4514,22 @@ pub(crate) mod tests {
                             binding::OwnedSyscallResume::CopyoutRedispatch,
                         )
                         .unwrap();
-                    if killing {
+                    if killing && native {
+                        assert_eq!(engine.native_owner_cancellations, 1);
+                        assert!(engine.completed_syscalls.is_empty());
+                        assert!(
+                            carrick_el1_abi::Lifecycle::process_exit_custody(
+                                &*root.lifecycle_page()
+                            )
+                            .caller_reserved()
+                        );
+                        assert!(
+                            engine.copyout_owner_probe.unwrap().wait_if_busy().is_some(),
+                            "editor stays held through native fatal custody"
+                        );
+                        assert_eq!(engine.prepared_commits, 0);
+                        release_tx.send(()).unwrap();
+                    } else if killing {
                         assert!(
                             matches!(
                                 job.phase,
@@ -4331,7 +4556,7 @@ pub(crate) mod tests {
                         assert!(matches!(completed, executor::ExecutorExit::Syscall));
                         let result = if nr == nr::WAIT4 { -10 } else { 0 };
                         assert_eq!(engine.completed_syscalls, [result]);
-                        if signum.is_some() {
+                        if signum.is_some() && !native {
                             assert_eq!(
                                 engine.injected_signals,
                                 [(Some(result), Some(result), false)]

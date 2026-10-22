@@ -80,6 +80,12 @@ fn deliver_boundary_wakes(
     doorbell: Option<carrick_el1_abi::HostWorkDoorbell>,
 ) {
     let pending = doorbell.is_some();
+    if doorbell
+        .as_ref()
+        .is_some_and(carrick_el1_abi::HostWorkDoorbell::native_signal_wake)
+    {
+        kernel.notify_native_owner_waits();
+    }
     if served {
         crate::el1_inotify::deliver_owed_wakes();
     }

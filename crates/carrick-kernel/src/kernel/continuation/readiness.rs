@@ -524,7 +524,28 @@ impl SignalReadinessProbe {
         {
             return Some(ContinuationEvent::Signal);
         }
+        if self.family == ContinuationFamily::KillableOwnerZone {
+            return match owner_wait_cancellation(&context)? {
+                cancellation @ (OwnerWaitCancellation::NativeFatal
+                | OwnerWaitCancellation::GroupExit) => {
+                    Some(ContinuationEvent::OwnerCancelled(cancellation))
+                }
+                OwnerWaitCancellation::Carrier => {
+                    reserve_killable_wait_signal(&context).map(ContinuationEvent::ReservedSignal)
+                }
+            };
+        }
         if context.thread().control_slot().native_signal_owner() {
+            if self.family.is_kill_only_wait() {
+                return self
+                    .host_signal
+                    .claim_pending_in_for(
+                        self.thread.tid.raw(),
+                        SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGKILL),
+                    )
+                    .then_some(ContinuationEvent::Signal);
+            }
+
             // This binding's bridge event belongs to native ingress. A
             // readiness sample may wake the continuation, but importing it
             // into a carrier ReservedSignal would create a second consumer
@@ -537,13 +558,6 @@ impl SignalReadinessProbe {
                 WaitSigMask::Replace(mask) => mask,
             }
             .union(non_interrupting);
-            let blocked = if self.family.is_kill_only_wait() {
-                SigSet::EMPTY
-                    .complement()
-                    .without(crate::linux_abi::LINUX_SIGKILL)
-            } else {
-                blocked
-            };
             return self
                 .host_signal
                 .claim_unblocked_pending_for(
@@ -554,17 +568,9 @@ impl SignalReadinessProbe {
         }
         let authority = context.signal_authority();
         if self.family.is_kill_only_wait() {
-            // A ptrace request waiting out its tracee's stop settlement is
-            // killable-only for the same reason: it has performed nothing,
-            // and ptrace(2) never fails it with EINTR.
-            // Linux waits for vfork completion in TASK_KILLABLE. That means
-            // only SIGKILL may interrupt the wait; caught signals and other
-            // default actions stay pending until the exact child exec/exit
-            // gate releases the parent. Reserve SIGKILL as a typed signal
-            // event so the delivery tail terminates the parent without ever
-            // manufacturing a successful vfork return.
             return reserve_killable_wait_signal(&context).map(ContinuationEvent::ReservedSignal);
         }
+
         let host_signum = self.host_signal.take_pending_for(self.thread.tid.raw());
         if let Some(wait_set) = self.wait_set {
             if host_signum != 0 && wait_set.contains(host_signum) {
@@ -1021,15 +1027,117 @@ impl ReadinessProbe {
     }
 }
 
+/// One cancellation answer from the task's selected signal owner. Native
+/// signals stay in their native queue. This query never dequeues a signal;
+/// legacy delivery reserves its selected SIGKILL only after the wake wins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnerWaitCancellation {
+    NativeFatal,
+    GroupExit,
+    Carrier,
+}
+
+pub fn owner_wait_cancellation(context: &KernelContext) -> Option<OwnerWaitCancellation> {
+    use carrick_el1_abi::Lifecycle;
+    let control = context.thread().control_slot();
+    if context
+        .lifecycle_page()
+        .process_exit_custody()
+        .caller_reserved()
+    {
+        return Some(if control.native_signal_owner() {
+            OwnerWaitCancellation::NativeFatal
+        } else {
+            OwnerWaitCancellation::GroupExit
+        });
+    }
+    if control.native_signal_owner() {
+        let kill = SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGKILL);
+        let pending = SigSet::from_raw(control.pending().load().0);
+        (pending.contains(crate::linux_abi::LINUX_SIGKILL)
+            || context
+                .kernel()
+                .host_signal()
+                .claim_pending_in_for(context.thread().key().tid.raw(), kill))
+        .then_some(OwnerWaitCancellation::NativeFatal)
+    } else {
+        let kill = SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGKILL);
+        (context.signal_authority().has_pending_in(kill)
+            || context
+                .kernel()
+                .host_signal()
+                .claim_pending_in_for(context.thread().key().tid.raw(), kill))
+        .then_some(OwnerWaitCancellation::Carrier)
+    }
+}
+
+/// Exact native owner waits which a native-signal host-work edge may notify.
+/// Ordinary syscall boundaries never walk this registry.
+#[derive(Debug, Default)]
+pub struct NativeOwnerWaitRegistry(
+    Mutex<std::collections::BTreeMap<ThreadKey, Vec<Weak<KernelContext>>>>,
+);
+
+#[derive(Debug)]
+pub struct NativeOwnerWaitRegistration {
+    registry: Arc<NativeOwnerWaitRegistry>,
+    context: Arc<KernelContext>,
+}
+impl NativeOwnerWaitRegistration {
+    pub fn enroll(context: &KernelContext) -> Option<Self> {
+        if !context.thread().control_slot().native_signal_owner() {
+            return None;
+        }
+        let registry = Arc::clone(&context.kernel().native_owner_waits);
+        let context = Arc::new(context.retain_exact());
+        registry
+            .0
+            .lock()
+            .entry(context.thread().key())
+            .or_default()
+            .push(Arc::downgrade(&context));
+        Some(Self { registry, context })
+    }
+}
+impl Drop for NativeOwnerWaitRegistration {
+    fn drop(&mut self) {
+        let mut waits = self.registry.0.lock();
+        let key = self.context.thread().key();
+        if let Some(entries) = waits.get_mut(&key) {
+            entries.retain(|entry| entry.as_ptr() != Arc::as_ptr(&self.context));
+            if entries.is_empty() {
+                waits.remove(&key);
+            }
+        }
+    }
+}
+impl Kernel {
+    pub(crate) fn notify_native_owner_waits(&self) {
+        let contexts = self
+            .native_owner_waits
+            .0
+            .lock()
+            .values()
+            .flatten()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for context in contexts {
+            if context.exact_thread_is_live() && owner_wait_cancellation(&context).is_some() {
+                context.task().wake();
+            }
+        }
+    }
+}
+
 /// Reserve only SIGKILL at an internal kernel lock wait. Ordinary host and
 /// kernel signals remain pending until the syscall's return boundary.
 pub fn reserve_killable_wait_signal(context: &KernelContext) -> Option<ReservedSignal> {
     let host_signal = context.kernel().host_signal();
     let authority = context.signal_authority();
-    let host_signum = host_signal.take_pending_for(context.thread().key().tid.raw());
-    if host_signum != 0 && host_signum != crate::linux_abi::LINUX_SIGKILL {
-        host_signal.publish_pending_for(context.thread().key().tid.raw(), host_signum);
-    }
+    let host_signum = host_signal.take_pending_in_for(
+        context.thread().key().tid.raw(),
+        SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGKILL),
+    );
     let kill_only = WaitSigMask::Replace(
         SigSet::EMPTY
             .complement()
