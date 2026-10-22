@@ -899,6 +899,17 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for ObjectWaitGuard<'_, C
     }
 }
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
+    /// Observe the exact native member while its service queue serializes
+    /// intake against cancellation and consumption. This observation grants
+    /// no MM ownership; the member's service cell authenticates the request.
+    pub fn native_service_member(&self, record: RecordRef) -> Option<crate::ThreadIdentity> {
+        if ObjectWaitKey::native_service(record) != Some(self.key) {
+            return None;
+        }
+        let member = self.zone.live(record)?;
+        member.is_native_owned().then(|| member.identity())
+    }
+
     fn release_with(&self, mut before_unlock: impl FnMut()) {
         let queue = self.queue();
         let Some(completion) = self.completion else {

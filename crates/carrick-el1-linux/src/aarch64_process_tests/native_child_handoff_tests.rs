@@ -704,6 +704,10 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             .zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin)
             .unwrap();
+        assert_eq!(queue.native_service_member(record), Some(identity));
+        let mut recycled = record;
+        recycled.incarnation += 1;
+        assert_eq!(queue.native_service_member(recycled), None);
         let mut stale = selector;
         stale.execution =
             carrick_core_abi::SnapshotGeneration::from_raw(selector.execution.raw() + 1);
@@ -737,10 +741,11 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
         .into_iter()
         .map(|(owner, page, control, selector, identity)| {
             let key = ObjectWaitKey::native_service(selector.record).unwrap();
-            let _queue = fixture
+            let queue = fixture
                 .zone
                 .object_wait(key, &carrick_sched_core::ShortLockSpin)
                 .unwrap();
+            assert_eq!(queue.native_service_member(selector.record), Some(identity));
             let ticket = unsafe {
                 ServiceCell::claim_notice(&control.service, selector, NonZeroU64::MIN, identity)
             }
