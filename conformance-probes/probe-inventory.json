@@ -2187,6 +2187,11 @@
     "excluded": false,
     "runner": "generic"
   },
+  "schedaffinitythreads": {
+    "class": "conformance",
+    "excluded": false,
+    "runner": "generic"
+  },
   "schedgetattr": {
     "class": "conformance",
     "excluded": false,
