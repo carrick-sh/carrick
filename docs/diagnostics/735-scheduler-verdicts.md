@@ -112,10 +112,10 @@ receipt=target/test-results/carrick-embed-signed-artifacts.jsonl
 sched_exe=$(jq -sr '\''[.[] | select(.record_type == "executable") |
   .canonical_path | select(test("/el1_sched-[^/]+$"))] | unique |
   if length == 1 then .[0] else error("expected one scheduler artifact") end'\'' "$receipt")
-evidence="$PWD/target/735-signed"
+evidence="$PWD/target/735-signed-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$evidence"
 cp "$receipt" "$evidence/artifacts.jsonl"
-shasum -a 256 "$sched_exe" > "$evidence/artifact.sha256"
+shasum -a 256 "$sched_exe" target/embed-fixtures/el1-sched-aarch64 > "$evidence/artifact.sha256"
 test_signed_has_entitlement "$sched_exe"
 test_signed_has_dof "$sched_exe"
 test_signed_cdhash "$sched_exe" > "$evidence/cdhash.txt"

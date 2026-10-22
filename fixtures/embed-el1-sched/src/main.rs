@@ -614,7 +614,6 @@ static CP_A: AtomicU32 = AtomicU32::new(0);
 static CP_B: AtomicU32 = AtomicU32::new(0);
 
 fn compute_sibling(rounds: u32) {
-    assert_eq!(pin(0), 0, "compute sibling affinity");
     for turn in 1..=rounds {
         while CP_A.load(Ordering::Acquire) < turn {
             std::hint::spin_loop();
@@ -636,8 +635,11 @@ fn compute_main(rounds: u32) {
 /// time window in which the host must deliver a sample or schedule a vCPU.
 fn compute_pair(rounds: u32) -> i32 {
     assert!(rounds >= 2);
+    let b = std::thread::spawn(move || {
+        assert_eq!(pin(0), 0, "compute sibling affinity");
+        compute_sibling(rounds);
+    });
     assert_eq!(pin(0), 0, "compute main affinity");
-    let b = std::thread::spawn(move || compute_sibling(rounds));
     // Retain the original valid-timespec regression surface under concurrent
     // thread setup. Correctness does not assume the sibling parked by now.
     sleep_ms(30);
@@ -1190,13 +1192,13 @@ fn epoll_pingpong(iters: usize) -> i32 {
 /// one vCPU. Pipes are in-zone and cannot exercise host completion here.
 fn host_compute(rounds: u32) -> i32 {
     assert!(rounds >= 2);
-    assert_eq!(pin(0), 0, "host-compute main affinity");
     let (read_fd, write_fd) = socket_pair();
     let b = std::thread::spawn(move || {
         assert_eq!(pin(0), 0, "host-compute sibling affinity");
         assert_eq!(read_byte(read_fd), 1, "host-compute read");
         compute_sibling(rounds);
     });
+    assert_eq!(pin(0), 0, "host-compute main affinity");
     // This exercises the same nanosleep input as the original reproducer;
     // neither the turn count nor the preemption assertion uses its duration.
     sleep_ms(30);

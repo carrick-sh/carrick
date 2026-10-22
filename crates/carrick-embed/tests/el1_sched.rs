@@ -1178,7 +1178,7 @@ fn el1_sched_timed_wait_times_out_in_guest() {
 }
 
 /// Part (c): two threads that compute without a syscall share one vCPU (the
-/// threads inherit CPU-0 affinity and exchange 16 counted compute turns).
+/// threads verify CPU-0 affinity and exchange 16 counted compute turns).
 /// Completion requires repeated progress by both syscall-free loops; the
 /// in-guest preemption counter must also advance. Host descheduling cannot
 /// expire a sampling window.
