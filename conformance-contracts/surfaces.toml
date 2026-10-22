@@ -680,7 +680,7 @@ contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_sched.rs"
-contracts = ["kernel.el1.epoll-zone", "kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.anonymous-reservations", "kernel.el1.fork-cow", "kernel.el1.ipc-two-process", "kernel.el1.delegated-root-fork", "kernel.el1.thread-lifecycle"]
+contracts = ["kernel.sleep.owner-copyin", "kernel.el1.epoll-zone", "kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.anonymous-reservations", "kernel.el1.fork-cow", "kernel.el1.ipc-two-process", "kernel.el1.delegated-root-fork", "kernel.el1.thread-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/sigframe.rs"
@@ -692,7 +692,7 @@ contracts = ["kernel.el1.guest-scheduler", "kernel.mm.user-va-ceiling"]
 
 [[surfaces]]
 path = "fixtures/embed-el1-sched/src/main.rs"
-contracts = ["kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation"]
+contracts = ["kernel.sleep.owner-copyin", "kernel.el1.anonymous-first-touch", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/asid.rs"
@@ -752,7 +752,7 @@ contracts = ["kernel.mm.image-page-permissions"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/mod.rs"
-contracts = ["kernel.mm.image-page-permissions", "kernel.signal.temporary-wait-mask", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.mm.image-page-permissions", "kernel.signal.temporary-wait-mask", "kernel.copyout.owner-refusal", "kernel.sleep.owner-copyin"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/hvpatch/mod.rs"
@@ -1438,7 +1438,7 @@ contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-chil
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
-contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-child", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-child", "kernel.copyout.owner-refusal", "kernel.sleep.owner-copyin"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/internal_read.rs"
@@ -1761,3 +1761,7 @@ contracts = ["kernel.scheduler.runnable-progress"]
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs"
 contracts = ["kernel.scheduler.runnable-progress"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/time.rs"
+contracts = ["kernel.sleep.owner-copyin"]

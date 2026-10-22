@@ -148,3 +148,11 @@ shasum -a 256 -c "$evidence/artifact.sha256"
 Each fixture still has its existing 60/120-second embed watchdog. These
 focused runs do not replace the director's full signed acceptance population,
 probe/smoke/full promotion or independent review.
+
+Residual diagnostic boundary: `continue_owner_read` also has an unreceipted
+`TransferProgress::Suspended` -> `MemoryError::HostMap` path (portal selection
+change or missing submission/completion receipt). This change does not invent
+an owner wait for that state. If a signed sleep still returns EFAULT, capture
+the existing `hvpatch_el1_host_read_progress` probe to distinguish that backend
+path from a typed owner/physical/supply suspension. Neither the historical logs
+nor the VM-free injection identify the exact backend event in the old run.
