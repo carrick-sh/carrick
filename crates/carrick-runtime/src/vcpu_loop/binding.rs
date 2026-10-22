@@ -227,6 +227,9 @@ pub(super) enum OwnerSupplyWait {
 /// A retained transfer cannot fall through to numeric syscall redispatch.
 pub(super) enum OwnedSyscallResume {
     CopyoutRedispatch,
+    Io(OwnedIoResume),
+}
+pub(super) enum OwnedIoResume {
     PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
     DirectoryRead(Box<carrick_kernel::dispatch::OwnedDirectoryRead>),
 }
@@ -235,11 +238,11 @@ fn owner_memory_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<Owne
     let (wait, resume) = match outcome {
         DispatchOutcome::WriteCopyInSuspended(pending) => (
             pending.wait().clone(),
-            OwnedSyscallResume::PreparedWrite(pending),
+            OwnedSyscallResume::Io(OwnedIoResume::PreparedWrite(pending)),
         ),
         DispatchOutcome::DirectoryReadSuspended(pending) => (
             pending.wait().clone(),
-            OwnedSyscallResume::DirectoryRead(pending),
+            OwnedSyscallResume::Io(OwnedIoResume::DirectoryRead(pending)),
         ),
         other => return (other, None),
     };
@@ -306,6 +309,7 @@ pub(super) enum HvpatchProductionPhase {
     ResumeOwnerZone {
         frame: carrick_hal::RawSyscall,
         resume: OwnedSyscallResume,
+        source: super::zone::OwnerZoneSource,
     },
     ResumeRetainedOwner {
         action: Box<RetainedMemoryAction>,
@@ -3344,6 +3348,29 @@ where
             );
         }
         if let DispatchOutcome::OwnerPhysicalWait { wait, committed } = outcome {
+            // Directory copyout has consumed nothing. Its physical dependency
+            // belongs to the existing killable owner-zone continuation, never
+            // main's readiness-first ResumeOwnerPhysical phase (#739).
+            if matches!(
+                resume,
+                Some(OwnedSyscallResume::Io(OwnedIoResume::DirectoryRead(_)))
+            ) {
+                if committed != 0 {
+                    return Err(RuntimeError::Configuration(
+                        "directory physical wait consumed an output prefix".to_owned(),
+                    )
+                    .into());
+                }
+                return self.park_directory_physical_owner(
+                    engine,
+                    control,
+                    frame,
+                    wait,
+                    resume.ok_or_else(|| {
+                        RuntimeError::Configuration("directory resume lost".to_owned())
+                    })?,
+                );
+            }
             self.state.owner_read_progress = self
                 .state
                 .owner_read_progress
@@ -4459,8 +4486,12 @@ where
             let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
             match phase {
                 HvpatchProductionPhase::ResumeZone => return self.resume_zone(engine, control),
-                HvpatchProductionPhase::ResumeOwnerZone { frame, resume } => {
-                    return self.resume_owner_zone(engine, control, frame, resume);
+                HvpatchProductionPhase::ResumeOwnerZone {
+                    frame,
+                    resume,
+                    source,
+                } => {
+                    return self.resume_owner_zone(engine, control, frame, resume, source);
                 }
                 HvpatchProductionPhase::ResumeOwnerPhysical {
                     frame,
@@ -4721,7 +4752,8 @@ where
                 }
                 HvpatchProductionPhase::ResumeRetainedOwner { action } => {
                     self.phase = HvpatchProductionPhase::RetainedMemoryRetry { action };
-                    let result = self.consume_owner_zone(control)?;
+                    let result =
+                        self.consume_owner_zone(control, &super::zone::OwnerZoneSource::Portal)?;
                     if !matches!(result.completion, carrick_kernel::kernel::continuation::ContinuationCompletion::ResumeRetainedMemory) {
                         return Err(RuntimeError::Configuration("clear-child-tid resumed as a syscall".to_owned()).into());
                     }
@@ -6986,7 +7018,7 @@ mod tests {
             wait_outcome,
             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
         );
-        let Some(OwnedSyscallResume::PreparedWrite(pending)) = resume else {
+        let Some(OwnedSyscallResume::Io(OwnedIoResume::PreparedWrite(pending))) = resume else {
             panic!("owner route lost the exact transfer");
         };
         assert_eq!(pending.wait(), &MemoryReadWait::Owner(wait));
@@ -7001,16 +7033,27 @@ mod tests {
         use carrick_kernel::kernel::continuation::CarrierWaitService;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        #[derive(Debug, Default)]
-        struct CodeReader(AtomicBool);
+        #[derive(Default)]
+        struct CodeReader {
+            ready: AtomicBool,
+            wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+        }
+        impl std::fmt::Debug for CodeReader {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("CodeReader")
+                    .field("ready", &self.ready)
+                    .finish_non_exhaustive()
+            }
+        }
         impl PhysicalMemoryWait for CodeReader {
             fn is_ready(&self) -> bool {
-                self.0.load(Ordering::Acquire)
+                self.ready.load(Ordering::Acquire)
             }
             fn enroll(
                 &self,
-                _: Arc<dyn Fn() + Send + Sync>,
+                wake: Arc<dyn Fn() + Send + Sync>,
             ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+                *self.wake.lock() = Some(wake);
                 (Box::new(()), self.is_ready())
             }
         }
@@ -7023,215 +7066,284 @@ mod tests {
         let region = carrick_test_support::TestEl1Region::zeroed();
         let _restore = Restore(carrick_el1_abi::get_el1_region_host_ptr());
         carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
-        let lower = tempfile::tempdir().unwrap();
-        std::fs::create_dir(lower.path().join("stdlib")).unwrap();
-        std::fs::write(lower.path().join("stdlib/module.py"), b"").unwrap();
-        let mut dispatcher = SyscallDispatcher::new();
-        dispatcher.set_rootfs_layer(
-            carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap(),
-        );
-        let (_runtime, scheduler, kernel, root, process, generation) =
-            test_carrier_graph_with_dispatcher!(72_759, dispatcher);
-        root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
-        let sibling = root
-            .kernel()
-            .reserve_thread_clone(
-                &root,
-                carrick_kernel::kernel::ClonePlan::from_flags(
-                    carrick_abi::LinuxCloneFlags::THREAD
-                        | carrick_abi::LinuxCloneFlags::SIGHAND
-                        | carrick_abi::LinuxCloneFlags::VM
-                        | carrick_abi::LinuxCloneFlags::FILES,
+        carrick_kernel::el1_zone::with_test_zone(carrick_el1_abi::zone_tables().unwrap(), || {
+            let lower = tempfile::tempdir().unwrap();
+            std::fs::create_dir(lower.path().join("stdlib")).unwrap();
+            std::fs::write(lower.path().join("stdlib/module.py"), b"").unwrap();
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.set_rootfs_layer(
+                carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap(),
+            );
+            let (_runtime, scheduler, kernel, root, process, generation) =
+                test_carrier_graph_with_dispatcher!(72_759, dispatcher);
+            root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+            let sibling = root
+                .kernel()
+                .reserve_thread_clone(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::THREAD
+                            | carrick_abi::LinuxCloneFlags::SIGHAND
+                            | carrick_abi::LinuxCloneFlags::VM
+                            | carrick_abi::LinuxCloneFlags::FILES,
+                    )
+                    .unwrap(),
+                    None,
                 )
-                .unwrap(),
-                None,
-            )
-            .unwrap()
-            .prepare(ThreadId::synthetic_for_tests(72_760))
-            .unwrap()
-            .commit()
-            .unwrap()
-            .start_thread()
-            .unwrap()
-            .into_context();
-        assert!(sibling.exact_thread_is_live());
-        let tid = root.thread().registry_id();
-        let registry = Arc::new(ThreadRegistry::new(tid));
-        let futex = Arc::new(FutexTable::new());
-        let mut path = carrick_kernel::dispatch::LinearMemory::new(0x400000, b"/stdlib\0".to_vec());
-        let reporter = crate::compat::CompatReporter::default();
-        let open = SyscallRequest::new(
-            carrick_abi::syscall::nr::OPENAT.raw(),
-            crate::compat::SyscallArgs([
-                carrick_abi::LINUX_AT_FDCWD as u64,
-                0x400000,
-                carrick_abi::LINUX_O_DIRECTORY,
-                0,
-                0,
-                0,
-            ]),
-        );
-        let DispatchOutcome::Returned { value: fd } = kernel
-            .dispatcher
-            .dispatch_threaded(
-                &root,
-                open,
-                &mut path,
-                &reporter,
-                ThreadCtx::new(tid, &registry, &futex),
-            )
-            .unwrap()
-        else {
-            panic!("open directory")
-        };
-        let reader = Arc::new(CodeReader::default());
-        let mut engine = CrashCaptureTestEngine {
-            prepare_dependency: Some(carrick_guest_mem::OwnedMemoryWait(reader.clone())),
-            exec_support: true,
-            snapshot_cpu: Some(executor::tests::task_state(&root, 759).cpu),
-            ..Default::default()
-        };
-        let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) =
-            engine.snapshot_cpu.as_mut().unwrap()
-        else {
-            unreachable!()
-        };
-        Arc::make_mut(cpu).syscall_continuation =
-            Some(carrick_hal::threaded::Aarch64SyscallContinuationV1 {
-                sequence: 1,
-                state: 0,
-                trap_kind: 0,
-                response_action: 0,
-                flags: 0,
-                native_nr: 61,
-                args: [fd as u64, 0x410000, 4096, 0, 0, 0],
-                x8: 61,
-                resume_pc: 0x400004,
-                spsr: 0,
-                fp: 0,
-                lr: 0,
-                sp: 0x420000,
-                esr: 0,
-                return_value: 0,
-                resume_x16: 0,
-                resume_x17: 0,
-            });
-        let frame = carrick_hal::RawSyscall {
-            current_guest_sp: None,
-            number: carrick_abi::syscall::nr::GETDENTS64,
-            args: [fd as u64, GuestVa::new(0x410000).raw(), 4096, 0, 0, 0],
-            guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
-            native_number: carrick_abi::NativeNr(61),
-        };
-        let request = SyscallRequest::from_raw(frame);
-        let outcome = kernel
-            .dispatcher
-            .dispatch_threaded(
-                &root,
-                request,
-                &mut engine,
-                &reporter,
-                ThreadCtx::new(tid, &registry, &futex),
-            )
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            DispatchOutcome::DirectoryReadSuspended(_)
-        ));
-        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
-            registry,
-            futex,
-            Arc::new(NoopPlatformFutex),
-            Arc::new(|_| Arc::new(NoopPlatformFutex)),
-            kernel.process_fork_barrier.clone(),
-            kernel.crash_capture.clone(),
-            Some(root.thread().clone()),
-            Some(process.pid()),
-            root.thread().key().tid,
-            kernel.fatal_signal.current_generation(),
-            tid,
-            VcpuThreadRegistry::default(),
-            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
-            carrick_hal::InGuestFlag::for_guest_thread(),
-            1_000,
-        );
-        state.service_kernel_context = Some(root.retain_exact());
-        state.zone_mm = Some(root.shared().mm().id().raw());
-        state.syscall_completion = SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
-            PreparedSyscall {
-                request,
-                original_args: request.args,
-            },
-            root.retain_exact(),
-            None,
-        ));
-        let mut job =
-            suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
-        let registration = scheduler
-            .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
-            .unwrap();
-        let mut running = scheduler.take(&registration).unwrap();
-        assert_eq!(running.generation(), generation);
-        let binding_state = executor::tests::task_state(&root, 759);
-        let binding = executor::tests::hvpatch_test_binding(&root, &binding_state, 759);
-        let publish = |_, _| Ok(());
-        let mut submission = executor::ExecutorSubmissionContext {
-            registration: None,
-            scheduler: &scheduler,
-            publish_test_descendant: &publish,
-            current: None,
-            authority: executor::ExecutionLeaseAuthoritySlot::from(Some(running.take_lease())),
-            exec_replacement: None,
-        };
-        let need_resched = AtomicBool::new(false);
-        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
-        control.binding = Some(&binding);
-        let exit = job
-            .route_outcome(&mut engine, &mut control, frame, outcome)
-            .unwrap();
-        assert!(!reader.is_ready());
-        assert_eq!(engine.prepared_commits, 0);
-        // Queue SIGKILL while the physical reader is still retained.
-        let kill =
-            carrick_kernel::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGKILL)
+                .unwrap()
+                .prepare(ThreadId::synthetic_for_tests(72_760))
+                .unwrap()
+                .commit()
+                .unwrap()
+                .start_thread()
+                .unwrap()
+                .into_context();
+            assert!(sibling.exact_thread_is_live());
+            let tid = root.thread().registry_id();
+            let registry = Arc::new(ThreadRegistry::new(tid));
+            let futex = Arc::new(FutexTable::new());
+            let mut path =
+                carrick_kernel::dispatch::LinearMemory::new(0x400000, b"/stdlib\0".to_vec());
+            let reporter = crate::compat::CompatReporter::default();
+            let open = SyscallRequest::new(
+                carrick_abi::syscall::nr::OPENAT.raw(),
+                crate::compat::SyscallArgs([
+                    carrick_abi::LINUX_AT_FDCWD,
+                    0x400000,
+                    carrick_abi::LINUX_O_DIRECTORY,
+                    0,
+                    0,
+                    0,
+                ]),
+            );
+            let DispatchOutcome::Returned { value: fd } = kernel
+                .dispatcher
+                .dispatch_threaded(
+                    &root,
+                    open,
+                    &mut path,
+                    &reporter,
+                    ThreadCtx::new(tid, &registry, &futex),
+                )
+                .unwrap()
+            else {
+                panic!("open directory")
+            };
+            let reader = Arc::new(CodeReader::default());
+            let mut engine = CrashCaptureTestEngine {
+                prepare_dependency: Some(carrick_guest_mem::OwnedMemoryWait(reader.clone())),
+                exec_support: true,
+                snapshot_cpu: Some(executor::tests::task_state(&root, 759).cpu),
+                ..Default::default()
+            };
+            let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) =
+                engine.snapshot_cpu.as_mut().unwrap()
+            else {
+                unreachable!()
+            };
+            Arc::make_mut(cpu).syscall_continuation =
+                Some(carrick_hal::threaded::Aarch64SyscallContinuationV1 {
+                    sequence: 1,
+                    state: 0,
+                    trap_kind: 0,
+                    response_action: 0,
+                    flags: 0,
+                    native_nr: 61,
+                    args: [fd as u64, 0x410000, 4096, 0, 0, 0],
+                    x8: 61,
+                    resume_pc: 0x400004,
+                    spsr: 0,
+                    fp: 0,
+                    lr: 0,
+                    sp: 0x420000,
+                    esr: 0,
+                    return_value: 0,
+                    resume_x16: 0,
+                    resume_x17: 0,
+                });
+            let frame = carrick_hal::RawSyscall {
+                current_guest_sp: None,
+                number: carrick_abi::syscall::nr::GETDENTS64,
+                args: [fd as u64, GuestVa::new(0x410000).raw(), 4096, 0, 0, 0],
+                guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                native_number: carrick_abi::NativeNr(61),
+            };
+            let request = SyscallRequest::from_raw(frame);
+            let outcome = kernel
+                .dispatcher
+                .dispatch_threaded(
+                    &root,
+                    request,
+                    &mut engine,
+                    &reporter,
+                    ThreadCtx::new(tid, &registry, &futex),
+                )
                 .unwrap();
-        root.signal_authority().enqueue_task_standard(kill, None);
-        root.task().wake();
-        let executor::ExecutorExit::BlockedContinuation { continuation, .. } = exit else {
-            // Main's physical path re-parks here before signal service.
+            assert!(matches!(
+                outcome,
+                DispatchOutcome::DirectoryReadSuspended(_)
+            ));
+            let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+                registry,
+                futex,
+                Arc::new(NoopPlatformFutex),
+                Arc::new(|_| Arc::new(NoopPlatformFutex)),
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(root.thread().clone()),
+                Some(process.pid()),
+                root.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                tid,
+                VcpuThreadRegistry::default(),
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+            state.service_kernel_context = Some(root.retain_exact());
+            state.zone_mm = Some(root.shared().mm().id().raw());
+            state.syscall_completion =
+                SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
+                    PreparedSyscall {
+                        request,
+                        original_args: request.args,
+                    },
+                    root.retain_exact(),
+                    None,
+                ));
+            let mut job =
+                suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+            let registration = scheduler
+                .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+                .unwrap();
+            let mut running = scheduler.take(&registration).unwrap();
+            assert_eq!(running.generation(), generation);
+            let binding_state = executor::tests::task_state(&root, 759);
+            let binding = executor::tests::hvpatch_test_binding(&root, &binding_state, 759);
+            let publish = |_, _| Ok(());
+            let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
+                scheduler: &scheduler,
+                publish_test_descendant: &publish,
+                current: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::from(Some(running.take_lease())),
+                exec_replacement: None,
+            };
+            let need_resched = AtomicBool::new(false);
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+            control.binding = Some(&binding);
+            let exit = job
+                .route_outcome(&mut engine, &mut control, frame, outcome)
+                .unwrap();
+            assert!(!reader.is_ready());
+            assert_eq!(engine.prepared_commits, 0);
+            let cursor = kernel
+                .dispatcher
+                .dispatch_threaded(
+                    &sibling,
+                    SyscallRequest::new(
+                        carrick_abi::syscall::nr::LSEEK.raw(),
+                        crate::compat::SyscallArgs([
+                            fd as u64,
+                            0,
+                            carrick_abi::LINUX_SEEK_CUR,
+                            0,
+                            0,
+                            0,
+                        ]),
+                    ),
+                    &mut path,
+                    &reporter,
+                    ThreadCtx::new(tid, &job.state.registry, &job.state.futex),
+                )
+                .unwrap();
+            assert_eq!(
+                cursor,
+                DispatchOutcome::Returned { value: 0 },
+                "suspension consumed the cursor"
+            );
+            let kill = || {
+                let kill = carrick_kernel::kernel::LinuxSignal::for_signal_number(
+                    carrick_abi::LINUX_SIGKILL,
+                )
+                .unwrap();
+                root.signal_authority().enqueue_task_standard(kill, None);
+                root.task().wake();
+            };
+            let executor::ExecutorExit::BlockedContinuation { continuation, .. } = exit else {
+                // Main's physical path re-parks here before signal service.
+                kill();
+                let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
+                assert!(
+                    matches!(exit, executor::ExecutorExit::Exited),
+                    "SIGKILL stayed blocked behind an unready physical reader"
+                );
+                return;
+            };
+            let service = CarrierWaitService::new(scheduler.clone());
+            let mut wait_registration = service.prepare_registration(&continuation);
+            service.enroll(&mut wait_registration).unwrap();
+            let lease = control.submission.take_execution_lease().unwrap();
+            running.restore_lease(lease).unwrap();
+            scheduler
+                .settle_blocked_continuation(running, *continuation, wait_registration)
+                .unwrap();
+            assert_eq!(
+                scheduler.queued_len(),
+                0,
+                "physical dependency must remain blocked"
+            );
+            // A partial reader release cannot complete physical readiness.
+            reader.wake.lock().as_ref().unwrap()();
+            assert_eq!(scheduler.queued_len(), 0);
+            kill();
+            let mut resumed = scheduler
+                .try_take(&registration)
+                .unwrap()
+                .expect("SIGKILL must make the task runnable");
+            control.submission.authority =
+                executor::ExecutionLeaseAuthoritySlot::from(Some(resumed.take_lease()));
+            let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
+            assert!(
+                matches!(exit, executor::ExecutorExit::Yielded),
+                "terminal drain handoff: {exit:?}"
+            );
+            assert!(job.phase.is_terminal_transition());
+            assert_eq!(
+                Arc::strong_count(&reader),
+                2,
+                "terminal handoff releases the retained operation and writer exclusion"
+            );
             let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
             assert!(
                 matches!(exit, executor::ExecutorExit::Exited),
-                "SIGKILL stayed blocked behind an unready physical reader"
+                "SIGKILL must terminate: {exit:?}"
             );
-            return;
-        };
-        let service = CarrierWaitService::new(scheduler.clone());
-        let mut wait_registration = service.prepare_registration(&continuation);
-        service.enroll(&mut wait_registration).unwrap();
-        let lease = control.submission.take_execution_lease().unwrap();
-        running.restore_lease(lease).unwrap();
-        scheduler
-            .settle_blocked_continuation(running, *continuation, wait_registration)
-            .unwrap();
-        let mut resumed = scheduler
-            .take(&registration)
-            .expect("SIGKILL must make the task runnable");
-        control.submission.authority =
-            executor::ExecutionLeaseAuthoritySlot::from(Some(resumed.take_lease()));
-        let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
-        assert!(
-            matches!(exit, executor::ExecutorExit::Exited),
-            "SIGKILL must enter terminal handling"
-        );
-        assert!(
-            !reader.is_ready(),
-            "termination must not require physical readiness"
-        );
-        assert_eq!(engine.prepared_commits, 0);
-        assert!(!engine.guest_memory.contains_key(&0x410000));
-        assert!(job.terminal_result.is_some());
-        scheduler.close();
+            assert!(
+                !reader.is_ready(),
+                "termination must not require physical readiness"
+            );
+            assert_eq!(engine.prepared_commits, 0);
+            assert!(!engine.guest_memory.contains_key(&0x410000));
+            let Some(Ok(VcpuLoopOutcome::ProcessExit(run))) = &job.terminal_result else {
+                panic!("SIGKILL did not publish process termination");
+            };
+            assert_eq!(run.terminating_signal, Some(carrick_abi::LINUX_SIGKILL));
+            assert!(!root.kernel().task_key_is_live(root.task().key()));
+            let lease = control.submission.take_execution_lease().unwrap();
+            resumed.restore_lease(lease).unwrap();
+            scheduler.settle_exited(resumed).unwrap();
+            reader.ready.store(true, Ordering::Release);
+            reader.wake.lock().as_ref().unwrap()();
+            assert_eq!(
+                scheduler.queued_len(),
+                0,
+                "late physical notification resurrected a dead task"
+            );
+            scheduler.unregister_executor(&registration).unwrap();
+            scheduler.close();
+        });
     }
 
     #[test]

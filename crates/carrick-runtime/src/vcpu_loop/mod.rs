@@ -1831,7 +1831,7 @@ where
                 kernel.dispatcher.resume_owned_directory_read(
                     &context,
                     request,
-                    pending,
+                    *pending,
                     engine,
                     &kernel.reporter,
                     Some(thread),

@@ -1902,13 +1902,32 @@ only the complete records already delivered. Internal preparation failures are
 runtime errors; only `OutOfBounds` becomes EFAULT. EOF does not access the
 buffer. No owner permit or editor guard is stored in `OwnedDirectoryRead`.
 
-`PreparedCopyoutWait` from #739 is **not on this branch**. The implementation
-extends main's retained I/O route (`WriteCopyInSuspended`) with
-`DirectoryReadSuspended`; it does not implement a second memory-preparation or
-parking service. The only wait-policy extension is in
-`vcpu_loop/zone.rs::park_owner_memory_action`: directory I/O selects the same
-killable owner-zone continuation as retained write copy-in. Existing waits
-keep their policy. Physical dependencies use main's `ResumeOwnerPhysical`.
+`PreparedCopyoutWait` from #739 is **not on this branch**. Directory I/O
+selects the existing killable owner-zone continuation and `resume_owner_zone`.
+The review-round repair adds only a physical readiness source for that same
+continuation. It retains the genuine dependency and subscription, publishes a
+private zone record, enrolls before probing readiness, and claims that exact
+record on release. SIGKILL cancellation uses the existing zone continuation;
+there is no new signal query or physical-wait cancellation policy. Its resume
+drops physical custody before retrying preparation, or drops the entire saved
+directory operation on fatal interruption. Generic `ResumeOwnerPhysical` and
+its other consumers retain their existing behavior for #739.
+
+Before any successful copy, refusal outcomes are:
+
+| Preparation refusal | Directory outcome |
+| --- | --- |
+| `OwnerWait` | Retain selection; authenticate/enroll the owner receipt in the killable zone path. |
+| `Supply(Metadata)` | Retain selection; use its observed owner receipt in the same zone path. |
+| `Supply(Grant)` / `Supply(Cow)` | Supply through the existing owner service, then resume the retained selection; any owner refusal uses the zone path and any physical dependency uses the directory zone source. |
+| `Physical` | Retain the genuine dependency; enroll readiness on a zone record with the existing killable continuation. Never enter `ResumeOwnerPhysical`. |
+| `Fault(OutOfBounds)` | EFAULT; cursor unchanged. |
+| Other `Fault` / `Limit` | Internal preparation error; cursor unchanged. |
+
+After committed progress, a transient refusal or real address fault returns
+only the complete records already copied. Internal faults and limit failures
+remain internal errors. No pending operation or physical source exists for a
+short result, and the next call starts at the first uncommitted record.
 
 Review re-ran the cursor witness against the unchanged `a2e34d5da` directory
 implementation: retry returned zero, exit 101. At `46b157b91`, the separate
@@ -1921,11 +1940,24 @@ commit after resume, true EFAULT versus internal failure, and cancellation.
 The batch witness covers mixed 1/14/255-byte names at 10/100/400/4096 records,
 unaligned output, existing PREPARE admission and page-proportional batch work.
 
-Full owner-wait acceptance remains open: two live guest threads with a sibling
-holding the editor, production handled-signal delivery after completion,
-SIGKILL/group exit, and the rule-2 holder audit/model. In particular, main's
-physical-wait branch re-parks an unready dependency before ordinary signal
-service; its SIGKILL cancellation has not been demonstrated here. This change
-must not be reported as closing #711/#739 or that physical-wait gap. The signed
-probe now compares fresh mmap, 2 MiB malloc and initialized 1 KiB destinations;
-the source-bound native ARM64 bless and Python import demo remain Mac gates.
+The review-round VM-free witness
+`serial_host_directory_physical_dependency_sigkill_uses_owner_zone_resume`
+first failed against unchanged `411190d55`: after SIGKILL, production poll
+returned blocked while the physical dependency stayed unready (exit 101).
+It now runs production directory dispatch, zone continuation enrollment,
+scheduler settlement, owner resume, signal delivery and terminal publication.
+The physical dependency is a test-engine stand-in for the retained code
+reader; it stays unready throughout. The witness requires zero output commits,
+an unchanged cursor, released retained custody, and process death by signal 9.
+This is a runtime witness without a VM, not live HVF code-reader evidence.
+
+The retained-selection component also failed before releasing the saved wait:
+PREPARE still observed two physical references instead of the single external
+observer (exit 101). Resume now drops that dependency before acquiring a new
+permit. The same witness verifies completion after the physical source is ready.
+
+Full owner-wait acceptance remains open: live HVF sibling-editor contention,
+handled-signal deferral, SIGKILL/group exit, and the rule-2 holder audit/model.
+Generic physical wait killability still belongs to #739. The director reports
+Python and both signed probes matching native ARM64 Docker at `411190d55`;
+the review-round runtime repair still needs signed verification on the Mac.

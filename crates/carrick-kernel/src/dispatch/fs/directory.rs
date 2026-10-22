@@ -79,7 +79,7 @@ impl SyscallDispatcher {
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
-        pending: Box<OwnedDirectoryRead>,
+        pending: OwnedDirectoryRead,
         memory: &mut M,
         reporter: &CompatReporter,
         thread: Option<ThreadCtx<'_>>,
@@ -90,6 +90,17 @@ impl SyscallDispatcher {
         {
             return Err(DispatchError::Errno(carrick_abi::LINUX_EIO));
         }
+        let OwnedDirectoryRead {
+            target,
+            _lease: lease,
+            address,
+            length,
+            wait,
+            ..
+        } = pending;
+        // A ready physical dependency still owns writer exclusion. Release
+        // that custody before PREPARE acquires a fresh destination permit.
+        drop(wait);
         let mut cx = SyscallCtx {
             host_wait: route.host_wait,
             kernel,
@@ -101,13 +112,8 @@ impl SyscallDispatcher {
             mm_executor: route.mm_executor,
         };
         resources::with_captured_resources(kernel, || {
-            self.fs_view().read_directory(
-                &mut cx,
-                pending.target,
-                pending._lease,
-                pending.address,
-                pending.length,
-            )
+            self.fs_view()
+                .read_directory(&mut cx, target, lease, address, length)
         })
     }
 }
@@ -250,6 +256,9 @@ impl<'a> FsView<'a> {
                 use carrick_guest_mem::{MemoryPrepareError, MemoryReadWait, MemorySupplyRequest};
                 let wait = match error {
                     MemoryPrepareError::OwnerWait(wait) => MemoryReadWait::Owner(wait),
+                    // Keep the real physical producer. The runtime binds a
+                    // directory suspension to its killable owner-zone resume;
+                    // relabeling this as an owner receipt would lose releases.
                     MemoryPrepareError::Physical(wait) => MemoryReadWait::Physical(wait),
                     MemoryPrepareError::Supply(MemorySupplyRequest::Metadata {
                         observed, ..
