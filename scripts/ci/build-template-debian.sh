@@ -81,6 +81,7 @@ cp "$xtask" seed/carrick-xtask
 cp "$inputs/rust-toolchain.toml" "$inputs/Cargo.lock" seed/
 cp "$inputs/scripts/ci/runner-once.sh" seed/
 cp "$inputs/scripts/ci/admit-job.sh" seed/
+cp "$inputs/scripts/ci/inputs/codex-sdk-requirements.txt" seed/
 printf '%s\n' "$profile" > seed/profile
 cat > seed/meta-data <<DATA
 instance-id: carrick-template-${template}
@@ -116,7 +117,7 @@ disable_root: true
 ssh_deletekeys: true
 ssh_genkeytypes: [ed25519, rsa]
 package_update: true
-packages: [sudo, build-essential, clang, git, gh, curl, jq, just, util-linux, procps, qemu-guest-agent, openssh-server, nftables, libicu76, libssl3t64, libkrb5-3, zlib1g]
+packages: [sudo, build-essential, clang, git, gh, curl, jq, just, python3-venv, util-linux, procps, qemu-guest-agent, openssh-server, nftables, libicu76, libssl3t64, libkrb5-3, zlib1g]
 runcmd:
   - [bash, -c, 'mkdir -p /mnt/carrick-seed; mount -o ro /dev/disk/by-label/cidata /mnt/carrick-seed; bash /mnt/carrick-seed/provision.sh']
 DATA
@@ -130,6 +131,14 @@ if [[ $(cat profile) == agent ]]; then
   printf '%s\n' 'runner ALL=(carrick-dispatch-agent) NOPASSWD: ALL' > /etc/sudoers.d/carrick-dispatch-agent
   chmod 0440 /etc/sudoers.d/carrick-dispatch-agent
   /usr/sbin/visudo -c
+  # The codex dispatch tier's pinned SDK, built once from hash-locked wheels.
+  # Root-owned and read-only for the agent; the driver points the launcher
+  # at it so no job installs packages at run time (#773).
+  python3 -m venv /opt/carrick-agent/codex-sdk
+  /opt/carrick-agent/codex-sdk/bin/pip install --quiet --disable-pip-version-check \
+    --no-deps --only-binary=:all: --require-hashes -r codex-sdk-requirements.txt
+  sed -n 's/^openai-codex==\([^ ]*\) .*/\1/p' codex-sdk-requirements.txt > /opt/carrick-agent/codex-sdk/.agy-director-sdk
+  chmod -R a+rX,go-w /opt/carrick-agent
 fi
 install -m 755 carrick-xtask /usr/local/bin/carrick-xtask
 install -m 755 runner-once.sh /usr/local/bin/carrick-ci-run-once

@@ -1130,6 +1130,44 @@ fn agent_template_profile_preserves_hardening_without_root_sudo() {
 }
 
 #[test]
+fn agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses() {
+    // The codex tier failed live because `python3 -m venv` was unavailable
+    // and every job would download the SDK from PyPI (#773).
+    let builder = include_str!("../../../scripts/ci/build-template-debian.sh");
+    let venv = carrick_xtask::dispatch_worker::CODEX_SDK_VENV;
+    assert!(builder.contains(&format!("python3 -m venv {venv}\n")));
+    assert!(builder.contains(&format!("{venv}/bin/pip install ")));
+    assert!(
+        builder.contains(
+            "--no-deps --only-binary=:all: --require-hashes -r codex-sdk-requirements.txt"
+        )
+    );
+    assert!(builder.contains(&format!("> {venv}/.agy-director-sdk")));
+    assert!(builder.contains("python3-venv"));
+    let requirements = include_str!("../../../scripts/ci/inputs/codex-sdk-requirements.txt");
+    assert!(
+        requirements
+            .lines()
+            .any(|line| line.starts_with("openai-codex=="))
+    );
+    for line in requirements.lines() {
+        let (pin, hash) = line.split_once(" --hash=sha256:").unwrap();
+        assert!(
+            pin.split_once("==")
+                .is_some_and(|(n, v)| !n.is_empty() && !v.is_empty()),
+            "{line}"
+        );
+        assert!(
+            hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{line}"
+        );
+    }
+    let driver = include_str!("../src/dispatch_worker.rs");
+    assert!(driver.contains(".env(\"AGY_DIRECTOR_CODEX_VENV\", CODEX_SDK_VENV)"));
+    assert!(driver.contains(".env(\"AGY_DIRECTOR_ROUTES\", \"default\")"));
+}
+
+#[test]
 fn template_installs_every_program_the_dispatch_driver_spawns() {
     // The runner-only witnesses use Git/GitHub stand-ins, so a program missing
     // from the template only failed live (#769: no `gh`, bootstrap refused).
