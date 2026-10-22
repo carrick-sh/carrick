@@ -1219,15 +1219,23 @@ impl Drop for PhysicalGrantProducer {
         self.0.callbacks.publish(0);
     }
 }
-/// Last producer release signals completion. Keep it beyond rollback and all
-/// inventory/alias guards; callbacks may reenter physical preparation.
+/// Last producer release signals completion. The token is deliberately
+/// non-`Send`: a shared MM ledger or owned continuation cannot retain the
+/// producer after its faulting holder returns. Keep it beyond rollback and
+/// all inventory/alias guards; callbacks may reenter physical preparation.
 #[derive(::core::fmt::Debug)]
-pub(crate) struct PhysicalGrantCompletion(std::sync::Arc<PhysicalGrantProducer>);
+pub(crate) struct PhysicalGrantCompletion(
+    std::sync::Arc<PhysicalGrantProducer>,
+    std::marker::PhantomData<std::rc::Rc<()>>,
+);
 impl PhysicalGrantCompletion {
     pub(crate) fn new() -> Self {
-        Self(std::sync::Arc::new(PhysicalGrantProducer(
-            std::sync::Arc::new(PhysicalGrantWait::default()),
-        )))
+        Self(
+            std::sync::Arc::new(PhysicalGrantProducer(std::sync::Arc::new(
+                PhysicalGrantWait::default(),
+            ))),
+            std::marker::PhantomData,
+        )
     }
 }
 impl PartialEq for PhysicalGrantCompletion {

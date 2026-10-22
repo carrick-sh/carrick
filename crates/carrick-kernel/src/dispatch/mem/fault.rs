@@ -1673,8 +1673,24 @@ impl<'a> MemView<'a> {
     /// Return the exact surviving physical residency publication.
     pub(crate) fn commit_published_frame_grant(
         &self,
-        plan: PublishedFrameGrantPlan<'_>,
+        plan: Result<PublishedFrameGrantPlan<'_>, String>,
     ) -> GrantResidencyPublication {
+        // An applied descriptor with uncommitted physical backing cannot
+        // release its readiness producer. The same terminal settlement owner
+        // handles this and a retired plan lacking the host exclusion.
+        let plan = plan.and_then(|plan| match &plan {
+            PublishedFrameGrantPlan::Retired(retired)
+                if !self.owns_host_alias_dispatch(&retired.exclusion) =>
+            {
+                Err(
+                    "caller lacks host alias dispatch exclusion during retired grant settlement"
+                        .to_owned(),
+                )
+            }
+            _ => Ok(plan),
+        });
+        let plan = plan
+            .unwrap_or_else(|reason| carrick_fatal!("dispatch::resident_frame_grant", "{reason}"));
         match plan {
             PublishedFrameGrantPlan::Resident(plan) => {
                 let resident = Some(GuestVa::new(plan.fault_page));
@@ -1685,12 +1701,6 @@ impl<'a> MemView<'a> {
                 }
             }
             PublishedFrameGrantPlan::Retired(plan) => {
-                if !self.owns_host_alias_dispatch(&plan.exclusion) {
-                    carrick_fatal!(
-                        "dispatch::resident_frame_grant",
-                        "caller lacks host alias dispatch exclusion during retired grant settlement"
-                    );
-                }
                 // The owed journal returns the retired pages. The stock
                 // list returns every remaining hole in this exact grant.
                 self.mem().lock().first_touch_stock.push(plan.span);

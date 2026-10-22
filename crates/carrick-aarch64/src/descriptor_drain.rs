@@ -508,7 +508,7 @@ impl<E: ThreadedEngine> carrick_hal::threaded::El1FrameGrantVenue for EngineGran
     fn prepare(
         &mut self,
         request: carrick_hal::El1FrameGrantRequest,
-    ) -> Result<Option<carrick_hal::El1FrameGrantReady>, TrapError> {
+    ) -> Result<Option<carrick_hal::threaded::PreparedEl1FrameGrant>, TrapError> {
         self.0.prepare_el1_frame_grant(request)
     }
 
@@ -539,21 +539,6 @@ impl<E: ThreadedEngine> carrick_hal::threaded::El1FrameGrantVenue for EngineGran
                 "host copyout grant publication is unsettled: {error}"
             ),
         }
-    }
-
-    fn settle_receipt(
-        &mut self,
-        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
-    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>
-    {
-        self.0
-            .settle_el1_descriptor_receipt(txn, receipt)
-            .map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "settle EL1 frame-grant descriptor receipt: {error:?}"
-                ))
-            })
     }
 
     fn complete(

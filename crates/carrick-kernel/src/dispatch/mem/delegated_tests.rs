@@ -4412,16 +4412,19 @@ impl carrick_hal::threaded::El1FrameGrantVenue for CopyoutVenue {
     fn prepare(
         &mut self,
         request: carrick_hal::El1FrameGrantRequest,
-    ) -> Result<Option<carrick_hal::El1FrameGrantReady>, carrick_hal::TrapError> {
+    ) -> Result<Option<carrick_hal::threaded::PreparedEl1FrameGrant>, carrick_hal::TrapError> {
         self.calls.push("prepare".to_owned());
         self.requests.push(request);
-        Ok(Some(carrick_hal::El1FrameGrantReady {
-            physical_ipa: 0x8000_0000 + self.requests.len() as u64 * 0x10_0000,
-            frame_id: self.requests.len() as u64,
-            mapping_id: self.requests.len() as u64,
-            owner_generation: 1,
-            inventory_revision: 1,
-        }))
+        Ok(Some(carrick_hal::threaded::PreparedEl1FrameGrant::new(
+            carrick_hal::El1FrameGrantReady {
+                physical_ipa: 0x8000_0000 + self.requests.len() as u64 * 0x10_0000,
+                frame_id: self.requests.len() as u64,
+                mapping_id: self.requests.len() as u64,
+                owner_generation: 1,
+                inventory_revision: 1,
+            },
+            (),
+        )))
     }
 
     fn publish(
@@ -4482,17 +4485,6 @@ impl carrick_hal::threaded::El1FrameGrantVenue for CopyoutVenue {
             .unwrap())
     }
 
-    fn settle_receipt(
-        &mut self,
-        _txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-        _receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
-    ) -> Result<
-        carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
-        carrick_hal::TrapError,
-    > {
-        unreachable!("no pending grant in these tests")
-    }
-
     fn complete(
         &mut self,
         _grant: carrick_hal::threaded::El1FrameGrantRollback,
@@ -4527,18 +4519,7 @@ fn copyout_grant(
         crate::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
     )
     .unwrap();
-    let calls = std::cell::RefCell::new(Vec::new());
-    let granted =
-        dispatcher.grant_for_host_copyout(&mut guard, address, len, venue, &mut |_, _| {
-            calls.borrow_mut().push("settle_pending");
-            Ok(())
-        });
-    assert_eq!(
-        calls.into_inner(),
-        vec!["settle_pending"],
-        "pending guest grants are settled once, before the plan"
-    );
-    granted
+    dispatcher.grant_for_host_copyout(&mut guard, address, len, venue)
 }
 
 /// Contract `kernel.el1.anonymous-reservations` (host copyout): a host
@@ -4581,7 +4562,7 @@ fn delegated_host_copyout_is_one_root_grant_per_run() {
 
     let mut venue = CopyoutVenue::default();
     assert_eq!(copyout_grant(&dispatcher, base, PAGE, &mut venue), Ok(true));
-    assert_eq!(venue.calls, ["prepare", "publish"]);
+    assert_eq!(venue.calls, ["prepare", "publish", "complete"]);
     assert_eq!(
         (venue.requests[0].semantic_base, venue.requests[0].len),
         (base, PAGE),
@@ -5114,7 +5095,7 @@ fn published_grant_settlement(retired_page: Option<u64>, precommit: bool) {
                 assert_eq!((resident.start(), resident.len()), (start, len));
             }
             let residency_before = dispatcher.mem().lock().resident.ranges();
-            let publication = dispatcher.mem_view().commit_published_frame_grant(plan);
+            let publication = dispatcher.mem_view().commit_published_frame_grant(Ok(plan));
             let table = Box::new(carrick_el1_abi::FrameGrantResidencyTable::new());
             publication.publish(&table, grant);
             assert_eq!(

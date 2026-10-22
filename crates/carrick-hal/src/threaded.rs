@@ -3062,6 +3062,42 @@ pub struct El1FrameGrantRollback {
     pub ready: El1FrameGrantReady,
 }
 
+/// A prepared grant's physical readiness producer belongs to the serving
+/// executor. Its private, non-`Send` completion stays in that executor's
+/// stack frame through descriptor and inventory settlement. It cannot enter
+/// the MM's shared publication ledger or an owned executor continuation.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<carrick_hal::threaded::PreparedEl1FrameGrant>();
+/// ```
+#[must_use = "retain the physical grant until publication settles"]
+pub struct PreparedEl1FrameGrant {
+    ready: El1FrameGrantReady,
+    completion: Option<Box<dyn std::any::Any>>,
+}
+
+impl PreparedEl1FrameGrant {
+    pub fn new(ready: El1FrameGrantReady, completion: impl std::any::Any) -> Self {
+        Self {
+            ready,
+            completion: Some(Box::new(completion)),
+        }
+    }
+
+    pub fn ready(&self) -> El1FrameGrantReady {
+        self.ready
+    }
+}
+
+impl Drop for PreparedEl1FrameGrant {
+    fn drop(&mut self) {
+        // Release readiness only after the holder finishes every operation
+        // in the enclosing synchronous settlement scope.
+        drop(self.completion.take());
+    }
+}
+
 /// The engine side of serving one EL1 frame grant outside the EL1 mailbox
 /// (a host copyout into never-touched memory): the same prepare and publish
 /// an EL0 first touch's grant uses, plus applying the guest lane's
@@ -3070,7 +3106,7 @@ pub trait El1FrameGrantVenue {
     fn prepare(
         &mut self,
         request: El1FrameGrantRequest,
-    ) -> Result<Option<El1FrameGrantReady>, TrapError>;
+    ) -> Result<Option<PreparedEl1FrameGrant>, TrapError>;
     fn publish(
         &mut self,
         grant: El1FrameGrantPublication,
@@ -3082,14 +3118,6 @@ pub trait El1FrameGrantVenue {
     fn apply_guest_publication(
         &mut self,
         txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-    ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>;
-    /// Authenticate EL1's receipt for a transaction this engine returned
-    /// earlier (a pending EL0 first-touch grant the copyout must settle
-    /// before it plans).
-    fn settle_receipt(
-        &mut self,
-        txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
-        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
     ) -> Result<carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt, TrapError>;
     fn complete(&mut self, grant: El1FrameGrantRollback) -> Result<(), TrapError>;
     fn roll_back(&mut self, grant: El1FrameGrantRollback) -> Result<bool, TrapError>;
@@ -3398,7 +3426,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     fn prepare_el1_frame_grant(
         &mut self,
         _request: El1FrameGrantRequest,
-    ) -> Result<Option<El1FrameGrantReady>, TrapError> {
+    ) -> Result<Option<PreparedEl1FrameGrant>, TrapError> {
         Ok(None)
     }
 
