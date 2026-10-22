@@ -3,6 +3,29 @@
 use super::*;
 use std::path::Path;
 
+/// Encode the next repeatable portion without publishing a directory cursor.
+pub(super) fn directory_record_batch(
+    entries: &[RootFsDirEntry],
+    offset: usize,
+    _address: u64,
+    capacity: usize,
+) -> Result<(Vec<u8>, usize), DispatchError> {
+    let mut out = Vec::with_capacity(capacity.min(65536));
+    let mut next = offset;
+    while next < entries.len() {
+        let length = dirent64_record_len(&entries[next]);
+        if length > capacity {
+            return Err(DispatchError::Errno(LINUX_EINVAL));
+        }
+        if out.len() + length > capacity {
+            break;
+        }
+        append_dirent64_record(&entries[next], next + 1, &mut out);
+        next += 1;
+    }
+    Ok((out, next))
+}
+
 struct RenameAtRequest {
     olddirfd: u64,
     oldpath: u64,
@@ -580,18 +603,8 @@ impl<'a> FsView<'a> {
                 entries.insert(0, dot_entry(".", dir_path));
             }
 
-            let mut out = Vec::with_capacity(length.min(65536));
-            while *offset < entries.len() {
-                let rec_len = dirent64_record_len(&entries[*offset]);
-                if rec_len > length {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                if out.len() + rec_len > length {
-                    break;
-                }
-                append_dirent64_record(&entries[*offset], *offset + 1, &mut out);
-                *offset += 1;
-            }
+            let (out, next) = directory_record_batch(entries, *offset, address, length)?;
+            *offset = next;
 
             memory.write_bytes(address, &out)?;
 
