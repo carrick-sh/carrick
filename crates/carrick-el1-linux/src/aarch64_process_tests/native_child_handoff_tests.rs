@@ -880,7 +880,7 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             NativeResume::NoPending
         ));
         assert_eq!(page.claimed_count(), 0);
-        let retained = unsafe { &(*fixture.zone.record(child).ctx_mut()).native };
+        let retained = unsafe { &fixture.zone.record(child).ctx_mut().native };
         let expected = match witness {
             ServiceWitness::Retry => (42, 0x4000),
             _ => (73, 0x4004),
