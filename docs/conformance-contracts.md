@@ -217,6 +217,28 @@ host lookup errors intact rather than manufacturing a shared authority.
 
 ## Executor empty host queue
 
+`kernel.el1.deferred-handback-identity` also covers a pinned service record
+evacuated when its executor enters an inline host wait. Linux affinity limits
+execution to eligible CPUs; lending a CPU must leave runnable work claimable
+by its borrower. The vacating actor can return and enter another inline wait
+without taking service work. Requeueing an unplaceable service record behind
+that actor repeatedly captures the same incarnation and delays its readiness.
+The ARM affinity venue in #703 exposes this path when the fixture's pin starts
+succeeding instead of returning ENOSYS.
+
+`unplaceable_service_is_captured_once_across_repeated_step_aways` drives real
+slot evacuation and host settlement at 1, 8 and 32 turns. It requires one
+capture, one host publication and zero rows on the away slot when a second
+live CPU is excluded. The broad-mask control still places the service on that
+peer. `hold_is_captured_exactly_once_at_the_next_step_away` drives the same
+test-only hold and production step-away hooks as the signed witness, now over
+three consecutive inline waits; its RED was three identical captures.
+Only first-entry births retain the fallback queue because they have no host
+row to release. These assertions do not change the retired-delivery budget.
+The signed binding is
+`el1_sched_deferred_handback_capture_observes_guest_records`; signed execution
+and end-to-end runtime acceptance remain director-owned.
+
 `kernel.scheduler.runnable-progress` also covers pool admission and guest CPU affinity.
 Linux authority: `sched_setaffinity(2)` restricts a runnable thread to the
 allowed CPUs; `sched_getaffinity(2)` and `nproc` must describe CPUs that can

@@ -1098,7 +1098,8 @@ pub fn drain_to_host(slot: SlotId) {
 /// its guest CPU: its stopped vCPU may hold no thread another vCPU could run,
 /// so what is queued there goes elsewhere, and no placement chooses the slot
 /// until [`come_back_to_slot`] (`ZoneTables::step_away`). A service thread no
-/// live slot will take stays, for this executor when it returns.
+/// live slot will take returns to its host run queue, where an executor
+/// borrowing the lent CPU can claim it.
 pub fn step_away_from_slot(slot: SlotId, driver: u64) {
     let Some(zone) = zone() else {
         return;
@@ -1134,8 +1135,8 @@ pub fn come_back_to_slot(slot: SlotId, driver: u64) {
 /// Executor `driver` stopped driving `slot`: the mailbox lease the slot
 /// follows moved on and it drives `now` instead, or (`now` `None`) it parks
 /// with no guest CPU and drives nothing. If nobody took `slot` over, what is
-/// queued there leaves; a service thread no live slot will take waits on
-/// `now`, or goes back to its host continuation.
+/// queued there leaves; a first-entry thread no live slot will take waits on
+/// `now`, while a service thread goes back to its host run queue.
 pub fn leave_slot(slot: SlotId, driver: u64, now: Option<SlotId>) {
     if let Some(zone) = zone() {
         leave_slot_in(zone, slot, driver, now);
@@ -1164,7 +1165,7 @@ pub fn leave_slot_in(zone: &ZoneTables, slot: SlotId, driver: u64, now: Option<S
 }
 
 /// Deliver what vacating a slot placed, and place or hand back what it took:
-/// a service thread no live slot takes waits on `fallback`, if any. Preserve
+/// a first-entry thread no live slot takes waits on `fallback`, if any. Preserve
 /// the incarnation captured at evacuation: another host claimant can retire
 /// and reuse the record before this deferred publication runs.
 fn settle_vacated(
@@ -1184,7 +1185,8 @@ fn settle_vacated(
         let Some(rec) = zone.live(record) else {
             continue;
         };
-        if rec.handback() == Some(Handback::Service) || rec.is_unadopted_birth() {
+        let first_entry = rec.is_unadopted_birth();
+        if rec.handback() == Some(Handback::Service) || first_entry {
             // A Born thread has reserved first-entry capacity, but no host
             // continuation yet. Even a Resumed handback must reach an
             // executor for activation rather than publish a continuation wake.
@@ -1194,13 +1196,20 @@ fn settle_vacated(
             if deliver_placement(zone.place_from_host(record.id)) {
                 continue;
             }
-            if deliver_placement(fallback.and_then(|fallback| zone.requeue_on(fallback, record.id)))
+            if first_entry
+                && deliver_placement(
+                    fallback.and_then(|fallback| zone.requeue_on(fallback, record.id)),
+                )
             {
                 continue;
             }
             // No slot runs an executor that could take it (every one is
             // stopped in a host call, say): its thread's held row goes to a
             // host run queue (`Scheduler::publish_zone_handback`).
+            // Requeueing service work on the away slot would hold it behind
+            // that slot's inline actor, which can step away again before
+            // ever taking service work. First-entry births have no host row
+            // to release and retain their separate activation fallback.
             publish(record);
         } else {
             publish(record);
