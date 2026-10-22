@@ -346,12 +346,8 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             carrick_kernel::dispatch::mm_quiesce::PtPauseBudget::DEFAULT,
         )
         .map_err(|error| std::io::Error::other(format!("host copyout grant quiesce: {error:?}")))?;
-        let end = address.saturating_add(len);
         dispatcher
-            .grant_for_host_copyout(&mut guard, address, len, venue, &mut |mutation, venue| {
-                super::signal::settle_guest_grants_over(dispatcher, venue, mutation, address, end)
-                    .map_err(|error| error.to_string())
-            })
+            .grant_for_host_copyout(&mut guard, address, len, venue)
             .map_err(|error| Box::new(std::io::Error::other(error)) as _)
     }
 

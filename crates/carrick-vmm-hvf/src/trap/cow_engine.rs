@@ -310,7 +310,6 @@ fn is_exactly_el1_frame_grant(
 /// replacement with it.
 #[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub(crate) struct PendingEl1GrantPublication {
-    pub(crate) completion: global_frame::PhysicalGrantCompletion,
     /// The exact grant, as settlement names it to completion or rollback.
     pub(crate) grant: carrick_hal::threaded::El1FrameGrantRollback,
     /// The predecessor's physical leases, planned at preparation. Completion
@@ -1397,7 +1396,7 @@ impl HvfVmState {
     pub(crate) fn prepare_el1_frame_grant(
         &mut self,
         request: carrick_hal::El1FrameGrantRequest,
-    ) -> Result<Option<carrick_hal::El1FrameGrantReady>, TrapError> {
+    ) -> Result<Option<carrick_hal::threaded::PreparedEl1FrameGrant>, TrapError> {
         let decline = |reason: &'static str| {
             carrick_observability::probes::guest_internal_write_fault(
                 request.semantic_base,
@@ -1592,11 +1591,10 @@ impl HvfVmState {
         if predecessor_leases.is_none() {
             register_shared_alias(published.alias);
         }
-        // Both descriptor lanes retain the sole readiness producer until the
-        // caller has stored and settled the leaf. The host lane used to drop
-        // it here, before `publish_el1_frame_grant` stored its descriptor.
+        // Only replacement accounting enters the shared ledger. The physical
+        // readiness producer returns to the holder's stack and cannot outlive
+        // its synchronous descriptor and inventory settlement.
         let pending = PendingEl1GrantPublication {
-            completion: published.completion,
             grant: carrick_hal::threaded::El1FrameGrantRollback {
                 mm_key: request.mm_key,
                 semantic_base: request.semantic_base,
@@ -1648,7 +1646,10 @@ impl HvfVmState {
             );
             },
         );
-        Ok(Some(published.ready))
+        Ok(Some(carrick_hal::threaded::PreparedEl1FrameGrant::new(
+            published.ready,
+            published.completion,
+        )))
     }
 
     /// The single inverse of [`Self::prepare_el1_frame_grant`] for a grant

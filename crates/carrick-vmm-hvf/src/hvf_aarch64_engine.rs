@@ -2669,7 +2669,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     fn prepare_el1_frame_grant(
         &mut self,
         request: carrick_hal::El1FrameGrantRequest,
-    ) -> Result<Option<carrick_hal::El1FrameGrantReady>, TrapError> {
+    ) -> Result<Option<carrick_hal::threaded::PreparedEl1FrameGrant>, TrapError> {
         self.state.prepare_el1_frame_grant(request)
     }
 

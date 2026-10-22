@@ -244,7 +244,9 @@ impl SyscallDispatcher {
         plan: impl Into<PublishedFrameGrantPlan<'permit>>,
         residency: carrick_el1_abi::FrameGrantResidencyIdentity,
     ) {
-        let publication = self.mem_view().commit_published_frame_grant(plan.into());
+        let publication = self
+            .mem_view()
+            .commit_published_frame_grant(Ok(plan.into()));
         if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
             publication.publish(table, residency);
         }
@@ -262,27 +264,17 @@ impl SyscallDispatcher {
     /// drawn in), so the grants back exactly the run: never a page outside
     /// it, never a resident page, and at most two pieces per size class.
     ///
-    /// `settle_pending` runs under the same mutation authority before the
-    /// plan: an EL0 first touch's guest-lane grant that is published but
-    /// not yet committed still reads as fresh root memory, so it must be
-    /// settled (or withdrawn and rolled back) first, or the copyout would
-    /// grant a second frame for the same page.
     pub fn grant_for_host_copyout(
         &self,
         authority: &mut FrameCowExactMmGuard,
         address: u64,
         len: u64,
         venue: &mut dyn carrick_hal::threaded::El1FrameGrantVenue,
-        settle_pending: &mut dyn FnMut(
-            &super::super::mm_mutation::MmMutationGuard<'_>,
-            &mut dyn carrick_hal::threaded::El1FrameGrantVenue,
-        ) -> Result<(), String>,
     ) -> Result<bool, String> {
         let mutation = super::super::mm_mutation::from_frame_cow(authority);
         if self.mem_view().mm_authority().mm_id != mutation.mm_id() {
             return Err("host copyout grant authority names another MM".to_owned());
         }
-        settle_pending(&mutation, venue)?;
         let page_size = self.linux_page_size();
         let mm_key = mutation.mm_id().raw();
         let permit = mutation.host_alias_permit();
@@ -303,6 +295,14 @@ impl SyscallDispatcher {
             }
         }
         Ok(granted)
+    }
+
+    /// Route an unsettled physical grant to the one residency settlement
+    /// owner. It fails stopped before the caller's readiness token drops.
+    fn unsettled_copyout_grant(&self, reason: String) -> String {
+        self.mem_view()
+            .commit_published_frame_grant(Err(reason.clone()));
+        reason
     }
 
     /// One aligned piece of a copyout run: plan it from the root within
@@ -335,7 +335,7 @@ impl SyscallDispatcher {
         let plan_end = plan.start().saturating_add(plan.len());
         let _prepared = self.adopt_frame_grant_provenance(&plan);
         let request = Self::el1_frame_grant_request(&plan, mm_key, cursor, 2);
-        let Some(ready) = venue
+        let Some(prepared) = venue
             .prepare(request)
             .map_err(|error| format!("prepare host copyout grant: {error}"))?
         else {
@@ -347,6 +347,7 @@ impl SyscallDispatcher {
             );
             return Ok(None);
         };
+        let ready = prepared.ready();
         let rollback = El1FrameGrantRollback {
             mm_key,
             semantic_base: request.semantic_base,
@@ -362,9 +363,19 @@ impl SyscallDispatcher {
                 permissions: request.permissions,
                 ready,
             })
-            .map_err(|error| format!("publish host copyout grant: {error}"))?;
+            .map_err(|error| {
+                self.unsettled_copyout_grant(format!(
+                    "prepared physical grant cannot publish descriptor: {error}"
+                ))
+            })?;
         match published {
-            El1FrameGrantPublished::OnHost => {}
+            El1FrameGrantPublished::OnHost => {
+                venue.complete(rollback).map_err(|error| {
+                    self.unsettled_copyout_grant(format!(
+                        "host descriptor cannot complete physical grant: {error}"
+                    ))
+                })?;
+            }
             El1FrameGrantPublished::Submit(txn) => {
                 // EL1 refused or rolled back cleanly: nothing names the
                 // prepared backing, so it is undone and no grant applies.
@@ -375,14 +386,18 @@ impl SyscallDispatcher {
                         19,
                         &format!("host copyout guest publication: {error}"),
                     );
-                    venue
-                        .roll_back(rollback)
-                        .map_err(|undo| format!("roll back host copyout grant: {undo}"))?;
+                    venue.roll_back(rollback).map_err(|undo| {
+                        self.unsettled_copyout_grant(format!(
+                            "refused guest descriptor cannot roll back backing: {undo}"
+                        ))
+                    })?;
                     return Ok(None);
                 }
-                venue
-                    .complete(rollback)
-                    .map_err(|error| format!("complete host copyout grant: {error}"))?;
+                venue.complete(rollback).map_err(|error| {
+                    self.unsettled_copyout_grant(format!(
+                        "applied descriptor cannot complete physical grant: {error}"
+                    ))
+                })?;
             }
             outcome
             @ (El1FrameGrantPublished::Unsupported | El1FrameGrantPublished::Refused(_)) => {
@@ -392,9 +407,11 @@ impl SyscallDispatcher {
                     20,
                     &format!("host copyout publication: {outcome:?}"),
                 );
-                venue
-                    .roll_back(rollback)
-                    .map_err(|error| format!("roll back host copyout grant: {error}"))?;
+                venue.roll_back(rollback).map_err(|error| {
+                    self.unsettled_copyout_grant(format!(
+                        "refused publication cannot roll back backing: {error}"
+                    ))
+                })?;
                 return Ok(None);
             }
         }

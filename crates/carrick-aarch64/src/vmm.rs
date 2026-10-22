@@ -1014,7 +1014,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     fn prepare_el1_frame_grant(
         &mut self,
         _request: carrick_hal::El1FrameGrantRequest,
-    ) -> Result<Option<carrick_hal::El1FrameGrantReady>, TrapError> {
+    ) -> Result<Option<carrick_hal::threaded::PreparedEl1FrameGrant>, TrapError> {
         Ok(None)
     }
 

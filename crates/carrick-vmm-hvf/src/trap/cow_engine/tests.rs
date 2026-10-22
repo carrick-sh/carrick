@@ -704,7 +704,6 @@ fn replacement(base: u64, generation: u64) -> super::PendingEl1GrantPublication 
         inventory_revision: 8,
     };
     PendingEl1GrantPublication {
-        completion: global_frame::PhysicalGrantCompletion::new(),
         grant: carrick_hal::threaded::El1FrameGrantRollback {
             mm_key: 41,
             semantic_base: base,
@@ -741,6 +740,10 @@ fn replacement(base: u64, generation: u64) -> super::PendingEl1GrantPublication 
 #[test]
 fn pending_el1_grant_publications_match_only_the_exact_grant() {
     use super::*;
+    fn require_send<T: Send>() {}
+    // The physical completion is !Send, so adding it to this MM-shared
+    // ledger would fail this bound at compile time.
+    require_send::<PendingEl1GrantPublications>();
     let mut ledger = PendingEl1GrantPublications::default();
     let first = replacement(0x10_0000, 3);
     let first_grant = first.grant;
