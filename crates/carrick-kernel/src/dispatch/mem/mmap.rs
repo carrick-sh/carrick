@@ -1402,14 +1402,41 @@ impl<'a> MemView<'a> {
             // failed mmap still leaves a MAP_FIXED target's prior mapping
             // intact (Linux's failure atomicity; the eager path gets this for
             // free by building its buffer before touching backing).
-            let lowering_candidate = file_lowering_eligible && !address_uses_alias;
+            // An admitted root already retains the file source and supplies
+            // private frames on first touch. Do not initialize its replacement
+            // through UserWrite: that checks the predecessor/placeholder's
+            // permissions and accepts at most one bounded stream chunk. Nor
+            // does a Linux file offset need host-page congruence in this venue.
+            let owner_file_len = if !address_uses_alias
+                && map_sharing == MmapSharing::Private
+                && !map_flags.intersects(
+                    LinuxMmapFlags::ANONYMOUS | LinuxMmapFlags::GROWSDOWN
+                        | LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED,
+                )
+                && this.mem().lock().delegated_root().is_some()
+            {
+                this.open_file(fd.0).and_then(|open_file| {
+                    let description = crate::kernel::FileDescription::inspect(&open_file.description);
+                    match description.as_deref() {
+                        Some(OpenDescription::HostFile { host_fd, metadata, .. })
+                            if metadata.kind == carrick_vfs::rootfs::RootFsEntryKind::File =>
+                                host_fd_file_len(host_fd.raw()),
+                        _ => None,
+                    }
+                })
+            } else {
+                None
+            };
+            let owner_file_backed = owner_file_len.is_some();
+            let lowering_candidate = file_lowering_eligible && !address_uses_alias
+                && !owner_file_backed;
             // A lowering candidate defers this scrub: `zero_anonymous_reuse`
             // materializes anonymous backing under the range, which would turn
             // the sparse hole the page-cache view needs into live pages and
             // force the eager snapshot. The lowering block below scrubs on its
             // fallback path instead, before the `pread` lands.
             let reuse_scrub_needed = (reused || fixed_anonymous) && !address_uses_alias;
-            if reuse_scrub_needed && !lowering_candidate {
+            if reuse_scrub_needed && !lowering_candidate && !owner_file_backed {
                 // Scrub the reused region's PHYSICAL backing. MUST bypass the
                 // guest-visible permission: a region just reclaimed from munmap
                 // is stage-1-invalidated (no-access) and a PROT_NONE mmap is not
@@ -1664,7 +1691,9 @@ impl<'a> MemView<'a> {
                 return Ok(DispatchOutcome::returned_u64(address)?);
             }
 
-            let mut bus_fault_offset = None;
+            let mut bus_fault_offset = owner_file_len.and_then(|file_len| {
+                shared_file_bus_offset(file_len, offset, length, page_size)
+            });
             // A MAP_SHARED mapping of a memfd sealed F_SEAL_WRITE is created
             // read-only here (a writable one already returned EPERM above); record
             // it so a later mprotect(PROT_WRITE) is rejected.
@@ -1674,7 +1703,7 @@ impl<'a> MemView<'a> {
             // EBUSY while it is mapped.
             let mut writable_memfd_desc: Option<Arc<crate::kernel::FileDescription>> = None;
             let mut packet_socket_desc: Option<Arc<super::net::packet::PacketSocket>> = None;
-            let bytes = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) || lowering_candidate {
+            let bytes = if map_flags.contains(LinuxMmapFlags::ANONYMOUS) || lowering_candidate || owner_file_backed {
                 Vec::new()
             } else {
                 let mut bytes = vec![0; length_usize];
@@ -2172,6 +2201,35 @@ impl<'a> MemView<'a> {
                     bytes = fallback;
                 }
             }
+            // Secure source custody before retiring physical backing. The
+            // common metadata commit below transfers this lease into the root.
+            let owner_source_lease = if owner_file_backed {
+                let Some(source) = PrivateFileMapEntry::for_mapping(
+                    &private_file_description, address, length, offset,
+                ) else {
+                    return Ok(request.refused(
+                        MmapRefusal::Internal("private file source was not retained"), LINUX_ENOMEM,
+                    ));
+                };
+                let lease = this.mem().lock().host_backing_custody.retain_labeled_source(
+                    source.backing, proc_map_path.clone(),
+                );
+                let Some(lease) = lease else {
+                    return Ok(request.refused(
+                        MmapRefusal::Internal("private file source capacity exhausted"), LINUX_ENOMEM,
+                    ));
+                };
+                if let Err(error) = memory.unmap_range(address, length_usize) {
+                    return Ok(request.refused_by(
+                        MmapRefusal::Internal("private file predecessor retirement failed"),
+                        LINUX_ENOMEM, format_args!("at {address:#x}+{length:#x}: {error}"),
+                    ));
+                }
+                this.remove_mapping_metadata(address, length);
+                Some(lease)
+            } else {
+                None
+            };
             // Stamp file content through the unchecked path: this is carrick
             // loading the mapping, not a guest write. The dynamic loader often
             // reserves a whole DSO as PROT_NONE before MAP_FIXED segment loads;
@@ -2213,12 +2271,13 @@ impl<'a> MemView<'a> {
             // Make the requested protection guest-visible (also restores RW for
             // a reused range). prot==0 here means file-backed PROT_NONE.
             // Unconditional: reserve across the whole arena; fatal only in-arena.
-            let initial_prot = if deferred_file_backed_len.is_some() {
+            let initial_prot = if owner_file_backed || deferred_file_backed_len.is_some() {
                 0
             } else {
                 prot
             };
-            if let Err(error) = memory.protect_range(address, length_usize, initial_prot)
+            if !owner_file_backed
+                && let Err(error) = memory.protect_range(address, length_usize, initial_prot)
                 && (in_arena || memory.supports_concurrent_exec_protection())
             {
                 if deferred_file_backed_len.is_some() {
@@ -2240,24 +2299,26 @@ impl<'a> MemView<'a> {
                 && let Some(bus_len) = length.checked_sub(bus_offset)
                 && let Ok(bus_len_usize) = usize::try_from(bus_len)
             {
-                memory.set_no_access(bus_start, bus_len_usize, true);
-                if let Err(error) = memory
-                    .protect_range(bus_start, bus_len_usize, 0)
-                    .and_then(|()| memory.mark_bus_fault(bus_start, bus_len_usize))
-                    && memory.supports_concurrent_exec_protection()
-                {
-                    if deferred_file_backed_len.is_some() {
-                        let _ = this
-                            .mem()
-                            .lock()
-                            .deferred_anonymous
-                            .retire(GuestVa::new(address), length_usize);
+                if !owner_file_backed {
+                    memory.set_no_access(bus_start, bus_len_usize, true);
+                    if let Err(error) = memory
+                        .protect_range(bus_start, bus_len_usize, 0)
+                        .and_then(|()| memory.mark_bus_fault(bus_start, bus_len_usize))
+                        && memory.supports_concurrent_exec_protection()
+                    {
+                        if deferred_file_backed_len.is_some() {
+                            let _ = this
+                                .mem()
+                                .lock()
+                                .deferred_anonymous
+                                .retire(GuestVa::new(address), length_usize);
+                        }
+                        return Ok(request.refused_by(
+                            MmapRefusal::Internal("beyond-EOF SIGBUS protection could not be published"),
+                            LINUX_ENOMEM,
+                            format_args!("at {bus_start:#x}+{bus_len:#x}: {error}"),
+                        ));
                     }
-                    return Ok(request.refused_by(
-                        MmapRefusal::Internal("beyond-EOF SIGBUS protection could not be published"),
-                        LINUX_ENOMEM,
-                        format_args!("at {bus_start:#x}+{bus_len:#x}: {error}"),
-                    ));
                 }
                 this.record_mmap_bus_fault_range(bus_start, bus_len);
             }
@@ -2270,7 +2331,7 @@ impl<'a> MemView<'a> {
             // MAP_POPULATE prefaults anonymous pages — so mincore must report
             // those pages resident even before the guest touches them (LTP
             // mincore04 mlocks in a child, then the parent queries mincore).
-            if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+            if (!owner_file_backed && !map_flags.contains(LinuxMmapFlags::ANONYMOUS))
                 || map_flags.contains(LinuxMmapFlags::POPULATE)
             {
                 this.mark_range_resident(address, length);
@@ -2298,6 +2359,10 @@ impl<'a> MemView<'a> {
                 let mem_authority = this.mem();
                 let mut mem = mem_authority.lock();
                 trim_private_file_maps(&mut mem.private_file_maps, address, length);
+                if let Some(lease) = owner_source_lease {
+                    let identity = lease.identity(0);
+                    mem.host_backing_leases.insert((identity.handle(), identity.generation()), lease);
+                }
                 if let Some(source) = PrivateFileMapEntry::for_mapping(
                     &private_file_description,
                     address,
