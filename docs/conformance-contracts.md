@@ -221,16 +221,21 @@ host lookup errors intact rather than manufacturing a shared authority.
 evacuated when its executor enters an inline host wait. Linux affinity limits
 execution to eligible CPUs; lending a CPU must leave runnable work claimable
 by its borrower. The vacating actor can return and enter another inline wait
-without taking service work. Requeueing an unplaceable service record behind
-that actor repeatedly captures the same incarnation and delays its readiness.
+without taking service work. Requeueing a captured service record behind
+that actor or another eligible driver repeatedly captures the same incarnation
+and delays its readiness.
 The ARM affinity venue in #703 exposes this path when the fixture's pin starts
 succeeding instead of returning ENOSYS.
 
-`unplaceable_service_is_captured_once_across_repeated_step_aways` drives real
+`service_capture_publishes_once_across_repeated_step_aways` drives real
 slot evacuation and host settlement at 1, 8 and 32 turns. It requires one
-capture, one host publication and zero rows on the away slot when a second
-live CPU is excluded. The broad-mask control still places the service on that
-peer. `hold_is_captured_exactly_once_at_the_next_step_away` drives the same
+capture, one host publication and zero zone queue rows, with either a pinned
+or broad mask. `service_capture_does_not_bounce_between_eligible_drivers`
+alternates eight step-aways between two drivers, on the same or different
+eligible CPUs. It was RED with eight captures even after the away-slot
+fallback was removed; service handback must end zone custody. Initial service
+placement is unchanged.
+`hold_is_captured_exactly_once_at_the_next_step_away` drives the same
 test-only hold and production step-away hooks as the signed witness, now over
 three consecutive inline waits; its RED was three identical captures.
 Only first-entry births retain the fallback queue because they have no host

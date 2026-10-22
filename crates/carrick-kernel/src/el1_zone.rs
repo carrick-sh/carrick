@@ -1097,8 +1097,8 @@ pub fn drain_to_host(slot: SlotId) {
 /// Executor `driver` of `slot` entered a blocking inline host wait and lent
 /// its guest CPU: its stopped vCPU may hold no thread another vCPU could run,
 /// so what is queued there goes elsewhere, and no placement chooses the slot
-/// until [`come_back_to_slot`] (`ZoneTables::step_away`). A service thread no
-/// live slot will take returns to its host run queue, where an executor
+/// until [`come_back_to_slot`] (`ZoneTables::step_away`). Captured service
+/// work returns to its host run queue, where an executor
 /// borrowing the lent CPU can claim it.
 pub fn step_away_from_slot(slot: SlotId, driver: u64) {
     let Some(zone) = zone() else {
@@ -1185,35 +1185,24 @@ fn settle_vacated(
         let Some(rec) = zone.live(record) else {
             continue;
         };
-        let first_entry = rec.is_unadopted_birth();
-        if rec.handback() == Some(Handback::Service) || first_entry {
+        if rec.is_unadopted_birth() {
             // A Born thread has reserved first-entry capacity, but no host
             // continuation yet. Even a Resumed handback must reach an
             // executor for activation rather than publish a continuation wake.
-            // A service record stands for its thread's held host row, which
-            // only the scheduler sees: placing it from host ownership is
-            // invisible to any claimant.
             if deliver_placement(zone.place_from_host(record.id)) {
                 continue;
             }
-            if first_entry
-                && deliver_placement(
-                    fallback.and_then(|fallback| zone.requeue_on(fallback, record.id)),
-                )
+            if deliver_placement(fallback.and_then(|fallback| zone.requeue_on(fallback, record.id)))
             {
                 continue;
             }
-            // No slot runs an executor that could take it (every one is
-            // stopped in a host call, say): its thread's held row goes to a
-            // host run queue (`Scheduler::publish_zone_handback`).
-            // Requeueing service work on the away slot would hold it behind
-            // that slot's inline actor, which can step away again before
-            // ever taking service work. First-entry births have no host row
-            // to release and retain their separate activation fallback.
-            publish(record);
-        } else {
-            publish(record);
         }
+        // A captured service record stands for a held host row. Release it
+        // through Scheduler::publish_zone_handback instead of admitting this
+        // incarnation to another zone queue. Either the away driver or an
+        // eligible peer can enter another inline host wait before consuming
+        // service work; re-placement lets the same record circulate forever.
+        publish(record);
     }
 }
 
@@ -2063,11 +2052,11 @@ mod tests {
         assert_eq!(batches, [vec![reference]]);
     }
 
-    /// A pinned service row cannot wait behind a driver doing consecutive
-    /// inline host calls. Its first evacuation must transfer readiness to
-    /// the host queue when there is no other eligible executor slot.
+    /// A service row cannot wait behind drivers doing consecutive inline
+    /// host calls. Its first capture transfers readiness to the host queue,
+    /// even if another slot could accept it without consuming it yet.
     #[test]
-    fn unplaceable_service_is_captured_once_across_repeated_step_aways() {
+    fn service_capture_publishes_once_across_repeated_step_aways() {
         for steps in [1, 8, 32] {
             for affinity in [0b01, 0b11] {
                 let zone = heap_zone();
@@ -2115,13 +2104,8 @@ mod tests {
                 }
                 assert_eq!(captures, [reference], "steps={steps} affinity={affinity}");
                 assert_eq!(zone.slot(away).queued(), 0);
-                if affinity == 0b01 {
-                    assert_eq!(published, [reference]);
-                    assert_eq!(zone.take_service_head(other), None);
-                } else {
-                    assert!(published.is_empty());
-                    assert_eq!(zone.take_service_head(other), Some(reference));
-                }
+                assert_eq!(published, [reference]);
+                assert_eq!(zone.take_service_head(other), None);
                 zone.free_record(record);
             }
         }
@@ -2343,13 +2327,13 @@ mod tests {
 
         /// #695 signed 20x at 81de5b7c0: 4 runs resumed the held thread and
         /// it faulted on its own stack. The hold must not change what the
-        /// record says or where production places it: released at a
-        /// step-away, the captured record is placed by `settle_vacated`
+        /// record says or how production settles it: released at a
+        /// step-away, the captured record is handed back by `settle_vacated`
         /// exactly as an unheld record queued on that slot is, with its
         /// identity (thread, generation, mm, affinity) unchanged, and the
-        /// live slot's executor takes exactly that record.
+        /// host handback retains the exact runnable generation.
         #[test]
-        fn held_record_is_placed_like_a_production_record() {
+        fn held_record_is_handed_back_like_a_production_record() {
             let context = thread(3);
             let generation = crate::kernel::objects::ExecutionGeneration::from_raw(9);
             let expected = carrick_el1_abi::ThreadIdentity {
@@ -2402,14 +2386,16 @@ mod tests {
                 let record = record.unwrap();
                 assert_eq!(batches, [vec![record]]);
                 assert_eq!(zone.slot(away).queued(), 0);
-                assert_eq!(zone.slot(live).queued(), 1);
-                let rec = zone.live(record).expect("placed record is live");
+                assert_eq!(zone.slot(live).queued(), 0);
+                let rec = zone.live(record).expect("captured record is live");
                 assert_eq!(rec.identity(), expected);
                 assert_eq!(rec.handback(), Some(Handback::Service));
-                // The live slot's executor takes exactly this record; its
-                // identity names the thread's exact runnable generation.
-                assert_eq!(zone.take_service_head(live), Some(record));
-                assert_eq!(zone.live(record).map(|rec| rec.identity()), Some(expected));
+                // Settlement returns the same identity to host ownership
+                // with no remaining zone links, held or unheld. The host
+                // publisher can release this exact thread/generation row.
+                assert!(matches!(rec.claim(), Claim::Host { .. }));
+                assert_eq!(zone.take_service_head(live), None);
+                zone.free_record(record.id);
             };
             run(false);
             run(true);
