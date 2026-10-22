@@ -75,6 +75,16 @@ unnecessary_get_then_check = "allow"
 split-debuginfo = "unpacked"
 incremental = false
 
+# #764: authority-debt --source-only measured 162 s in dev vs 80 s with these overrides.
+[profile.dev.package.carrick-xtask]
+opt-level = 3
+[profile.dev.package.syn]
+opt-level = 3
+[profile.dev.package.proc-macro2]
+opt-level = 3
+[profile.dev.package.quote]
+opt-level = 3
+
 [profile.test]
 split-debuginfo = "unpacked"
 incremental = false
