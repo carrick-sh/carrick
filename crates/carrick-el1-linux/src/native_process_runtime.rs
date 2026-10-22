@@ -5592,6 +5592,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 )
                 .map_err(|_| NativeProcessError::Quarantined)?;
         }
+        if !self.source.zone.mark_native_owned(record) {
+            return Err(NativeProcessError::Quarantined);
+        }
         self.source.zone.requeue_preempted(self.source.slot, record);
         Ok(visible.get())
     }
