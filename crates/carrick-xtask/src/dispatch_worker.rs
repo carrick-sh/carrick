@@ -241,6 +241,9 @@ pub fn valid_branch(branch: &str) -> bool {
         && !branch.ends_with('/')
 }
 
+/// Built by `scripts/ci/build-template-debian.sh` for the agent profile.
+pub const CODEX_SDK_VENV: &str = "/opt/carrick-agent/codex-sdk";
+
 fn schema() -> Value {
     json!({"type":"object","additionalProperties":false,
         "required":["status","summary","tests","risks"],"properties":{
@@ -408,6 +411,11 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         .env("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
         .env("AGY_BIN", state.join("bin/agy"))
         .env("AGY_DIRECTOR_CODEX_SDK_BIN", state.join("bin/codex"))
+        // The template's read-only, hash-locked SDK (#773). The tier table
+        // names the backend, so the launcher's own route default must not
+        // report the dispatch as overriding an owner pause.
+        .env("AGY_DIRECTOR_CODEX_VENV", CODEX_SDK_VENV)
+        .env("AGY_DIRECTOR_ROUTES", "default")
         .current_dir(root);
     let mut isolated = Command::new("/usr/bin/sudo");
     private_environment(&mut isolated);
