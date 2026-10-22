@@ -651,6 +651,8 @@ struct FakeExecutor {
     residency_generation: super::residency::ResidencyGeneration,
     resident_task: Option<(ThreadKey, ExecutionGeneration, Arc<FakeBinding>)>,
     exit_seen: bool,
+    idle_slot: Option<carrick_el1_abi::SlotId>,
+    idle_entry: Option<Box<dyn FnOnce()>>,
 }
 
 struct BoundaryAuditProbe;
@@ -908,11 +910,26 @@ impl PersistentExecutorFactory for FakeFactory {
             residency_generation: super::residency::ResidencyGeneration::INITIAL,
             resident_task: None,
             exit_seen: false,
+            idle_slot: None,
+            idle_entry: None,
         })
     }
 }
 
 impl PersistentExecutor for FakeExecutor {
+    fn zone_slot(&self) -> Option<carrick_el1_abi::SlotId> {
+        self.idle_slot
+    }
+
+    fn wait_in_guest(&mut self) -> Result<super::GuestIdleExit, TrapError> {
+        if let Some(entry) = self.idle_entry.take() {
+            entry();
+            Ok(super::GuestIdleExit::Idle)
+        } else {
+            Ok(super::GuestIdleExit::Unsupported)
+        }
+    }
+
     type TaskBinding = FakeBinding;
 
     fn load(&mut self, task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError> {
@@ -8295,4 +8312,254 @@ fn shutdown_kick_stays_set_when_a_closing_worker_claims_a_row() {
     scheduler
         .unregister_executor(&registration)
         .expect("unregister worker");
+}
+
+/// A host-returned service must wake the executor's CURRENT idle mailbox,
+/// even after the executor relinquished its creation-time mailbox. The wake
+/// lands after next_runnable's last scan and before effective guest entry:
+/// a transient hardware exit alone cannot make the host row reachable.
+#[test]
+fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle_slot() {
+    use carrick_el1_abi::{CurrentTask, SlotId};
+    use carrick_guest_mem::{HostVa, SharedFutexLocation};
+    use carrick_kernel::kernel::continuation::{
+        BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass,
+    };
+
+    #[derive(Clone)]
+    struct CreationMailboxKick(usize);
+    impl carrick_hal::VcpuKick for CreationMailboxKick {
+        fn kick(&self) {
+            // The real persistent HVF handle retains this slot at creation.
+            // The hardware exit is deliberately before effective guest entry.
+            carrick_el1_abi::mark_pending_host_work(self.0);
+        }
+    }
+    struct RestoreRegion(usize);
+    impl Drop for RestoreRegion {
+        fn drop(&mut self) {
+            carrick_kernel::el1_zone::register_handback_publisher(Arc::new(|_| {}));
+            carrick_el1_abi::record_el1_region_host_ptr(self.0);
+        }
+    }
+
+    let (process, context) = crate::hvpatch::process_context_for_tests(14_231);
+    context
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+    let scheduler = Arc::new(Scheduler::new_with_policy(
+        Arc::clone(context.kernel()),
+        Arc::new(GuestCpuPolicy::new(2)),
+    ));
+    let kick = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+    assert!(
+        kick.publish_hardware(
+            super::ExactHardwareKick::new(
+                Box::new(CreationMailboxKick(0)),
+                1,
+                super::current_owner_thread_port(),
+            )
+            .unwrap()
+        )
+    );
+    let destination = scheduler
+        .register_executor_bound(kick.clone(), Some(GuestCpuId::new(0)), false)
+        .unwrap();
+    let origin = scheduler
+        .register_executor_bound(
+            Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default()))),
+            Some(GuestCpuId::new(1)),
+            false,
+        )
+        .unwrap();
+    publish(&context, 231);
+    scheduler.make_runnable(context.thread().key()).unwrap();
+    let running = scheduler.take(&origin).unwrap();
+    assert_eq!(running.guest_cpu(), GuestCpuId::new(1));
+
+    // A real self sched_setaffinity changes the current authority to CPU 0.
+    let dispatcher = SyscallDispatcher::new();
+    dispatcher.bind_hvpatch_process(Arc::new(process));
+    let registry = crate::thread::ThreadRegistry::new(context.thread().registry_id());
+    let futex = crate::thread::FutexTable::new();
+    let mut memory =
+        carrick_kernel::dispatch::LinearMemory::new(0x8000, 1u64.to_le_bytes().to_vec());
+    let current = context
+        .task_binding()
+        .capture(context.thread().key().tid)
+        .unwrap();
+    let mut mm_executor = dispatcher.enter_mm_executor().unwrap();
+    let result = dispatcher
+        .dispatch_threaded_with_mm_executor(
+            &mut mm_executor,
+            &current,
+            SyscallRequest::new(122, SyscallArgs::from([0, 8, 0x8000, 0, 0, 0])),
+            &mut memory,
+            &crate::compat::CompatReporter::default(),
+            carrick_kernel::dispatch::ThreadCtx::new(
+                context.thread().registry_id(),
+                &registry,
+                &futex,
+            ),
+        )
+        .unwrap();
+    assert!(matches!(result, DispatchOutcome::Returned { value: 0 }));
+    assert_eq!(context.thread().affinity().words()[0], 1);
+    drop(mm_executor);
+
+    // Enroll and settle the actual shared-futex continuation; its producer
+    // will wake it while the destination is entering its guest idle lane.
+    let word = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let address = word.as_ptr() as usize;
+    let location = SharedFutexLocation::Direct {
+        word: HostVa::new(address),
+        waiter_key: address,
+    };
+    let futex_key = carrick_thread::platform_futex::carrier_shared_futex_key(location);
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::SharedFutexWait {
+            target: carrick_kernel::dispatch::SharedFutexTarget::new(location, address),
+            generation: context
+                .kernel()
+                .shared_futex()
+                .table()
+                .prepare_wait(futex_key),
+            value: 0,
+            timeout: None,
+        },
+        ContinuationCapture::from_lease(
+            &current,
+            running.lease(),
+            SyscallRequest::new(98, SyscallArgs([0; 6])),
+            RestartClass::RestartSyscall,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let waits = CarrierWaitService::new(Arc::clone(&scheduler));
+    let mut registration = waits.prepare_registration(&continuation);
+    waits.enroll(&mut registration).unwrap();
+    scheduler
+        .settle_blocked_continuation(running, continuation, registration)
+        .unwrap();
+    assert_eq!(scheduler.queued_len(), 0);
+
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let _restore = RestoreRegion(carrick_el1_abi::get_el1_region_host_ptr());
+    carrick_el1_abi::record_el1_region_host_ptr(region.as_mut_ptr() as usize);
+    let zone = carrick_el1_abi::zone_tables().unwrap();
+    zone.publish_carrier_cpu_count(2);
+    let (donor, idle) = (SlotId::new(0), SlotId::new(12));
+    zone.drive(donor, 7);
+    zone.publish_slot(donor, 0, Some(0), 0);
+    // The idle vCPU has a new mailbox, unlike its creation-time hardware kick.
+    zone.drive(idle, 8);
+    zone.publish_slot(idle, 0, Some(0), 0);
+    zone.step_away(idle, 8, &mut |_| panic!("empty idle slot"), &mut |_| {});
+    let control = context.thread().control_slot();
+    // SAFETY: this retained control is directly mapped in the VM-free fixture.
+    unsafe {
+        control.publish_affinity_aliases(carrick_guest_arch::GuestVa::new(
+            core::ptr::from_ref(control).expose_provenance() as u64,
+        ));
+    }
+    let captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let publish_scheduler = scheduler.clone();
+    let captured_by_publisher = captured.clone();
+    carrick_kernel::el1_zone::register_handback_publisher(Arc::new(move |event| match event {
+        carrick_kernel::el1_zone::HandbackEvent::DeferredCaptured(records) => {
+            captured_by_publisher.lock().extend_from_slice(records)
+        }
+        carrick_kernel::el1_zone::HandbackEvent::Ready(record) => {
+            publish_scheduler.publish_zone_handback(record)
+        }
+    }));
+    let mut backend = FakeFactory::default().create(&destination).unwrap();
+    backend.idle_slot = Some(idle);
+    let wake_scheduler = scheduler.clone();
+    let wake_captured = captured.clone();
+    backend.idle_entry = Some(Box::new(move || {
+        let _word = word; // Keep the real futex word alive through notification.
+        assert_eq!(
+            wake_scheduler
+                .kernel()
+                .shared_futex()
+                .table()
+                .wake(futex_key, 1),
+            1
+        );
+        assert_eq!(zone.slot(donor).queued(), 1);
+        carrick_kernel::el1_zone::step_away_from_slot(donor, 7);
+        assert_eq!(wake_captured.lock().len(), 1);
+        assert_eq!(zone.slot(donor).queued(), 0);
+        assert_eq!(zone.slot(idle).queued(), 0);
+        assert_eq!(wake_scheduler.queued_len(), 1);
+        zone.step_back(idle, 8);
+        // The actual EL1 idle owner must observe the durable host work. A
+        // FakeCpu WFI without any pending event fails instead of hanging.
+        // SAFETY: aligned, retained ABI storage for this exact mailbox slot.
+        let task = unsafe {
+            &*((region
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize)
+                as *const CurrentTask)
+                .add(usize::from(idle.raw())))
+        };
+        let mut cpu = carrick_el1_linux::sched::FakeCpu::default();
+        let counters = carrick_el1_abi::Counters::default();
+        let mut sched = carrick_el1_linux::sched::Sched {
+            zone,
+            slot: idle,
+            task,
+            cpu: &mut cpu,
+            user: &carrick_el1_linux::sched::HardwareUserWord,
+            counters: &counters,
+            handoff: None,
+        };
+        assert_eq!(
+            sched.idle(&mut carrick_el1_abi::TrapFrame::default(), u64::MAX),
+            carrick_core::Served::Idle
+        );
+        assert_eq!(
+            cpu.wfis, 0,
+            "host service must not sleep awaiting an unrelated interrupt"
+        );
+        assert!(task.linux.has_pending_host_work());
+    }));
+    carrick_kernel::el1_zone::with_test_zone(zone, || {
+        assert!(
+            super::next_runnable(&scheduler, &mut backend, &destination, &kick)
+                .unwrap_or_else(|_| panic!("idle entry must succeed"))
+                .is_none()
+        );
+        assert!(
+            scheduler.try_take(&origin).unwrap().is_none(),
+            "old CPU cannot claim outside the new mask"
+        );
+        let served = super::next_runnable(&scheduler, &mut backend, &destination, &kick)
+            .unwrap_or_else(|_| panic!("returned service must be claimable"))
+            .unwrap();
+        assert_eq!(served.thread_key(), context.thread().key());
+        assert_eq!(served.guest_cpu(), GuestCpuId::new(0));
+        assert_eq!(
+            served
+                .lease()
+                .blocked_continuation()
+                .unwrap()
+                .ready_event()
+                .unwrap(),
+            carrick_kernel::kernel::continuation::ContinuationEvent::Ready
+        );
+        scheduler.settle_exited(served).unwrap();
+        for _ in 0..3 {
+            carrick_kernel::el1_zone::come_back_to_slot(donor, 7);
+            carrick_kernel::el1_zone::step_away_from_slot(donor, 7);
+        }
+        assert_eq!(
+            captured.lock().len(),
+            1,
+            "the serviced incarnation is captured once"
+        );
+        assert_eq!(scheduler.queued_len(), 0);
+    });
 }
