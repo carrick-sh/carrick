@@ -1984,12 +1984,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 }
             } else {
                 let retained = retain_member_control(control)?;
+                let pending = carrick_el1_abi::NativePendingCustody::try_admit(retained.clone())
+                    .map_err(|_| NativeProcessError::Busy)?;
                 retained.commit_registration();
                 let projection = row
                     .native()
                     .resources()
                     .signals
-                    .project_member(source.zone.record_ref(record), retained.clone());
+                    .project_member(source.zone.record_ref(record), pending);
                 row.native_mut().resources_mut().members.push(NativeMember {
                     thread: key.task,
                     process,
@@ -2558,8 +2560,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         members.extend(imported.iter().map(|(member, _, _)| member.clone()));
         let signals = NativeProcessSignals::fresh_root(key);
         for member in &mut members {
-            member.signal_projection =
-                Some(signals.project_member(member.record, member.control.clone()));
+            let pending = carrick_el1_abi::NativePendingCustody::try_admit(member.control.clone())
+                .map_err(|_| NativeProcessError::Busy)?;
+            member.signal_projection = Some(signals.project_member(member.record, pending));
         }
         let resources = NativeResources {
             _control_custody: carrick_core::lifecycle::MemberControlCustody::retain(control)
@@ -5328,15 +5331,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let leader = carrick_core::lifecycle::MemberControlCustody::retain(control)
                 .map_err(|_| NativeProcessError::Stale)?;
             let member = retain_member_control(control)?;
+            let pending = carrick_el1_abi::NativePendingCustody::try_admit(member.clone())
+                .map_err(|_| NativeProcessError::Busy)?;
             let expected = carrick_core::terminal::ThreadBirthIdentity::from_parts(
                 carrick_core_abi::EntryTaskKey::from_raw(child_key.id.raw() as u64),
                 carrick_core_abi::entry::BirthSerial::of_task(child_key.serial),
                 carrick_core_abi::EntryThreadGeneration::from_raw(thread_serial.get()),
             )
             .ok_or(NativeProcessError::Stale)?;
-            Ok((leader, member, expected))
+            Ok((leader, member, pending, expected))
         })();
-        let (leader_custody, member_custody, expected_host) = match retained {
+        let (leader_custody, member_custody, pending, expected_host) = match retained {
             Ok(retained) => retained,
             Err(error) => {
                 self.runtime.graph.lock().owner.rollback_birth(&permit);
@@ -5365,6 +5370,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Ok(r) => r,
             Err(_) => {
                 self.runtime.graph.lock().owner.rollback_birth(&permit);
+                drop(pending);
                 drop(member_custody);
                 drop(leader_custody);
                 if let Err((_, p)) = self.service.abort_mm(prepared) {
@@ -5379,6 +5385,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         {
             self.source.zone.free_record(record);
             self.runtime.graph.lock().owner.rollback_birth(&permit);
+            drop(pending);
             drop(member_custody);
             drop(leader_custody);
             if let Err((_, p)) = self.service.abort_mm(prepared) {
@@ -5392,35 +5399,33 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // SAFETY: this exact newly allocated record remains Free and unpublished.
         unsafe { *self.source.zone.record(record).ctx_mut() = *child_words };
         let member_registration = member_custody.clone();
-        let resources =
-            NativeResources {
-                _control_custody: leader_custody,
+        let resources = NativeResources {
+            _control_custody: leader_custody,
+            zone: self.source.zone,
+            record: self.source.zone.record_ref(record),
+            control,
+            page,
+            members: vec![NativeMember {
+                thread: NativeThreadIdentity::ring_born(child_key.id),
+                process: child_key,
                 zone: self.source.zone,
                 record: self.source.zone.record_ref(record),
-                control,
-                page,
-                members: vec![NativeMember {
-                    thread: NativeThreadIdentity::ring_born(child_key.id),
-                    process: child_key,
-                    zone: self.source.zone,
-                    record: self.source.zone.record_ref(record),
-                    signal_projection: Some(signals.project_member(
-                        self.source.zone.record_ref(record),
-                        member_custody.clone(),
-                    )),
-                    control: member_custody,
-                    expected_host,
-                }],
-                mm: self.service.prepared_mm(&prepared),
-                address,
-                interrupted_child_waits: BTreeMap::new(),
-                pending_child_tid: child_tid.set.then_some(child_tid.address),
-                signals,
-                _thread_claim: thread_claim,
-                channel: None,
-                usage: TaskRusage::default(),
-                file_table: child_file_table,
-            };
+                signal_projection: Some(
+                    signals.project_member(self.source.zone.record_ref(record), pending),
+                ),
+                control: member_custody,
+                expected_host,
+            }],
+            mm: self.service.prepared_mm(&prepared),
+            address,
+            interrupted_child_waits: BTreeMap::new(),
+            pending_child_tid: child_tid.set.then_some(child_tid.address),
+            signals,
+            _thread_claim: thread_claim,
+            channel: None,
+            usage: TaskRusage::default(),
+            file_table: child_file_table,
+        };
         let mut child = GuestTask::new(
             GuestTaskMetadata {
                 key: child_key,

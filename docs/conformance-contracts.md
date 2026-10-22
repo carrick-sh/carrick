@@ -641,7 +641,13 @@ lets release win Ready, reacquires the real sibling editor, posts native
 `tgkill(SIGKILL)` and settles its doorbell before resuming the continuation.
 Native terminal custody must be entered before the renewed editor releases.
 Carrier and native queue projections have distinct publication capabilities;
-the shared pending observation is their read-only union.
+the shared pending observation is their read-only union. Native custody admits
+one writer per control slot, even across independent retains. The writer cannot
+be cloned; its destructor alone releases the claim and clears the projection.
+`native_pending_writer_admission_is_exclusive_until_drop` and
+`duplicate_member_projection_must_preserve_pending` exercise refusal, retained
+SIGKILL and final cleanup; `NativePendingCustody` doctests reject move duplication
+and cloning.
 
 `serial_host_native_owner_wait_fatal_callback_budget` binds deterministic
 publication work at 1/8/32/128 live thread wait registrations in one process.
