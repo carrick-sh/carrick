@@ -1,5 +1,6 @@
 //! Shared host-to-EL1 descriptor drain, used by fork and host copyout.
 
+use carrick_guest_mem::{MappingRetirementError, MemoryError};
 use carrick_hal::{ThreadedEngine, TrapError};
 use carrick_mmu_core::aarch64::GuestTxnSettleError;
 use carrick_mmu_core::aarch64::descriptor_txn::{
@@ -100,6 +101,41 @@ impl From<GuestPublishError> for TrapError {
         match error {
             GuestPublishError::NotApplied { error, .. } | GuestPublishError::Unsettled(error) => {
                 error
+            }
+        }
+    }
+}
+
+/// Aggregate clean-refusal authority across all chunks of one retirement.
+/// A clean receipt describes only its own transaction, not earlier chunks.
+#[derive(Default)]
+pub(crate) struct RetirementProgress {
+    applied: bool,
+}
+
+impl RetirementProgress {
+    pub(crate) fn committed(&mut self) {
+        self.applied = true;
+    }
+
+    pub(crate) fn before_publication_error(&self, error: MemoryError) -> MappingRetirementError {
+        if self.applied {
+            MappingRetirementError::Indeterminate(error)
+        } else {
+            MappingRetirementError::Clean(error)
+        }
+    }
+
+    pub(crate) fn publication_error(&self, error: GuestPublishError) -> MappingRetirementError {
+        let error = if self.applied {
+            error.into_partial()
+        } else {
+            error
+        };
+        match error.into_clean_refusal() {
+            Ok(error) => MappingRetirementError::Clean(MemoryError::HostMap(error.to_string())),
+            Err(error) => {
+                MappingRetirementError::Indeterminate(MemoryError::HostMap(error.to_string()))
             }
         }
     }
@@ -553,5 +589,54 @@ impl<E: ThreadedEngine> carrick_hal::threaded::El1FrameGrantVenue for EngineGran
         grant: carrick_hal::threaded::El1FrameGrantRollback,
     ) -> Result<bool, TrapError> {
         self.0.roll_back_el1_frame_grant(grant)
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+
+    #[test]
+    fn retirement_refusals_are_clean_only_before_any_chunk_commits() {
+        let mut progress = RetirementProgress::default();
+        let preparation_error = || MemoryError::HostMap("table capacity exhausted".into());
+        let refused = |rolled_back| GuestPublishError::NotApplied {
+            outcome: if rolled_back {
+                CleanRefusal::RolledBack(DescriptorRefusal::ReclaimCapacity)
+            } else {
+                CleanRefusal::Refused(DescriptorRefusal::ReclaimCapacity)
+            },
+            error: TrapError::Hypervisor("retirement refused".into()),
+        };
+        assert!(matches!(
+            progress.before_publication_error(preparation_error()),
+            MappingRetirementError::Clean(_)
+        ));
+        for rolled_back in [false, true] {
+            assert!(matches!(
+                progress.publication_error(refused(rolled_back)),
+                MappingRetirementError::Clean(_)
+            ));
+        }
+        // An unauthenticated completion never proves a clean refusal, even
+        // before the first verified chunk. TLBI/backend errors are likewise
+        // unclassified and must use Indeterminate directly.
+        assert!(matches!(
+            progress.publication_error(GuestPublishError::Unsettled(TrapError::Hypervisor(
+                "lost receipt".into()
+            ))),
+            MappingRetirementError::Indeterminate(_)
+        ));
+        progress.committed();
+        assert!(matches!(
+            progress.before_publication_error(preparation_error()),
+            MappingRetirementError::Indeterminate(_)
+        ));
+        for rolled_back in [false, true] {
+            assert!(matches!(
+                progress.publication_error(refused(rolled_back)),
+                MappingRetirementError::Indeterminate(_)
+            ));
+        }
     }
 }

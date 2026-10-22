@@ -1906,8 +1906,14 @@ First touch uses the existing private frame-grant service; no VA is reused as
 an IPA and no host-page congruence is imposed on the source offset. Fixed
 host-served placement preserves the predecessor until successful publication.
 POPULATE, LOCKED, GROWSDOWN and nonregular objects keep their existing paths.
-The source lease is secured before physical retirement and physical retirement
-is the final fallible owner-file step. Signed first touch, private-store/fork
+The source lease is secured before physical retirement. A typed retirement
+result proves whether a refusal preserved the predecessor: preparation and
+authenticated clean descriptor refusal can return ENOMEM before any chunk
+commits. Any partial or unknown retirement, failed TLBI, or backend failure
+after descriptor retirement fails stopped while source custody remains held.
+`retirement_refusals_are_clean_only_before_any_chunk_commits` exercises the
+production progress classifier with refused, rolled-back and unsettled
+receipts. Signed first touch, private-store/fork
 integration, the exact observed ENOMEM attribution, Python startup, native
 ARM64 oracle and full artifact promotion remain required.
 

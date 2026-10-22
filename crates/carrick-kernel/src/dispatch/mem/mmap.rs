@@ -2219,11 +2219,20 @@ impl<'a> MemView<'a> {
                         MmapRefusal::Internal("private file source capacity exhausted"), LINUX_ENOMEM,
                     ));
                 };
-                if let Err(error) = memory.unmap_range(address, length_usize) {
-                    return Ok(request.refused_by(
-                        MmapRefusal::Internal("private file predecessor retirement failed"),
-                        LINUX_ENOMEM, format_args!("at {address:#x}+{length:#x}: {error}"),
-                    ));
+                match memory.retire_mapping(GuestVa::new(address), length_usize) {
+                    Ok(()) => {}
+                    Err(carrick_guest_mem::MappingRetirementError::Clean(error)) => {
+                        return Ok(request.refused_by(
+                            MmapRefusal::Internal("private file predecessor retirement failed"),
+                            LINUX_ENOMEM, format_args!("at {address:#x}+{length:#x}: {error}"),
+                        ));
+                    }
+                    Err(carrick_guest_mem::MappingRetirementError::Indeterminate(error)) => {
+                        carrick_fatal!(
+                            "dispatch::mmap_retirement",
+                            "private file replacement retirement is indeterminate at {address:#x}+{length:#x}: {error}"
+                        );
+                    }
                 }
                 this.remove_mapping_metadata(address, length);
                 Some(lease)
