@@ -164,6 +164,10 @@ fn warm_apt_cache_installs_without_contacting_the_mirror() {
     for (name, body) in [
         ("sudo", "#!/bin/sh\nexec \"$@\"\n".to_owned()),
         (
+            "dpkg",
+            format!("#!/bin/sh\necho \"dpkg $*\" >> '{}'\n", log.display()),
+        ),
+        (
             "apt-get",
             format!(
                 "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$*\" in *--download-only*)\n  [ -n \"$APT_STUB_FAIL_DOWNLOAD\" ] && exit 100\n  for a in \"$@\"; do case \"$a\" in Dir::Cache::archives=*) touch \"${{a#Dir::Cache::archives=}}/pkg_1.0_amd64.deb\";; esac; done;;\nesac\n",
@@ -199,7 +203,7 @@ fn warm_apt_cache_installs_without_contacting_the_mirror() {
         "warm cache contacted the mirror: {warm}"
     );
     assert!(!warm.contains("--download-only"), "{warm}");
-    assert!(warm.contains("--no-download"), "{warm}");
+    assert!(warm.contains("dpkg -i "), "{warm}");
     assert!(warm.contains("pkg_1.0_amd64.deb"), "{warm}");
     let changed = run(&["clang", "llvm"]);
     assert!(

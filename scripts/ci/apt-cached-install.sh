@@ -27,11 +27,12 @@ else
     -o Dir::Cache::archives="$dir" "$@"
   printf '%s\n' "$want" | sudo tee "$dir/complete" > /dev/null
 fi
-# Local .deb paths resolve against each other and the installed system, so no
-# package lists (and no `apt-get update`) are needed on a hit.
+# The cached set is exactly what apt chose to add to this runner image, so one
+# dpkg call installs it with dependencies satisfied among its members. apt would
+# instead look for the files in its own archive directory and try to fetch them.
 shopt -s nullglob
 debs=("$dir"/*.deb)
 shopt -u nullglob
 if ((${#debs[@]})); then
-  sudo apt-get install -y --no-download "${debs[@]}"
+  sudo dpkg -i "${debs[@]}"
 fi
