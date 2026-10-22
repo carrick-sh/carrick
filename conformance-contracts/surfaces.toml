@@ -1016,11 +1016,11 @@ contracts = ["kernel.mm.user-va-ceiling"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs"
-contracts = ["kernel.mm.user-va-ceiling"]
+contracts = ["kernel.mm.user-va-ceiling", "kernel.mm.private-file-fixed-replacement"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem/anonymous.rs"
-contracts = ["kernel.mm.user-va-ceiling"]
+contracts = ["kernel.mm.user-va-ceiling", "kernel.mm.private-file-fixed-replacement"]
 
 # Native process custody and Linux identity/exit/wait policy retain the shared lifecycle contracts.
 

@@ -5452,6 +5452,9 @@ fn libpython_fixed_file_segments_use_owner_source_without_eager_copy() {
     const END: u64 = 0x65f000;
     for offset in [DATA, DATA - PAGE] {
         let mut dispatcher = SyscallDispatcher::new();
+        dispatcher
+            .try_set_credentials(carrick_abi::NsUid::new(1000), carrick_abi::NsGid::new(1000))
+            .unwrap();
         let contents: Vec<_> = (0..END)
             .map(|i| ((i / PAGE * 17 + i % PAGE) % 251) as u8)
             .collect();
@@ -5535,6 +5538,43 @@ fn libpython_fixed_file_segments_use_owner_source_without_eager_copy() {
                 contents[(offset + delta) as usize..(offset + delta + PAGE) as usize]
             );
         }
+        // A real guest resource refusal occurs after placement, but before
+        // backing installation. It must not replace the prior root with NONE.
+        context
+            .task()
+            .replace_rlimit(carrick_abi::LinuxResource::Memlock, |_| {
+                Ok::<_, std::convert::Infallible>(carrick_abi::LinuxRlimit::new(PAGE, PAGE))
+            })
+            .unwrap();
+        let refused = dispatcher.dispatch(
+            &context,
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([
+                    base + DATA,
+                    LENGTH,
+                    LINUX_PROT_READ | LINUX_PROT_WRITE,
+                    flags | LINUX_MAP_FIXED | carrick_abi::LINUX_MAP_LOCKED,
+                    FILE_FD as u64,
+                    offset + PAGE,
+                ]),
+            ),
+            &mut memory,
+            &CompatReporter::default(),
+        );
+        assert!(
+            matches!(refused,
+                Ok(DispatchOutcome::Errno { errno }) | Err(DispatchError::Errno(errno))
+                    if errno == LINUX_ENOMEM
+            ),
+            "real memlock exhaustion must return errno 12: {refused:?}"
+        );
+        let retained = root.lock().mapping(base + DATA).unwrap();
+        assert_eq!(
+            retained.host_backing, mapping.host_backing,
+            "failed fixed replacement retired the predecessor file source"
+        );
+        assert_eq!(retained.protection, mapping.protection);
         assert!(
             memory.regions()[0].shared_initialized_bytes().1.is_empty(),
             "owner-backed file mapping eagerly copied into the compatibility image; large owner PREPARE is bounded to 4096 bytes"
