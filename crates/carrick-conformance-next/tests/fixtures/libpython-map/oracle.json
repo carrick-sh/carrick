@@ -1,6 +1,6 @@
 {
   "status": "pending-director-bless",
-  "source_sha256": "31fd2092a6b1db5d42cd670f6360b8c151d8c3408ee6268e227d001cddb8df43",
+  "source_sha256": "113bfb4d9ba58cf7da58ee65988b4c27a91ec8a9f3b9c6ec2b384c28a9fc147a",
   "authority": "mmap(2) and diagnostic native Linux x86_64 run; ARM64 Docker bless pending",
-  "stdout": "file_offset=4694016\nreservation_errno=0\ntext_errno=0\ntrim_errno=0\ntrim_errno=0\nprotect_errno=0\ndata_errno=0\ncontents_private_neighbors=ok\nfile_offset=4689920\nreservation_errno=0\ntext_errno=0\ntrim_errno=0\ntrim_errno=0\nprotect_errno=0\ndata_errno=0\ncontents_private_neighbors=ok\n"
+  "stdout": "reservation_flags=2082\nfile_offset=4694016\nreservation_errno=0\ntext_errno=0\ntrim_errno=0\ntrim_errno=0\nprotect_errno=0\ndata_errno=0\ncontents_private_neighbors=ok\nreservation_flags=2082\nfile_offset=4689920\nreservation_errno=0\ntext_errno=0\ntrim_errno=0\ntrim_errno=0\nprotect_errno=0\ndata_errno=0\ncontents_private_neighbors=ok\nreservation_flags=2050\nfile_offset=4694016\nreservation_errno=0\ntext_errno=0\ntrim_errno=0\ntrim_errno=0\nprotect_errno=0\ndata_errno=0\ncontents_private_neighbors=ok\nreservation_flags=2050\nfile_offset=4689920\nreservation_errno=0\ntext_errno=0\ntrim_errno=0\ntrim_errno=0\nprotect_errno=0\ndata_errno=0\ncontents_private_neighbors=ok\n"
 }

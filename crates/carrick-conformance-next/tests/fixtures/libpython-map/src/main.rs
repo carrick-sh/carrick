@@ -25,7 +25,7 @@ fn map(
     address: *mut libc::c_void,
     len: usize,
     prot: i32,
-    fixed: bool,
+    extra_flags: i32,
     offset: usize,
     name: &str,
 ) -> io::Result<*mut libc::c_void> {
@@ -34,7 +34,7 @@ fn map(
             address,
             len,
             prot,
-            libc::MAP_PRIVATE | 0x800 | if fixed { libc::MAP_FIXED } else { 0 },
+            libc::MAP_PRIVATE | 0x800 | extra_flags,
             file.as_raw_fd(),
             offset as libc::off_t,
         )
@@ -55,41 +55,72 @@ fn map(
     clippy::disallowed_methods,
     reason = "standalone Linux guest fixture; these are guest file operations, not carrier services"
 )]
-fn run(offset: usize) -> io::Result<()> {
-    let path = format!("/tmp/libpython-map-{}-{offset:x}", std::process::id());
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    std::fs::remove_file(path)?;
-    let contents: Vec<_> = (0..ROUNDED)
-        .map(|i| ((i / PAGE * 17 + i % PAGE) % 251) as u8)
-        .collect();
-    file.write_all_at(&contents, 0)?;
-    let base = map(
+fn run(offset: usize, anonymous_reservation: bool, source: Option<&str>) -> io::Result<()> {
+    let (file, contents) = if let Some(path) = source {
+        // An OCI lower-layer file takes the production immutable-file path.
+        // The static probe can open libpython even while its loader is broken.
+        let file = File::open(path)?;
+        let inspected_len = (DATA_DELTA + DATA_LEN + 1).max(offset + DATA_LEN);
+        let mut bytes = vec![0; inspected_len];
+        file.read_exact_at(&mut bytes, 0)?;
+        (file, bytes)
+    } else {
+        let path = format!("/tmp/libpython-map-{}-{offset:x}", std::process::id());
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        std::fs::remove_file(path)?;
+        let bytes: Vec<_> = (0..ROUNDED)
+            .map(|i| ((i / PAGE * 17 + i % PAGE) % 251) as u8)
+            .collect();
+        file.write_all_at(&bytes, 0)?;
+        (file, bytes)
+    };
+    let reservation = map(
         &file,
         std::ptr::null_mut(),
         RESERVE,
         libc::PROT_NONE,
-        false,
+        if anonymous_reservation {
+            libc::MAP_ANONYMOUS
+        } else {
+            0
+        },
         0,
         "reservation",
     )?;
-    let _mapping = Mapping(base);
+    let _mapping = Mapping(reservation);
+    let base = ((reservation as usize + 0xffff) & !0xffff) as *mut libc::c_void;
     map(
         &file,
         base,
         TEXT,
         libc::PROT_READ | libc::PROT_EXEC,
-        true,
+        libc::MAP_FIXED,
         0,
         "text",
     )?;
-    // The trace omits the two trim addresses. Trim only unused suffix pages;
-    // the whole data target remains covered by the file-backed reservation.
-    for delta in [0x65e000, 0x65d000] {
-        let rc = unsafe { libc::munmap(base.byte_add(delta), PAGE) };
+    // Align text within the reservation, then trim its prefix and suffix.
+    // If Linux already aligned the reservation, split the unused suffix so
+    // both trim calls remain real, nonempty munmaps.
+    let prefix = base as usize - reservation as usize;
+    let text_end = base as usize + 0x64f000;
+    let reservation_end = reservation as usize + ROUNDED;
+    let trims = if prefix != 0 {
+        [
+            (reservation as usize, prefix),
+            (text_end, reservation_end - text_end),
+        ]
+    } else {
+        [
+            (text_end, PAGE),
+            (text_end + PAGE, reservation_end - text_end - PAGE),
+        ]
+    };
+    for (address, len) in trims {
+        let rc = unsafe { libc::munmap(address as *mut libc::c_void, len) };
         println!("trim_errno={}", if rc == 0 { 0 } else { errno() });
         if rc != 0 {
             return Err(io::Error::last_os_error());
@@ -106,7 +137,7 @@ fn run(offset: usize) -> io::Result<()> {
         data,
         DATA_LEN,
         libc::PROT_READ | libc::PROT_WRITE,
-        true,
+        libc::MAP_FIXED,
         offset,
         "data",
     )?;
@@ -115,7 +146,7 @@ fn run(offset: usize) -> io::Result<()> {
     for i in (0..DATA_LEN).step_by(PAGE) {
         bytes[i] ^= 0xff;
     }
-    let mut observed = vec![0; ROUNDED];
+    let mut observed = vec![0; contents.len()];
     file.read_exact_at(&mut observed, 0)?;
     assert_eq!(observed, contents, "private stores reached the file");
     assert_eq!(
@@ -135,9 +166,16 @@ fn main() -> io::Result<()> {
         option_env!("CARRICK_LIBPYTHON_MAP_SOURCE_SHA256").unwrap_or("unrecorded")
     );
     // Both the congruent and incongruent 4 KiB file offsets are legal on Linux.
-    for offset in [0x47a000, 0x479000] {
-        println!("file_offset={offset}");
-        run(offset)?;
+    let source = std::env::args().nth(1);
+    for anonymous_reservation in [true, false] {
+        for offset in [0x47a000, 0x479000] {
+            println!(
+                "reservation_flags={}",
+                0x802 | if anonymous_reservation { 0x20 } else { 0 }
+            );
+            println!("file_offset={offset}");
+            run(offset, anonymous_reservation, source.as_deref())?;
+        }
     }
     Ok(())
 }
