@@ -519,6 +519,7 @@ _FRAME_GRANT_MAILBOX_STATES = {
     4: "response",
     5: "guest-consuming",
 }
+_ZONE_IDLE_EXIT_KINDS = {1: "syscall", 2: "el0-fault", 3: "el1-cow-fault"}
 
 
 def _format_el1_grant_claim(tid: int, mm: int, packed: int) -> str:
@@ -774,6 +775,15 @@ _EVENTRING_KINDS = {
             f"slot={a} running_mm={b & 0xffffffff} requested_mm={c & 0xffffffff}"
         ),
     ),
+    82: (
+        "ZONE_IDLE_EXIT",
+        lambda a, b, c: (
+            f"slot={a} record={b} kind={_ZONE_IDLE_EXIT_KINDS.get(c & 0xff, 'other')} "
+            f"native={str(bool(c & 0x100)).lower()}"
+        ),
+    ),
+    83: ("ZONE_IDLE_ESR", lambda a, b, c: f"slot={c} esr={_join64(a, b):#018x}"),
+    84: ("ZONE_IDLE_FAR", lambda a, b, c: f"slot={c} far={_join64(a, b):#018x}"),
 }
 
 
