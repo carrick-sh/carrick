@@ -2906,14 +2906,16 @@ impl Thread {
     pub fn post_pending_read_blocked(&self, bits: SigSet) -> SigSet {
         let blocked = self
             .control
-            .pending()
+            .carrier_pending()
             .post_then_read_blocked(PendingSignals(bits.raw()), &self.control);
         SigSet::from_raw(blocked.0)
     }
 
     /// Retire `bits` from the pending summary (delivery consumed them).
     pub fn clear_pending_summary(&self, bits: SigSet) {
-        self.control.pending().clear(PendingSignals(bits.raw()));
+        self.control
+            .carrier_pending()
+            .clear(PendingSignals(bits.raw()));
     }
 
     /// Current `sigaltstack`; `None` is disabled.
@@ -2988,7 +2990,10 @@ impl Thread {
     pub(in crate::kernel) fn publish_signal_state(&self, state: &ThreadSignalState) {
         self.publish_pending(state.pending());
         self.revision.publish();
-        debug_assert_eq!(self.control.pending().load().0, state.pending().raw());
+        debug_assert_eq!(
+            self.control.carrier_pending().load().0,
+            state.pending().raw()
+        );
     }
 
     /// Make the summary equal `pending`. Newly pending bits are posted first
@@ -2996,7 +3001,7 @@ impl Thread {
     /// lock-free reader never sees a still-pending signal missing. Only
     /// callers holding `signal_state` write the summary.
     fn publish_pending(&self, pending: SigSet) {
-        let current = self.control.pending().load().0;
+        let current = self.control.carrier_pending().load().0;
         let added = pending.raw() & !current;
         let removed = current & !pending.raw();
         if added != 0 {

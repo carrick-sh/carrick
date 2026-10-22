@@ -1121,8 +1121,12 @@ impl Kernel {
             .flatten()
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
+        let mut notified = std::collections::BTreeSet::new();
         for context in contexts {
-            if context.exact_thread_is_live() && owner_wait_cancellation(&context).is_some() {
+            if context.exact_thread_is_live()
+                && owner_wait_cancellation(&context).is_some()
+                && notified.insert(context.task().key())
+            {
                 context.task().wake();
             }
         }

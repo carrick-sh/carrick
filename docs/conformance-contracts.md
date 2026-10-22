@@ -633,6 +633,24 @@ that exact owner. The witnesses sample the exact stage-2 pin count inside
 the callback and require zero, rather than checking only after producer Drop.
 The same copyout signed fixture remains the required production binding.
 
+`kernel.copyout.owner-refusal` also requires a native fatal signal to survive
+an ordinary owner-release wake and carrier continuation cleanup. The VM-free
+runtime binding
+`serial_host_native_owner_wait_release_wins_then_tgkill_survives_recontention`
+lets release win Ready, reacquires the real sibling editor, posts native
+`tgkill(SIGKILL)` and settles its doorbell before resuming the continuation.
+Native terminal custody must be entered before the renewed editor releases.
+Carrier and native queue projections have distinct publication capabilities;
+the shared pending observation is their read-only union.
+
+`serial_host_native_owner_wait_fatal_callback_budget` binds deterministic
+publication work at 1/8/32/128 live thread wait registrations in one process.
+One native process-fatal host-work publication must invoke exactly N persistent
+task callbacks for N subscriptions: each exact TaskKey is notified once,
+regardless of its eligible waiter population. The budget counts callback
+invocations, including redundant invocations hidden by runnable latches.
+Signed HVF and Docker promotion remain director-owned.
+
 ## Terminal clear custody
 
 `kernel.thread.clear-tid-custody` covers `set_tid_address(2)` and
