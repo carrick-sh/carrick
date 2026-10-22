@@ -9894,7 +9894,7 @@ mod tests {
         assert!(
             matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == -11)
         );
-        assert!(!runtime.graph.lock().pending.member(&entry.record).is_some());
+        assert!(runtime.graph.lock().pending.member(&entry.record).is_none());
         assert!(zone.timer_owner(slot).is_none());
         if default_stop {
             assert!(
