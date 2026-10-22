@@ -167,6 +167,8 @@ struct TestStockCrossing {
     handbacks: AtomicUsize,
     root_exits: AtomicUsize,
     root_exit_status: AtomicU64,
+    #[cfg(all(test, target_os = "linux"))]
+    require_stack_commit: bool,
 }
 
 impl TestStockCrossing {
@@ -200,6 +202,8 @@ impl TestStockCrossing {
             handbacks: AtomicUsize::new(0),
             root_exits: AtomicUsize::new(0),
             root_exit_status: AtomicU64::new(u64::MAX),
+            #[cfg(all(test, target_os = "linux"))]
+            require_stack_commit: false,
         }
     }
 }
@@ -398,6 +402,10 @@ impl ForkStockCrossing for TestStockCrossing {
                 Ok(())
             }
             Some(ForkStockKind::Commit) => {
+                #[cfg(all(test, target_os = "linux"))]
+                if self.require_stack_commit {
+                    native_child_handoff_tests::assert_current_stack_commit(record_gpa);
+                }
                 self.settlements_committed.fetch_add(1, Ordering::AcqRel);
                 let settlement = unsafe { &mut *(record_gpa as *mut ForkStockSettlement) };
                 #[cfg(test)]
@@ -529,17 +537,24 @@ impl Fixture {
         let file_table = leader.file_table;
         // The host records the leader's birth identity when it allocates the
         // control slot. Its process serial is independent of the snapshot.
-        control.publish_host_birth_identity(
-            carrick_core::terminal::ThreadBirthIdentity::from_parts(
-                carrick_core_abi::EntryTaskKey::from_raw(leader.tid),
-                carrick_core_abi::entry::BirthSerial::of_task(
-                    carrick_sched_core::process::TaskSerial::from_raw_u64(leader.generation)
-                        .unwrap(),
-                ),
-                carrick_core_abi::EntryThreadGeneration::from_raw(leader.serial),
-            )
-            .unwrap(),
-        );
+        if let Some(birth) = control.host_birth_identity() {
+            // Kernel-backed fixtures retain the real process incarnation;
+            // an execution snapshot generation is not its birth serial.
+            assert_eq!(birth.task().raw(), leader.tid);
+            assert_eq!(birth.thread().raw(), leader.serial);
+        } else {
+            control.publish_host_birth_identity(
+                carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                    carrick_core_abi::EntryTaskKey::from_raw(leader.tid),
+                    carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(leader.generation)
+                            .unwrap(),
+                    ),
+                    carrick_core_abi::EntryThreadGeneration::from_raw(leader.serial),
+                )
+                .unwrap(),
+            );
+        }
         control.initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(&[
             leader.affinity
         ]));
