@@ -7543,6 +7543,594 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
+    enum DirectoryPhysicalScenario {
+        KillParked,
+        KillDuringEnrollment,
+        KillDuringPreparation,
+        NonLeaderKillParked,
+        NonLeaderKillDuringEnrollment,
+        ReleaseParked,
+        ReleaseDuringEnrollment,
+    }
+
+    #[test]
+    fn serial_host_directory_physical_dependency_sigkill_uses_owner_physical_resume() {
+        exercise_directory_physical_resume(DirectoryPhysicalScenario::KillParked);
+    }
+
+    #[test]
+    fn serial_host_directory_physical_sigkill_during_enrollment_precedes_ready_retry() {
+        exercise_directory_physical_resume(DirectoryPhysicalScenario::KillDuringEnrollment);
+    }
+
+    #[test]
+    fn serial_host_directory_physical_nonleader_process_sigkill_precedes_ready_retry() {
+        exercise_directory_physical_resume(DirectoryPhysicalScenario::NonLeaderKillParked);
+    }
+
+    #[test]
+    fn serial_host_directory_physical_nonleader_process_sigkill_during_enrollment() {
+        exercise_directory_physical_resume(
+            DirectoryPhysicalScenario::NonLeaderKillDuringEnrollment,
+        );
+    }
+
+    #[test]
+    fn serial_host_directory_physical_resume_releases_writer_before_retry() {
+        exercise_directory_physical_resume(DirectoryPhysicalScenario::ReleaseParked);
+    }
+
+    #[test]
+    fn serial_host_directory_physical_immediate_resume_releases_writer_before_retry() {
+        exercise_directory_physical_resume(DirectoryPhysicalScenario::ReleaseDuringEnrollment);
+    }
+
+    #[test]
+    fn serial_host_directory_physical_kill_after_ready_before_effect_admission() {
+        exercise_directory_physical_resume(DirectoryPhysicalScenario::KillDuringPreparation);
+    }
+
+    /// Real dispatch, scheduler, retained directory operation and content writer.
+    /// Only the engine and the enrollment interleaving are test-controlled.
+    fn exercise_directory_physical_resume(scenario: DirectoryPhysicalScenario) {
+        use super::super::code_content_test::{CodeContent, ContentError, PendingContentWrite};
+        use carrick_guest_mem::{GuestVa, OwnedMemoryWait, PhysicalMemoryWait};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct EnrollmentHook {
+            wait: OwnedMemoryWait,
+            hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        }
+        impl std::fmt::Debug for EnrollmentHook {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("EnrollmentHook")
+                    .field("wait", &self.wait)
+                    .finish_non_exhaustive()
+            }
+        }
+        impl PhysicalMemoryWait for EnrollmentHook {
+            fn is_ready(&self) -> bool {
+                self.wait.0.is_ready()
+            }
+            fn enroll(
+                &self,
+                wake: Arc<dyn Fn() + Send + Sync>,
+            ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+                let enrollment = self.wait.0.enroll(wake);
+                if let Some(hook) = self.hook.lock().take() {
+                    hook();
+                }
+                // Preserve the pre-hook sample: runtime must also handle release
+                // between enrollment and its subsequent readiness check.
+                enrollment
+            }
+        }
+        let during_preparation =
+            matches!(scenario, DirectoryPhysicalScenario::KillDuringPreparation);
+        let kill_pending = matches!(
+            scenario,
+            DirectoryPhysicalScenario::KillParked
+                | DirectoryPhysicalScenario::KillDuringEnrollment
+                | DirectoryPhysicalScenario::KillDuringPreparation
+                | DirectoryPhysicalScenario::NonLeaderKillParked
+                | DirectoryPhysicalScenario::NonLeaderKillDuringEnrollment
+        );
+        let during_enrollment = matches!(
+            scenario,
+            DirectoryPhysicalScenario::KillDuringEnrollment
+                | DirectoryPhysicalScenario::KillDuringPreparation
+                | DirectoryPhysicalScenario::NonLeaderKillDuringEnrollment
+                | DirectoryPhysicalScenario::ReleaseDuringEnrollment
+        );
+        let non_leader = matches!(
+            scenario,
+            DirectoryPhysicalScenario::NonLeaderKillParked
+                | DirectoryPhysicalScenario::NonLeaderKillDuringEnrollment
+        );
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(self.0);
+            }
+        }
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        let _restore = Restore(carrick_el1_abi::get_el1_region_host_ptr());
+        carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
+        carrick_kernel::el1_zone::with_test_zone(carrick_el1_abi::zone_tables().unwrap(), || {
+            let lower = tempfile::tempdir().unwrap();
+            std::fs::create_dir(lower.path().join("stdlib")).unwrap();
+            std::fs::write(lower.path().join("stdlib/module.py"), b"").unwrap();
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.set_rootfs_layer(
+                carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap(),
+            );
+            let (runtime, scheduler, kernel, root, process, generation) =
+                test_carrier_graph_with_dispatcher!(72_759, dispatcher);
+            root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+            let sibling = root
+                .kernel()
+                .reserve_thread_clone(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::THREAD
+                            | carrick_abi::LinuxCloneFlags::SIGHAND
+                            | carrick_abi::LinuxCloneFlags::VM
+                            | carrick_abi::LinuxCloneFlags::FILES,
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+                .prepare(ThreadId::synthetic_for_tests(72_760))
+                .unwrap()
+                .commit()
+                .unwrap()
+                .start_thread()
+                .unwrap()
+                .into_context();
+            let registration = scheduler
+                .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+                .unwrap();
+            let (root, sibling, generation) = if non_leader {
+                use executor::TaskBindingResolver;
+                let directory = runtime.persistent_bindings();
+                let authority = directory
+                    .take_submission_authority(root.thread().key(), generation)
+                    .unwrap();
+                let state = executor::tests::task_state(&sibling, 759);
+                let child_generation = sibling
+                    .thread()
+                    .publish_initial_task_state(state.clone())
+                    .unwrap();
+                let binding = executor::tests::hvpatch_test_binding(&sibling, &state, 759);
+                let dormant = directory
+                    .prepare_submission(
+                        &scheduler,
+                        executor::TaskSubmissionShape::SameTaskSibling {
+                            grant: (root.thread().key(), generation),
+                        },
+                        Some(&authority),
+                        Arc::clone(sibling.thread()),
+                        child_generation,
+                        Arc::clone(&binding),
+                    )
+                    .unwrap();
+                executor::tests::activate_hvpatch_test_submission(
+                    dormant,
+                    &scheduler,
+                    &sibling,
+                    &state,
+                    child_generation,
+                    binding.as_ref(),
+                );
+                directory.restore_submission_authority(authority).unwrap();
+                // Keep the live carrier-owned leader parked while the sibling
+                // executes. Its signal mask still owns process-directed kill.
+                let leader = scheduler
+                    .try_take(&registration)
+                    .unwrap()
+                    .expect("leader runnable");
+                assert_eq!(leader.thread().key(), root.thread().key());
+                scheduler
+                    .settle_blocked(
+                        leader,
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    )
+                    .unwrap();
+                (sibling, root, child_generation)
+            } else {
+                (root, sibling, generation)
+            };
+            assert!(sibling.exact_thread_is_live());
+            if non_leader {
+                assert_ne!(root.thread().key().tid.raw(), root.task().key().id.raw());
+                assert_eq!(
+                    sibling.thread().key().tid.raw(),
+                    sibling.task().key().id.raw()
+                );
+                assert!(!sibling.thread().control_slot().native_signal_owner());
+                assert!(
+                    !sibling
+                        .thread()
+                        .blocked_mask()
+                        .contains(carrick_abi::LINUX_SIGKILL)
+                );
+            }
+            let tid = root.thread().registry_id();
+            let registry = Arc::new(ThreadRegistry::new(tid));
+            let futex = Arc::new(FutexTable::new());
+            let mut path =
+                carrick_kernel::dispatch::LinearMemory::new(0x400000, b"/stdlib\0".to_vec());
+            let reporter = crate::compat::CompatReporter::default();
+            let open = SyscallRequest::new(
+                carrick_abi::syscall::nr::OPENAT.raw(),
+                crate::compat::SyscallArgs([
+                    carrick_abi::LINUX_AT_FDCWD,
+                    0x400000,
+                    carrick_abi::LINUX_O_DIRECTORY,
+                    0,
+                    0,
+                    0,
+                ]),
+            );
+            let DispatchOutcome::Returned { value: fd } = kernel
+                .dispatcher
+                .dispatch_threaded(
+                    &root,
+                    open,
+                    &mut path,
+                    &reporter,
+                    ThreadCtx::new(tid, &registry, &futex),
+                )
+                .unwrap()
+            else {
+                panic!("open directory")
+            };
+            let content = Arc::new(CodeContent::new(4096));
+            let mut executing = content.observe(0, 4).unwrap();
+            executing.begin_execution().unwrap();
+            let reader = Arc::new(Mutex::new(Some(executing)));
+            let physical = OwnedMemoryWait(Arc::new(
+                PendingContentWrite::new(content.clone(), 0, 4096).unwrap(),
+            ));
+            assert_eq!(content.writer_count(), 1);
+            assert_eq!(
+                content.observe(0, 4).unwrap_err(),
+                ContentError::WriteInProgress
+            );
+            let kill = {
+                let context = Arc::new(root.retain_exact());
+                move || {
+                    let kill = carrick_kernel::kernel::LinuxSignal::for_signal_number(
+                        carrick_abi::LINUX_SIGKILL,
+                    )
+                    .unwrap();
+                    context.signal_authority().enqueue_task_standard(kill, None);
+                    if non_leader {
+                        assert_eq!(
+                            carrick_kernel::kernel::continuation::owner_wait_cancellation(&context),
+                            Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::Carrier),
+                        );
+                        assert!(
+                            carrick_kernel::kernel::continuation::reserve_killable_wait_signal(
+                                &context
+                            )
+                            .is_none(),
+                            "the live unblocked leader owns process-signal delivery",
+                        );
+                    }
+                    context.task().wake();
+                }
+            };
+            let enrollment_kill = kill.clone();
+            let enrollment_reader = reader.clone();
+            let mut refusal = Some(OwnedMemoryWait(Arc::new(EnrollmentHook {
+                wait: physical,
+                hook: Mutex::new(Some(Box::new(move || {
+                    if during_enrollment {
+                        if kill_pending && !during_preparation {
+                            enrollment_kill();
+                        }
+                        let executing = enrollment_reader.lock().take();
+                        drop(executing);
+                    }
+                }))),
+            })));
+            let retries = Arc::new(AtomicUsize::new(0));
+            let prepare_retries = retries.clone();
+            let prepare_content = content.clone();
+            let prepare_kill = kill.clone();
+            let mut engine = CrashCaptureTestEngine {
+                copyout_prepare: Some(Box::new(move || {
+                    if let Some(wait) = refusal.take() {
+                        return Some(wait);
+                    }
+                    prepare_retries.fetch_add(1, Ordering::SeqCst);
+                    if during_preparation {
+                        prepare_kill();
+                    }
+                    // The fatal race witness must reach its output/cursor checks
+                    // independently of the writer-custody assertion.
+                    if !kill_pending {
+                        assert_eq!(
+                            prepare_content.writer_count(),
+                            0,
+                            "runtime retained PendingContentWrite across re-preparation"
+                        );
+                        assert!(
+                            prepare_content.observe(0, 4).is_ok(),
+                            "sibling instruction observation still sees WriteInProgress"
+                        );
+                    }
+                    None
+                })),
+                exec_support: true,
+                snapshot_cpu: Some(executor::tests::task_state(&root, 759).cpu),
+                ..Default::default()
+            };
+            let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) =
+                engine.snapshot_cpu.as_mut().unwrap()
+            else {
+                unreachable!()
+            };
+            Arc::make_mut(cpu).syscall_continuation =
+                Some(carrick_hal::threaded::Aarch64SyscallContinuationV1 {
+                    sequence: 1,
+                    state: 0,
+                    trap_kind: 0,
+                    response_action: 0,
+                    flags: 0,
+                    native_nr: 61,
+                    args: [fd as u64, 0x410000, 4096, 0, 0, 0],
+                    x8: 61,
+                    resume_pc: 0x400004,
+                    spsr: 0,
+                    fp: 0,
+                    lr: 0,
+                    sp: 0x420000,
+                    esr: 0,
+                    return_value: 0,
+                    resume_x16: 0,
+                    resume_x17: 0,
+                });
+            let frame = carrick_hal::RawSyscall {
+                current_guest_sp: None,
+                number: carrick_abi::syscall::nr::GETDENTS64,
+                args: [fd as u64, GuestVa::new(0x410000).raw(), 4096, 0, 0, 0],
+                guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                native_number: carrick_abi::NativeNr(61),
+            };
+            let request = SyscallRequest::from_raw(frame);
+            let outcome = kernel
+                .dispatcher
+                .dispatch_threaded(
+                    &root,
+                    request,
+                    &mut engine,
+                    &reporter,
+                    ThreadCtx::new(tid, &registry, &futex),
+                )
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                DispatchOutcome::DirectoryReadSuspended(_)
+            ));
+            let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+                registry,
+                futex,
+                Arc::new(NoopPlatformFutex),
+                Arc::new(|_| Arc::new(NoopPlatformFutex)),
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(root.thread().clone()),
+                Some(process.pid()),
+                root.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                tid,
+                VcpuThreadRegistry::default(),
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+            state.service_kernel_context = Some(root.retain_exact());
+            state.guest_execution = Some(
+                kernel
+                    .dispatcher
+                    .enter_mm_executor_for_thread(
+                        Some(Arc::clone(root.thread())),
+                        Arc::clone(&state.kicker),
+                        tid,
+                        test_execution_slot(),
+                    )
+                    .unwrap(),
+            );
+            state.zone_mm = Some(root.shared().mm().id().raw());
+            state.syscall_completion =
+                SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
+                    PreparedSyscall {
+                        request,
+                        original_args: request.args,
+                    },
+                    root.retain_exact(),
+                    None,
+                ));
+            let mut job =
+                suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+            let mut running = scheduler
+                .try_take(&registration)
+                .unwrap()
+                .expect("waiter runnable");
+            assert_eq!(running.generation(), generation);
+            let binding_state = executor::tests::task_state(&root, 759);
+            let binding = executor::tests::hvpatch_test_binding(&root, &binding_state, 759);
+            let publish = |_, _| Ok(());
+            let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
+                scheduler: &scheduler,
+                publish_test_descendant: &publish,
+                current: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::from(Some(running.take_lease())),
+                exec_replacement: None,
+            };
+            let need_resched = AtomicBool::new(false);
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+            control.binding = Some(&binding);
+            let exit = job
+                .route_outcome(&mut engine, &mut control, frame, outcome)
+                .unwrap();
+            if kill_pending || !during_enrollment {
+                assert_eq!(
+                    engine.prepared_commits, 0,
+                    "fatal cancellation must precede output commit"
+                );
+            }
+            let mut directory_cursor = |state: &ThreadRuntimeState<CrashCaptureTestEngine>| {
+                kernel
+                    .dispatcher
+                    .dispatch_threaded(
+                        &sibling,
+                        SyscallRequest::new(
+                            carrick_abi::syscall::nr::LSEEK.raw(),
+                            crate::compat::SyscallArgs([
+                                fd as u64,
+                                0,
+                                carrick_abi::LINUX_SEEK_CUR,
+                                0,
+                                0,
+                                0,
+                            ]),
+                        ),
+                        &mut path,
+                        &reporter,
+                        ThreadCtx::new(tid, &state.registry, &state.futex),
+                    )
+                    .unwrap()
+            };
+            let cursor = directory_cursor(&job.state);
+            if kill_pending || !during_enrollment {
+                assert_eq!(
+                    cursor,
+                    DispatchOutcome::Returned { value: 0 },
+                    "suspension consumed the cursor"
+                );
+            }
+            let (exit, mut settled) = if during_enrollment {
+                (exit, running)
+            } else {
+                assert!(matches!(exit, executor::ExecutorExit::Blocked(_)));
+                let lease = control.submission.take_execution_lease().unwrap();
+                running.restore_lease(lease).unwrap();
+                scheduler
+                    .settle_blocked(
+                        running,
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    scheduler.queued_len(),
+                    0,
+                    "physical dependency must remain blocked"
+                );
+                root.task().wake();
+                assert_eq!(
+                    scheduler.queued_len(),
+                    0,
+                    "nonfatal notifications cannot release the wait"
+                );
+                if kill_pending {
+                    kill();
+                }
+                if !kill_pending || non_leader {
+                    let executing = reader.lock().take();
+                    drop(executing);
+                }
+                let mut resumed = scheduler
+                    .try_take(&registration)
+                    .unwrap()
+                    .expect("release or SIGKILL must make the task runnable");
+                control.submission.authority =
+                    executor::ExecutionLeaseAuthoritySlot::from(Some(resumed.take_lease()));
+                let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
+                (exit, resumed)
+            };
+            assert_eq!(
+                content.writer_count(),
+                0,
+                "resume must release retained writer custody"
+            );
+            assert!(content.observe(0, 4).is_ok());
+            let cursor_after_resume = directory_cursor(&job.state);
+            if kill_pending {
+                assert_eq!(
+                    cursor_after_resume,
+                    DispatchOutcome::Returned { value: 0 },
+                    "fatal cancellation advanced the shared cursor"
+                );
+            } else {
+                assert!(
+                    matches!(cursor_after_resume, DispatchOutcome::Returned { value } if value > 0)
+                );
+            }
+
+            if !kill_pending {
+                assert!(
+                    matches!(exit, executor::ExecutorExit::Syscall),
+                    "copyout must complete: {exit:?}"
+                );
+                assert_eq!(retries.load(Ordering::SeqCst), 1);
+                assert_eq!(engine.prepared_commits, 1);
+                assert!(
+                    engine.guest_memory[&0x410000]
+                        .windows(9)
+                        .any(|bytes| bytes == b"module.py")
+                );
+                assert_eq!(engine.completed_syscalls.len(), 1);
+                let lease = control.submission.take_execution_lease().unwrap();
+                settled.restore_lease(lease).unwrap();
+                scheduler.settle_exited(settled).unwrap();
+                scheduler.unregister_executor(&registration).unwrap();
+                scheduler.close();
+                return;
+            }
+            assert!(
+                matches!(exit, executor::ExecutorExit::Yielded),
+                "terminal drain handoff: {exit:?}"
+            );
+            assert!(job.phase.is_terminal_transition());
+            let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
+            assert!(
+                matches!(exit, executor::ExecutorExit::Exited),
+                "SIGKILL must terminate: {exit:?}"
+            );
+            assert_eq!(
+                retries.load(Ordering::SeqCst),
+                usize::from(during_preparation),
+                "fatal cancellation must precede re-preparation"
+            );
+            assert_eq!(engine.prepared_commits, 0);
+            assert!(!engine.guest_memory.contains_key(&0x410000));
+            let Some(Ok(VcpuLoopOutcome::ProcessExit(run))) = &job.terminal_result else {
+                panic!("SIGKILL did not publish process termination");
+            };
+            assert_eq!(run.terminating_signal, Some(carrick_abi::LINUX_SIGKILL));
+            assert!(!root.kernel().task_key_is_live(root.task().key()));
+            let lease = control.submission.take_execution_lease().unwrap();
+            settled.restore_lease(lease).unwrap();
+            scheduler.settle_exited(settled).unwrap();
+            let executing = reader.lock().take();
+            drop(executing);
+            assert_eq!(
+                scheduler.queued_len(),
+                0,
+                "late physical notification resurrected a dead task"
+            );
+            scheduler.unregister_executor(&registration).unwrap();
+            scheduler.close();
+        });
+    }
+
+    #[derive(Clone, Copy)]
     enum OwnerPhysicalScenario {
         KillParked,
         KillDuringEnrollment,
