@@ -244,6 +244,26 @@ The signed binding is
 `el1_sched_deferred_handback_capture_observes_guest_records`; signed execution
 and end-to-end runtime acceptance remain director-owned.
 
+Returning the service row also requires an executor wake on the mailbox
+leased by its current idle entry. A persistent hardware handle can retain
+a relinquished creation-time mailbox after fork or task migration. The
+runtime publishes an owned idle-wake target before its final host queue
+scan and holds that target through delivery and idle teardown. Zone wakes
+mark durable host work on that mailbox before kicking it; physical idle
+lanes retain their backend wake route.
+
+`serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle_slot`
+executes self `sched_setaffinity`, real shared-futex enrollment and wake,
+service capture and scheduler publication, then the production EL1 idle
+loop and host claim. The wake lands after the final queue scan but before
+effective guest entry, after the mailbox moved from slot 0 to slot 12.
+Its RED enters WFI without an event on both the pre-#765 fixed stack and
+the rebased stack. GREEN requires no WFI, one capture, and a claim on CPU 0
+after self-affinity excluded CPU 1. The supplied pre-fix signed comparison
+failed with `Cannot fork` before exercising the handoff, so it cannot
+establish absence of the hang under a successful fork. Signed acceptance
+of both properties remains open.
+
 `kernel.scheduler.runnable-progress` also covers pool admission and guest CPU affinity.
 Linux authority: `sched_setaffinity(2)` restricts a runnable thread to the
 allowed CPUs; `sched_getaffinity(2)` and `nproc` must describe CPUs that can

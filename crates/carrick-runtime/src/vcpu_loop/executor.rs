@@ -1625,27 +1625,24 @@ fn next_runnable<F: PersistentExecutor>(
         } else if backend.has_physical_idle_lane() {
             // A backend with a physical in-guest idle lane uses the same
             // publish/recheck/kick handshake as the EL1-zone path below.
-            kick.set_guest_idle(true);
+            let idle_wait = kick.enter_guest_idle(GuestIdleTarget::Physical);
             if let Err(error) = backend.arm_guest_idle() {
-                kick.set_guest_idle(false);
                 return Err(NextError::Fatal(error.to_string()));
             }
             match scheduler.try_take(registration) {
                 Ok(Some(running)) => {
                     backend.disarm_guest_idle();
-                    kick.set_guest_idle(false);
                     return Ok(Some(running));
                 }
                 Ok(None) => {}
                 Err(error) => {
                     backend.disarm_guest_idle();
-                    kick.set_guest_idle(false);
                     return Err(error.into());
                 }
             }
             let waited = backend.wait_in_guest();
             backend.disarm_guest_idle();
-            kick.set_guest_idle(false);
+            drop(idle_wait);
             if matches!(
                 waited.map_err(|error| NextError::Fatal(error.to_string()))?,
                 GuestIdleExit::Idle
@@ -1733,27 +1730,26 @@ fn next_runnable<F: PersistentExecutor>(
     if let Some(running) = scheduler.try_take(registration)? {
         return Ok(Some(running));
     }
-    // Publish the wait, then look once more: a wake either sees the flag
-    // and forces the vCPU out, or published its work before this scan.
-    kick.set_guest_idle(true);
+    // Publish this lease's mailbox, then look once more: a wake either
+    // reaches this wait or published its work before the scan. A worker's
+    // creation-time hardware handle may name an already relinquished mailbox.
+    let idle_wait = kick.enter_guest_idle(GuestIdleTarget::Zone(slot));
     let _ = carrick_kernel::el1_delegation::settle_el1_boundary(
         usize::from(slot.raw()),
         scheduler.kernel(),
     );
     match scheduler.try_take(registration) {
         Ok(Some(running)) => {
-            kick.set_guest_idle(false);
             return Ok(Some(running));
         }
         Ok(None) => {}
         Err(error) => {
-            kick.set_guest_idle(false);
             return Err(error.into());
         }
     }
     backend.note_bound_cpu(registration.bound_cpu().map(|cpu| cpu.as_u32()));
     let waited = backend.wait_in_guest();
-    kick.set_guest_idle(false);
+    drop(idle_wait);
     match waited.map_err(|error| NextError::Fatal(error.to_string()))? {
         GuestIdleExit::Idle => Ok(None),
         GuestIdleExit::Unsupported => Ok(Some(scheduler.take(registration)?)),

@@ -293,6 +293,25 @@ impl carrick_kernel::kernel::scheduler::DiscardRecorder for ReceiptLog {
     }
 }
 
+/// The destination owned by one executor wait. A zone mailbox follows its
+/// current lease, while a physical idle lane uses the worker's hardware route.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GuestIdleTarget {
+    Physical,
+    Zone(carrick_el1_abi::SlotId),
+}
+
+/// Keeps the wake destination published until this exact idle entry ends.
+/// Teardown synchronizes with delivery before the executor can change leases.
+#[must_use]
+pub(crate) struct GuestIdleWait<'a>(&'a WorkerKick);
+
+impl Drop for GuestIdleWait<'_> {
+    fn drop(&mut self) {
+        *self.0.guest_idle.lock() = None;
+    }
+}
+
 pub(crate) struct WorkerKick {
     pub(crate) binding: Mutex<Option<ExecutorBinding>>,
     pub(crate) hardware: Mutex<Option<ExactHardwareKick>>,
@@ -300,7 +319,7 @@ pub(crate) struct WorkerKick {
     shutdown_interrupted: AtomicBool,
     /// The executor waits for work in the guest's scheduler (EL1 plan 1d):
     /// a scheduler wake reaches it by forcing its vCPU out.
-    guest_idle: AtomicBool,
+    guest_idle: Mutex<Option<GuestIdleTarget>>,
     receipts: Arc<ReceiptLog>,
     #[cfg(test)]
     delivery_validation_gate: Mutex<Option<Arc<std::sync::Barrier>>>,
@@ -330,7 +349,7 @@ impl WorkerKick {
             hardware: Mutex::new(None),
             need_resched: AtomicBool::new(false),
             shutdown_interrupted: AtomicBool::new(false),
-            guest_idle: AtomicBool::new(false),
+            guest_idle: Mutex::new(None),
             receipts,
             #[cfg(test)]
             delivery_validation_gate: Mutex::new(None),
@@ -391,11 +410,12 @@ impl WorkerKick {
             && self.need_resched.load(Ordering::Acquire)
     }
 
-    /// Publish (or end) the executor's wait in the guest. Sequentially
-    /// consistent: a waker either sees the flag and forces the vCPU out, or
-    /// published its work before the executor's re-scan that follows.
-    pub(crate) fn set_guest_idle(&self, idle: bool) {
-        self.guest_idle.store(idle, Ordering::SeqCst);
+    /// Publish the destination before the final host queue scan. A publisher
+    /// either finds this wait under the same lock, or queued its row before
+    /// the executor's scan. The guard removes the destination on every exit.
+    pub(crate) fn enter_guest_idle(&self, target: GuestIdleTarget) -> GuestIdleWait<'_> {
+        *self.guest_idle.lock() = Some(target);
+        GuestIdleWait(self)
     }
 
     #[cfg(test)]
@@ -502,10 +522,18 @@ impl ExecutorKick for WorkerKick {
     }
 
     fn wake_from_guest_idle(&self) {
-        if self.guest_idle.load(Ordering::SeqCst)
-            && let Some(hardware) = self.hardware.lock().as_ref()
-        {
-            hardware.handle.kick();
+        // Keep the wait's ownership through delivery: its mailbox cannot be
+        // retired or replaced while a wake still targets it. Zone kicks mark
+        // durable work on the current mailbox before the physical interrupt,
+        // including when the interrupt precedes effective guest entry.
+        match *self.guest_idle.lock() {
+            Some(GuestIdleTarget::Zone(slot)) => carrick_kernel::el1_zone::kick_slot(slot),
+            Some(GuestIdleTarget::Physical) => {
+                if let Some(hardware) = self.hardware.lock().as_ref() {
+                    hardware.handle.kick();
+                }
+            }
+            None => {}
         }
     }
 
