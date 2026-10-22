@@ -1,29 +1,115 @@
 //! Directory operations: `getdents64`, `mkdirat`, `mknodat`, `linkat`,
 //! `symlinkat`, `renameat`, `renameat2`, `unlinkat`, `readlinkat`.
 use super::*;
+use carrick_guest_mem::CurrentMmMemory;
 use std::path::Path;
 
 /// Encode the next repeatable portion without publishing a directory cursor.
 pub(super) fn directory_record_batch(
     entries: &[RootFsDirEntry],
     offset: usize,
-    _address: u64,
+    address: u64,
     capacity: usize,
 ) -> Result<(Vec<u8>, usize), DispatchError> {
-    let mut out = Vec::with_capacity(capacity.min(65536));
+    let transfer_limit = carrick_el1_abi::MM_PORTAL_MAX_BYTES as usize;
+    let page_size = carrick_abi::LINUX_PAGE_SIZE as usize;
+    let mut out = Vec::with_capacity(capacity.min(transfer_limit));
     let mut next = offset;
+    let page_left = page_size - (address as usize % page_size);
     while next < entries.len() {
         let length = dirent64_record_len(&entries[next]);
-        if length > capacity {
-            return Err(DispatchError::Errno(LINUX_EINVAL));
+        if length > capacity || length > transfer_limit {
+            if out.is_empty() {
+                return Err(DispatchError::Errno(LINUX_EINVAL));
+            }
+            break;
         }
-        if out.len() + length > capacity {
+        if out.len() + length > capacity.min(page_left).min(transfer_limit) {
+            if !out.is_empty() {
+                break;
+            }
+            // One record straddles a page. Prepare that whole record alone;
+            // a later bad page must not revoke preceding complete records.
+            append_dirent64_record(&entries[next], next + 1, &mut out);
+            next += 1;
             break;
         }
         append_dirent64_record(&entries[next], next + 1, &mut out);
         next += 1;
     }
     Ok((out, next))
+}
+
+/// One directory selection retained before the first record is consumed.
+/// No guard or guest pointer is held across an owner-memory dependency.
+pub struct OwnedDirectoryRead {
+    target: OpenFile,
+    _lease: crate::kernel::objects::FileDescriptionFdLease,
+    thread: crate::kernel::ThreadKey,
+    address: GuestVa,
+    length: usize,
+    wait: carrick_guest_mem::MemoryReadWait,
+}
+impl std::fmt::Debug for OwnedDirectoryRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedDirectoryRead")
+            .field("wait", &self.wait)
+            .finish_non_exhaustive()
+    }
+}
+impl PartialEq for OwnedDirectoryRead {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.target.description, &other.target.description)
+            && self.thread == other.thread
+            && self.address == other.address
+            && self.length == other.length
+            && self.wait == other.wait
+    }
+}
+impl Eq for OwnedDirectoryRead {}
+impl OwnedDirectoryRead {
+    pub fn wait(&self) -> &carrick_guest_mem::MemoryReadWait {
+        &self.wait
+    }
+}
+
+impl SyscallDispatcher {
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_owned_directory_read<M: CurrentMmMemory>(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        pending: Box<OwnedDirectoryRead>,
+        memory: &mut M,
+        reporter: &CompatReporter,
+        thread: Option<ThreadCtx<'_>>,
+        route: OrdinaryDispatchRoute<'_, '_>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if request.number != carrick_abi::syscall::nr::GETDENTS64
+            || pending.thread != kernel.thread().key()
+        {
+            return Err(DispatchError::Errno(carrick_abi::LINUX_EIO));
+        }
+        let mut cx = SyscallCtx {
+            host_wait: route.host_wait,
+            kernel,
+            request,
+            memory,
+            reporter,
+            thread,
+            execution_lease: route.lease,
+            mm_executor: route.mm_executor,
+        };
+        resources::with_captured_resources(kernel, || {
+            self.fs_view().read_directory(
+                &mut cx,
+                pending.target,
+                pending._lease,
+                pending.address,
+                pending.length,
+            )
+        })
+    }
 }
 
 struct RenameAtRequest {
@@ -36,6 +122,163 @@ struct RenameAtRequest {
 }
 
 impl<'a> FsView<'a> {
+    pub(super) fn read_directory<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: OpenFile,
+        lease: crate::kernel::objects::FileDescriptionFdLease,
+        address: GuestVa,
+        length: usize,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let Some(mut open) = crate::kernel::FileDescription::write_for_io(&target.description)
+        else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        let OpenDescription::Directory {
+            listing,
+            offset,
+            path,
+            trusted_host_dir,
+            ..
+        } = &mut *open
+        else {
+            return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
+        };
+        // The listing is taken LAZILY on the first read (Linux lists at
+        // getdents time, and a walk anchor that never reads pays
+        // nothing): streamed off a trusted host dirfd when nothing
+        // interferes, the exact layered merge otherwise.
+        let visible_self = proc_visible_self(cx.kernel);
+        let is_self_fd = is_proc_self_fd_dir(path, visible_self);
+        let is_self_fdinfo = is_proc_self_fdinfo_dir(path, visible_self);
+        if (is_self_fd || is_self_fdinfo)
+            && (*offset == 0 || matches!(listing, DirListing::Pending))
+        {
+            *listing = DirListing::Fixed(self.proc_self_fd_entries(path, is_self_fdinfo));
+        } else if matches!(listing, DirListing::Pending) {
+            *listing =
+                DirListing::Loaded(self.list_directory_entries(path, trusted_host_dir.as_ref()));
+        }
+        let entries = match listing {
+            DirListing::Loaded(entries) | DirListing::Fixed(entries) => entries,
+            DirListing::Pending => unreachable!("listing materialized above"),
+        };
+
+        // Real Linux getdents64 always returns `.` (self) and `..` (parent)
+        // first. Synthesize them on the READ path only — NOT in
+        // layered_directory_entries, which also backs the rmdir/unlinkat
+        // emptiness check (two synthetic dot entries there made every empty
+        // dir look non-empty → ENOTEMPTY broke `rm -rf`). Idempotent: prepend
+        // once if absent.
+        if entries.first().map(|e| e.name.as_str()) != Some(".") {
+            let parent = std::path::Path::new(path.as_str())
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".to_string());
+            let dir_path = path.clone();
+            let dot_entry = |name: &str, p: String| RootFsDirEntry {
+                name: name.to_string(),
+                metadata: RootFsMetadata {
+                    path: std::path::PathBuf::from(p),
+                    kind: RootFsEntryKind::Directory,
+                    mode: 0o755,
+                    size: 0,
+                },
+                // "."/".." are skipped by scandir; ino unused → hash fallback.
+                ino: 0,
+            };
+            entries.insert(0, dot_entry("..", parent));
+            entries.insert(0, dot_entry(".", dir_path));
+        }
+
+        let mut copied = 0;
+        while *offset < entries.len() && copied < length {
+            let Some(at) = address.raw().checked_add(copied as u64) else {
+                return Ok(if copied > 0 {
+                    DispatchOutcome::returned_len_or_errno(copied)
+                } else {
+                    DispatchOutcome::errno(LINUX_EFAULT)
+                });
+            };
+            let (bytes, next) = match directory_record_batch(entries, *offset, at, length - copied)
+            {
+                Ok(batch) => batch,
+                Err(_) if copied > 0 => break,
+                Err(error) => return Err(error),
+            };
+            let result =
+                if cx.memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+                    let Some(range) =
+                        carrick_guest_mem::GuestWriteRange::new(GuestVa::new(at), bytes.len())
+                    else {
+                        return Ok(if copied > 0 {
+                            DispatchOutcome::returned_len_or_errno(copied)
+                        } else {
+                            DispatchOutcome::errno(LINUX_EFAULT)
+                        });
+                    };
+                    match cx.memory.prepare_write(&[range]) {
+                        Ok(prepared) => {
+                            prepared.commit(&[&bytes]);
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    cx.memory
+                        .write_bytes(at, &bytes)
+                        .map_err(carrick_guest_mem::MemoryPrepareError::Fault)
+                };
+            if let Err(error) = result {
+                if let carrick_guest_mem::MemoryPrepareError::Limit(limit) = error {
+                    return Err(DispatchError::MemoryPreparation(format!(
+                        "directory record batch exceeds owner permit: {limit:?}"
+                    )));
+                }
+                if let carrick_guest_mem::MemoryPrepareError::Fault(ref fault) = error
+                    && !matches!(fault, carrick_guest_mem::MemoryError::OutOfBounds { .. })
+                {
+                    return Err(DispatchError::MemoryPreparation(format!(
+                        "directory copyout failed internally: {fault}"
+                    )));
+                }
+                // Only real, complete records can become a short result. No
+                // cursor or lock crosses a wait after such a prefix.
+                if copied > 0 {
+                    break;
+                }
+                use carrick_guest_mem::{MemoryPrepareError, MemoryReadWait, MemorySupplyRequest};
+                let wait = match error {
+                    MemoryPrepareError::OwnerWait(wait) => MemoryReadWait::Owner(wait),
+                    MemoryPrepareError::Physical(wait) => MemoryReadWait::Physical(wait),
+                    MemoryPrepareError::Supply(MemorySupplyRequest::Metadata {
+                        observed, ..
+                    }) => MemoryReadWait::Owner(observed),
+                    MemoryPrepareError::Supply(request) => MemoryReadWait::Supply(request),
+                    other => return Ok(crate::el1_delegation::owner_prepare_refusal(other)),
+                };
+                drop(open);
+                return Ok(DispatchOutcome::DirectoryReadSuspended(Box::new(
+                    OwnedDirectoryRead {
+                        target,
+                        _lease: lease,
+                        thread: cx.kernel.thread().key(),
+                        address,
+                        length,
+                        wait,
+                    },
+                )));
+            }
+            *offset = next;
+            copied += bytes.len();
+        }
+        Ok(if copied == 0 && *offset < entries.len() {
+            DispatchOutcome::errno(LINUX_EINVAL)
+        } else {
+            DispatchOutcome::returned_len_or_errno(copied)
+        })
+    }
+
     /// Whether a raw `getdirentries64` stream off `trusted`'s fd IS the exact
     /// guest listing of `dir_path` — i.e. no other layer contributes a name to
     /// it and every `d_type` the stream reports is the guest-visible type.
@@ -533,82 +776,10 @@ impl<'a> FsView<'a> {
 
     define_syscall! {
         fn getdents64(this, cx, fd: Fd, dirp: GuestPtr, count: u64) {
-            let fd: Fd = fd;
-            let address = dirp.0;
-            let length =
-                usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
-            let memory = &mut *cx.memory;
-            let Some(open_file) = this.open_file(fd.0) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            let OpenDescription::Directory {
-                listing,
-                offset,
-                path,
-                trusted_host_dir,
-                ..
-            } = &mut *open
-            else {
-                return Ok(DispatchOutcome::errno(LINUX_ENOTDIR));
-            };
-
-            // The listing is taken LAZILY on the first read (Linux lists at
-            // getdents time, and a walk anchor that never reads pays
-            // nothing): streamed off a trusted host dirfd when nothing
-            // interferes, the exact layered merge otherwise.
-            let visible_self = proc_visible_self(cx.kernel);
-            let is_self_fd = is_proc_self_fd_dir(path, visible_self);
-            let is_self_fdinfo = is_proc_self_fdinfo_dir(path, visible_self);
-            if (is_self_fd || is_self_fdinfo)
-                && (*offset == 0 || matches!(listing, DirListing::Pending))
-            {
-                *listing = DirListing::Fixed(this.proc_self_fd_entries(path, is_self_fdinfo));
-            } else if matches!(listing, DirListing::Pending) {
-                *listing = DirListing::Loaded(
-                    this.list_directory_entries(path, trusted_host_dir.as_ref()),
-                );
-            }
-            let entries = match listing {
-                DirListing::Loaded(entries) | DirListing::Fixed(entries) => entries,
-                DirListing::Pending => unreachable!("listing materialized above"),
-            };
-
-            // Real Linux getdents64 always returns `.` (self) and `..` (parent)
-            // first. Synthesize them on the READ path only — NOT in
-            // layered_directory_entries, which also backs the rmdir/unlinkat
-            // emptiness check (two synthetic dot entries there made every empty
-            // dir look non-empty → ENOTEMPTY broke `rm -rf`). Idempotent: prepend
-            // once if absent.
-            if entries.first().map(|e| e.name.as_str()) != Some(".") {
-                let parent = std::path::Path::new(path.as_str())
-                    .parent()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "/".to_string());
-                let dir_path = path.clone();
-                let dot_entry = |name: &str, p: String| RootFsDirEntry {
-                    name: name.to_string(),
-                    metadata: RootFsMetadata {
-                        path: std::path::PathBuf::from(p),
-                        kind: RootFsEntryKind::Directory,
-                        mode: 0o755,
-                        size: 0,
-                    },
-                    // "."/".." are skipped by scandir; ino unused → hash fallback.
-                    ino: 0,
-                };
-                entries.insert(0, dot_entry("..", parent));
-                entries.insert(0, dot_entry(".", dir_path));
-            }
-
-            let (out, next) = directory_record_batch(entries, *offset, address, length)?;
-            *offset = next;
-
-            memory.write_bytes(address, &out)?;
-
-            Ok(DispatchOutcome::returned_len_or_errno(out.len()))
+            let length = usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
+            let Some(target) = this.open_file(fd.0) else { return Ok(DispatchOutcome::errno(LINUX_EBADF)); };
+            let Some(lease) = target.description.retain_fd_lease() else { return Ok(DispatchOutcome::errno(LINUX_EBADF)); };
+            this.read_directory(cx, target, lease, GuestVa::new(dirp.0), length)
         }
 
         fn readlinkat(this, cx, dirfd: u64, pathname: GuestPtr, buf: GuestPtr, bufsiz: u64) {

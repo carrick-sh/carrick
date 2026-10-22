@@ -228,13 +228,22 @@ pub(super) enum OwnerSupplyWait {
 pub(super) enum OwnedSyscallResume {
     CopyoutRedispatch,
     PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
+    DirectoryRead(Box<carrick_kernel::dispatch::OwnedDirectoryRead>),
 }
 
-fn owner_copyin_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
-    let DispatchOutcome::WriteCopyInSuspended(pending) = outcome else {
-        return (outcome, None);
+fn owner_memory_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
+    let (wait, resume) = match outcome {
+        DispatchOutcome::WriteCopyInSuspended(pending) => (
+            pending.wait().clone(),
+            OwnedSyscallResume::PreparedWrite(pending),
+        ),
+        DispatchOutcome::DirectoryReadSuspended(pending) => (
+            pending.wait().clone(),
+            OwnedSyscallResume::DirectoryRead(pending),
+        ),
+        other => return (other, None),
     };
-    let wait_outcome = match pending.wait().clone() {
+    let wait_outcome = match wait {
         carrick_guest_mem::MemoryReadWait::Owner(wait) => {
             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
         }
@@ -246,10 +255,7 @@ fn owner_copyin_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<Owne
             DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
         }
     };
-    (
-        wait_outcome,
-        Some(OwnedSyscallResume::PreparedWrite(pending)),
-    )
+    (wait_outcome, Some(resume))
 }
 
 pub(super) enum HvpatchProductionPhase {
@@ -3281,7 +3287,7 @@ where
         frame: carrick_hal::RawSyscall,
         outcome: DispatchOutcome,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        let (outcome, resume) = owner_copyin_route(outcome);
+        let (outcome, resume) = owner_memory_route(outcome);
         self.service_outcome(engine, control, frame, outcome, resume)
     }
 
@@ -6926,7 +6932,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn owner_copyin_route_keeps_the_transfer_for_zone_resume() {
+    fn owner_memory_route_keeps_the_transfer_for_zone_resume() {
         use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
         use carrick_guest_mem::{
             CurrentMmMemory, MemoryError, MemoryReadSuspension, MemoryReadWait,
@@ -6975,7 +6981,7 @@ mod tests {
         let first = dispatcher
             .dispatch(&context, request, &mut memory, &reporter)
             .unwrap();
-        let (wait_outcome, resume) = super::owner_copyin_route(first);
+        let (wait_outcome, resume) = super::owner_memory_route(first);
         assert_eq!(
             wait_outcome,
             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }

@@ -32981,7 +32981,7 @@
     {
       "family": "k1_create_install",
       "operation": "write_for_io",
-      "owner": "carrick_kernel::dispatch::fs::directory::FsView<'a>::getdents64",
+      "owner": "carrick_kernel::dispatch::fs::directory::FsView<'a>::read_directory",
       "lane": "shared",
       "ceiling": 1
     },

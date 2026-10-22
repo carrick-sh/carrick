@@ -10,6 +10,11 @@
       "from": "carrick_vmm_hvf::host_signal::ForkResetWaiterRegistry::hold_for_fork",
       "to": "carrick_signal_linux::fork_reset::PreparedForkBacking<T>::hold",
       "issue": 488
+    },
+    {
+      "from": "carrick_kernel::dispatch::fs::directory::FsView<'a>::getdents64",
+      "to": "carrick_kernel::dispatch::fs::directory::FsView<'a>::read_directory",
+      "issue": 759
     }
   ],
   "terminal_custody": []

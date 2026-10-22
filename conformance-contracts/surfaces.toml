@@ -1775,5 +1775,41 @@ path = "crates/carrick-conformance-next/tests/directory_copyout.rs"
 contracts = ["kernel.fs.directory-copyout"]
 
 [[surfaces]]
-path = "crates/carrick-conformance-next/tests/fixtures/directory-copyout/**"
+path = "crates/carrick-conformance-next/tests/fixtures/directory-copyout/src/main.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/tests.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/mod.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/outcome.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/continuation.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/runtime.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/mod.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
+contracts = ["kernel.fs.directory-copyout"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/zone.rs"
 contracts = ["kernel.fs.directory-copyout"]

@@ -1892,3 +1892,40 @@ The signed `case_libpython_directory_copyout` reports openat/fstat/getdents64
 separately for mmap and malloc buffers. Its pre-fix owner failure, exact
 ARM64 oracle bless, runtime work/timing and Python startup verification remain
 explicit director gates on the Mac; this Linux worker cannot claim them.
+
+The reviewed stage-2 repair splits complete records at guest-page/transfer
+boundaries, calls the existing owner `prepare_write`, commits bytes, then
+advances the shared description cursor. A refusal before progress retains the
+exact description lease and thread, drops the description guard, and uses the
+existing supply/owner-zone resume machinery. A refusal after progress returns
+only the complete records already delivered. Internal preparation failures are
+runtime errors; only `OutOfBounds` becomes EFAULT. EOF does not access the
+buffer. No owner permit or editor guard is stored in `OwnedDirectoryRead`.
+
+`PreparedCopyoutWait` from #739 is **not on this branch**. The implementation
+extends main's retained I/O route (`WriteCopyInSuspended`) with
+`DirectoryReadSuspended`; it does not implement a second memory-preparation or
+parking service. The only wait-policy extension is in
+`vcpu_loop/zone.rs::park_owner_memory_action`: directory I/O selects the same
+killable owner-zone continuation as retained write copy-in. Existing waits
+keep their policy. Physical dependencies use main's `ResumeOwnerPhysical`.
+
+Review re-ran the cursor witness against the unchanged `a2e34d5da` directory
+implementation: retry returned zero, exit 101. At `46b157b91`, the separate
+encoder/admission witness also failed, with a 16000-byte batch. These are
+production-path/component witnesses, **not** live ARM owner-wait tests.
+The candidate adds a test-only refusal adapter over sparse AddressSpace to
+exercise production dispatch, suspended-operation ownership and resume after
+sibling fd reuse; it checks no initial commit/cursor change, exactly one
+commit after resume, true EFAULT versus internal failure, and cancellation.
+The batch witness covers mixed 1/14/255-byte names at 10/100/400/4096 records,
+unaligned output, existing PREPARE admission and page-proportional batch work.
+
+Full owner-wait acceptance remains open: two live guest threads with a sibling
+holding the editor, production handled-signal delivery after completion,
+SIGKILL/group exit, and the rule-2 holder audit/model. In particular, main's
+physical-wait branch re-parks an unready dependency before ordinary signal
+service; its SIGKILL cancellation has not been demonstrated here. This change
+must not be reported as closing #711/#739 or that physical-wait gap. The signed
+probe now compares fresh mmap, 2 MiB malloc and initialized 1 KiB destinations;
+the source-bound native ARM64 bless and Python import demo remain Mac gates.
