@@ -79,3 +79,105 @@ fn hosted_caches_keep_profiles_compiler_data_and_bootstrap_artifacts() {
         .unwrap();
     assert!(cache["with"]["save-if"].is_badvalue());
 }
+
+#[test]
+fn cross_toolchain_installs_restore_their_package_cache_first() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let workflow = &yaml_rust2::YamlLoader::load_from_str(&text).unwrap()[0];
+    let mut installs = 0;
+    for (job, body) in workflow["jobs"].as_hash().unwrap() {
+        let Some(steps) = body["steps"].as_vec() else {
+            continue;
+        };
+        for (index, step) in steps.iter().enumerate() {
+            let Some(recipe) = step["run"]
+                .as_str()
+                .and_then(|run| run.strip_prefix("just "))
+                .filter(|recipe| recipe.starts_with("ci-install-") && recipe.ends_with("-cross"))
+            else {
+                continue;
+            };
+            installs += 1;
+            let cache = &steps[index - 1];
+            assert!(
+                cache["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/cache@")),
+                "{job:?}: {recipe} must follow its package cache"
+            );
+            assert_eq!(
+                cache["with"]["path"].as_str(),
+                Some("${{ runner.temp }}/apt-cross")
+            );
+            let key = cache["with"]["key"].as_str().unwrap();
+            assert!(key.starts_with(&format!("apt-{recipe}-")), "{key}");
+            assert!(
+                key.contains("${{ steps.runner-image.outputs.id }}"),
+                "{key}"
+            );
+            assert!(key.contains("hashFiles('scripts/ci/apt-cached-install.sh')"));
+            assert_eq!(steps[index - 2]["id"].as_str(), Some("runner-image"));
+        }
+    }
+    assert_eq!(installs, 4, "every cross toolchain install is cached");
+}
+
+#[test]
+// The script runs on hosted Ubuntu; GNU timeout is absent from stock macOS.
+#[cfg(target_os = "linux")]
+fn warm_apt_cache_installs_without_contacting_the_mirror() {
+    // #615: a crawling mirror failed `portable` seven times in one day.
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let script = root.join("scripts/ci/apt-cached-install.sh");
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let log = temp.path().join("apt.log");
+    for (name, body) in [
+        ("sudo", "#!/bin/sh\nexec \"$@\"\n".to_owned()),
+        (
+            "apt-get",
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$*\" in *--download-only*)\n  for a in \"$@\"; do case \"$a\" in Dir::Cache::archives=*) touch \"${{a#Dir::Cache::archives=}}/pkg_1.0_amd64.deb\";; esac; done;;\nesac\n",
+                log.display()
+            ),
+        ),
+    ] {
+        let path = bin.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cache = temp.path().join("apt-cross");
+    let run = |packages: &[&str]| {
+        let _ = std::fs::remove_file(&log);
+        let status = std::process::Command::new(&script)
+            .arg(&cache)
+            .args(packages)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::read_to_string(&log).unwrap()
+    };
+    let cold = run(&["gcc-aarch64-linux-gnu"]);
+    assert!(cold.contains("update"), "{cold}");
+    assert!(cold.contains("--download-only"), "{cold}");
+    let warm = run(&["gcc-aarch64-linux-gnu"]);
+    assert!(
+        !warm.contains("update"),
+        "warm cache contacted the mirror: {warm}"
+    );
+    assert!(!warm.contains("--download-only"), "{warm}");
+    assert!(warm.contains("--no-download"), "{warm}");
+    assert!(warm.contains("pkg_1.0_amd64.deb"), "{warm}");
+    let changed = run(&["clang", "llvm"]);
+    assert!(
+        changed.contains("update"),
+        "a different package set must refetch: {changed}"
+    );
+}

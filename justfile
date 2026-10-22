@@ -1246,11 +1246,13 @@ ci-install-semgrep:
     "$RUNNER_TEMP/semgrep/bin/pip" install semgrep
     echo "$RUNNER_TEMP/semgrep/bin" >> "${GITHUB_PATH:?}"
 
+# The cross toolchains install from an actions/cache directory, so a slow
+# Ubuntu mirror cannot fail a job with a warm cache (#615).
 ci-install-linux-cross:
-    timeout 600 sh -c 'sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 update && sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 install -y gcc-aarch64-linux-gnu'
+    scripts/ci/apt-cached-install.sh "${RUNNER_TEMP:?}/apt-cross" gcc-aarch64-linux-gnu
 
 ci-install-freebsd-cross:
-    timeout 600 sh -c 'sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 update && sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 install -y clang llvm'
+    scripts/ci/apt-cached-install.sh "${RUNNER_TEMP:?}/apt-cross" clang llvm
 
 # Keep the permanent archive: release mirrors eventually remove old sysroots.
 ci-freebsd-sysroot:
