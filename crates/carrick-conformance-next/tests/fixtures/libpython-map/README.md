@@ -2,7 +2,8 @@
 
 Clean-room fixture from mmap(2) and the signed syscall shapes in #759.
 The native x86_64 Linux diagnostic passes. The oracle is provisional until
-blessed on native ARM64 Docker; a provisional pass is not Linux acceptance.
+blessed on native ARM64 Docker. The signed case runs the fixture and prints
+its output, then fails closed while the oracle status is provisional.
 The recorded reservation flags are 0x822 (private anonymous, DENYWRITE),
 while the text/data flags are 0x812 (private fixed file, DENYWRITE). The
 fixture covers that observed anonymous reservation first, then the file-backed
@@ -32,6 +33,9 @@ The test hashes current source and executable and requires the guest to emit
 its compiled source fingerprint. Run the same static binary on native ARM64
 Docker after stopping Carrick, retain image digest, kernel identity, binary
 hash and stdout, and bless `oracle.json` against that evidence.
+Set its status to `blessed` and record the native ARM64 image digest, kernel
+identity and tested binary hash with the oracle authority. Keep the current
+source fingerprint and compare the exact captured stdout before promotion.
 The startup selector additionally requires `python:3.12-slim python3 -c
 'print(1)'` to succeed. The existing deferred-anonymous, signal-mask and
 syscall-destination witnesses now have `case_` names so signed selectors
