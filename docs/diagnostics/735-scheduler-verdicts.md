@@ -17,24 +17,24 @@ remains provisional until the owner reruns the corrected artifact on HVF.
 - `el1_sched_pipe_pingpong_stays_in_guest`: `pingpong_rates` fails its guest
   success assertion, before checking any host-work slope. Guest iteration
   1199 is the final exchange of 200 warmups plus 1000 measured rounds. The
-  fixture does not currently report which syscall failed or its return value.
+  original fixture did not report which syscall failed or its return value.
   A sibling exits after writing that final byte, so memory edits during exit
   can coincide with the reader resuming. This ordering is a hypothesis, not
   a live trace proving the exact historical interleaving.
 
 ## Production refusal paths
 
-The sleep input path is `dispatch_time::{nanosleep,clock_nanosleep}` ->
-`read_timespec` -> `read_kernel_struct` -> `read_kernel_prefix`. The final
-helper applies `map_err(|_| LINUX_EFAULT)` to `GuestMemory::read_bytes`.
+Before the fix, the sleep input path was
+`dispatch_time::{nanosleep,clock_nanosleep}` -> `read_timespec` -> `read_kernel_struct` -> `read_kernel_prefix`. The final
+helper applied `map_err(|_| LINUX_EFAULT)` to `GuestMemory::read_bytes`.
 On admitted ARM roots, `Aarch64EngineCore::read_bytes_raw` calls
 `read_owner_bytes` / `continue_owner_read`; owner-lock, physical and supply
 waits return `MemoryError::ReadSuspended` with a retained transfer. The ABI
-helper discards that transfer and manufactures EFAULT. This is a product
+helper discarded that transfer and manufactured EFAULT. This is a product
 error; no guest pointer fault is required.
 
-The pipe adapter's `ipc::run` returns `written as i64` for any resumed
-`StepStatus::Fault` on `PipeRead`, including zero bytes. `ValidatedCopy`
+Before the fix, the pipe adapter's `ipc::run` returned `written as i64` for
+any resumed `StepStatus::Fault` on `PipeRead`, including zero bytes. `ValidatedCopy`
 returns false if the live memory validator cannot authorize the destination.
 Consequently a resumed read can report EOF while its pipe still contains the
 byte. The operation must preserve its description and transfer custody and
@@ -81,6 +81,10 @@ forwarded read and in-guest preemptions (the old test accepted zero). This
 proves host-served completion followed by shared-CPU progress. It does not
 force the exact instant of host wait enrollment; the VM-free host-wake and
 virtual-timer bindings remain the deterministic proof of that boundary.
+Specifically, `sched::tests::a_slice_ending_before_a_host_runnable_thread_leaves_for_the_host`
+publishes host work through `place_from_host`, delivers the owed reschedule
+interrupt, advances a fake clock by one slice, and asserts a host-service exit
+with the compute thread's registers retained. It passes on this branch.
 
 ## Signed commands for the director
 
@@ -156,3 +160,41 @@ an owner wait for that state. If a signed sleep still returns EFAULT, capture
 the existing `hvpatch_el1_host_read_progress` probe to distinguish that backend
 path from a typed owner/physical/supply suspension. Neither the historical logs
 nor the VM-free injection identify the exact backend event in the old run.
+
+## Linux verification
+
+Both production witnesses were committed red before their fixes: the pipe
+witness exited 101 with `Returned` instead of `Handback`, and the sleep
+witness exited 101 after observing errno 14 for a retained input transfer.
+The corrected IPC adapter suite passes all 26 tests. All three sleep
+copy-in tests and the runtime continuation-routing test pass. The virtual
+timer and host-service slice tests pass through the production scheduler
+adapter with a fake CPU clock.
+
+`just test-kernel`, `just clippy`, `just clippy-linux`, `just fmt-check`,
+`just lint-domains`, and finally the full `just test` all exit zero with
+`env -u RUSTC_WRAPPER CARRICK_SCCACHE=0`. The final kernel gate reports
+3,080 passed tests across 40 suites, with seven existing ignored tests.
+No sched-core code changed, so `just test-loom` is not applicable. The revised fixture passes the AArch64
+musl compile check and builds as a static AArch64 ELF with
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc`.
+The first fixture build failed because it selected the x86 host linker;
+selecting the installed cross-linker fixed that build configuration.
+
+The first `just lint-domains` run rejected the two new bare `Debug` derives
+in the glob-importing time dispatcher. Qualifying them through
+`::core::fmt::Debug` fixes that census ambiguity; the focused sleep tests
+and source authority-debt check against the original main base pass. The
+final gate sequence passed after that correction. The live authority census
+checked Linux CLI and runtime; its other host profiles remain pending.
+
+Final gate logs are `/tmp/735-final-<recipe>.log` on ctb-w2, with exit codes
+in `/tmp/735-final-gates.status`. The full host log includes the new pipe,
+sleep and runtime-route witnesses passing; its final zero-test entries are
+the serial partition of targets whose tests ran in the preceding parallel
+partition. No gate was piped through an output filter, retried without a
+fix, or run with reduced test concurrency.
+
+HVF execution, five-of-five signed qualification, refreshed Docker evidence
+and signed promotion remain outstanding. The unreceipted backend refusal
+above also remains outside the proven fix. This is not issue closure.
