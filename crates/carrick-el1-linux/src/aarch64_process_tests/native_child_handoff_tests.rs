@@ -552,8 +552,14 @@ fn interrupted_native_service_preserves_instruction_and_registers() {
     two_native_children_service_waits(ServiceWitness::Interrupt);
 }
 
+#[test]
+fn native_service_intake_does_not_reacquire_the_busy_mm_root() {
+    two_native_children_service_waits(ServiceWitness::RootBusy);
+}
+
 #[derive(Clone, Copy)]
 enum ServiceWitness {
+    RootBusy,
     Fault,
     Completed,
     Retry,
@@ -650,7 +656,7 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
                 fixture.task.linux.mark_pending_host_work();
                 carrick_el1_abi::Action::Forward
             }
-            ServiceWitness::Fault => {
+            ServiceWitness::Fault | ServiceWitness::RootBusy => {
                 frame.esr = 0x9200004f;
                 frame.far = 0x6000000fd8;
                 carrick_el1_abi::Action::Forward
@@ -679,6 +685,18 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             control,
             &mut service,
             |entry| {
+                let _root = matches!(witness, ServiceWitness::RootBusy).then(|| {
+                    fixture
+                        .region
+                        .table()
+                        .lock_in(
+                            crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+                            fixture.zone.spaces.find(identity.mm).unwrap().index(),
+                            ReservationMm::new(identity.mm).unwrap(),
+                            1,
+                        )
+                        .unwrap()
+                });
                 let result = entry.begin_service(operation).unwrap();
                 assert!(entry.take_handoff_receipt().is_some());
                 result

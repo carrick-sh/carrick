@@ -201,6 +201,42 @@ impl ServiceCell {
         self.state.store(IDLE, Ordering::Release);
         Ok(())
     }
+    /// Recover the immutable admitted-MM identity from this member's birth.
+    /// The native entry has already authenticated its task/thread/record;
+    /// recovering this retained handle never acquires a reservation root.
+    pub fn bound_birth(
+        &self,
+        process: TaskKey,
+        thread: EntryThreadGeneration,
+        record: RecordRef,
+    ) -> Result<ServiceBirth, ServiceError> {
+        self.state
+            .compare_exchange(IDLE, WRITING, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ServiceError::Busy)?;
+        let birth = (|| {
+            let carrier = NonZeroU64::new(self.words[0].load(Ordering::Relaxed))
+                .ok_or(ServiceError::Stale)?;
+            let mm = crate::ReservationMm::new(self.words[6].load(Ordering::Relaxed))
+                .ok_or(ServiceError::Stale)?;
+            let incarnation = NonZeroU64::new(self.words[7].load(Ordering::Relaxed))
+                .ok_or(ServiceError::Stale)?;
+            // SAFETY: bind stored this admitted handle; IDLE excludes an
+            // outstanding request and the WRITING reservation excludes reset.
+            let mm = unsafe { El1MmHandle::from_admitted_owner(carrier, mm, incarnation) };
+            let birth = ServiceBirth {
+                process,
+                thread,
+                record,
+                mm,
+            };
+            self.same_birth(birth)
+                .then_some(birth)
+                .ok_or(ServiceError::Stale)
+        })();
+        self.state.store(IDLE, Ordering::Release);
+        birth
+    }
+
     /// Caller holds the member reset reservation. An outstanding request
     /// refuses reset even if a physical metadata pin keeps its bytes mapped.
     pub fn reset_unpublished(&self) -> Result<(), ServiceError> {
@@ -676,6 +712,22 @@ mod tests {
         cell.reset_unpublished().unwrap();
         let new_birth = birth(1, 2);
         cell.bind(new_birth).unwrap();
+        assert_eq!(
+            cell.bound_birth(old_birth.process, old_birth.thread, old_birth.record),
+            Err(ServiceError::Stale)
+        );
+        assert_eq!(
+            cell.bound_birth(new_birth.process, old_birth.thread, new_birth.record),
+            Err(ServiceError::Stale)
+        );
+        assert_eq!(
+            cell.bound_birth(new_birth.process, new_birth.thread, old_birth.record),
+            Err(ServiceError::Stale)
+        );
+        assert_eq!(
+            cell.bound_birth(new_birth.process, new_birth.thread, new_birth.record),
+            Ok(new_birth)
+        );
         let new = cell
             .publish(new_birth, SnapshotGeneration::INITIAL, fault())
             .unwrap();

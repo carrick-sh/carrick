@@ -274,7 +274,9 @@ retains at most one signal or service wait in the shared continuation table;
 one retained member allocation also preserves a saved signal mask after its
 wait completes, until signal delivery consumes that mask. Host
 records retain backing and observe exact identities; they do not adopt children
-into another process graph. The binding is
+into another process graph. Intake reuses the birth-bound MM identity even
+when another admitted participant holds the reservation root. The bindings include
+`native_service_intake_does_not_reacquire_the_busy_mm_root` and
 `two_native_children_service_waits_release_the_only_execution_slot` in
 `carrick-el1-linux`. Its companion cases preserve a completed result through
 cancellation, retry an effect-free syscall with its original arguments, and

@@ -1,9 +1,7 @@
 //! Native-member service continuations. Slot custody ends at park; semantic
 //! process/MM custody ends only after the exact external acknowledgment.
 use super::*;
-use carrick_core_abi::service::{
-    ServiceBirth, ServiceError, ServiceOperation, ServiceRequest, ServiceResult,
-};
+use carrick_core_abi::service::{ServiceError, ServiceOperation, ServiceRequest, ServiceResult};
 use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
 
 pub(super) struct PendingService<'a> {
@@ -92,7 +90,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         operation: ServiceOperation,
     ) -> Result<NativeResume, NativeProcessError> {
-        let (page, mm, control) = {
+        let (page, control) = {
             let graph = self.runtime.graph.lock();
             if graph.has_member_wait(&self.record) {
                 return Err(NativeProcessError::Busy);
@@ -111,17 +109,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         && core::ptr::eq(member.control.control(), self.control)
                 })
                 .ok_or(NativeProcessError::Stale)?;
-            (resources.page, resources.mm.clone(), member.control.clone())
+            (resources.page, member.control.clone())
         };
-        let handle = self.service.service_mm_handle(&mm)?;
+        let birth = control
+            .service
+            .bound_birth(self.key, self.binding.thread_generation, self.record)
+            .map_err(service_error)?;
         let claim = carrick_core::terminal::NativeServiceClaim::acquire(page)
             .map_err(|_| NativeProcessError::Busy)?;
-        let birth = ServiceBirth {
-            process: self.key,
-            thread: self.binding.thread_generation,
-            record: self.record,
-            mm: handle,
-        };
         let published = {
             let graph = self.runtime.graph.lock();
             if !claim.admitted() || graph.has_member_wait(&self.record) {
