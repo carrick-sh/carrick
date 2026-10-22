@@ -4878,6 +4878,120 @@ fn delegated_published_grant_settles_after_backing_leaves_pristine() {
     published_grant_settlement(None, true);
 }
 
+/// A guest-lane fault still owns its first-touch plan when its verified
+/// descriptor receipt arrives. Run the production classifier in a child so
+/// re-acquiring the plan's alias exclusion fails on a bounded deadline.
+#[test]
+fn delegated_guest_grant_reuses_fault_plan_alias_exclusion() {
+    const CHILD: &str = "CARRICK_GRANT_ALIAS_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            BackingIdentity, DescriptorApplied, DescriptorOp, DescriptorOutcome, DescriptorReceipt,
+            DescriptorTxn, DescriptorTxnId, PageSpan, ReclaimedTables, TableGrants,
+        };
+        use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
+        let dispatcher = SyscallDispatcher::new();
+        let root = Root::admit(&dispatcher);
+        let fault = LINUX_MMAP_BASE + STOCK_WINDOW + 2 * PAGE;
+        root.guest_mmap(
+            Placement::Fixed(fault),
+            2 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+        crate::dispatch::mm_mutation::test_support::with_permit(
+            dispatcher.mm_mutation_coordinator(),
+            |permit| {
+                let plan = dispatcher
+                    .resident_frame_grant_plan(permit, fault, STOCK_WINDOW)
+                    .expect("root first-touch plan");
+                let nz = |value| std::num::NonZeroU64::new(value).unwrap();
+                let grant = carrick_el1_abi::FrameGrantResidencyIdentity {
+                    mm_key: dispatcher.mm_authority().mm_id.raw(),
+                    semantic_base: plan.start(),
+                    physical_ipa: 0x1234_0000,
+                    len: plan.len(),
+                    mapping_id: 1,
+                    frame_id: 1,
+                    owner_generation: 1,
+                    inventory_revision: 1,
+                };
+                let txn = DescriptorTxn {
+                    id: DescriptorTxnId {
+                        mm_key: nz(grant.mm_key),
+                        generation: nz(1),
+                    },
+                    root: SubstrateGpa(0x8800_0000_0000),
+                    op: DescriptorOp::Prepare {
+                        publication: GuestLeafPublication {
+                            va: grant.semantic_base,
+                            ipa: grant.physical_ipa,
+                            len: grant.len,
+                            writable: true,
+                            executable: false,
+                        },
+                        resident: PageSpan::new(fault, PAGE),
+                        backing: BackingIdentity {
+                            frame_id: nz(1),
+                            mapping_id: nz(1),
+                            owner_generation: nz(1),
+                            inventory_revision: nz(1),
+                        },
+                    },
+                    tables: TableGrants::NONE,
+                };
+                let receipt = txn
+                    .verify_receipt(&DescriptorReceipt {
+                        id: txn.id,
+                        digest: txn.digest(),
+                        outcome: DescriptorOutcome::Applied(DescriptorApplied {
+                            pages: grant.len / PAGE,
+                            live_stores: 1,
+                            flush_required: true,
+                            resident: PageSpan::new(fault, PAGE),
+                            tables_linked: 0,
+                            reclaimed: ReclaimedTables::NONE,
+                        }),
+                    })
+                    .unwrap();
+                // The original plan remains live while the production
+                // receipt classifier runs, as it does in the fault resolver.
+                let publication = dispatcher
+                    .published_frame_grant_plan(
+                        permit,
+                        grant,
+                        LinuxProtFlags::READ | LinuxProtFlags::WRITE,
+                        &receipt,
+                    )
+                    .unwrap();
+                dispatcher.commit_published_frame_grant(publication, grant);
+                drop(plan);
+            },
+        );
+        return;
+    }
+    let module = module_path!().split_once("::").unwrap().1;
+    let name = format!("{module}::delegated_guest_grant_reuses_fault_plan_alias_exclusion");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--nocapture"])
+        .env(CHILD, "1")
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "guest first touch exited {status}");
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("guest first touch deadlocked on its own alias exclusion");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn delegated_published_grant_settles_after_guest_retirement_without_reviving_residency() {
     published_grant_settlement(Some(0), true);
