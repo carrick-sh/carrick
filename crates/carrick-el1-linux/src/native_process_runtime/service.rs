@@ -33,6 +33,19 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .zone
             .object_wait(key, &carrick_sched_core::ShortLockSpin)
             .map_err(|_| NativeProcessError::Quarantined)?;
+        // Completion may have consumed the captured request before this
+        // queue lock was acquired. A signal targets the member, not an old
+        // service sequence; never cancel its replacement or fail the run.
+        if self
+            .graph
+            .lock()
+            .services
+            .get(&record)
+            .map(|pending| pending.request)
+            != Some(request)
+        {
+            return Ok(());
+        }
         control
             .service
             .cancel(request.identity)
@@ -135,7 +148,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 control,
             },
         );
-        if let Err(error) = self.service.intake_service(request, self.control) {
+        if let Err(error) = self
+            .current
+            .service_notice
+            .publish(request.identity.into())
+            .map_err(service_error)
+        {
             let key =
                 ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
             let guard = self
@@ -276,7 +294,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if pending.request != request {
             return Err(NativeProcessError::Quarantined);
         }
-        self.release_service_claim(pending.claim)?;
         if self
             .runtime
             .graph
@@ -295,6 +312,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         ServiceOperation::Crossing { .. } => OwnerEntry::Syscall,
                     });
             }
+            self.release_service_claim(pending.claim)?;
             return Ok(NativeResume::NoPending);
         }
         // SAFETY: completion belongs to this exact selected record.
@@ -304,7 +322,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .record(self.record.id)
                 .consume_owner_continuation();
         }
-        match (request.operation, result) {
+        let completed = (|| match (request.operation, result) {
             (ServiceOperation::Crossing { .. }, ServiceResult::Refused) => {
                 Ok(NativeResume::Returned(SyscallResult::new(
                     carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),
@@ -334,10 +352,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| NativeProcessError::Fault)?;
                 Ok(NativeResume::NoPending)
             }
-            (_, _) => self
-                .service
-                .complete_service(request, result, &mut self.words),
-        }
+            (ServiceOperation::Fault(_), ServiceResult::Supplied) => {
+                // Supply changes physical availability only. Retry the exact
+                // faulting instruction; the ring fault resolver still decides
+                // the descriptor transaction or signal.
+                Ok(NativeResume::NoPending)
+            }
+            (ServiceOperation::Crossing { .. }, ServiceResult::Supplied) => {
+                // No generic host syscall dispatcher owns native semantics.
+                Err(NativeProcessError::Quarantined)
+            }
+        })();
+        // Mapping/signal completion still needs the exact member/MM. Release
+        // terminal custody only after the ring has made that decision.
+        self.release_service_claim(pending.claim)?;
+        completed
     }
 }
 fn service_error(error: ServiceError) -> NativeProcessError {

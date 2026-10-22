@@ -1196,7 +1196,7 @@ pub struct CurrentTask {
     pub mm: ExecutionMm,
     pub metadata: LinuxTaskMetadata,
     root_generation: AtomicU64,
-    _stride_padding: [u64; 4],
+    pub service_notice: carrick_core_abi::service::ServiceNotice,
 }
 
 pub const CURRENT_TASK_STRIDE_SHIFT: u32 = 7;
@@ -1231,7 +1231,7 @@ impl CurrentTask {
             mm: ExecutionMm::new(),
             metadata: LinuxTaskMetadata::new(),
             root_generation: AtomicU64::new(0),
-            _stride_padding: [0; 4],
+            service_notice: carrick_core_abi::service::ServiceNotice::new(),
         }
     }
 
@@ -5529,14 +5529,21 @@ mod layout_manifest {
                      mm: _,
                      metadata: _,
                      root_generation: _,
-                     _stride_padding: _,
+                     service_notice: _,
                  }: CurrentTask| {};
         field!(CurrentTask, execution, ExecutionIdentity, 0, 16, 8);
         field!(CurrentTask, linux, LinuxTaskState, 16, 32, 8);
         field!(CurrentTask, mm, ExecutionMm, 48, 16, 8);
         field!(CurrentTask, metadata, LinuxTaskMetadata, 64, 24, 8);
         field!(CurrentTask, root_generation, AtomicU64, 88, 8, 8);
-        field!(CurrentTask, _stride_padding, [u64; 4], 96, 32, 8);
+        field!(
+            CurrentTask,
+            service_notice,
+            carrick_core_abi::service::ServiceNotice,
+            96,
+            32,
+            8
+        );
     }
 
     #[test]

@@ -305,17 +305,6 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         &self,
         mm: &Self::Mm,
     ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError>;
-    fn intake_service(
-        &mut self,
-        request: carrick_core_abi::service::ServiceRequest,
-        control: &'a ThreadControlSlot,
-    ) -> Result<(), NativeProcessError>;
-    fn complete_service(
-        &mut self,
-        request: carrick_core_abi::service::ServiceRequest,
-        result: carrick_core_abi::service::ServiceResult,
-        words: &mut C,
-    ) -> Result<NativeResume, NativeProcessError>;
     fn prepare_mm(
         &mut self,
         parent: &Self::Mm,
