@@ -26,8 +26,8 @@ use std::sync::Arc;
 use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{
-    CurrentMmMemory, Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError, RepointPrivateError,
-    SharedFutexLocation,
+    CurrentMmMemory, Gpa, GuestMemory, GuestVa, MappingRetirementError, MappingSharing,
+    MemoryError, RepointPrivateError, SharedFutexLocation,
 };
 use carrick_guest_mem::{LegacyProtectionRead, UserMemoryAuthority};
 use carrick_hal::guest_arch::GuestArch as _;
@@ -1911,37 +1911,47 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         va: u64,
         len: usize,
         reclaim: bool,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<(), MappingRetirementError> {
         if self.page_tables.live_descriptor_owner() != LiveDescriptorOwner::Guest {
-            return self.pt_edit_and_flush_after_adopting(va, len, |editor| {
-                if reclaim {
-                    editor.unmap_aliased(va, len)
-                } else {
-                    editor.invalidate(va, len)
-                }
-            });
+            return self
+                .pt_edit_and_flush_after_adopting(va, len, |editor| {
+                    if reclaim {
+                        editor.unmap_aliased(va, len)
+                    } else {
+                        editor.invalidate(va, len)
+                    }
+                })
+                .map_err(MappingRetirementError::Indeterminate);
         }
         if !reclaim {
             return self
-                .apply_stage1_rules((va, len), &[(va, len, TerminalRule::pt(PtOp::Retire))]);
+                .apply_stage1_rules((va, len), &[(va, len, TerminalRule::pt(PtOp::Retire))])
+                .map_err(MappingRetirementError::Indeterminate);
         }
         let failure = |what: String| MemoryError::HostMap(format!("guest stage-1 unmap: {what}"));
-        let mm = std::num::NonZeroU64::new(self.mm_generation)
-            .ok_or_else(|| failure("no MM identity".to_owned()))?;
-        let slots = carrick_el1_abi::descriptor_txn_slots_host()
-            .ok_or_else(|| failure("no descriptor slots".to_owned()))?;
-        self.load_live_stage1_manager()?;
+        let mut progress = crate::descriptor_drain::RetirementProgress::default();
+        let mm = std::num::NonZeroU64::new(self.mm_generation).ok_or_else(|| {
+            progress.before_publication_error(failure("no MM identity".to_owned()))
+        })?;
+        let slots = carrick_el1_abi::descriptor_txn_slots_host().ok_or_else(|| {
+            progress.before_publication_error(failure("no descriptor slots".to_owned()))
+        })?;
+        self.load_live_stage1_manager()
+            .map_err(|error| progress.before_publication_error(error))?;
         let tables = self.page_tables.clone();
         // One required invalidation after the last piece, as in
         // `apply_stage1_rules`.
         let required = std::cell::Cell::new(false);
         const TWO_MIB: u64 = 2 << 20;
-        let mut retire = || -> Result<(), MemoryError> {
+        let mut retire = || -> Result<(), MappingRetirementError> {
             let mut pending = vec![(va, len as u64)];
             while let Some((start, span)) = pending.pop() {
                 let op = tables
                     .with_manager(|manager| manager.unmap_aliased_op(start, span))
-                    .ok_or_else(|| failure("stage-1 image absent".to_owned()))?;
+                    .ok_or_else(|| {
+                        progress
+                            .before_publication_error(failure("stage-1 image absent".to_owned()))
+                    })?;
                 let txn = match tables.prepare_guest_descriptor_txn(mm, op) {
                     Ok(txn) => txn,
                     Err(carrick_mmu_core::aarch64::GuestTxnPrepareError::Refused(
@@ -1949,9 +1959,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     )) => {
                         let mid = (start + span / 2) & !(TWO_MIB - 1);
                         if mid <= start || mid >= start + span {
-                            return Err(failure(format!(
+                            return Err(progress.before_publication_error(failure(format!(
                                 "0x{start:x}+0x{span:x} empties more tables than one receipt carries"
-                            )));
+                            ))));
                         }
                         // Upper half first so the lower half is submitted first.
                         pending.push((mid, start + span - mid));
@@ -1959,7 +1969,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                         continue;
                     }
                     Err(error) => {
-                        return Err(failure(format!("prepare at 0x{start:x}: {error:?}")));
+                        return Err(progress.before_publication_error(failure(format!("prepare at 0x{start:x}: {error:?}"))));
                     }
                 };
                 let mut services = self.descriptor_services();
@@ -1969,14 +1979,18 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     slots,
                     &[txn],
                 )
-                .map_err(|error| failure(format!("apply at 0x{start:x}: {error}")))?;
+                .map_err(|error| progress.publication_error(error))?;
+                progress.committed();
             }
             Ok(())
         };
         let retired = retire();
         if required.get() {
-            self.invalidate_after_edit()
-                .map_err(|error| failure(format!("stage-1 TLBI failed: {error}")))?;
+            self.invalidate_after_edit().map_err(|error| {
+                MappingRetirementError::Indeterminate(failure(format!(
+                    "stage-1 TLBI failed: {error}"
+                )))
+            })?;
         }
         retired
     }
@@ -4221,6 +4235,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // uncertain publication must fail stopped with old owners still retained.
         if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
             self.retire_stage1_range(address, len, true)
+                .map_err(MappingRetirementError::into_memory_error)
         } else {
             self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
         }
@@ -4460,6 +4475,16 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.retire_mapping(GuestVa::new(address), len)
+            .map_err(MappingRetirementError::into_memory_error)
+    }
+
+    fn retire_mapping(
+        &mut self,
+        address: GuestVa,
+        len: usize,
+    ) -> Result<(), MappingRetirementError> {
+        let address = address.raw();
         let span = carrick_mmu_core::aarch64::descriptor_txn::PageSpan::new(address, len as u64);
         trace_el1_mapping_leafs(
             self,
@@ -4485,7 +4510,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             self.retire_stage1_range(address, len, false)?;
         }
         self.vm.on_unmap(address, len).map_err(|error| {
-            MemoryError::HostMap(format!("retire backend mapping after munmap: {error}"))
+            MappingRetirementError::Indeterminate(MemoryError::HostMap(format!(
+                "retire backend mapping after munmap: {error}"
+            )))
         })?;
         self.set_unmapped(address, len, true);
         trace_el1_mapping_leafs(
@@ -4503,9 +4530,11 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// in-place reuse). Flush the stale TLB entry. Mirrors HVF.
     fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         // Reclaim the alias leaves/table and complete TLBI before unregistering
-        // backend lookup metadata. An Err therefore leaves the alias registry
-        // intact and consistent with the still-owned host/stage-2 backing.
-        self.retire_stage1_range(address, len, true)?;
+        // backend lookup metadata. This legacy API erases the classification;
+        // replacement uses retire_mapping so partial publication cannot be
+        // mistaken for an intact predecessor.
+        self.retire_stage1_range(address, len, true)
+            .map_err(MappingRetirementError::into_memory_error)?;
         self.vm.on_unmap(address, len).map_err(|error| {
             MemoryError::HostMap(format!("retire backend alias after munmap: {error}"))
         })?;
@@ -7418,7 +7447,7 @@ mod tests {
             .split("\n#[cfg(test)]\nmod tests")
             .next()
             .expect("production AArch64 engine source");
-        for path in ["fn unmap_range", "fn unmap_alias_range"] {
+        for path in ["fn retire_mapping", "fn unmap_alias_range"] {
             // Stop at the next item's doc comment, which may name the funnel.
             let body = production
                 .split(path)

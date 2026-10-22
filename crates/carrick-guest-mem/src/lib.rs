@@ -469,6 +469,26 @@ impl RepointPrivateError {
     }
 }
 
+/// Failure while retiring translations and backing before a replacement.
+/// Only `Clean` proves that the predecessor is still intact. Once any part
+/// has committed, an error must not return control to the guest with the old
+/// semantic mapping still published.
+#[derive(Debug, Clone, PartialEq, Eq, ::thiserror::Error)]
+pub enum MappingRetirementError {
+    #[error("mapping retirement refused without changing the predecessor: {0}")]
+    Clean(#[source] MemoryError),
+    #[error("mapping retirement may have changed the predecessor: {0}")]
+    Indeterminate(#[source] MemoryError),
+}
+
+impl MappingRetirementError {
+    pub fn into_memory_error(self) -> MemoryError {
+        match self {
+            Self::Clean(error) | Self::Indeterminate(error) => error,
+        }
+    }
+}
+
 /// The guest physical/virtual memory a syscall handler reads and writes. The
 /// backend may be the real HVF-backed address space or the in-memory
 /// `LinearMemory` used by unit tests.
@@ -944,6 +964,18 @@ pub trait GuestMemory {
     /// for guest `munmap`. Default: no-op.
     fn unmap_range(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
         Ok(())
+    }
+
+    /// Retire physical mappings before committing a semantic replacement.
+    /// A backend may report `Clean` only if every predecessor translation and
+    /// backing remains intact. Untyped unmap errors prove no such guarantee.
+    fn retire_mapping(
+        &mut self,
+        address: GuestVa,
+        len: usize,
+    ) -> Result<(), MappingRetirementError> {
+        self.unmap_range(address.raw(), len)
+            .map_err(MappingRetirementError::Indeterminate)
     }
 
     /// `munmap` of a high-VA alias mapping: like `unmap_range`, but the HVF
