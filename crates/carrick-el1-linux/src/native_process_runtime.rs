@@ -899,23 +899,125 @@ struct MemberWaitState<'a> {
     suspend_mask: Option<carrick_signal_core::policy::SigBlockMask>,
 }
 
+// Every continuation remains separately typed and keyed, while one tree
+// implementation serves process operations, terminal custody, and member waits.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum PendingKey {
+    Operation(TaskKey),
+    Exit(TaskKey),
+    Member(RecordRef),
+}
+enum PendingState<'a> {
+    Operation(PendingContinuation),
+    Exit(PendingExit<'a>),
+    Member(MemberWaitState<'a>),
+}
+#[derive(Default)]
+struct PendingTable<'a> {
+    rows: BTreeMap<PendingKey, Box<PendingState<'a>>>,
+}
+impl<'a> PendingTable<'a> {
+    #[inline(never)]
+    fn insert_row(&mut self, key: PendingKey, state: PendingState<'a>) {
+        self.rows.insert(key, Box::new(state));
+    }
+    #[inline(never)]
+    fn take_row(&mut self, key: &PendingKey) -> Option<PendingState<'a>> {
+        self.rows.remove(key).map(|row| *row)
+    }
+    fn get(&self, key: &TaskKey) -> Option<&PendingContinuation> {
+        match self.rows.get(&PendingKey::Operation(*key))?.as_ref() {
+            PendingState::Operation(pending) => Some(pending),
+            _ => unreachable!(),
+        }
+    }
+    fn contains_key(&self, key: &TaskKey) -> bool {
+        self.get(key).is_some()
+    }
+    fn insert(&mut self, key: TaskKey, pending: PendingContinuation) {
+        self.insert_row(PendingKey::Operation(key), PendingState::Operation(pending));
+    }
+    fn remove(&mut self, key: &TaskKey) -> Option<PendingContinuation> {
+        match self.take_row(&PendingKey::Operation(*key))? {
+            PendingState::Operation(pending) => Some(pending),
+            _ => unreachable!(),
+        }
+    }
+    fn exit(&self, key: &TaskKey) -> Option<&PendingExit<'a>> {
+        match self.rows.get(&PendingKey::Exit(*key))?.as_ref() {
+            PendingState::Exit(pending) => Some(pending),
+            _ => unreachable!(),
+        }
+    }
+    fn exit_mut(&mut self, key: &TaskKey) -> Option<&mut PendingExit<'a>> {
+        match self.rows.get_mut(&PendingKey::Exit(*key))?.as_mut() {
+            PendingState::Exit(pending) => Some(pending),
+            _ => unreachable!(),
+        }
+    }
+    fn has_exit(&self, key: &TaskKey) -> bool {
+        self.exit(key).is_some()
+    }
+    fn insert_exit(&mut self, key: TaskKey, pending: PendingExit<'a>) {
+        self.insert_row(PendingKey::Exit(key), PendingState::Exit(pending));
+    }
+    fn remove_exit(&mut self, key: &TaskKey) -> Option<PendingExit<'a>> {
+        match self.take_row(&PendingKey::Exit(*key))? {
+            PendingState::Exit(pending) => Some(pending),
+            _ => unreachable!(),
+        }
+    }
+    fn member(&self, record: &RecordRef) -> Option<&MemberWaitState<'a>> {
+        match self.rows.get(&PendingKey::Member(*record))?.as_ref() {
+            PendingState::Member(state) => Some(state),
+            _ => unreachable!(),
+        }
+    }
+    fn member_mut(&mut self, record: &RecordRef) -> Option<&mut MemberWaitState<'a>> {
+        match self.rows.get_mut(&PendingKey::Member(*record))?.as_mut() {
+            PendingState::Member(state) => Some(state),
+            _ => unreachable!(),
+        }
+    }
+    #[inline(never)]
+    fn member_state(&mut self, record: RecordRef) -> &mut MemberWaitState<'a> {
+        match self
+            .rows
+            .entry(PendingKey::Member(record))
+            .or_insert_with(|| Box::new(PendingState::Member(MemberWaitState::default())))
+            .as_mut()
+        {
+            PendingState::Member(state) => state,
+            _ => unreachable!(),
+        }
+    }
+    fn remove_member(&mut self, record: &RecordRef) {
+        self.take_row(&PendingKey::Member(*record));
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.rows
+            .keys()
+            .filter(|key| matches!(key, PendingKey::Operation(_)))
+            .count()
+    }
+}
+
 struct Graph<'a, M: Clone, C: ProcessContext> {
     owner: Owner<'a, M, C>,
     root_key: TaskKey,
     namespace: Arc<SpinLock<NamespaceState>>,
     visible_namespace: VisibleNamespace,
     serials: SerialAllocator,
-    pending: BTreeMap<TaskKey, PendingContinuation>,
-    pending_exit: BTreeMap<TaskKey, PendingExit<'a>>,
-    member_waits: BTreeMap<RecordRef, Box<MemberWaitState<'a>>>,
+    pending: PendingTable<'a>,
     _root_roles: NativeClaim,
     uts: carrick_personality_linux::sysinfo::LinuxUtsname,
     ipc: Arc<SpinLock<IpcNamespace>>,
 }
 impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     fn has_member_wait(&self, record: &RecordRef) -> bool {
-        self.member_waits
-            .get(record)
+        self.pending
+            .member(record)
             .is_some_and(|state| state.wait.is_some())
     }
 
@@ -923,7 +1025,7 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
     // member row. Keep allocation/publication in one bounded slow path.
     #[inline(never)]
     fn member_wait_state(&mut self, record: RecordRef) -> &mut MemberWaitState<'a> {
-        self.member_waits.entry(record).or_default()
+        self.pending.member_state(record)
     }
 
     #[inline(never)]
@@ -933,17 +1035,17 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
 
     #[inline(never)]
     fn take_member_wait(&mut self, record: &RecordRef) -> Option<MemberWait<'a>> {
-        let state = self.member_waits.get_mut(record)?;
+        let state = self.pending.member_mut(record)?;
         let wait = state.wait.take();
         if state.suspend_mask.is_none() {
-            self.member_waits.remove(record);
+            self.pending.remove_member(record);
         }
         wait
     }
 
     fn has_suspend_mask(&self, record: &RecordRef) -> bool {
-        self.member_waits
-            .get(record)
+        self.pending
+            .member(record)
             .is_some_and(|state| state.suspend_mask.is_some())
     }
 
@@ -961,16 +1063,16 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
         &mut self,
         record: &RecordRef,
     ) -> Option<carrick_signal_core::policy::SigBlockMask> {
-        let state = self.member_waits.get_mut(record)?;
+        let state = self.pending.member_mut(record)?;
         let mask = state.suspend_mask.take();
         if state.wait.is_none() {
-            self.member_waits.remove(record);
+            self.pending.remove_member(record);
         }
         mask
     }
 
     fn service_wait(&self, record: &RecordRef) -> Option<&service::PendingService<'a>> {
-        match self.member_waits.get(record)?.wait.as_ref()? {
+        match self.pending.member(record)?.wait.as_ref()? {
             MemberWait::Service(pending) => Some(pending),
             MemberWait::Signal(_) => None,
         }
@@ -986,7 +1088,7 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
 
     fn remove_signal_wait(&mut self, record: &RecordRef) -> Option<PendingSignalWait> {
         if !matches!(
-            self.member_waits.get(record)?.wait.as_ref(),
+            self.pending.member(record)?.wait.as_ref(),
             Some(MemberWait::Signal(_))
         ) {
             return None;
@@ -1000,9 +1102,9 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
 impl<'a, M: Clone, C: ProcessContext> Drop for Graph<'a, M, C> {
     fn drop(&mut self) {
         NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(
-            self.member_waits
+            self.pending.rows
                 .values()
-                .filter(|state| state.suspend_mask.is_some())
+                .filter(|state| matches!(state.as_ref(), PendingState::Member(member) if member.suspend_mask.is_some()))
                 .count(),
             Ordering::Release,
         );
@@ -1466,7 +1568,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         // Every refusing check precedes publication under both owner guards.
         // An adopted receipt is the slot's birth identity: renewing the
         // execution binding leaves the receipt Closing owes unchanged.
-        if let Some(pending) = graph.pending_exit.get_mut(&process) {
+        if let Some(pending) = graph.pending.exit_mut(&process) {
             if pending.outstanding.iter().any(|receipt| {
                 matches!(receipt, OutstandingExitReceipt::Adopted { birth, control: expected }
                     if core::ptr::eq(expected.control(), control) && *birth != host_identity)
@@ -2116,7 +2218,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 });
             }
             row.native().resources().sync_non_interrupting_signals();
-            graph.pending_exit.contains_key(&process)
+            graph.pending.has_exit(&process)
         };
         state.members.insert(
             key,
@@ -2777,9 +2879,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 namespace: ns,
                 visible_namespace,
                 serials,
-                pending: BTreeMap::new(),
-                pending_exit: BTreeMap::new(),
-                member_waits: BTreeMap::new(),
+                pending: PendingTable::default(),
                 _root_roles: root_roles,
                 uts,
                 ipc,
@@ -2865,8 +2965,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
         let owner_continuation = graph
-            .pending_exit
-            .get(&key)
+            .pending
+            .exit(&key)
             .is_some_and(|pending| core::ptr::eq(pending.caller.control(), control));
         drop(graph);
         Ok(NativeProcessEntry {
@@ -3022,8 +3122,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
         let owner_continuation = graph
-            .pending_exit
-            .get(&member.process)
+            .pending
+            .exit(&member.process)
             .is_some_and(|pending| core::ptr::eq(pending.caller.control(), member_control));
         drop(graph);
         Ok((
@@ -4237,8 +4337,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .runtime
             .graph
             .lock()
-            .pending_exit
-            .get(&self.key)
+            .pending
+            .exit(&self.key)
             .filter(|pending| core::ptr::eq(pending.caller.control(), self.control))
             .map(|p| (p.status, p.entry));
         if let Some((status, entry)) = status {
@@ -4388,7 +4488,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // before enrollment needs no wake; a later settlement owns our wake.
         let (is_owner, ready) = {
             let graph = self.runtime.graph.lock();
-            let pending = graph.pending_exit.get(&self.key);
+            let pending = graph.pending.exit(&self.key);
             let is_owner = pending
                 .is_some_and(|pending| core::ptr::eq(pending.caller.control(), self.control));
             let ready = pending.is_some_and(|pending| pending.ready_or_record(page, is_owner));
@@ -4489,11 +4589,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut member_notification = None;
         let (page, channel, first_close) = {
             let mut graph = self.runtime.graph.lock();
-            let first_close = !graph.pending_exit.contains_key(&self.key);
+            let first_close = !graph.pending.has_exit(&self.key);
             let is_owner = first_close
                 || graph
-                    .pending_exit
-                    .get(&self.key)
+                    .pending
+                    .exit(&self.key)
                     .is_some_and(|pending| core::ptr::eq(pending.caller.control(), self.control));
             let row = graph
                 .owner
@@ -4726,7 +4826,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 let wake = Some(ExitWakeCustody {
                     channel: channel.clone(),
                 });
-                graph.pending_exit.insert(
+                graph.pending.insert_exit(
                     self.key,
                     PendingExit {
                         status: wait_status,
@@ -4777,8 +4877,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             (
                 page,
                 graph
-                    .pending_exit
-                    .get(&self.key)
+                    .pending
+                    .exit(&self.key)
                     .ok_or(NativeProcessError::Quarantined)?
                     .channel
                     .clone(),
@@ -4866,8 +4966,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let attempt = {
                 let mut graph = self.runtime.graph.lock();
                 let pending = graph
-                    .pending_exit
-                    .get_mut(&self.key)
+                    .pending
+                    .exit_mut(&self.key)
                     .ok_or(NativeProcessError::Quarantined)?;
                 let receipts = pending.completed_receipts(page);
                 let custody = pending
@@ -4994,7 +5094,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(published) => published,
                 Err(_) => return Err(NativeProcessError::Quarantined),
             };
-            graph.pending_exit.remove(&self.key);
+            graph.pending.remove_exit(&self.key);
             (page, file_table, resources, published)
         };
         let record = self
@@ -5896,14 +5996,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         let wake = {
             let mut graph = self.runtime.graph.lock();
-            if graph.pending_exit.contains_key(&self.key) {
+            if graph.pending.has_exit(&self.key) {
                 let page = graph
                     .owner
                     .task(self.key)
                     .map_err(|_| NativeProcessError::Quarantined)
                     .map(|row| row.native().resources().page);
                 page.map(|page| {
-                    let ready = graph.pending_exit.get(&self.key).is_some_and(|pending| {
+                    let ready = graph.pending.exit(&self.key).is_some_and(|pending| {
                         pending.custody.as_ref().is_some_and(|custody| {
                             pending
                                 .completed_receipts(page)
@@ -5912,8 +6012,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                     });
                     if ready {
                         graph
-                            .pending_exit
-                            .get_mut(&self.key)
+                            .pending
+                            .exit_mut(&self.key)
                             .and_then(|pending| pending.wake.take())
                     } else {
                         None
@@ -9794,13 +9894,7 @@ mod tests {
         assert!(
             matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == -11)
         );
-        assert!(
-            !runtime
-                .graph
-                .lock()
-                .member_waits
-                .contains_key(&entry.record)
-        );
+        assert!(!runtime.graph.lock().pending.member(&entry.record).is_some());
         assert!(zone.timer_owner(slot).is_none());
         if default_stop {
             assert!(
@@ -10359,8 +10453,8 @@ mod tests {
             let channel = runtime
                 .graph
                 .lock()
-                .pending_exit
-                .get(&entry.key)
+                .pending
+                .exit(&entry.key)
                 .unwrap()
                 .channel
                 .clone();
@@ -10398,8 +10492,8 @@ mod tests {
                 let channel = runtime
                     .graph
                     .lock()
-                    .pending_exit
-                    .get(&entry.key)
+                    .pending
+                    .exit(&entry.key)
                     .unwrap()
                     .channel
                     .clone();
