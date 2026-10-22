@@ -1552,3 +1552,65 @@ mod rlimit_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod owner_sleep_tests {
+    use super::*;
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{
+        GuestMemory, MemoryReadSuspension, MemoryReadWait, OwnedReadContinuation,
+    };
+    use std::num::NonZeroU64;
+
+    struct SuspendedTimespec(PortalOwnerWait);
+    impl GuestMemory for SuspendedTimespec {
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                wait: MemoryReadWait::Owner(self.0),
+                continuation: OwnedReadContinuation::new(vec![0u8; 8]),
+            })))
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            panic!("sleep input must not write memory")
+        }
+    }
+    impl CurrentMmMemory for SuspendedTimespec {}
+
+    #[test]
+    fn sleep_copyin_owner_wait_is_not_efault() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(context.shared().mm().id().raw()).unwrap(),
+                    NonZeroU64::new(3).unwrap(),
+                ),
+                PortalWaitCause::Reservations,
+                7,
+            )
+        };
+        for (number, args) in [
+            (nr::NANOSLEEP, [0x20000, 0, 0, 0, 0, 0]),
+            (
+                nr::CLOCK_NANOSLEEP,
+                [LINUX_CLOCK_MONOTONIC, 0, 0x20000, 0, 0, 0],
+            ),
+        ] {
+            let result = dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(number.raw(), SyscallArgs::from(args)),
+                    &mut SuspendedTimespec(wait),
+                    &CompatReporter::default(),
+                )
+                .unwrap();
+            assert_ne!(
+                result,
+                DispatchOutcome::errno(LINUX_EFAULT),
+                "owner reservation contention is not a bad timespec pointer"
+            );
+        }
+    }
+}
