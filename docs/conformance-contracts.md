@@ -1937,13 +1937,9 @@ refusal message, so exact-offset/branch live confirmation remains for the Mac.
 The fallback first requests writable physical protection, which can itself
 refuse before the bounded copy is reached; the component witness establishes
 the incompatible fallback, not which downstream ENOMEM exit the Mac took.
-The signed static case reads the actual immutable OCI libpython file; a new
-mutable /tmp file would not bind the original lowering path.
-
-Run the signed selectors with
-`CARRICK_RUN_ID=759-libpython-map env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just test-conformance-next case_libpython_ --nocapture`.
-The [fixture instructions](../crates/carrick-conformance-next/tests/fixtures/libpython-map/README.md)
-describe source and executable identity and the pending native ARM64 bless.
+Signed loader integration and its native ARM64 oracle are retained in the
+deferred probe layer accompanying #740. The fixes-only layer registers no
+additional signed cases.
 
 ## Directory copyout into untouched private memory (#759 stage 2)
 
@@ -1964,10 +1960,9 @@ AddressSpace. The first fault consumed all 402 entries before copyout:
 retry into a never-touched private buffer returned zero (`exit 101`,
 `/tmp/759-directory-red.log`). The bound witness checks the actual encoded
 batch through production admission; it does not simulate an ARM backend.
-The signed `case_libpython_directory_copyout` reports openat/fstat/getdents64
-separately for mmap and malloc buffers. Its pre-fix owner failure, exact
-ARM64 oracle bless, runtime work/timing and Python startup verification remain
-explicit director gates on the Mac; this Linux worker cannot claim them.
+Signed syscall attribution, native ARM64 oracle comparison, runtime work/timing
+and Python startup verification remain director gates in the deferred probe
+layer; this Linux worker cannot claim them.
 
 The reviewed stage-2 repair splits complete records at guest-page/transfer
 boundaries, calls the existing owner `prepare_write`, commits bytes, then
@@ -1978,30 +1973,28 @@ only the complete records already delivered. Internal preparation failures are
 runtime errors; only `OutOfBounds` becomes EFAULT. EOF does not access the
 buffer. No owner permit or editor guard is stored in `OwnedDirectoryRead`.
 
-`PreparedCopyoutWait` from #739 is **not on this branch**. The implementation
-extends main's retained I/O route (`WriteCopyInSuspended`) with
-`DirectoryReadSuspended`; it does not implement a second memory-preparation or
-parking service. The only wait-policy extension is in
-`vcpu_loop/zone.rs::park_owner_memory_action`: directory I/O selects the same
-killable owner-zone continuation as retained write copy-in. Existing waits
-keep their policy. Physical dependencies use main's `ResumeOwnerPhysical`.
+Directory I/O retains its selected description in the existing owner-resume
+route. Owner receipts, supply and physical dependencies all settle through
+#802's shared `OwnerWait`; there is no directory-specific wait adapter or
+cancellation query. Resumption consumes the saved operation and releases its
+physical dependency before preparing a new destination. Fatal settlement
+releases the operation without output or cursor progress.
 
-Review re-ran the cursor witness against the unchanged `a2e34d5da` directory
-implementation: retry returned zero, exit 101. At `46b157b91`, the separate
-encoder/admission witness also failed, with a 16000-byte batch. These are
-production-path/component witnesses, **not** live ARM owner-wait tests.
-The candidate adds a test-only refusal adapter over sparse AddressSpace to
-exercise production dispatch, suspended-operation ownership and resume after
-sibling fd reuse; it checks no initial commit/cursor change, exactly one
-commit after resume, true EFAULT versus internal failure, and cancellation.
-The batch witness covers mixed 1/14/255-byte names at 10/100/400/4096 records,
-unaligned output, existing PREPARE admission and page-proportional batch work.
+Secured directory output acquires the same `ProcessEffect` admission as other
+owner copyouts. It retains custody through bytes and cursor publication, then
+releases it before the next batch. Fatal publication during re-preparation
+therefore cannot authorize output from a prior readiness sample.
 
-Full owner-wait acceptance remains open: two live guest threads with a sibling
-holding the editor, production handled-signal delivery after completion,
-SIGKILL/group exit, and the rule-2 holder audit/model. In particular, main's
-physical-wait branch re-parks an unready dependency before ordinary signal
-service; its SIGKILL cancellation has not been demonstrated here. This change
-must not be reported as closing #711/#739 or that physical-wait gap. The signed
-probe now compares fresh mmap, 2 MiB malloc and initialized 1 KiB destinations;
-the source-bound native ARM64 bless and Python import demo remain Mac gates.
+The VM-free bindings cover cursor retention after a real address fault,
+mixed-width records at 10/100/400/4096 entries, unaligned output, existing
+PREPARE limits, page-proportional work, and retained descriptions across sibling
+fd reuse. Runtime bindings use production dispatch, scheduler enrollment,
+shared settlement and terminal publication with real `PendingContentWrite`.
+They cover unready SIGKILL, a non-leader waiter with a live leader, readiness
+during enrollment, writer release before both retry paths, and cancellation
+during destination re-preparation. None uses a second memory-wait path.
+
+The deferred probe layer retains the native ARM64 oracle and its source
+fingerprint. Fresh signed HVF execution, live sibling-editor contention,
+handled-signal delivery, final runtime ratios and exact-artifact promotion
+remain director-owned. VM-free evidence does not close those integration gates.

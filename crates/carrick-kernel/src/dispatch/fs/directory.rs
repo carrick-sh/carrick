@@ -79,7 +79,7 @@ impl SyscallDispatcher {
         &self,
         kernel: &crate::kernel::KernelContext,
         request: SyscallRequest,
-        pending: Box<OwnedDirectoryRead>,
+        pending: OwnedDirectoryRead,
         memory: &mut M,
         reporter: &CompatReporter,
         thread: Option<ThreadCtx<'_>>,
@@ -90,6 +90,17 @@ impl SyscallDispatcher {
         {
             return Err(DispatchError::Errno(carrick_abi::LINUX_EIO));
         }
+        let OwnedDirectoryRead {
+            target,
+            _lease: lease,
+            address,
+            length,
+            wait,
+            ..
+        } = pending;
+        // A ready physical dependency still owns writer exclusion. Release
+        // that custody before PREPARE acquires a fresh destination permit.
+        drop(wait);
         let mut cx = SyscallCtx {
             host_wait: route.host_wait,
             kernel,
@@ -101,13 +112,8 @@ impl SyscallDispatcher {
             mm_executor: route.mm_executor,
         };
         resources::with_captured_resources(kernel, || {
-            self.fs_view().read_directory(
-                &mut cx,
-                pending.target,
-                pending._lease,
-                pending.address,
-                pending.length,
-            )
+            self.fs_view()
+                .read_directory(&mut cx, target, lease, address, length)
         })
     }
 }
@@ -219,58 +225,75 @@ impl<'a> FsView<'a> {
                     };
                     match cx.memory.prepare_write(&[range]) {
                         Ok(prepared) => {
+                            let effect = match super::super::copyout::admit_effect(cx.kernel) {
+                                Ok(effect) => effect,
+                                Err(cancelled) => return Ok(cancelled.into_outcome()),
+                            };
                             prepared.commit(&[&bytes]);
-                            Ok(())
+                            Ok(Some(effect))
                         }
                         Err(error) => Err(error),
                     }
                 } else {
                     cx.memory
                         .write_bytes(at, &bytes)
+                        .map(|()| None)
                         .map_err(carrick_guest_mem::MemoryPrepareError::Fault)
                 };
-            if let Err(error) = result {
-                if let carrick_guest_mem::MemoryPrepareError::Limit(limit) = error {
-                    return Err(DispatchError::MemoryPreparation(format!(
-                        "directory record batch exceeds owner permit: {limit:?}"
+            let effect = match result {
+                Ok(effect) => effect,
+                Err(error) => {
+                    if let carrick_guest_mem::MemoryPrepareError::Limit(limit) = error {
+                        return Err(DispatchError::MemoryPreparation(format!(
+                            "directory record batch exceeds owner permit: {limit:?}"
+                        )));
+                    }
+                    if let carrick_guest_mem::MemoryPrepareError::Fault(ref fault) = error
+                        && !matches!(fault, carrick_guest_mem::MemoryError::OutOfBounds { .. })
+                    {
+                        return Err(DispatchError::MemoryPreparation(format!(
+                            "directory copyout failed internally: {fault}"
+                        )));
+                    }
+                    // Only real, complete records can become a short result. No
+                    // cursor or lock crosses a wait after such a prefix.
+                    if copied > 0 {
+                        break;
+                    }
+                    use carrick_guest_mem::{
+                        MemoryPrepareError, MemoryReadWait, MemorySupplyRequest,
+                    };
+                    let wait = match error {
+                        MemoryPrepareError::OwnerWait(wait) => MemoryReadWait::Owner(wait),
+                        // Keep the real physical producer. The runtime binds a
+                        // directory suspension to the shared killable physical resume;
+                        // relabeling this as an owner receipt would lose releases.
+                        MemoryPrepareError::Physical(wait) => MemoryReadWait::Physical(wait),
+                        MemoryPrepareError::Supply(MemorySupplyRequest::Metadata {
+                            observed,
+                            ..
+                        }) => MemoryReadWait::Owner(observed),
+                        MemoryPrepareError::Supply(request) => MemoryReadWait::Supply(request),
+                        other => return Ok(crate::el1_delegation::owner_prepare_refusal(other)),
+                    };
+                    drop(open);
+                    return Ok(DispatchOutcome::DirectoryReadSuspended(Box::new(
+                        OwnedDirectoryRead {
+                            target,
+                            _lease: lease,
+                            thread: cx.kernel.thread().key(),
+                            address,
+                            length,
+                            wait,
+                        },
                     )));
                 }
-                if let carrick_guest_mem::MemoryPrepareError::Fault(ref fault) = error
-                    && !matches!(fault, carrick_guest_mem::MemoryError::OutOfBounds { .. })
-                {
-                    return Err(DispatchError::MemoryPreparation(format!(
-                        "directory copyout failed internally: {fault}"
-                    )));
-                }
-                // Only real, complete records can become a short result. No
-                // cursor or lock crosses a wait after such a prefix.
-                if copied > 0 {
-                    break;
-                }
-                use carrick_guest_mem::{MemoryPrepareError, MemoryReadWait, MemorySupplyRequest};
-                let wait = match error {
-                    MemoryPrepareError::OwnerWait(wait) => MemoryReadWait::Owner(wait),
-                    MemoryPrepareError::Physical(wait) => MemoryReadWait::Physical(wait),
-                    MemoryPrepareError::Supply(MemorySupplyRequest::Metadata {
-                        observed, ..
-                    }) => MemoryReadWait::Owner(observed),
-                    MemoryPrepareError::Supply(request) => MemoryReadWait::Supply(request),
-                    other => return Ok(crate::el1_delegation::owner_prepare_refusal(other)),
-                };
-                drop(open);
-                return Ok(DispatchOutcome::DirectoryReadSuspended(Box::new(
-                    OwnedDirectoryRead {
-                        target,
-                        _lease: lease,
-                        thread: cx.kernel.thread().key(),
-                        address,
-                        length,
-                        wait,
-                    },
-                )));
-            }
+            };
             *offset = next;
             copied += bytes.len();
+            // Cursor publication is part of the same admitted bounded effect
+            // as the prepared copy. Never retain custody across another wait.
+            drop(effect);
         }
         Ok(if copied == 0 && *offset < entries.len() {
             DispatchOutcome::errno(LINUX_EINVAL)
