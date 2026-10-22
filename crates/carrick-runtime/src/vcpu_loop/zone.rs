@@ -468,8 +468,11 @@ where
         let request = SyscallRequest::new(98, carrick_observability::compat::SyscallArgs([0; 6]));
         let exit = self.settle_into_zone(
             control,
-            state,
-            own,
+            continuation::quantum::ZoneSave {
+                base: state,
+                record: own,
+                origin: executor::residency::ZoneResumeOrigin::GuestRecord,
+            },
             seq,
             ZoneWaitPolicy::Ordinary(timeout),
             request,
@@ -547,8 +550,7 @@ where
     fn settle_into_zone(
         &mut self,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        base: GuestCpuState,
-        record: RecordRef,
+        save: continuation::quantum::ZoneSave,
         seq: u32,
         policy: ZoneWaitPolicy,
         request: SyscallRequest,
@@ -568,7 +570,7 @@ where
             carrick_kernel::kernel::continuation::RestartClass::Never,
         )
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let wait = carrick_kernel::kernel::continuation::ZoneWait::new(record, seq);
+        let wait = carrick_kernel::kernel::continuation::ZoneWait::new(save.record, seq);
         let continuation = match policy {
             ZoneWaitPolicy::KillableOwnerMemory => {
                 carrick_kernel::kernel::continuation::BlockedContinuation::from_killable_owner_zone_park(capture, wait)
@@ -580,7 +582,7 @@ where
         let binding = control.binding.ok_or_else(|| {
             RuntimeError::Configuration("EL1 zone settle without a task binding".to_owned())
         })?;
-        binding.set_zone_save(continuation::quantum::ZoneSave { base, record });
+        binding.set_zone_save(save);
         self.state.service_kernel_context = Some(context);
         self.phase = HvpatchProductionPhase::ResumeZone;
         Ok(self.suspend(
@@ -694,8 +696,11 @@ where
         let record = zone.record_ref(record);
         self.settle_into_zone(
             control,
-            state,
-            record,
+            continuation::quantum::ZoneSave {
+                base: state,
+                record,
+                origin: executor::residency::ZoneResumeOrigin::GuestRecord,
+            },
             seq,
             ZoneWaitPolicy::Ordinary(timeout),
             request,
@@ -821,8 +826,15 @@ where
                     (OwnerMemoryAction::Syscall { frame, resume }, Some((state, _, request))) => {
                         let exit = self.settle_into_zone(
                             control,
-                            state,
-                            zone.record_ref(record),
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: if self.state.ipc_user_return.is_some() {
+                                    executor::residency::ZoneResumeOrigin::HostEl0
+                                } else {
+                                    executor::residency::ZoneResumeOrigin::HostTrap
+                                },
+                            },
                             seq,
                             ZoneWaitPolicy::for_owner_resume(&resume),
                             request,
@@ -1465,8 +1477,11 @@ where
                 let record = zone.record_ref(record);
                 self.settle_into_zone(
                     control,
-                    state,
-                    record,
+                    continuation::quantum::ZoneSave {
+                        base: state,
+                        record,
+                        origin: executor::residency::ZoneResumeOrigin::GuestRecord,
+                    },
                     seq,
                     ZoneWaitPolicy::Ordinary(None),
                     request,

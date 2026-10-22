@@ -241,3 +241,23 @@ secured copy commits.
 The broad copy-in/EFAULT sweep remains #711 slice 2, outside this change.
 The signed commands above remain the required Mac qualification; portable
 results from the earlier handoff do not certify this new artifact.
+
+A second independent review caught a missing loader edge in that direct EL0
+path: `park_host` retained host ownership, but the executor materializer still
+required a mailbox syscall continuation. Extending the runtime witnesses to
+consume the actual `ZoneSave` and call `TaskCpuResidency::materialize_with`
+made both completion and cancellation fail at that production check. The
+saved residency now carries `ZoneResumeOrigin`: guest-record completion,
+host trap completion, or host EL0 completion. All loader paths validate this
+origin against the record ownership and retained CPU frame. The read stays
+host-owned while waiting; an ordinary IPC re-park returns to guest-record
+ownership. The witnesses pass through materialization and check the direct
+return PC advances from the SVC at 0x4000 to 0x4004. Wrong completion origins
+are rejected. The second review found no further P1 in this correction.
+
+Red evidence is `/tmp/735-review-materialize-red.log` (exit 101, both IPC
+tests rejected by the old materializer). The corrected two IPC witnesses,
+two sleep witnesses and residency tests pass. No scheduler interleaving or
+sched-core code changed. Dedicated runtime supply/physical refusal and
+owner-to-empty-pipe re-park schedules remain outside these witnesses; the
+existing typed wait machinery serves those paths.

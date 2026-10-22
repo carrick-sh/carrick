@@ -5,7 +5,7 @@ guest_surfaces = ["syscall:pipe2", "syscall:eventfd2", "syscall:read", "syscall:
 semantic_authority = ["man 7 pipe", "man 2 eventfd", "man 2 splice", "man 2 tee"]
 fixture = "two live descriptor owners; final endpoint close at 1/8/64 pairs"
 scale_points = [1, 8, 64]
-rationale = "Final shared writer close must release its endpoint without a second host pin owner. Typed fixtures count retained endpoints at every scale. Owner copyout refusal retains the read token and endpoint before consuming bytes; production handback witnesses resume exact bytes, verify count, EOF and cancellation pin release. Existing continuation fixtures prove no replay; they do not prove EL1 creation or executor exhaustion. See the M2-M5 witness ledger."
+rationale = "Final shared writer close must release its endpoint without a second host pin owner. Typed fixtures count retained endpoints at every scale. Owner copyout refusal retains the read token and endpoint before consuming bytes; production handback witnesses resume exact bytes, verify count, EOF and cancellation pin release through actual zone-state materialization and the direct EL0 return PC. Existing continuation fixtures prove no replay; they do not prove EL1 creation or executor exhaustion. See the M2-M5 witness ledger."
 structural_budgets = []
 
 [bindings]

@@ -3633,7 +3633,10 @@ pub(crate) mod tests {
         }
 
         fn current_pc(&self) -> Result<u64, TrapError> {
-            Ok(0)
+            Ok(match &self.snapshot_cpu {
+                Some(carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu)) => cpu.pc,
+                _ => 0,
+            })
         }
 
         fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
@@ -4626,6 +4629,8 @@ pub(crate) mod tests {
                         });
                     if ipc_read {
                         cpu.syscall_continuation = None;
+                        cpu.pc = 0x4000;
+                        cpu.pstate = 0;
                     }
                     engine.exec_support = true;
                     engine.snapshot_cpu = Some(snapshot);
@@ -4804,6 +4809,20 @@ pub(crate) mod tests {
                         .try_take(&registration)
                         .unwrap()
                         .expect("owner wake must reach the registered host executor");
+                    let saved = binding
+                        .take_zone_save()
+                        .expect("owner park saves residency");
+                    let mut residency = executor::residency::TaskCpuResidency::Zone {
+                        base: saved.base,
+                        record: saved.record,
+                        origin: saved.origin,
+                    };
+                    engine.snapshot_cpu = Some(
+                        residency
+                            .materialize_with(|_, _| panic!("zone save owns the CPU state"))
+                            .expect("the real executor must reload the owner-wait state")
+                            .clone(),
+                    );
                     let lease = resumed.take_lease();
                     job.state.guest_execution = Some(
                         kernel
@@ -4943,6 +4962,12 @@ pub(crate) mod tests {
                                 engine
                                     .written_registers
                                     .contains(&(carrick_hal::Reg::X(0), 6))
+                            );
+                            assert!(
+                                engine
+                                    .written_registers
+                                    .contains(&(carrick_hal::Reg::Pc, 0x4004)),
+                                "the direct EL0 syscall returns exactly once past its SVC"
                             );
                             assert_eq!(engine.guest_memory[&0x71_1020], b"retain");
                         } else {
