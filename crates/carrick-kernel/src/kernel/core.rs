@@ -593,6 +593,7 @@ pub struct Kernel {
     /// VM): the bridge is carrier-wide glue, so every task shares it.
     host_signal: Arc<dyn HostSignalBridge>,
     work_scope: RwLock<Option<carrick_observability::work_meter::WorkScope>>,
+    pub(crate) native_owner_waits: Arc<super::continuation::readiness::NativeOwnerWaitRegistry>,
 }
 
 /// A fully constructed container-init graph that is still invisible to the
@@ -1570,6 +1571,7 @@ impl Kernel {
             abort_reason: Arc::new(Mutex::new(None)),
             unpublished_jobs: AtomicUsize::new(0),
             work_scope: RwLock::new(None),
+            native_owner_waits: Arc::default(),
         });
         kernel.registry().thread_ledger().bind_kernel(&kernel);
         container.bind_kernel(&kernel);

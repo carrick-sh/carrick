@@ -1141,11 +1141,28 @@ impl MailboxBinding {
                 | MailboxResponseAction::NativeSignalCheckpoint
                 | MailboxResponseAction::NativeSignalCheckpointNoRestart,
             ) => Ok(Some(value as i64)),
-            Ok(MailboxResponseAction::RegistersPrepared) => Ok(None),
+            Ok(
+                MailboxResponseAction::RegistersPrepared | MailboxResponseAction::NativeOwnerCancel,
+            ) => Ok(None),
             Err(unknown) => Err(MailboxConsumeError::Protocol(
                 MailboxProtocolError::UnknownResponseAction(unknown.0),
             )),
         }
+    }
+
+    pub fn publish_native_owner_cancel(&mut self) -> Result<(), MailboxConsumeError> {
+        self.require_request_ready()?;
+        // SAFETY: stopped host owns this RequestReady response. No result is
+        // written: EL1 must enter fatal native custody before any EL0 return.
+        unsafe {
+            self.write_volatile(
+                core::ptr::addr_of_mut!((*self.host.as_ptr()).response_action),
+                MailboxResponseAction::NativeOwnerCancel.raw(),
+            );
+        }
+        self.state()
+            .store(MailboxState::ResponseReady.raw(), Ordering::Release);
+        Ok(())
     }
 
     pub fn publish_registers_prepared(&mut self) -> Result<(), MailboxConsumeError> {
@@ -1904,6 +1921,25 @@ mod tests {
             mailbox.response_action,
             MailboxResponseAction::RegistersPrepared.raw()
         );
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            MailboxState::ResponseReady.raw()
+        );
+    }
+
+    #[test]
+    fn native_owner_cancel_publishes_only_a_fatal_checkpoint() {
+        let (mut binding, mut mailbox) = binding();
+        publish_valid_request(&binding, &mut mailbox);
+        binding.take_request().unwrap().expect("request");
+        mailbox.return_value = 0xfeed_face;
+        binding.publish_native_owner_cancel().unwrap();
+        assert_eq!(mailbox.return_value, 0xfeed_face);
+        assert_eq!(
+            mailbox.response_action,
+            MailboxResponseAction::NativeOwnerCancel.raw()
+        );
+        assert_eq!(binding.pending_normal_return().unwrap(), None);
         assert_eq!(
             mailbox.state.load(Ordering::Acquire),
             MailboxState::ResponseReady.raw()

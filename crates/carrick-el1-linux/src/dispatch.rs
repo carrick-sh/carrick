@@ -644,7 +644,7 @@ pub fn dispatch_irq(frame: &mut TrapFrame, counters: &Counters) -> Action {
 /// Unified entry dispatch (interrupts, lower-EL data aborts, and syscalls).
 pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    if matches!(frame.esr, 0xfffe | 0xfffd) {
+    if matches!(frame.esr, 0xfffc..=0xfffe) {
         return arm_signal_user_return(frame);
     }
     let action = if frame.esr == 0 {
@@ -671,13 +671,25 @@ pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
 fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
         unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
+    let fatal_owner_cancel = frame.esr == 0xfffc;
     let Some(task) = current_tasks.get(frame.slot as usize) else {
+        if fatal_owner_cancel {
+            invalid_completion(NativeInvariant::EntryBinding)
+        }
         return Action::Served;
     };
     let Some((page, control)) = task.lifecycle_refs() else {
+        if fatal_owner_cancel {
+            invalid_completion(NativeInvariant::EntryBinding)
+        }
         return Action::Served;
     };
-    if !control.native_signal_owner() || !carrick_el1_abi::Lifecycle::gate(page).serves_ring() {
+    if !control.native_signal_owner()
+        || (frame.esr != 0xfffc && !carrick_el1_abi::Lifecycle::gate(page).serves_ring())
+    {
+        if fatal_owner_cancel {
+            invalid_completion(NativeInvariant::EntryBinding)
+        }
         return Action::Served;
     }
     let Some(slot) = SlotId::from_index(frame.slot as usize) else {
@@ -685,8 +697,9 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     };
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
     let source = carrick_el1_abi::BornInZoneSource { zone, slot };
-    if !(frame.esr == 0xfffe
-        && frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64)
+    if frame.esr != 0xfffc
+        && !(frame.esr == 0xfffe
+            && frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64)
         && carrick_el1::isa::signal_ingress_guest().is_empty()
         && control.zone_record().is_some_and(|record| {
             !super::aarch64_process::registry().signal_checkpoint_needed(zone, record)

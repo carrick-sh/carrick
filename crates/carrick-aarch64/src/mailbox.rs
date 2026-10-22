@@ -169,6 +169,8 @@ pub enum MailboxResponseAction {
     NormalReturnAndArmPortal = 3,
     NativeSignalCheckpoint = 4,
     NativeSignalCheckpointNoRestart = 5,
+    /// Fatal-only handoff; no return value belongs to this response.
+    NativeOwnerCancel = 6,
 }
 
 impl MailboxResponseAction {
@@ -215,6 +217,7 @@ impl TryFrom<u32> for MailboxResponseAction {
             3 => Ok(Self::NormalReturnAndArmPortal),
             4 => Ok(Self::NativeSignalCheckpoint),
             5 => Ok(Self::NativeSignalCheckpointNoRestart),
+            6 => Ok(Self::NativeOwnerCancel),
             unknown => Err(UnknownMailboxValue(unknown)),
         }
     }

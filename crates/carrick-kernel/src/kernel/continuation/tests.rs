@@ -7633,6 +7633,28 @@ fn retained_write_owner_park_ignores_two_signals_until_release_but_kill_wakes() 
 }
 
 #[test]
+fn serial_host_native_owner_wait_defers_bridge_sigstop() {
+    let (_kernel, context) = bootstrap(15_463);
+    let generation = publish(&context, 15_463);
+    let control = context.thread().control_slot();
+    let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    custody.commit_native_signal_owner();
+    let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+    let continuation =
+        BlockedContinuation::from_killable_owner_zone_park(capture(&context, generation), wait);
+    let tid = context.thread().key().tid.raw();
+    let _ = carrick_signal_linux::take_pending_event_for(tid);
+    carrick_signal_linux::publish_process_signal(carrick_abi::LINUX_SIGSTOP);
+    let event = SignalReadinessProbe::from_continuation(&continuation).event();
+    // Consume the test's process-wide bridge event even when the assertion
+    // fails, so this red witness cannot contaminate another serial test.
+    let pending = carrick_signal_linux::take_pending_event_for(tid);
+    assert_eq!(event, None, "SIGSTOP cannot complete an owner wait");
+    assert_eq!(pending.unwrap().signum, carrick_abi::LINUX_SIGSTOP);
+}
+
+#[test]
 fn serial_host_native_signal_owner_killable_owner_write_ignores_sigalrm_until_sigkill() {
     let (_kernel, context) = bootstrap(15_462);
     let generation = publish(&context, 15_462);
@@ -7670,7 +7692,9 @@ fn serial_host_native_signal_owner_killable_owner_write_ignores_sigalrm_until_si
     carrick_signal_linux::publish_process_signal(carrick_abi::LINUX_SIGKILL);
     assert_eq!(
         probe.event(),
-        Some(ContinuationEvent::Signal),
+        Some(ContinuationEvent::OwnerCancelled(
+            super::OwnerWaitCancellation::NativeFatal
+        )),
         "SIGKILL must wake a native killable-owner write park"
     );
     assert_eq!(

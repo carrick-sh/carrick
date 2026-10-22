@@ -1,7 +1,7 @@
 //! Retained signal resources for an admitted fresh native process.
 //! Signal and child-exit decisions remain in the shared Linux signal policy.
 extern crate alloc;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use carrick_el1::lock::SpinLock;
 use carrick_personality_linux::signal::{EnqueueOutcome, SignalInbox, StaleTarget};
 use carrick_sched_core::process::exit::{
@@ -38,11 +38,57 @@ impl<S: BlockedMaskSource + ?Sized> BlockedMaskSource for Arc<S> {
 use alloc::vec::Vec;
 use carrick_personality_linux::signal::PendingSignals;
 
-struct SignalResources<T> {
+struct SignalResources<'a, T> {
     actions: ActionTable,
     inbox: SignalInbox<TaskKey, T>,
     thread_pending: Vec<(carrick_sched_core::RecordRef, PendingSignals<T>)>,
     forced_segv: Vec<carrick_sched_core::RecordRef>,
+    projections: Vec<(
+        carrick_sched_core::RecordRef,
+        Weak<NativeSignalProjection<'a, T>>,
+    )>,
+}
+
+impl<T> SignalResources<'_, T> {
+    fn thread_pending_set(&self, record: carrick_sched_core::RecordRef) -> SignalSet {
+        self.thread_pending
+            .binary_search_by_key(&record, |(record, _)| *record)
+            .map_or(SignalSet::EMPTY, |index| {
+                self.thread_pending[index].1.present()
+            })
+    }
+    fn thread_pending_mut(
+        &mut self,
+        record: carrick_sched_core::RecordRef,
+    ) -> &mut PendingSignals<T> {
+        let index = match self
+            .thread_pending
+            .binary_search_by_key(&record, |(record, _)| *record)
+        {
+            Ok(index) => index,
+            Err(index) => {
+                self.thread_pending
+                    .insert(index, (record, PendingSignals::default()));
+                index
+            }
+        };
+        &mut self.thread_pending[index].1
+    }
+    fn take_thread_pending(&mut self, record: carrick_sched_core::RecordRef) -> PendingSignals<T> {
+        self.thread_pending
+            .binary_search_by_key(&record, |(record, _)| *record)
+            .map(|index| self.thread_pending.remove(index).1)
+            .unwrap_or_default()
+    }
+    fn restore_thread_pending(
+        &mut self,
+        record: carrick_sched_core::RecordRef,
+        pending: PendingSignals<T>,
+    ) {
+        if !pending.is_empty() {
+            *self.thread_pending_mut(record) = pending;
+        }
+    }
 }
 
 // The summary is conservative across native processes: a signal in another
@@ -81,45 +127,114 @@ fn publish_summary_delta(before: u64, after: u64) {
     SUMMARY_WORD.store(word, Ordering::Release);
 }
 
-struct SignalShared<T> {
-    state: SpinLock<SignalResources<T>>,
-    summary: AtomicU64,
+#[derive(Clone, Copy)]
+enum ProjectionUpdate {
+    All,
+    Member(carrick_sched_core::RecordRef),
+    None,
 }
 
-impl<T> SignalShared<T> {
-    fn new(resources: SignalResources<T>) -> Self {
+struct SignalShared<'a, T> {
+    state: SpinLock<SignalResources<'a, T>>,
+    summary: AtomicU64,
+    process_summary: AtomicU64,
+    #[cfg(test)]
+    projection_visits: core::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    projection_stores: core::sync::atomic::AtomicUsize,
+}
+
+impl<'a, T> SignalShared<'a, T> {
+    fn new(resources: SignalResources<'a, T>) -> Self {
         let shared = Self {
             state: SpinLock::new(resources),
             summary: AtomicU64::new(0),
+            process_summary: AtomicU64::new(0),
+            #[cfg(test)]
+            projection_visits: core::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            projection_stores: core::sync::atomic::AtomicUsize::new(0),
         };
         {
             let state = shared.state.lock();
-            shared.refresh_summary(&state);
+            shared.refresh_summary(&state, ProjectionUpdate::All);
         }
         shared
     }
 
-    fn refresh_summary(&self, resources: &SignalResources<T>) {
-        let mut present = resources.inbox.pending().present().bits();
+    fn refresh_summary(&self, resources: &SignalResources<'a, T>, update: ProjectionUpdate) {
+        let process = resources.inbox.pending().present().bits();
+        let mut present = process;
         for (_, pending) in &resources.thread_pending {
             present |= pending.present().bits();
         }
         for _ in &resources.forced_segv {
             present |= Signal::SEGV.bit();
         }
+        // A process queue change affects every member. A thread queue change
+        // affects only its exact record, regardless of unrelated live members.
+        // The queue lock serializes this cache with every projection publication.
+        let update = if self.process_summary.swap(process, Ordering::Relaxed) != process {
+            ProjectionUpdate::All
+        } else {
+            update
+        };
+        match update {
+            ProjectionUpdate::All => {
+                for (record, projection) in &resources.projections {
+                    #[cfg(test)]
+                    self.projection_visits.fetch_add(1, Ordering::Relaxed);
+                    self.publish_projection(resources, *record, projection, process);
+                }
+            }
+            ProjectionUpdate::Member(record) => {
+                if let Ok(index) = resources.projections.binary_search_by(|(candidate, _)| {
+                    #[cfg(test)]
+                    self.projection_visits.fetch_add(1, Ordering::Relaxed);
+                    candidate.cmp(&record)
+                }) {
+                    self.publish_projection(
+                        resources,
+                        record,
+                        &resources.projections[index].1,
+                        process,
+                    );
+                }
+            }
+            ProjectionUpdate::None => {}
+        }
         let before = self.summary.swap(present, Ordering::Relaxed);
         publish_summary_delta(before, present);
     }
+    fn publish_projection(
+        &self,
+        resources: &SignalResources<'a, T>,
+        record: carrick_sched_core::RecordRef,
+        projection: &Weak<NativeSignalProjection<'a, T>>,
+        process: u64,
+    ) {
+        let Some(projection) = projection.upgrade() else {
+            return;
+        };
+        let pending = process | resources.thread_pending_set(record).bits();
+        projection
+            .control
+            .control()
+            .pending()
+            .replace_from_locked_queue(carrick_el1_abi::PendingSignals(pending));
+        #[cfg(test)]
+        self.projection_stores.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
-impl<T> Deref for SignalShared<T> {
-    type Target = SpinLock<SignalResources<T>>;
+impl<'a, T> Deref for SignalShared<'a, T> {
+    type Target = SpinLock<SignalResources<'a, T>>;
     fn deref(&self) -> &Self::Target {
         &self.state
     }
 }
 
-impl<T> Drop for SignalShared<T> {
+impl<'a, T> Drop for SignalShared<'a, T> {
     fn drop(&mut self) {
         publish_summary_delta(self.summary.load(Ordering::Relaxed), 0);
     }
@@ -131,12 +246,59 @@ fn awaits_stop_custody(action: Action, signal: Signal) -> bool {
         && carrick_signal_core::policy::default_delivery(signal)
             == carrick_signal_core::policy::Delivery::Stop
 }
-/// One actual sighand and pending owner, retained by exact task handles.
-pub struct NativeProcessSignals<T> {
-    key: TaskKey,
-    resources: Arc<SignalShared<T>>,
+/// A retained member's read-only projection of its native pending queue.
+/// It cannot dequeue signals. The final member snapshot releases both this
+/// projection and exact-incarnation control custody before slot reuse.
+pub struct NativeSignalProjection<'a, T> {
+    owner: Weak<SignalShared<'a, T>>,
+    control:
+        Arc<carrick_core::lifecycle::MemberControlCustody<'a, carrick_el1_abi::ThreadControlSlot>>,
 }
-impl<T> Clone for NativeProcessSignals<T> {
+impl<T> NativeSignalProjection<'_, T> {
+    pub fn rehome(&self, record: carrick_sched_core::RecordRef) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        let mut state = owner.lock();
+        let Some(index) = state
+            .projections
+            .iter()
+            .position(|(_, projection)| projection.as_ptr() == core::ptr::from_ref(self))
+        else {
+            return;
+        };
+        if state.projections[index].0 == record {
+            return;
+        }
+        let (previous, projection) = state.projections.remove(index);
+        let index = state
+            .projections
+            .partition_point(|(current, _)| *current < record);
+        state.projections.insert(index, (record, projection));
+        let pending = state.take_thread_pending(previous);
+        state.restore_thread_pending(record, pending);
+        for current in &mut state.forced_segv {
+            if *current == previous {
+                *current = record;
+            }
+        }
+        owner.refresh_summary(&state, ProjectionUpdate::Member(record));
+    }
+}
+impl<T> Drop for NativeSignalProjection<'_, T> {
+    fn drop(&mut self) {
+        self.control
+            .control()
+            .pending()
+            .replace_from_locked_queue(carrick_el1_abi::PendingSignals(0));
+    }
+}
+/// One actual sighand and pending owner, retained by exact task handles.
+pub struct NativeProcessSignals<'a, T> {
+    key: TaskKey,
+    resources: Arc<SignalShared<'a, T>>,
+}
+impl<'a, T> Clone for NativeProcessSignals<'a, T> {
     fn clone(&self) -> Self {
         Self {
             key: self.key,
@@ -149,7 +311,7 @@ pub enum SignalActionError {
     Stale,
     Action(ActionError),
 }
-impl<T> NativeProcessSignals<T> {
+impl<'a, T> NativeProcessSignals<'a, T> {
     /// Fresh native-root admission owns the initial default actions and empty
     /// pending queue. This does not claim to import another launcher's sighand.
     pub fn fresh_root(key: TaskKey) -> Self {
@@ -160,8 +322,34 @@ impl<T> NativeProcessSignals<T> {
                 inbox: SignalInbox::new(key),
                 thread_pending: Vec::new(),
                 forced_segv: Vec::new(),
+                projections: Vec::new(),
             })),
         }
+    }
+    pub fn project_member(
+        &self,
+        record: carrick_sched_core::RecordRef,
+        control: Arc<
+            carrick_core::lifecycle::MemberControlCustody<'a, carrick_el1_abi::ThreadControlSlot>,
+        >,
+    ) -> Arc<NativeSignalProjection<'a, T>> {
+        let projection = Arc::new(NativeSignalProjection {
+            owner: Arc::downgrade(&self.resources),
+            control,
+        });
+        let mut resources = self.resources.lock();
+        resources
+            .projections
+            .retain(|(_, projection)| projection.strong_count() != 0);
+        let index = resources
+            .projections
+            .partition_point(|(current, _)| *current < record);
+        resources
+            .projections
+            .insert(index, (record, Arc::downgrade(&projection)));
+        self.resources
+            .refresh_summary(&resources, ProjectionUpdate::Member(record));
+        projection
     }
     /// Future rt_sigaction adapters update this authority after wire validation.
     pub fn install_action(
@@ -192,7 +380,8 @@ impl<T> NativeProcessSignals<T> {
                 }
             }
             thread_pending.retain(|(_, pending)| !pending.is_empty());
-            self.resources.refresh_summary(&resources);
+            self.resources
+                .refresh_summary(&resources, ProjectionUpdate::All);
         }
         Ok(old)
     }
@@ -226,18 +415,9 @@ impl<T> NativeProcessSignals<T> {
         {
             let _ = resources.actions.install(signal, Action::default());
         }
-        if let Some((_, pending)) = resources
-            .thread_pending
-            .iter_mut()
-            .find(|(id, _)| *id == tid)
-        {
-            pending.enqueue(signal, info);
-        } else {
-            let mut pending = PendingSignals::default();
-            pending.enqueue(signal, info);
-            resources.thread_pending.push((tid, pending));
-        }
-        self.resources.refresh_summary(&resources);
+        resources.thread_pending_mut(tid).enqueue(signal, info);
+        self.resources
+            .refresh_summary(&resources, ProjectionUpdate::Member(tid));
     }
     pub fn action(&self, signal: Signal) -> Action {
         self.resources.lock().actions.action(signal)
@@ -258,7 +438,8 @@ impl<T> NativeProcessSignals<T> {
     ) -> Result<EnqueueOutcome, StaleTarget> {
         let mut resources = self.resources.lock();
         let outcome = resources.inbox.enqueue_for(key, signal, info);
-        self.resources.refresh_summary(&resources);
+        self.resources
+            .refresh_summary(&resources, ProjectionUpdate::None);
         outcome
     }
     pub fn enqueue_thread(
@@ -268,25 +449,15 @@ impl<T> NativeProcessSignals<T> {
         info: Option<T>,
     ) -> EnqueueOutcome {
         let mut res = self.resources.lock();
-        let outcome = if let Some((_, p)) = res.thread_pending.iter_mut().find(|(t, _)| *t == tid) {
-            p.enqueue(signal, info)
-        } else {
-            let mut p = PendingSignals::default();
-            let outcome = p.enqueue(signal, info);
-            res.thread_pending.push((tid, p));
-            outcome
-        };
-        self.resources.refresh_summary(&res);
+        let outcome = res.thread_pending_mut(tid).enqueue(signal, info);
+        self.resources
+            .refresh_summary(&res, ProjectionUpdate::Member(tid));
         outcome
     }
     pub fn pending_set(&self, tid: carrick_sched_core::RecordRef) -> SignalSet {
         let resources = self.resources.lock();
         let proc = resources.inbox.pending().present();
-        let thread = resources
-            .thread_pending
-            .iter()
-            .find(|(t, _)| *t == tid)
-            .map_or(SignalSet::EMPTY, |(_, p)| p.present());
+        let thread = resources.thread_pending_set(tid);
         proc.union(thread)
     }
     pub fn has_deliverable(
@@ -295,11 +466,7 @@ impl<T> NativeProcessSignals<T> {
         blocked: SigBlockMask,
     ) -> bool {
         let resources = self.resources.lock();
-        let thread = resources
-            .thread_pending
-            .iter()
-            .find(|(id, _)| *id == tid)
-            .map_or(SignalSet::EMPTY, |(_, pending)| pending.present());
+        let thread = resources.thread_pending_set(tid);
         let mut selected = blocked.select(resources.inbox.pending().present().union(thread));
         while let Some(number) = selected.lowest() {
             let Some(signal) = Signal::from_number(number) else {
@@ -322,10 +489,7 @@ impl<T> NativeProcessSignals<T> {
     ) -> Option<(Signal, Option<T>, Action)> {
         loop {
             let mut resources = self.resources.lock();
-            let idx = resources.thread_pending.iter().position(|(t, _)| *t == tid);
-            let mut thread_pending = idx
-                .map(|i| resources.thread_pending.remove(i).1)
-                .unwrap_or_default();
+            let mut thread_pending = resources.take_thread_pending(tid);
             let forced = resources.forced_segv.contains(&tid);
             let present = resources
                 .inbox
@@ -356,15 +520,15 @@ impl<T> NativeProcessSignals<T> {
                 resources.inbox.pending_mut(),
                 unblocked,
             );
-            if !thread_pending.is_empty() {
-                resources.thread_pending.push((tid, thread_pending));
-            }
-            self.resources.refresh_summary(&resources);
+            resources.restore_thread_pending(tid, thread_pending);
+            self.resources
+                .refresh_summary(&resources, ProjectionUpdate::Member(tid));
             let delivery = delivery?;
             let signal = delivery.entry.signal;
             if signal == Signal::SEGV {
                 resources.forced_segv.retain(|id| *id != tid);
-                self.resources.refresh_summary(&resources);
+                self.resources
+                    .refresh_summary(&resources, ProjectionUpdate::Member(tid));
             }
             let action = resources.actions.action(signal);
             if action.disposition == Disposition::Ignore
@@ -387,18 +551,14 @@ impl<T> NativeProcessSignals<T> {
         set: SignalSet,
     ) -> Option<(Signal, Option<T>)> {
         let mut resources = self.resources.lock();
-        let idx = resources.thread_pending.iter().position(|(t, _)| *t == tid);
-        let mut thread_pending = idx
-            .map(|i| resources.thread_pending.remove(i).1)
-            .unwrap_or_default();
+        let mut thread_pending = resources.take_thread_pending(tid);
         let delivery = {
             let proc_pending = resources.inbox.pending_mut();
             carrick_personality_linux::signal::take_pending(&mut thread_pending, proc_pending, set)
         };
-        if !thread_pending.is_empty() {
-            resources.thread_pending.push((tid, thread_pending));
-        }
-        self.resources.refresh_summary(&resources);
+        resources.restore_thread_pending(tid, thread_pending);
+        self.resources
+            .refresh_summary(&resources, ProjectionUpdate::Member(tid));
         let delivery = delivery?;
         Some((delivery.entry.signal, delivery.entry.info))
     }
@@ -423,6 +583,7 @@ impl<T> NativeProcessSignals<T> {
                 inbox: source.inbox.for_fork(child),
                 thread_pending: Vec::new(),
                 forced_segv: Vec::new(),
+                projections: Vec::new(),
             })),
         })
     }
@@ -434,7 +595,7 @@ impl<T> NativeProcessSignals<T> {
         )
         .auto_reap
     }
-    pub fn exit_source<M: BlockedMaskSource>(&self, mask: M) -> NativeExitSignals<T, M> {
+    pub fn exit_source<M: BlockedMaskSource>(&self, mask: M) -> NativeExitSignals<'a, T, M> {
         NativeExitSignals {
             signals: self.clone(),
             mask,
@@ -445,11 +606,11 @@ impl<T> NativeProcessSignals<T> {
 /// Native signal locks are leaves: their operations never acquire the process
 /// graph or scheduler buckets. Exit delivery may sample them while retaining
 /// graph custody to select and notify the same live parent generation.
-pub struct NativeExitSignals<T, M> {
-    signals: NativeProcessSignals<T>,
+pub struct NativeExitSignals<'a, T, M> {
+    signals: NativeProcessSignals<'a, T>,
     mask: M,
 }
-impl<T, M: BlockedMaskSource> ExitSignalSource for NativeExitSignals<T, M> {
+impl<'a, T, M: BlockedMaskSource> ExitSignalSource for NativeExitSignals<'a, T, M> {
     fn exit_signal_state(&self, signal: LinuxSignal) -> ExitSignalState {
         let Some(signal) = Signal::from_number(signal.raw()) else {
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::SignalNumber)
@@ -484,6 +645,167 @@ mod tests {
             serial: TaskSerial::from_raw_u64(serial).unwrap(),
         }
     }
+    #[test]
+    fn thread_signal_projection_work_is_bounded_by_lookup_depth() {
+        for population in [1usize, 8, 32, 128] {
+            let controls: Vec<_> = (0..population)
+                .map(|_| carrick_el1_abi::ThreadControlSlot::new())
+                .collect();
+            let signals = NativeProcessSignals::<()>::fresh_root(key(41, 11));
+            let record = |index: usize| carrick_sched_core::RecordRef {
+                id: carrick_sched_core::RecordId::from_raw((index + 1) as u32).unwrap(),
+                incarnation: 1,
+            };
+            // Reverse registration catches an accidentally unsorted lookup table.
+            let _projections: Vec<_> = (0..population)
+                .rev()
+                .map(|index| {
+                    signals.project_member(
+                        record(index),
+                        Arc::new(
+                            carrick_core::lifecycle::MemberControlCustody::retain(&controls[index])
+                                .unwrap(),
+                        ),
+                    )
+                })
+                .collect();
+            signals
+                .resources
+                .projection_visits
+                .store(0, Ordering::Relaxed);
+            signals
+                .resources
+                .projection_stores
+                .store(0, Ordering::Relaxed);
+            let target = population / 2;
+            signals.enqueue_thread(record(target), Signal::ALRM, None);
+            for (index, control) in controls.iter().enumerate() {
+                assert_eq!(
+                    control.pending().load().0,
+                    if index == target {
+                        Signal::ALRM.bit()
+                    } else {
+                        0
+                    }
+                );
+            }
+            assert_eq!(
+                signals
+                    .take_deliverable(record(target), SigBlockMask::NONE)
+                    .unwrap()
+                    .0,
+                Signal::ALRM
+            );
+            assert!(
+                controls
+                    .iter()
+                    .all(|control| control.pending().load().0 == 0)
+            );
+            let visits = signals.resources.projection_visits.load(Ordering::Relaxed);
+            let budget = 2 * (population.ilog2() as usize + 2);
+            assert!(
+                visits <= budget,
+                "{population} members: {visits} visits > {budget}"
+            );
+            assert_eq!(
+                signals.resources.projection_stores.load(Ordering::Relaxed),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn process_projection_updates_cover_late_members_and_rehomes() {
+        let first = carrick_el1_abi::ThreadControlSlot::new();
+        let second = carrick_el1_abi::ThreadControlSlot::new();
+        let task = key(41, 11);
+        let signals = NativeProcessSignals::<()>::fresh_root(task);
+        let record = |id| carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(id).unwrap(),
+            incarnation: 1,
+        };
+        let first_projection = signals.project_member(
+            record(1),
+            Arc::new(carrick_core::lifecycle::MemberControlCustody::retain(&first).unwrap()),
+        );
+        signals.enqueue(task, Signal::KILL, None).unwrap();
+        let _second_projection = signals.project_member(
+            record(2),
+            Arc::new(carrick_core::lifecycle::MemberControlCustody::retain(&second).unwrap()),
+        );
+        first_projection.rehome(record(3));
+        assert_eq!(first.pending().load().0, Signal::KILL.bit());
+        assert_eq!(second.pending().load().0, Signal::KILL.bit());
+        assert_eq!(
+            signals
+                .take_deliverable(record(2), SigBlockMask::NONE)
+                .unwrap()
+                .0,
+            Signal::KILL
+        );
+        assert_eq!(first.pending().load().0, 0);
+        assert_eq!(second.pending().load().0, 0);
+
+        // Ordinary process and per-thread signals retain full pending words.
+        signals.enqueue_thread(record(3), Signal::STOP, None);
+        signals.enqueue(task, Signal::ALRM, None).unwrap();
+        assert_eq!(
+            first.pending().load().0,
+            Signal::STOP.bit() | Signal::ALRM.bit()
+        );
+        assert_eq!(second.pending().load().0, Signal::ALRM.bit());
+        signals
+            .install_action(
+                task,
+                Signal::ALRM,
+                Action {
+                    disposition: Disposition::Ignore,
+                    ..Action::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(first.pending().load().0, Signal::STOP.bit());
+        assert_eq!(second.pending().load().0, 0);
+    }
+
+    #[test]
+    fn native_pending_projection_keeps_exact_member_and_rehomed_queue() {
+        let first = carrick_el1_abi::ThreadControlSlot::new();
+        let second = carrick_el1_abi::ThreadControlSlot::new();
+        let signals = NativeProcessSignals::<()>::fresh_root(key(41, 11));
+        let first_custody =
+            Arc::new(carrick_core::lifecycle::MemberControlCustody::retain(&first).unwrap());
+        let second_custody =
+            Arc::new(carrick_core::lifecycle::MemberControlCustody::retain(&second).unwrap());
+        let record = |id| carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(id).unwrap(),
+            incarnation: 1,
+        };
+        let first_projection = signals.project_member(record(1), first_custody);
+        let _second_projection = signals.project_member(record(2), second_custody);
+        signals.enqueue_thread(record(1), Signal::STOP, None);
+        assert_eq!(first.pending().load().0, Signal::STOP.bit());
+        assert_eq!(second.pending().load().0, 0);
+        signals.enqueue(key(41, 11), Signal::ALRM, None).unwrap();
+        assert_eq!(second.pending().load().0, Signal::ALRM.bit());
+        first_projection.rehome(record(3));
+        assert!(signals.pending_set(record(3)).contains(Signal::STOP));
+        assert!(!signals.pending_set(record(1)).contains(Signal::STOP));
+        signals.enqueue_thread(record(2), Signal::KILL, None);
+        assert_eq!(first.pending().load().0 & Signal::KILL.bit(), 0);
+        assert_ne!(second.pending().load().0 & Signal::KILL.bit(), 0);
+        assert_eq!(
+            signals
+                .take_deliverable(record(2), SigBlockMask::NONE)
+                .unwrap()
+                .0,
+            Signal::KILL
+        );
+        assert_eq!(second.pending().load().0 & Signal::KILL.bit(), 0);
+        drop(first_projection);
+        assert_eq!(first.pending().load().0, 0);
+    }
+
     #[test]
     fn process_sigint_waits_for_unblocked_worker_and_survives_exec() {
         let task = key(41, 11);

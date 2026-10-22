@@ -61,7 +61,10 @@ pub mod wait_service;
 
 pub(crate) use self::readiness::ReadinessProbe;
 pub use self::readiness::{ContinuationWakeToken, ReservedSignal, ResumeContext, StaleThreadCause};
-pub use self::readiness::{SignalReadinessProbe, reserve_killable_wait_signal};
+pub use self::readiness::{
+    NativeOwnerWaitRegistration, OwnerWaitCancellation, SignalReadinessProbe,
+    owner_wait_cancellation, reserve_killable_wait_signal,
+};
 pub use self::wait_service::{
     CarrierWaitService, ContinuationEventFuture, WaitServiceError, WaitServiceTopology,
     WakePublishReceipt,
@@ -749,6 +752,7 @@ fn event_diagnostic(event: &ContinuationEvent) -> &'static str {
         ContinuationEvent::Timeout => "timeout",
         ContinuationEvent::Signal => "signal",
         ContinuationEvent::ReservedSignal(_) => "reserved-signal",
+        ContinuationEvent::OwnerCancelled(_) => "owner-cancelled",
     }
 }
 
@@ -2368,6 +2372,12 @@ impl BlockedContinuation {
             ContinuationCompletion::Errno(LINUX_EINTR)
         } else {
             match event {
+                ContinuationEvent::OwnerCancelled(cancellation) => {
+                    if family != ContinuationFamily::KillableOwnerZone {
+                        return Err(ContinuationResumeError::MissingContinuation);
+                    }
+                    ContinuationCompletion::OwnerCancelled(cancellation)
+                }
                 ContinuationEvent::Ready => match producer_completion {
                     Some(
                         outcome
@@ -2779,13 +2789,14 @@ pub enum ContinuationEvent {
     Timeout,
     Signal,
     ReservedSignal(ReservedSignal),
+    OwnerCancelled(OwnerWaitCancellation),
 }
 
 impl ContinuationEvent {
     pub fn reserved_signal(&self) -> Option<&ReservedSignal> {
         match self {
             Self::ReservedSignal(signal) => Some(signal),
-            Self::Ready | Self::Timeout | Self::Signal => None,
+            Self::Ready | Self::Timeout | Self::Signal | Self::OwnerCancelled(_) => None,
         }
     }
 }
@@ -2793,6 +2804,7 @@ impl ContinuationEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContinuationCompletion {
     ResumeRetainedMemory,
+    OwnerCancelled(OwnerWaitCancellation),
     Return(i64),
     Errno(LinuxErrno),
     Redispatch,
@@ -2859,7 +2871,8 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
     memory: &mut M,
 ) -> Result<Option<DispatchOutcome>, MemoryError> {
     Ok(match completion {
-        ContinuationCompletion::ResumeRetainedMemory => return Err(MemoryError::Unsupported),
+        ContinuationCompletion::ResumeRetainedMemory
+        | ContinuationCompletion::OwnerCancelled(_) => return Err(MemoryError::Unsupported),
         ContinuationCompletion::Return(value) => Some(DispatchOutcome::Returned { value }),
         ContinuationCompletion::Errno(errno) => Some(DispatchOutcome::Errno { errno }),
         ContinuationCompletion::Redispatch => None,

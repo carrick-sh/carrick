@@ -3353,7 +3353,35 @@ where
             })?;
             let scheduler = runtime.continuation_services(context.kernel()).0;
             let wake = registration_wake_callback(scheduler, context.thread().key(), false);
-            let (subscription, ready) = wait.0.enroll(wake);
+            let mut observed = context.task().wake_generation();
+            let native_wait =
+                carrick_kernel::kernel::continuation::NativeOwnerWaitRegistration::enroll(context);
+            let signal_wake = Arc::clone(&wake);
+            let signal_context = context.retain_exact();
+            let signal_callback: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |_| {
+                if carrick_kernel::kernel::continuation::owner_wait_cancellation(&signal_context)
+                    .is_some()
+                {
+                    signal_wake();
+                }
+            });
+            let signal_subscription = loop {
+                match context.task().subscribe_wake(observed, Arc::clone(&signal_callback)) {
+                    carrick_kernel::kernel::objects::TaskWakeEnrollment::Subscribed(subscription) => break carrick_kernel::kernel::continuation::wait_service::ProducerSubscription::Task(subscription),
+                    carrick_kernel::kernel::objects::TaskWakeEnrollment::Ready(current) => {
+                        signal_callback(current);
+                        observed = current;
+                    }
+                }
+            };
+            let (subscription, ready) = wait.0.enroll(Arc::clone(&wake));
+            // Enroll before the fatal sample: a publication on either side of
+            // enrollment is owned by the producer callback or this sample.
+            if carrick_kernel::kernel::continuation::owner_wait_cancellation(context).is_some() {
+                wake();
+            }
+            let subscription: Box<dyn std::fmt::Debug + Send + Sync> =
+                Box::new((subscription, signal_subscription, native_wait));
             if ready || wait.0.is_ready() {
                 drop(subscription);
                 let outcome = self.state.resume_owned_syscall(
@@ -4036,6 +4064,22 @@ where
         })
     }
 
+    /// A native owner selected fatal cancellation. Transfer the obligation,
+    /// not a syscall result: another member may already be draining the group.
+    pub(super) fn cancel_native_owner_wait(
+        &mut self,
+        engine: &mut E,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        self.state.publish_external_ingress(&self.kernel)?;
+        engine
+            .cancel_native_owner_wait()
+            .map_err(RuntimeError::Trap)?;
+        self.state.retire_syscall()?;
+        self.state.continuation_restart = None;
+        self.phase = HvpatchProductionPhase::Resident;
+        Ok(executor::ExecutorExit::Syscall)
+    }
+
     /// Route a terminal outcome produced outside `service_outcome` — a fault
     /// signal that killed the process, or a forced-exit signal service — into
     /// the persistent terminal, the same way the trap watchdog does.
@@ -4150,7 +4194,12 @@ where
             if let Some(context) = self.state.service_kernel_context.as_ref() {
                 self.kernel.wake_native_terminal_members(context)?;
             }
-            if !self.phase.is_terminal_transition() {
+            if !self.phase.is_terminal_transition()
+                && !matches!(
+                    self.phase,
+                    HvpatchProductionPhase::ResumeOwnerPhysical { .. }
+                )
+            {
                 self.state.publish_external_ingress(&self.kernel)?;
             }
             if !self.phase.is_terminal_transition()
@@ -4416,8 +4465,29 @@ where
                     let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
                         RuntimeError::Configuration("physical owner resume lost context".to_owned())
                     })?;
-                    if let Some(reserved) =
-                        carrick_kernel::kernel::continuation::reserve_killable_wait_signal(context)
+                    let cancellation =
+                        carrick_kernel::kernel::continuation::owner_wait_cancellation(context);
+                    if matches!(
+                        cancellation,
+                        Some(
+                            carrick_kernel::kernel::continuation::OwnerWaitCancellation::GroupExit
+                        )
+                    ) {
+                        drop(_subscription);
+                        return self.drive_thread_exit(engine, control, 0);
+                    }
+                    if matches!(cancellation, Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::NativeFatal)) {
+                        drop(_subscription);
+                        return self.cancel_native_owner_wait(engine);
+                    }
+                    if cancellation
+                        == Some(
+                            carrick_kernel::kernel::continuation::OwnerWaitCancellation::Carrier,
+                        )
+                        && let Some(reserved) =
+                            carrick_kernel::kernel::continuation::reserve_killable_wait_signal(
+                                context,
+                            )
                     {
                         if let Some(outcome) = service_signals_threaded(
                             &self.kernel,
@@ -7369,6 +7439,20 @@ mod tests {
 
     #[test]
     fn physical_owner_wait_sigkill_enters_production_terminal_without_readiness() {
+        exercise_physical_owner_wait(false, false);
+    }
+
+    #[test]
+    fn serial_host_native_sibling_kill_cancels_physical_owner_wait_without_readiness() {
+        exercise_physical_owner_wait(true, false);
+    }
+
+    #[test]
+    fn serial_host_native_sibling_tgkill_cancels_physical_owner_wait_without_readiness() {
+        exercise_physical_owner_wait(true, true);
+    }
+
+    fn exercise_physical_owner_wait(native: bool, thread_directed: bool) {
         #[derive(Debug)]
         struct NotReady;
         impl carrick_guest_mem::PhysicalMemoryWait for NotReady {
@@ -7385,6 +7469,46 @@ mod tests {
         let dispatcher = SyscallDispatcher::new();
         let (_runtime, scheduler, kernel, root, process, _generation) =
             test_carrier_graph_with_dispatcher!(72_431, dispatcher);
+        struct ClearRegion;
+        impl Drop for ClearRegion {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(0);
+            }
+        }
+        let _clear_region = native.then_some(ClearRegion);
+        root.thread()
+            .set_affinity(carrick_hal::CpuAffinity::from_words(&[1]));
+        let native_owner = if native {
+            use carrick_el1_linux::mm_portal::test_support::{ROOT, Region, admit_notified};
+            let region = Box::leak(Box::new(Region::new()));
+            let zone = region.zone();
+            carrick_el1_abi::record_el1_region_host_ptr(region.ptr.as_ptr() as usize);
+            admit_notified(region, root.shared().mm().id().raw(), ROOT, 1, 0);
+            let mut owner = tests::native_owner_fixture(&root, zone);
+            let sibling = root
+                .kernel()
+                .reserve_thread_clone(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::VM
+                            | carrick_abi::LinuxCloneFlags::SIGHAND
+                            | carrick_abi::LinuxCloneFlags::THREAD,
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+                .prepare(ThreadId::synthetic_for_tests(72_432))
+                .unwrap()
+                .commit_for_el1()
+                .unwrap()
+                .into_context()
+                .unwrap();
+            tests::native_owner_add_sibling(&mut owner, &sibling);
+            Some(Arc::new(owner))
+        } else {
+            None
+        };
         let tid = ThreadId::synthetic_for_tests(72_431);
         let kicker: Arc<dyn VcpuRegistry> = Arc::new(carrick_hal::GenericVcpuRegistry::new());
         let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
@@ -7417,6 +7541,7 @@ mod tests {
                 .unwrap(),
         );
         let mut engine = CrashCaptureTestEngine {
+            native_owner: native_owner.clone(),
             prepare_dependency: Some(carrick_guest_mem::OwnedMemoryWait(Arc::new(NotReady))),
             ..Default::default()
         };
@@ -7453,22 +7578,93 @@ mod tests {
                 .unwrap(),
             executor::ExecutorExit::Blocked(_)
         ));
-        root.signal_authority().enqueue_thread_standard(
-            carrick_kernel::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGKILL)
-                .unwrap(),
-            None,
-        );
+        let lease = submission.take_execution_lease().unwrap();
+        running.restore_lease(lease).unwrap();
+        scheduler
+            .settle_blocked(
+                running,
+                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+            )
+            .unwrap();
+        assert_eq!(scheduler.queued_len(), 0);
+        // A generic wake, including a bridge stop, cannot make an unready
+        // killable owner wait runnable. SIGKILL below uses the real publisher.
         root.task().wake();
+        assert_eq!(scheduler.queued_len(), 0);
+        if native {
+            let bridge = root.kernel().host_signal();
+            struct ClearStop<'a>(&'a dyn carrick_hal::HostSignalBridge, i32);
+            impl Drop for ClearStop<'_> {
+                fn drop(&mut self) {
+                    self.0.take_pending_in_for(
+                        self.1,
+                        carrick_abi::SigSet::EMPTY.with(carrick_abi::LINUX_SIGSTOP),
+                    );
+                }
+            }
+            let clear_stop = ClearStop(bridge.as_ref(), root.thread().key().tid.raw());
+            bridge.publish_pending_for(root.thread().key().tid.raw(), carrick_abi::LINUX_SIGSTOP);
+            root.task().wake();
+            assert_eq!(
+                scheduler.queued_len(),
+                0,
+                "SIGSTOP must not wake a physical owner wait"
+            );
+            drop(clear_stop);
+        }
+        if let Some(owner) = &native_owner {
+            let doorbell = if thread_directed {
+                owner.tgkill_from_sibling()
+            } else {
+                owner.kill_from_sibling()
+            };
+            assert!(
+                doorbell.is_some(),
+                "native SIGKILL must publish an event-driven host wake"
+            );
+            carrick_kernel::el1_delegation::settle_host_work_boundary(
+                root.kernel(),
+                false,
+                doorbell,
+            );
+        } else {
+            root.signal_authority().enqueue_thread_standard(
+                carrick_kernel::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGKILL)
+                    .unwrap(),
+                None,
+            );
+            root.task().wake();
+        }
+        assert_eq!(
+            scheduler.queued_len(),
+            1,
+            "signal publication must wake the parked physical wait"
+        );
+        let mut running = scheduler
+            .try_take(&registration)
+            .unwrap()
+            .expect("fatal signal must reach physical waiter executor");
+        submission.authority =
+            executor::ExecutionLeaseAuthoritySlot::new(Some(running.take_lease()));
+        let mut control = executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
         assert!(
             !kernel.process_exiting(),
             "posting SIGKILL alone is not group exit"
         );
         job.poll_with_engine(&mut engine, &mut control).unwrap();
-        assert!(
-            job.phase.is_terminal_transition(),
-            "SIGKILL must enter production termination while physical backing is unready"
-        );
-        assert!(kernel.process_exiting());
+        if native {
+            assert_eq!(engine.native_owner_cancellations, 1);
+            assert!(
+                carrick_el1_abi::Lifecycle::process_exit_custody(&*root.lifecycle_page())
+                    .caller_reserved()
+            );
+        } else {
+            assert!(
+                job.phase.is_terminal_transition(),
+                "SIGKILL must enter production termination while physical backing is unready"
+            );
+            assert!(kernel.process_exiting());
+        }
         assert!(
             engine.completed_syscalls.is_empty(),
             "SIGKILL must not fabricate a syscall return"

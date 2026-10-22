@@ -27,9 +27,12 @@ pub struct LinuxTaskState {
 /// host step that settles that work. Nothing else can clear the doorbell.
 #[must_use = "a consumed host-work doorbell must reach the boundary that settles its work"]
 #[derive(Debug, Eq, PartialEq)]
-pub struct HostWorkDoorbell(());
+pub struct HostWorkDoorbell(u32);
 
 impl HostWorkDoorbell {
+    pub fn native_signal_wake(&self) -> bool {
+        self.0 & 2 != 0
+    }
     /// The settling boundary has delivered the owed work.
     pub fn settled(self) {}
 }
@@ -51,7 +54,8 @@ impl LinuxTaskState {
     /// Consume the doorbell. The token must be passed to the boundary that
     /// settles what it announces.
     pub fn take_host_work_doorbell(&self) -> Option<HostWorkDoorbell> {
-        (self.pending_host_work.swap(0, Ordering::AcqRel) != 0).then_some(HostWorkDoorbell(()))
+        let work = self.pending_host_work.swap(0, Ordering::AcqRel);
+        (work != 0).then_some(HostWorkDoorbell(work))
     }
 
     /// Byte offset of the served-boundary word, for ABI layout checks and
@@ -84,7 +88,12 @@ impl LinuxTaskState {
         self.pending_host_work.load(Ordering::Acquire) != 0
     }
     pub fn mark_pending_host_work(&self) {
-        self.pending_host_work.store(1, Ordering::Release);
+        self.pending_host_work.fetch_or(1, Ordering::Release);
+    }
+    /// Native SIGKILL publication owes a wake to host owner continuations.
+    /// Preserve this cause when ordinary host work is published concurrently.
+    pub fn mark_native_signal_work(&self) {
+        self.pending_host_work.fetch_or(2, Ordering::Release);
     }
     pub fn take_served_boundary(&self) -> Option<ServedBoundary> {
         match self.served_with_work.swap(0, Ordering::AcqRel) {
@@ -185,6 +194,22 @@ impl SyscallResult {
 
 // Literal wire layout captured from 3fd7862be on a 64-bit host.
 // Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod host_work_tests {
+    use super::*;
+    #[test]
+    fn native_signal_wake_cause_survives_ordinary_publication() {
+        let state = LinuxTaskState::new();
+        state.mark_native_signal_work();
+        state.mark_pending_host_work();
+        let doorbell = state.take_host_work_doorbell().unwrap();
+        assert!(doorbell.native_signal_wake());
+        assert_eq!(state.take_served_boundary(), None);
+        doorbell.settled();
+        assert!(!state.has_pending_host_work());
+    }
+}
+
 #[cfg(test)]
 mod layout_manifest {
     use super::*;

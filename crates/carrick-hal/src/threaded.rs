@@ -3274,6 +3274,11 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     ) -> Result<(), TrapError> {
         self.complete_syscall(value)
     }
+    /// Transfer a proven fatal owner-wait obligation to native signal custody.
+    /// This is not a syscall completion and must never return to user mode.
+    fn cancel_native_owner_wait(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
     /// Commit a host-loaded in-kernel home only after exact MM occupancy has
     /// been published. Engines without a guest process owner have no home.
     fn commit_prepared_home(&mut self) -> Result<(), TrapError> {

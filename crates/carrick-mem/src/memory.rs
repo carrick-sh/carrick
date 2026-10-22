@@ -4972,6 +4972,13 @@ fn write_el1_hook(
                     &mut cursor,
                     enc_ldr_wt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION),
                 );
+                emit(bytes, &mut cursor, enc_cmp_w16_imm(6) | (1 << 5));
+                let ordinary_signal_branch = cursor;
+                emit(bytes, &mut cursor, 0);
+                emit(bytes, &mut cursor, enc_movz_w16(0xfffc) | 1);
+                let fatal_store_branch = cursor;
+                emit(bytes, &mut cursor, 0);
+                let ordinary_signal = cursor;
                 emit(bytes, &mut cursor, enc_cmp_w16_imm(5) | (1 << 5)); // cmp w17, #5
                 let eligible_branch = cursor;
                 emit(bytes, &mut cursor, 0);
@@ -4981,6 +4988,16 @@ fn write_el1_hook(
                 let eligible = cursor;
                 emit(bytes, &mut cursor, enc_movz_w16(0xfffe) | 1);
                 let store = cursor;
+                put(
+                    bytes,
+                    ordinary_signal_branch,
+                    enc_bne(ordinary_signal_branch as u64, ordinary_signal as u64),
+                );
+                put(
+                    bytes,
+                    fatal_store_branch,
+                    enc_b(fatal_store_branch as u64, store as u64),
+                );
                 put(
                     bytes,
                     eligible_branch,
@@ -5112,6 +5129,7 @@ fn write_el1_hook(
     if entry == HookEntry::Syscall {
         // The syscall is complete: the host must not replay it.
         emit(bytes, &mut cursor, 0x9100_1021); // add x1, x1, #4 (&served_with_work)
+        emit(bytes, &mut cursor, (enc_movz_w16(1) & !31) | 2); // cause bits are not replay policy
         emit(bytes, &mut cursor, 0x889F_FC22); // stlr w2, [x1] (mark served_with_work = 1)
     }
     let branch_to_forward = cursor;
@@ -5777,6 +5795,9 @@ fn el1_vectors_bytes_mailbox_with_layout(
     emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(5));
     let native_signal_no_restart_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(6));
+    let native_owner_cancel_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
     let invalid_action_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
@@ -5804,6 +5825,7 @@ fn el1_vectors_bytes_mailbox_with_layout(
         &mut cursor,
         enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE),
     );
+    let native_owner_cancel = cursor;
     emit(&mut bytes, &mut cursor, enc_movz_w16(0));
     emit(&mut bytes, &mut cursor, AARCH64_STLR_W16_X17_OPCODE);
     emit(
@@ -5994,6 +6016,14 @@ fn el1_vectors_bytes_mailbox_with_layout(
         enc_beq(
             native_signal_no_restart_branch as u64,
             native_signal_return as u64,
+        ),
+    );
+    put(
+        &mut bytes,
+        native_owner_cancel_branch,
+        enc_beq(
+            native_owner_cancel_branch as u64,
+            native_owner_cancel as u64,
         ),
     );
     put(

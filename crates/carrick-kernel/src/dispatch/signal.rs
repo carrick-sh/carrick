@@ -5930,6 +5930,9 @@ mod tests {
     struct NoHostSignalIngress;
     #[allow(clippy::panic)]
     impl carrick_hal::HostSignalBridge for NoHostSignalIngress {
+        fn claim_pending_in_for(&self, _: i32, _: SigSet) -> bool {
+            false
+        }
         fn has_unblocked_pending_for(&self, _: i32, _: SigBlockMask) -> bool {
             false
         }

@@ -95,6 +95,12 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
     use crate::sched::ThreadCpu;
     use zerocopy::IntoBytes;
 
+    if frame.esr == 0xfffc {
+        return Some(match process.cancel_owner_wait() {
+            Ok(_) => carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+            Err(_) => carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion,
+        });
+    }
     if !(process.signal_checkpoint_needed()
         || (frame.esr == 0xfffe
             && frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64))
