@@ -205,7 +205,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         .ok_or(NativeProcessError::Stale)?;
         let entry = match request.operation {
             ServiceOperation::Fault(_) => OwnerEntry::Exception,
-            ServiceOperation::Crossing { .. } => OwnerEntry::Syscall,
+            ServiceOperation::Crossing { .. } | ServiceOperation::CompletedWork => {
+                OwnerEntry::Syscall
+            }
         };
         let mut completion = None;
         let mut failure = None;
@@ -309,7 +311,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .record(self.record.id)
                     .publish_owner_continuation(match request.operation {
                         ServiceOperation::Fault(_) => OwnerEntry::Exception,
-                        ServiceOperation::Crossing { .. } => OwnerEntry::Syscall,
+                        ServiceOperation::Crossing { .. } | ServiceOperation::CompletedWork => {
+                            OwnerEntry::Syscall
+                        }
                     });
             }
             self.release_service_claim(pending.claim)?;
@@ -323,6 +327,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .consume_owner_continuation();
         }
         let completed = (|| match (request.operation, result) {
+            (
+                ServiceOperation::CompletedWork,
+                ServiceResult::Supplied | ServiceResult::Cancelled,
+            ) => {
+                // Bytes/results already committed before suspension. Cancellation
+                // cannot turn that completion into a short transfer or EINTR.
+                Ok(NativeResume::NoPending)
+            }
+            (ServiceOperation::CompletedWork, ServiceResult::Refused) => {
+                Err(NativeProcessError::Quarantined)
+            }
             (ServiceOperation::Crossing { .. }, ServiceResult::Refused) => {
                 Ok(NativeResume::Returned(SyscallResult::new(
                     carrick_syscall_abi::LINUX_ENOSYS.guest_retval(),

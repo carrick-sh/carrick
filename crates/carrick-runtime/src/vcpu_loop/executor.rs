@@ -1754,7 +1754,7 @@ fn next_runnable<F: PersistentExecutor>(
         GuestIdleExit::Idle => Ok(None),
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         GuestIdleExit::Service(service) => {
-            backend::finish_native_service(service)
+            backend::finish_native_service(service, scheduler.kernel())
                 .map_err(|error| NextError::Fatal(error.to_string()))?;
             Ok(None)
         }

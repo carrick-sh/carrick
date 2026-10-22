@@ -41,6 +41,23 @@ impl NativeService {
     /// An unsupported service is refused to its ring owner, which alone
     /// chooses errno or signal. There is no host syscall dispatch fallback.
     pub fn refuse(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        self.complete(false)
+    }
+
+    /// The carrier delivered the completed instruction's owed work. Its
+    /// result remains exclusively in the ring continuation.
+    pub fn acknowledge_work(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        if self.request().operation != carrick_core_abi::service::ServiceOperation::CompletedWork {
+            return Err(stale());
+        }
+        self.complete(true)
+    }
+
+    pub fn slot(&self) -> carrick_sched_core::SlotId {
+        self.slot
+    }
+
+    fn complete(self, supplied: bool) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let region = retained_abi_region(&self.custody).ok_or_else(stale)?;
         let (_, zone) = stopped_records(
             region,
@@ -54,7 +71,7 @@ impl NativeService {
             .map_err(|_| stale())?;
         // Claim, cancel, and complete share this queue lock. WRITING is never
         // treated as a stale generation merely because another CPU is active.
-        self.ticket.complete(false).map_err(|_| stale())?;
+        self.ticket.complete(supplied).map_err(|_| stale())?;
         let mut effects = carrick_sched_core::WakeEffects::default();
         queue
             .notify_object(self.slot, &mut effects)
@@ -155,7 +172,7 @@ pub(super) fn take(
             custody: Arc::clone(custody),
             slot: carrick_sched_core::SlotId::from_index(cpu.raw() as usize).ok_or_else(stale)?,
         })),
-        // Cancellation may have won before intake; it already owns completion.
+        // A stale selector cannot acknowledge or complete a successor.
         Err(ServiceError::Stale) => Ok(None),
         Err(_) => Err(stale()),
     }

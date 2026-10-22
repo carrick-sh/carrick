@@ -266,6 +266,17 @@ impl Frames {
                     + allocation,
             ),
             (
+                "native service continuation",
+                (entry
+                    + self.required("::dispatch::arm_native_service_exit::")?
+                    + self.required("::aarch64_process::with_process_entry::")?
+                    + self.maximum("::begin_service::"))
+                .max(resume + self.maximum("::resume_service::"))
+                    + self.required("::park_service::")?
+                    + self.sum(&["::finish_service::", "::release_service_claim::"])
+                    + allocation,
+            ),
+            (
                 "native wait copy",
                 native.max(resume)
                     + self.required("::wait_query::")?
@@ -404,6 +415,8 @@ mod tests {
             "x::prepare_mm::h0",
             "x::fork_child_context_boxed::h0",
             "x::wait_query::h0",
+            "x::dispatch::arm_native_service_exit::h0",
+            "x::park_service::h0",
             "x::setup_arm_signal_frame::h0",
             "x::restore_live_arm_signal_frame::h0",
             "x::serve_delegated_anonymous::h0",

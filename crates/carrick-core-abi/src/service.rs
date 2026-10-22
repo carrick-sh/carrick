@@ -23,7 +23,11 @@ pub struct ServiceIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceOperation {
     Fault(FaultInfo),
-    Crossing { ordinal: NativeOrdinal },
+    Crossing {
+        ordinal: NativeOrdinal,
+    },
+    /// The instruction completed; only carrier wake/completion delivery remains.
+    CompletedWork,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServiceRequest {
@@ -232,6 +236,7 @@ impl ServiceCell {
         let (kind, first, second) = match operation {
             ServiceOperation::Fault(fault) => (1, fault_bits(fault), fault.address.raw()),
             ServiceOperation::Crossing { ordinal } => (2, ordinal.raw(), 0),
+            ServiceOperation::CompletedWork => (3, 0, 0),
         };
         for (index, value) in [(8, execution.raw()), (9, kind), (10, first), (11, second)] {
             self.words[index].store(value, Ordering::Relaxed);
@@ -335,6 +340,9 @@ impl ServiceCell {
                 2 => ServiceOperation::Crossing {
                     ordinal: NativeOrdinal::new(first),
                 },
+                3 if first == 0 && cell.words[11].load(Ordering::Relaxed) == 0 => {
+                    ServiceOperation::CompletedWork
+                }
                 _ => return Err(ServiceError::Stale),
             };
             Ok(ServiceRequest {
@@ -391,6 +399,11 @@ impl ServiceCell {
             ServiceOperation::Crossing { ordinal } => {
                 cell.words[9].load(Ordering::Relaxed) == 2
                     && cell.words[10].load(Ordering::Relaxed) == ordinal.raw()
+            }
+            ServiceOperation::CompletedWork => {
+                cell.words[9].load(Ordering::Relaxed) == 3
+                    && cell.words[10].load(Ordering::Relaxed) == 0
+                    && cell.words[11].load(Ordering::Relaxed) == 0
             }
         };
         if !operation_matches {

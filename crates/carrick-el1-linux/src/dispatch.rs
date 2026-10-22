@@ -655,12 +655,6 @@ pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
         dispatch_syscall(frame, counters)
     };
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    if action == Action::Forward && frame.esr != 0 {
-        if let Some(owned) = arm_native_service_exit(frame) {
-            return owned;
-        }
-    }
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     if action == Action::Served
         && (frame.esr == 0 || matches!((frame.esr >> 26) & 0x3f, 0x20 | 0x24))
     {
@@ -669,11 +663,22 @@ pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
     action
 }
 
+/// Capture only after the final descriptor drain has selected its boundary.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub fn capture_native_service_exit(frame: &mut TrapFrame, action: Action) -> Action {
+    if matches!(action, Action::Forward | Action::ServedWithWork) && frame.esr != 0 {
+        if let Some(owned) = arm_native_service_exit(frame, action) {
+            return owned;
+        }
+    }
+    action
+}
+
 /// Capture the exception while its native owner still owns the trap words.
 /// The host receives a selector only after this continuation has parked.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
-fn arm_native_service_exit(frame: &mut TrapFrame) -> Option<Action> {
+fn arm_native_service_exit(frame: &mut TrapFrame, action: Action) -> Option<Action> {
     use super::native_process_runtime::NativeResume;
     use carrick_core_abi::service::ServiceOperation;
     use carrick_guest_arch::{Access, FaultInfo, NativeOrdinal, UserVa};
@@ -686,7 +691,19 @@ fn arm_native_service_exit(frame: &mut TrapFrame) -> Option<Action> {
         return None;
     }
     let (page, control) = task.lifecycle_refs()?;
-    let operation = if matches!((frame.esr >> 26) & 0x3f, 0x20 | 0x24) {
+    let operation = if action == Action::ServedWithWork {
+        // A metadata commit still owed is a different capability from a
+        // completed result. Never replay or refuse an already completed call.
+        if task.linux.served_word() != carrick_el1_abi::SERVED_WAKES_OWED {
+            return None;
+        }
+        let boundary = task.linux.take_served_boundary();
+        if boundary != Some(carrick_el1_abi::ServedBoundary::Completed) {
+            invalid_completion(NativeInvariant::EntryBinding);
+        }
+        task.linux.mark_pending_host_work();
+        ServiceOperation::CompletedWork
+    } else if matches!((frame.esr >> 26) & 0x3f, 0x20 | 0x24) {
         ServiceOperation::Fault(FaultInfo {
             address: UserVa::new(frame.far),
             access: if (frame.esr >> 26) & 0x3f == 0x20 {
