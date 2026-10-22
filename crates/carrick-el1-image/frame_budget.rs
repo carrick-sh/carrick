@@ -255,6 +255,16 @@ impl Frames {
                     + self.maximum("::fork_child_context_boxed::")
                     + allocation,
             ),
+            // Commit copies the 128-byte settlement onto the stopped CPU's
+            // stack. The release of the child's space gate may also schedule
+            // another lane, so retain the owner and allocation frames here.
+            (
+                "native fork settlement",
+                native
+                    + self.required("::fork_owned::")?
+                    + self.required("::settle_mm::")?
+                    + allocation,
+            ),
             (
                 "native wait copy",
                 native.max(resume)
@@ -390,6 +400,7 @@ mod tests {
             "x::signal_delivery::deliver_signal_on_syscall_return::h0",
             "x::admit_entry_runtime::h0",
             "x::fork_owned::h0",
+            "x::settle_mm::h0",
             "x::prepare_mm::h0",
             "x::fork_child_context_boxed::h0",
             "x::wait_query::h0",
@@ -403,6 +414,14 @@ mod tests {
         }
         let mut frames = Frames(values);
         assert!(frames.check(16384, 288).is_ok());
+        frames.0.insert("x::settle_mm::h0".to_owned(), 12000);
+        assert!(
+            frames
+                .check(16384, 288)
+                .unwrap_err()
+                .contains("native fork settlement")
+        );
+        frames.0.insert("x::settle_mm::h0".to_owned(), 128);
         for method in ["fork_owned", "prepare_mm", "publish_fork", "root_any"] {
             frames.0.insert(format!("x::{method}::h0"), 3000);
         }
