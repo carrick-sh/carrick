@@ -65,7 +65,7 @@ pub fn root_mapping_incarnation<
 /// Whether a delegated MM's root lets this prepared page be committed:
 /// NotDelegated when the MM has no admitted root (its host arming decided), else
 /// whether a node covers `page` and, for plain anonymous memory, permits
-/// `access`. A busy root is Unavailable, never a Linux protection decline.
+/// `access`. A busy root names its reservation producer, never a Linux protection decline.
 pub fn root_fault_admission<
     Policy: crate::mm::reservation::ReservationPolicy,
     Geometry: crate::mm::reservation::ReservationGeometry,
@@ -90,8 +90,10 @@ pub fn root_fault_admission<
     if !roots.admitted(index, mm) {
         return RootFaultAdmission::NotDelegated;
     }
-    let Ok(mut model) = roots.lock_in(spaces, index, mm, slot) else {
-        return RootFaultAdmission::Unavailable;
+    let mut model = match roots.lock_in(spaces, index, mm, slot) {
+        Ok(model) => model,
+        Err(crate::mm::reservation::Refusal::Busy) => return RootFaultAdmission::Busy,
+        Err(_) => return RootFaultAdmission::Unavailable,
     };
     let bits = match access {
         LeafAccess::Read => 1,
@@ -111,6 +113,7 @@ pub fn root_fault_admission<
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RootFaultAdmission {
+    Busy,
     NotDelegated,
     Allowed,
     Declined,

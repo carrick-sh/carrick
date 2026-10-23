@@ -231,6 +231,19 @@ impl ExcludedEditor<'_> {
 }
 
 impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'a, C> {
+    /// The admitted editor retains this exact translation identity even if
+    /// a host pause raises the gate while waiting for this guard to leave.
+    pub fn grant(&self) -> SpaceGrant {
+        let published = self.entry.cow_published.load(Ordering::Acquire);
+        let covered = self.entry.cow_covered.load(Ordering::Acquire);
+        SpaceGrant {
+            index: self.index,
+            ttbr0: self.entry.ttbr0.load(Ordering::Acquire),
+            ttbr1: self.entry.ttbr1.load(Ordering::Acquire),
+            cow_owed: (published != covered).then_some(published),
+        }
+    }
+
     pub fn mmap_next(&self) -> u64 {
         self.entry.mmap_next.load(Ordering::Acquire)
     }

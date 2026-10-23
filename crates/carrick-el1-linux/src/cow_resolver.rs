@@ -181,7 +181,11 @@ pub(crate) fn native_fault_supply<'a>(
 /// Increments `counters.fault_taken`; at EL1, requests host-published bulk
 /// frames, consumes refusals, or resolves in-guest COW faults.
 /// Host builds retain the forward-only path.
-pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
+pub fn dispatch_fault(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
+) -> Action {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let current_tasks = unsafe {
@@ -199,12 +203,27 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
         let portal = unsafe {
             &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
         };
-        let supply = OwnerFaultSupply::new(portal);
+        let mut supply = OwnerFaultSupply::new(portal);
         let native = zone
             .slot(carrick_sched_core::SlotId::new(frame.slot as u8))
             .current()
             .is_some_and(|record| zone.record(record).is_native_owned());
-        dispatch_fault_with_descriptor_txns(
+        if native {
+            let slot = carrick_sched_core::SlotId::new(frame.slot as u8);
+            if let Some(record) = zone.slot(slot).current()
+                && let Some(task) = current_tasks.get(frame.slot as usize)
+                && let Some((_, control)) = task.lifecycle_refs()
+                && let Ok(handle) = control.service.bound_mm(
+                    zone.record_ref(record),
+                    carrick_el1_abi::EntryThreadGeneration::from_raw(
+                        zone.record(record).identity().serial,
+                    ),
+                )
+            {
+                supply = supply.with_handle(handle);
+            }
+        }
+        let action = dispatch_fault_with_descriptor_txns(
             frame,
             counters,
             current_tasks,
@@ -237,19 +256,23 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 publication: None,
                 completion: None,
             },
-        )
+        );
+        if let OwnerFaultSupplyOutcome::Wait(wait) = supply.outcome() {
+            *owner_wait = Some(wait);
+        }
+        action
     }
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     {
         // CPL0 enters through `dispatch_x86_fault_with_prepared` with its
         // decoded #PF. This ARM TrapFrame entry has no x86 fault provenance.
-        let _ = frame;
+        let _ = (frame, owner_wait);
         counters.fault_taken.fetch_add(1, Ordering::Relaxed);
         Action::Forward
     }
     #[cfg(not(target_os = "none"))]
     {
-        let _ = frame;
+        let _ = (frame, owner_wait);
         counters.fault_taken.fetch_add(1, Ordering::Relaxed);
         Action::Forward
     }
@@ -275,7 +298,7 @@ mod tests {
         let counters = Counters::default();
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
 
-        let action = dispatch_fault(&mut frame, &counters);
+        let action = dispatch_fault(&mut frame, &counters, &mut None);
         assert_eq!(action, Action::Forward);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
         // Ensure arbitrary x8 was not dispatched as a syscall and syscall counters were not touched

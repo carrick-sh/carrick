@@ -219,6 +219,16 @@ impl Frames {
         let delivery = self.required("::arm_signal::deliver_on_user_return::")?
             + 2 * self.required("::signal_delivery::deliver_signal_on_syscall_return::")?
             + self.maximum("::signal_delivery::force_delivery_fault::");
+        let service = (entry
+            + self.required("::dispatch::arm_native_service_exit::")?
+            + self.required("::aarch64_process::with_process_entry::")?
+            + self.maximum("::begin_service::")
+            + self.required("::begin_service_inner::")?)
+        .max(resume + self.maximum("::resume_service::"))
+            + self
+                .required("::park_service::")?
+                .max(self.required("::park_owner_wait::")? + self.maximum("::finish_owner_wait::"))
+            + self.maximum("::finish_service::");
         let chains = [
             (
                 "native admission",
@@ -267,14 +277,14 @@ impl Frames {
             ),
             (
                 "native service continuation",
-                (entry
-                    + self.required("::dispatch::arm_native_service_exit::")?
-                    + self.required("::aarch64_process::with_process_entry::")?
-                    + self.maximum("::begin_service::"))
-                .max(resume + self.maximum("::resume_service::"))
-                    + self.required("::park_service::")?
-                    + self.sum(&["::finish_service::", "::release_service_claim::"])
-                    + allocation,
+                service + self.maximum("::release_service_claim::") + allocation,
+            ),
+            (
+                "native backing reply",
+                service
+                    + self.required("::apply_fault_reply::")?
+                    + (self.sum(&["::grant_target::", "::root_for::"]) + root)
+                        .max(self.maximum("::apply_grant::") + descriptors),
             ),
             (
                 "native wait copy",
@@ -417,6 +427,9 @@ mod tests {
             "x::wait_query::h0",
             "x::dispatch::arm_native_service_exit::h0",
             "x::park_service::h0",
+            "x::begin_service_inner::h0",
+            "x::park_owner_wait::h0",
+            "x::apply_fault_reply::h0",
             "x::setup_arm_signal_frame::h0",
             "x::restore_live_arm_signal_frame::h0",
             "x::serve_delegated_anonymous::h0",
