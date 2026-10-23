@@ -2,7 +2,8 @@
 use super::*;
 
 #[test]
-fn arm_native_fork_child_runs_after_parent_host_handoff() {
+fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
+    use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
@@ -85,6 +86,112 @@ fn arm_native_fork_child_runs_after_parent_host_handoff() {
     // fixture ends, and the selected record is OnCpu on the only slot.
     let child_page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
     let child_control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+    // Suspend this very child through the production service continuation.
+    // Re-selecting a different MM would hide stale installed-space occupancy.
+    let saved = unsafe { *fixture.zone.record(child).ctx_mut() };
+    let child_ttbr = cpu.ttbr;
+    assert_eq!(fixture.zone.installed_space(fixture.slot), identity.mm);
+    let result = with_process_entry(
+        BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        },
+        &fixture.task,
+        &saved.native,
+        child_ttbr.0,
+        child_page,
+        child_control,
+        &mut service,
+        |entry| {
+            let result = entry
+                .begin_service(carrick_core_abi::service::ServiceOperation::CarrierWork {
+                    entry: carrick_sched_core::object_wait::OwnerEntry::Exception,
+                })
+                .unwrap();
+            assert!(entry.take_handoff_receipt().is_some());
+            result
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        result,
+        super::super::native_process_runtime::NativeResume::Left(None)
+    ));
+    assert_eq!(
+        super::super::dispatch::native_service_idle(fixture.zone, fixture.slot, &mut cpu),
+        carrick_el1_abi::Action::Idle
+    );
+    assert_eq!(cpu.ttbr, (0x30000, 0x30000), "park left the child roots");
+    assert_eq!(fixture.zone.installed_space(fixture.slot), 0);
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+    let selector = fixture.task.service_notice.take().unwrap().unwrap();
+    let ticket = unsafe {
+        carrick_core_abi::service::ServiceCell::claim_notice(
+            &child_control.service,
+            selector,
+            NonZeroU64::MIN,
+            identity,
+        )
+    }
+    .unwrap();
+    assert!(ticket.complete(true).is_ok());
+    fixture
+        .zone
+        .object_wait(
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(selector.record)
+                .unwrap(),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap()
+        .notify_object(fixture.slot, &mut Default::default())
+        .unwrap();
+    // run_idle_entry_on_vcpu resets both hardware roots to the carrier root.
+    // It cannot repair the ring's installed-space occupancy on our behalf.
+    cpu.ttbr = (0x30000, 0x30000);
+    let installs = cpu.translations.len();
+    let mut handoff = None;
+    let mut zone = crate::dispatch::Zone {
+        tables: fixture.zone,
+        cpu: &mut cpu,
+        user: &crate::sched::HardwareUserWord,
+    };
+    assert_eq!(
+        super::super::dispatch::native_scheduler(
+            &mut zone,
+            &fixture.task,
+            &counters,
+            fixture.slot,
+            &mut handoff,
+        )
+        .idle_entry(&mut frame, 0),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
+    assert_eq!(
+        cpu.ttbr, child_ttbr,
+        "same child must reinstall its MM after carrier-root reset"
+    );
+    assert_eq!(
+        cpu.translations.len() - installs,
+        1,
+        "one bounded child-root installation"
+    );
+    assert_eq!(fixture.zone.installed_space(fixture.slot), identity.mm);
+    assert!(matches!(
+        super::super::aarch64_process::resume_selected(
+            &owner,
+            registry(),
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot
+            },
+            &fixture.task,
+            child,
+            &mut service,
+        ),
+        super::super::native_process_runtime::NativeResume::NoPending
+    ));
+    assert_eq!(child_page.claimed_count(), 0);
     frame.x[8] = 172; // getpid, the child's first EL0 syscall.
     let cache = carrick_el1_abi::InotifyNameCache::new();
     let grant = fixture

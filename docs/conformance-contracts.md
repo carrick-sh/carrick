@@ -337,10 +337,14 @@ this to production x86 fork, idle-peer migration and child MM retirement with
 unpublished topology. Published masks still follow Linux fork inheritance;
 empty `sched_setaffinity` requests remain invalid. Signed execution remains
 director-owned.
-For ARM native fork, `arm_native_fork_child_runs_after_parent_host_handoff`
+For ARM native fork, `arm_native_fork_child_reinstalls_mm_after_service_ack`
 binds the same runnable-progress contract after the parent has left its host
 continuation: the forked record must enter through an idle executor with no
-host task and dispatch its first child syscall. The signed shell and exec
+host task, park for service, and resume the same child after acknowledgment.
+The witness models idle entry resetting TTBRs to the carrier root and requires
+exactly one child-root installation before its first child syscall. Service
+park switches to the maintenance root before releasing installed occupancy.
+The signed shell and exec
 probe remain the execution-layer binding.
 
 `kernel.executor.empty-host-steal` covers an executor seeking host-runnable
