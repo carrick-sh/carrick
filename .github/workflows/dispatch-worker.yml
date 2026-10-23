@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   guard:
+    if: github.event_name == 'issues' || (github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -118,8 +119,8 @@ jobs:
         id: auth
         if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' && steps.admission.outcome == 'success' }}
         env:
-          CODEX_AUTH_JSON: ${{ needs.guard.outputs.backend == 'codex' && secrets.CODEX_AUTH_JSON || '' }}
-          AGY_OAUTH_TOKEN: ${{ (needs.guard.outputs.backend == 'agy' || github.event_name == 'pull_request_review') && secrets.AGY_OAUTH_TOKEN || '' }}
+          CODEX_AUTH_JSON: ${{ steps.admission.outputs.backend == 'codex' && secrets.CODEX_AUTH_JSON || '' }}
+          AGY_OAUTH_TOKEN: ${{ (steps.admission.outputs.backend == 'agy' || github.event_name == 'pull_request_review') && secrets.AGY_OAUTH_TOKEN || '' }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner auth --event "$GITHUB_EVENT_PATH"'
       - name: Run foreground agent and collect output
         id: worker

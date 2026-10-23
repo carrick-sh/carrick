@@ -108,9 +108,11 @@ fn disposable_worker_has_no_publisher_or_artifact_transfer() {
 fn provider_workflow_selects_only_the_admitted_backend() {
     let text = include_str!("../../../.github/workflows/dispatch-worker.yml");
     assert!(
-        text.contains("needs.guard.outputs.backend == 'codex' && secrets.CODEX_AUTH_JSON || ''")
+        text.contains(
+            "steps.admission.outputs.backend == 'codex' && secrets.CODEX_AUTH_JSON || ''"
+        )
     );
-    assert!(text.contains("(needs.guard.outputs.backend == 'agy' || github.event_name == 'pull_request_review') && secrets.AGY_OAUTH_TOKEN || ''"));
+    assert!(text.contains("(steps.admission.outputs.backend == 'agy' || github.event_name == 'pull_request_review') && secrets.AGY_OAUTH_TOKEN || ''"));
     assert!(text.contains("backend: ${{ steps.tier.outputs.backend }}"));
 }
 
@@ -416,7 +418,7 @@ fi
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     std::fs::write(temp.path().join("pr.json"), json!([{"number":1,"user":{"login":"github-actions[bot]","type":"Bot"},"head":{"repo":{"full_name":"carrick-sh/carrick"},"ref":"work/dispatch-733-42"},"base":{"ref":"main"},"draft":true,"body":"Closes #733\nDispatch run: https://github.com/carrick-sh/carrick/actions/runs/42"}]).to_string()).unwrap();
-    std::fs::write(temp.path().join("run.json"), json!({"id":42,"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","repository":{"full_name":"carrick-sh/carrick"},"actor":{"login":"tjfontaine"}}).to_string()).unwrap();
+    std::fs::write(temp.path().join("run.json"), json!({"id":42,"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","repository":{"full_name":"carrick-sh/carrick"},"actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"},"head_repository":{"full_name":"carrick-sh/carrick"},"head_sha":"a".repeat(40)}).to_string()).unwrap();
     let summary = temp.path().join("summary.md");
     let outputs = temp.path().join("outputs");
     std::fs::write(&summary, "").unwrap();
@@ -934,7 +936,7 @@ fn review_setup_failure_posts_fallback_only_on_the_admitted_pr() {
         "head":{"ref":"work/dispatch-799-42","repo":{"full_name":"carrick-sh/carrick"}},
         "base":{"ref":"main"},"draft":true,"body":"Closes #799\nDispatch run: https://github.com/carrick-sh/carrick/actions/runs/42"});
     let issue = json!({"number":799,"title":"Fixture","state":"open","user":{"login":"tjfontaine","type":"User"},"body":"## Brief\nFixture", "labels":[{"name":"dispatch:sol-high"}]});
-    let run = json!({"id":42,"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","repository":{"full_name":"carrick-sh/carrick"},"actor":{"login":"tjfontaine"}});
+    let run = json!({"id":42,"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","repository":{"full_name":"carrick-sh/carrick"},"actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"},"head_repository":{"full_name":"carrick-sh/carrick"},"head_sha":"a".repeat(40)});
     for (name, value) in [
         ("pr.json", json!([pr.clone()])),
         ("issue.json", issue),
@@ -969,27 +971,52 @@ fi
     )
     .unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
-        .args([
-            "dispatch-worker",
-            "loop",
-            "--setup-status",
-            "failure/skipped",
-            "--event",
-        ])
-        .arg(&event)
-        .current_dir(&root)
-        .env_clear()
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-        .env("RUNNER_TEMP", temp.path())
-        .env("GITHUB_RUN_ID", "999")
-        .env("GITHUB_RUN_ATTEMPT", "1")
-        .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
-        .env("CARRICK_DISPATCH_BASE", base.trim())
-        .env("GITHUB_SHA", "b".repeat(40))
-        .env("GH_TOKEN", "fixture-job-token")
-        .output()
-        .unwrap();
+    for (name, script) in [
+        (
+            "git",
+            "#!/bin/sh\nfor arg do [ \"$arg\" != fetch ] || exit 0; done\nexec /usr/bin/git \"$@\"\n",
+        ),
+        (
+            "curl",
+            "#!/bin/sh\necho curl >> \"$RUNNER_TEMP/gh.args\"\nexit 91\n",
+        ),
+    ] {
+        let path = bin.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let invoke = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(args)
+            .arg(&event)
+            .current_dir(&root)
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("RUNNER_TEMP", temp.path())
+            .env("GITHUB_RUN_ID", "999")
+            .env("GITHUB_RUN_ATTEMPT", "1")
+            .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
+            .env("CARRICK_DISPATCH_BASE", base.trim())
+            .env("GITHUB_SHA", "b".repeat(40))
+            .env("GH_TOKEN", "fixture-job-token")
+            .output()
+            .unwrap()
+    };
+    let admission = invoke(&["dispatch-worker", "guard", "--admit", "--event"]);
+    assert!(admission.status.success(), "{admission:?}");
+    // A remote relabel after admission must not reselect credentials or tier.
+    let mut relabeled: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(temp.path().join("issue.json")).unwrap())
+            .unwrap();
+    relabeled["labels"] = json!([{"name":"dispatch:opus"}]);
+    std::fs::write(temp.path().join("issue.json"), relabeled.to_string()).unwrap();
+    let output = invoke(&[
+        "dispatch-worker",
+        "loop",
+        "--setup-status",
+        "failure/skipped",
+        "--event",
+    ]);
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("fallback outcome posted"),
@@ -1006,6 +1033,14 @@ fi
     let calls = std::fs::read_to_string(temp.path().join("gh.args")).unwrap();
     assert!(calls.contains("pr\ncomment\n800\n"));
     assert!(!calls.contains("issue\ncomment"));
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.ends_with("/issues/799"))
+            .count(),
+        1,
+        "loop re-queried issue labels after admission"
+    );
     std::fs::create_dir(state.join("home")).unwrap();
     let auth = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
         .args(["agent-runner", "auth", "--event"])
@@ -1017,12 +1052,16 @@ fi
         .env("GITHUB_RUN_ID", "999")
         .env("GITHUB_RUN_ATTEMPT", "1")
         .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
-        .env("GH_TOKEN", "fixture-job-token")
         .env("CODEX_AUTH_JSON", "{\"token\":\"worker-codex-secret\"}")
         .env("AGY_OAUTH_TOKEN", "loop-agy-secret")
         .output()
         .unwrap();
     assert!(auth.status.success(), "{auth:?}");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("gh.args")).unwrap(),
+        calls,
+        "auth called the API after admission"
+    );
     assert!(state.join("home/.codex/auth.json").is_file());
     assert!(!state.join("home/.gemini").exists());
     assert!(!state.join("loop-home/.codex").exists());
@@ -1034,5 +1073,19 @@ fi
     assert_eq!(
         std::fs::metadata(credential).unwrap().permissions().mode() & 0o777,
         0o600
+    );
+}
+
+#[test]
+fn guard_skips_reviews_outside_dispatch_changes_requests() {
+    let docs = YamlLoader::load_from_str(include_str!(
+        "../../../.github/workflows/dispatch-worker.yml"
+    ))
+    .unwrap();
+    assert_eq!(
+        docs[0]["jobs"]["guard"]["if"].as_str(),
+        Some(
+            "github.event_name == 'issues' || (github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-'))"
+        )
     );
 }

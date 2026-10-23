@@ -20,6 +20,7 @@ coauthor = "Claude Opus <noreply@anthropic.com>"
 backend = "agy"
 model = "high"
 calls = 12
+reads = 2
 workers = 1
 publishes = 1
 comments = 2

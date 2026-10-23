@@ -504,7 +504,7 @@ fn standing_run(event: &str, branch: &str) -> serde_json::Value {
 #[test]
 fn standing_demand_serves_only_trusted_kernel_runtime_runs() {
     for (event, branch) in [("push", "main"), ("workflow_dispatch", "main")] {
-        assert!(Admission::Standing.admits_run(&standing_run(event, branch)));
+        assert!(Admission::Standing.identifies_run(&standing_run(event, branch)));
     }
     for (event, branch) in [
         ("pull_request", "main"),
@@ -516,19 +516,19 @@ fn standing_demand_serves_only_trusted_kernel_runtime_runs() {
         ),
         ("push", "work/x"),
     ] {
-        assert!(!Admission::Standing.admits_run(&standing_run(event, branch)));
+        assert!(!Admission::Standing.identifies_run(&standing_run(event, branch)));
     }
     let mut foreign = standing_run("push", "main");
     foreign["path"] = ".github/workflows/ci.yml".into();
-    assert!(!Admission::Standing.admits_run(&foreign));
+    assert!(!Admission::Standing.identifies_run(&foreign));
     let mut fork = standing_run("push", "main");
     fork["head_repository"]["full_name"] = "fork/carrick".into();
-    assert!(!Admission::Standing.admits_run(&fork));
+    assert!(!Admission::Standing.identifies_run(&fork));
     // The pilot never serves kernel-runtime demand.
     assert!(
         !Admission::pilot(&"d".repeat(40))
             .unwrap()
-            .admits_run(&standing_run("push", "main"))
+            .identifies_run(&standing_run("push", "main"))
     );
 }
 
@@ -959,7 +959,7 @@ fn owner_dispatch_requires_both_original_and_triggering_actor() {
         run["actor"] = serde_json::json!({"login":actor});
         run["triggering_actor"] = serde_json::json!({"login":triggering});
         assert_eq!(
-            Admission::Standing.admits_run(&run),
+            Admission::Standing.identifies_run(&run),
             accepted,
             "run: {actor}/{triggering}"
         );
@@ -974,7 +974,7 @@ fn owner_dispatch_requires_both_original_and_triggering_actor() {
             "hook: {actor}/{triggering}"
         );
     }
-    assert!(Admission::Standing.admits_run(&standing_run("push", "main")));
+    assert!(Admission::Standing.identifies_run(&standing_run("push", "main")));
 }
 
 #[test]
@@ -1035,12 +1035,12 @@ fn dispatch_demand_and_hook_are_bound_to_owner_main_workflow_run() {
     run["path"] = DISPATCH_WORKFLOW.into();
     run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
     run["triggering_actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
-    assert!(Admission::Agent.admits_run(&run));
-    assert!(!Admission::Standing.admits_run(&run));
+    assert!(Admission::Agent.identifies_run(&run));
+    assert!(!Admission::Standing.identifies_run(&run));
     for field in ["actor", "triggering_actor"] {
         let mut bad = run.clone();
         bad[field]["login"] = "outsider".into();
-        assert!(!Admission::Agent.admits_run(&bad));
+        assert!(!Admission::Agent.identifies_run(&bad));
     }
     let mut context = standing_context("issues", "refs/heads/main");
     context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/heads/main");
@@ -1069,7 +1069,7 @@ fn dispatch_demand_refuses_worker_app_actor_and_triggering_actor() {
         let mut app_run = run.clone();
         app_run[field]["login"] = "carrick-workers[bot]".into();
         assert!(
-            !Admission::Agent.admits_run(&app_run),
+            !Admission::Agent.identifies_run(&app_run),
             "worker App in {field} admitted a credentialed agent clone"
         );
     }
@@ -1081,7 +1081,7 @@ fn dispatch_demand_refuses_nonuser_or_missing_actor_types() {
     run["path"] = DISPATCH_WORKFLOW.into();
     run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
     run["triggering_actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
-    assert!(Admission::Agent.admits_run(&run));
+    assert!(Admission::Agent.identifies_run(&run));
     for field in ["actor", "triggering_actor"] {
         for account_type in [Some("Bot"), Some("Organization"), None] {
             let mut spoofed = run.clone();
@@ -1092,7 +1092,7 @@ fn dispatch_demand_refuses_nonuser_or_missing_actor_types() {
                 }
             }
             assert!(
-                !Admission::Agent.admits_run(&spoofed),
+                !Admission::Agent.identifies_run(&spoofed),
                 "{field} with type {account_type:?} admitted an owner-spoofed run"
             );
         }
@@ -1291,9 +1291,9 @@ fn review_dispatch_demand_and_hook_are_admitted() {
     run["path"] = DISPATCH_WORKFLOW.into();
     run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
     run["triggering_actor"] = run["actor"].clone();
-    assert!(Admission::Agent.admits_run(&run));
+    assert!(Admission::Agent.identifies_run(&run));
     run["head_branch"] = "work/arbitrary".into();
-    assert!(!Admission::Agent.admits_run(&run));
+    assert!(!Admission::Agent.identifies_run(&run));
     let mut context = standing_context("pull_request_review", "refs/pull/42/merge");
     context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/pull/42/merge");
     assert!(Admission::Agent.authorize(&context).is_ok());

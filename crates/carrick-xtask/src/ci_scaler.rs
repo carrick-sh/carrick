@@ -484,7 +484,7 @@ pub enum Admission {
     /// Owner issue labels on main, served only by credentialed Contabo clones.
     Agent,
 }
-fn full_sha(sha: &str) -> bool {
+pub(crate) fn full_sha(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_hexdigit())
 }
 impl Admission {
@@ -505,8 +505,9 @@ impl Admission {
         };
         path.rsplit('/').next().unwrap_or(path)
     }
-    /// Demand side: may a controller create a runner for this workflow run?
-    pub fn admits_run(&self, run: &serde_json::Value) -> bool {
+    /// Run identity only. GitHub admission additionally verifies review PR
+    /// ownership and workflow blobs before demand or provisioning.
+    pub fn identifies_run(&self, run: &serde_json::Value) -> bool {
         let branch = run["head_branch"].as_str().unwrap_or_default();
         let event = run["event"].as_str().unwrap_or_default();
         if run["repository"]["full_name"] != REPOSITORY {
@@ -519,18 +520,7 @@ impl Admission {
                     && branch == PILOT_BRANCH
                     && run["path"] == PILOT_WORKFLOW
             }
-            Self::Agent => {
-                run["head_repository"]["full_name"] == REPOSITORY
-                    && run["path"] == DISPATCH_WORKFLOW
-                    && run["head_sha"].as_str().is_some_and(full_sha)
-                    && ((event == "issues" && branch == "main")
-                        || (event == "pull_request_review"
-                            && crate::dispatch_worker::dispatch_branch(branch).is_some()))
-                    && run["actor"]["login"] == "tjfontaine"
-                    && run["actor"]["type"] == "User"
-                    && run["triggering_actor"]["login"] == "tjfontaine"
-                    && run["triggering_actor"]["type"] == "User"
-            }
+            Self::Agent => crate::dispatch_worker::dispatch_run_identity(run, None),
             Self::Standing => {
                 run["head_repository"]["full_name"] == REPOSITORY
                     && run["path"] == KERNEL_RUNTIME_WORKFLOW
