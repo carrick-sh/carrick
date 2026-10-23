@@ -85,6 +85,40 @@ An independent read-only review found no production correctness defects;
 it confirmed the relocated ARM COW window at offset `0x220000` is provisioned
 dynamically and x86 backs the entire unchanged 64 MiB shared region.
 
+### Raised-budget portable gate result
+
+The replacement's required gates ran in the foreground with
+`env -u RUSTC_WRAPPER CARRICK_SCCACHE=0`. Both image builds, `just test-kernel`,
+`just test-loom`, `just clippy`, `just clippy-linux`,
+`just cross-check-macos`, `just fmt-check`, `just lint-domains`, and
+`just check-contract-change 0aa665ef5dc2d6ca2460eab036f5dae6ae1d678c HEAD`
+exited zero. The source authority-debt check against that same main base
+also exited zero. The initial Linux Clippy failure on constant-valued test
+assertions was corrected by evaluating those assertions at compile time;
+both Clippy gates then passed.
+
+**The full `just test` gate, run last, failed (exit 1).** Its kernel
+`serial_host` lane reported 184 passed and one failed:
+`dispatch::sysv::ipc_set_tests::serial_host::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting`.
+The failure at `crates/carrick-kernel/src/dispatch/sysv.rs:7123` was the
+fixture's five-second child-process watchdog. Both new layout witnesses
+passed in that full run. The recipe stopped after the red batch, so later
+recipe groups did not run. The complete failure output is preserved in
+`/tmp/el1-size-801/budget-raise/test.initial.log`.
+
+Two bounded diagnostic runs of the exact kernel test binary passed: the
+isolated failing case (0.04 seconds) and its 13-test SysV serial group
+(0.45 seconds). These do not replace the failed full gate. The fixture and
+its SysV lock implementation are unchanged against main and do not consume
+the EL1 layout, but no fresh main reproduction or root-cause attribution
+has been established. No timeout, retry policy, or gate was weakened, and
+the full suite was not retried to obtain green. This remains an unresolved
+acceptance blocker reported to the director.
+
+Signed HVF execution is unavailable on this Linux worker. The new layout
+still requires the director's signed validation; the earlier signed A/B
+only establishes rejection of `opt-level=s`.
+
 ## Measurement boundary
 
 The authoritative size is `_image_end - _image_start`, the same expression
