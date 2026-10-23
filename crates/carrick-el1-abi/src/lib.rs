@@ -24,9 +24,9 @@
 pub use carrick_guest_arch::ContextGeneration;
 
 use carrick_core_abi::OpenLifetime;
+mod entry_binding_fatal;
 #[cfg(test)]
 mod image_layout_tests;
-mod entry_binding_fatal;
 pub use entry_binding_fatal::*;
 mod open_lifetime;
 pub use open_lifetime::*;
