@@ -104,9 +104,12 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
         &mut service,
         |entry| {
             let result = entry
-                .begin_service(carrick_core_abi::service::ServiceOperation::CarrierWork {
-                    entry: carrick_sched_core::object_wait::OwnerEntry::Exception,
-                })
+                .begin_service(
+                    carrick_core_abi::service::ServiceOperation::CarrierWork {
+                        entry: carrick_sched_core::object_wait::OwnerEntry::Exception,
+                    },
+                    None,
+                )
                 .unwrap();
             assert!(entry.take_handoff_receipt().is_some());
             result
@@ -804,7 +807,7 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
                         )
                         .unwrap()
                 });
-                let result = entry.begin_service(operation).unwrap();
+                let result = entry.begin_service(operation, None).unwrap();
                 assert!(entry.take_handoff_receipt().is_some());
                 result
             },
