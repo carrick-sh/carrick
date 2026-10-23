@@ -12,10 +12,45 @@ impl RecordPinVenue for PinVenue {
     }
 }
 
-pub(super) struct PhysicalStock {
-    pub owner: ForkStock<carrick_hal::asid::AsidAllocator, RecordPin<PinVenue>>,
+#[derive(Debug)]
+pub(super) struct PhysicalChild {
+    _inherited: RecordPin<PinVenue>,
+    pub supplied: Option<carrick_hal::physical_grants::NativePhysicalGrants<SupplyBacking>>,
+}
+pub(super) struct SupplyBacking {
     record: Arc<Mutex<CarrierStage2Record>>,
     identity: CarrierStage2RecordIdentity,
+    authority: Arc<dyn carrick_hal::FrameCowAuthority>,
+    mapping: carrick_hal::MappingId,
+    early_drop: Arc<core::sync::atomic::AtomicBool>,
+}
+impl Drop for SupplyBacking {
+    fn drop(&mut self) {
+        if self.authority.live_mapping_row(self.mapping).is_some() {
+            self.early_drop.store(true, Ordering::Release);
+        }
+        let mut record = self.record.lock().unwrap();
+        assert!(matches!(
+            prepare_record_retirement(&mut record, self.identity),
+            RecordRetirement::Unmap { .. }
+        ));
+        assert_eq!(
+            settle_record_retirement(&mut record, self.identity, Ok(())),
+            CarrierStage2RetireOutcome::RetiredUnmapped
+        );
+    }
+}
+
+pub(super) struct PhysicalStock {
+    pub owner: ForkStock<carrick_hal::asid::AsidAllocator, PhysicalChild>,
+    record: Arc<Mutex<CarrierStage2Record>>,
+    identity: CarrierStage2RecordIdentity,
+    pub inventory: Arc<dyn carrick_hal::PhysicalFrameInventory>,
+    pub residency: Option<&'static carrick_el1_abi::FrameGrantResidencyTable>,
+    pub pool: Option<&'static carrick_el1_abi::CowGrantPool>,
+    supplied_records: Vec<Arc<Mutex<CarrierStage2Record>>>,
+    early_drop: Arc<core::sync::atomic::AtomicBool>,
+    pub settled: usize,
     window: Option<LifecycleWindow>,
     execution: Option<GrantExecution>,
     tables: (core::ptr::NonNull<AtomicU64>, u64, usize),
@@ -63,6 +98,13 @@ impl PhysicalStock {
             owner,
             record,
             identity,
+            inventory: Arc::new(carrick_kernel::kernel::FrameInventoryAuthority::new())
+                .physical_projection(Arc::new(carrick_kernel::kernel::ObjectIdRegistry::new())),
+            residency: None,
+            pool: None,
+            supplied_records: Vec::new(),
+            early_drop: Arc::default(),
+            settled: 0,
             window: None,
             execution: None,
             tables: (
@@ -124,7 +166,11 @@ impl PhysicalStock {
                 |_| true,
                 |_| true,
                 |_, _, _| {
-                    Ok(pin_record(&mut self.record.lock().unwrap(), identity, venue).unwrap())
+                    Ok(PhysicalChild {
+                        _inherited: pin_record(&mut self.record.lock().unwrap(), identity, venue)
+                            .unwrap(),
+                        supplied: None,
+                    })
                 },
             )
             .unwrap();
@@ -141,9 +187,9 @@ impl PhysicalStock {
         let execution = ReclaimExecution::maintenance_root(idle, idle).unwrap();
         let window = self.window.unwrap();
         let (words, base, len) = self.tables;
-        let inventory = Arc::new(carrick_kernel::kernel::FrameInventoryAuthority::new())
-            .physical_projection(Arc::new(carrick_kernel::kernel::ObjectIdRegistry::new()));
-        let residency = carrick_el1_abi::FrameGrantResidencyTable::new();
+        let inventory = self.inventory.clone();
+        let local_residency = carrick_el1_abi::FrameGrantResidencyTable::new();
+        let residency = self.residency.unwrap_or(&local_residency);
         let returned = self
             .owner
             .reclaim(
@@ -182,7 +228,7 @@ impl PhysicalStock {
                 |life| window.clear(life),
                 |absence| {
                     self.releases += 1;
-                    carrick_hal::fork_stock::release_child_mm(&*inventory, &residency, absence.mm())
+                    carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence.mm())
                 },
             )
             .unwrap();
@@ -190,6 +236,87 @@ impl PhysicalStock {
             returned, 1,
             "terminal exit must relinquish all child storage borrows"
         );
+    }
+    pub fn backing(
+        &mut self,
+        staged: &carrick_hal::physical_grants::StagedPhysicalGrants,
+        len: u64,
+    ) -> SupplyBacking {
+        let grant = *staged.grants().last().unwrap();
+        let id = CarrierStage2RecordId(self.supplied_records.len() as u64 + 2);
+        let identity = CarrierStage2RecordIdentity {
+            record_id: id,
+            ..self.identity
+        };
+        let mut snapshot = self.record.lock().unwrap().snapshot;
+        snapshot.record_id = id;
+        snapshot.ipa = grant.gpa.raw();
+        snapshot.len = len as usize;
+        snapshot.pin_count = 0;
+        let record = Arc::new(Mutex::new(CarrierStage2Record {
+            snapshot,
+            unmap_in_flight: false,
+        }));
+        self.supplied_records.push(record.clone());
+        SupplyBacking {
+            record,
+            identity,
+            authority: staged.authority().clone(),
+            mapping: carrick_hal::MappingId::from_kernel_allocation(grant.identity.mapping_id),
+            early_drop: self.early_drop.clone(),
+        }
+    }
+    pub fn retire(
+        &mut self,
+        zone: &ZoneTables<Aarch64ParkedContext>,
+        execution: GrantExecution,
+        record: &mut carrick_el1_abi::NativeChildRetire,
+    ) {
+        if let Some(pool) = self.pool {
+            let access = crate::sched::object_wait::space_access(zone, SlotId::new(0));
+            let mm = execution.context.mm.raw().get();
+            let exclusion = access
+                .try_exclude_editor(access.find(mm).unwrap(), mm)
+                .unwrap();
+            let (words, base, len) = self.tables;
+            let root = execution.context.root;
+            if let Some(grants) = self
+                .owner
+                .child_physical_mut(ReservationMm::new(mm).unwrap(), root)
+                .unwrap()
+                .supplied
+                .as_mut()
+            {
+                self.settled += grants
+                    .settle(pool, exclusion.proof(), |va| {
+                        let mut table = root.address().raw();
+                        for (level, index) in carrick_mmu_core::aarch64::indices(va)
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let offset =
+                                ((table.checked_add(index as u64 * 8)?.checked_sub(base)?) / 8)
+                                    as usize;
+                            if offset >= len {
+                                return None;
+                            }
+                            let word = unsafe { words.as_ptr().add(offset).as_ref()? }
+                                .load(Ordering::Acquire);
+                            if word & 3 != 3 {
+                                return None;
+                            }
+                            if level == 3 {
+                                return Some(word & AARCH64_ROOT_ADDRESS_MASK);
+                            }
+                            table = word & AARCH64_ROOT_ADDRESS_MASK;
+                        }
+                        None
+                    })
+                    .unwrap();
+            }
+            pool.release_mm(exclusion.proof());
+        }
+        self.owner.retire_child(execution, record).unwrap();
     }
     pub fn shutdown(&self) {
         self.shutdown_after_releases(1);
@@ -211,6 +338,16 @@ impl PhysicalStock {
             settle_record_retirement(&mut self.record.lock().unwrap(), self.identity, Ok(())),
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
+        assert!(
+            !self.early_drop.load(Ordering::Acquire),
+            "physical backing dropped before exact-MM inventory retirement"
+        );
+        for record in &self.supplied_records {
+            assert!(
+                !record.lock().unwrap().snapshot.mapped,
+                "supplied backing must reach neutral terminal retirement"
+            );
+        }
         assert_eq!(self.releases, expected);
         assert_eq!(self.owner.live_children(), 0);
         assert!(!self.owner.has_quarantine());

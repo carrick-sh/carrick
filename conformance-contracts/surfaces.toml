@@ -1134,7 +1134,7 @@ contracts = ["kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "proces
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs"
-contracts = ["kernel.el1.fork-cow"]
+contracts = ["kernel.el1.fork-cow", "kernel.el1.mm-exclusive-owner", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs"

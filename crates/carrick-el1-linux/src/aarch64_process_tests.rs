@@ -278,19 +278,15 @@ impl ForkStockCrossing for TestStockCrossing {
         }
         #[cfg(test)]
         if let Some(physical) = &self.physical {
-            physical
-                .lock()
-                .unwrap()
-                .owner
-                .retire_child(
-                    carrick_hal::fork_stock::GrantExecution::new(
-                        carrick_guest_arch::CpuId::new(cpu as u32),
-                        binding,
-                        context,
-                    ),
-                    record,
-                )
-                .unwrap();
+            physical.lock().unwrap().retire(
+                zone,
+                carrick_hal::fork_stock::GrantExecution::new(
+                    carrick_guest_arch::CpuId::new(cpu as u32),
+                    binding,
+                    context,
+                ),
+                record,
+            );
         }
         assert!(zone.accept_terminal(
             slot,
@@ -3377,10 +3373,10 @@ fn arm_call(
 }
 
 #[cfg(test)]
-fn arm_call_with_cpu(
+fn arm_call_with_cpu<X: ForkStockCrossing>(
     fixture: &'static Fixture,
     control: &'static ThreadControlSlot,
-    service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    service: &mut Aarch64NativeProcessService<'static, X>,
     frame: &mut carrick_el1_abi::TrapFrame,
     cpu: &mut crate::sched::FakeCpu,
 ) -> Result<carrick_personality_linux::dispatch::CompletionRoute, NativeProcessError> {

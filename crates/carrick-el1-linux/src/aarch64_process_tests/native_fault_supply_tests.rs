@@ -25,6 +25,45 @@ fn leaf(words: &impl LiveDescriptorWords, root: u64, va: u64) -> u64 {
     }
     unreachable!()
 }
+struct UntouchedMapping<'a>(&'a dyn LiveDescriptorWords);
+impl carrick_el1::memory::AnonymousBackingProbe for UntouchedMapping<'_> {
+    fn backing(
+        &mut self,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        va: UserVa,
+        len: carrick_guest_arch::GuestLen,
+    ) -> carrick_el1::memory::Stage1Backing {
+        carrick_el1::memory::classify_stage1_range(
+            &|address| self.0.load(address).ok(),
+            root.raw() & AARCH64_ROOT_ADDRESS_MASK,
+            va.raw(),
+            len.raw(),
+        )
+    }
+    fn stock_span(&mut self, _: ReservationMm, _: UserVa) -> Option<carrick_guest_arch::UserRange> {
+        None
+    }
+}
+impl carrick_el1::memory::AnonymousPermissionEditor for UntouchedMapping<'_> {
+    fn protect_and_invalidate(
+        &mut self,
+        _: carrick_guest_arch::AddressSpaceRegister,
+        _: carrick_mmu_core::aarch64::GuestPermissionEdit,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestPermissionEditError> {
+        panic!("new mapping has no resident permission work")
+    }
+}
+impl carrick_el1::memory::AnonymousRetirementEditor for UntouchedMapping<'_> {
+    fn retire_and_invalidate(
+        &mut self,
+        _: carrick_guest_arch::AddressSpaceRegister,
+        _: UserVa,
+        _: carrick_guest_arch::GuestLen,
+    ) -> Result<(), carrick_mmu_core::aarch64::GuestRetirementError> {
+        panic!("new mapping has no resident retirement work")
+    }
+}
+
 struct FaultResolver<'a> {
     tables: &'a crate::mm_portal::test_support::Tables,
     memory: &'a FaultMemory,
@@ -91,15 +130,27 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
     }
     let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
     let pages: Vec<_> = (0..16).map(|index| 0x20000 + index * 4096).collect();
+    let pool: &'static carrick_el1_abi::CowGrantPool =
+        Box::leak(Box::new(carrick_el1_abi::CowGrantPool::new()));
+    let residency: &'static carrick_el1_abi::FrameGrantResidencyTable =
+        Box::leak(carrick_el1::cow::test_support::residency_table());
+    let mut crossing = TestStockCrossing::new(&pages);
+    let mut stock = super::native_retirement_tests::PhysicalStock::new(&fixture.tables);
+    stock.pool = Some(pool);
+    stock.residency = Some(residency);
+    crossing.physical = Some(std::sync::Mutex::new(stock));
+    *crossing.zone.lock().unwrap() = Some(fixture.zone);
+    let crossing = Box::leak(Box::new(crossing));
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
         fixture.slot,
         fixture.zone,
         fixture.region.table(),
         NonZeroU64::MIN,
-        TestStockCrossing::new(&pages),
+        &*crossing,
     )
-    .with_words(words);
+    .with_words(words)
+    .with_fault_residency(residency);
     let mut frame = carrick_el1_abi::TrapFrame::default();
     let mut cpu = crate::sched::FakeCpu::default();
     frame.x[8] = 220;
@@ -153,14 +204,12 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
         ),
         copies: Cell::new(0),
     };
-    let pool = Box::new(carrick_el1_abi::CowGrantPool::new());
-    let residency = carrick_el1::cow::test_support::residency_table();
     assert_eq!(pool.ready(identity.mm).count(), 0);
     let mut resolver = FaultResolver {
         tables: &fixture.tables,
         memory: &memory,
-        pool: &pool,
-        residency: &residency,
+        pool,
+        residency,
     };
     let portal = fixture.region.portal_slots();
     assert!(portal.bind_carrier(NonZeroU64::MIN));
@@ -217,7 +266,7 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
                         &busy
                     ),
                     Some(carrick_el1::fault::PreparedFaultPath {
-                        residency: &residency,
+                        residency,
                         resolver: &mut carrick_el1::fault::NoopPreparedResolver,
                         roots: Some(fixture.region.table()),
                         file_slots: Some(portal)
@@ -339,7 +388,7 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
             &supply,
         ),
         Some(carrick_el1::fault::PreparedFaultPath {
-            residency: &residency,
+            residency,
             resolver: &mut carrick_el1::fault::NoopPreparedResolver,
             roots: Some(fixture.region.table()),
             file_slots: Some(portal),
@@ -448,10 +497,14 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
     assert_eq!(page.claimed_count(), 1);
     // The physical supplier uses the same inventory publication as CPL0 boot.
     // It receives only an exact-MM grant window, never a VMA/table owner.
-    let inventory = std::sync::Arc::new(carrick_kernel::kernel::FrameInventoryAuthority::new());
-    let physical = inventory.physical_projection(std::sync::Arc::new(
-        carrick_kernel::kernel::ObjectIdRegistry::new(),
-    ));
+    let physical = crossing
+        .physical
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .inventory
+        .clone();
     let physical_owner = carrick_hal::GuestFrameOwner {
         native_mm: MmGeneration::new(NonZeroU64::new(identity.mm).unwrap()),
         root_generation: ContextGeneration::new(selected.operation.incarnation),
@@ -473,11 +526,31 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
             physical_owner,
         )
         .unwrap();
+        let retained = crossing
+            .physical
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .backing(&staged, 16384);
         physical_grants
-            .publish_cow(staged, (), &pool, exclusion.proof())
+            .publish_cow(staged, retained, pool, exclusion.proof())
             .unwrap();
     }
     assert_eq!(pool.ready(identity.mm).count(), 2, "bounded first refill");
+    let child_physical_root =
+        RootGpa::page_aligned(FrameGpa::new(child_root & AARCH64_ROOT_ADDRESS_MASK)).unwrap();
+    crossing
+        .physical
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .owner
+        .child_physical_mut(handle.mm(), child_physical_root)
+        .unwrap()
+        .supplied = Some(physical_grants);
+
     drop(exclusion);
     {
         let queue = fixture
@@ -536,7 +609,7 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
                 &supply
             ),
             Some(carrick_el1::fault::PreparedFaultPath {
-                residency: &residency,
+                residency,
                 resolver: &mut carrick_el1::fault::NoopPreparedResolver,
                 roots: Some(fixture.region.table()),
                 file_slots: Some(portal)
@@ -595,36 +668,271 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
     ));
     assert_eq!(frame.x[0], identity.tid);
     assert_eq!(counters.served[172].load(Ordering::Acquire), 1);
+    // A second, untouched mapping exercises the request-owned backing reply
+    // through native park/resume and the shared descriptor publication owner.
+    frame.esr = 0x15 << 26;
+    frame.x[8] = 222;
+    frame.x[..6].copy_from_slice(&[VA + 0x10000, 8192, 3, 0x32, u64::MAX, 0]);
+    assert_eq!(
+        carrick_el1::memory::serve_delegated_anonymous(
+            &mut frame,
+            &counters,
+            &fixture.task,
+            access,
+            fixture.region.table(),
+            &mut UntouchedMapping(words),
+        ),
+        carrick_el1::memory::DelegatedAnonymous::Served
+    );
+    let fresh = frame.x[0];
+    assert!(
+        fresh >= VA + 8192 && fresh < VA + 0x1000_0000,
+        "native mmap: {fresh:#x}"
+    );
+    frame.esr = 0x92000046;
+    frame.far = fresh + 7;
+    frame.elr = 0x401300;
+    let backing_supply = OwnerFaultSupply::new(portal).with_handle(handle);
+    assert_eq!(
+        carrick_el1::fault::dispatch_fault_with_prepared(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            access,
+            crate::cow_resolver::native_fault_supply(
+                true,
+                carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                &backing_supply
+            ),
+            Some(carrick_el1::fault::PreparedFaultPath {
+                residency,
+                resolver: &mut carrick_el1::fault::NoopPreparedResolver,
+                roots: Some(fixture.region.table()),
+                file_slots: Some(portal)
+            }),
+            &mut resolver,
+        ),
+        carrick_el1_abi::Action::Forward
+    );
+    assert_eq!(backing_supply.outcome(), OwnerFaultSupplyOutcome::Selected);
+    let (_, window) = portal
+        .grant(0)
+        .unwrap()
+        .pending_fault_selection(identity.mm, frame.far)
+        .unwrap();
+    let mut saved = Aarch64ParkedContext::ZERO;
+    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+    assert!(matches!(
+        with_process_entry(
+            source,
+            &fixture.task,
+            &saved.native,
+            child_root,
+            page,
+            control,
+            &mut service,
+            |entry| {
+                let result = entry
+                    .begin_service(
+                        ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
+                            address: UserVa::new(frame.far),
+                            access: carrick_guest_arch::Access::Write,
+                            present: false,
+                        }),
+                        Some(window.operation.sequence),
+                    )
+                    .unwrap();
+                assert!(entry.take_handoff_receipt().is_some());
+                result
+            }
+        )
+        .unwrap(),
+        NativeResume::Left(None)
+    ));
+    let notice = fixture.task.service_notice.take().unwrap().unwrap();
+    let mut ticket = {
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        let member = queue.native_service_member(notice.record).unwrap();
+        unsafe { ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, member) }
+            .unwrap()
+    };
+    assert_eq!(
+        ticket
+            .take_fault_selection(portal.grant(0).unwrap())
+            .unwrap(),
+        Some(carrick_core_abi::service::ServiceFaultSupply::Backing(
+            window
+        ))
+    );
+    let reply = ticket.reply_address().unwrap();
+    let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
+        std::sync::Arc::default(),
+        physical.clone(),
+        [FrameGpa::new(0xa0020000)],
+        0,
+        16384,
+        NonZeroU64::MIN,
+        physical_owner,
+    )
+    .unwrap();
+    let rows = {
+        let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
+        let retained = stock.backing(&staged, 16384);
+        stock
+            .owner
+            .child_physical_mut(handle.mm(), child_physical_root)
+            .unwrap()
+            .supplied
+            .as_mut()
+            .unwrap()
+            .retain_backing(staged, retained)
+            .unwrap()
+    };
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, TableGrants,
+    };
+    let txn = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: NonZeroU64::new(identity.mm).unwrap(),
+            generation: window.operation.sequence,
+        },
+        root: carrick_mmu_core::aarch64::SubstrateGpa(child_physical_root.address().raw()),
+        op: DescriptorOp::Prepare {
+            publication: carrick_mmu_core::aarch64::GuestLeafPublication {
+                va: window.range.start(),
+                ipa: rows[0].gpa.raw(),
+                len: 4096,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(window.fault_page, 4096),
+            backing: rows[0].identity,
+        },
+        tables: TableGrants::new(&[]).unwrap(),
+    };
+    assert_eq!(window.range.start(), fresh);
+    assert!(window.range.len() >= 8192);
+    // SAFETY: the native pending request owns this aligned reply through ACK.
+    assert!(
+        unsafe { &*(reply.raw() as *const carrick_el1_abi::PortalGrantSlot) }.submit(window, &txn)
+    );
+    {
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        assert!(ticket.complete(true).is_ok());
+        queue
+            .notify_object(fixture.slot, &mut Default::default())
+            .unwrap();
+    }
+    let mut handoff = None;
+    let mut zone = crate::dispatch::Zone {
+        tables: fixture.zone,
+        cpu: &mut cpu,
+        user: &crate::sched::HardwareUserWord,
+    };
+    assert_eq!(
+        crate::dispatch::native_scheduler(
+            &mut zone,
+            &fixture.task,
+            &counters,
+            fixture.slot,
+            &mut handoff
+        )
+        .idle_entry(&mut frame, 0),
+        carrick_el1_abi::Action::Served
+    );
+    assert!(matches!(
+        resume_selected(
+            &owner,
+            registry(),
+            source,
+            &fixture.task,
+            child,
+            &mut service
+        ),
+        NativeResume::NoPending
+    ));
+    assert_eq!(frame.elr, 0x401300);
+    assert_eq!(
+        leaf(words, child_root, fresh) & AARCH64_ROOT_ADDRESS_MASK,
+        rows[0].gpa.raw()
+    );
+    assert_eq!(
+        leaf(words, child_root, fresh + 4096),
+        0,
+        "unreadable suffix must remain absent"
+    );
+    assert_eq!(
+        leaf(words, 0x10000, fresh),
+        0,
+        "parent acquires no child backing"
+    );
+    assert_eq!(page.claimed_count(), 0);
     let exclusion = access
         .try_exclude_editor(access.find(identity.mm).unwrap(), identity.mm)
         .unwrap();
+    let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
+    let physical_grants = stock
+        .owner
+        .child_physical_mut(handle.mm(), child_physical_root)
+        .unwrap()
+        .supplied
+        .as_mut()
+        .unwrap();
     assert!(
         physical_grants
-            .settle(&pool, exclusion.proof(), |_| None)
+            .settle(pool, exclusion.proof(), |_| None)
             .is_err()
     );
     assert!(
         pool.has_completions_for(identity.mm),
         "failed authentication retains USED"
     );
+    drop(stock);
+    drop(exclusion);
+    // Leave USED for the actual terminal adapter: it must settle while the
+    // child root exists, then return stock without any later fork loan.
+    let context =
+        unsafe { observed_entry_address(source, &fixture.task, child_root, child) }.unwrap();
+    *crossing.child.lock().unwrap() = Some((
+        crate::common_entry::execution_binding(&fixture.task),
+        context,
+    ));
+    let mut saved = Aarch64ParkedContext::ZERO;
+    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+    with_process_entry(
+        source,
+        &fixture.task,
+        &saved.native,
+        child_root,
+        page,
+        control,
+        &mut service,
+        |entry| {
+            assert!(matches!(
+                entry.exit_group(0),
+                LifecycleOutcome::Transferred { .. }
+            ));
+            assert_eq!(entry.take_run_failure(), None);
+        },
+    )
+    .unwrap();
+    assert!(fixture.zone.spaces.find(identity.mm).is_none());
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
+    assert_eq!(pool.ready(identity.mm).count(), 0);
+    assert!(!pool.has_completions_for(identity.mm));
+    let stock = crossing.physical.as_ref().unwrap().lock().unwrap();
+    assert_eq!(stock.settled, 1, "terminal USED settlement is once-only");
+    assert_eq!(memory.pages.borrow()[&IPA][13], 17);
     assert_eq!(
-        physical_grants
-            .settle(&pool, exclusion.proof(), |va| Some(
-                leaf(words, child_root, va) & AARCH64_ROOT_ADDRESS_MASK
-            ))
-            .unwrap(),
-        1
+        leaf(words, 0x10000, VA) & AARCH64_ROOT_ADDRESS_MASK,
+        IPA,
+        "child table clear cannot alter the parent's translation"
     );
-    assert!(
-        !pool.has_completions_for(identity.mm),
-        "settled exactly once"
-    );
-    assert_eq!(
-        physical_grants
-            .settle(&pool, exclusion.proof(), |_| panic!(
-                "no repeated page work"
-            ))
-            .unwrap(),
-        0
-    );
+    stock.shutdown();
 }
