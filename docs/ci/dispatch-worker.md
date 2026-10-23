@@ -208,7 +208,12 @@ itself still comes from GitHub's merge ref: repository writers remain trusted
 for that YAML, as in `ci.yml`. Publication refuses `.github/workflows/*`.
 
 The controller admits only owner review runs from this repository and workflow
-on dispatch head refs; its job hook binds the run, attempt, SHA and merge ref.
+on dispatch head refs. Review-run REST metadata uses the PR head SHA, while
+`GITHUB_SHA` names the merge commit. The job hook reads the head identity from
+the runner-written webhook and retains the exact run/attempt/head-SHA binding;
+it separately validates the merge ref and workflow ref. This identity is never
+the driver build base. The pinned runner writes the webhook before invoking
+its hook ([runner v2.337.0 source](https://github.com/actions/runner/blob/v2.337.0/src/Runner.Worker/JobHookProvider.cs)).
 The server repeats the full review and PR checks. Issue events serialize on the
 issue number, review events on the PR head ref. These are different concurrency
 keys, so a label run and a review run can overlap. The shared publication code's

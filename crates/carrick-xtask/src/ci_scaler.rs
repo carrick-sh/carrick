@@ -701,9 +701,29 @@ pub struct JobContext {
     pub triggering_actor: String,
     pub workflow_ref: String,
     pub git_ref: String,
+    /// The API run head identity; review merges never become a driver build base.
     pub sha: String,
     pub run_id: u64,
     pub run_attempt: u32,
+}
+
+// The pinned runner writes its webhook before invoking the job hook. Review
+// REST run identity is the PR head, whereas GITHUB_SHA is the merge commit.
+fn hook_run_sha(
+    event_name: &str,
+    github_sha: &str,
+    webhook: Option<&serde_json::Value>,
+) -> Result<String, ScalerError> {
+    if event_name != "pull_request_review" {
+        return Ok(github_sha.to_owned());
+    }
+    webhook
+        .and_then(|event| event["pull_request"]["head"]["sha"].as_str())
+        .filter(|sha| full_sha(sha))
+        .map(str::to_owned)
+        .ok_or(ScalerError::Guard(
+            "review hook requires the webhook PR head SHA",
+        ))
 }
 
 /// The exact workflow run (and attempt, at one SHA) a runner was minted for.
@@ -1015,14 +1035,25 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
                     .parse::<u64>()
                     .map_err(|_| ScalerError::Guard("malformed GitHub run context"))
             };
+            let event = get("GITHUB_EVENT_NAME")?;
+            let webhook = if event == "pull_request_review" {
+                Some(serde_json::from_str::<serde_json::Value>(
+                    &crate::safe_copy::text(
+                        Path::new(&get("GITHUB_EVENT_PATH")?),
+                        32 * 1024 * 1024,
+                    )?,
+                )?)
+            } else {
+                None
+            };
             let context = JobContext {
                 repository: get("GITHUB_REPOSITORY")?,
-                event: get("GITHUB_EVENT_NAME")?,
+                event: event.clone(),
                 actor: get("GITHUB_ACTOR")?,
                 triggering_actor: get("GITHUB_TRIGGERING_ACTOR")?,
                 workflow_ref: get("GITHUB_WORKFLOW_REF")?,
                 git_ref: get("GITHUB_REF")?,
-                sha: get("GITHUB_SHA")?,
+                sha: hook_run_sha(&event, &get("GITHUB_SHA")?, webhook.as_ref())?,
                 run_id: number("GITHUB_RUN_ID")?,
                 run_attempt: u32::try_from(number("GITHUB_RUN_ATTEMPT")?)
                     .map_err(|_| ScalerError::Guard("malformed GitHub run context"))?,
@@ -1365,5 +1396,24 @@ mod timeout_tests {
             start.elapsed() < Duration::from_secs(1),
             "descendant defeated timeout"
         );
+    }
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn review_hook_binds_api_head_sha_instead_of_the_merge_sha() {
+        let head = "a".repeat(40);
+        let merge = "b".repeat(40);
+        let webhook = serde_json::json!({"pull_request":{"head":{"sha":head}}});
+        assert_eq!(
+            hook_run_sha("pull_request_review", &merge, Some(&webhook)).unwrap(),
+            head
+        );
+        assert_eq!(hook_run_sha("issues", &merge, None).unwrap(), merge);
+        for webhook in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"pull_request":{"head":{"sha":"bad"}}})),
+        ] {
+            assert!(hook_run_sha("pull_request_review", &merge, webhook.as_ref()).is_err());
+        }
     }
 }

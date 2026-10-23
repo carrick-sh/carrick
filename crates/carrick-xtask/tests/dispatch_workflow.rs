@@ -747,6 +747,111 @@ fn review_workflow_pins_main_and_orders_the_loop() {
 }
 
 #[test]
+fn review_base_scripts_resolve_main_and_refuse_bad_checkouts_before_build() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let docs = YamlLoader::load_from_str(include_str!(
+        "../../../.github/workflows/dispatch-worker.yml"
+    ))
+    .unwrap();
+    let guard = docs[0]["jobs"]["guard"]["steps"].as_vec().unwrap();
+    let resolved = guard
+        .iter()
+        .position(|s| s["id"].as_str() == Some("base"))
+        .unwrap();
+    let guard_checkout = guard
+        .iter()
+        .position(|s| s["uses"].as_str() == Some("actions/checkout@v4"))
+        .unwrap();
+    let validate = guard
+        .iter()
+        .position(|s| s["id"].as_str() == Some("tier"))
+        .unwrap();
+    assert!(resolved < guard_checkout && guard_checkout < validate);
+    let resolve = guard[resolved]["run"].as_str().unwrap();
+    let steps = docs[0]["jobs"]["worker"]["steps"].as_vec().unwrap();
+    let verify = steps
+        .iter()
+        .position(|s| {
+            s["name"].as_str()
+                == Some("Verify admitted base against freshly fetched main before building")
+        })
+        .unwrap();
+    let build = steps
+        .iter()
+        .position(|s| s["id"].as_str() == Some("driver"))
+        .unwrap();
+    let checkout = steps
+        .iter()
+        .position(|s| s["uses"].as_str() == Some("actions/checkout@v4"))
+        .unwrap();
+    assert!(checkout < verify && verify < build);
+    let temp = tempfile::tempdir().unwrap();
+    let git = temp.path().join("git");
+    std::fs::write(&git, r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$FIXTURE_CALLS"
+case "$1" in
+ls-remote) test "$2 $3" = 'https://github.com/carrick-sh/carrick refs/heads/main'; printf '%s\trefs/heads/main\n' "$FIXTURE_MAIN" ;;
+fetch) test "$2 $3 $4" = '--no-tags https://github.com/carrick-sh/carrick refs/heads/main' ;;
+rev-parse) test "$2" = HEAD; printf '%s\n' "$FIXTURE_CHECKOUT" ;;
+merge-base) test "$2 $3 $4" = "--is-ancestor $FIXTURE_MAIN FETCH_HEAD"; exit "$FIXTURE_ANCESTOR" ;;
+*) exit 91 ;;
+esac
+"#).unwrap();
+    std::fs::set_permissions(git, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let main = "a".repeat(40);
+    let merge = "b".repeat(40);
+    let output = temp.path().join("output");
+    let calls = temp.path().join("calls");
+    let command = |script: &str| {
+        let mut command = Command::new("/bin/bash");
+        command
+            .args(["-eu", "-c", script])
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+            .env("FIXTURE_MAIN", &main)
+            .env("FIXTURE_CALLS", &calls)
+            .env("EVENT_SHA", &merge)
+            .env("GITHUB_OUTPUT", &output)
+            .env("CARRICK_DISPATCH_BASE", &main);
+        command
+    };
+    for (event, expected) in [("pull_request_review", &main), ("issues", &merge)] {
+        std::fs::write(&output, "").unwrap();
+        assert!(
+            command(resolve)
+                .env("EVENT_NAME", event)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            format!("base={expected}\n")
+        );
+    }
+    let verify = steps[verify]["run"].as_str().unwrap();
+    for (checkout, ancestor, allowed) in [
+        (&main, "0", true),
+        (&merge, "0", false),
+        (&main, "1", false),
+    ] {
+        std::fs::write(&calls, "").unwrap();
+        let result = command(verify)
+            .env("FIXTURE_CHECKOUT", checkout)
+            .env("FIXTURE_ANCESTOR", ancestor)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.success(), allowed, "{result:?}");
+        assert!(std::fs::read_to_string(&calls).unwrap().starts_with(
+            "fetch --no-tags https://github.com/carrick-sh/carrick refs/heads/main\n"
+        ));
+    }
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn loop_client_alias_sends_one_strict_json_request() {
     use std::io::{BufRead, Write};
@@ -760,6 +865,7 @@ fn loop_client_alias_sends_one_strict_json_request() {
     std::fs::copy(env!("CARGO_BIN_EXE_carrick-xtask"), &alias).unwrap();
     let mut child = Command::new(&alias)
         .args(["tool", "read_state"])
+        .current_dir(temp.path())
         .env_clear()
         .env("CARRICK_DISPATCH_SOCKET", &socket)
         .stdin(Stdio::piped())
