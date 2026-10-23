@@ -50,6 +50,7 @@ pub enum ServiceResult {
     Supplied,
     Refused,
     Cancelled,
+    Wait(crate::PortalOwnerWait),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceError {
@@ -58,7 +59,7 @@ pub enum ServiceError {
     Exhausted,
 }
 
-pub const NATIVE_SERVICE_PROTOCOL: u64 = 2;
+pub const NATIVE_SERVICE_PROTOCOL: u64 = 3;
 
 /// Transport selector only: authority remains in the member's retained cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,6 +152,8 @@ const CANCEL_REQUESTED: u64 = 5;
 const COMPLETED: u64 = 6;
 const CANCELLED: u64 = 7;
 const CANCEL_QUEUED: u64 = 8;
+const OWNED_WAIT: u64 = 9;
+const WAIT_CANCELLED: u64 = 10;
 
 /// A member owns this cell, not the execution slot. Its enclosing allocation
 /// and semantic MM claim must remain retained through acknowledgment. All
@@ -162,6 +165,7 @@ pub struct ServiceCell {
     sequence: AtomicU64,
     words: [AtomicU64; 12],
     result: AtomicU64,
+    wait_revision: AtomicU64,
 }
 impl ServiceCell {
     pub const fn new() -> Self {
@@ -170,6 +174,7 @@ impl ServiceCell {
             sequence: AtomicU64::new(0),
             words: [const { AtomicU64::new(0) }; 12],
             result: AtomicU64::new(0),
+            wait_revision: AtomicU64::new(0),
         }
     }
     // Binding/publication must use authenticated lifecycle and admitted-MM
@@ -514,6 +519,11 @@ impl ServiceCell {
                 self.state.store(IDLE, Ordering::Release);
                 Ok(true)
             }
+            OWNED_WAIT | WAIT_CANCELLED => {
+                self.lock_exact(state, identity)?;
+                self.state.store(WAIT_CANCELLED, Ordering::Release);
+                Ok(true)
+            }
             REQUESTED | CANCEL_QUEUED | SERVICING | CANCEL_REQUESTED | COMPLETED | CANCELLED => {
                 self.lock_exact(state, identity)?;
                 let acknowledged = matches!(state, COMPLETED | CANCELLED);
@@ -559,11 +569,78 @@ impl ServiceCell {
             ServiceResult::Cancelled
         } else if self.result.load(Ordering::Relaxed) == 1 {
             ServiceResult::Supplied
+        } else if let Some(cause) =
+            crate::PortalWaitCause::decode(self.result.load(Ordering::Relaxed).saturating_sub(2))
+        {
+            // SAFETY: complete_wait checked the retained exact MM identity;
+            // the service ticket supplies its pre-probe resource revision.
+            ServiceResult::Wait(unsafe {
+                crate::PortalOwnerWait::from_owner(
+                    identity.birth.mm,
+                    cause,
+                    self.wait_revision.load(Ordering::Relaxed),
+                )
+            })
         } else {
             ServiceResult::Refused
         };
-        self.state.store(IDLE, Ordering::Release);
+        self.state.store(
+            if matches!(result, ServiceResult::Wait(_)) {
+                OWNED_WAIT
+            } else {
+                IDLE
+            },
+            Ordering::Release,
+        );
         Ok(result)
+    }
+    /// Reserve a ring-owned resource wait without publishing external work.
+    /// Caller holds the member service queue across request/phase publication.
+    pub fn begin_owner_wait(
+        &self,
+        birth: ServiceBirth,
+        execution: SnapshotGeneration,
+        operation: ServiceOperation,
+        wait: crate::PortalOwnerWait,
+    ) -> Result<ServiceRequest, ServiceError> {
+        if wait.handle() != birth.mm {
+            return Err(ServiceError::Stale);
+        }
+        let request = self.publish(birth, execution, operation, None)?;
+        self.lock_exact(REQUESTED, request.identity)?;
+        self.result
+            .store(2 + wait.cause().encode(), Ordering::Relaxed);
+        self.wait_revision.store(wait.revision(), Ordering::Relaxed);
+        self.state.store(OWNED_WAIT, Ordering::Release);
+        Ok(request)
+    }
+    /// Inspect sticky cancellation under the stable member service queue.
+    pub fn owner_wait_cancelled(&self, identity: ServiceIdentity) -> Result<bool, ServiceError> {
+        let state = self.state.load(Ordering::Acquire);
+        if !matches!(state, OWNED_WAIT | WAIT_CANCELLED) {
+            return Err(ServiceError::Busy);
+        }
+        self.lock_exact(state, identity)?;
+        self.state.store(state, Ordering::Release);
+        Ok(state == WAIT_CANCELLED)
+    }
+    /// Consume the one owner wait after its producer edge or cancellation.
+    /// No external ticket or second acknowledgment exists for this phase.
+    pub fn finish_owner_wait(
+        &self,
+        identity: ServiceIdentity,
+    ) -> Result<ServiceResult, ServiceError> {
+        let state = self.state.load(Ordering::Acquire);
+        if !matches!(state, OWNED_WAIT | WAIT_CANCELLED) {
+            return Err(ServiceError::Busy);
+        }
+        self.lock_exact(state, identity)?;
+        self.state.store(IDLE, Ordering::Release);
+        Ok(if state == WAIT_CANCELLED {
+            ServiceResult::Cancelled
+        } else {
+            ServiceResult::Supplied
+        })
     }
 }
 /// Dropping a transport handle is not completion: it leaves the operation and
@@ -590,7 +667,18 @@ impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
         self.selection_taken = true;
         slot.take_native_fault_selection(self)
     }
-    pub fn complete(mut self, supplied: bool) -> Result<(), (ServiceError, Self)> {
+    pub fn complete(self, supplied: bool) -> Result<(), (ServiceError, Self)> {
+        self.acknowledge(u64::from(supplied), 0)
+    }
+    /// Acknowledge physical service and transfer the same continuation to an
+    /// exact-MM producer. No physical resource guard survives this call.
+    pub fn complete_wait(self, wait: crate::PortalOwnerWait) -> Result<(), (ServiceError, Self)> {
+        if wait.handle() != self.request.identity.birth.mm {
+            return Err((ServiceError::Stale, self));
+        }
+        self.acknowledge(2 + wait.cause().encode(), wait.revision())
+    }
+    fn acknowledge(mut self, result: u64, revision: u64) -> Result<(), (ServiceError, Self)> {
         let cell = &**self.cell;
         let state = cell.state.load(Ordering::Acquire);
         if !matches!(state, SERVICING | CANCEL_REQUESTED) {
@@ -606,7 +694,8 @@ impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
         if let Err(error) = cell.lock_exact(state, self.request.identity) {
             return Err((error, self));
         }
-        cell.result.store(u64::from(supplied), Ordering::Relaxed);
+        cell.result.store(result, Ordering::Relaxed);
+        cell.wait_revision.store(revision, Ordering::Relaxed);
         cell.state.store(
             if state == CANCEL_REQUESTED {
                 CANCELLED
@@ -940,5 +1029,24 @@ mod tests {
             second.consume(b_request.identity),
             Ok(ServiceResult::Refused)
         );
+    }
+    #[test]
+    fn mm_busy_ack_preserves_the_native_claim_until_its_owner_wakes() {
+        let cell = ServiceCell::new();
+        let owner = birth(1, 1);
+        cell.bind(owner).unwrap();
+        let request = cell
+            .publish(owner, SnapshotGeneration::INITIAL, fault(), None)
+            .unwrap();
+        // SAFETY: fixture names its exact admitted source before the busy probe.
+        let wait = unsafe {
+            crate::PortalOwnerWait::from_owner(owner.mm, crate::PortalWaitCause::Editor, 7)
+        };
+        assert!(cell.claim(request).unwrap().complete_wait(wait).is_ok());
+        assert_eq!(
+            cell.consume(request.identity),
+            Ok(ServiceResult::Wait(wait))
+        );
+        assert_eq!(cell.reset_unpublished(), Err(ServiceError::Busy));
     }
 }

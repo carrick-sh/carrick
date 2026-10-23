@@ -1078,6 +1078,13 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
         }
     }
 
+    fn service_wait_mut(&mut self, record: &RecordRef) -> Option<&mut service::PendingService<'a>> {
+        match self.pending.member_mut(record)?.wait.as_mut()? {
+            MemberWait::Service(pending) => Some(pending),
+            MemberWait::Signal(_) => None,
+        }
+    }
+
     fn remove_service_wait(&mut self, record: &RecordRef) -> Option<service::PendingService<'a>> {
         self.service_wait(record)?;
         match self.take_member_wait(record)? {

@@ -99,6 +99,51 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
         self.revision
     }
 
+    /// Authenticate a ring-owned continuation against its retained birth MM.
+    pub fn for_owner(
+        zone: &'a ZoneTables<C>,
+        expected: crate::El1MmHandle,
+        receipt: crate::PortalOwnerWait,
+    ) -> Result<Self, ObjectWaitError> {
+        if receipt.handle() != expected {
+            return Err(ObjectWaitError::Stale);
+        }
+        use crate::PortalWaitCause;
+        let cause = match receipt.cause() {
+            PortalWaitCause::Editor => SpaceWaitCause::Editor,
+            PortalWaitCause::Reservations => SpaceWaitCause::Reservations,
+            PortalWaitCause::PendingEdit => SpaceWaitCause::PendingEdit,
+            PortalWaitCause::Gate => SpaceWaitCause::Gate,
+            PortalWaitCause::Metadata => SpaceWaitCause::Metadata,
+            PortalWaitCause::ReservationPool => return Err(ObjectWaitError::Stale),
+        };
+        let entry = zone
+            .space_entry(
+                core::num::NonZeroU64::new(expected.mm().raw()).ok_or(ObjectWaitError::Stale)?,
+            )
+            .ok_or(ObjectWaitError::Stale)?;
+        Ok(Self::new(
+            entry.notifications(expected.incarnation())?,
+            cause,
+            receipt.revision(),
+        ))
+    }
+    pub fn owner_request(&self, operation: OperationToken) -> ObjectParkRequest {
+        let mut request = ObjectParkRequest::owner(
+            self.source.key(self.cause),
+            operation,
+            carrick_sched_core::object_wait::OwnerEntry::Exception,
+        );
+        request.snapshot = Some(self.source.observed_revision(self.cause, self.revision));
+        request
+    }
+    pub fn is_live(&self) -> bool {
+        self.source.is_live()
+    }
+    pub fn key(&self) -> ObjectWaitKey {
+        self.source.key(self.cause)
+    }
+
     pub fn park_host(
         self,
         record: RecordId,

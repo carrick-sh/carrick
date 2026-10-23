@@ -1321,6 +1321,33 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
         rec.object.queue.store(0, Ordering::Release);
     }
 
+    /// Cancel exactly one owned operation without fabricating a producer edge
+    /// or visiting other waiters on this MM resource.
+    pub fn wake_owner_operation(
+        &self,
+        record: RecordRef,
+        operation: &OperationToken,
+        waker: SlotId,
+        effects: &mut WakeEffects,
+    ) -> bool {
+        if self.zone.record_ref(record.id) != record {
+            return false;
+        }
+        let rec = self.zone.record(record.id);
+        if rec.object.queue.load(Ordering::Acquire) != self.key.index + 1
+            || rec.object.generation.load(Ordering::Relaxed) != self.key.generation
+            || rec.object.operation.load(Ordering::Acquire) != operation.index()
+            || rec.object.operation_generation.load(Ordering::Relaxed) != operation.generation()
+        {
+            return false;
+        }
+        let Claim::Parked { seq } = rec.claim() else {
+            return false;
+        };
+        self.zone
+            .claim_for_el1(record.id, seq, 0, waker, effects, || self.unlink(record.id))
+    }
+
     /// Publish a readiness change, even with no waiters. Called by a running
     /// guest slot while holding object state (host venue integration must use
     /// its own placement boundary, never impersonate a running guest slot).
