@@ -690,7 +690,9 @@ pub fn handle_user_page_fault_prepared(
             ];
             0
         }
-        OwnerFaultSupplyOutcome::Unavailable => 9,
+        // This lane has no native-service birth handle, so it cannot mint
+        // an owner wait. Refuse any such mismatched outcome at the boundary.
+        OwnerFaultSupplyOutcome::Wait(_) | OwnerFaultSupplyOutcome::Unavailable => 9,
         OwnerFaultSupplyOutcome::CowSelected => {
             cross_owner_grant(
                 carrick_guest_arch::CpuId::new(binding.cpu_slot),

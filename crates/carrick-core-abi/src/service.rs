@@ -252,6 +252,27 @@ impl ServiceCell {
         birth
     }
 
+    /// Recover the birth MM for a currently executing, exact member. This
+    /// does not probe the reservation root whose contention is being handled.
+    pub fn bound_mm(
+        &self,
+        record: RecordRef,
+        thread: EntryThreadGeneration,
+    ) -> Result<El1MmHandle, ServiceError> {
+        let id = i32::try_from(self.words[1].load(Ordering::Acquire))
+            .ok()
+            .and_then(core::num::NonZeroI32::new)
+            .ok_or(ServiceError::Stale)?;
+        let serial =
+            NonZeroU64::new(self.words[2].load(Ordering::Acquire)).ok_or(ServiceError::Stale)?;
+        let process = TaskKey {
+            id: carrick_sched_core::process::TaskId::from_registry_allocation(id),
+            serial: carrick_sched_core::process::TaskSerial::from_registry_allocation(serial),
+        };
+        self.bound_birth(process, thread, record)
+            .map(|birth| birth.mm)
+    }
+
     /// Caller holds the member reset reservation. An outstanding request
     /// refuses reset even if a physical metadata pin keeps its bytes mapped.
     pub fn reset_unpublished(&self) -> Result<(), ServiceError> {

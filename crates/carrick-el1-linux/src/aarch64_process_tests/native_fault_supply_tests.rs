@@ -68,9 +68,7 @@ impl CowResolver for FaultResolver<'_> {
         );
         carrick_el1::fault::handle_cow_outcome(outcome, &mut None)
     }
-    fn editor_busy(&mut self) {
-        panic!("uncontended fixture");
-    }
+    fn editor_busy(&mut self) {}
 }
 
 #[test]
@@ -166,12 +164,170 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
     };
     let portal = fixture.region.portal_slots();
     assert!(portal.bind_carrier(NonZeroU64::MIN));
-    let supply = OwnerFaultSupply::new(portal);
+    // The same immutable birth handle used by the hardware fault entry.
+    let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+    let handle = control
+        .service
+        .bound_mm(
+            fixture.zone.record_ref(child),
+            carrick_el1_abi::EntryThreadGeneration::from_raw(identity.serial),
+        )
+        .unwrap();
+    let supply = OwnerFaultSupply::new(portal).with_handle(handle);
     let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
     frame.esr = 0x9200004f;
     frame.far = VA + 13;
     frame.elr = 0x401234;
     frame.x[3] = 0x7abc;
+    for cause in [
+        carrick_el1_abi::PortalWaitCause::Editor,
+        carrick_el1_abi::PortalWaitCause::Reservations,
+        carrick_el1_abi::PortalWaitCause::Gate,
+    ] {
+        for release_before_enroll in [true, false] {
+            let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+            let index = access.find(identity.mm).unwrap();
+            let child_root = access.grant(index, identity.mm).unwrap().ttbr0;
+            let mut held_editor = (cause == carrick_el1_abi::PortalWaitCause::Editor).then(|| {
+                access
+                    .try_begin_edit(index, identity.mm, NonZeroU64::new(99).unwrap())
+                    .unwrap()
+            });
+            let mut held_root =
+                (cause == carrick_el1_abi::PortalWaitCause::Reservations).then(|| {
+                    fixture
+                        .region
+                        .table()
+                        .lock_in(access, index.index(), handle.mm(), 7)
+                        .unwrap()
+                });
+            if cause == carrick_el1_abi::PortalWaitCause::Gate {
+                access.raise(index);
+            }
+            let busy = OwnerFaultSupply::new(portal).with_handle(handle);
+            assert_eq!(
+                carrick_el1::fault::dispatch_fault_with_prepared(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    access,
+                    crate::cow_resolver::native_fault_supply(
+                        true,
+                        carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                        &busy
+                    ),
+                    Some(carrick_el1::fault::PreparedFaultPath {
+                        residency: &residency,
+                        resolver: &mut carrick_el1::fault::NoopPreparedResolver,
+                        roots: Some(fixture.region.table()),
+                        file_slots: Some(portal)
+                    }),
+                    &mut resolver,
+                ),
+                carrick_el1_abi::Action::Forward
+            );
+            let OwnerFaultSupplyOutcome::Wait(wait) = busy.outcome() else {
+                panic!("known contention lost its producer: {:?}", busy.outcome());
+            };
+            assert_eq!(wait.cause(), cause);
+            assert_eq!(wait.handle(), handle);
+            let mut release = || {
+                drop(held_editor.take());
+                drop(held_root.take());
+                if cause == carrick_el1_abi::PortalWaitCause::Gate {
+                    access.lower(index);
+                }
+            };
+            if release_before_enroll {
+                release();
+            }
+            let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+            let mut saved = Aarch64ParkedContext::ZERO;
+            crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+            let result = with_process_entry(
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                &fixture.task,
+                &saved.native,
+                child_root,
+                page,
+                control,
+                &mut service,
+                |entry| {
+                    let result = entry
+                        .begin_owner_service_wait(
+                            ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
+                                address: UserVa::new(frame.far),
+                                access: carrick_guest_arch::Access::Write,
+                                present: true,
+                            }),
+                            wait,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        entry.take_handoff_receipt().is_some(),
+                        !release_before_enroll
+                    );
+                    result
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                fixture.task.service_notice.take().unwrap(),
+                None,
+                "ring contention must not request physical service"
+            );
+            if release_before_enroll {
+                assert!(
+                    matches!(result, NativeResume::NoPending),
+                    "publication in the enrollment gap retries once without parking"
+                );
+            } else {
+                assert!(matches!(result, NativeResume::Left(None)));
+                assert_eq!(page.claimed_count(), 1);
+                crate::dispatch::native_service_idle(fixture.zone, fixture.slot, &mut cpu);
+                release();
+                let mut handoff = None;
+                let mut zone = crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                };
+                assert_eq!(
+                    crate::dispatch::native_scheduler(
+                        &mut zone,
+                        &fixture.task,
+                        &counters,
+                        fixture.slot,
+                        &mut handoff
+                    )
+                    .idle_entry(&mut frame, 0),
+                    carrick_el1_abi::Action::Served
+                );
+                assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
+                assert!(matches!(
+                    resume_selected(
+                        &owner,
+                        registry(),
+                        BornInZoneSource {
+                            zone: fixture.zone,
+                            slot: fixture.slot
+                        },
+                        &fixture.task,
+                        child,
+                        &mut service
+                    ),
+                    NativeResume::NoPending
+                ));
+                frame.esr = 0x9200004f;
+                frame.far = VA + 13;
+            }
+            assert_eq!(page.claimed_count(), 0);
+            assert_eq!(memory.copies.get(), 0);
+        }
+    }
     let action = carrick_el1::fault::dispatch_fault_with_prepared(
         &mut frame,
         &counters,

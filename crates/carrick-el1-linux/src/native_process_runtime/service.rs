@@ -136,6 +136,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         fault_sequence: Option<core::num::NonZeroU64>,
     ) -> Result<NativeResume, NativeProcessError> {
+        self.begin_service_inner(operation, fault_sequence, None)
+    }
+    /// Park the exact ring operation on the producer observed before its
+    /// failed admission. No physical service notice is published.
+    pub fn begin_owner_service_wait(
+        &mut self,
+        operation: ServiceOperation,
+        wait: carrick_core_abi::PortalOwnerWait,
+    ) -> Result<NativeResume, NativeProcessError> {
+        self.begin_service_inner(operation, None, Some(wait))
+    }
+    #[inline(never)]
+    fn begin_service_inner(
+        &mut self,
+        operation: ServiceOperation,
+        fault_sequence: Option<core::num::NonZeroU64>,
+        owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
+    ) -> Result<NativeResume, NativeProcessError> {
         let (page, control) = {
             let graph = self.runtime.graph.lock();
             if graph.has_member_wait(&self.record) {
@@ -168,12 +186,27 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         } else {
             None
         };
+        let owner_queue = owner_wait
+            .map(|_| {
+                let key =
+                    ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
+                self.source
+                    .zone
+                    .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                    .map_err(|_| NativeProcessError::Stale)
+            })
+            .transpose()?;
         let claim = carrick_core::terminal::NativeServiceClaim::acquire(page)
             .map_err(|_| NativeProcessError::Busy)?;
         let published = {
             let graph = self.runtime.graph.lock();
             if !claim.admitted() || graph.has_member_wait(&self.record) {
                 Err(NativeProcessError::Busy)
+            } else if let Some(wait) = owner_wait {
+                self.control
+                    .service
+                    .begin_owner_wait(birth, self.binding.generation, operation, wait)
+                    .map_err(service_error)
             } else {
                 self.control
                     .service
@@ -194,6 +227,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let request = match published {
             Ok(request) => request,
             Err(error) => {
+                drop(owner_queue);
                 self.release_service_claim(claim)?;
                 return Err(error);
             }
@@ -203,11 +237,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             MemberWait::Service(PendingService {
                 reply,
                 request,
-                wait: None,
+                wait: owner_wait,
                 claim,
                 control,
             }),
         );
+        drop(owner_queue);
+        if let Some(wait) = owner_wait {
+            return self.park_owner_wait(request, wait);
+        }
         if let Err(error) = self
             .current
             .service_notice
@@ -483,6 +521,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             match self.service.apply_fault_reply(reply) {
                 Ok(()) => {}
                 Err(carrick_core::mm::transaction::MmError::Wait(wait)) => {
+                    let key = ObjectWaitKey::native_service(self.record)
+                        .ok_or(NativeProcessError::Stale)?;
+                    let queue = self
+                        .source
+                        .zone
+                        .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                        .map_err(|_| NativeProcessError::Stale)?;
                     let next = self
                         .control
                         .service
@@ -499,6 +544,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .graph
                         .lock()
                         .insert_member_wait(self.record, MemberWait::Service(pending));
+                    drop(queue);
                     return self.park_owner_wait(next, wait);
                 }
                 Err(_) => result = ServiceResult::Refused,
