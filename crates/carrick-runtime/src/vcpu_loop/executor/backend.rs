@@ -983,8 +983,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("HVPatch executor lost loaded engine".into()))?;
         let exit = quantum.poll_quantum_with_engine(engine, &mut control);
-        if let Some(slot) = engine
-            .mailbox_slot()
+        if let Some(slot) = carrick_hal::ThreadedEngine::mailbox_slot(engine)
             .and_then(carrick_el1_abi::SlotId::from_index)
             && let Some(service) =
                 carrick_vmm_hvf::hvf_aarch64_engine::take_worker_native_service(engine.vm(), slot)?
