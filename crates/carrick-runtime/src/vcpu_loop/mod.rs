@@ -1857,6 +1857,14 @@ where
                 self.resume_write_copy_in(kernel, engine, pending, host_wait)
             }
             binding::OwnedSyscallResume::Sleep(pending) => Ok(pending.resume(engine)),
+            binding::OwnedSyscallResume::RecvfromAddress(pending) => {
+                let context = self.service_kernel_context.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "recvfrom address completion lost context".to_owned(),
+                    )
+                })?;
+                Ok(pending.resume(context, engine))
+            }
             binding::OwnedSyscallResume::Ipc(pending) => {
                 self.resume_ipc_copyout(kernel, engine, pending)
             }

@@ -671,6 +671,7 @@ pub use fs::RecordLockContentionFixture;
 pub use fs::StdioSink;
 pub use fs::rw::OwnedWriteCopyIn;
 pub use fs::state::{PipedOutput, StdioReadiness};
+pub use net::send_recv::OwnedRecvfromAddress;
 pub use time::OwnedSleepCopyIn;
 mod keys;
 pub use fs::MountRetirement;

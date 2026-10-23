@@ -230,6 +230,7 @@ pub(super) enum OwnedSyscallResume {
     Ipc(carrick_kernel::kernel::continuation::ipc::RetainedIpcOperation),
     PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
     Sleep(Box<carrick_kernel::dispatch::OwnedSleepCopyIn>),
+    RecvfromAddress(Box<carrick_kernel::dispatch::OwnedRecvfromAddress>),
 }
 
 pub(super) fn owner_copyin_route(
@@ -243,6 +244,10 @@ pub(super) fn owner_copyin_route(
         DispatchOutcome::SleepCopyInSuspended(pending) => {
             (pending.wait().clone(), OwnedSyscallResume::Sleep(pending))
         }
+        DispatchOutcome::RecvfromAddressSuspended(pending) => (
+            pending.wait().clone(),
+            OwnedSyscallResume::RecvfromAddress(pending),
+        ),
         other => return (other, None),
     };
     let wait_outcome = match wait {

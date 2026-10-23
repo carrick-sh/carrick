@@ -1805,6 +1805,16 @@ intent and applying payload only under exact owner custody preserves Service.
 
 ## One owner for memory waits (`kernel.memory.owner-wait`, #802)
 
+Owner-backed stream `recvfrom` reads and validates `addrlen` after payload
+copyout, including when the pointers alias and under `MSG_PEEK`. Empty sockets
+still return errno 11 or wait before touching address completion. The VM-free
+recvfrom witnesses cover zero/negative post-copyout lengths (success/errno 22),
+invalid length pointers (errno 14), and retained read/write waits after copyout.
+Address completion resumes its exact phase and never receives again; payload
+and metadata each use one bounded prepared copyout, with no permit held while
+waiting.
+
+
 The #711/#802 owner contract is:
 
 - Owner waits are killable-only; stops and handled signals never complete them.

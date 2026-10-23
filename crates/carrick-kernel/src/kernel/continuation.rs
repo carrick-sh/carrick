@@ -1629,6 +1629,7 @@ impl BlockedContinuation {
             | DispatchOutcome::Errno { .. }
             | DispatchOutcome::WriteCopyInSuspended(_)
             | DispatchOutcome::SleepCopyInSuspended(_)
+            | DispatchOutcome::RecvfromAddressSuspended(_)
             | DispatchOutcome::OwnerCancelled(_)
             | DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }

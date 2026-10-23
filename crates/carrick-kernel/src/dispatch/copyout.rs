@@ -638,11 +638,23 @@ pub(crate) mod owner_fixture {
                 return Err(MemoryError::ReadSuspended(Box::new(
                     carrick_guest_mem::MemoryReadSuspension {
                         wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
-                        continuation: carrick_guest_mem::OwnedReadContinuation::new(()),
+                        continuation: carrick_guest_mem::OwnedReadContinuation::new((
+                            address, length,
+                        )),
                     },
                 )));
             }
             self.inner.read_bytes_raw(address, length)
+        }
+
+        fn resume_read(
+            &self,
+            continuation: carrick_guest_mem::OwnedReadContinuation,
+        ) -> Result<Vec<u8>, MemoryError> {
+            let (address, length) = continuation
+                .take::<(u64, usize)>()
+                .expect("fixture read continuation belongs to this memory");
+            self.read_bytes_raw(address, length)
         }
 
         fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {

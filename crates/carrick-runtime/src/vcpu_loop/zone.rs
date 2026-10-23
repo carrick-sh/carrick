@@ -48,7 +48,8 @@ impl ZoneWaitPolicy {
             OwnedSyscallResume::CopyoutRedispatch
             | OwnedSyscallResume::Ipc(_)
             | OwnedSyscallResume::PreparedWrite(_)
-            | OwnedSyscallResume::Sleep(_) => Self::KillableOwnerMemory,
+            | OwnedSyscallResume::Sleep(_)
+            | OwnedSyscallResume::RecvfromAddress(_) => Self::KillableOwnerMemory,
         }
     }
 }

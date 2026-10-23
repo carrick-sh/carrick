@@ -503,6 +503,8 @@ pub enum DispatchOutcome {
     /// Backend: park on the exact memory dependency and resume the retained
     /// timespec copy before creating the sleep's timed continuation.
     SleepCopyInSuspended(#[serde(skip_serializing)] Box<super::OwnedSleepCopyIn>),
+    /// Resume only address completion; the receive payload is already copied.
+    RecvfromAddressSuspended(#[serde(skip_serializing)] Box<super::OwnedRecvfromAddress>),
     /// Backend: write `value` into the guest's syscall return register, service any
     /// signal that became pending during the call, and resume the task.
     Returned { value: i64 },

@@ -92,6 +92,32 @@ impl Guest {
         )
     }
 
+    fn stream_pair(&self) -> (i32, i32) {
+        let creds = super::net::unix_pure::LinuxUcred {
+            pid: 100,
+            uid: 1000,
+            gid: 1000,
+        };
+        let (left, right) =
+            super::net::unix_pure::PureSocketInner::pair(LINUX_SOCK_STREAM, creds, creds);
+        let install = |socket| {
+            self.dispatcher
+                .install_fd_at_or_above(
+                    3,
+                    OpenFile::from_open_description_with_status_flags(
+                        Arc::new(parking_lot::RwLock::new(OpenDescription::InMemorySocket {
+                            base: OpenDescriptionBase::new(0),
+                            socket,
+                        })),
+                        LINUX_O_RDWR,
+                        0,
+                    ),
+                )
+                .unwrap()
+        };
+        (install(left), install(right))
+    }
+
     fn seed_path(&mut self, path: &str) {
         self.memory.seed(PATH, format!("{path}\0").as_bytes());
     }
@@ -453,31 +479,13 @@ fn zero_output_gettimeofday_makes_zero_owner_prepares() {
 
 #[test]
 fn recvfrom_owner_defers_addrlen_fault_until_data() {
-    for addrlen in [0, BASE + LEN as u64 + 1] {
+    for addrlen in [0, BASE + LEN as u64 + 1, LEN_ADDR] {
         let mut g = Guest::new();
-        let creds = super::net::unix_pure::LinuxUcred {
-            pid: 100,
-            uid: 1000,
-            gid: 1000,
-        };
-        let (left, right) =
-            super::net::unix_pure::PureSocketInner::pair(LINUX_SOCK_STREAM, creds, creds);
-        let install = |socket| {
-            g.dispatcher
-                .install_fd_at_or_above(
-                    3,
-                    OpenFile::from_open_description_with_status_flags(
-                        Arc::new(parking_lot::RwLock::new(OpenDescription::InMemorySocket {
-                            base: OpenDescriptionBase::new(0),
-                            socket,
-                        })),
-                        LINUX_O_RDWR,
-                        0,
-                    ),
-                )
-                .unwrap()
-        };
-        let (left, right) = (install(left), install(right));
+        let (left, right) = g.stream_pair();
+        if addrlen == LEN_ADDR {
+            g.memory.seed(LEN_ADDR, &0u32.to_ne_bytes());
+            g.memory.protect_readonly(LEN_ADDR, 4);
+        }
         let args = [
             left as u64,
             OUT,
@@ -516,6 +524,142 @@ fn recvfrom_owner_defers_addrlen_fault_until_data() {
             g.call(nr::RECVFROM.raw(), args),
             DispatchOutcome::errno(LINUX_EAGAIN),
             "the faulting receive consumed the payload"
+        );
+    }
+}
+
+#[test]
+fn recvfrom_owner_reads_aliased_addrlen_after_payload() {
+    for peek in [false, true] {
+        for (initial, payload, expected) in [
+            (u32::MAX, 0u32, DispatchOutcome::Returned { value: 4 }),
+            (0, u32::MAX, DispatchOutcome::errno(LINUX_EINVAL)),
+        ] {
+            let mut g = Guest::new();
+            let (left, right) = g.stream_pair();
+            g.memory.seed(OUT, &initial.to_ne_bytes());
+            g.memory.seed(PATH, &payload.to_ne_bytes());
+            assert_eq!(g.ok(nr::WRITE.raw(), [right as u64, PATH, 4, 0, 0, 0]), 4);
+            let flags = LinuxMsgFlags::DONTWAIT
+                | if peek {
+                    LinuxMsgFlags::PEEK
+                } else {
+                    LinuxMsgFlags::empty()
+                };
+            let prepares = g.memory.prepares;
+            assert_eq!(
+                g.call(
+                    nr::RECVFROM.raw(),
+                    [left as u64, OUT, 4, flags.bits() as u64, OUT2, OUT]
+                ),
+                expected,
+                "peek={peek}: use post-copyout addrlen, zero succeeds and 0xffffffff returns errno 22"
+            );
+            assert_eq!(g.memory.read_bytes(OUT, 4).unwrap(), payload.to_ne_bytes());
+            assert_eq!(
+                g.memory.prepares - prepares,
+                if payload == 0 { 2 } else { 1 },
+                "one payload prepare, plus one metadata prepare only after validation"
+            );
+            assert_eq!(
+                g.call(
+                    nr::RECVFROM.raw(),
+                    [
+                        left as u64,
+                        OUT,
+                        4,
+                        LinuxMsgFlags::DONTWAIT.bits() as u64,
+                        0,
+                        0
+                    ]
+                ),
+                if peek {
+                    DispatchOutcome::Returned { value: 4 }
+                } else {
+                    DispatchOutcome::errno(LINUX_EAGAIN)
+                },
+                "MSG_PEEK retains payload; normal receive consumes it (errno 11)"
+            );
+        }
+    }
+}
+
+#[test]
+fn recvfrom_owner_resumes_address_without_replaying_payload() {
+    for peek in [false, true] {
+        let mut g = Guest::new();
+        let (left, right) = g.stream_pair();
+        g.memory.seed(PATH, &[0; 4]);
+        assert_eq!(g.ok(nr::WRITE.raw(), [right as u64, PATH, 4, 0, 0, 0]), 4);
+        g.memory.seed(OUT, &u32::MAX.to_ne_bytes());
+        let wait = g.memory.refuse_next_read();
+        let flags = LinuxMsgFlags::DONTWAIT
+            | if peek {
+                LinuxMsgFlags::PEEK
+            } else {
+                LinuxMsgFlags::empty()
+            };
+        let first = g.call(
+            nr::RECVFROM.raw(),
+            [left as u64, OUT, 4, flags.bits() as u64, OUT2, OUT],
+        );
+        let DispatchOutcome::RecvfromAddressSuspended(first) = first else {
+            panic!("address read must suspend after receiving: {first:?}");
+        };
+        assert_eq!(
+            first.wait(),
+            &carrick_guest_mem::MemoryReadWait::Owner(wait)
+        );
+        assert_eq!(g.memory.read_bytes(OUT, 4).unwrap(), [0; 4]);
+        // Distinct queued bytes make a replay observable even for MSG_PEEK.
+        g.memory.seed(PATH, b"next");
+        assert_eq!(g.ok(nr::WRITE.raw(), [right as u64, PATH, 4, 0, 0, 0]), 4);
+        let context = g.dispatcher.capture_one_task_context().unwrap();
+        // Retain the read continuation across another read suspension.
+        let wait = g.memory.refuse_next_read();
+        let DispatchOutcome::RecvfromAddressSuspended(second) =
+            first.resume(&context, &mut g.memory)
+        else {
+            panic!("address read must retain its continuation");
+        };
+        assert_eq!(
+            second.wait(),
+            &carrick_guest_mem::MemoryReadWait::Owner(wait)
+        );
+        let wait = g.memory.refuse_next();
+        let DispatchOutcome::RecvfromAddressSuspended(third) =
+            second.resume(&context, &mut g.memory)
+        else {
+            panic!("validated address write must retain its own phase");
+        };
+        assert_eq!(
+            third.wait(),
+            &carrick_guest_mem::MemoryReadWait::Owner(wait)
+        );
+        // Once validated, a write wait must not read the edited length again.
+        g.memory.seed(OUT, &u32::MAX.to_ne_bytes());
+        assert_eq!(
+            third.resume(&context, &mut g.memory),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        assert_eq!(g.memory.read_bytes(OUT, 4).unwrap(), [0; 4]);
+        let receive = [
+            left as u64,
+            OUT,
+            4,
+            LinuxMsgFlags::DONTWAIT.bits() as u64,
+            0,
+            0,
+        ];
+        if peek {
+            assert_eq!(g.ok(nr::RECVFROM.raw(), receive), 4);
+            assert_eq!(g.memory.read_bytes(OUT, 4).unwrap(), [0; 4]);
+        }
+        assert_eq!(g.ok(nr::RECVFROM.raw(), receive), 4);
+        assert_eq!(g.memory.read_bytes(OUT, 4).unwrap(), b"next");
+        assert_eq!(
+            g.call(nr::RECVFROM.raw(), receive),
+            DispatchOutcome::errno(LINUX_EAGAIN)
         );
     }
 }
