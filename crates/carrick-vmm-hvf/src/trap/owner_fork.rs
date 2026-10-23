@@ -149,16 +149,15 @@ impl ForkCustody for ForkPhysicalCustody {
                     let Some(bound) = record.ipa.checked_add(record.len as u64) else {
                         return Ok(None);
                     };
-                    if let Some(logical) = record.logical_owner {
-                        if let Some(owner) = self
+                    if let Some(logical) = record.logical_owner
+                        && let Some(owner) = self
                             .custody
                             .native_frame_backings
                             .lock()
                             .get(&(record.ipa, logical.generation))
                             .and_then(std::sync::Weak::upgrade)
-                        {
-                            native_owners.push(owner);
-                        }
+                    {
+                        native_owners.push(owner);
                     }
                     cursor = bound.min(end);
                     frames.push((pin, mapping));
