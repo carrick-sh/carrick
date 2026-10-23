@@ -5,6 +5,8 @@ mod native_service;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use native_service::NativeService;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use native_service::settle_native_cow;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn take_native_service(
     custody: &Arc<crate::trap::CarrierVmCustody>,
     cpu: carrick_guest_arch::CpuId,
@@ -72,6 +74,14 @@ impl<'a> RetainedAbiRegion<'a> {
 /// Runtime-owned handback venue for an already enrolled parent wait.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub trait NativeWaitChannelWake: std::fmt::Debug + Send + Sync {
+    fn complete_mm_wake(
+        &self,
+        zone: &carrick_sched_core::ZoneTables<carrick_el1_abi::Aarch64ParkedContext>,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
+    );
     fn wake(&self, mm: carrick_el1_abi::EntryMmKey, address: core::num::NonZeroU64) -> Option<u32>;
 }
 
@@ -209,6 +219,42 @@ fn service_terminal_operation(
     }) else {
         return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
     };
+    // Settle USED while the exact root still exists, then release unused pool
+    // records. Physical bytes remain with ForkStock until neutral reclamation.
+    let Some((_, zone)) = stopped_records(region, cpu) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    let Some(wake) = custody.native_wait_channel_wake.lock().clone() else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    let deliver = |zone: &carrick_sched_core::ZoneTables<carrick_el1_abi::Aarch64ParkedContext>,
+                   _: carrick_sched_core::Waker,
+                   effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+        '_,
+        carrick_el1_abi::Aarch64ParkedContext,
+    >| wake.complete_mm_wake(zone, effects);
+    let access = carrick_sched_core::spaces::notification::SpaceAccess::notified(
+        carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+            zone,
+            waker: carrick_sched_core::Waker::Host,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                &deliver,
+            ),
+        },
+    );
+    let Some(index) = zone.spaces.find(binding.mm.raw()) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    let Ok(exclusion) = access.try_exclude_editor(index, binding.mm.raw()) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    if let Some(pool) = carrick_el1_abi::cow_grant_pool_host() {
+        if settle_native_cow(custody, pool, exclusion.proof()).is_err() {
+            return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        }
+        pool.release_mm(exclusion.proof());
+    }
+    drop(exclusion);
     // SAFETY: the synchronous crossing retains the caller's aligned wire record.
     let retire = unsafe { &mut *pointer };
     if custody
@@ -1515,7 +1561,7 @@ pub(crate) fn service_native_fork_stock(
                         .owner
                         .child_custody(pending.loan.request.operation, execution.context.root)
                 {
-                    for row in rows {
+                    for row in &rows.inherited {
                         if let Some(source) = row.retained_host_backing() {
                             inherited.inherit(source);
                         }
@@ -1544,6 +1590,12 @@ pub(crate) fn service_native_fork_stock(
                             count,
                             inherited,
                         )
+                        .map(|inherited| {
+                            crate::fork_stock::NativeChildPhysical {
+                                inherited,
+                                ..Default::default()
+                            }
+                        })
                     },
                 );
                 if let Err(refusal) = &result {

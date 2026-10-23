@@ -633,7 +633,13 @@ pub(super) fn finish_native_service(
         carrick_kernel::el1_delegation::settle_host_work_boundary(kernel, true, doorbell);
         service.acknowledge_work()?
     } else {
-        service.refuse()?
+        service.supply(|zone, _waker, effects| {
+            carrick_sched_core::LockWait::complete_object_wake(
+                &carrick_kernel::el1_zone::HostLockWait,
+                zone,
+                effects,
+            );
+        })?
     };
     for target in effects.sgi_slots() {
         carrick_kernel::el1_zone::resched_slot(target);

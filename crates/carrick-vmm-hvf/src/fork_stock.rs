@@ -10,9 +10,49 @@ pub type PendingForkLoan = carrick_hal::fork_stock::PendingForkLoan<AsidGenerati
 use crate::trap::{CarrierVmCustody, El1FrameGrantLedger, El1FrameGrantMm};
 use carrick_hal::fork_stock::{ForkStock, ForkTableLedger};
 
+#[derive(Default)]
+pub(crate) struct NativeChildPhysical {
+    pub inherited: Vec<crate::trap::ForkPhysicalRetention>,
+    pub supplied: Option<
+        carrick_hal::physical_grants::NativePhysicalGrants<std::sync::Arc<NativeFrameBacking>>,
+    >,
+    pub rollback: std::sync::Arc<carrick_hal::physical_grants::PhysicalGrantRollback>,
+}
+impl core::fmt::Debug for NativeChildPhysical {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NativeChildPhysical")
+            .field("inherited", &self.inherited)
+            .field("supplied", &self.supplied)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Debug)]
+pub(crate) struct NativeFrameBacking {
+    pub carrier: std::sync::Weak<CarrierVmCustody>,
+    pub ipa: u64,
+    pub generation: u64,
+}
+impl Drop for NativeFrameBacking {
+    fn drop(&mut self) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(carrier) = self.carrier.upgrade() {
+            carrier
+                .native_frame_backings
+                .lock()
+                .remove(&(self.ipa, self.generation));
+            crate::trap::retire_global_frame_host_owner_if_generation_in(
+                &carrier,
+                self.ipa,
+                carrick_el1_abi::COW_GRANT_SIZE,
+                self.generation,
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ForkStockHostCustody {
-    pub(crate) owner: ForkStock<AsidAllocator, Vec<crate::trap::ForkPhysicalRetention>>,
+    pub(crate) owner: ForkStock<AsidAllocator, NativeChildPhysical>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     backing: Option<NativeForkBacking>,
     run_failure: carrick_core_abi::NativeRunFailureConsumer,

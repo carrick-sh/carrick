@@ -418,6 +418,12 @@ pub struct CarrierVmCustody {
     >,
     pub(crate) metadata_aperture: parking_lot::Mutex<crate::metadata_grant::HostApertureState>,
     pub fork_stock: parking_lot::Mutex<crate::fork_stock::ForkStockHostCustody>,
+    pub(crate) native_frame_backings: parking_lot::Mutex<
+        std::collections::BTreeMap<
+            (u64, u64),
+            std::sync::Weak<crate::fork_stock::NativeFrameBacking>,
+        >,
+    >,
     pub asids: carrick_hal::asid::AsidAllocator,
     pub(crate) state: parking_lot::Mutex<CarrierVmCustodyState>,
     pub(crate) structural_backings: parking_lot::Mutex<
@@ -632,6 +638,7 @@ impl CarrierVmCustody {
             metadata_aperture: parking_lot::Mutex::new(
                 crate::metadata_grant::HostApertureState::new(),
             ),
+            native_frame_backings: Default::default(),
             fork_stock: parking_lot::Mutex::new(
                 crate::fork_stock::ForkStockHostCustody::with_asids(
                     transfer_carrier,
@@ -4597,7 +4604,12 @@ mod carrier_vm_custody_tests {
                             &mut reserve,
                             |_| true,
                             |_| true,
-                            |_, _, _| Ok(vec![retained]),
+                            |_, _, _| {
+                                Ok(crate::fork_stock::NativeChildPhysical {
+                                    inherited: vec![retained],
+                                    ..Default::default()
+                                })
+                            },
                         )
                         .expect("reserve custody");
                     let mut commit =

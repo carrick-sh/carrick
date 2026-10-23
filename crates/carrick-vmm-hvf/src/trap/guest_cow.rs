@@ -235,7 +235,7 @@ pub(crate) fn require_guest_cow_settled(mm: u64, site: &'static str) {
 
 /// One replacement compound, stage-2 mapped and registered as a live global
 /// frame owner: its host pointer, IPA and owner generation.
-fn allocate_grant_compound(
+pub(crate) fn allocate_grant_compound(
     custody: &std::sync::Arc<CarrierVmCustody>,
     stage2_perms: applevisor::memory::MemPerms,
 ) -> Result<(*mut u8, u64, u64), TrapError> {
@@ -654,6 +654,11 @@ impl CowGrantSettlement for CarrierGuestCowSettlement {
         let Some(custody) = self.custody.upgrade() else {
             return;
         };
+        match crate::metadata_grant::settle_native_cow(&custody, pool, excluded) {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(error) => carrick_fatal!("hvpatch::guest_cow", "native COW settlement: {error}"),
+        }
         match custody.guest_cow_state(excluded.key()) {
             Ok(Some(state)) => {
                 settle_guest_cow_completions(&state, &custody, pool, excluded);

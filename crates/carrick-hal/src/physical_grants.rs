@@ -34,6 +34,7 @@ pub struct PhysicalFrameGrant {
 /// bound to the authority that issued it through rollback or publication.
 #[must_use = "retain rollback custody until the publication owner accepts these grants"]
 pub struct StagedPhysicalGrants {
+    owner: GuestFrameOwner,
     rollback: Arc<PhysicalGrantRollback>,
     authority: Arc<dyn FrameCowAuthority>,
     receipt: Option<UnpublishedFrameInventoryApply<dyn FrameCowAuthority>>,
@@ -138,6 +139,7 @@ impl StagedPhysicalGrants {
             UnpublishedFrameInventoryApply::apply(Arc::clone(&authority), reservation.commit(()))
                 .map_err(|error| fail(format!("initial inventory apply: {error}")))?;
         let mut staged = Self {
+            owner,
             rollback,
             authority,
             receipt: Some(receipt),
@@ -179,5 +181,116 @@ impl Drop for StagedPhysicalGrants {
         {
             self.rollback.retain(receipt);
         }
+    }
+}
+
+/// Physical publications retained by one native MM. The neutral fork owner
+/// drops this custody only after MM inventory retirement and slot absence.
+pub struct NativePhysicalGrants<R> {
+    owner: GuestFrameOwner,
+    grants: std::collections::BTreeMap<u64, NativeGrant<R>>,
+}
+struct NativeGrant<R> {
+    custody: PhysicalGrantCustody,
+    _retained: R,
+    published: Option<carrick_el1_abi::CowGrant>,
+}
+impl<R> core::fmt::Debug for NativePhysicalGrants<R> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NativePhysicalGrants")
+            .field("owner", &self.owner)
+            .field("grants", &self.grants.len())
+            .finish()
+    }
+}
+impl<R> NativePhysicalGrants<R> {
+    pub const REFILL_GRANTS: usize = 2;
+    pub fn new(owner: GuestFrameOwner) -> Self {
+        Self {
+            owner,
+            grants: Default::default(),
+        }
+    }
+    pub fn owner(&self) -> GuestFrameOwner {
+        self.owner
+    }
+    /// Retain the inventory receipt and backing before publishing READY. The
+    /// exclusion keeps the ring from observing a partly admitted batch.
+    pub fn publish_cow(
+        &mut self,
+        staged: StagedPhysicalGrants,
+        retained: R,
+        pool: &carrick_el1_abi::CowGrantPool,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+    ) -> Result<(), TrapError> {
+        let fail = || TrapError::Hypervisor("native physical grant admission mismatch".into());
+        if excluded.key() != self.owner.native_mm.raw().get()
+            || staged.owner != self.owner
+            || staged.grants.len() != 1
+            || staged.length.raw() != carrick_el1_abi::COW_GRANT_SIZE
+            || pool.ready(excluded.key()).count() >= Self::REFILL_GRANTS
+        {
+            drop(staged);
+            drop(retained);
+            return Err(fail());
+        }
+        let grant = staged.grants[0];
+        if self.grants.contains_key(&grant.gpa.raw()) {
+            drop(staged);
+            drop(retained);
+            return Err(fail());
+        }
+        let custody = staged.handoff()?;
+        let entry = self.grants.entry(grant.gpa.raw()).or_insert(NativeGrant {
+            custody,
+            _retained: retained,
+            published: None,
+        });
+        let published = pool
+            .publish(excluded.key(), grant.gpa.raw(), grant.identity)
+            .ok_or_else(fail)?;
+        entry.published = Some(published);
+        Ok(())
+    }
+    /// Settle exact USED receipts while the MM editor is excluded. Live
+    /// descriptor output is supplied by the ISA adapter; inventory identities,
+    /// bounded page work and once-only pool completion belong to this owner.
+    pub fn settle(
+        &mut self,
+        pool: &carrick_el1_abi::CowGrantPool,
+        excluded: &carrick_sched_core::ExcludedEditor<'_>,
+        mut output: impl FnMut(u64) -> Option<u64>,
+    ) -> Result<usize, TrapError> {
+        let fail = || TrapError::Hypervisor("native USED physical receipt mismatch".into());
+        if excluded.key() != self.owner.native_mm.raw().get() || pool.claimed_by(excluded) {
+            return Err(fail());
+        }
+        let mut count = 0;
+        for completion in pool.completions(excluded) {
+            if !completion.is_well_formed() {
+                return Err(fail());
+            }
+            let grant = completion.grant;
+            let entry = self.grants.get_mut(&grant.physical_ipa).ok_or_else(fail)?;
+            let identity = grant.backing;
+            if entry.published != Some(grant)
+                || !entry.custody.authority.mapping_is_live_exact_generation(
+                    crate::MappingId::from_kernel_allocation(identity.mapping_id),
+                    crate::FrameId::from_kernel_allocation(identity.frame_id),
+                    MappingGeneration::from_backend_counter(identity.owner_generation),
+                    carrick_guest_mem::Gpa::new(grant.physical_ipa),
+                    entry.custody.length,
+                )
+                || (0..completion.span_len).step_by(4096).any(|offset| {
+                    output(completion.span_va + offset) != Some(completion.new_ipa + offset)
+                })
+                || !pool.finish(excluded, &grant)
+            {
+                return Err(fail());
+            }
+            entry.published = None;
+            count += 1;
+        }
+        Ok(count)
     }
 }
