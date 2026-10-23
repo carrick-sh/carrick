@@ -8,6 +8,22 @@ use carrick_guest_arch::FrameGpa;
 use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
 use std::{num::NonZeroU64, sync::Arc};
 
+/// Failed unpublished rollback remains in carrier custody until the existing
+/// carrier observer reports the invariant failure. Destructors never decide
+/// terminal policy or discard the issuing authority on refusal.
+#[derive(Default)]
+pub struct PhysicalGrantRollback {
+    receipts: parking_lot::Mutex<Vec<UnpublishedFrameInventoryApply<dyn FrameCowAuthority>>>,
+}
+impl PhysicalGrantRollback {
+    pub fn failed(&self) -> bool {
+        !self.receipts.lock().is_empty()
+    }
+    pub fn retain(&self, receipt: UnpublishedFrameInventoryApply<dyn FrameCowAuthority>) {
+        self.receipts.lock().push(receipt);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PhysicalFrameGrant {
     pub gpa: FrameGpa,
@@ -18,6 +34,7 @@ pub struct PhysicalFrameGrant {
 /// bound to the authority that issued it through rollback or publication.
 #[must_use = "retain rollback custody until the publication owner accepts these grants"]
 pub struct StagedPhysicalGrants {
+    rollback: Arc<PhysicalGrantRollback>,
     authority: Arc<dyn FrameCowAuthority>,
     receipt: Option<UnpublishedFrameInventoryApply<dyn FrameCowAuthority>>,
     frames: Vec<(FrameGpa, BackingIdentity)>,
@@ -55,6 +72,7 @@ impl StagedPhysicalGrants {
         })
     }
     pub fn stage(
+        rollback: Arc<PhysicalGrantRollback>,
         source: Arc<dyn PhysicalFrameInventory>,
         gpas: impl IntoIterator<Item = FrameGpa>,
         table_grants: usize,
@@ -120,6 +138,7 @@ impl StagedPhysicalGrants {
             UnpublishedFrameInventoryApply::apply(Arc::clone(&authority), reservation.commit(()))
                 .map_err(|error| fail(format!("initial inventory apply: {error}")))?;
         let mut staged = Self {
+            rollback,
             authority,
             receipt: Some(receipt),
             frames: Vec::with_capacity(rows.len() - table_grants),
@@ -155,13 +174,10 @@ impl StagedPhysicalGrants {
 
 impl Drop for StagedPhysicalGrants {
     fn drop(&mut self) {
-        if let Some(receipt) = &mut self.receipt
-            && let Err(error) = receipt.rollback()
+        if let Some(mut receipt) = self.receipt.take()
+            && receipt.rollback().is_err()
         {
-            carrick_fatal::carrick_fatal!(
-                "hal::physical_grants",
-                "unexposed physical staging rollback failed: {error}"
-            );
+            self.rollback.retain(receipt);
         }
     }
 }
