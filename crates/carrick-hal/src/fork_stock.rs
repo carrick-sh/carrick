@@ -901,6 +901,16 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         .then_some(&child.physical)
     }
 
+    /// Physical access requires the committed root; this grants no new
+    /// semantic admission. Terminal settlement may consume an existing receipt.
+    pub fn child_physical_mut(&mut self, mm: ReservationMm, root: RootGpa) -> Option<&mut C> {
+        let child = self.children.get_mut(&MmKey::of(mm)?)?;
+        (child.root == root).then_some(&mut child.physical)
+    }
+    pub fn child_owner(&self, mm: ReservationMm) -> Option<carrick_el1_abi::El1MmHandle> {
+        Some(self.children.get(&MmKey::of(mm)?)?.owner)
+    }
+
     pub fn child_lifecycle(&self, mm: ReservationMm) -> Option<ForkLifecycleLoan> {
         Some(self.children.get(&MmKey::of(mm)?)?.lifecycle)
     }

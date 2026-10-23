@@ -62,7 +62,140 @@ impl NativeService {
         self.slot
     }
 
+    /// Supply exact-MM physical COW stock; the ring owns fault policy and retry.
+    pub fn supply(
+        self,
+        deliver: for<'z> fn(
+            &'z carrick_sched_core::ZoneTables<carrick_el1_abi::Aarch64ParkedContext>,
+            carrick_sched_core::Waker,
+            carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                'z,
+                carrick_el1_abi::Aarch64ParkedContext,
+            >,
+        ),
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        use carrick_sched_core::spaces::notification::{
+            SpaceAccess, SpaceReleaseVenue, SpaceWaitCause, SpaceWakeDelivery,
+        };
+        let Some(carrick_core_abi::service::ServiceFaultSupply::Cow(window)) = self.cow else {
+            return self.refuse();
+        };
+        let custody = Arc::clone(&self.custody);
+        let region = retained_abi_region(&custody).ok_or_else(stale)?;
+        let (_, zone) = stopped_records(
+            region,
+            carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
+        )
+        .ok_or_else(stale)?;
+        let handle = self.request().identity.birth.mm;
+        let entry = zone
+            .space_entry(core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(stale)?)
+            .ok_or_else(stale)?;
+        let source = entry
+            .notifications(handle.incarnation())
+            .map_err(|_| stale())?;
+        // Observe the exact editor producer before raising its gate/probing.
+        let revision = source.observe(SpaceWaitCause::Editor).revision();
+        let access = SpaceAccess::notified(SpaceReleaseVenue {
+            zone,
+            waker: carrick_sched_core::Waker::Host,
+            deliver: SpaceWakeDelivery::Function(deliver),
+        });
+        let index = zone.spaces.find(handle.mm().raw()).ok_or_else(stale)?;
+        let exclusion = match access.try_exclude_editor(index, handle.mm().raw()) {
+            Ok(exclusion) => exclusion,
+            Err(carrick_sched_core::spaces::notification::ExclusionRefusal::Busy) => {
+                // SAFETY: authenticated source above, sampled before the probe.
+                let wait = unsafe {
+                    carrick_el1_abi::PortalOwnerWait::from_owner(
+                        handle,
+                        carrick_el1_abi::PortalWaitCause::Editor,
+                        revision,
+                    )
+                };
+                return self.complete_wait(wait);
+            }
+            Err(_) => return self.refuse(),
+        };
+        let pool = carrick_el1_abi::cow_grant_pool_host().ok_or_else(stale)?;
+        let mut stock = custody.fork_stock.lock();
+        if stock.owner.child_owner(handle.mm()) != Some(handle)
+            || stock.owner.is_quarantined(handle.mm())
+        {
+            return self.refuse();
+        }
+        let root = stock.owner.child_root(handle.mm()).ok_or_else(stale)?;
+        let inventory = stock.inventory().ok_or_else(stale)?;
+        let physical = stock
+            .owner
+            .child_physical_mut(handle.mm(), root)
+            .ok_or_else(stale)?;
+        let owner = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_guest_arch::MmGeneration::new(
+                core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(stale)?,
+            ),
+            root_generation: carrick_guest_arch::ContextGeneration::new(handle.incarnation()),
+        };
+        let grants = physical
+            .supplied
+            .get_or_insert_with(|| carrick_hal::physical_grants::NativePhysicalGrants::new(owner));
+        if grants.owner() != owner || physical.rollback.failed() {
+            return Err(stale());
+        }
+        grants.settle(pool, exclusion.proof(), |va| {
+            native_output(&custody, root, va)
+        })?;
+        if pool.ready(handle.mm().raw()).next().is_none() {
+            for _ in 0..carrick_hal::physical_grants::NativePhysicalGrants::<
+                crate::fork_stock::NativeFrameBacking,
+            >::REFILL_GRANTS
+            {
+                let (_, ipa, generation) = crate::trap::allocate_grant_compound(
+                    &custody,
+                    applevisor::memory::MemPerms::ReadWrite,
+                )?;
+                let retained = Arc::new(crate::fork_stock::NativeFrameBacking {
+                    carrier: Arc::downgrade(&custody),
+                    ipa,
+                    generation,
+                });
+                custody
+                    .native_frame_backings
+                    .lock()
+                    .insert((ipa, generation), Arc::downgrade(&retained));
+                let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
+                    Arc::clone(&physical.rollback),
+                    Arc::clone(&inventory),
+                    [carrick_guest_arch::FrameGpa::new(ipa)],
+                    0,
+                    carrick_el1_abi::COW_GRANT_SIZE,
+                    core::num::NonZeroU64::new(generation).ok_or_else(stale)?,
+                    owner,
+                )?;
+                grants.publish_cow(staged, retained, pool, exclusion.proof())?;
+            }
+        }
+        let supplied = pool.ready(window.operation.mm.raw()).next().is_some();
+        drop(stock);
+        drop(exclusion);
+        drop(source);
+        self.complete(supplied)
+    }
+
+    fn complete_wait(
+        self,
+        wait: carrick_el1_abi::PortalOwnerWait,
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        self.finish(Some(wait), false)
+    }
     fn complete(self, supplied: bool) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        self.finish(None, supplied)
+    }
+    fn finish(
+        self,
+        wait: Option<carrick_el1_abi::PortalOwnerWait>,
+        supplied: bool,
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let region = retained_abi_region(&self.custody).ok_or_else(stale)?;
         let (_, zone) = stopped_records(
             region,
@@ -76,7 +209,11 @@ impl NativeService {
             .map_err(|_| stale())?;
         // Claim, cancel, and complete share this queue lock. WRITING is never
         // treated as a stale generation merely because another CPU is active.
-        self.ticket.complete(supplied).map_err(|_| stale())?;
+        if let Some(wait) = wait {
+            self.ticket.complete_wait(wait).map_err(|_| stale())?;
+        } else {
+            self.ticket.complete(supplied).map_err(|_| stale())?;
+        }
         let mut effects = carrick_sched_core::WakeEffects::default();
         queue
             .notify_object(self.slot, &mut effects)
@@ -191,4 +328,56 @@ pub(super) fn take(
         Err(ServiceError::Stale) => Ok(None),
         Err(_) => Err(stale()),
     }
+}
+
+// The stock lock retains the table arenas; exclusion prevents descriptor edits.
+fn native_output(
+    custody: &crate::trap::CarrierVmCustody,
+    root: carrick_guest_arch::RootGpa,
+    va: u64,
+) -> Option<u64> {
+    let mut table = root.address().raw();
+    for (level, index) in carrick_mmu_core::aarch64::indices(va)
+        .into_iter()
+        .enumerate()
+    {
+        let pointer = crate::fork_stock::ForkStockHostCustody::physical_ptr::<AtomicU64>(
+            custody,
+            carrick_guest_arch::FrameGpa::new(table + index as u64 * 8),
+        )
+        .ok()?;
+        // SAFETY: retained stock tables and exact owner exclusion, atomic word.
+        let word = unsafe { &*pointer }.load(Ordering::Acquire);
+        if level == 3 {
+            return (word != 0).then_some(word & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK);
+        }
+        if word & 3 != 3 {
+            return None;
+        }
+        table = word & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
+    }
+    None
+}
+
+pub(crate) fn settle_native_cow(
+    custody: &crate::trap::CarrierVmCustody,
+    pool: &carrick_el1_abi::CowGrantPool,
+    excluded: &carrick_sched_core::ExcludedEditor<'_>,
+) -> Result<Option<usize>, TrapError> {
+    let mm = carrick_el1_abi::ReservationMm::new(excluded.key()).ok_or_else(stale)?;
+    let mut stock = custody.fork_stock.lock();
+    let Some(root) = stock.owner.child_root(mm) else {
+        return Ok(None);
+    };
+    let physical = stock.owner.child_physical_mut(mm, root).ok_or_else(stale)?;
+    let Some(grants) = &mut physical.supplied else {
+        return if pool.has_completions_for(mm.raw()) {
+            Err(stale())
+        } else {
+            Ok(Some(0))
+        };
+    };
+    grants
+        .settle(pool, excluded, |va| native_output(custody, root, va))
+        .map(Some)
 }

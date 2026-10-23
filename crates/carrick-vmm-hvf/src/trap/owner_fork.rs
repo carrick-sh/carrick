@@ -26,6 +26,7 @@ impl ForkPhysicalCustody {
 pub struct ForkPhysicalRetention {
     selected: PortalForkCustody,
     _frames: Vec<(CarrierStage2Pin, Arc<GlobalFrameSharedMapping>)>,
+    _native_owners: Vec<Arc<crate::fork_stock::NativeFrameBacking>>,
     source: Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>>,
 }
 impl core::fmt::Debug for ForkPhysicalRetention {
@@ -131,6 +132,7 @@ impl ForkCustody for ForkPhysicalCustody {
             .map(|source| ForkPhysicalRetention {
                 selected,
                 _frames: Vec::new(),
+                _native_owners: Vec::new(),
                 source: Some(source),
             })),
             PortalForkCustody::Frame { ipa, len, .. } => {
@@ -139,6 +141,7 @@ impl ForkCustody for ForkPhysicalCustody {
                 };
                 let mut cursor = ipa;
                 let mut frames = Vec::new();
+                let mut native_owners = Vec::new();
                 while cursor < end {
                     let Some((pin, mapping, record)) = self.retain_extent(cursor, 1)? else {
                         return Ok(None);
@@ -146,12 +149,24 @@ impl ForkCustody for ForkPhysicalCustody {
                     let Some(bound) = record.ipa.checked_add(record.len as u64) else {
                         return Ok(None);
                     };
+                    if let Some(logical) = record.logical_owner {
+                        if let Some(owner) = self
+                            .custody
+                            .native_frame_backings
+                            .lock()
+                            .get(&(record.ipa, logical.generation))
+                            .and_then(std::sync::Weak::upgrade)
+                        {
+                            native_owners.push(owner);
+                        }
+                    }
                     cursor = bound.min(end);
                     frames.push((pin, mapping));
                 }
                 Ok(Some(ForkPhysicalRetention {
                     selected,
                     _frames: frames,
+                    _native_owners: native_owners,
                     source: None,
                 }))
             }
@@ -226,6 +241,7 @@ impl ForkCustody for ForkPhysicalCustody {
                 Ok(Some(ForkPhysicalRetention {
                     selected,
                     source: None,
+                    _native_owners: Vec::new(),
                     _frames: vec![
                         (source_pin, source_mapping),
                         (destination_pin, destination_mapping),

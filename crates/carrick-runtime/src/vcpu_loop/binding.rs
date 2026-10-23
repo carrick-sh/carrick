@@ -37,6 +37,20 @@ use super::*;
 struct TerminalNativeWaitWake;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_vmm_hvf::metadata_grant::NativeWaitChannelWake for TerminalNativeWaitWake {
+    fn complete_mm_wake(
+        &self,
+        zone: &carrick_sched_core::ZoneTables<carrick_el1_abi::Aarch64ParkedContext>,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
+    ) {
+        carrick_sched_core::LockWait::complete_object_wake(
+            &carrick_kernel::el1_zone::HostLockWait,
+            zone,
+            effects,
+        );
+    }
     fn wake(&self, mm: carrick_el1_abi::EntryMmKey, address: std::num::NonZeroU64) -> Option<u32> {
         carrick_kernel::el1_zone::wake_exit_wait_channel(mm, address)
     }

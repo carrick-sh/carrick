@@ -304,24 +304,24 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
     let exclusion = access
         .try_exclude_editor(access.find(identity.mm).unwrap(), identity.mm)
         .unwrap();
-    let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
-        std::sync::Arc::default(),
-        physical,
-        [FrameGpa::new(0xa0000000), FrameGpa::new(0xa0004000)],
-        0,
-        16384,
-        NonZeroU64::MIN,
-        physical_owner,
-    )
-    .unwrap();
-    assert_eq!(staged.grants().len(), 2, "bounded first refill");
-    // Move the whole batch into retained MM custody before the first READY.
-    // A later partial publication can never roll back an exposed inventory row.
-    let published_inventory = staged.handoff().unwrap();
-    for grant in &published_inventory.grants {
-        pool.publish(identity.mm, grant.gpa.raw(), grant.identity)
+    let mut physical_grants =
+        carrick_hal::physical_grants::NativePhysicalGrants::new(physical_owner);
+    for gpa in [0xa0000000, 0xa0004000] {
+        let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
+            std::sync::Arc::default(),
+            physical.clone(),
+            [FrameGpa::new(gpa)],
+            0,
+            16384,
+            NonZeroU64::MIN,
+            physical_owner,
+        )
+        .unwrap();
+        physical_grants
+            .publish_cow(staged, (), &pool, exclusion.proof())
             .unwrap();
     }
+    assert_eq!(pool.ready(identity.mm).count(), 2, "bounded first refill");
     drop(exclusion);
     {
         let queue = fixture
@@ -439,4 +439,36 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
     ));
     assert_eq!(frame.x[0], identity.tid);
     assert_eq!(counters.served[172].load(Ordering::Acquire), 1);
+    let exclusion = access
+        .try_exclude_editor(access.find(identity.mm).unwrap(), identity.mm)
+        .unwrap();
+    assert!(
+        physical_grants
+            .settle(&pool, exclusion.proof(), |_| None)
+            .is_err()
+    );
+    assert!(
+        pool.has_completions_for(identity.mm),
+        "failed authentication retains USED"
+    );
+    assert_eq!(
+        physical_grants
+            .settle(&pool, exclusion.proof(), |va| Some(
+                leaf(words, child_root, va) & AARCH64_ROOT_ADDRESS_MASK
+            ))
+            .unwrap(),
+        1
+    );
+    assert!(
+        !pool.has_completions_for(identity.mm),
+        "settled exactly once"
+    );
+    assert_eq!(
+        physical_grants
+            .settle(&pool, exclusion.proof(), |_| panic!(
+                "no repeated page work"
+            ))
+            .unwrap(),
+        0
+    );
 }
