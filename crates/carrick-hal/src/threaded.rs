@@ -3264,6 +3264,14 @@ impl HvpatchVerifiedChildKernelBinding {
     }
 }
 
+/// Completion authority retained by a host operation across an owner wait.
+/// Fatal transfer must not manufacture a mailbox request for an EL0 frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeOwnerWaitOrigin {
+    HostTrap,
+    HostEl0,
+}
+
 pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// A ring-owned signal binding must checkpoint delivery after a host
     /// forwarded completion and before the next EL0 instruction.
@@ -3276,7 +3284,10 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     }
     /// Transfer a proven fatal owner-wait obligation to native signal custody.
     /// This is not a syscall completion and must never return to user mode.
-    fn cancel_native_owner_wait(&mut self) -> Result<(), TrapError> {
+    fn cancel_native_owner_wait(
+        &mut self,
+        _origin: NativeOwnerWaitOrigin,
+    ) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
     /// Commit a host-loaded in-kernel home only after exact MM occupancy has

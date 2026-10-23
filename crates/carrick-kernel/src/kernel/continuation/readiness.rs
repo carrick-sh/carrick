@@ -525,15 +525,7 @@ impl SignalReadinessProbe {
             return Some(ContinuationEvent::Signal);
         }
         if self.family == ContinuationFamily::KillableOwnerZone {
-            return match owner_wait_cancellation(&context)? {
-                cancellation @ (OwnerWaitCancellation::NativeFatal
-                | OwnerWaitCancellation::GroupExit) => {
-                    Some(ContinuationEvent::OwnerCancelled(cancellation))
-                }
-                OwnerWaitCancellation::Carrier => {
-                    reserve_killable_wait_signal(&context).map(ContinuationEvent::ReservedSignal)
-                }
-            };
+            return owner_wait_cancellation(&context).map(ContinuationEvent::OwnerCancelled);
         }
         if context.thread().control_slot().native_signal_owner() {
             if self.family.is_kill_only_wait() {

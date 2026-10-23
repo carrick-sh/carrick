@@ -33,6 +33,25 @@ use carrick_guest_mem::{
 };
 
 use super::{DispatchError, DispatchOutcome};
+use crate::kernel::KernelContext;
+pub(crate) type OwnerEffect =
+    carrick_core::cancellation::ProcessEffect<crate::kernel::objects::ThreadLifecycleLease>;
+
+pub(crate) fn admit_effect(context: &KernelContext) -> Result<OwnerEffect, CopyoutRefusal> {
+    use crate::kernel::continuation::OwnerWaitCancellation;
+    use carrick_core::cancellation::ProcessCancellation;
+    OwnerEffect::acquire(context.lifecycle_page()).map_err(|cause| {
+        let reason = if context.thread().control_slot().native_signal_owner() {
+            OwnerWaitCancellation::NativeFatal
+        } else {
+            match cause {
+                ProcessCancellation::FatalSignal => OwnerWaitCancellation::Carrier,
+                ProcessCancellation::GroupExit => OwnerWaitCancellation::GroupExit,
+            }
+        };
+        CopyoutRefusal(Box::new(DispatchOutcome::OwnerCancelled(reason)))
+    })
+}
 
 /// The largest total output one copyout prepares: one owner portal permit.
 /// Fixed records are checked at compile time; variable outputs must clamp
@@ -187,11 +206,25 @@ enum Venue<'m, M: CurrentMmMemory> {
 pub(crate) struct PreparedCopyout<'m, M: CurrentMmMemory, const N: usize> {
     slots: [Option<UserSlot>; N],
     venue: Venue<'m, M>,
+    effect: Option<OwnerEffect>,
 }
 
 /// Prepare every output of one syscall. `None` slots (a NULL optional
 /// pointer) and zero-capacity slots write nothing.
-pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
+pub(crate) fn prepare<'m, M: CurrentMmMemory, const N: usize>(
+    context: &KernelContext,
+    memory: &'m mut M,
+    slots: [Option<UserSlot>; N],
+) -> Result<PreparedCopyout<'m, M, N>, CopyoutRefusal> {
+    let owner = memory.user_memory_venue() == UserMemoryVenue::Owner;
+    let mut output = prepare_memory(memory, slots)?;
+    if owner {
+        output.effect = Some(admit_effect(context)?);
+    }
+    Ok(output)
+}
+
+fn prepare_memory<M: CurrentMmMemory, const N: usize>(
     memory: &mut M,
     slots: [Option<UserSlot>; N],
 ) -> Result<PreparedCopyout<'_, M, N>, CopyoutRefusal> {
@@ -202,12 +235,14 @@ pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
     if memory.user_memory_venue() == UserMemoryVenue::Legacy {
         return Ok(PreparedCopyout {
             slots,
+            effect: None,
             venue: Venue::Legacy(memory),
         });
     }
     let Some(empty) = GuestWriteRange::new(GuestVa::new(0), 0) else {
         return Ok(PreparedCopyout {
             slots,
+            effect: None,
             venue: Venue::Owner {
                 permit: None,
                 valid_present: 0,
@@ -248,6 +283,7 @@ pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
     if count == 0 {
         return Ok(PreparedCopyout {
             slots,
+            effect: None,
             venue: Venue::Owner {
                 permit: None,
                 valid_present: 0,
@@ -272,6 +308,7 @@ pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
             Ok(permit) => {
                 return Ok(PreparedCopyout {
                     slots,
+                    effect: None,
                     venue: Venue::Owner {
                         permit: Some(permit),
                         valid_present: prefix,
@@ -290,6 +327,7 @@ pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
     }
     Ok(PreparedCopyout {
         slots,
+        effect: None,
         venue: Venue::Owner {
             permit: None,
             valid_present: 0,
@@ -306,6 +344,37 @@ impl<M: CurrentMmMemory, const N: usize> PreparedCopyout<'_, M, N> {
             .copied()
             .flatten()
             .map_or(0, UserSlot::capacity)
+    }
+
+    /// Capacity already secured for a consuming operation. A faulted owner
+    /// slot accepts no bytes: the source must not consume on a failed copy.
+    pub(crate) fn secured_capacity(&self, index: usize) -> usize {
+        match &self.venue {
+            Venue::Owner { valid_present, .. } => {
+                let present = self.slots.iter().take(index + 1).flatten().count();
+                if present > *valid_present {
+                    0
+                } else {
+                    self.capacity(index)
+                }
+            }
+            Venue::Legacy(_) => self.capacity(index),
+        }
+    }
+
+    /// Release an unused destination while retaining metadata-effect custody.
+    /// EOF and would-block never access the destination, even if it is invalid.
+    pub(crate) fn cancel_retaining(mut self) -> Option<OwnerEffect> {
+        self.effect.take()
+    }
+
+    /// Keep effect custody through metadata publication following copyout.
+    pub(crate) fn commit_retaining(
+        mut self,
+        outputs: [&[u8]; N],
+    ) -> (Result<(), CopyoutFault>, Option<OwnerEffect>) {
+        let effect = self.effect.take();
+        (self.commit(outputs), effect)
     }
 
     /// Write one prefix per slot; the output for an absent slot (a NULL
@@ -383,12 +452,13 @@ impl<T: KernelAbi> UserOut<T> {
         }
     }
 
-    pub(crate) fn prepare<M: CurrentMmMemory>(
+    pub(crate) fn prepare<'m, M: CurrentMmMemory>(
         self,
-        memory: &mut M,
-    ) -> Result<PreparedOut<'_, M, T>, CopyoutRefusal> {
+        context: &KernelContext,
+        memory: &'m mut M,
+    ) -> Result<PreparedOut<'m, M, T>, CopyoutRefusal> {
         Ok(PreparedOut {
-            inner: prepare(memory, [Some(self.slot)])?,
+            inner: prepare(context, memory, [Some(self.slot)])?,
             _record: core::marker::PhantomData,
         })
     }
@@ -418,12 +488,13 @@ impl<M: CurrentMmMemory, T: KernelAbi> PreparedOut<'_, M, T> {
 /// Prepare and commit one record from a handler with nothing irrevocable
 /// behind it: a refusal or fault is the whole syscall's answer.
 pub(crate) fn copyout_record<T: KernelAbi>(
+    context: &KernelContext,
     memory: &mut impl CurrentMmMemory,
     address: u64,
     value: &T,
     success: DispatchOutcome,
 ) -> DispatchOutcome {
-    match UserOut::<T>::new(address).prepare(memory) {
+    match UserOut::<T>::new(address).prepare(context, memory) {
         Ok(out) => out.commit_returning(value, success),
         Err(refusal) => refusal.into_outcome(),
     }
@@ -606,12 +677,18 @@ mod tests {
 
     const BASE: u64 = 0x1_0000;
 
+    fn context() -> crate::kernel::KernelContext {
+        crate::dispatch::SyscallDispatcher::new()
+            .capture_one_task_context()
+            .unwrap()
+    }
+
     #[test]
     fn owner_refusal_is_the_wait_outcome_and_writes_nothing() {
         let mut memory = OwnerRefusingMemory::new(BASE, 0x1000, 0xa5);
         let wait = memory.refuse_next();
         let refused = UserOut::<LinuxTimespec>::new(BASE + 0x10)
-            .prepare(&mut memory)
+            .prepare(&context(), &mut memory)
             .err()
             .expect("first prepare is refused");
         assert_eq!(
@@ -622,7 +699,7 @@ mod tests {
 
         let value = LinuxTimespec::new(5, 7);
         UserOut::new(BASE + 0x10)
-            .prepare(&mut memory)
+            .prepare(&context(), &mut memory)
             .unwrap()
             .commit(&value)
             .unwrap();
@@ -635,7 +712,9 @@ mod tests {
     #[test]
     fn owner_fault_surfaces_at_commit_like_legacy() {
         let mut memory = OwnerRefusingMemory::new(BASE, 0x1000, 0);
-        let Ok(prepared) = UserOut::<LinuxTimespec>::new(BASE + 0x2000).prepare(&mut memory) else {
+        let Ok(prepared) =
+            UserOut::<LinuxTimespec>::new(BASE + 0x2000).prepare(&context(), &mut memory)
+        else {
             panic!("an invalid pointer is not a retryable refusal");
         };
         assert_eq!(
@@ -648,6 +727,7 @@ mod tests {
     fn absent_slots_are_skipped_on_both_venues() {
         let mut owner = OwnerRefusingMemory::new(BASE, 0x1000, 0xa5);
         prepare(
+            &context(),
             &mut owner,
             [UserSlot::optional(0, 4), UserSlot::optional(BASE, 4)],
         )
@@ -658,6 +738,7 @@ mod tests {
 
         let mut legacy = LinearMemory::new(BASE, vec![0xa5; 0x1000]);
         let prepared = prepare(
+            &context(),
             &mut legacy,
             [UserSlot::optional(BASE, 4), UserSlot::optional(0, 4)],
         )
@@ -671,7 +752,7 @@ mod tests {
     fn legacy_fault_surfaces_at_commit_as_before() {
         let mut legacy = LinearMemory::new(BASE, vec![0; 0x100]);
         let prepared = UserOut::<LinuxTimespec>::new(BASE + 0x1000)
-            .prepare(&mut legacy)
+            .prepare(&context(), &mut legacy)
             .expect("legacy preparation is free");
         assert_eq!(
             prepared.commit(&LinuxTimespec::new(1, 1)),
@@ -684,6 +765,7 @@ mod tests {
         let mut owner = OwnerRefusingMemory::new(BASE, 0x1000, 0xa5);
         let _wait = owner.refuse_next();
         prepare(
+            &context(),
             &mut owner,
             [UserSlot::optional(0, 8), Some(UserSlot::new(BASE, 0))],
         )
@@ -700,6 +782,7 @@ mod tests {
     fn later_invalid_slot_commits_valid_prefix_on_both_venues() {
         let mut owner = OwnerRefusingMemory::new(BASE, 0x1000, 0xa5);
         let prepared = prepare(
+            &context(),
             &mut owner,
             [
                 Some(UserSlot::new(BASE + 0x10, 4)),
@@ -716,6 +799,7 @@ mod tests {
 
         let mut legacy = LinearMemory::new(BASE, vec![0xa5; 0x1000]);
         let prepared = prepare(
+            &context(),
             &mut legacy,
             [
                 Some(UserSlot::new(BASE + 0x10, 4)),

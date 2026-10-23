@@ -70,6 +70,9 @@ use carrick_kernel::run_result::{RunResult, RuntimeError};
 pub mod continuation;
 pub mod executor;
 mod fd_ceiling;
+mod owner_wait;
+#[cfg(all(test, feature = "loom"))]
+mod owner_wait_loom;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod reservations;
 #[cfg(all(test, feature = "loom"))]
@@ -975,6 +978,10 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// An IPC operation this boundary's handback left waiting: the syscall
     /// service parks the thread on its object queue ([`zone`]).
     pub(super) pending_ipc_park: Option<zone::IpcPark>,
+    pub(super) pending_ipc_owner:
+        Option<carrick_kernel::kernel::continuation::ipc::RetainedIpcOperation>,
+    /// A resumed in-zone IPC call returns at EL0, without a host trap frame.
+    pub(super) ipc_user_return: Option<SyscallRequest>,
     #[cfg(test)]
     pub(in crate::vcpu_loop) exec_terminal_context_failpoint:
         Option<exec::ExecTerminalContextFailpoint>,
@@ -1090,6 +1097,8 @@ where
             external_signals: signal_ingress_producer::HostSignalIngressProducer::new(),
             zone_mm: None,
             pending_ipc_park: None,
+            pending_ipc_owner: None,
+            ipc_user_return: None,
             #[cfg(test)]
             exec_terminal_context_failpoint: None,
             #[cfg(test)]
@@ -1629,6 +1638,10 @@ where
                 &mut request,
             )? {
                 zone::IpcHandbackRoute::Complete(outcome) => ipc_prepared = Some(outcome),
+                zone::IpcHandbackRoute::OwnerMemory { pending, outcome } => {
+                    self.pending_ipc_owner = Some(pending);
+                    ipc_prepared = Some(outcome);
+                }
                 zone::IpcHandbackRoute::Restart => {}
                 zone::IpcHandbackRoute::Park(park) => {
                     self.pending_ipc_park = Some(park);
@@ -1842,6 +1855,10 @@ where
             }
             binding::OwnedSyscallResume::PreparedWrite(pending) => {
                 self.resume_write_copy_in(kernel, engine, pending, host_wait)
+            }
+            binding::OwnedSyscallResume::Sleep(pending) => Ok(pending.resume(engine)),
+            binding::OwnedSyscallResume::Ipc(pending) => {
+                self.resume_ipc_copyout(kernel, engine, pending)
             }
         }
     }
@@ -2339,6 +2356,18 @@ where
         kernel: &KernelState,
         value: i64,
     ) -> Result<i64, RuntimeError> {
+        if self.ipc_user_return.take().is_some() {
+            // This operation was loaded at its original SVC from an IPC
+            // wait record, rather than forwarded through an EL1 trap frame.
+            let pc = engine.current_pc()?;
+            engine
+                .set_reg(carrick_hal::Reg::X(0), value as u64)
+                .map_err(|error| RuntimeError::Configuration(format!("IPC return x0: {error}")))?;
+            engine
+                .set_reg(carrick_hal::Reg::Pc, pc.wrapping_add(4))
+                .map_err(|error| RuntimeError::Configuration(format!("IPC return pc: {error}")))?;
+            return Ok(value);
+        }
         if !matches!(
             self.syscall_completion,
             SyscallCompletionOwnership::Guest(_)
@@ -2379,6 +2408,43 @@ where
         errno: LinuxErrno,
     ) -> Result<i64, RuntimeError> {
         self.complete_returned(engine, kernel, errno.guest_retval())
+    }
+
+    pub(super) fn owner_wait_origin(
+        &self,
+    ) -> Result<carrick_hal::threaded::NativeOwnerWaitOrigin, RuntimeError> {
+        use carrick_hal::threaded::NativeOwnerWaitOrigin;
+        if self.ipc_user_return.is_some() {
+            if !self.syscall_completion.is_idle() {
+                return Err(RuntimeError::Configuration(
+                    "EL0 owner wait has conflicting guest completion ownership".into(),
+                ));
+            }
+            Ok(NativeOwnerWaitOrigin::HostEl0)
+        } else {
+            self.syscall_completion
+                .guest("trap owner wait lost guest completion ownership")?;
+            Ok(NativeOwnerWaitOrigin::HostTrap)
+        }
+    }
+
+    pub(super) fn retire_owner_wait(
+        &mut self,
+        origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
+    ) -> Result<(), RuntimeError> {
+        if self.owner_wait_origin()? != origin {
+            return Err(RuntimeError::Configuration(
+                "owner cancellation changed completion origin".into(),
+            ));
+        }
+        match origin {
+            carrick_hal::threaded::NativeOwnerWaitOrigin::HostTrap => self.retire_syscall(),
+            carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0 => {
+                self.ipc_user_return = None;
+                self.owner_read_progress = 0;
+                Ok(())
+            }
+        }
     }
 
     pub(super) fn retire_syscall(&mut self) -> Result<(), RuntimeError> {
@@ -2616,6 +2682,11 @@ mod cow_refault_watch_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../carrick-vmm-hvf/src/trap/code_content.rs"]
+mod code_content_test;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -3375,6 +3446,7 @@ pub(crate) mod tests {
         pub(crate) native_owner: Option<Arc<carrick_el1_linux::native_process_runtime::host_test_support::NativeOwnerSignalFixture>>,
         pub(crate) native_owner_cancellations: usize,
         pub(crate) completed_syscalls: Vec<i64>,
+        pub(crate) written_registers: Vec<(carrick_hal::Reg, u64)>,
         pub(crate) completion_events: Option<Arc<Mutex<Vec<&'static str>>>>,
         pub(crate) execve_installs: usize,
         pub(crate) exec_inventory_arms: usize,
@@ -3393,6 +3465,7 @@ pub(crate) mod tests {
         pub(crate) fail_execve_into: Option<String>,
         pub(crate) terminal_continuation_discards: usize,
         pub(crate) mailbox_slot: Option<usize>,
+        pub(crate) copyout_prepare: Option<Box<dyn FnMut() -> Option<carrick_guest_mem::OwnedMemoryWait> + Send>>,
         pub(crate) prepare_dependency: Option<carrick_guest_mem::OwnedMemoryWait>,
         pub(crate) prepared_write_context: Option<carrick_kernel::kernel::KernelContext>,
         pub(crate) prepared_cancels: usize,
@@ -3454,7 +3527,10 @@ pub(crate) mod tests {
 
     impl carrick_guest_mem::GuestMemory for CrashCaptureTestEngine {
         fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
-            if self.prepare_dependency.is_some() || self.copyout_owner_probe.is_some() {
+            if self.prepare_dependency.is_some()
+                || self.copyout_owner_probe.is_some()
+                || self.copyout_prepare.is_some()
+            {
                 carrick_guest_mem::UserMemoryVenue::Owner
             } else {
                 carrick_guest_mem::UserMemoryVenue::Legacy
@@ -3467,6 +3543,24 @@ pub(crate) mod tests {
             Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
             carrick_guest_mem::MemoryPrepareError,
         > {
+            if let Some(wait) = &self.prepare_dependency
+                && !wait.0.is_ready()
+            {
+                return Err(carrick_guest_mem::MemoryPrepareError::Physical(
+                    wait.clone(),
+                ));
+            }
+            if let Some(prepare) = &mut self.copyout_prepare {
+                if let Some(wait) = prepare() {
+                    return Err(carrick_guest_mem::MemoryPrepareError::Physical(wait));
+                }
+                assert_eq!(ranges.len(), 1);
+                return Ok(Box::new(TestPreparedCopyout {
+                    address: ranges[0].address().raw(),
+                    engine: self,
+                    committed: false,
+                }));
+            }
             if let Some(probe) = self.copyout_owner_probe {
                 if let Some(wait) = probe.wait_if_busy() {
                     return Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(wait));
@@ -3498,6 +3592,18 @@ pub(crate) mod tests {
             address: u64,
             length: usize,
         ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            if let Some(probe) = self.copyout_owner_probe
+                && let Some(wait) = probe.wait_if_busy()
+            {
+                return Err(carrick_guest_mem::MemoryError::ReadSuspended(Box::new(
+                    carrick_guest_mem::MemoryReadSuspension {
+                        wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
+                        continuation: carrick_guest_mem::OwnedReadContinuation::new((
+                            address, length,
+                        )),
+                    },
+                )));
+            }
             if self.fail_read_at == Some(address) {
                 return Err(carrick_guest_mem::MemoryError::OutOfBounds { address, length });
             }
@@ -3510,6 +3616,14 @@ pub(crate) mod tests {
                 .filter(|bytes| bytes.len() == length)
                 .cloned()
                 .unwrap_or_else(|| vec![0; length]))
+        }
+
+        fn resume_read(
+            &self,
+            continuation: carrick_guest_mem::OwnedReadContinuation,
+        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+            let (address, length) = continuation.take::<(u64, usize)>().unwrap();
+            self.read_bytes_raw(address, length)
         }
 
         fn write_bytes_raw(
@@ -3536,9 +3650,10 @@ pub(crate) mod tests {
 
         fn set_reg(
             &mut self,
-            _register: carrick_hal::Reg,
-            _value: u64,
+            register: carrick_hal::Reg,
+            value: u64,
         ) -> Result<(), carrick_hal::OsError> {
+            self.written_registers.push((register, value));
             Ok(())
         }
 
@@ -3585,7 +3700,10 @@ pub(crate) mod tests {
         }
 
         fn current_pc(&self) -> Result<u64, TrapError> {
-            Ok(0)
+            Ok(match &self.snapshot_cpu {
+                Some(carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu)) => cpu.pc,
+                _ => 0,
+            })
         }
 
         fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
@@ -3677,7 +3795,19 @@ pub(crate) mod tests {
     }
 
     impl ThreadedEngine for CrashCaptureTestEngine {
-        fn cancel_native_owner_wait(&mut self) -> Result<(), TrapError> {
+        fn cancel_native_owner_wait(
+            &mut self,
+            origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
+        ) -> Result<(), TrapError> {
+            if let Some(carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu)) = &self.snapshot_cpu {
+                assert_eq!(
+                    cpu.syscall_continuation.is_some(),
+                    origin == carrick_hal::threaded::NativeOwnerWaitOrigin::HostTrap
+                );
+                if origin == carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0 {
+                    assert_eq!(cpu.pstate & 0xf, 0);
+                }
+            }
             self.native_owner
                 .as_ref()
                 .expect("real native signal owner")
@@ -3915,6 +4045,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn serial_host_carrier_ipc_owner_wait_cancellation_from_el0() {
+        exercise_owner_wait_schedule_at(
+            carrick_abi::syscall::nr::READ,
+            Some(carrick_abi::LINUX_SIGKILL),
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn serial_host_carrier_ipc_physical_owner_wait_cancellation_from_el0() {
+        exercise_owner_wait_schedule_at(
+            carrick_abi::syscall::nr::READ,
+            Some(carrick_abi::LINUX_SIGKILL),
+            false,
+            false,
+            true,
+        );
+    }
+
+    #[test]
+    fn serial_host_native_ipc_owner_wait_cancellation_from_el0() {
+        exercise_owner_wait_schedule_at(
+            carrick_abi::syscall::nr::READ,
+            Some(carrick_abi::LINUX_SIGKILL),
+            true,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn serial_host_native_ipc_physical_owner_wait_cancellation_from_el0() {
+        exercise_owner_wait_schedule_at(
+            carrick_abi::syscall::nr::READ,
+            Some(carrick_abi::LINUX_SIGKILL),
+            true,
+            false,
+            true,
+        );
+    }
+
+    #[test]
     fn serial_host_native_owner_wait_defers_stop_until_fstat_owner_release() {
         exercise_owner_wait(
             carrick_abi::syscall::nr::FSTAT,
@@ -4120,6 +4294,43 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn serial_host_sleep_copyin_wait_preserves_handled_signal_until_completion() {
+        for nr in [
+            carrick_abi::syscall::nr::NANOSLEEP,
+            carrick_abi::syscall::nr::CLOCK_NANOSLEEP,
+        ] {
+            exercise_owner_wait(nr, Some(carrick_abi::LINUX_SIGUSR1), false);
+        }
+    }
+
+    #[test]
+    fn serial_host_sleep_copyin_wait_remains_killable() {
+        exercise_owner_wait(
+            carrick_abi::syscall::nr::NANOSLEEP,
+            Some(carrick_abi::LINUX_SIGKILL),
+            false,
+        );
+    }
+
+    #[test]
+    fn serial_host_ipc_copyout_wait_resumes_without_losing_bytes() {
+        exercise_owner_wait(
+            carrick_abi::syscall::nr::READ,
+            Some(carrick_abi::LINUX_SIGUSR1),
+            false,
+        );
+    }
+
+    #[test]
+    fn serial_host_ipc_copyout_wait_cancellation_releases_its_pin() {
+        exercise_owner_wait(
+            carrick_abi::syscall::nr::READ,
+            Some(carrick_abi::LINUX_SIGKILL),
+            false,
+        );
+    }
+
     fn exercise_owner_wait(nr: carrick_abi::CanonicalNr, signum: Option<i32>, native: bool) {
         exercise_owner_wait_schedule(nr, signum, native, false);
     }
@@ -4130,6 +4341,29 @@ pub(crate) mod tests {
         native: bool,
         release_wins: bool,
     ) {
+        exercise_owner_wait_schedule_at(nr, signum, native, release_wins, false);
+    }
+
+    fn exercise_owner_wait_schedule_at(
+        nr: carrick_abi::CanonicalNr,
+        signum: Option<i32>,
+        native: bool,
+        release_wins: bool,
+        physical: bool,
+    ) {
+        #[derive(Debug)]
+        struct UnreadyBacking;
+        impl carrick_guest_mem::PhysicalMemoryWait for UnreadyBacking {
+            fn is_ready(&self) -> bool {
+                false
+            }
+            fn enroll(
+                &self,
+                _: Arc<dyn Fn() + Send + Sync>,
+            ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+                (Box::new(()), false)
+            }
+        }
         use carrick_abi::{LinuxCloneFlags, syscall::nr};
         use carrick_el1_linux::mm_portal::{
             MmPortal,
@@ -4139,6 +4373,8 @@ pub(crate) mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
+        let sleep = nr == nr::NANOSLEEP || nr == nr::CLOCK_NANOSLEEP;
+        let ipc_read = nr == nr::READ;
         let (process, _) = crate::hvpatch::process_context_for_tests(71_102);
         let dispatcher = SyscallDispatcher::new();
         dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
@@ -4260,9 +4496,12 @@ pub(crate) mod tests {
             unreachable!()
         };
         Arc::make_mut(cpu).asid_generation = process.asid_generation();
-        let scheduler = Arc::new(carrick_kernel::kernel::Scheduler::new(Arc::clone(
-            root.kernel(),
-        )));
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .unwrap()
+            .continuation_services(root.kernel())
+            .0;
         let bindings = Arc::new(executor::TaskBindingDirectory::<
             crate::vcpu_loop::continuation::HvpatchTaskBinding,
         >::default());
@@ -4324,7 +4563,11 @@ pub(crate) mod tests {
         let frame = carrick_hal::RawSyscall {
             current_guest_sp: None,
             number: nr,
-            args: if nr == nr::PIPE2 {
+            args: if nr == nr::NANOSLEEP {
+                [0x71_1000, 0x71_1020, 0, 0, 0, 0]
+            } else if nr == nr::CLOCK_NANOSLEEP {
+                [1, 0, 0x71_1000, 0x71_1020, 0, 0]
+            } else if nr == nr::PIPE2 {
                 [0x71_1020, 0, 0, 0, 0, 0]
             } else if nr == nr::FSTAT {
                 [0, 0x71_1020, 0, 0, 0, 0]
@@ -4334,6 +4577,56 @@ pub(crate) mod tests {
             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
             native_number: carrick_abi::NativeNr(nr.raw()),
         };
+
+        let ipc = ipc_read.then(|| {
+            use carrick_el1_abi::ipc::fd::{AccessMode, Description, Fd, StatusFlags};
+            use carrick_el1_abi::ipc::{
+                End, IpcBacking, IpcHandback, IpcMmKey, IpcOpKind, IpcOperation, IpcUserVa,
+                WriteProgress,
+            };
+            use carrick_kernel::kernel::continuation::ipc::HostIpcWait;
+            let owner = root.kernel().ipc().unwrap();
+            let object = owner.create_pipe(65536).unwrap();
+            let region = owner.region();
+            let pin = region
+                .fd(HostIpcWait)
+                .create_pinned(Description::new(
+                    IpcBacking::Pipe {
+                        object,
+                        end: End::Reader,
+                    }
+                    .encode(),
+                    AccessMode::ReadOnly,
+                    StatusFlags::default(),
+                ))
+                .unwrap();
+            let table = owner.create_table(1024, 64).unwrap();
+            region
+                .fd(HostIpcWait)
+                .install_pin(table, Fd(3), &pin, false)
+                .unwrap();
+            {
+                let mut guard = region.lock(object, &HostIpcWait).unwrap();
+                guard.provide_ring_from_stock().unwrap();
+                assert_eq!(guard.pipe().unwrap().try_write(b"retain").result, Ok(6));
+            }
+            let token = region
+                .begin_operation(IpcOperation {
+                    kind: IpcOpKind::PipeRead,
+                    pin: pin.into_raw(),
+                    object: object.to_raw(),
+                    mm: IpcMmKey(mm.raw()),
+                    buf: IpcUserVa(0x71_1020),
+                    progress: WriteProgress::new(6),
+                    orig_x0: 3,
+                    nr: 63,
+                    handback: IpcHandback::Continue,
+                    ..IpcOperation::EMPTY
+                })
+                .unwrap()
+                .into_raw();
+            (owner, object, table, token)
+        });
 
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -4404,14 +4697,64 @@ pub(crate) mod tests {
                         wait,
                         zone: zone as *const _ as usize,
                     });
-                    let first = state
-                        .service_threaded_syscall(&kernel, &mut engine, frame, None)
+                    if physical {
+                        engine.prepare_dependency =
+                            Some(carrick_guest_mem::OwnedMemoryWait(Arc::new(UnreadyBacking)));
+                    }
+                    let (first, resume) = if let Some((owner, object, _, raw)) = &ipc {
+                        use carrick_kernel::kernel::continuation::ipc as host_ipc;
+                        let request = SyscallRequest::new(
+                            63,
+                            carrick_kernel::compat::SyscallArgs::from([3, 0x71_1020, 6, 0, 0, 0]),
+                        );
+                        state.ipc_user_return = Some(request);
+                        state.service_kernel_context = Some(root.retain_exact());
+                        let outcome = host_ipc::complete_handback(
+                            &root,
+                            &owner.region(),
+                            carrick_el1_abi::ipc::IpcOpToken::from_raw(*raw),
+                            carrick_el1_abi::ipc::IpcMmKey(mm.raw()),
+                            &mut engine,
+                            None,
+                            &host_ipc::ZoneHostServices::new(root.kernel()).unwrap(),
+                        )
                         .unwrap();
-                    assert_eq!(
-                        first,
-                        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
-                        "the production service must park on the sibling's editor, never return EFAULT",
-                    );
+                        assert_eq!(
+                            owner
+                                .region()
+                                .lock(*object, &host_ipc::HostIpcWait)
+                                .unwrap()
+                                .pipe()
+                                .unwrap()
+                                .unread_bytes(),
+                            6
+                        );
+                        let zone::IpcHandbackRoute::OwnerMemory { pending, outcome } =
+                            zone::ipc_route(&kernel.dispatcher, &root, this_tid, outcome, None)
+                                .unwrap()
+                        else {
+                            panic!("read must retain its exact operation on refusal");
+                        };
+                        (outcome, binding::OwnedSyscallResume::Ipc(pending))
+                    } else {
+                        let first = state
+                            .service_threaded_syscall(&kernel, &mut engine, frame, None)
+                            .unwrap();
+                        let (first, resume) = binding::owner_copyin_route(first);
+                        (
+                            first,
+                            resume.unwrap_or(binding::OwnedSyscallResume::CopyoutRedispatch),
+                        )
+                    };
+                    if physical {
+                        assert!(matches!(first, DispatchOutcome::OwnerPhysicalWait { .. }));
+                    } else {
+                        assert_eq!(
+                            first,
+                            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                            "the production service must park on the sibling's editor, never return EFAULT",
+                        );
+                    }
                     assert_eq!(engine.prepared_commits, 0);
                     assert_eq!(root.resources().files().slot_count(), 0);
 
@@ -4442,6 +4785,15 @@ pub(crate) mod tests {
                             resume_x16: 0x1616,
                             resume_x17: 0x1717,
                         });
+                    if ipc_read {
+                        assert!(
+                            state.syscall_completion.is_idle(),
+                            "IPC read has no guest syscall completion"
+                        );
+                        cpu.syscall_continuation = None;
+                        cpu.pc = 0x4000;
+                        cpu.pstate = 0;
+                    }
                     engine.exec_support = true;
                     engine.snapshot_cpu = Some(snapshot);
                     let mut job = suffix_failure_test_job(
@@ -4487,33 +4839,50 @@ pub(crate) mod tests {
                         binding: Some(&binding),
                         cow_invalidation_observer: None,
                     };
-                    let parked = job
-                        .owner_memory_park(
-                            &mut engine,
-                            &mut control,
-                            frame,
-                            wait,
-                            binding::OwnedSyscallResume::CopyoutRedispatch,
-                        )
-                        .unwrap();
-                    let executor::ExecutorExit::BlockedContinuation {
-                        continuation,
-                        vfork_activation: None,
-                    } = parked
-                    else {
-                        panic!("owner wait did not return its production continuation");
-                    };
                     let wait_service =
                         carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::clone(
                             &scheduler,
                         ));
-                    let mut wait_registration = wait_service.prepare_registration(&continuation);
-                    wait_service.enroll(&mut wait_registration).unwrap();
-                    let lease = submission.take_execution_lease().unwrap();
-                    running.restore_lease(lease).unwrap();
-                    scheduler
-                        .settle_blocked_continuation(running, *continuation, wait_registration)
-                        .unwrap();
+                    if physical {
+                        let binding::OwnedSyscallResume::Ipc(pending) = resume else {
+                            panic!("retained pipe read")
+                        };
+                        job.state.pending_ipc_owner = Some(pending);
+                        assert!(matches!(
+                            job.route_outcome(&mut engine, &mut control, frame, first)
+                                .unwrap(),
+                            executor::ExecutorExit::Blocked(_)
+                        ));
+                        running
+                            .restore_lease(submission.take_execution_lease().unwrap())
+                            .unwrap();
+                        scheduler
+                            .settle_blocked(
+                                running,
+                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                            )
+                            .unwrap();
+                    } else {
+                        let parked = job
+                            .owner_memory_park(&mut engine, &mut control, frame, wait, resume)
+                            .unwrap();
+                        let executor::ExecutorExit::BlockedContinuation {
+                            continuation,
+                            vfork_activation: None,
+                        } = parked
+                        else {
+                            panic!("owner wait did not return its production continuation");
+                        };
+                        let mut wait_registration =
+                            wait_service.prepare_registration(&continuation);
+                        wait_service.enroll(&mut wait_registration).unwrap();
+                        running
+                            .restore_lease(submission.take_execution_lease().unwrap())
+                            .unwrap();
+                        scheduler
+                            .settle_blocked_continuation(running, *continuation, wait_registration)
+                            .unwrap();
+                    }
 
                     if release_wins {
                         release_tx.send(()).unwrap();
@@ -4615,10 +4984,6 @@ pub(crate) mod tests {
                         peer.join().unwrap();
                     }
                     carrick_kernel::el1_zone::hand_back_completions();
-                    let deadline = std::time::Instant::now() + Duration::from_millis(200);
-                    while scheduler.queued_len() == 0 && std::time::Instant::now() < deadline {
-                        std::thread::yield_now();
-                    }
                     assert_ne!(
                         scheduler.queued_len(),
                         0,
@@ -4629,6 +4994,22 @@ pub(crate) mod tests {
                         .try_take(&registration)
                         .unwrap()
                         .expect("owner wake must reach the registered host executor");
+                    if !physical {
+                        let saved = binding
+                            .take_zone_save()
+                            .expect("owner park saves residency");
+                        let mut residency = executor::residency::TaskCpuResidency::Zone {
+                            base: saved.base,
+                            record: saved.record,
+                            origin: saved.origin,
+                        };
+                        engine.snapshot_cpu = Some(
+                            residency
+                                .materialize_with(|_, _| panic!("zone save owns the CPU state"))
+                                .expect("the real executor must reload the owner-wait state")
+                                .clone(),
+                        );
+                    }
                     let lease = resumed.take_lease();
                     job.state.guest_execution = Some(
                         kernel
@@ -4654,66 +5035,34 @@ pub(crate) mod tests {
                         &mut resumed_submission,
                     );
                     resumed_control.binding = Some(&binding);
-                    let mut completed = job
-                        .resume_owner_zone(
+                    let completed = if physical {
+                        job.poll_with_engine(&mut engine, &mut resumed_control)
+                            .unwrap()
+                    } else {
+                        let HvpatchProductionPhase::ResumeOwnerZone { resume, origin, .. } =
+                            std::mem::replace(&mut job.phase, HvpatchProductionPhase::Resident)
+                        else {
+                            panic!("owner park lost its retained syscall");
+                        };
+                        job.resume_owner_zone(
                             &mut engine,
                             &mut resumed_control,
                             frame,
-                            binding::OwnedSyscallResume::CopyoutRedispatch,
+                            resume,
+                            origin,
                         )
-                        .unwrap();
+                        .unwrap()
+                    };
                     if release_wins {
-                        let executor::ExecutorExit::BlockedContinuation {
-                            continuation,
-                            vfork_activation: None,
-                        } = completed
-                        else {
-                            panic!(
-                                "renewed editor contention must return a new continuation: {completed:?}"
-                            );
-                        };
-                        let mut renewal = wait_service.prepare_registration(&continuation);
-                        wait_service.enroll(&mut renewal).unwrap();
-                        let lease = resumed_submission.take_execution_lease().unwrap();
-                        resumed.restore_lease(lease).unwrap();
-                        scheduler
-                            .settle_blocked_continuation(resumed, *continuation, renewal)
-                            .unwrap();
-                        assert_eq!(
-                            scheduler.queued_len(),
-                            1,
-                            "settled native SIGKILL must cancel renewed contention without another owner release"
+                        assert!(
+                            matches!(completed, executor::ExecutorExit::Syscall),
+                            "fatal cancellation after Ready must settle before re-preparation"
                         );
-                        resumed = scheduler.try_take(&registration).unwrap().unwrap();
-                        resumed_submission.authority =
-                            executor::ExecutionLeaseAuthoritySlot::new(Some(resumed.take_lease()));
-                        job.state.guest_execution = Some(
-                            kernel
-                                .dispatcher
-                                .enter_mm_executor_for_thread(
-                                    Some(Arc::clone(root.thread())),
-                                    Arc::clone(&job.state.kicker),
-                                    job.state.this_tid,
-                                    test_execution_slot(),
-                                )
-                                .unwrap(),
-                        );
-                        let mut resumed_control = executor::HvpatchQuantumControl::for_test(
-                            &need_resched,
-                            &mut resumed_submission,
-                        );
-                        resumed_control.binding = Some(&binding);
-                        completed = job
-                            .resume_owner_zone(
-                                &mut engine,
-                                &mut resumed_control,
-                                frame,
-                                binding::OwnedSyscallResume::CopyoutRedispatch,
-                            )
-                            .unwrap();
                     }
                     if killing && native {
                         assert_eq!(engine.native_owner_cancellations, 1);
+                        assert!(job.state.ipc_user_return.is_none());
+                        assert!(job.state.syscall_completion.is_idle());
                         assert!(engine.completed_syscalls.is_empty());
                         assert!(
                             carrick_el1_abi::Lifecycle::process_exit_custody(
@@ -4752,12 +5101,37 @@ pub(crate) mod tests {
                         // The scoped peer is joined when this scope ends.
                     } else {
                         assert!(matches!(completed, executor::ExecutorExit::Syscall));
-                        let result = if nr == nr::WAIT4 { -10 } else { 0 };
-                        assert_eq!(engine.completed_syscalls, [result]);
+                        let result = if ipc_read {
+                            6
+                        } else if nr == nr::WAIT4 {
+                            -10
+                        } else {
+                            0
+                        };
+                        if ipc_read {
+                            assert!(
+                                engine.completed_syscalls.is_empty(),
+                                "EL0 IPC return has no trap to complete"
+                            );
+                            assert!(
+                                engine
+                                    .written_registers
+                                    .contains(&(carrick_hal::Reg::X(0), 6))
+                            );
+                            assert!(
+                                engine
+                                    .written_registers
+                                    .contains(&(carrick_hal::Reg::Pc, 0x4004)),
+                                "the direct EL0 syscall returns exactly once past its SVC"
+                            );
+                            assert_eq!(engine.guest_memory[&0x71_1020], b"retain");
+                        } else {
+                            assert_eq!(engine.completed_syscalls, [result]);
+                        }
                         if signum.is_some() && !native {
                             assert_eq!(
                                 engine.injected_signals,
-                                [(Some(result), Some(result), false)]
+                                [(Some(result), (!ipc_read).then_some(result), false)]
                             );
                             assert!(
                                 !root
@@ -4767,11 +5141,41 @@ pub(crate) mod tests {
                             );
                         }
                     }
+                    if let Some((owner, object, table, raw)) = &ipc {
+                        use carrick_kernel::kernel::continuation::ipc::HostIpcWait;
+                        let region = owner.region();
+                        assert!(matches!(
+                            region.operation(&carrick_el1_abi::ipc::IpcOpToken::from_raw(*raw)),
+                            Err(carrick_el1_abi::ipc::IpcError::Stale)
+                        ));
+                        let (check_pin, _) = region
+                            .fd(HostIpcWait)
+                            .pin(*table, carrick_el1_abi::ipc::fd::Fd(3))
+                            .unwrap();
+                        assert_eq!(
+                            region.fd(HostIpcWait).holds(&check_pin).unwrap(),
+                            (1, 1),
+                            "only the inspection pin remains"
+                        );
+                        region.fd(HostIpcWait).unpin(check_pin).unwrap();
+                        assert_eq!(
+                            region
+                                .lock(*object, &HostIpcWait)
+                                .unwrap()
+                                .pipe()
+                                .unwrap()
+                                .unread_bytes(),
+                            if killing { 6 } else { 0 }
+                        );
+                    }
                     let lease = resumed_submission.take_execution_lease().unwrap();
                     resumed.restore_lease(lease).unwrap();
                     scheduler.settle_runnable_successor(resumed).unwrap();
                     if !killing {
-                        assert_eq!(engine.prepared_commits, usize::from(nr != nr::WAIT4));
+                        assert_eq!(
+                            engine.prepared_commits,
+                            usize::from(nr != nr::WAIT4 && !sleep)
+                        );
                         if nr == nr::PIPE2 {
                             assert_eq!(engine.guest_memory[&0x71_1020].len(), 8);
                             assert_eq!(root.resources().files().slot_count(), 2);

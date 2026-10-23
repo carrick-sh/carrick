@@ -901,7 +901,18 @@ fn serial_host_native_owned_write_park_ignores_caught_sigalrm_until_sigkill() {
             .signum,
         14
     );
-    carrick_signal_linux::publish_process_signal(carrick_abi::LINUX_SIGKILL);
+    let page = context.lifecycle_page();
+    let task = context.task().key();
+    let signals = carrick_el1_linux::native_process_signals::NativeProcessSignals::<()>::fresh_root(
+        task, &page,
+    );
+    signals
+        .enqueue(
+            task,
+            carrick_personality_linux::signal::policy::Signal::KILL,
+            None,
+        )
+        .unwrap();
     assert_eq!(
         probe.event(),
         Some(ContinuationEvent::OwnerCancelled(
@@ -910,10 +921,9 @@ fn serial_host_native_owned_write_park_ignores_caught_sigalrm_until_sigkill() {
         "SIGKILL must wake a parked owned write"
     );
     assert_eq!(
-        carrick_signal_linux::take_pending_event_for(tid)
-            .unwrap()
-            .signum,
-        carrick_abi::LINUX_SIGKILL
+        signals.pending_count(),
+        1,
+        "wait probing cannot dequeue SIGKILL"
     );
 }
 

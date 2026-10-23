@@ -344,7 +344,10 @@ pub trait Aarch64Vcpu {
         self.complete_syscall_return(return_value)
     }
 
-    fn cancel_native_owner_wait(&mut self) -> Result<(), TrapError> {
+    fn cancel_native_owner_wait(
+        &mut self,
+        _origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
+    ) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
 
@@ -1485,6 +1488,33 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     fn destroy_vcpu_on_thread_exit(&mut self, _vcpu: &mut Self::Vcpu) {}
 }
 
+/// Enter the existing fatal signal checkpoint from an exact EL0 frame.
+/// The transport has selected NativeOwnerCancel in an Idle mailbox. No GPR,
+/// user stack or syscall return is changed; PC is published last.
+pub fn enter_native_owner_cancel_el0<C: Aarch64Vcpu>(
+    vcpu: &mut C,
+    mailbox: carrick_guest_mem::GuestVa,
+) -> Result<(), TrapError> {
+    let pc = vcpu.get_reg(Reg::Pc)?;
+    let pstate = vcpu.get_reg(Reg::Pstate)?;
+    if pstate & 0xf != 0 {
+        return Err(TrapError::Hypervisor(
+            "native owner cancellation requires an EL0 frame".into(),
+        ));
+    }
+    const EL1H_DAIF_MASKED: u64 = 0x3c5;
+    for (reg, value) in [
+        (Reg::ElrEl1, pc),
+        (Reg::SpsrEl1, pstate),
+        (Reg::SpEl1, mailbox.raw()),
+        (Reg::Pstate, EL1H_DAIF_MASKED),
+        (Reg::Pc, carrick_mem::memory::native_owner_cancel_entry()),
+    ] {
+        vcpu.set_reg(reg, value)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod completion_tests {
     use super::*;
@@ -1492,11 +1522,16 @@ mod completion_tests {
     struct RegisterCompletionVcpu {
         writes: Vec<(Reg, u64)>,
         saved_x9: Option<u64>,
+        el0: Option<(u64, u64)>,
     }
 
     impl Aarch64Vcpu for RegisterCompletionVcpu {
-        fn get_reg(&self, _r: Reg) -> Result<u64, TrapError> {
-            Ok(0)
+        fn get_reg(&self, r: Reg) -> Result<u64, TrapError> {
+            Ok(match (self.el0, r) {
+                (Some((pc, _)), Reg::Pc) => pc,
+                (Some((_, pstate)), Reg::Pstate) => pstate,
+                _ => 0,
+            })
         }
 
         fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), TrapError> {
@@ -1566,10 +1601,38 @@ mod completion_tests {
     }
 
     #[test]
+    fn native_owner_cancel_el0_enters_fatal_hook_without_user_register_writes() {
+        let mut vcpu = RegisterCompletionVcpu {
+            writes: Vec::new(),
+            saved_x9: None,
+            el0: Some((0x4000, 0x6000_0000)),
+        };
+        enter_native_owner_cancel_el0(&mut vcpu, carrick_guest_mem::GuestVa::new(0x1000)).unwrap();
+        assert_eq!(
+            vcpu.writes,
+            [
+                (Reg::ElrEl1, 0x4000),
+                (Reg::SpsrEl1, 0x6000_0000),
+                (Reg::SpEl1, 0x1000),
+                (Reg::Pstate, 0x3c5),
+                (Reg::Pc, carrick_mem::memory::native_owner_cancel_entry()),
+            ]
+        );
+        vcpu.writes.clear();
+        vcpu.el0 = Some((0x4000, 0x3c5));
+        assert!(
+            enter_native_owner_cancel_el0(&mut vcpu, carrick_guest_mem::GuestVa::new(0x1000))
+                .is_err()
+        );
+        assert!(vcpu.writes.is_empty());
+    }
+
+    #[test]
     fn default_complete_syscall_return_preserves_register_transport() {
         let mut vcpu = RegisterCompletionVcpu {
             writes: Vec::new(),
             saved_x9: Some(0x9999),
+            el0: None,
         };
         vcpu.complete_syscall_return(-9).expect("completion");
         assert_eq!(

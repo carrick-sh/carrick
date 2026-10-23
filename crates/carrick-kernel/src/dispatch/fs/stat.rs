@@ -38,24 +38,26 @@ impl<'a> FsView<'a> {
 
     pub(super) fn write_fd_stat(
         &self,
+        context: &crate::kernel::KernelContext,
         fd: i32,
         statbuf: u64,
         memory: &mut impl CurrentMmMemory,
     ) -> DispatchOutcome {
         match self.fd_stat_record(fd) {
-            Ok(record) => write_stat_record(memory, statbuf, &record),
+            Ok(record) => write_stat_record(context, memory, statbuf, &record),
             Err(errno) => DispatchOutcome::errno(errno),
         }
     }
 
     pub(super) fn write_fd_statx(
         &self,
+        context: &crate::kernel::KernelContext,
         fd: i32,
         statxbuf: u64,
         memory: &mut impl CurrentMmMemory,
     ) -> DispatchOutcome {
         match self.fd_stat_record(fd) {
-            Ok(record) => write_statx_record(memory, statxbuf, &record),
+            Ok(record) => write_statx_record(context, memory, statxbuf, &record),
             Err(errno) => DispatchOutcome::errno(errno),
         }
     }
@@ -570,7 +572,7 @@ impl<'a> FsView<'a> {
                 Err(error) => return Ok(error.into_outcome()),
             };
             match this.path_stat_record(cx.kernel, dirfd, &path, flags) {
-                Ok(record) => Ok(write_stat_record(memory, statbuf, &record)),
+                Ok(record) => Ok(write_stat_record(cx.kernel, memory, statbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
 
@@ -586,7 +588,7 @@ impl<'a> FsView<'a> {
                 Err(error) => return Ok(error.into_outcome()),
             };
             match this.path_stat_record(cx.kernel, LINUX_AT_FDCWD, &path, 0) {
-                Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
+                Ok(record) => Ok(write_x8664_stat_record(cx.kernel, memory, statbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
 
@@ -597,7 +599,7 @@ impl<'a> FsView<'a> {
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
             match this.fd_stat_record(fd.0) {
-                Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
+                Ok(record) => Ok(write_x8664_stat_record(cx.kernel, memory, statbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
 
@@ -618,7 +620,7 @@ impl<'a> FsView<'a> {
                 &path,
                 LINUX_AT_SYMLINK_NOFOLLOW,
             ) {
-                Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
+                Ok(record) => Ok(write_x8664_stat_record(cx.kernel, memory, statbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
 
@@ -642,7 +644,7 @@ impl<'a> FsView<'a> {
                 Err(error) => return Ok(error.into_outcome()),
             };
             match this.path_stat_record(cx.kernel, dirfd, &path, flags) {
-                Ok(record) => Ok(write_x8664_stat_record(memory, statbuf, &record)),
+                Ok(record) => Ok(write_x8664_stat_record(cx.kernel, memory, statbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
 
@@ -658,11 +660,11 @@ impl<'a> FsView<'a> {
                 let uninit_real = std::mem::MaybeUninit::<carrick_vfs::fs_backend::RealStat>::uninit();
                 let uninit_md = std::mem::MaybeUninit::<RootFsMetadata>::uninit();
                 unsafe {
-                    let _ = write_statx_real(memory, 0, &*uninit_real.as_ptr());
-                    let _ = write_statx(memory, 0, &*uninit_md.as_ptr());
+                    let _ = write_statx_real(cx.kernel, memory, 0, &*uninit_real.as_ptr());
+                    let _ = write_statx(cx.kernel, memory, 0, &*uninit_md.as_ptr());
                 }
-                let _ = write_synthetic_statx(memory, 0, "", 0);
-                let _ = write_synthetic_statx_mode(memory, 0, "", 0, 0);
+                let _ = write_synthetic_statx(cx.kernel, memory, 0, "", 0);
+                let _ = write_synthetic_statx_mode(cx.kernel, memory, 0, "", 0, 0);
             }
 
             if !linux_statx_flags_are_supported(flags) || mask & LINUX_STATX_RESERVED != 0 {
@@ -677,7 +679,7 @@ impl<'a> FsView<'a> {
                 if flags & LINUX_AT_EMPTY_PATH == 0 {
                     return Ok(DispatchOutcome::errno(LINUX_ENOENT));
                 }
-                return Ok(this.write_fd_statx(dirfd as i32, statxbuf, memory));
+                return Ok(this.write_fd_statx(cx.kernel, dirfd as i32, statxbuf, memory));
             }
 
             let at_flags = carrick_abi::LinuxAtFlags::from_bits_retain(flags);
@@ -695,7 +697,7 @@ impl<'a> FsView<'a> {
             let _ = lookup.fast_path_answered();
             let _ = lookup.resolved_path();
             match lookup.into_stat() {
-                Ok(record) => Ok(write_statx_record(memory, statxbuf, &record)),
+                Ok(record) => Ok(write_statx_record(cx.kernel, memory, statxbuf, &record)),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
             }
 
@@ -705,7 +707,7 @@ impl<'a> FsView<'a> {
 
             let fd: Fd = fd;
             let statbuf = statbuf.0;
-            Ok(this.write_fd_stat(fd.0, statbuf, &mut *cx.memory))
+            Ok(this.write_fd_stat(cx.kernel, fd.0, statbuf, &mut *cx.memory))
 
         }
 

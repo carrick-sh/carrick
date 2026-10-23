@@ -3152,6 +3152,7 @@ impl<'a> ProcView<'a> {
                 // owner refusal parks and retries with the zombie, stop or
                 // continue report still waitable (#711).
                 let infop_out = match super::copyout::prepare(
+                    cx.kernel,
                     &mut *cx.memory,
                     [super::copyout::UserSlot::optional(
                         infop_addr.0,
@@ -3263,6 +3264,7 @@ impl<'a> ProcView<'a> {
                 let rusage_size =
                     <carrick_abi::LinuxRusage as carrick_abi::KernelAbi>::ABI_SIZE;
                 let outputs = match super::copyout::prepare(
+                    cx.kernel,
                     &mut *cx.memory,
                     [
                         super::copyout::UserSlot::optional(wstatus_addr.0, 4),

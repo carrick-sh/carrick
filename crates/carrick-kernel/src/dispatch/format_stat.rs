@@ -32,6 +32,7 @@ pub(crate) fn linux_access_flags_are_supported(flags: u64) -> bool {
 }
 
 pub(super) fn write_stat_record(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     statbuf: u64,
     record: &StatRecord,
@@ -65,6 +66,7 @@ pub(super) fn write_stat_record(
     };
 
     copyout_record(
+        context,
         memory,
         statbuf,
         &stat,
@@ -73,6 +75,7 @@ pub(super) fn write_stat_record(
 }
 
 pub(super) fn write_x8664_stat_record(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     statbuf: u64,
     record: &StatRecord,
@@ -104,6 +107,7 @@ pub(super) fn write_x8664_stat_record(
     };
 
     copyout_record(
+        context,
         memory,
         statbuf,
         &stat,
@@ -141,22 +145,30 @@ pub(super) fn real_stat_from_libc(st: &libc::stat) -> carrick_vfs::fs_backend::R
 
 /// Build and write a `statx` record from a real backing stat.
 pub(crate) fn write_statx_real(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     statxbuf: u64,
     real: &carrick_vfs::fs_backend::RealStat,
 ) -> DispatchOutcome {
-    write_statx_record(memory, statxbuf, &StatRecord::from_real(real))
+    write_statx_record(context, memory, statxbuf, &StatRecord::from_real(real))
 }
 
 pub(crate) fn write_statx(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     statxbuf: u64,
     metadata: &RootFsMetadata,
 ) -> DispatchOutcome {
-    write_statx_record(memory, statxbuf, &StatRecord::from_metadata(metadata))
+    write_statx_record(
+        context,
+        memory,
+        statxbuf,
+        &StatRecord::from_metadata(metadata),
+    )
 }
 
 pub(super) fn write_statx_record(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     statxbuf: u64,
     record: &StatRecord,
@@ -203,6 +215,7 @@ pub(super) fn write_statx_record(
         __spare3: [0; 8],
     };
     copyout_record(
+        context,
         memory,
         statxbuf,
         &statx,
@@ -211,20 +224,27 @@ pub(super) fn write_statx_record(
 }
 
 pub(crate) fn write_synthetic_statx(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     statxbuf: u64,
     path: &str,
     size: usize,
 ) -> DispatchOutcome {
-    write_synthetic_statx_mode(memory, statxbuf, path, size, LINUX_S_IFREG | 0o444)
+    write_synthetic_statx_mode(context, memory, statxbuf, path, size, LINUX_S_IFREG | 0o444)
 }
 
 pub(crate) fn write_synthetic_statx_mode(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     statxbuf: u64,
     path: &str,
     size: usize,
     mode: u32,
 ) -> DispatchOutcome {
-    write_statx_record(memory, statxbuf, &StatRecord::synthetic(path, size, mode))
+    write_statx_record(
+        context,
+        memory,
+        statxbuf,
+        &StatRecord::synthetic(path, size, mode),
+    )
 }

@@ -275,6 +275,12 @@ impl World {
     }
 }
 
+fn caller() -> crate::kernel::KernelContext {
+    crate::dispatch::SyscallDispatcher::new()
+        .capture_one_task_context()
+        .unwrap()
+}
+
 fn memory(bytes: &[u8]) -> LinearMemory {
     let mut m = LinearMemory::new(BUF, vec![0; 1 << 20]);
     m.write_bytes(BUF, bytes).unwrap();
@@ -372,7 +378,8 @@ fn el1_epoll_wait_interruption_is_eintr_and_continuation_restarts() {
     w.hand_back(&token, IpcHandback::Continue, 0, 0);
     let wakes = Wakes::default();
     let mut mem = memory(&[0; 16]);
-    let outcome = complete_handback(w.region, token, MM, &mut mem, None, &wakes).unwrap();
+    let outcome =
+        complete_handback(&caller(), w.region, token, MM, &mut mem, None, &wakes).unwrap();
     assert_eq!(outcome, restart);
     let (pin, _) = w.region.fd(HostIpcWait).pin(w.table, r).unwrap();
     assert_eq!(w.region.fd(HostIpcWait).holds(&pin), Ok((1, 1)));
@@ -436,8 +443,16 @@ fn el1_epoll_timed_wait_host_rerun_waits_only_what_is_left() {
             now: woken_at,
         };
         let mut mem = memory(&[0; 16]);
-        let outcome =
-            complete_handback(w.region, timed(&w), MM, &mut mem, None, &services).unwrap();
+        let outcome = complete_handback(
+            &caller(),
+            w.region,
+            timed(&w),
+            MM,
+            &mut mem,
+            None,
+            &services,
+        )
+        .unwrap();
         let IpcHostOutcome::Restart {
             timeout_ms: Some(left),
             ..
@@ -465,7 +480,16 @@ fn el1_epoll_timed_wait_host_rerun_waits_only_what_is_left() {
         let outcome = match cause {
             None => {
                 let mut mem = memory(&[0; 16]);
-                complete_handback(w.region, timed(&w), MM, &mut mem, None, &services).unwrap()
+                complete_handback(
+                    &caller(),
+                    w.region,
+                    timed(&w),
+                    MM,
+                    &mut mem,
+                    None,
+                    &services,
+                )
+                .unwrap()
             }
             Some(cause) => interrupt(w.region, timed(&w), cause, &services).unwrap(),
         };
@@ -497,6 +521,7 @@ fn el1_ipc_partial_progress_signal_returns_the_count() {
     let wakes = Wakes::default();
     let mut mem = memory(&[1; 100_000]);
     let outcome = complete_handback(
+        &caller(),
         w.region,
         token,
         MM,
@@ -529,7 +554,7 @@ fn el1_ipc_sigpipe_after_partial_write_completes_exactly_once() {
     assert_eq!((op.orig_x0, op.nr), (wfd.0 as u64, 64));
     let mut mem = memory(&[]);
     assert_eq!(
-        complete_handback(w.region, token, MM, &mut mem, None, &wakes).unwrap(),
+        complete_handback(&caller(), w.region, token, MM, &mut mem, None, &wakes).unwrap(),
         IpcHostOutcome::Complete {
             result: 65536,
             sigpipe: true
@@ -557,7 +582,8 @@ fn el1_ipc_continue_resumes_a_write_without_replay() {
     w.hand_back(&token, IpcHandback::Continue, 1000, 0);
     let wakes = Wakes::default();
     let mut mem = memory(&source);
-    let outcome = complete_handback(w.region, token, MM, &mut mem, None, &wakes).unwrap();
+    let outcome =
+        complete_handback(&caller(), w.region, token, MM, &mut mem, None, &wakes).unwrap();
     let IpcHostOutcome::Blocked {
         token,
         lane,
@@ -582,7 +608,8 @@ fn el1_ipc_continue_resumes_a_write_without_replay() {
         let mut g = w.region.lock(object, &HostIpcWait).unwrap();
         g.pipe().unwrap().try_read(&mut out);
     }
-    let outcome = complete_handback(w.region, token, MM, &mut mem, None, &wakes).unwrap();
+    let outcome =
+        complete_handback(&caller(), w.region, token, MM, &mut mem, None, &wakes).unwrap();
     assert_eq!(
         outcome,
         IpcHostOutcome::Complete {
@@ -617,6 +644,7 @@ fn el1_ipc_continue_rejects_a_stale_address_space_before_copying() {
     let mut mem = memory(&[]);
     assert_eq!(
         complete_handback(
+            &caller(),
             w.region,
             token,
             IpcMmKey(8),
@@ -631,8 +659,16 @@ fn el1_ipc_continue_rejects_a_stale_address_space_before_copying() {
     assert_eq!(mem.read_bytes(BUF, 6).unwrap(), vec![0; 6]);
     // The owner still holds the operation and can finish it.
     let (token, _) = take_handback(w.region, raw).unwrap();
-    let outcome =
-        complete_handback(w.region, token, MM, &mut mem, None, &Wakes::default()).unwrap();
+    let outcome = complete_handback(
+        &caller(),
+        w.region,
+        token,
+        MM,
+        &mut mem,
+        None,
+        &Wakes::default(),
+    )
+    .unwrap();
     assert_eq!(
         outcome,
         IpcHostOutcome::Complete {
@@ -899,7 +935,8 @@ fn serial_host_el1_ipc_host_completed_handback_wakes_host_subscribers() {
         .unwrap();
     let mut mem = memory(&[]);
     let service = ZoneHostServices::for_dispatcher(&dispatcher).unwrap();
-    let outcome = complete_handback(&region, token, MM, &mut mem, None, &service).unwrap();
+    let outcome =
+        complete_handback(&caller(), &region, token, MM, &mut mem, None, &service).unwrap();
     assert_eq!(
         outcome,
         IpcHostOutcome::Complete {
@@ -1074,4 +1111,218 @@ fn serial_host_el1_ipc_mixed_venue_readv_wakes_on_el1_write_after_enroll() {
 #[test]
 fn serial_host_el1_ipc_mixed_venue_readv_wakes_on_el1_write_before_enroll() {
     mixed_venue_readv_wakes_on_el1_write(true);
+}
+
+#[test]
+fn el1_ipc_read_owner_refusal_keeps_bytes_until_destination_is_secured() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    let w = world();
+    let (r, writer, object) = w.pipe();
+    {
+        let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+        guard.pipe().unwrap().try_write(b"retain");
+    }
+    let token = w.operation(r, IpcOpKind::PipeRead, 6, 63);
+    w.hand_back(&token, IpcHandback::Continue, 0, 0);
+    let mut memory = OwnerRefusingMemory::new(BUF, 4096, 0xa5);
+    memory.refuse_next();
+    let outcome = complete_handback(
+        &caller(),
+        w.region,
+        token,
+        MM,
+        &mut memory,
+        None,
+        &Wakes::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        w.unread(object),
+        6,
+        "copyout refusal must consume no pipe bytes: {outcome:?}"
+    );
+    assert_eq!(memory.inner.read_bytes(BUF, 6).unwrap(), [0xa5; 6]);
+    let IpcHostOutcome::OwnerMemory { token, outcome } = outcome else {
+        panic!("transient destination refusal must retain the read");
+    };
+    assert!(matches!(
+        *outcome,
+        crate::dispatch::DispatchOutcome::OwnerMemoryWait { committed: 0, .. }
+    ));
+    let raw = token.into_raw();
+    let token = IpcOpToken::from_raw(raw);
+    let saved = w.region.operation(&token).unwrap();
+    assert_eq!(saved.progress.written, 0);
+    let pin = OfdPin::from_raw(saved.pin);
+    assert_eq!(w.region.fd(HostIpcWait).holds(&pin).unwrap(), (1, 1));
+    let _ = pin.into_raw();
+    let outcome = complete_handback(
+        &caller(),
+        w.region,
+        token,
+        MM,
+        &mut memory,
+        None,
+        &Wakes::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        IpcHostOutcome::Complete {
+            result: 6,
+            sigpipe: false
+        }
+    );
+    assert_eq!(memory.inner.read_bytes(BUF, 6).unwrap(), b"retain");
+    assert_eq!(w.unread(object), 0);
+    assert_eq!(w.holds(r), 1);
+    assert_eq!(
+        take_handback(w.region, raw.pack()).err(),
+        Some(IpcError::Stale)
+    );
+    let description = w
+        .region
+        .fd(HostIpcWait)
+        .close(w.table, writer)
+        .unwrap()
+        .unwrap();
+    w.region
+        .release_backing(description.backing, &HostIpcWait)
+        .unwrap();
+    let token = w.operation(r, IpcOpKind::PipeRead, 6, 63);
+    w.hand_back(&token, IpcHandback::Continue, 0, 0);
+    assert_eq!(
+        complete_handback(
+            &caller(),
+            w.region,
+            token,
+            MM,
+            &mut memory,
+            None,
+            &Wakes::default()
+        )
+        .unwrap(),
+        IpcHostOutcome::Complete {
+            result: 0,
+            sigpipe: false
+        }
+    );
+}
+
+#[test]
+fn el1_ipc_owner_copyout_fault_and_page_prefix_preserve_unread_bytes() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    for fault in [false, true] {
+        let w = world();
+        let (reader, _writer, object) = w.pipe();
+        {
+            let mut guard = w.region.lock(object, &HostIpcWait).unwrap();
+            guard.pipe().unwrap().try_write(b"abcdef");
+        }
+        let token = w.operation(reader, IpcOpKind::PipeRead, 6, 63);
+        w.hand_back(&token, IpcHandback::Continue, 0, 0);
+        let mut op = w.region.operation(&token).unwrap();
+        op.buf = IpcUserVa(BUF + 4093);
+        w.region.update_operation(&token, op).unwrap();
+        let mut memory = OwnerRefusingMemory::new(BUF, 8192, 0xa5);
+        if fault {
+            memory.protect_readonly(BUF, 8192);
+        }
+        let result = complete_handback(
+            &caller(),
+            w.region,
+            token,
+            MM,
+            &mut memory,
+            None,
+            &Wakes::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            IpcHostOutcome::Complete {
+                result: if fault {
+                    LINUX_EFAULT.guest_retval()
+                } else {
+                    3
+                },
+                sigpipe: false,
+            }
+        );
+        assert_eq!(w.unread(object), if fault { 6 } else { 3 });
+        assert_eq!(
+            memory.inner.read_bytes(BUF + 4093, 6).unwrap(),
+            if fault {
+                vec![0xa5; 6]
+            } else {
+                vec![b'a', b'b', b'c', 0xa5, 0xa5, 0xa5]
+            }
+        );
+    }
+}
+
+#[test]
+fn el1_ipc_empty_owner_read_does_not_touch_invalid_destination() {
+    use crate::dispatch::copyout::owner_fixture::OwnerRefusingMemory;
+    for mode in 0..3 {
+        let w = world();
+        let (reader, writer, _) = w.pipe();
+        if mode == 0 {
+            let description = w
+                .region
+                .fd(HostIpcWait)
+                .close(w.table, writer)
+                .unwrap()
+                .unwrap();
+            w.region
+                .release_backing(description.backing, &HostIpcWait)
+                .unwrap();
+        } else if mode == 1 {
+            w.region
+                .fd(HostIpcWait)
+                .setfl(
+                    w.table,
+                    reader,
+                    StatusFlags {
+                        nonblock: true,
+                        ..StatusFlags::default()
+                    },
+                )
+                .unwrap();
+        }
+        let token = w.operation(reader, IpcOpKind::PipeRead, 6, 63);
+        w.hand_back(&token, IpcHandback::Continue, 0, 0);
+        let mut memory = OwnerRefusingMemory::new(BUF, 4096, 0xa5);
+        memory.protect_readonly(BUF, 4096);
+        let dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let outcome = complete_handback(
+            &context,
+            w.region,
+            token,
+            MM,
+            &mut memory,
+            None,
+            &Wakes::default(),
+        )
+        .unwrap();
+        match mode {
+            0 | 1 => assert_eq!(
+                outcome,
+                IpcHostOutcome::Complete {
+                    result: if mode == 0 {
+                        0
+                    } else {
+                        carrick_abi::LINUX_EAGAIN.guest_retval()
+                    },
+                    sigpipe: false,
+                }
+            ),
+            _ => assert!(
+                matches!(outcome, IpcHostOutcome::Blocked { .. }),
+                "{outcome:?}"
+            ),
+        }
+        assert_eq!(memory.inner.read_bytes(BUF, 6).unwrap(), [0xa5; 6]);
+    }
 }

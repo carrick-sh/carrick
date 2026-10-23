@@ -227,14 +227,25 @@ pub(super) enum OwnerSupplyWait {
 /// A retained transfer cannot fall through to numeric syscall redispatch.
 pub(super) enum OwnedSyscallResume {
     CopyoutRedispatch,
+    Ipc(carrick_kernel::kernel::continuation::ipc::RetainedIpcOperation),
     PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
+    Sleep(Box<carrick_kernel::dispatch::OwnedSleepCopyIn>),
 }
 
-fn owner_copyin_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
-    let DispatchOutcome::WriteCopyInSuspended(pending) = outcome else {
-        return (outcome, None);
+pub(super) fn owner_copyin_route(
+    outcome: DispatchOutcome,
+) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
+    let (wait, resume) = match outcome {
+        DispatchOutcome::WriteCopyInSuspended(pending) => (
+            pending.wait().clone(),
+            OwnedSyscallResume::PreparedWrite(pending),
+        ),
+        DispatchOutcome::SleepCopyInSuspended(pending) => {
+            (pending.wait().clone(), OwnedSyscallResume::Sleep(pending))
+        }
+        other => return (other, None),
     };
-    let wait_outcome = match pending.wait().clone() {
+    let wait_outcome = match wait {
         carrick_guest_mem::MemoryReadWait::Owner(wait) => {
             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
         }
@@ -246,10 +257,21 @@ fn owner_copyin_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<Owne
             DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
         }
     };
-    (
-        wait_outcome,
-        Some(OwnedSyscallResume::PreparedWrite(pending)),
-    )
+    (wait_outcome, Some(resume))
+}
+
+/// One owner of the physical wait, its subscriptions and retained syscall.
+/// Enrollment and scheduler resumption settle through the same killable gate.
+pub(super) struct OwnerPhysicalResume {
+    origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
+    frame: carrick_hal::RawSyscall,
+    wait: super::owner_wait::OwnerWait<
+        (
+            carrick_guest_mem::OwnedMemoryWait,
+            Box<dyn std::fmt::Debug + Send + Sync>,
+        ),
+        OwnedSyscallResume,
+    >,
 }
 
 pub(super) enum HvpatchProductionPhase {
@@ -300,6 +322,7 @@ pub(super) enum HvpatchProductionPhase {
     ResumeOwnerZone {
         frame: carrick_hal::RawSyscall,
         resume: OwnedSyscallResume,
+        origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
     },
     ResumeRetainedOwner {
         action: Box<RetainedMemoryAction>,
@@ -314,12 +337,7 @@ pub(super) enum HvpatchProductionPhase {
     },
     /// A retained physical writer owns this dependency. Its subscription
     /// remains live while the job, not a pool worker, is blocked.
-    ResumeOwnerPhysical {
-        frame: carrick_hal::RawSyscall,
-        resume: OwnedSyscallResume,
-        wait: carrick_guest_mem::OwnedMemoryWait,
-        _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
-    },
+    ResumeOwnerPhysical(OwnerPhysicalResume),
     /// The exact unpublished physical grant must settle before EL0 can
     /// reselect this fault. No syscall completion belongs to this wait.
     ResumeFaultPhysical {
@@ -486,7 +504,7 @@ impl HvpatchProductionPhase {
             Self::Complete => 12,
             Self::BootstrapThreadChild => 13,
             Self::ResumeZone | Self::ResumeOwnerZone { .. } => 14,
-            Self::ResumeOwnerPhysical { .. } => 18,
+            Self::ResumeOwnerPhysical(_) => 18,
             Self::ResumeRetainedOwner { .. } => 19,
             Self::ResumeRetainedPhysical { .. } => 20,
             Self::RetainedMemoryRetry { .. } => 21,
@@ -3274,6 +3292,116 @@ where
         result
     }
 
+    /// A fatal process obligation cancels every waiter; reserving delivery for
+    /// one thread cannot grant another thread permission to resume.
+    pub(super) fn finish_owner_cancellation(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        cancellation: carrick_kernel::kernel::continuation::OwnerWaitCancellation,
+        origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        use carrick_kernel::kernel::continuation::OwnerWaitCancellation;
+        // An immediate effect-admission refusal has not moved this operation
+        // into OwnedSyscallResume yet. Release its IPC pin before native exit.
+        drop(self.state.pending_ipc_owner.take());
+        match cancellation {
+            OwnerWaitCancellation::GroupExit => self.drive_thread_exit(engine, control, 0),
+            OwnerWaitCancellation::NativeFatal => self.cancel_native_owner_wait(engine, origin),
+            OwnerWaitCancellation::Carrier => self.route_outcome(
+                engine,
+                control,
+                frame,
+                DispatchOutcome::SignalDeath {
+                    signum: carrick_abi::LINUX_SIGKILL,
+                },
+            ),
+        }
+    }
+
+    pub(super) fn resume_owner_ready(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        resume: OwnedSyscallResume,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let origin = self.state.owner_wait_origin()?;
+        let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("ready owner resume lost context".to_owned())
+        })?;
+        match super::owner_wait::OwnerWait::new((), resume).settle(
+            || carrick_kernel::kernel::continuation::owner_wait_cancellation(context),
+            |()| true,
+        ) {
+            super::owner_wait::Settlement::Resume(resume) => {
+                let outcome = self.state.resume_owned_syscall(
+                    &self.kernel,
+                    engine,
+                    resume,
+                    control.submission.host_wait_context(),
+                )?;
+                self.route_outcome(engine, control, frame, outcome)
+            }
+            super::owner_wait::Settlement::Cancelled(cancellation) => {
+                self.finish_owner_cancellation(engine, control, frame, cancellation, origin)
+            }
+            super::owner_wait::Settlement::Waiting(_) => Err(RuntimeError::Configuration(
+                "ready owner wait did not settle".to_owned(),
+            )
+            .into()),
+        }
+    }
+
+    fn resume_owner_physical(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        pending: OwnerPhysicalResume,
+        ready_at_enrollment: bool,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        use super::owner_wait::Settlement;
+        let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("physical owner resume lost context".to_owned())
+        })?;
+        let OwnerPhysicalResume {
+            origin,
+            frame,
+            wait,
+        } = pending;
+        match wait.settle(
+            || carrick_kernel::kernel::continuation::owner_wait_cancellation(context),
+            |(wait, _)| ready_at_enrollment || wait.0.is_ready(),
+        ) {
+            Settlement::Cancelled(cancellation) => {
+                self.finish_owner_cancellation(engine, control, frame, cancellation, origin)
+            }
+            Settlement::Waiting(wait) => {
+                self.phase = HvpatchProductionPhase::ResumeOwnerPhysical(OwnerPhysicalResume {
+                    origin,
+                    frame,
+                    wait,
+                });
+                Ok(self.suspend(
+                    HvpatchLoopSuspension::BlockedContinuation,
+                    executor::ExecutorExit::Blocked(
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    ),
+                ))
+            }
+            Settlement::Resume(resume) => {
+                let outcome = self.state.resume_owned_syscall(
+                    &self.kernel,
+                    engine,
+                    resume,
+                    control.submission.host_wait_context(),
+                )?;
+                self.route_outcome(engine, control, frame, outcome)
+            }
+        }
+    }
+
     pub(super) fn route_outcome(
         &mut self,
         engine: &mut E,
@@ -3281,7 +3409,16 @@ where
         frame: carrick_hal::RawSyscall,
         outcome: DispatchOutcome,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        if let Some(park) = self.state.pending_ipc_park.take() {
+            return self.ipc_park(engine, control, frame, park);
+        }
         let (outcome, resume) = owner_copyin_route(outcome);
+        let resume = resume.or_else(|| {
+            self.state
+                .pending_ipc_owner
+                .take()
+                .map(OwnedSyscallResume::Ipc)
+        });
         self.service_outcome(engine, control, frame, outcome, resume)
     }
 
@@ -3313,13 +3450,12 @@ where
                 };
                 return self.service_outcome(engine, control, frame, outcome, resume);
             }
-            let outcome = self.state.resume_owned_syscall(
-                &self.kernel,
+            return self.resume_owner_ready(
                 engine,
+                control,
+                frame,
                 resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
-                control.submission.host_wait_context(),
-            )?;
-            return self.route_outcome(engine, control, frame, outcome);
+            );
         }
         if let DispatchOutcome::OwnerMemoryWait { wait, committed } = outcome {
             self.state.owner_read_progress = self
@@ -3375,36 +3511,26 @@ where
                 }
             };
             let (subscription, ready) = wait.0.enroll(Arc::clone(&wake));
-            // Enroll before the fatal sample: a publication on either side of
-            // enrollment is owned by the producer callback or this sample.
-            if carrick_kernel::kernel::continuation::owner_wait_cancellation(context).is_some() {
-                wake();
-            }
-            let subscription: Box<dyn std::fmt::Debug + Send + Sync> =
-                Box::new((subscription, signal_subscription, native_wait));
-            if ready || wait.0.is_ready() {
-                drop(subscription);
-                let outcome = self.state.resume_owned_syscall(
-                    &self.kernel,
-                    engine,
-                    resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
-                    control.submission.host_wait_context(),
-                )?;
-                return self.route_outcome(engine, control, frame, outcome);
-            }
-            self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
-                frame,
-                resume: resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
-                wait,
-                _subscription: subscription,
-            };
-            return Ok(self.suspend(
-                HvpatchLoopSuspension::BlockedContinuation,
-                executor::ExecutorExit::Blocked(
-                    carrick_kernel::kernel::objects::BlockedReason::HostWait,
-                ),
-            ));
+            // Both immediate readiness and a later scheduler wake must pass
+            // the same cancellation-first gate before the syscall can retry.
+            return self.resume_owner_physical(
+                engine,
+                control,
+                OwnerPhysicalResume {
+                    origin: self.state.owner_wait_origin()?,
+                    frame,
+                    wait: super::owner_wait::OwnerWait::new(
+                        (
+                            wait,
+                            Box::new((subscription, signal_subscription, native_wait)),
+                        ),
+                        resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
+                    ),
+                },
+                ready,
+            );
         }
+
         if carrick_kernel::kernel::continuation::is_blocking_dispatch_outcome(&outcome) {
             let _ = self.state.stash_parked_registers(engine);
             let request = self
@@ -4026,8 +4152,19 @@ where
                 }
                 executor::ExecutorExit::Syscall
             }
+            DispatchOutcome::OwnerCancelled(cancellation) => {
+                let origin = self.state.owner_wait_origin()?;
+                return self.finish_owner_cancellation(
+                    engine,
+                    control,
+                    frame,
+                    cancellation,
+                    origin,
+                );
+            }
             DispatchOutcome::SignalDeath { signum } => {
-                self.state.retire_syscall()?;
+                let origin = self.state.owner_wait_origin()?;
+                self.state.retire_owner_wait(origin)?;
                 let context = self
                     .state
                     .service_kernel_context
@@ -4069,12 +4206,19 @@ where
     pub(super) fn cancel_native_owner_wait(
         &mut self,
         engine: &mut E,
+        origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        if self.state.owner_wait_origin()? != origin {
+            return Err(RuntimeError::Configuration(
+                "owner cancellation changed completion origin".into(),
+            )
+            .into());
+        }
         self.state.publish_external_ingress(&self.kernel)?;
         engine
-            .cancel_native_owner_wait()
+            .cancel_native_owner_wait(origin)
             .map_err(RuntimeError::Trap)?;
-        self.state.retire_syscall()?;
+        self.state.retire_owner_wait(origin)?;
         self.state.continuation_restart = None;
         self.phase = HvpatchProductionPhase::Resident;
         Ok(executor::ExecutorExit::Syscall)
@@ -4195,10 +4339,7 @@ where
                 self.kernel.wake_native_terminal_members(context)?;
             }
             if !self.phase.is_terminal_transition()
-                && !matches!(
-                    self.phase,
-                    HvpatchProductionPhase::ResumeOwnerPhysical { .. }
-                )
+                && !matches!(self.phase, HvpatchProductionPhase::ResumeOwnerPhysical(_))
             {
                 self.state.publish_external_ingress(&self.kernel)?;
             }
@@ -4453,80 +4594,15 @@ where
             let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
             match phase {
                 HvpatchProductionPhase::ResumeZone => return self.resume_zone(engine, control),
-                HvpatchProductionPhase::ResumeOwnerZone { frame, resume } => {
-                    return self.resume_owner_zone(engine, control, frame, resume);
-                }
-                HvpatchProductionPhase::ResumeOwnerPhysical {
+                HvpatchProductionPhase::ResumeOwnerZone {
                     frame,
                     resume,
-                    wait,
-                    _subscription,
+                    origin,
                 } => {
-                    let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
-                        RuntimeError::Configuration("physical owner resume lost context".to_owned())
-                    })?;
-                    let cancellation =
-                        carrick_kernel::kernel::continuation::owner_wait_cancellation(context);
-                    if matches!(
-                        cancellation,
-                        Some(
-                            carrick_kernel::kernel::continuation::OwnerWaitCancellation::GroupExit
-                        )
-                    ) {
-                        drop(_subscription);
-                        return self.drive_thread_exit(engine, control, 0);
-                    }
-                    if matches!(cancellation, Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::NativeFatal)) {
-                        drop(_subscription);
-                        return self.cancel_native_owner_wait(engine);
-                    }
-                    if cancellation
-                        == Some(
-                            carrick_kernel::kernel::continuation::OwnerWaitCancellation::Carrier,
-                        )
-                        && let Some(reserved) =
-                            carrick_kernel::kernel::continuation::reserve_killable_wait_signal(
-                                context,
-                            )
-                    {
-                        if let Some(outcome) = service_signals_threaded(
-                            &self.kernel,
-                            context,
-                            engine,
-                            self.state.this_tid,
-                            self.state.fatal_image_generation,
-                            None,
-                            None,
-                            None,
-                            Some(reserved),
-                            self.traps,
-                        )? {
-                            drop(_subscription);
-                            return Ok(self.enter_terminal_with_outcome(engine, outcome));
-                        }
-                    }
-                    if !wait.0.is_ready() {
-                        self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
-                            frame,
-                            resume,
-                            wait,
-                            _subscription,
-                        };
-                        return Ok(self.suspend(
-                            HvpatchLoopSuspension::BlockedContinuation,
-                            executor::ExecutorExit::Blocked(
-                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
-                            ),
-                        ));
-                    }
-                    drop(_subscription);
-                    let outcome = self.state.resume_owned_syscall(
-                        &self.kernel,
-                        engine,
-                        resume,
-                        control.submission.host_wait_context(),
-                    )?;
-                    return self.route_outcome(engine, control, frame, outcome);
+                    return self.resume_owner_zone(engine, control, frame, resume, origin);
+                }
+                HvpatchProductionPhase::ResumeOwnerPhysical(pending) => {
+                    return self.resume_owner_physical(engine, control, pending, false);
                 }
                 HvpatchProductionPhase::ResumeFaultPhysical {
                     wait,
@@ -6984,6 +7060,29 @@ mod tests {
             panic!("owner route lost the exact transfer");
         };
         assert_eq!(pending.wait(), &MemoryReadWait::Owner(wait));
+
+        let sleep = carrick_kernel::dispatch::SyscallRequest::new(
+            carrick_abi::syscall::nr::NANOSLEEP.raw(),
+            carrick_kernel::compat::SyscallArgs::from([0x200120, 0, 0, 0, 0, 0]),
+        );
+        let first = dispatcher
+            .dispatch(&context, sleep, &mut memory, &reporter)
+            .unwrap();
+        let (wait_outcome, resume) = super::owner_copyin_route(first);
+        assert_eq!(
+            wait_outcome,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        let Some(OwnedSyscallResume::Sleep(pending)) = resume else {
+            panic!("sleep route lost the exact transfer");
+        };
+        assert_eq!(pending.wait(), &MemoryReadWait::Owner(wait));
+        // The test backend supplies four bytes, not a complete timespec.
+        // Only this completed malformed input may become EFAULT.
+        assert_eq!(
+            pending.resume(&memory),
+            DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
+        );
     }
 
     #[test]
@@ -7427,6 +7526,538 @@ mod tests {
             "member retirement must not start process-wide terminal work"
         );
         scheduler.close();
+    }
+
+    #[derive(Clone, Copy)]
+    enum OwnerPhysicalScenario {
+        KillParked,
+        KillDuringEnrollment,
+        KillDuringPreparation,
+        NonLeaderKillParked,
+        NonLeaderKillDuringEnrollment,
+        ReservedLeaderKillParked,
+        ReservedLeaderKillDuringEnrollment,
+        ReleaseParked,
+        ReleaseDuringEnrollment,
+    }
+
+    #[test]
+    fn serial_host_owner_physical_dependency_sigkill_uses_owner_physical_resume() {
+        exercise_owner_physical_resume(OwnerPhysicalScenario::KillParked);
+    }
+
+    #[test]
+    fn serial_host_owner_physical_sigkill_during_enrollment_precedes_ready_retry() {
+        exercise_owner_physical_resume(OwnerPhysicalScenario::KillDuringEnrollment);
+    }
+
+    #[test]
+    fn serial_host_owner_physical_kill_after_ready_before_effect_admission() {
+        exercise_owner_physical_resume(OwnerPhysicalScenario::KillDuringPreparation);
+    }
+
+    #[test]
+    fn serial_host_owner_physical_nonleader_process_sigkill_precedes_ready_retry() {
+        exercise_owner_physical_resume(OwnerPhysicalScenario::NonLeaderKillParked);
+    }
+
+    #[test]
+    fn serial_host_owner_physical_nonleader_process_sigkill_during_enrollment() {
+        exercise_owner_physical_resume(OwnerPhysicalScenario::NonLeaderKillDuringEnrollment);
+    }
+
+    #[test]
+    fn serial_host_owner_physical_reserved_leader_kill_stops_parked_sibling() {
+        exercise_owner_physical_resume(OwnerPhysicalScenario::ReservedLeaderKillParked);
+    }
+
+    #[test]
+    fn serial_host_owner_physical_reserved_leader_kill_stops_ready_sibling() {
+        exercise_owner_physical_resume(OwnerPhysicalScenario::ReservedLeaderKillDuringEnrollment);
+    }
+
+    #[test]
+    fn serial_host_owner_physical_resume_releases_writer_before_retry() {
+        exercise_owner_physical_resume(OwnerPhysicalScenario::ReleaseParked);
+    }
+
+    #[test]
+    fn serial_host_owner_physical_immediate_resume_releases_writer_before_retry() {
+        exercise_owner_physical_resume(OwnerPhysicalScenario::ReleaseDuringEnrollment);
+    }
+
+    /// Real pipe2 dispatch, scheduler and content writer.
+    /// Only the engine and the enrollment interleaving are test-controlled.
+    fn exercise_owner_physical_resume(scenario: OwnerPhysicalScenario) {
+        use super::super::code_content_test::{CodeContent, ContentError, PendingContentWrite};
+        use carrick_guest_mem::{GuestVa, OwnedMemoryWait, PhysicalMemoryWait};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct EnrollmentHook {
+            wait: OwnedMemoryWait,
+            hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        }
+        impl std::fmt::Debug for EnrollmentHook {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("EnrollmentHook")
+                    .field("wait", &self.wait)
+                    .finish_non_exhaustive()
+            }
+        }
+        impl PhysicalMemoryWait for EnrollmentHook {
+            fn is_ready(&self) -> bool {
+                self.wait.0.is_ready()
+            }
+            fn enroll(
+                &self,
+                wake: Arc<dyn Fn() + Send + Sync>,
+            ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+                let enrollment = self.wait.0.enroll(wake);
+                if let Some(hook) = self.hook.lock().take() {
+                    hook();
+                }
+                // Preserve the pre-hook sample: runtime must also handle release
+                // between enrollment and its subsequent readiness check.
+                enrollment
+            }
+        }
+        let during_preparation = matches!(scenario, OwnerPhysicalScenario::KillDuringPreparation);
+        let reserved_leader = matches!(
+            scenario,
+            OwnerPhysicalScenario::ReservedLeaderKillParked
+                | OwnerPhysicalScenario::ReservedLeaderKillDuringEnrollment
+        );
+        let kill_pending = !matches!(
+            scenario,
+            OwnerPhysicalScenario::ReleaseParked | OwnerPhysicalScenario::ReleaseDuringEnrollment
+        );
+        let during_enrollment = matches!(
+            scenario,
+            OwnerPhysicalScenario::KillDuringEnrollment
+                | OwnerPhysicalScenario::KillDuringPreparation
+                | OwnerPhysicalScenario::NonLeaderKillDuringEnrollment
+                | OwnerPhysicalScenario::ReservedLeaderKillDuringEnrollment
+                | OwnerPhysicalScenario::ReleaseDuringEnrollment
+        );
+        let non_leader = reserved_leader
+            || matches!(
+                scenario,
+                OwnerPhysicalScenario::NonLeaderKillParked
+                    | OwnerPhysicalScenario::NonLeaderKillDuringEnrollment
+            );
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(self.0);
+            }
+        }
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        let _restore = Restore(carrick_el1_abi::get_el1_region_host_ptr());
+        carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
+        carrick_kernel::el1_zone::with_test_zone(carrick_el1_abi::zone_tables().unwrap(), || {
+            let dispatcher = SyscallDispatcher::new();
+            let (runtime, scheduler, kernel, root, process, generation) =
+                test_carrier_graph_with_dispatcher!(72_759, dispatcher);
+            root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
+            let sibling = root
+                .kernel()
+                .reserve_thread_clone(
+                    &root,
+                    carrick_kernel::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::THREAD
+                            | carrick_abi::LinuxCloneFlags::SIGHAND
+                            | carrick_abi::LinuxCloneFlags::VM
+                            | carrick_abi::LinuxCloneFlags::FILES,
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+                .prepare(ThreadId::synthetic_for_tests(72_760))
+                .unwrap()
+                .commit()
+                .unwrap()
+                .start_thread()
+                .unwrap()
+                .into_context();
+            let registration = scheduler
+                .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+                .unwrap();
+            let (root, sibling, generation) = if non_leader {
+                use executor::TaskBindingResolver;
+                let directory = runtime.persistent_bindings();
+                let authority = directory
+                    .take_submission_authority(root.thread().key(), generation)
+                    .unwrap();
+                let state = executor::tests::task_state(&sibling, 759);
+                let child_generation = sibling
+                    .thread()
+                    .publish_initial_task_state(state.clone())
+                    .unwrap();
+                let binding = executor::tests::hvpatch_test_binding(&sibling, &state, 759);
+                let dormant = directory
+                    .prepare_submission(
+                        &scheduler,
+                        executor::TaskSubmissionShape::SameTaskSibling {
+                            grant: (root.thread().key(), generation),
+                        },
+                        Some(&authority),
+                        Arc::clone(sibling.thread()),
+                        child_generation,
+                        Arc::clone(&binding),
+                    )
+                    .unwrap();
+                executor::tests::activate_hvpatch_test_submission(
+                    dormant,
+                    &scheduler,
+                    &sibling,
+                    &state,
+                    child_generation,
+                    binding.as_ref(),
+                );
+                directory.restore_submission_authority(authority).unwrap();
+                // Keep the live carrier-owned leader parked while the sibling
+                // executes. Its signal mask still owns process-directed kill.
+                let leader = scheduler
+                    .try_take(&registration)
+                    .unwrap()
+                    .expect("leader runnable");
+                assert_eq!(leader.thread().key(), root.thread().key());
+                scheduler
+                    .settle_blocked(
+                        leader,
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    )
+                    .unwrap();
+                (sibling, root, child_generation)
+            } else {
+                (root, sibling, generation)
+            };
+            assert!(sibling.exact_thread_is_live());
+            if non_leader {
+                assert_ne!(root.thread().key().tid.raw(), root.task().key().id.raw());
+                assert_eq!(
+                    sibling.thread().key().tid.raw(),
+                    sibling.task().key().id.raw()
+                );
+                assert!(!sibling.thread().control_slot().native_signal_owner());
+                assert!(
+                    !sibling
+                        .thread()
+                        .blocked_mask()
+                        .contains(carrick_abi::LINUX_SIGKILL)
+                );
+            }
+            let tid = root.thread().registry_id();
+            let registry = Arc::new(ThreadRegistry::new(tid));
+            let futex = Arc::new(FutexTable::new());
+            let reporter = crate::compat::CompatReporter::default();
+            let content = Arc::new(CodeContent::new(4096));
+            let mut executing = content.observe(0, 4).unwrap();
+            executing.begin_execution().unwrap();
+            let reader = Arc::new(Mutex::new(Some(executing)));
+            let physical = OwnedMemoryWait(Arc::new(
+                PendingContentWrite::new(content.clone(), 0, 4096).unwrap(),
+            ));
+            assert_eq!(content.writer_count(), 1);
+            assert_eq!(
+                content.observe(0, 4).unwrap_err(),
+                ContentError::WriteInProgress
+            );
+            let reserved_delivery = Arc::new(Mutex::new(None));
+            let kill = {
+                let leader = Arc::new(sibling.retain_exact());
+                let reservation = reserved_delivery.clone();
+                let context = Arc::new(root.retain_exact());
+                move || {
+                    let kill = carrick_kernel::kernel::LinuxSignal::for_signal_number(
+                        carrick_abi::LINUX_SIGKILL,
+                    )
+                    .unwrap();
+                    context.signal_authority().enqueue_task_standard(kill, None);
+                    if non_leader {
+                        assert_eq!(
+                            carrick_kernel::kernel::continuation::owner_wait_cancellation(&context),
+                            Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::Carrier),
+                        );
+                        assert!(
+                            carrick_kernel::kernel::continuation::reserve_killable_wait_signal(
+                                &context
+                            )
+                            .is_none(),
+                            "the live unblocked leader owns process-signal delivery",
+                        );
+                    }
+                    if reserved_leader {
+                        *reservation.lock() = Some(
+                            carrick_kernel::kernel::continuation::reserve_killable_wait_signal(
+                                &leader,
+                            )
+                            .expect("leader must own the actual fatal reservation"),
+                        );
+                    }
+                    context.task().wake();
+                }
+            };
+            let enrollment_kill = kill.clone();
+            let enrollment_reader = reader.clone();
+            let mut refusal = Some(OwnedMemoryWait(Arc::new(EnrollmentHook {
+                wait: physical,
+                hook: Mutex::new(Some(Box::new(move || {
+                    if during_enrollment {
+                        if kill_pending && !during_preparation {
+                            enrollment_kill();
+                        }
+                        let executing = enrollment_reader.lock().take();
+                        drop(executing);
+                    }
+                }))),
+            })));
+            let retries = Arc::new(AtomicUsize::new(0));
+            let prepare_retries = retries.clone();
+            let prepare_content = content.clone();
+            let writer_counts = Arc::new(Mutex::new(Vec::new()));
+            let prepare_counts = writer_counts.clone();
+            let prepare_kill = kill.clone();
+            let mut engine = CrashCaptureTestEngine {
+                copyout_prepare: Some(Box::new(move || {
+                    if let Some(wait) = refusal.take() {
+                        return Some(wait);
+                    }
+                    prepare_retries.fetch_add(1, Ordering::SeqCst);
+                    prepare_counts.lock().push(prepare_content.writer_count());
+                    if during_preparation {
+                        prepare_kill();
+                    }
+                    None
+                })),
+                exec_support: true,
+                snapshot_cpu: Some(executor::tests::task_state(&root, 759).cpu),
+                ..Default::default()
+            };
+            let carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu) =
+                engine.snapshot_cpu.as_mut().unwrap()
+            else {
+                unreachable!()
+            };
+            Arc::make_mut(cpu).syscall_continuation =
+                Some(carrick_hal::threaded::Aarch64SyscallContinuationV1 {
+                    sequence: 1,
+                    state: 0,
+                    trap_kind: 0,
+                    response_action: 0,
+                    flags: 0,
+                    native_nr: 59,
+                    args: [0x410000, 0, 0, 0, 0, 0],
+                    x8: 59,
+                    resume_pc: 0x400004,
+                    spsr: 0,
+                    fp: 0,
+                    lr: 0,
+                    sp: 0x420000,
+                    esr: 0,
+                    return_value: 0,
+                    resume_x16: 0,
+                    resume_x17: 0,
+                });
+            let frame = carrick_hal::RawSyscall {
+                current_guest_sp: None,
+                number: carrick_abi::syscall::nr::PIPE2,
+                args: [GuestVa::new(0x410000).raw(), 0, 0, 0, 0, 0],
+                guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
+                native_number: carrick_abi::NativeNr(59),
+            };
+            let request = SyscallRequest::from_raw(frame);
+            let outcome = kernel
+                .dispatcher
+                .dispatch_threaded(
+                    &root,
+                    request,
+                    &mut engine,
+                    &reporter,
+                    ThreadCtx::new(tid, &registry, &futex),
+                )
+                .unwrap();
+            assert!(matches!(outcome, DispatchOutcome::OwnerPhysicalWait { .. }));
+            let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+                registry,
+                futex,
+                Arc::new(NoopPlatformFutex),
+                Arc::new(|_| Arc::new(NoopPlatformFutex)),
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(root.thread().clone()),
+                Some(process.pid()),
+                root.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                tid,
+                VcpuThreadRegistry::default(),
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+            state.service_kernel_context = Some(root.retain_exact());
+            state.guest_execution = Some(
+                kernel
+                    .dispatcher
+                    .enter_mm_executor_for_thread(
+                        Some(Arc::clone(root.thread())),
+                        Arc::clone(&state.kicker),
+                        tid,
+                        test_execution_slot(),
+                    )
+                    .unwrap(),
+            );
+            state.zone_mm = Some(root.shared().mm().id().raw());
+            state.syscall_completion =
+                SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
+                    PreparedSyscall {
+                        request,
+                        original_args: request.args,
+                    },
+                    root.retain_exact(),
+                    None,
+                ));
+            let mut job =
+                suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+            let mut running = scheduler
+                .try_take(&registration)
+                .unwrap()
+                .expect("waiter runnable");
+            assert_eq!(running.generation(), generation);
+            let binding_state = executor::tests::task_state(&root, 759);
+            let binding = executor::tests::hvpatch_test_binding(&root, &binding_state, 759);
+            let publish = |_, _| Ok(());
+            let mut submission = executor::ExecutorSubmissionContext {
+                registration: None,
+                scheduler: &scheduler,
+                publish_test_descendant: &publish,
+                current: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::from(Some(running.take_lease())),
+                exec_replacement: None,
+            };
+            let need_resched = AtomicBool::new(false);
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+            control.binding = Some(&binding);
+            let exit = job
+                .route_outcome(&mut engine, &mut control, frame, outcome)
+                .unwrap();
+            if kill_pending || !during_enrollment {
+                assert_eq!(
+                    engine.prepared_commits, 0,
+                    "fatal cancellation must precede output commit"
+                );
+            }
+            if kill_pending || !during_enrollment {
+                assert_eq!(root.resources().files().slot_count(), 0);
+            }
+            let (exit, mut settled) = if during_enrollment {
+                (exit, running)
+            } else {
+                assert!(matches!(exit, executor::ExecutorExit::Blocked(_)));
+                let lease = control.submission.take_execution_lease().unwrap();
+                running.restore_lease(lease).unwrap();
+                scheduler
+                    .settle_blocked(
+                        running,
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    scheduler.queued_len(),
+                    0,
+                    "physical dependency must remain blocked"
+                );
+                root.task().wake();
+                assert_eq!(
+                    scheduler.queued_len(),
+                    0,
+                    "nonfatal notifications cannot release the wait"
+                );
+                if kill_pending {
+                    kill();
+                }
+                if !kill_pending || non_leader {
+                    let executing = reader.lock().take();
+                    drop(executing);
+                }
+                let mut resumed = scheduler
+                    .try_take(&registration)
+                    .unwrap()
+                    .expect("release or SIGKILL must make the task runnable");
+                control.submission.authority =
+                    executor::ExecutionLeaseAuthoritySlot::from(Some(resumed.take_lease()));
+                let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
+                (exit, resumed)
+            };
+            assert_eq!(
+                content.writer_count(),
+                0,
+                "resume must release retained writer custody"
+            );
+            assert!(content.observe(0, 4).is_ok());
+            assert_eq!(
+                root.resources().files().slot_count(),
+                if kill_pending { 0 } else { 2 }
+            );
+
+            if !kill_pending {
+                assert!(
+                    matches!(exit, executor::ExecutorExit::Syscall),
+                    "copyout must complete: {exit:?}"
+                );
+                assert_eq!(
+                    *writer_counts.lock(),
+                    vec![0],
+                    "writer exclusion held across retry"
+                );
+                assert_eq!(retries.load(Ordering::SeqCst), 1);
+                assert_eq!(engine.prepared_commits, 1);
+                assert_eq!(engine.guest_memory[&0x410000].len(), 8);
+                assert_eq!(engine.completed_syscalls.len(), 1);
+                let lease = control.submission.take_execution_lease().unwrap();
+                settled.restore_lease(lease).unwrap();
+                scheduler.settle_exited(settled).unwrap();
+                scheduler.unregister_executor(&registration).unwrap();
+                scheduler.close();
+                return;
+            }
+            assert!(
+                matches!(exit, executor::ExecutorExit::Yielded),
+                "terminal drain handoff: {exit:?}"
+            );
+            assert!(job.phase.is_terminal_transition());
+            let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
+            assert!(
+                matches!(exit, executor::ExecutorExit::Exited),
+                "SIGKILL must terminate: {exit:?}"
+            );
+            assert_eq!(
+                retries.load(Ordering::SeqCst),
+                usize::from(during_preparation),
+                "only the preparation that publishes cancellation may run"
+            );
+            assert_eq!(engine.prepared_commits, 0);
+            assert!(!engine.guest_memory.contains_key(&0x410000));
+            let Some(Ok(VcpuLoopOutcome::ProcessExit(run))) = &job.terminal_result else {
+                panic!("SIGKILL did not publish process termination");
+            };
+            assert_eq!(run.terminating_signal, Some(carrick_abi::LINUX_SIGKILL));
+            assert!(!root.kernel().task_key_is_live(root.task().key()));
+            let lease = control.submission.take_execution_lease().unwrap();
+            settled.restore_lease(lease).unwrap();
+            scheduler.settle_exited(settled).unwrap();
+            let executing = reader.lock().take();
+            drop(executing);
+            assert_eq!(
+                scheduler.queued_len(),
+                0,
+                "late physical notification resurrected a dead task"
+            );
+            scheduler.unregister_executor(&registration).unwrap();
+            scheduler.close();
+        });
     }
 
     #[test]

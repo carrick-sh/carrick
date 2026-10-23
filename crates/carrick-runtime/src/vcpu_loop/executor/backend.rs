@@ -135,8 +135,13 @@ impl HvpatchResidencyHandle {
                 let guard = self.residency.lock();
                 match &*guard {
                     Some(TaskCpuResidency::Materialized(cpu)) => return Ok(Some(cpu.clone())),
-                    Some(TaskCpuResidency::Zone { base, record }) => {
-                        return super::residency::materialize_zone(base, *record).map(Some);
+                    Some(TaskCpuResidency::Zone {
+                        base,
+                        record,
+                        origin,
+                    }) => {
+                        return super::residency::materialize_zone(base, *record, *origin)
+                            .map(Some);
                     }
                     None => return Ok(None),
                     Some(TaskCpuResidency::Resident { .. }) => {}
@@ -148,8 +153,12 @@ impl HvpatchResidencyHandle {
         loop {
             match &*guard {
                 Some(TaskCpuResidency::Materialized(cpu)) => return Ok(Some(cpu.clone())),
-                Some(TaskCpuResidency::Zone { base, record }) => {
-                    return super::residency::materialize_zone(base, *record).map(Some);
+                Some(TaskCpuResidency::Zone {
+                    base,
+                    record,
+                    origin,
+                }) => {
+                    return super::residency::materialize_zone(base, *record, *origin).map(Some);
                 }
                 None => return Ok(None),
                 Some(TaskCpuResidency::Resident { .. }) => {
@@ -764,9 +773,11 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             Some(TaskCpuResidency::Materialized(cpu)) => Some(cpu),
             // Parked in the in-guest zone: its registers are in the record
             // its handback made host-owned (the job frees it on resume).
-            Some(TaskCpuResidency::Zone { base, record }) => {
-                Some(super::residency::materialize_zone(&base, record)?)
-            }
+            Some(TaskCpuResidency::Zone {
+                base,
+                record,
+                origin,
+            }) => Some(super::residency::materialize_zone(&base, record, origin)?),
             _ => None,
         };
         let cpu = materialized_cpu.as_ref().unwrap_or(initial_cpu);
@@ -1166,6 +1177,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             backend.set_residency(TaskCpuResidency::Zone {
                 base: zone_save.base,
                 record: zone_save.record,
+                origin: zone_save.origin,
             });
             self.resident_task = None;
             self.residency_generation = self.residency_generation.next();

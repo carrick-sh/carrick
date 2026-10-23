@@ -7576,14 +7576,23 @@ fn retained_write_owner_park_ignores_two_signals_until_release_but_kill_wakes() 
                 .expect("SIGKILL must wake")
                 .expect("kill event");
             wakes += 1;
-            assert!(
-                matches!(&event, ContinuationEvent::ReservedSignal(signal) if signal.signum() == carrick_abi::LINUX_SIGKILL)
+            assert_eq!(
+                event,
+                ContinuationEvent::OwnerCancelled(OwnerWaitCancellation::Carrier)
             );
             write.attach_registration(registration).unwrap();
             let result = write.resume(event, &context).unwrap();
             assert_eq!(
                 result.completion,
-                ContinuationCompletion::Errno(carrick_abi::LINUX_EINTR)
+                ContinuationCompletion::OwnerCancelled(OwnerWaitCancellation::Carrier)
+            );
+            assert!(result.reserved_signal().is_none());
+            assert!(
+                context
+                    .signal_authority()
+                    .thread_pending()
+                    .contains(carrick_abi::LINUX_SIGKILL),
+                "owner cancellation must leave delivery with the signal owner"
             );
             assert_eq!(wakes, 1);
         } else {
@@ -7689,7 +7698,17 @@ fn serial_host_native_signal_owner_killable_owner_write_ignores_sigalrm_until_si
             .signum,
         carrick_abi::LINUX_SIGALRM
     );
-    carrick_signal_linux::publish_process_signal(carrick_abi::LINUX_SIGKILL);
+    let page = context.lifecycle_page();
+    let task = carrick_sched_core::process::TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(tid).unwrap(),
+        serial: carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+    };
+    let signals = carrick_el1_linux::native_process_signals::NativeProcessSignals::<()>::fresh_root(
+        task, &page,
+    );
+    signals
+        .enqueue(task, carrick_signal_core::policy::Signal::KILL, None)
+        .unwrap();
     assert_eq!(
         probe.event(),
         Some(ContinuationEvent::OwnerCancelled(
@@ -7698,10 +7717,9 @@ fn serial_host_native_signal_owner_killable_owner_write_ignores_sigalrm_until_si
         "SIGKILL must wake a native killable-owner write park"
     );
     assert_eq!(
-        carrick_signal_linux::take_pending_event_for(tid)
-            .unwrap()
-            .signum,
-        carrick_abi::LINUX_SIGKILL
+        signals.pending_count(),
+        1,
+        "wait probing cannot dequeue SIGKILL"
     );
 }
 

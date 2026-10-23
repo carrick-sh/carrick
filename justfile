@@ -405,6 +405,7 @@ test-loom:
     {{_admit}} {{_cargo}} test --locked -p carrick-fd-core --features loom --lib loom_models
     {{_admit}} {{_cargo}} test --locked -p carrick-kernel --features loom --lib loom_models
     {{_admit}} {{_cargo}} test --locked -p carrick-runtime {{_platform_features}} --features loom --lib terminal_clear_loom
+    {{_admit}} {{_cargo}} test --locked -p carrick-runtime {{_platform_features}} --features loom --lib owner_wait_loom
     {{_admit}} {{_cargo}} test --locked -p carrick-core --features loom --lib loom_models
 
 # The scripted kernel-semantics suites alone (crates/carrick-kernel-example):

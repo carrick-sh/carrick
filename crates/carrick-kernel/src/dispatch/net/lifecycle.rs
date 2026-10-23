@@ -2032,7 +2032,7 @@ impl<'a> NetView<'a> {
             // after both ends existed failed a live thread's valid stack array
             // (#695 control, #708).
             let out = match crate::dispatch::copyout::UserOut::<LinuxFdPair>::new(sv_addr)
-                .prepare(memory)
+                .prepare(cx.kernel, memory)
             {
                 Ok(out) => out,
                 Err(refusal) => return Ok(refusal.into_outcome()),
@@ -3840,7 +3840,7 @@ impl<'a> NetView<'a> {
                 && let Some(OpenDescription::Netlink { pid, groups, .. }) = crate::kernel::FileDescription::inspect(&open_file.description).as_deref()
             {
                 let nl = sockaddr_nl_bytes(*pid, *groups);
-                return Ok(copyout_linux_sockaddr(memory, addr_addr, addrlen_addr, &nl));
+                return Ok(copyout_linux_sockaddr(cx.kernel, memory, addr_addr, addrlen_addr, &nl));
             }
             if let Some(open_file) = this.open_file(fd)
                 && let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description)
@@ -3861,12 +3861,12 @@ impl<'a> NetView<'a> {
                         } else {
                             vec![0u8; 16]
                         };
-                        return Ok(copyout_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes));
+                        return Ok(copyout_linux_sockaddr(cx.kernel, memory, addr_addr, addrlen_addr, &linux_bytes));
                     }
                     OpenDescription::Packet { socket, .. } => {
                         let socket = Arc::clone(socket);
                         drop(open);
-                        return Ok(socket.getsockname(memory, addr_addr, addrlen_addr));
+                        return Ok(socket.getsockname(cx.kernel, memory, addr_addr, addrlen_addr));
                     }
                     _ => {}
                 }
@@ -3891,7 +3891,7 @@ impl<'a> NetView<'a> {
             if let Some(guest_local) = host_authority.guest_local
                 && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_local.0)
             {
-                return Ok(copyout_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes));
+                return Ok(copyout_linux_sockaddr(cx.kernel, memory, addr_addr, addrlen_addr, &linux_bytes));
             }
             if let Ok(Some(guest_local)) = this
                 .network
@@ -3899,7 +3899,7 @@ impl<'a> NetView<'a> {
                 .guest_visible_local_addr(crate::network::SocketKey::for_host_fd(host_fd.get()))
                 && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_local.0)
             {
-                return Ok(copyout_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes));
+                return Ok(copyout_linux_sockaddr(cx.kernel, memory, addr_addr, addrlen_addr, &linux_bytes));
             }
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
@@ -3910,7 +3910,7 @@ impl<'a> NetView<'a> {
             }
             let used = (sa_len as usize).min(sa.len());
             let linux_bytes = host_to_linux_sockaddr(&sa[..used], family, false);
-            Ok(copyout_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes))
+            Ok(copyout_linux_sockaddr(cx.kernel, memory, addr_addr, addrlen_addr, &linux_bytes))
 
         }
 
@@ -3940,7 +3940,7 @@ impl<'a> NetView<'a> {
                         let Some(linux_bytes) = socket_addr_to_linux_sockaddr(peer) else {
                             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                         };
-                        return Ok(copyout_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes));
+                        return Ok(copyout_linux_sockaddr(cx.kernel, memory, addr_addr, addrlen_addr, &linux_bytes));
                     }
                     OpenDescription::Packet { .. } => {
                         return Ok(DispatchOutcome::errno(LINUX_ENOTCONN));
@@ -3967,7 +3967,7 @@ impl<'a> NetView<'a> {
                 let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_peer.0) else {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 };
-                return Ok(copyout_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes));
+                return Ok(copyout_linux_sockaddr(cx.kernel, memory, addr_addr, addrlen_addr, &linux_bytes));
             }
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
@@ -4001,11 +4001,11 @@ impl<'a> NetView<'a> {
                 .guest_visible_peer_addr(crate::network::SocketKey::for_host_fd(host_fd.get()))
                 && let Some(linux_bytes) = socket_addr_to_linux_sockaddr(guest_peer.0)
             {
-                return Ok(copyout_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes));
+                return Ok(copyout_linux_sockaddr(cx.kernel, memory, addr_addr, addrlen_addr, &linux_bytes));
             }
             let used = (sa_len as usize).min(sa.len());
             let linux_bytes = host_to_linux_sockaddr(&sa[..used], family, false);
-            Ok(copyout_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes))
+            Ok(copyout_linux_sockaddr(cx.kernel, memory, addr_addr, addrlen_addr, &linux_bytes))
 
         }
 

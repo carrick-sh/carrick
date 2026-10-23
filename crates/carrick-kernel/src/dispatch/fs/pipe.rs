@@ -954,7 +954,7 @@ impl<'a> FsView<'a> {
             // refusal parks and retries this syscall, which is only clean
             // while no pipe or descriptor exists yet (#711).
             let out = match crate::dispatch::copyout::UserOut::<LinuxFdPair>::new(address)
-                .prepare(memory)
+                .prepare(cx.kernel, memory)
             {
                 Ok(out) => out,
                 Err(refusal) => return Ok(refusal.into_outcome()),

@@ -1802,3 +1802,60 @@ The old requester resumes its untagged Control write before its failed CAS,
 overwriting the replacement's Service handback despite returning Stale.
 This is RED on the under-custody repair at focused bound 3; publishing tagged
 intent and applying payload only under exact owner custody preserves Service.
+
+## One owner for memory waits (`kernel.memory.owner-wait`, #802)
+
+The #711/#802 owner contract is:
+
+- Owner waits are killable-only; stops and handled signals never complete them.
+- Fatal process-wide cancellation (SIGKILL or group exit) stops every waiter's
+  resume, regardless of the thread selected for signal delivery.
+- Cancellation uses native terminal custody for every completion origin:
+  mailbox trap, direct-EL0 IPC record, and physical dependency. A typed origin
+  prevents the direct-EL0 route from publishing a mailbox response or retiring
+  a guest trap completion it does not own.
+- Nothing is consumed before secured copyout, or after cancellation is pending.
+- Writer exclusion is released before re-preparation.
+- All users share one settlement path, including already-ready enrollment.
+
+`vcpu_loop::owner_wait::OwnerWait` owns dependency release and settlement for
+physical, zone and supply-ready resumes. Every cancellation query consults the
+exact lifecycle page's monotonic `CancellationAuthority`; signal delivery
+reservation and native dequeue cannot erase it. Native signal state binds the
+root or freshly admitted child page. Terminal custody consumes the obligation
+without clearing its cause.
+
+A validated fatal request atomically closes effect admission. Its typed
+publication drains existing bounded effects outside signal/topology locks,
+then publishes before queue/wake delivery. `ProcessEffect` is non-cloneable
+and non-Send; prepared output retains it through consumption, copyout and
+cursor/descriptor publication, releasing it before notifications or waits.
+An already-ready resume must acquire effect custody after securing memory.
+This orders actual effects before fatal publication, not merely the earlier
+cancellation sample. Rejected stale targets cannot request cancellation;
+accepted targets that retire during drain fall back to the process queue.
+
+The physical witnesses use real `pipe2` dispatch and `PendingContentWrite`,
+with a live carrier leader and a separately admitted non-leader waiter.
+Against main's physical route, ready SIGKILL committed output, non-leader
+SIGKILL installed descriptors, and immediate/scheduled retry retained writer
+exclusion. The actual leader-reservation tests exercise the delivery gap.
+Native IPC and sleep witnesses need #735's retained-operation prerequisites:
+restoring unconditional trap retirement fails direct-EL0 completion; ordinary
+sleep owner parking wakes on a handled signal before editor release. These
+are regression controls with prerequisites, not pristine-main builds.
+A late-kill test publishes during re-preparation: without effect admission it
+commits one output, with admission none. Empty IPC reads and stale authorized
+SIGKILL posts also have red-first review regression controls.
+
+Six runtime loom models call shipping settlement and cancellation code with
+loom atomic words. They explore editor release, sibling effects, process
+cancellation, nonfatal deferral, two waiters and already-ready enrollment.
+The strict model asserts no consumption after fatal publication. It is not
+an expected panic. There is no preemption/permutation/time cap; each execution
+has a 1,000-branch bound. Core models separately exercise concurrent admission, two admitted effects,
+request/publication and terminal consumption. Production queues, mailbox
+transport, scheduler enrollment and the complete editor-holder audit remain
+outside these models; the production witnesses bind the modeled protocol to
+its adapters. See [input disposition and scope](design/owner-wait-handoff.md).
+Signed HVF acceptance remains director-owned on this Linux worker.

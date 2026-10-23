@@ -673,34 +673,34 @@ impl<'a> NetView<'a> {
                             && flags & LinuxMsgFlags::OOB.bits() == 0
                             && memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
                         {
+                            use super::super::copyout::{self, UserSlot};
                             let copy_len = len.min(4096 - (buf_addr as usize & 4095));
-                            let Some(range) = carrick_guest_mem::GuestWriteRange::new(
-                                carrick_guest_mem::GuestVa::new(buf_addr), copy_len,
-                            ) else {
+                            let address_length = if src_addr != 0 {
+                                let length = match copyout::read_u32_before_effects(memory, src_len_addr) {
+                                    Ok(Ok(length)) => length,
+                                    Ok(Err(fault)) => return Ok(fault.outcome()),
+                                    Err(refusal) => return Ok(refusal.into_outcome()),
+                                };
+                                if (length as i32) < 0 {
+                                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                                }
+                                Some(UserSlot::new(src_len_addr, 4))
+                            } else { None };
+                            let output = match copyout::prepare(cx.kernel, memory,
+                                [Some(UserSlot::new(buf_addr, copy_len)), address_length]) {
+                                Ok(output) => output,
+                                Err(refusal) => return Ok(refusal.into_outcome()),
+                            };
+                            if output.secured_capacity(0) != copy_len
+                                || (address_length.is_some() && output.secured_capacity(1) != 4) {
                                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                            };
-                            let permit = match memory.prepare_write(&[range]) {
-                                Ok(permit) => permit,
-                                Err(error) => return Ok(crate::el1_delegation::owner_prepare_refusal(error)),
-                            };
+                            }
                             let mut target_buf = vec![0u8; copy_len];
                             match socket.recv_stream_flags(&mut target_buf, 0, peek) {
                                 Ok((read_len, _rights)) => {
-                                    permit.commit(&[&target_buf[..read_len]]);
-                                    if src_addr != 0 {
-                                        if src_len_addr == 0 {
-                                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                                        }
-                                        let len_bytes = match memory.read_bytes(src_len_addr, 4) {
-                                            Ok(bytes) => bytes,
-                                            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                                        };
-                                        if i32::from_ne_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) < 0 {
-                                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                                        }
-                                        if memory.write_bytes(src_len_addr, &0u32.to_ne_bytes()).is_err() {
-                                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                                        }
+                                    if let Err(fault) = output.commit(
+                                        [&target_buf[..read_len], &0u32.to_ne_bytes()]) {
+                                        return Ok(fault.outcome());
                                     }
                                     return Ok(DispatchOutcome::returned_len(read_len)?);
                                 }
@@ -869,6 +869,10 @@ impl<'a> NetView<'a> {
                     Ok(permit) => permit,
                     Err(error) => return Ok(crate::el1_delegation::owner_prepare_refusal(error)),
                 };
+                let effect = match super::super::copyout::admit_effect(cx.kernel) {
+                    Ok(effect) => effect,
+                    Err(refusal) => return Ok(refusal.into_outcome()),
+                };
                 let mut bytes = vec![0u8; chunk];
                 // Host sockets are nonblocking and MSG_DONTWAIT is explicit.
                 // EAGAIN drops the permit before the runtime's readiness wait.
@@ -890,10 +894,12 @@ impl<'a> NetView<'a> {
                         {
                             flow.lock_ledger().consume_bytes(count as usize, true);
                         }
+                        drop(effect);
                         return Ok(DispatchOutcome::Returned { value: count as i64 });
                     }
                     Err(errno) => {
                         drop(permit);
+                        drop(effect);
                         if errno == LINUX_EAGAIN {
                             let timeout = this.open_file(fd)
                                 .and_then(|file| crate::kernel::FileDescription::inspect(&file.description)?.recv_timeout());

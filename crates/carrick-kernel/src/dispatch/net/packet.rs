@@ -480,6 +480,7 @@ impl PacketSocket {
 
     pub(crate) fn getsockname<M: CurrentMmMemory>(
         &self,
+        context: &crate::kernel::KernelContext,
         memory: &mut M,
         addr_addr: u64,
         addrlen_addr: u64,
@@ -500,7 +501,7 @@ impl PacketSocket {
             sll.sll_protocol = self.protocol;
         }
         let sll_bytes = sll.as_bytes();
-        super::support::copyout_linux_sockaddr(memory, addr_addr, addrlen_addr, sll_bytes)
+        super::support::copyout_linux_sockaddr(context, memory, addr_addr, addrlen_addr, sll_bytes)
     }
 }
 

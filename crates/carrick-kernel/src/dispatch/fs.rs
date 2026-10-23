@@ -1682,6 +1682,7 @@ impl<'a> FsView<'a> {
     }
 
     pub(super) fn read_host_pipe_iovecs<M: CurrentMmMemory>(
+        context: &crate::kernel::KernelContext,
         memory: &mut M,
         iovecs: &[LinuxIovec],
         target: HostPipeReadTarget<'_>,
@@ -1695,7 +1696,7 @@ impl<'a> FsView<'a> {
             if len == 0 {
                 continue;
             }
-            match read_host_pipe(memory, iov.iov_base, len, target.clone())? {
+            match read_host_pipe(context, memory, iov.iov_base, len, target.clone())? {
                 DispatchOutcome::Returned { value } => {
                     total += value;
                     if value == 0 || (value as usize) < len {

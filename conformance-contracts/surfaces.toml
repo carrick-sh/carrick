@@ -26,7 +26,7 @@ contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.
 
 [[surfaces]]
 path = "crates/carrick-mem/src/memory.rs"
-contracts = ["hvpatch.syscall.portal", "kernel.el1.transparent", "kernel.vcpu.kick-el0-boundary", "kernel.el1.gic", "kernel.el1.guest-scheduler", "kernel.el1.fault-entry", "kernel.el1.stage1-publication", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.memory.owner-wait", "hvpatch.syscall.portal", "kernel.el1.transparent", "kernel.vcpu.kick-el0-boundary", "kernel.el1.gic", "kernel.el1.guest-scheduler", "kernel.el1.fault-entry", "kernel.el1.stage1-publication", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_transparent.rs"
@@ -42,7 +42,7 @@ contracts = ["hvpatch.syscall.portal"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/syscall_mailbox.rs"
-contracts = ["hvpatch.syscall.portal", "kernel.el1.files.cross-process-readers"]
+contracts = ["kernel.memory.owner-wait", "hvpatch.syscall.portal", "kernel.el1.files.cross-process-readers"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/futex.rs"
@@ -50,11 +50,11 @@ contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/continuation.rs"
-contracts = ["kernel.futex.contention", "kernel.futex.requeue", "kernel.signal.temporary-wait-mask", "kernel.signal.socket-restart"]
+contracts = ["kernel.memory.owner-wait", "kernel.futex.contention", "kernel.futex.requeue", "kernel.signal.temporary-wait-mask", "kernel.signal.socket-restart"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/continuation/tests.rs"
-contracts = ["kernel.signal.socket-restart"]
+contracts = ["kernel.memory.owner-wait", "kernel.signal.socket-restart"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/net/lifecycle.rs"
@@ -182,7 +182,7 @@ contracts = ["kernel.fork.stage1-image", "kernel.mm.metadata-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "kernel.el1.task-load-entry", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "process.native.arm-admission"]
+contracts = ["kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "kernel.el1.task-load-entry", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "process.native.arm-admission"]
 
 [[surfaces]]
 path = "crates/carrick-mmu-core/src/aarch64.rs"
@@ -210,7 +210,7 @@ contracts = ["kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.kick-el0-boundary", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication"]
+contracts = ["kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.kick-el0-boundary", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap.rs"
@@ -376,7 +376,7 @@ contracts = ["kernel.execution.native-code-density", "kernel.execution.native-da
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/code_content.rs"
-contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
+contracts = ["kernel.memory.owner-wait", "kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/global_frame.rs"
@@ -440,7 +440,7 @@ contracts = ["kernel.mm.syscall-code-write"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/vmm.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.vcpu.kick-el0-boundary", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "process.native.arm-admission"]
+contracts = ["kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel.vcpu.kick-el0-boundary", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "process.native.arm-admission"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/guest_memory.rs"
@@ -460,7 +460,7 @@ contracts = ["kernel.mm.syscall-code-write", "kernel.signal.socket-restart"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/runtime.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.el1.gic"]
+contracts = ["kernel.memory.owner-wait", "kernel.mm.syscall-code-write", "kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-conformance-next/tests/syscall_write_destinations.rs"
@@ -484,7 +484,7 @@ contracts = ["kernel.wait.process-group"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.files.cross-process-readers", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.task-load-entry"]
+contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "kernel.el1.files.cross-process-readers", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.task-load-entry"]
 
 [[surfaces]]
 path = "fixtures/embed-zone-readers/src/main.rs"
@@ -524,7 +524,7 @@ contracts = ["kernel.el1.address-space-switch", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/threaded.rs"
-contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.el1.stage1-publication"]
+contracts = ["kernel.memory.owner-wait", "kernel.mm.pt-pause-drain-acknowledgement", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/birth_serial.rs"
@@ -548,7 +548,7 @@ contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.vcpu.kick-el0-b
 
 [[surfaces]]
 path = "crates/carrick-mem/src/memory/el1_hook_kick.rs"
-contracts = ["kernel.vcpu.kick-el0-boundary", "kernel.el1.gic", "kernel.el1.guest-scheduler", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.memory.owner-wait", "kernel.vcpu.kick-el0-boundary", "kernel.el1.gic", "kernel.el1.guest-scheduler", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_kick_served_loop.rs"
@@ -676,7 +676,7 @@ contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/zone.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/el1_sched.rs"
@@ -752,7 +752,7 @@ contracts = ["kernel.mm.image-page-permissions"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/mod.rs"
-contracts = ["kernel.mm.image-page-permissions", "kernel.signal.temporary-wait-mask", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.memory.owner-wait", "kernel.mm.image-page-permissions", "kernel.signal.temporary-wait-mask", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/hvpatch/mod.rs"
@@ -1358,7 +1358,7 @@ contracts = []
 
 [[surfaces]]
 path = "crates/carrick-core/src/terminal.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.el1.thread-lifecycle", "process.native.terminal-child"]
+contracts = ["kernel.el1.thread-lifecycle", "process.native.terminal-child", "kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-kernel-example/src/personality.rs"
@@ -1438,7 +1438,7 @@ contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-chil
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
-contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-child", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "process.native.terminal-child", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/internal_read.rs"
@@ -1510,7 +1510,7 @@ contracts = ["kernel.scheduler.runnable-progress", "process.native.arm-admission
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
-contracts = ["kernel.scheduler.runnable-progress", "process.native.arm-admission", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "process.native.arm-admission", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/file_region.rs"
@@ -1695,7 +1695,7 @@ contracts = ["kernel.el1.thread-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/copyout.rs"
-contracts = ["kernel.copyout.owner-refusal"]
+contracts = ["kernel.memory.owner-wait", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/copyout_tests.rs"
@@ -1765,6 +1765,54 @@ contracts = ["kernel.scheduler.runnable-progress"]
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/image_layout_tests.rs"
 contracts = ["kernel.fork.stage1-image", "kernel.el1.metadata-allocation", "kernel.mm.image-page-permissions"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/mod.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/outcome.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/time.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/continuation/ipc.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/lib.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/continuation/quantum.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/continuation/tests.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/executor/residency.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/executor/tests.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/owner_wait.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/owner_wait_loom.rs"
+contracts = ["kernel.memory.owner-wait"]
 
 [[surfaces]]
 path = "crates/carrick-core/src/cancellation.rs"

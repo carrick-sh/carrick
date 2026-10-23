@@ -123,7 +123,7 @@
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/net/send_recv.rs",
-      "ceiling": 40
+      "ceiling": 39
     },
     {
       "path": "crates/carrick-kernel/src/dispatch/net/sockopt.rs",

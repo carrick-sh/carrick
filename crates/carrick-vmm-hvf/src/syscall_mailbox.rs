@@ -10,7 +10,7 @@ use carrick_aarch64::mailbox::{
     MailboxState, PortalSessionWire, PortalState, validate_request_metadata,
 };
 use carrick_guest_mem::Aarch64SyscallFrame;
-use carrick_hal::threaded::Aarch64SyscallContinuationV1;
+use carrick_hal::threaded::{Aarch64SyscallContinuationV1, NativeOwnerWaitOrigin};
 use carrick_observability::probes::SyscallMailboxPhase;
 
 pub use carrick_mem::memory::{
@@ -1150,18 +1150,39 @@ impl MailboxBinding {
         }
     }
 
-    pub fn publish_native_owner_cancel(&mut self) -> Result<(), MailboxConsumeError> {
-        self.require_request_ready()?;
-        // SAFETY: stopped host owns this RequestReady response. No result is
-        // written: EL1 must enter fatal native custody before any EL0 return.
+    pub fn publish_native_owner_cancel(
+        &mut self,
+        origin: NativeOwnerWaitOrigin,
+    ) -> Result<(), MailboxConsumeError> {
+        match origin {
+            NativeOwnerWaitOrigin::HostTrap => self.require_request_ready()?,
+            NativeOwnerWaitOrigin::HostEl0 => {
+                // Export authenticates the live lease and rejects all other
+                // non-idle protocol states. EL0 must own no continuation.
+                if self.export_task_continuation()?.is_some() {
+                    return Err(MailboxConsumeError::Protocol(
+                        MailboxProtocolError::UnexpectedState {
+                            expected: MailboxState::Idle,
+                            actual: self.state().load(Ordering::Acquire),
+                        },
+                    ));
+                }
+            }
+        }
+        // SAFETY: the stopped host owns this slot. Only the hook selector is
+        // written; no result is fabricated for either completion origin.
         unsafe {
             self.write_volatile(
                 core::ptr::addr_of_mut!((*self.host.as_ptr()).response_action),
                 MailboxResponseAction::NativeOwnerCancel.raw(),
             );
         }
-        self.state()
-            .store(MailboxState::ResponseReady.raw(), Ordering::Release);
+        if origin == NativeOwnerWaitOrigin::HostTrap {
+            self.state()
+                .store(MailboxState::ResponseReady.raw(), Ordering::Release);
+        }
+        // HostEl0 enters the very same hook with an Idle mailbox, like the
+        // mailbox trampoline after it consumes a NativeOwnerCancel response.
         Ok(())
     }
 
@@ -1786,7 +1807,7 @@ mod tests {
     /// `go build`); a record that predated its lease did the same for the
     /// moved thread.
     #[test]
-    fn a_mailbox_lease_owns_its_el1_current_task_record() {
+    fn serial_host_a_mailbox_lease_owns_its_el1_current_task_record() {
         let region = carrick_test_support::TestEl1Region::zeroed();
         let previous = carrick_el1_abi::get_el1_region_host_ptr();
         carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
@@ -1933,7 +1954,14 @@ mod tests {
         publish_valid_request(&binding, &mut mailbox);
         binding.take_request().unwrap().expect("request");
         mailbox.return_value = 0xfeed_face;
-        binding.publish_native_owner_cancel().unwrap();
+        assert!(
+            binding
+                .publish_native_owner_cancel(NativeOwnerWaitOrigin::HostEl0)
+                .is_err()
+        );
+        binding
+            .publish_native_owner_cancel(NativeOwnerWaitOrigin::HostTrap)
+            .unwrap();
         assert_eq!(mailbox.return_value, 0xfeed_face);
         assert_eq!(
             mailbox.response_action,
@@ -1944,6 +1972,31 @@ mod tests {
             mailbox.state.load(Ordering::Acquire),
             MailboxState::ResponseReady.raw()
         );
+    }
+
+    #[test]
+    fn native_owner_cancel_from_el0_keeps_idle_without_syscall_authority() {
+        let (mut binding, mut mailbox) = binding();
+        assert!(binding.export_task_continuation().unwrap().is_none());
+        mailbox.return_value = 0xfeed_face;
+        assert!(
+            binding
+                .publish_native_owner_cancel(NativeOwnerWaitOrigin::HostTrap)
+                .is_err()
+        );
+        binding
+            .publish_native_owner_cancel(NativeOwnerWaitOrigin::HostEl0)
+            .unwrap();
+        assert_eq!(mailbox.return_value, 0xfeed_face);
+        assert_eq!(
+            mailbox.response_action,
+            MailboxResponseAction::NativeOwnerCancel.raw()
+        );
+        assert_eq!(
+            mailbox.state.load(Ordering::Acquire),
+            MailboxState::Idle.raw()
+        );
+        assert!(binding.export_task_continuation().unwrap().is_none());
     }
 
     #[test]

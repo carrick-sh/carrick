@@ -1954,6 +1954,7 @@ pub(crate) fn owner_prepare_refusal_after(
 
 #[allow(clippy::too_many_arguments)]
 fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
     description: &FileDescription,
     nr: usize,
     args: [u64; 3],
@@ -2003,6 +2004,10 @@ fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
         let permit = match memory.prepare_write(&[range]) {
             Ok(permit) => permit,
             Err(error) => return Some(owner_prepare_refusal_after(error, delivered)),
+        };
+        let effect = match crate::dispatch::copyout::admit_effect(context) {
+            Ok(effect) => effect,
+            Err(refusal) => return Some(refusal.into_outcome()),
         };
         let file_guard = lock_delegated_file(file, handle);
         if !record.is_bound_to(file)
@@ -2072,8 +2077,9 @@ fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
         if let Some(bytes) = user.pending {
             permit.commit(&[&bytes]);
         }
-        crate::el1_inotify::deliver_owed_wakes();
         delivered += value as u64;
+        drop(effect);
+        crate::el1_inotify::deliver_owed_wakes();
         if value == 0 {
             break;
         }
@@ -2113,6 +2119,7 @@ static HOST_SERVED: AtomicUsize = AtomicUsize::new(0);
 /// be served here exactly and the caller takes the ordinary path, whose guard
 /// accessor recalls first.
 pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
     description: &FileDescription,
     nr: usize,
     args: [u64; 3],
@@ -2137,6 +2144,7 @@ pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
         && memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
     {
         return serve_prepared_owner_read(
+            context,
             description,
             nr,
             args,
@@ -3828,6 +3836,9 @@ mod tests {
             // write(fd, 0x1000, 3) at the delegated offset 0.
             assert_eq!(
                 returned(serve_on_host(
+                    &crate::dispatch::SyscallDispatcher::new()
+                        .capture_one_task_context()
+                        .unwrap(),
                     &open.description,
                     64,
                     [0x1000, 3, 0],
@@ -3837,12 +3848,23 @@ mod tests {
             );
             // lseek(fd, 0, SEEK_SET).
             assert_eq!(
-                returned(serve_on_host(&open.description, 62, [0, 0, 0], &mut memory)),
+                returned(serve_on_host(
+                    &crate::dispatch::SyscallDispatcher::new()
+                        .capture_one_task_context()
+                        .unwrap(),
+                    &open.description,
+                    62,
+                    [0, 0, 0],
+                    &mut memory
+                )),
                 0
             );
             // read(fd, 0x1003, 3) reads back what the write stored.
             assert_eq!(
                 returned(serve_on_host(
+                    &crate::dispatch::SyscallDispatcher::new()
+                        .capture_one_task_context()
+                        .unwrap(),
                     &open.description,
                     63,
                     [0x1003, 3, 0],
@@ -3865,7 +3887,18 @@ mod tests {
             delegate_default(&open, 3).unwrap();
             let mut memory = crate::dispatch::outcome::LinearMemory::new(0x1000, vec![0; 4]);
             // The buffer is outside guest memory: the host path must take over.
-            assert!(serve_on_host(&open.description, 63, [0x9000, 3, 0], &mut memory).is_none());
+            assert!(
+                serve_on_host(
+                    &crate::dispatch::SyscallDispatcher::new()
+                        .capture_one_task_context()
+                        .unwrap(),
+                    &open.description,
+                    63,
+                    [0x9000, 3, 0],
+                    &mut memory
+                )
+                .is_none()
+            );
             recall(&open.description).unwrap();
         }
 

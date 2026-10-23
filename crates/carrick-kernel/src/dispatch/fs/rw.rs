@@ -1632,6 +1632,7 @@ impl<'a> FsView<'a> {
             if let Some(delegated) = this.open_file(fd.0)
                 && delegated.description.delegation_handle() != 0
                 && let Some(outcome) = crate::el1_delegation::serve_on_host(
+                    cx.kernel,
                     &delegated.description,
                     62,
                     [offset, whence, 0],
@@ -2011,6 +2012,7 @@ impl<'a> FsView<'a> {
                         )?;
                     }
                     return read_host_pipe(
+                    cx.kernel,
                         memory,
                         address,
                         length,
@@ -2032,6 +2034,7 @@ impl<'a> FsView<'a> {
             // through to the path below, whose accessor recalls first.
             if open_file.description.delegation_handle() != 0
                 && let Some(outcome) = crate::el1_delegation::serve_on_host(
+                    cx.kernel,
                     &open_file.description,
                     63,
                     [buf.raw(), count, 0],
@@ -2143,18 +2146,15 @@ impl<'a> FsView<'a> {
             {
                 if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
                     let (copied, refusal) = read_from_repeatable_owner_at(
+                        cx.kernel,
                         memory,
                         address,
                         length,
-                        *offset,
+                        offset,
                         |at, bytes| contents.read_at(at as u64, bytes),
                     )?;
-                    *offset += copied;
                     return Ok(match refusal {
-                        Some(error) => crate::el1_delegation::owner_prepare_refusal_after(
-                            error,
-                            copied as u64,
-                        ),
+                        Some(outcome) => outcome,
                         None => DispatchOutcome::returned_len_or_errno(copied),
                     });
                 }
@@ -2169,22 +2169,19 @@ impl<'a> FsView<'a> {
                 let data = contents.read();
                 if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
                     let (copied, refusal) = read_from_repeatable_owner_at(
+                        cx.kernel,
                         memory,
                         address,
                         length,
-                        *offset,
+                        offset,
                         |at, bytes| {
                             let source = data.read_range(at, bytes.len());
                             bytes[..source.len()].copy_from_slice(&source);
                             Ok(source.len())
                         },
                     )?;
-                    *offset += copied;
                     return Ok(match refusal {
-                        Some(error) => crate::el1_delegation::owner_prepare_refusal_after(
-                            error,
-                            copied as u64,
-                        ),
+                        Some(outcome) => outcome,
                         None => DispatchOutcome::returned_len_or_errno(copied),
                     });
                 }
@@ -2423,6 +2420,7 @@ impl<'a> FsView<'a> {
                         return Ok(DispatchOutcome::returned_len_or_errno(staged.len()));
                     }
                     let outcome = read_host_pipe(
+                    cx.kernel,
                         memory,
                         address,
                         length,
@@ -2488,6 +2486,7 @@ impl<'a> FsView<'a> {
                     let host_fd_owner = host_fd.clone();
                     drop(open);
                     let res = read_host_pipe(
+                    cx.kernel,
                         memory,
                         address,
                         length,
@@ -2554,6 +2553,7 @@ impl<'a> FsView<'a> {
                     let host_fd_raw = host_io.raw();
                     host_io.record_sequential_io();
                     let outcome = read_host_pipe(
+                    cx.kernel,
                         memory,
                         address,
                         length,
@@ -2668,6 +2668,7 @@ impl<'a> FsView<'a> {
                 }
                 drop(open);
                 let outcome = Self::read_host_pipe_iovecs(
+                    cx.kernel,
                     memory,
                     &iovecs,
                     HostPipeReadTarget::new(
@@ -2717,6 +2718,7 @@ impl<'a> FsView<'a> {
                         return Ok(DispatchOutcome::returned_len_or_errno(read_len));
                     }
                     let outcome = Self::read_host_pipe_iovecs(
+                    cx.kernel,
                         memory,
                         &iovecs,
                         HostPipeReadTarget::new(
@@ -2746,6 +2748,7 @@ impl<'a> FsView<'a> {
                     drop(open);
                     let flows = open_file.description.common().socket_flows();
                     let res = Self::read_host_pipe_iovecs(
+                    cx.kernel,
                         memory,
                         &iovecs,
                         HostPipeReadTarget::new(
@@ -2939,6 +2942,7 @@ impl<'a> FsView<'a> {
             if let Some(delegated) = this.open_file(fd.0)
                 && delegated.description.delegation_handle() != 0
                 && let Some(outcome) = crate::el1_delegation::serve_on_host(
+                    cx.kernel,
                     &delegated.description,
                     67,
                     [buf.raw(), count, offset],
@@ -2998,6 +3002,7 @@ impl<'a> FsView<'a> {
                 let host_fd_raw = host_io.raw();
                 let length = length.min(crate::dispatch::MAX_RW_COUNT);
                 let outcome = read_host_pipe_at(
+                    cx.kernel,
                     memory,
                     buffer,
                     length,
@@ -3018,17 +3023,18 @@ impl<'a> FsView<'a> {
             if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
                 let result = match &*open {
                     OpenDescription::File { contents, .. } => Some(
-                        read_from_repeatable_owner_at(memory, buffer, length, offset, |at, bytes| {
+                        read_from_repeatable_owner_at(cx.kernel, memory, buffer, length, &mut { offset }, |at, bytes| {
                             contents.read_at(at as u64, bytes)
                         })?,
                     ),
                     OpenDescription::InMemoryFile { contents, .. } => {
                         let data = contents.read();
                         Some(read_from_repeatable_owner_at(
+                        cx.kernel,
                             memory,
                             buffer,
                             length,
-                            offset,
+                            &mut { offset },
                             |at, bytes| {
                                 let source = data.read_range(at, bytes.len());
                                 bytes[..source.len()].copy_from_slice(&source);
@@ -3040,10 +3046,7 @@ impl<'a> FsView<'a> {
                 };
                 if let Some((copied, refusal)) = result {
                     return Ok(match refusal {
-                        Some(error) => crate::el1_delegation::owner_prepare_refusal_after(
-                            error,
-                            copied as u64,
-                        ),
+                        Some(outcome) => outcome,
                         None => DispatchOutcome::returned_len_or_errno(copied),
                     });
                 }
@@ -3249,9 +3252,9 @@ impl<'a> FsView<'a> {
                     )
                     .with_host_wait(host_wait_ref);
                     let outcome = if read_at_current {
-                        read_host_pipe(memory, iov.iov_base, len, target)?
+                        read_host_pipe(cx.kernel, memory, iov.iov_base, len, target)?
                     } else {
-                        read_host_pipe_at(memory, iov.iov_base, len, cur as i64, target)?
+                        read_host_pipe_at(cx.kernel, memory, iov.iov_base, len, cur as i64, target)?
                     };
                     match outcome {
                         DispatchOutcome::Returned { value } => {
@@ -3337,6 +3340,7 @@ impl<'a> FsView<'a> {
             if let Some(ref delegated) = open_file
                 && delegated.description.delegation_handle() != 0
                 && let Some(outcome) = crate::el1_delegation::serve_on_host(
+                    cx.kernel,
                     &delegated.description,
                     68,
                     [buf.raw(), count, offset],
@@ -3488,6 +3492,7 @@ impl<'a> FsView<'a> {
             if let Some(ref delegated) = open_file
                 && delegated.description.delegation_handle() != 0
                 && let Some(outcome) = crate::el1_delegation::serve_on_host(
+                    cx.kernel,
                     &delegated.description,
                     64,
                     [buf.raw(), count, 0],

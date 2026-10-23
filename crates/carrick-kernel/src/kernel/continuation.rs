@@ -1628,6 +1628,8 @@ impl BlockedContinuation {
             | DispatchOutcome::SchedulerYield
             | DispatchOutcome::Errno { .. }
             | DispatchOutcome::WriteCopyInSuspended(_)
+            | DispatchOutcome::SleepCopyInSuspended(_)
+            | DispatchOutcome::OwnerCancelled(_)
             | DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }
             | DispatchOutcome::OwnerPhysicalWait { .. }

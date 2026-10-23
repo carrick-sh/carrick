@@ -514,3 +514,10 @@ mod rosetta_detection_tests {
 
 #[cfg(test)]
 mod test_hooks;
+
+// Exercise the production mailbox protocol without linking the macOS VMM.
+// The implementation has no platform calls; its hardware adapter stays in HVF.
+#[cfg(all(test, not(target_os = "macos")))]
+#[path = "../../carrick-vmm-hvf/src/syscall_mailbox.rs"]
+#[allow(dead_code)]
+mod hvf_mailbox_tests;

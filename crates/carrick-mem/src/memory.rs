@@ -4802,6 +4802,17 @@ const EL0_IRQ_HOOK_OFFSET: usize = 0x2000;
 /// Synthetic EL0 return checkpoint after a host-forwarded syscall. It shares
 /// the IRQ hook's 4 KiB code island but does not acknowledge a physical IRQ.
 const EL0_SIGNAL_HOOK_OFFSET: usize = 0x2800;
+
+// Reserve the last 32 bytes of the signal hook island for its fatal entry.
+const NATIVE_OWNER_CANCEL_ENTRY_OFFSET: usize = EL0_FAULT_HOOK_OFFSET - 32;
+
+/// Durable entry to the existing fatal checkpoint. The entry PC survives
+/// executor migration; its prefix re-establishes the fatal selector in the
+/// destination's Idle mailbox before the shared signal hook reads it.
+pub const fn native_owner_cancel_entry() -> u64 {
+    LINUX_EL1_VECTORS_BASE + NATIVE_OWNER_CANCEL_ENTRY_OFFSET as u64
+}
+
 /// The EL0 fault hook: the lower-EL sync slot branches here for EC 0x20
 /// instruction aborts and EC 0x24 data aborts,
 /// saving all architectural registers, ESR and FAR, calling the EL1 image, and forwarding
@@ -5294,7 +5305,7 @@ fn write_el1_hook(
         cursor
             <= match entry {
                 HookEntry::Irq => EL0_SIGNAL_HOOK_OFFSET,
-                HookEntry::SignalCheck => EL0_FAULT_HOOK_OFFSET,
+                HookEntry::SignalCheck => NATIVE_OWNER_CANCEL_ENTRY_OFFSET,
                 _ => hook_offset + 0x1000,
             },
         "EL1 hook overruns its 4 KiB of the vector page"
@@ -6075,6 +6086,28 @@ fn el1_vectors_bytes_mailbox_with_layout(
             irq,
             HookEntry::SignalCheck,
         );
+        // The source executor's Idle mailbox is not task state. Reconstruct
+        // the fatal selector after a reload instead of relying on its payload.
+        // Preserve x16; the ordinary signal hook owns every remaining step.
+        for (index, opcode) in [
+            enc_str_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+            enc_movz_w16(6), // MailboxResponseAction::NativeOwnerCancel
+            enc_str_wt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION),
+            enc_ldr_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+            enc_b(
+                (NATIVE_OWNER_CANCEL_ENTRY_OFFSET + 16) as u64,
+                EL0_SIGNAL_HOOK_OFFSET as u64,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put(
+                &mut bytes,
+                NATIVE_OWNER_CANCEL_ENTRY_OFFSET + index * 4,
+                opcode,
+            );
+        }
         if irq == El1IrqMode::Gic {
             let _ = write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);
         }

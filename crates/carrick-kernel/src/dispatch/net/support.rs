@@ -1908,12 +1908,13 @@ pub(in crate::dispatch) enum PreparedSockaddr<'m, M: CurrentMmMemory> {
     Faulted,
 }
 
-pub(in crate::dispatch) fn prepare_linux_sockaddr<M: CurrentMmMemory>(
-    memory: &mut M,
+pub(in crate::dispatch) fn prepare_linux_sockaddr<'m, M: CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
+    memory: &'m mut M,
     addr: u64,
     addrlen_addr: u64,
     actual_len: usize,
-) -> Result<PreparedSockaddr<'_, M>, crate::dispatch::copyout::CopyoutRefusal> {
+) -> Result<PreparedSockaddr<'m, M>, crate::dispatch::copyout::CopyoutRefusal> {
     use crate::dispatch::copyout::{UserSlot, prepare, read_u32_before_effects};
     let cur = match read_u32_before_effects(memory, addrlen_addr)? {
         Ok(cur) => cur as usize,
@@ -1921,6 +1922,7 @@ pub(in crate::dispatch) fn prepare_linux_sockaddr<M: CurrentMmMemory>(
     };
     let capacity = cur.min(actual_len);
     Ok(PreparedSockaddr::Ready(prepare(
+        context,
         memory,
         [
             UserSlot::optional(addr, capacity),
@@ -1947,12 +1949,13 @@ impl<M: CurrentMmMemory> PreparedSockaddr<'_, M> {
 /// Prepare and commit a sockaddr from a handler with nothing irrevocable
 /// behind it (getsockname, getpeername): a refusal or fault is the answer.
 pub(in crate::dispatch) fn copyout_linux_sockaddr(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     addr: u64,
     addrlen_addr: u64,
     bytes: &[u8],
 ) -> DispatchOutcome {
-    match prepare_linux_sockaddr(memory, addr, addrlen_addr, bytes.len()) {
+    match prepare_linux_sockaddr(context, memory, addr, addrlen_addr, bytes.len()) {
         Ok(out) => match out.commit(bytes) {
             Ok(()) => DispatchOutcome::Returned { value: 0 },
             Err(fault) => fault.outcome(),

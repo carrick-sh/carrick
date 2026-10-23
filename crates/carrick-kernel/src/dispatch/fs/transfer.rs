@@ -1746,6 +1746,7 @@ impl<'a> FsView<'a> {
                     Ok(this.splice_write_out(cx.kernel.container().tty_registry(), SpliceOutputTarget { fd: fd.0, offset_address: 0, nonblocking }, bytes, memory, tid))
                 }
                 VmDir::ReadHost(hfd, owner) => Ok(Self::read_host_pipe_iovecs(
+                    cx.kernel,
                     memory,
                     &iovecs,
                     HostPipeReadTarget::new(

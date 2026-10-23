@@ -262,6 +262,12 @@ pub enum IpcHostOutcome {
         nr: u32,
         timeout_ms: Option<i32>,
     },
+    /// The output was refused before consuming anything. Keep the operation
+    /// and its endpoint pin while the existing owner-memory machinery waits.
+    OwnerMemory {
+        token: IpcOpToken,
+        outcome: Box<crate::dispatch::DispatchOutcome>,
+    },
     /// Still waiting on `lane`: park the thread with `token` (resumption at
     /// the SVC; EL1 or the host takes the token before any fd lookup).
     Blocked {
@@ -271,6 +277,62 @@ pub enum IpcHostOutcome {
         x0: u64,
         nr: u32,
     },
+}
+
+/// An operation retained across an owner-memory wait. Cancellation releases
+/// the exact endpoint pin once; resumption never looks the numeric fd up again.
+pub struct RetainedIpcOperation {
+    token: Option<IpcOpToken>,
+    service: ZoneHostServices,
+}
+
+impl RetainedIpcOperation {
+    pub fn new(kernel: &crate::kernel::Kernel, token: IpcOpToken) -> Result<Self, IpcError> {
+        let service = ZoneHostServices::new(kernel)?;
+        service.owner.region().operation(&token)?;
+        Ok(Self {
+            token: Some(token),
+            service,
+        })
+    }
+
+    pub fn object(&self) -> Result<IpcObjectHandle, IpcError> {
+        let token = self.token.as_ref().ok_or(IpcError::Stale)?;
+        Ok(IpcObjectHandle::from_raw(
+            self.service.owner.region().operation(token)?.object,
+        ))
+    }
+
+    pub fn resume<M: carrick_guest_mem::CurrentMmMemory>(
+        mut self,
+        context: &crate::kernel::KernelContext,
+        mm: IpcMmKey,
+        memory: &mut M,
+    ) -> Result<IpcHostOutcome, IpcError> {
+        let token = self.token.take().ok_or(IpcError::Stale)?;
+        let raw = token.into_raw();
+        let outcome = complete_handback(
+            context,
+            &self.service.owner.region(),
+            IpcOpToken::from_raw(raw),
+            mm,
+            memory,
+            None,
+            &self.service,
+        );
+        if outcome.is_err() {
+            self.token = Some(IpcOpToken::from_raw(raw));
+        }
+        outcome
+    }
+}
+
+impl Drop for RetainedIpcOperation {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            let _ = finish(&self.service.owner.region(), token, &self.service);
+        }
+    }
 }
 
 /// The owned operation a handback frame names (its packed token in `x0`).
@@ -388,15 +450,32 @@ const HOST_STEP_BYTES: u64 = 1 << 20;
 /// IPC lock: copies in are served from a prefix read before the lock, and
 /// copies out are validated under it and landed after it.
 struct HostCopy<'m, M: carrick_guest_mem::CurrentMmMemory> {
-    memory: &'m mut M,
+    output: HostOutput<'m, M>,
     prefetch_va: u64,
     prefetch: Vec<u8>,
     pending: Vec<(u64, Vec<u8>)>,
 }
 
+enum HostOutput<'m, M: carrick_guest_mem::CurrentMmMemory> {
+    Legacy(&'m mut M),
+    Prepared {
+        copyout: crate::dispatch::copyout::PreparedCopyout<'m, M, 1>,
+        base: u64,
+        capacity: usize,
+    },
+}
+
 impl<M: carrick_guest_mem::CurrentMmMemory> UserCopy for HostCopy<'_, M> {
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
-        if !self.memory.guest_range_is_writable(dst_va, src.len()) {
+        let writable = match &self.output {
+            HostOutput::Legacy(memory) => memory.guest_range_is_writable(dst_va, src.len()),
+            HostOutput::Prepared { base, capacity, .. } => dst_va
+                .checked_sub(*base)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .and_then(|offset| offset.checked_add(src.len()))
+                .is_some_and(|end| end <= *capacity),
+        };
+        if !writable {
             return false;
         }
         self.pending.push((dst_va, src.to_vec()));
@@ -424,12 +503,15 @@ impl<M: carrick_guest_mem::CurrentMmMemory> UserCopy for HostCopy<'_, M> {
 impl<M: carrick_guest_mem::CurrentMmMemory> HostCopy<'_, M> {
     /// Read the longest readable prefix of `[va, va+len)` before any lock.
     fn prefetch(&mut self, va: u64, len: u64) {
+        let HostOutput::Legacy(memory) = &self.output else {
+            return;
+        };
         self.prefetch_va = va;
         self.prefetch.clear();
         let mut at = 0u64;
         while at < len {
             let n = (len - at).min(4096 - (va + at) % 4096);
-            match self.memory.read_bytes(va + at, n as usize) {
+            match memory.read_bytes(va + at, n as usize) {
                 Ok(bytes) => self.prefetch.extend_from_slice(&bytes),
                 Err(_) => break,
             }
@@ -437,12 +519,28 @@ impl<M: carrick_guest_mem::CurrentMmMemory> HostCopy<'_, M> {
         }
     }
 
-    fn land(&mut self) -> bool {
-        let mut landed = true;
-        for (va, bytes) in self.pending.drain(..) {
-            landed &= self.memory.write_bytes(va, &bytes).is_ok();
+    fn land(self) -> (bool, Option<crate::dispatch::copyout::OwnerEffect>) {
+        match self.output {
+            HostOutput::Prepared { copyout, .. } => {
+                if self.pending.is_empty() {
+                    return (true, copyout.cancel_retaining());
+                }
+                let bytes: Vec<u8> = self
+                    .pending
+                    .into_iter()
+                    .flat_map(|(_, bytes)| bytes)
+                    .collect();
+                let (landed, effect) = copyout.commit_retaining([&bytes]);
+                (landed.is_ok(), effect)
+            }
+            HostOutput::Legacy(memory) => {
+                let mut landed = true;
+                for (va, bytes) in self.pending {
+                    landed &= memory.write_bytes(va, &bytes).is_ok();
+                }
+                (landed, None)
+            }
         }
-        landed
     }
 }
 
@@ -456,6 +554,7 @@ fn errno(e: LinuxErrno) -> i64 {
 /// `signal` is a deliverable signal (or control action) pending for the
 /// thread: a continuation stops for it instead of taking more effects.
 pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
+    context: &crate::kernel::KernelContext,
     region: &IpcRegion<'_>,
     token: IpcOpToken,
     mm: IpcMmKey,
@@ -509,8 +608,46 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
         op.pin = pin.into_raw();
         flags.map_err(IpcError::Fd)?
     };
+    let output = if matches!(op.kind, IpcOpKind::PipeRead | IpcOpKind::EventFdRead)
+        && memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
+    {
+        use crate::dispatch::copyout::{self, UserSlot};
+        let base = op.buf.0.wrapping_add(op.progress.written);
+        // One page-bounded permit, before locking the source. A read may
+        // return this exact prefix; no byte outside it can be consumed.
+        let capacity = if op.kind == IpcOpKind::EventFdRead {
+            8
+        } else {
+            op.progress
+                .remaining()
+                .min(
+                    (carrick_el1::substrate::ipc::USER_COPY_GRANULE
+                        - base % carrick_el1::substrate::ipc::USER_COPY_GRANULE)
+                        as usize,
+                )
+                .min(copyout::COPYOUT_MAX_BYTES)
+        };
+        let copyout = match copyout::prepare(context, memory, [Some(UserSlot::new(base, capacity))])
+        {
+            Ok(copyout) => copyout,
+            Err(refusal) => {
+                return Ok(IpcHostOutcome::OwnerMemory {
+                    token,
+                    outcome: Box::new(refusal.into_outcome()),
+                });
+            }
+        };
+        let capacity = copyout.secured_capacity(0);
+        HostOutput::Prepared {
+            copyout,
+            base,
+            capacity,
+        }
+    } else {
+        HostOutput::Legacy(memory)
+    };
     let mut user = HostCopy {
-        memory,
+        output,
         prefetch_va: 0,
         prefetch: Vec::new(),
         pending: Vec::new(),
@@ -525,8 +662,9 @@ pub fn complete_handback<M: carrick_guest_mem::CurrentMmMemory>(
         let (status, wake_set) = transfer(&mut guard, &mut op, &mut copy)?;
         (status, guard.publish(wake_set))
     };
-    let landed = user.land();
+    let (landed, effect) = user.land();
     region.update_operation(&token, op)?;
+    drop(effect);
     if published.readers || published.writers {
         wake.wake(published);
     }

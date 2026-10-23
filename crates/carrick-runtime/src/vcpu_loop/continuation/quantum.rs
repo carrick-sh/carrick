@@ -187,13 +187,14 @@ impl HvpatchTaskQuantum {
     }
 }
 
-/// A thread its own job parked in the in-guest zone: at the save that
-/// follows, its registers are in `record`, not on the vCPU. `base` is the
-/// task-invariant state (translation, controls, generations) the loader
-/// combines with the record's EL0 context.
+/// A thread its own job parked in the in-guest zone. `origin` selects the
+/// register authority: a guest operation resumes the record's context with
+/// `base` translation state; a host operation retains the exact `base` frame
+/// until host completion, with the record serving only as a wake receipt.
 pub(crate) struct ZoneSave {
     pub(crate) base: carrick_hal::threaded::GuestCpuState,
     pub(crate) record: carrick_el1_abi::RecordRef,
+    pub(crate) origin: crate::vcpu_loop::executor::residency::ZoneResumeOrigin,
 }
 
 pub(crate) struct HvpatchTaskBinding {

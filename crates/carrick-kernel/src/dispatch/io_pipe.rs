@@ -172,6 +172,7 @@ fn host_read_into(
 }
 
 fn read_host_pipe_into_owner(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     guest_addr: u64,
     buf: &mut [u8],
@@ -230,6 +231,10 @@ fn read_host_pipe_into_owner(
                 )));
             }
         };
+        let effect = match super::copyout::admit_effect(context) {
+            Ok(effect) => effect,
+            Err(refusal) => return Ok(refusal.into_outcome()),
+        };
         // A positioned read must advance the explicit offset by the prefix;
         // ordinary read advances the shared host description itself.
         let chunk_target = if let Some(base) = target.offset {
@@ -263,6 +268,7 @@ fn read_host_pipe_into_owner(
         let count = n as usize;
         prepared.commit(&[&buf[delivered..delivered + count]]);
         delivered += count;
+        drop(effect);
         if count < page_left || (target.socket_flow.is_some() && !target.is_stream) {
             break;
         }
@@ -276,13 +282,14 @@ fn read_host_pipe_into_owner(
 /// non-blocking guest fd gets EAGAIN. Never blocks under the dispatcher lock.
 /// `nonblocking` is the guest's intended mode (status_flags / O_NONBLOCK).
 pub(crate) fn read_host_pipe_into(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     guest_addr: u64,
     buf: &mut [u8],
     target: HostPipeReadTarget<'_>,
 ) -> Result<DispatchOutcome, super::outcome::DispatchError> {
     if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
-        return read_host_pipe_into_owner(memory, guest_addr, buf, target);
+        return read_host_pipe_into_owner(context, memory, guest_addr, buf, target);
     }
     let HostPipeReadTarget {
         host_fd,
@@ -429,13 +436,20 @@ fn deliver_writable_prefix(
 }
 
 pub(crate) fn read_host_pipe_at(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     guest_addr: u64,
     length: usize,
     offset: i64,
     target: HostPipeReadTarget<'_>,
 ) -> Result<DispatchOutcome, super::outcome::DispatchError> {
-    read_host_pipe(memory, guest_addr, length, target.with_offset(offset))
+    read_host_pipe(
+        context,
+        memory,
+        guest_addr,
+        length,
+        target.with_offset(offset),
+    )
 }
 
 /// Read from a host fd straight into a raw guest-memory destination, without
@@ -513,6 +527,7 @@ fn read_host_pipe_raw(
 }
 
 pub(crate) fn read_host_pipe(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     guest_addr: u64,
     length: usize,
@@ -527,10 +542,16 @@ pub(crate) fn read_host_pipe(
     if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
         if length <= SMALL_HOST_READ_BUF {
             let mut buf = [0u8; SMALL_HOST_READ_BUF];
-            return read_host_pipe_into_owner(memory, guest_addr, &mut buf[..length], target);
+            return read_host_pipe_into_owner(
+                context,
+                memory,
+                guest_addr,
+                &mut buf[..length],
+                target,
+            );
         }
         let mut buf = vec![0u8; length];
-        return read_host_pipe_into_owner(memory, guest_addr, &mut buf, target);
+        return read_host_pipe_into_owner(context, memory, guest_addr, &mut buf, target);
     }
     if let Some(host_ptr) = memory.host_ptr_for_write(guest_addr, length) {
         let range = [carrick_guest_mem::HostWriteRange {
@@ -548,10 +569,10 @@ pub(crate) fn read_host_pipe(
         read_host_pipe_raw(host_ptr, length, target)
     } else if length <= SMALL_HOST_READ_BUF {
         let mut buf = [0u8; SMALL_HOST_READ_BUF];
-        read_host_pipe_into(memory, guest_addr, &mut buf[..length], target)
+        read_host_pipe_into(context, memory, guest_addr, &mut buf[..length], target)
     } else {
         let mut buf = vec![0u8; length];
-        read_host_pipe_into(memory, guest_addr, &mut buf, target)
+        read_host_pipe_into(context, memory, guest_addr, &mut buf, target)
     }
 }
 
@@ -1264,11 +1285,29 @@ mod host_pipe_read_pin_tests {
             )
         };
         assert_eq!(
-            read_host_pipe(&mut memory, MEM_BASE + 123, 5000, target()).unwrap(),
+            read_host_pipe(
+                &crate::dispatch::SyscallDispatcher::new()
+                    .capture_one_task_context()
+                    .unwrap(),
+                &mut memory,
+                MEM_BASE + 123,
+                5000,
+                target()
+            )
+            .unwrap(),
             DispatchOutcome::Returned { value: 5000 },
         );
         assert_eq!(
-            read_host_pipe(&mut memory, MEM_BASE + 5123, 1000, target()).unwrap(),
+            read_host_pipe(
+                &crate::dispatch::SyscallDispatcher::new()
+                    .capture_one_task_context()
+                    .unwrap(),
+                &mut memory,
+                MEM_BASE + 5123,
+                1000,
+                target()
+            )
+            .unwrap(),
             DispatchOutcome::Returned { value: 1000 },
         );
         assert_eq!(memory.read_bytes(MEM_BASE + 123, 6000).unwrap(), payload);
@@ -1295,6 +1334,9 @@ mod host_pipe_read_pin_tests {
             wait_prepare: None,
         };
         let outcome = read_host_pipe(
+            &crate::dispatch::SyscallDispatcher::new()
+                .capture_one_task_context()
+                .unwrap(),
             &mut memory,
             MEM_BASE,
             payload.len(),
@@ -1351,6 +1393,9 @@ mod host_pipe_read_pin_tests {
             wait_prepare: Some(wait),
         };
         let outcome = read_host_pipe(
+            &crate::dispatch::SyscallDispatcher::new()
+                .capture_one_task_context()
+                .unwrap(),
             &mut memory,
             MEM_BASE,
             payload.len(),
@@ -1419,8 +1464,11 @@ mod host_pipe_read_pin_tests {
             crate::dispatch::wait_authority::WaitFdAuthority::Empty,
         );
 
+        let context = crate::dispatch::SyscallDispatcher::new()
+            .capture_one_task_context()
+            .unwrap();
         let (outcome, snapshot) = budget_meter::measure_no_allocations(|| {
-            read_host_pipe(&mut memory, guest_addr, length, target)
+            read_host_pipe(&context, &mut memory, guest_addr, length, target)
                 .expect("read_host_pipe should succeed")
         });
 

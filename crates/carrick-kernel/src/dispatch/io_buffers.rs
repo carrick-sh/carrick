@@ -3,7 +3,9 @@
 use carrick_abi::{LINUX_EFAULT, LINUX_EINVAL};
 pub(crate) use carrick_abi::{LINUX_IOV_MAX, LinuxIovec, LinuxOpenHow};
 use carrick_fatal::carrick_fatal;
-use carrick_guest_mem::{CurrentMmMemory, GuestVa, GuestWriteRange, MemoryPrepareError};
+#[cfg(test)]
+use carrick_guest_mem::MemoryPrepareError;
+use carrick_guest_mem::{CurrentMmMemory, GuestVa, GuestWriteRange};
 
 use crate::dispatch::DispatchError;
 use crate::dispatch::fd_table::FileContents;
@@ -204,21 +206,20 @@ fn copy_read_bytes(memory: &mut impl CurrentMmMemory, address: u64, bytes: &[u8]
 /// bytes actually read. The caller owns the file offset and advances it by
 /// `copied` even when the next chunk needs an owner supply or wait.
 pub(in crate::dispatch) fn read_from_repeatable_owner_at(
+    context: &crate::kernel::KernelContext,
     memory: &mut impl CurrentMmMemory,
     address: u64,
     length: usize,
-    offset: usize,
+    offset: &mut usize,
     mut read_at: impl FnMut(usize, &mut [u8]) -> Result<usize, LinuxErrno>,
-) -> Result<(usize, Option<MemoryPrepareError>), DispatchError> {
+) -> Result<(usize, Option<super::DispatchOutcome>), DispatchError> {
     let mut scratch = [0u8; 4096];
     let mut copied = 0usize;
     while copied < length {
         let at = address
             .checked_add(copied as u64)
             .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-        let source_offset = offset
-            .checked_add(copied)
-            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+        let source_offset = *offset;
         let step = (4096 - (at as usize & 4095)).min(length - copied);
         let read_len = match read_at(source_offset, &mut scratch[..step]) {
             Ok(0) => break,
@@ -230,10 +231,24 @@ pub(in crate::dispatch) fn read_from_repeatable_owner_at(
             .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
         let prepared = match memory.prepare_write(&[range]) {
             Ok(prepared) => prepared,
-            Err(error) => return Ok((copied, Some(error))),
+            Err(error) => {
+                return Ok((
+                    copied,
+                    Some(crate::el1_delegation::owner_prepare_refusal_after(
+                        error,
+                        copied as u64,
+                    )),
+                ));
+            }
+        };
+        let effect = match super::copyout::admit_effect(context) {
+            Ok(effect) => effect,
+            Err(refusal) => return Ok((copied, Some(refusal.into_outcome()))),
         };
         prepared.commit(&[&scratch[..read_len]]);
         copied += read_len;
+        *offset += read_len;
+        drop(effect);
     }
     Ok((copied, None))
 }
@@ -453,24 +468,33 @@ mod owner_repeatable_read_tests {
             Ok(count)
         };
         let (prefix, refusal) = read_from_repeatable_owner_at(
+            &crate::dispatch::SyscallDispatcher::new()
+                .capture_one_task_context()
+                .unwrap(),
             &mut memory,
             address,
             payload.len(),
-            source_offset,
+            &mut { source_offset },
             &mut read_at,
         )
         .unwrap();
         assert_eq!(prefix, 1000);
-        assert!(matches!(refusal, Some(MemoryPrepareError::Fault(_))));
+        assert_eq!(
+            refusal,
+            Some(crate::dispatch::DispatchOutcome::Returned { value: 1000 })
+        );
         assert_eq!(*observed_offsets.borrow(), [50, 1050]);
         assert_eq!(&memory.bytes.lock().unwrap()[100..1100], &payload[..1000]);
 
         memory.refuse_at = None;
         let (remaining, refusal) = read_from_repeatable_owner_at(
+            &crate::dispatch::SyscallDispatcher::new()
+                .capture_one_task_context()
+                .unwrap(),
             &mut memory,
             address + prefix as u64,
             payload.len() - prefix,
-            source_offset + prefix,
+            &mut { source_offset + prefix },
             &mut read_at,
         )
         .unwrap();
