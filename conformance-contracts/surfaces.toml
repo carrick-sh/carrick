@@ -1133,6 +1133,10 @@ path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_child_handoff_
 contracts = ["kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "process.native.arm-admission"]
 
 [[surfaces]]
+path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_fault_supply_tests.rs"
+contracts = ["kernel.el1.fork-cow"]
+
+[[surfaces]]
 path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs"
 contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission"]
 
