@@ -168,3 +168,193 @@ Next measurement: enable cross-crate LTO only in the nested EL1 image build,
 retaining optimization level 3, frame pointers, overflow checks and DWARF.
 Reject configurations that violate an existing stack-path or individual-frame
 budget. Follow with both image variants and the requested host gates.
+
+## Measured configuration alternatives
+
+Each candidate used the real nested build and the unchanged frame/FP-SIMD
+checks, not an independently linked approximation. Rejected candidates were
+removed before the final verification. LTO and codegen-unit overrides were
+experimental only; the committed change sets only the nested release
+`opt-level` to `s`.
+
+| Configuration | Loaded bytes | Reclaimed vs main | Result |
+|---|---:|---:|---|
+| Main: opt 3, default CGUs/local LTO | 1,021,872 | 0 | Pass |
+| Cross-crate ThinLTO | 1,047,072 | -25,200 | Pass, larger: rejected |
+| Cross-crate fat LTO | 973,120 | 48,752 | Rejected: missing retained `dispatch_syscall` frame |
+| ThinLTO, one codegen unit | 977,024 | 44,848 | Rejected: missing retained `dispatch_entry` frame |
+| **Opt s, default CGUs/local LTO** | **860,400** | **161,472** | **Pass** |
+
+The passing choice exceeds the 65,536-byte reclaim target by **95,936 bytes**.
+No source dispatch or scheduler path moved; no Forward fallback, dynamic
+adapter, table deletion, panic-message edit or budget change was needed.
+There is one independent reclaim commit, since one isolated profile setting
+already exceeds the goal. Opt `z` was not necessary to meet the target; this
+is not a claim that `s` is the globally smallest possible configuration.
+
+The setting is applied via `CARGO_PROFILE_RELEASE_OPT_LEVEL=s` on the nested
+Cargo command only, covering the image's freestanding dependency closure.
+Host release optimization, full DWARF, overflow checks, frame pointers, panic
+strategy, LTO and codegen-unit defaults are unchanged. Smaller code may change
+runtime performance; this worker cannot establish the signed ARM runtime or
+throughput result. The director must run the signed gate on the final artifact.
+
+### Final default-image sections
+
+| Loaded component | Before | After | Reclaimed |
+|---|---:|---:|---:|
+| `.header` | 32 | 32 | 0 |
+| `.text` | 935,500 | 771,260 | 164,240 |
+| `.rodata` | 76,632 | 79,048 | -2,416 |
+| `.data` | 40 | 40 | 0 |
+| `.bss` | 7,192 | 7,152 | 40 |
+| Alignment | 2,476 | 2,868 | -392 |
+| **Loaded extent** | **1,021,872** | **860,400** | **161,472** |
+| **Headroom** | **26,704** | **188,176** | |
+
+The reduction is principally compiler code sharing/inlining choices, not
+stripped diagnostics. Text symbols containing `core::fmt` total 10,604 bytes
+before and 10,372 after; `::panicking::` totals 672 and 700 bytes, respectively.
+`unwrap_failed` remains 28 bytes. These overlapping name-based categories
+are diagnostic clues, not additive accounting buckets. The panic handler
+still publishes sentinel, line, column and MM detail. Formatting alone cannot
+supply a 64 KiB reduction at these measured sizes. ARM `::descriptor_txn::`
+text falls from 78,320 to 52,100 bytes without altering its generic API.
+
+The final image's symbol attribution shifts when the compiler outlines code
+previously inlined into callers: for example `alloc` increases while the
+calling Carrick crates shrink. Therefore differences between per-crate totals
+must not be interpreted as independent source deletions.
+
+### Final symbol attribution and largest functions
+
+| Symbol crate prefix | Text bytes | Named data/BSS bytes |
+|---|---:|---:|
+| `alloc` | 213456 | 0 |
+| `carrick_el1_linux` | 178464 | 688 |
+| `carrick_core` | 94252 | 8 |
+| `carrick_sched_core` | 63016 | 0 |
+| `carrick_personality_linux` | 52152 | 4096 |
+| `carrick_mmu_core` | 49848 | 0 |
+| `carrick_el1` | 32508 | 6416 |
+| `core` | 29692 | 0 |
+| `carrick_el1_abi` | 23188 | 40 |
+| `carrick_core_abi` | 12264 | 0 |
+| `anonymous data` | 0 | 9500 |
+| `carrick_fd_core` | 4252 | 0 |
+| `carrick_pipe_core` | 3524 | 0 |
+| `carrick_inotify_core` | 2820 | 0 |
+| `carrick_signal_core` | 2332 | 33 |
+| `&T as core` | 2276 | 0 |
+| `compiler_builtins` | 1332 | 0 |
+| `unqualified/assembly` | 1320 | 8 |
+| `u64 as core` | 876 | 0 |
+| `carrick_syscall_abi` | 828 | 0 |
+| `zerocopy` | 776 | 0 |
+| `u32 as core` | 568 | 0 |
+| `__rustc` | 348 | 0 |
+| `usize as core` | 308 | 0 |
+| `T as alloc` | 280 | 0 |
+| `carrick_guest_arch` | 196 | 0 |
+| `T as core` | 184 | 0 |
+| `(U,T) as core` | 116 | 0 |
+| `W as carrick_sched_core` | 24 | 0 |
+| `str as core` | 20 | 0 |
+| `&str as core` | 16 | 0 |
+| `&dyn core` | 12 | 0 |
+| `&u64 as core` | 12 | 0 |
+
+| Rank | Function (separate monomorphizations retained) | Bytes |
+|---:|---|---:|
+| 1 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::begin_closing` | 4368 |
+| 2 | `<carrick_el1_linux::aarch64_process::Aarch64NativeProcessService<X> as carrick_el1_linux::native_process_runtime::NativeProcessService<carrick_sched_core::aarch64_context::Aarch64ParkedContext>>::prepare_mm` | 4188 |
+| 3 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::exit_with_status` | 4124 |
+| 4 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::fork_publish` | 4076 |
+| 5 | `carrick_el1_linux::native_process_runtime::NativeProcessRuntime<M,C>::admit_fresh_root` | 3656 |
+| 6 | `carrick_personality_linux::identity::invoke` | 3236 |
+| 7 | `carrick_el1_linux::native_process_runtime::NativeProcessRegistry<M,C>::register_thread` | 2996 |
+| 8 | `carrick_personality_linux::signal::invoke` | 2932 |
+| 9 | `<carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S> as carrick_personality_linux::signal::ProcessSignals>::kill` | 2908 |
+| 10 | `carrick_sched_core::process::exit::<impl carrick_sched_core::process::registry::ProcessRegistry<C,L,Z,R,Reservation,Retired,Group,Session,Failure>>::prepare_exit_topology` | 2904 |
+| 11 | `carrick_personality_linux::ipc::invoke` | 2468 |
+| 12 | `carrick_el1_linux::native_process_runtime::NativeProcessRegistry<M,C>::rehome_entry` | 2416 |
+| 13 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::fork_reserve` | 2412 |
+| 14 | `carrick_core::mm::transaction::owner::MmPortal<P,Policy,Geometry,Venue,B,Context>::select` | 2268 |
+| 15 | `carrick_core::mm::transaction::owner::MmPortal<P,Policy,Geometry,Venue,B,Context>::select` | 2236 |
+| 16 | `carrick_el1_linux::ipc::epoll::serve_with` | 2108 |
+| 17 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::send_thread_signal` | 2016 |
+| 18 | `carrick_el1::fault::dispatch_classified_fault` | 1992 |
+| 19 | `carrick_el1_linux::arm_signal::setup_arm_signal_frame` | 1920 |
+| 20 | `carrick_el1::memory::serve_delegated_anonymous` | 1884 |
+| 21 | `carrick_el1_linux::mm_portal::fork::serve_fork_hw` | 1828 |
+| 22 | `carrick_core::mm::capacity::MetadataAllocatorCore::allocate_with_metrics` | 1812 |
+| 23 | `carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxnSlot::claim_for_mm` | 1804 |
+| 24 | `carrick_core::mm::fork::copy_entry` | 1764 |
+| 25 | `carrick_el1_linux::ipc::run` | 1752 |
+| 26 | `carrick_core::mm::fork::copy_entry` | 1728 |
+| 27 | `<carrick_core::mm::transaction::owner::MmPortal<P,Policy,Geometry,Venue,B,Context> as carrick_el1_linux::mm_portal::fork::NativeForkPortal<P,B>>::prepare_fork` | 1680 |
+| 28 | `<carrick_core::mm::transaction::owner::MmPortal<P,Policy,Geometry,Venue,B,Context> as carrick_el1_linux::mm_portal::fork::NativeForkPortal<P,B>>::prepare_fork` | 1680 |
+| 29 | `carrick_personality_linux::lifecycle::serve_exit` | 1608 |
+| 30 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::resume_ipc` | 1592 |
+| 31 | `carrick_el1_linux::ipc::admit` | 1588 |
+| 32 | `carrick_personality_linux::dispatch::dispatch` | 1552 |
+| 33 | `carrick_core::mm::fork::PreparedOwnerFork<B>::publish` | 1544 |
+| 34 | `carrick_personality_linux::sysinfo::LinuxSysinfo::to_bytes` | 1540 |
+| 35 | `carrick_el1_linux::process_owner::GuestPendingExit<C,U,N,F>::publish` | 1540 |
+| 36 | `carrick_el1_linux::native_process_runtime::NativeProcessRegistry<M,C>::admit_external_event` | 1492 |
+| 37 | `carrick_el1_abi::ipc::epoll::<impl carrick_el1_abi::ipc::IpcRegion>::epoll_harvest` | 1484 |
+| 38 | `carrick_el1_linux::native_process_runtime::NativeProcessRegistry<M,C>::register_root` | 1480 |
+| 39 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::wait_query` | 1452 |
+| 40 | `carrick_core::mm::cow::resolve_guest_cow` | 1448 |
+
+| Repeated demangled function family | Instances | Total text bytes |
+|---|---:|---:|
+| `alloc::collections::btree::node::BalancingContext<K,V>::do_merge` | 42 | 21592 |
+| `alloc::collections::btree::node::BalancingContext<K,V>::bulk_steal_right` | 21 | 11828 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Leaf>,alloc::collections::btree::node::marker::Edge>::insert` | 28 | 11400 |
+| `alloc::collections::btree::remove::<impl alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Leaf>,alloc::collections::btree::node::marker::KV>>::remove_leaf_kv` | 23 | 11292 |
+| `alloc::collections::btree::node::BalancingContext<K,V>::bulk_steal_left` | 21 | 11104 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Leaf>,alloc::collections::btree::node::marker::Edge>::insert_recursing` | 28 | 10184 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Internal>,alloc::collections::btree::node::marker::Edge>::insert` | 28 | 8524 |
+| `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::descend` | 6 | 7576 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Internal>,alloc::collections::btree::node::marker::KV>::split` | 28 | 7380 |
+| `alloc::collections::btree::remove::<impl alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Internal>,alloc::collections::btree::node::marker::KV>>::remove_internal_kv` | 23 | 7184 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Internal>,alloc::collections::btree::node::marker::Edge>::insert_fit` | 24 | 6480 |
+| `alloc::collections::btree::map::entry::VacantEntry<K,V,A>::insert_entry` | 28 | 5956 |
+| `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::visit_entry` | 6 | 5896 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,NodeType>,alloc::collections::btree::node::marker::KV>::split_leaf_data` | 24 | 5228 |
+| `alloc::collections::btree::fix::<impl alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::fix_node_through_parent` | 21 | 5040 |
+
+## Image variants and stack envelopes
+
+Both final builds exit zero, including the unchanged individual-frame,
+retained-frame, FP/SIMD and loaded-image checks.
+
+| Image variant | Main loaded bytes | Final loaded bytes | Reclaimed | Final headroom |
+|---|---:|---:|---:|---:|
+| Default | 1,021,872 | 860,400 | 161,472 | 188,176 |
+| `allocator-test-control` | 1,025,968 | 860,416 | 165,552 | 188,160 |
+
+The following final frame totals are identical for both variants. The maximum
+is **10,064 / 12,288 bytes**, leaving 2,224 bytes below the budget and 6,320
+below the physical stack size. These are the gate's conservative registered
+chain envelopes, not a new whole-program stack proof.
+
+| Registered stack path | Main bytes | Final bytes |
+|---|---:|---:|
+| Native admission | 7,967 | 7,600 |
+| Native fork publication | 9,326 | 8,943 |
+| Native fork descriptors | 9,950 | 9,263 |
+| Native fork context | 2,847 | 4,048 |
+| Native wait copy | 11,919 | 10,064 |
+| Signal delivery copy | 10,383 | 8,416 |
+| Signal terminal exit | 10,511 | 8,976 |
+| Signal return | 5,759 | 5,888 |
+| Anonymous munmap | 6,928 | 6,688 |
+| Metadata grant | 7,472 | 6,912 |
+| Backing retirement | 9,296 | 9,040 |
+| Descriptor drain | 7,120 | 5,968 |
+
+The native fork-context and signal-return envelopes grow, but remain within
+the original limits. No frame-budget parser, required-symbol rule or ceiling
+was modified to admit the configuration.
