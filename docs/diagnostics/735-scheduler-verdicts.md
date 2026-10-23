@@ -363,3 +363,51 @@ The guest has no existing enrollment notification; the startup sleep is not
 such a proof. Adding a host admission rendezvous is outside this P1 slice.
 The original exact signed commands above still apply; run them on a freshly
 built, signed artifact containing this correction.
+
+
+## Round-3 final portable verification
+
+This supersedes the earlier partial-gate handoff. The round-3 correction was
+rebased onto GitHub main `aafb7bdb0` before the gates. Every product fix was
+kept: retained pipe handback, sleep copy-in, counted scheduler assertions,
+killable owner routing, prepared IPC output, completion-origin residency,
+and native fatal cancellation. No fix was ported or dropped. Product code,
+fixtures and contracts were byte-identical across this rebase; upstream
+changed only CI tooling/documentation. The resulting implementation commit
+is `c41a8e882`.
+
+All focused checks and all required gates exited zero. The foreground gate
+sequence was:
+
+```sh
+env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just test-kernel
+env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just clippy
+env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just clippy-linux
+env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just cross-check-macos
+env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just fmt-check
+env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just lint-domains
+env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 just test
+```
+
+`just test-kernel` passed 3,110 tests across 40 suites, with seven existing
+ignored tests. Full `just test` ran last and reported 8,754 passing results
+across 328 result rows (including subprocess fixtures), with no failed suite.
+Exact logs are
+`/tmp/735-r3-<gate>.log`, with each command's own exit status in
+`/tmp/735-r3-gates.status`. Focused results and commands are retained in
+`/tmp/735-r3-focused.status` and `/tmp/735-r3-focused.sh`.
+No sched-core code changed, so no loom gate was required. Independent
+read-only review found no further major issue in the correction. No load
+generators were started; `pgrep -x yes`, `pgrep -x stress`, and
+`pgrep -x stress-ng` found none. Nothing was pushed or written to GitHub.
+
+The director's signed run of the earlier `c21986da6` passed ping-pong and
+preemption. Its only new full-gate failure was host-compute: the base lacks
+`sched_setaffinity` and returned ENOSYS (-38). The affinity assertion stays
+strict. This branch must be based on, or land after, the affinity stack
+#751/#752/#715; that earlier result does not qualify this correction.
+
+The macOS cross-check compiles and lints the backend; it does not execute
+HVF. Signed 5/5 proof on one artifact remains on the director's Mac using
+the exact commands above. The optional host-compute enrollment P2 remains
+open, and the sleep remaining-time copyout P2 remains #711 slice 2.
