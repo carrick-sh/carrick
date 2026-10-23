@@ -769,6 +769,9 @@ pub struct ZoneRecord<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     /// The next record on the run queue it is queued on (0: the tail).
     /// Written only under that slot's run-queue lock.
     next: AtomicU32,
+    /// The native process owner, rather than a host scheduler thread, owns
+    /// this record's next execution. It may enter EL0 from an idle vCPU.
+    native_owned: AtomicU32,
     /// The host wants the thread back (a signal, an exit or exec drain)
     /// while EL1 held its record: the slot's executor hands it back at its
     /// next exit ([`ZoneTables::take_host_wanted`]) instead of leaving it
@@ -882,6 +885,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.generation.load(Ordering::Relaxed) == 0
             && self.lifecycle_page.load(Ordering::Relaxed) != 0
             && self.control_slot.load(Ordering::Relaxed) != 0
+    }
+
+    /// A native process record has no host scheduler thread to adopt it.
+    pub fn is_native_owned(&self) -> bool {
+        self.native_owned.load(Ordering::Acquire) != 0
     }
 
     pub fn needs_host(&self) -> bool {
@@ -2077,8 +2085,20 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         record.host_wanted.clear();
         record.deadline.store(0, Ordering::Relaxed);
         record.object.reset_completion_flags();
+        record.native_owned.store(0, Ordering::Relaxed);
         record.claim.store(Claim::Free.encode(), Ordering::Release);
         Ok(id)
+    }
+
+    /// Publish the execution owner before making a freshly allocated record
+    /// runnable. Only its allocator may call this while it remains Free.
+    pub fn mark_native_owned(&self, id: RecordId) -> bool {
+        let record = self.record(id);
+        if record.claim() != Claim::Free {
+            return false;
+        }
+        record.native_owned.store(1, Ordering::Release);
+        true
     }
 
     /// Allocate a record for a thread the host made runnable on its side
@@ -2871,11 +2891,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// slot; any other on a slot running its address space, or on a slot
     /// whose executor has a task loaded when EL1 may install the thread's
     /// address space there (a hint: [`Self::install_space`] decides). A vCPU
-    /// in the idle entry (no task loaded) runs no thread itself; its
-    /// executor loads it.
+    /// in the idle entry may run a record with a published native owner;
+    /// host-owned threads still require their executor.
     fn runs_mm_of(&self, slot: SlotId, rec: &ZoneRecord<C>) -> bool {
         let mm = rec.mm.load(Ordering::Relaxed);
-        rec.needs_host() || self.installed_space(slot) == mm || self.may_switch_to(slot, mm)
+        rec.needs_host()
+            || self.installed_space(slot) == mm
+            || self.may_switch_to(slot, mm)
+            || (rec.is_native_owned() && self.spaces.is_open(mm))
     }
 
     /// Whether EL1 on `slot` may install address space `mm` itself: the
@@ -3278,7 +3301,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let mm = rec.mm.load(Ordering::Relaxed);
         rec.needs_host()
             || rec.is_unadopted_birth()
-            || (self.installed_space(slot) != mm && !self.may_switch_to(slot, mm))
+            || (self.installed_space(slot) != mm
+                && !self.may_switch_to(slot, mm)
+                && !(rec.is_native_owned() && self.spaces.is_open(mm)))
     }
 
     /// The address space installed on `slot`'s vCPU, by the occupancy
@@ -5219,6 +5244,7 @@ mod layout_manifest {
                      affinity: _,
                      object: _,
                      affinity_source: _,
+                     native_owned: _,
                      ctx: _,
                  }: ZoneRecord| {};
         field!(ZoneRecord, claim, AtomicU64, 0, 8, 8);
@@ -5244,6 +5270,7 @@ mod layout_manifest {
         field!(ZoneRecord, affinity, AtomicU64, 136, 8, 8);
         field!(ZoneRecord, object, object_wait::ObjectRecord, 144, 40, 8);
         field!(ZoneRecord, affinity_source, AtomicU64, 184, 8, 8);
+        field!(ZoneRecord, native_owned, AtomicU32, 116, 4, 4);
         field!(ZoneRecord, ctx, UnsafeCell<ThreadCtx>, 192, 832, 16);
     }
 }

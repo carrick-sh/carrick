@@ -365,10 +365,20 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// ends (the tick migrates it to an idle vCPU first).
     pub fn enqueue_born(&mut self, record: carrick_el1_abi::RecordId) {
         let (zone, slot) = (self.zone, self.slot);
-        let was_empty = zone.slot(slot).queued() == 0;
         zone.requeue_preempted(slot, record);
-        if was_empty {
-            zone.note_queued_since(slot, self.cpu.now());
+        self.arm_published_runnable();
+    }
+
+    /// A native process fork publishes its child only after physical MM
+    /// settlement. That publication has already queued the record; retain
+    /// the same first-entry timer obligation as an EL1 thread birth.
+    pub fn arm_published_runnable(&mut self) {
+        let slot = self.slot;
+        if self.zone.slot(slot).queued() == 0 {
+            return;
+        }
+        if self.zone.slot(slot).queued_since() == 0 {
+            self.zone.note_queued_since(slot, self.cpu.now());
         }
         self.program_timer(true);
     }
@@ -440,7 +450,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             self.send_sgis(&effects);
             return LoadResult::NeedsHost;
         }
-        if !self.enter_space(rec.identity().mm) {
+        if !self.enter_space(rec.identity().mm, rec.is_native_owned()) {
             zone.unswitch(slot, switched.record);
             return LoadResult::NeedsHost;
         }
@@ -481,19 +491,22 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// Dekker pair with a page-table pause or ASID retirement), and only
     /// then installs `mm`'s roots, after invalidating its ASID if a
     /// foreign-COW publication is not yet covered.
-    fn enter_space(&mut self, mm: u64) -> bool {
+    fn enter_space(&mut self, mm: u64, native_owned: bool) -> bool {
         let (zone, slot) = (self.zone, self.slot);
         if mm != 0 && zone.installed_space(slot) == mm {
             return true;
         }
-        // Only for an executor with a task loaded: the idle entry runs no
-        // thread itself (its executor loads it), and switches nothing.
-        if mm == 0 || zone.spaces.idle_ttbr() == 0 || !zone.executor_has_task(slot) {
+        // A native owner has no host thread for the idle executor to load;
+        // its queued record is the authority to install its published MM.
+        if mm == 0
+            || zone.spaces.idle_ttbr() == 0
+            || (!zone.executor_has_task(slot) && !native_owned)
+        {
             return false;
         }
         // Only away from a published space (one root for both halves, the
-        // default memory model: nothing an EL1 switch leaves behind), so the
-        // host can settle the thread it loaded here with that space's roots.
+        // default memory model: nothing an EL1 switch leaves behind), so a
+        // host-loaded thread can still be settled against its own roots.
         let installed = zone.installed_space(slot);
         if installed != 0 && zone.spaces.find(installed).is_none() {
             return false;

@@ -4559,7 +4559,7 @@ mod carrier_vm_custody_tests {
                 };
                 let physical_owner = super::ForkPhysicalCustody::new(
                     std::sync::Arc::clone(custody),
-                    std::sync::Arc::new(|_, _| false),
+                    std::sync::Arc::new(|_, _| None),
                 );
                 let retained = physical_owner
                     .retain(loan.request, selected)

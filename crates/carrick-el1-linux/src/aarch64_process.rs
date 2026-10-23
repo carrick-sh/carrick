@@ -551,14 +551,18 @@ impl AdmittedCustodyToken {
 
     #[allow(clippy::boxed_local)]
     fn consume<X: ForkStockCrossing>(
-        mut self: Box<Self>,
+        self: Box<Self>,
         crossing: &X,
         slot: SlotId,
         zone: &ZoneTables<Aarch64ParkedContext>,
     ) -> Result<(), Box<Self>> {
+        // The physical crossing admits only a complete stopped-CPU stack
+        // record. The retained token and its loan stay boxed until acceptance;
+        // its heap-resident wire template is never the crossing argument.
+        let mut commit = self.commit;
         let crossed =
-            crossing.cross_fork_stock(&raw mut self.commit as *mut _ as u64, u64::from(slot.raw()));
-        if crossed.is_err() || !matches!(self.commit.take(self.loan), Some(Ok(()))) {
+            crossing.cross_fork_stock(&raw mut commit as *mut _ as u64, u64::from(slot.raw()));
+        if crossed.is_err() || !matches!(commit.take(self.loan), Some(Ok(()))) {
             return Err(self);
         }
         carrick_core::wait::space_access(zone, slot, release).open(self.index);
@@ -1087,12 +1091,16 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                     NonZeroU64::new(u64::from(self.worker()) + 1)
                         .ok_or(NativeProcessError::Stale)?,
                 )
-                .ok_or(NativeProcessError::Busy)?;
+                .ok_or_else(|| {
+                    super::native_fork_refusal::busy(NativeForkStage::ParentSpaceEdit)
+                })?;
             let mut root = owner
                 .root(mm, self.worker())
                 .map_err(|e| refused(NativeForkStage::ParentRoot, e))?;
             if !root.fork_ready() {
-                return Err(NativeProcessError::Busy);
+                return Err(super::native_fork_refusal::busy(
+                    NativeForkStage::ParentForkReady,
+                ));
             }
             let mut full = false;
             root.observe_mappings(&mut |mapping| {

@@ -1212,12 +1212,12 @@ fn fork_custody_in_retained_region(offset: usize, bytes: usize) -> bool {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn retain_fork_custody_rows(
     custody: &Arc<crate::trap::CarrierVmCustody>,
-    inventory: Option<Arc<dyn carrick_hal::PhysicalFrameInventory>>,
     region: RetainedAbiRegion<'_>,
     parent: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
     request: carrick_el1_abi::PortalForkRequest,
     address: carrick_guest_arch::KernelVa,
     count: u64,
+    inherited: carrick_hal::fork_stock::ForkHostBackingCustody,
 ) -> Result<Vec<crate::trap::ForkPhysicalRetention>, ForkStockRefusal> {
     use carrick_aarch64::fork::ForkCustody;
     if count == 0 {
@@ -1264,16 +1264,36 @@ fn retain_fork_custody_rows(
     if retained.try_reserve_exact(count).is_err() {
         return Err(ForkStockRefusal::Capacity);
     }
+    // The exact live root owns the dispatcher byte-source handles. Frame
+    // inventory IDs describe resident mappings and cannot authenticate them.
+    let source_authority = custody
+        .guest_cow_state(request.operation.mm.raw())
+        .ok()
+        .flatten()
+        .filter(|state| {
+            state.protections.owner().is_some_and(|owner| {
+                owner.carrier() == request.operation.carrier
+                    && owner.mm() == request.operation.mm
+                    && owner.incarnation() == request.operation.incarnation
+            }) && state.page_tables_authority().root_base() == Some(parent.root.address().raw())
+        })
+        .and_then(|state| {
+            state.cow_runtime.read().as_ref().and_then(|binding| {
+                (binding.identity.mm == request.operation.mm.raw()
+                    && binding.persistent_vm_lifecycle)
+                    .then(|| Arc::clone(&binding.authority))
+            })
+        });
     let source = Arc::new(
         move |handle: core::num::NonZeroU64, generation: core::num::NonZeroU64| {
-            let Some(inventory) = inventory.as_ref() else {
-                return false;
-            };
-            let view = inventory.bind(parent.into());
-            let id = carrick_hal::MappingId::from_kernel_allocation(handle);
-            let generation = carrick_hal::MappingGeneration::from_backend_counter(generation);
-            view.live_mapping_row(id)
-                .is_some_and(|row| row.generation == generation)
+            inherited.retain(
+                carrick_el1_abi::HostBackingIdentity::new(handle, generation, 0),
+                || {
+                    source_authority
+                        .as_ref()
+                        .and_then(|authority| authority.retain_host_backing(handle, generation))
+                },
+            )
         },
     );
     let physical = crate::trap::ForkPhysicalCustody::new(Arc::clone(custody), source);
@@ -1418,7 +1438,19 @@ pub(crate) fn service_native_fork_stock(
             };
             let mut stock = custody.fork_stock.lock();
             if kind == Some(ForkStockKind::Reserve) {
-                let inventory = stock.inventory();
+                // Capture inherited receipts before reserve mutably borrows stock.
+                let mut inherited = carrick_hal::fork_stock::ForkHostBackingCustody::default();
+                if let Some(pending) = stock.owner.pending(execution.cpu)
+                    && let Some(rows) = stock
+                        .owner
+                        .child_custody(pending.loan.request.operation, execution.context.root)
+                {
+                    for row in rows {
+                        if let Some(source) = row.retained_host_backing() {
+                            inherited.inherit(source);
+                        }
+                    }
+                }
                 let result = stock.owner.reserve_custody(
                     execution,
                     settlement,
@@ -1435,12 +1467,12 @@ pub(crate) fn service_native_fork_stock(
                     |request, address, count| {
                         retain_fork_custody_rows(
                             custody,
-                            inventory,
                             region,
                             execution.context,
                             request,
                             address,
                             count,
+                            inherited,
                         )
                     },
                 );
@@ -1882,6 +1914,35 @@ fn stopped_records<'a>(
         .record_ptr::<carrick_el1_abi::ZoneTables>(carrick_el1_abi::EL1_ZONE_OFFSET as usize)?;
     // SAFETY: initialized disjoint fixed ABI records; mutation uses their atomics.
     Some(unsafe { (&*task, &*zone) })
+}
+
+/// Terminal-only observation. Do not require the execution binding whose
+/// failure brought us here, and never read a live scheduler context.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn entry_binding_fatal_diagnostic(
+    custody: &crate::trap::CarrierVmCustody,
+    cpu: carrick_guest_arch::CpuId,
+    registers: carrick_el1_abi::ArmEntryFatalRegisters,
+) -> Option<carrick_el1_abi::ArmEntryBindingFatal> {
+    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
+    let region = retained_abi_region(custody)?;
+    let pointer = abi_stack_ptr::<carrick_el1_abi::TrapFrame>(
+        region,
+        cpu,
+        carrick_guest_arch::KernelVa::new(carrick_el1_abi::el1_slot_frame_va(cpu.raw() as usize)),
+    )?;
+    let (task, zone) = stopped_records(region, cpu)?;
+    // SAFETY: abi_stack_ptr checked the complete aligned vector frame on
+    // this synchronously stopped CPU's retained stack. Other CPUs use
+    // disjoint stacks; scheduler record observations below use only atomics.
+    let frame = unsafe { &*pointer };
+    Some(carrick_el1_abi::ArmEntryBindingFatal::capture(
+        registers,
+        frame,
+        carrick_core::entry::binding(&task.execution, &task.mm),
+        zone,
+        slot,
+    ))
 }
 
 /// Observation-only identity of a stopped lane. Unlike terminal custody,

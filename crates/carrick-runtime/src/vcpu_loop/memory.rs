@@ -241,16 +241,16 @@ pub(crate) fn kernel_frame_cow_authority_for_test(
 }
 
 impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
-    fn retains_host_backing(
+    fn retain_host_backing(
         &self,
         handle: std::num::NonZeroU64,
         generation: std::num::NonZeroU64,
-    ) -> bool {
-        self.runtime.upgrade().is_some_and(|runtime| {
+    ) -> Option<Arc<dyn carrick_hal::fork_stock::HostBackingRetention>> {
+        self.runtime.upgrade().and_then(|runtime| {
             runtime
                 .dispatcher
                 .mem_view()
-                .retains_host_backing(handle, generation)
+                .retain_host_backing(handle, generation)
         })
     }
 
@@ -888,6 +888,53 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     mod native_jit;
     use super::*;
+
+    #[test]
+    fn arm_entry_binding_diagnostic_reaches_the_fatal_record_without_truncation() {
+        let diagnostic = carrick_el1_abi::ArmEntryBindingFatal {
+            registers: carrick_el1_abi::ArmEntryFatalRegisters {
+                pc: Some(0x1010),
+                lr: Some(0x2020),
+                fp: Some(0x3030),
+                sp_el0: Some(0x4040),
+                sp_el1: Some(0x5050),
+                esr_el1: Some(0x6060),
+                far_el1: Some(0x7070),
+                elr_el1: Some(0x8080),
+                spsr_el1: Some(0x9090),
+            },
+            slot: carrick_el1_abi::SlotId::new(0),
+            frame_slot: 0,
+            saved_lr: 0x1111,
+            saved_x: [1, 2, 3, 4],
+            saved_elr: 0x2222,
+            saved_spsr: 0,
+            saved_esr: 0,
+            saved_far: 0,
+            loaded: carrick_el1_abi::ExecutionBinding {
+                task: carrick_el1_abi::EntryTaskKey::from_raw(41),
+                generation: carrick_el1_abi::SnapshotGeneration::INITIAL,
+                mm: carrick_el1_abi::EntryMmKey::from_raw(7),
+                thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
+            },
+            record: None,
+        };
+        let expected = format!("{diagnostic}");
+        let report = carrick_el1_abi::ArmEl1FatalReport::Entry(&diagnostic);
+        let mut message = [0; carrick_fatal::MAX_MESSAGE_LEN];
+        let mut line = [0; 1280];
+        let (message_len, line_len) = carrick_fatal::format_fatal_parts(
+            "el1",
+            format_args!("{report}"),
+            &mut message,
+            &mut line,
+        );
+        assert_eq!(&message[..message_len], expected.as_bytes());
+        assert_eq!(
+            &line[..line_len],
+            format!("carrick fatal [el1]: {expected}\n").as_bytes()
+        );
+    }
 
     #[test]
     fn proc_maps_projects_linux_initial_stack_vma_not_full_rlimit_backing() {

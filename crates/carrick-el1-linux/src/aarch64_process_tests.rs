@@ -167,6 +167,8 @@ struct TestStockCrossing {
     handbacks: AtomicUsize,
     root_exits: AtomicUsize,
     root_exit_status: AtomicU64,
+    #[cfg(all(test, target_os = "linux"))]
+    require_stack_commit: bool,
 }
 
 impl TestStockCrossing {
@@ -200,6 +202,8 @@ impl TestStockCrossing {
             handbacks: AtomicUsize::new(0),
             root_exits: AtomicUsize::new(0),
             root_exit_status: AtomicU64::new(u64::MAX),
+            #[cfg(all(test, target_os = "linux"))]
+            require_stack_commit: false,
         }
     }
 }
@@ -398,6 +402,10 @@ impl ForkStockCrossing for TestStockCrossing {
                 Ok(())
             }
             Some(ForkStockKind::Commit) => {
+                #[cfg(all(test, target_os = "linux"))]
+                if self.require_stack_commit {
+                    native_child_handoff_tests::assert_current_stack_commit(record_gpa);
+                }
                 self.settlements_committed.fetch_add(1, Ordering::AcqRel);
                 let settlement = unsafe { &mut *(record_gpa as *mut ForkStockSettlement) };
                 #[cfg(test)]
@@ -529,17 +537,24 @@ impl Fixture {
         let file_table = leader.file_table;
         // The host records the leader's birth identity when it allocates the
         // control slot. Its process serial is independent of the snapshot.
-        control.publish_host_birth_identity(
-            carrick_core::terminal::ThreadBirthIdentity::from_parts(
-                carrick_core_abi::EntryTaskKey::from_raw(leader.tid),
-                carrick_core_abi::entry::BirthSerial::of_task(
-                    carrick_sched_core::process::TaskSerial::from_raw_u64(leader.generation)
-                        .unwrap(),
-                ),
-                carrick_core_abi::EntryThreadGeneration::from_raw(leader.serial),
-            )
-            .unwrap(),
-        );
+        if let Some(birth) = control.host_birth_identity() {
+            // Kernel-backed fixtures retain the real process incarnation;
+            // an execution snapshot generation is not its birth serial.
+            assert_eq!(birth.task().raw(), leader.tid);
+            assert_eq!(birth.thread().raw(), leader.serial);
+        } else {
+            control.publish_host_birth_identity(
+                carrick_core::terminal::ThreadBirthIdentity::from_parts(
+                    carrick_core_abi::EntryTaskKey::from_raw(leader.tid),
+                    carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(leader.generation)
+                            .unwrap(),
+                    ),
+                    carrick_core_abi::EntryThreadGeneration::from_raw(leader.serial),
+                )
+                .unwrap(),
+            );
+        }
         control.initialize_affinity(carrick_core::affinity::CpuAffinity::from_words(&[
             leader.affinity
         ]));
@@ -1770,6 +1785,94 @@ fn fork_reserve_refusal_retains_diagnostic_stage_and_retryable_errno() {
         super::native_fork_refusal::NativeForkCause::StockReservation(ForkStockRefusal::Inventory)
     );
     assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn native_fork_busy_diagnostic_names_parent_space_editor() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let crossing = TestStockCrossing::new(&[]);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let owner = super::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    );
+    let index = fixture.zone.spaces.find(1).unwrap();
+    let access = owner.space_access(0).unwrap();
+    let editor = access.try_begin_edit(index, 1, NonZeroU64::MIN).unwrap();
+    let error = service
+        .prepare_mm(
+            &fixture.address,
+            &parked,
+            MmGeneration::new(NonZeroU64::new(2).unwrap()),
+        )
+        .expect_err("an outstanding editor must retain its exclusion");
+    drop(editor);
+    assert_eq!(error.errno(), -11);
+    assert_eq!(
+        error.run_failure_reason(),
+        NativeProcessError::Busy.run_failure_reason()
+    );
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 0);
+    let NativeProcessError::ForkRefused(refusal) = error else {
+        panic!("space edit refusal lost its site: {error:?}");
+    };
+    assert_eq!(format!("{:?}", refusal.stage), "ParentSpaceEdit");
+}
+
+#[test]
+fn native_fork_busy_diagnostic_names_unsettled_parent_fork() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let crossing = TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ]);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let prepared = service
+        .prepare_mm(
+            &fixture.address,
+            &parked,
+            MmGeneration::new(NonZeroU64::new(2).unwrap()),
+        )
+        .unwrap();
+    let error = service
+        .prepare_mm(
+            &fixture.address,
+            &parked,
+            MmGeneration::new(NonZeroU64::new(3).unwrap()),
+        )
+        .expect_err("a prepared fork must retain parent publication custody");
+    service.abort_mm(prepared).unwrap();
+    assert_eq!(error.errno(), -11);
+    assert_eq!(
+        error.run_failure_reason(),
+        NativeProcessError::Busy.run_failure_reason()
+    );
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
+    assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 1);
+    let NativeProcessError::ForkRefused(refusal) = error else {
+        panic!("parent readiness refusal lost its site: {error:?}");
+    };
+    assert_eq!(format!("{:?}", refusal.stage), "ParentForkReady");
 }
 
 #[test]
@@ -3150,9 +3253,25 @@ fn arm_call(
     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
     frame: &mut carrick_el1_abi::TrapFrame,
 ) -> Result<carrick_personality_linux::dispatch::CompletionRoute, NativeProcessError> {
+    arm_call_with_cpu(
+        fixture,
+        control,
+        service,
+        frame,
+        &mut crate::sched::FakeCpu::default(),
+    )
+}
+
+#[cfg(test)]
+fn arm_call_with_cpu(
+    fixture: &'static Fixture,
+    control: &'static ThreadControlSlot,
+    service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    frame: &mut carrick_el1_abi::TrapFrame,
+    cpu: &mut crate::sched::FakeCpu,
+) -> Result<carrick_personality_linux::dispatch::CompletionRoute, NativeProcessError> {
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
-    let mut cpu = crate::sched::FakeCpu::default();
     super::dispatch::dispatch_arm_syscall_with_native_process(
         frame,
         &counters,
@@ -3164,7 +3283,7 @@ fn arm_call(
         &cache,
         Some(crate::dispatch::Zone {
             tables: fixture.zone,
-            cpu: &mut cpu,
+            cpu,
             user: &crate::sched::HardwareUserWord,
         }),
         None,

@@ -7,6 +7,22 @@
  * and requested/cached address contexts as five bounded Debug strings.
  * Root-prepublish is the positive control when a corrected fork succeeds.
  * The diagnostic is failure-only, bounded, and grants no memory authority.
+ * ProcessNative::fork records final untyped errors (including admission),
+ * their original negative errno and run-failure policy. Typed MM refusals
+ * retain their existing owner record without a duplicate boundary record.
+ * Busy refusals retain their exact NativeForkStage (parent gate/edit/readiness,
+ * birth reservation/publication, child lifecycle claim/control reset).
+ * ParentLifecycleGate carries the exact observed GateState from the admission
+ * read; AwaitingExecBinding is legal for a process fork on a distinct page.
+ * Reserve follows a successful stock Loan. Reserve: Inventory names table
+ * resolution or inherited custody validation; empty reusable stock refuses
+ * Capacity during Loan, before preparation reaches Reserve.
+ * Service-boundary stages apply only when that service returned untyped Busy;
+ * an existing typed owner refusal is never replaced or emitted twice.
+ * LifecycleNative::process_fork venue=unavailable records None/fallback,
+ * not a final errno; it includes missing or mismatched execution bindings.
+ * The existing crossing authenticates VM/task identity before emitting:
+ * zero records cannot exclude a failure of that diagnostic authentication.
  * A Prepare/NoMemory record also observes the first primary alias beyond
  * the admitted child table prefix using the existing owner translation.
  * Perturbation on that refusal: one bounded four-level descriptor lookup;

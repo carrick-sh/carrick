@@ -13,7 +13,11 @@ scale_points = [1, 8, 32, 128]
 rationale = "Fork memory mapping projection must scale affinely with populated VMAs and avoid unbounded hashing, allocation, or full-table scans when unpopulated mappings exist. A deferred private alias remains inaccessible in the child, but its invalid leaf must retain the alias registry's authenticated current output instead of a superseded identity address so the child's later first touch resolves the same live frame authority."
 
 [bindings]
-vm_free = "carrick-kernel-example::fork_mappings_contract; carrick-vmm-hvf::trap::process_plan::tests::untouched_private_alias_repoints_retained_leaf_without_making_it_valid"
+# The post-exec source binding checks opaque LoadedImage custody through the
+# production dispatcher publication/import and shared stock loan/reserve/commit.
+# It adds semantic source-scope and finite-capacity evidence. The many-source
+# binding bounds identity work during inherited custody lookup, not runtime ratio.
+vm_free = "carrick-kernel-example::fork_mappings_contract; carrick-vmm-hvf::trap::process_plan::tests::untouched_private_alias_repoints_retained_leaf_without_making_it_valid; carrick-kernel::dispatch::mem::delegated_tests::post_exec_native_fork_reserves_loaded_image_source_custody; carrick-kernel::dispatch::mem::host_backing::tests::fork_source_custody_bounds_identity_work_for_many_sources"
 embed = "carrick-embed::fork_mappings_contract"
 docker = "probe:forksnapshot"
 ecosystem = ["ltp:fork14"]

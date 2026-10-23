@@ -3,6 +3,7 @@
 //! incarnation; it does not import a host TaskSerial or launcher credentials.
 extern crate alloc;
 use super::{
+    native_fork_refusal::{NativeForkStage, at_busy_site, busy},
     native_process_custody::{ProcessResources, ProcessWake, RetainedProcessCustody},
     native_process_entry::{self, CopiedWaitOutcome, ForkTryError, PreparedFork, WaitWork},
     native_process_signals::{NativeExitSignals, NativeProcessSignals},
@@ -5020,7 +5021,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .lock()
                         .owner
                         .rollback_birth(&reservation.permit);
-                    return Err(error);
+                    return Err(at_busy_site(NativeForkStage::PrepareService, error));
                 }
             };
         self.fork_publish(child_tid, reservation, prepared)
@@ -5059,8 +5060,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .owner
                 .task(self.key)
                 .map_err(|_| NativeProcessError::Stale)?;
-            if row.native().resources().page.gate() != carrick_el1_abi::GateState::Open {
-                return Err(NativeProcessError::Busy);
+            let observed = row.native().resources().page.gate();
+            match observed {
+                // Exec's missing executable thread-birth capacity does not
+                // conflict with a process fork: its child receives a distinct
+                // lifecycle page. Keep the parent's binding state intact.
+                carrick_el1_abi::GateState::Open
+                | carrick_el1_abi::GateState::AwaitingExecBinding => {}
+                carrick_el1_abi::GateState::ForkClosing
+                | carrick_el1_abi::GateState::Closed
+                | carrick_el1_abi::GateState::HostOnly => {
+                    return Err(busy(NativeForkStage::ParentLifecycleGate { observed }));
+                }
             }
             let parent_mm = row.native().resources().mm.clone();
             let identity = row.identity();
@@ -5148,7 +5159,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let permit = graph
                 .owner
                 .reserve_birth(snapshot, snapshot, transaction)
-                .map_err(|_| NativeProcessError::Busy)?;
+                .map_err(|_| busy(NativeForkStage::BirthReservation))?;
             (
                 snapshot,
                 permit,
@@ -5310,7 +5321,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| NativeProcessError::Invalid)?;
             let claim = page
                 .claim(lifecycle_entry)
-                .map_err(|_| NativeProcessError::Busy)?;
+                .map_err(|_| busy(NativeForkStage::ChildLifecycleClaim))?;
             if control
                 .reset_for_birth(
                     blocked,
@@ -5325,7 +5336,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             {
                 page.unclaim(claim)
                     .map_err(|_| NativeProcessError::Quarantined)?;
-                return Err(NativeProcessError::Busy);
+                return Err(busy(NativeForkStage::ChildControlReset));
             }
             if control.set_affinity(parent_affinity).is_err() {
                 page.unclaim(claim)
@@ -5438,7 +5449,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             if let Err((_, p)) = self.service.abort_mm(prepared) {
                 self.service.quarantine_prepared(p)
             };
-            return Err(error);
+            return Err(at_busy_site(NativeForkStage::ForkFileTable, error));
         }
         let child_words = self
             .service
@@ -5522,8 +5533,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Err(failure) => {
                 drop(member_registration);
                 let (error, prep) = match failure {
-                    ForkTryError::Admission(_, prep) => (NativeProcessError::Busy, prep),
-                    ForkTryError::Commit(error, prep) => (error, prep),
+                    ForkTryError::Admission(_, prep) => {
+                        (busy(NativeForkStage::BirthPublication), prep)
+                    }
+                    ForkTryError::Commit(error, prep) => (
+                        at_busy_site(NativeForkStage::CommitChildService, error),
+                        prep,
+                    ),
                 };
                 let returned = {
                     let mut graph = self.runtime.graph.lock();
@@ -5576,6 +5592,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 )
                 .map_err(|_| NativeProcessError::Quarantined)?;
         }
+        if !self.source.zone.mark_native_owned(record) {
+            return Err(NativeProcessError::Quarantined);
+        }
         self.source.zone.requeue_preempted(self.source.slot, record);
         Ok(visible.get())
     }
@@ -5612,7 +5631,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn fork(&mut self, child_tid: ProcessForkChildTid) -> LifecycleOutcome {
         match self.fork_owned(child_tid) {
             Ok(pid) => returned(i64::from(pid)),
-            Err(error) => self.fail(error),
+            Err(error) => self.fail(super::native_fork_refusal::observe_process_error(error)),
         }
     }
     fn wait4(
@@ -7842,6 +7861,21 @@ mod tests {
     }
     #[test]
     fn two_roots_in_one_carrier_have_independent_fork_and_wait_authority() {
+        two_roots_fork_gate_contract(None);
+    }
+    #[test]
+    fn native_fork_awaiting_exec_binding_with_fork_closing_peer() {
+        two_roots_fork_gate_contract(Some(carrick_el1_abi::GateState::ForkClosing));
+    }
+    #[test]
+    fn native_fork_awaiting_exec_binding_with_closed_peer() {
+        two_roots_fork_gate_contract(Some(carrick_el1_abi::GateState::Closed));
+    }
+    #[test]
+    fn native_fork_awaiting_exec_binding_with_host_only_peer() {
+        two_roots_fork_gate_contract(Some(carrick_el1_abi::GateState::HostOnly));
+    }
+    fn two_roots_fork_gate_contract(peer_gate: Option<carrick_el1_abi::GateState>) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -7942,6 +7976,79 @@ mod tests {
                 .unwrap();
             runtimes.push(runtime);
             addresses.push(address);
+        }
+        if let Some(peer_gate) = peer_gate {
+            use super::super::native_fork_refusal::{NativeForkCause, NativeForkRefusal};
+            use carrick_el1_abi::GateState;
+
+            // Both exact parents are live in the same carrier before either
+            // gate changes. Use the production post-exec transition rather
+            // than storing a fabricated gate word.
+            pages[0].close_for_fork().unwrap();
+            pages[0].await_exec_binding().unwrap();
+            match peer_gate {
+                GateState::ForkClosing => pages[1].close_for_fork().unwrap(),
+                GateState::Closed => pages[1].close(),
+                GateState::HostOnly => pages[1].decline_to_host(),
+                _ => panic!("fixture requires a refusing peer gate"),
+            }
+            for index in [1, 0] {
+                let source = BornInZoneSource {
+                    zone: &zone,
+                    slot: carrick_sched_core::SlotId::new(index as u8),
+                };
+                let mut service = Physical {
+                    zone: &zone,
+                    page: &child_pages[index],
+                    controls: &child_controls[index],
+                    copies: Vec::new(),
+                    tid_words: BTreeMap::new(),
+                    tid_wakes: 0,
+                    tid_writes: Vec::new(),
+                    refuse_copy: false,
+                    child_copy_error: None,
+                    on_signal_clock: None,
+                };
+                let mut entry = runtimes[index]
+                    .enter(source, &tasks[index], words(addresses[index]), &mut service)
+                    .unwrap();
+                let result = entry.fork_owned(ProcessForkChildTid::NONE);
+                if index == 1 {
+                    let error = result.unwrap_err();
+                    assert_eq!(
+                        error,
+                        NativeProcessError::ForkRefused(NativeForkRefusal {
+                            stage: NativeForkStage::ParentLifecycleGate {
+                                observed: peer_gate,
+                            },
+                            cause: NativeForkCause::Busy,
+                        })
+                    );
+                    assert_eq!(error.errno(), -11);
+                    assert_eq!(
+                        error.run_failure_reason(),
+                        carrick_core_abi::NativeRunFailureReason::NativeBusy
+                    );
+                    assert_eq!(zone.slot(source.slot).queued(), 0);
+                    assert!(runtimes[1].namespace_child_key(entry.key, 52).is_none());
+                } else {
+                    assert_eq!(result.expect("AwaitingExecBinding parent must fork"), 42);
+                    let child = runtimes[0].namespace_child_key(entry.key, 42).unwrap();
+                    let graph = runtimes[0].graph.lock();
+                    let child = graph.owner.task(child).unwrap();
+                    assert_eq!(child.parent(), Some(entry.key));
+                    let resources = child.native().resources();
+                    assert_eq!(resources.page.live(), 1);
+                    assert_eq!(resources.members.len(), 1);
+                    assert!(!core::ptr::eq(resources.page, &pages[0]));
+                    assert_eq!(zone.slot(source.slot).queued(), 1);
+                }
+                assert_eq!(pages[0].gate(), GateState::AwaitingExecBinding);
+                assert_eq!(pages[1].gate(), peer_gate);
+                assert_eq!(pages[0].live(), 1);
+                assert_eq!(pages[1].live(), 1);
+            }
+            return;
         }
         // An ingress record authenticates the exact live native member, not
         // just a tid shared by two roots or a recycled record slot.

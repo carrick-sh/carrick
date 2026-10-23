@@ -27,6 +27,41 @@ use carrick_el1_abi::{
 use carrick_guest_arch::{AddressContext, Asid, CpuId, RootGpa};
 
 use crate::asid::{AsidAllocator, AsidError, AsidGeneration};
+
+/// Strong custody of an opaque byte source, independent of its original MM.
+/// The implementing source owner authenticates the handle and generation.
+pub trait HostBackingRetention: Send + Sync {
+    fn identity(&self) -> carrick_el1_abi::HostBackingIdentity;
+}
+
+/// Sources inherited from an exact, live committed child. Source identities
+/// belong to byte custody, never to the resident-frame inventory.
+#[derive(Default, Clone)]
+pub struct ForkHostBackingCustody {
+    sources: BTreeMap<(NonZeroU64, NonZeroU64), std::sync::Arc<dyn HostBackingRetention>>,
+}
+impl ForkHostBackingCustody {
+    pub fn inherit(&mut self, source: std::sync::Arc<dyn HostBackingRetention>) {
+        let identity = source.identity();
+        self.sources
+            .insert((identity.handle(), identity.generation()), source);
+    }
+
+    pub fn retain(
+        &self,
+        identity: carrick_el1_abi::HostBackingIdentity,
+        owner: impl FnOnce() -> Option<std::sync::Arc<dyn HostBackingRetention>>,
+    ) -> Option<std::sync::Arc<dyn HostBackingRetention>> {
+        let matches = |source: &std::sync::Arc<dyn HostBackingRetention>| {
+            let retained = source.identity();
+            retained.handle() == identity.handle() && retained.generation() == identity.generation()
+        };
+        self.sources
+            .get(&(identity.handle(), identity.generation()))
+            .cloned()
+            .or_else(|| owner().filter(matches))
+    }
+}
 pub use carrick_observability::compat::{
     ForkAdmissionRefusal, ForkCapacityResource, ForkQuarantineState,
 };
@@ -545,13 +580,14 @@ impl<T, C> PendingForkLoan<T, C> {
 /// A settled child whose memory is live in the guest owner graph.
 #[derive(Debug)]
 struct CommittedChild<T, C> {
+    owner: carrick_el1_abi::El1MmHandle,
     root: RootGpa,
     lifecycle: ForkLifecycleLoan,
     control: ForkControlCapacity,
     tag: ChildTag<T>,
     /// Carrier authenticated physical allocations inherited by this MM.
     /// They stay pinned through quarantine and drop only after neutral release.
-    _physical: C,
+    physical: C,
 }
 
 /// Monotonic counters for diagnostics and the counted-`EAGAIN` contract.
@@ -801,6 +837,22 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     /// Committed physical root, for authenticating a stopped child lane.
     pub fn child_root(&self, mm: ReservationMm) -> Option<RootGpa> {
         Some(self.children.get(&MmKey::of(mm)?)?.root)
+    }
+
+    /// Borrow inherited custody only for the exact committed owner and root.
+    /// Retired children retain pins for reclamation, but cannot admit births.
+    pub fn child_custody(
+        &self,
+        operation: carrick_el1_abi::PortalOperation,
+        root: RootGpa,
+    ) -> Option<&C> {
+        let key = MmKey::of(operation.mm)?;
+        let child = self.children.get(&key)?;
+        (child.owner.carrier() == operation.carrier
+            && child.owner.incarnation() == operation.incarnation
+            && child.root == root
+            && !self.quarantine.contains_key(&key))
+        .then_some(&child.physical)
     }
 
     pub fn child_lifecycle(&self, mm: ReservationMm) -> Option<ForkLifecycleLoan> {
@@ -1286,11 +1338,12 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         self.children.insert(
             admitted.child_key,
             CommittedChild {
+                owner: admitted.completion.child,
                 root: pending.child_tables[0],
                 lifecycle: pending.lifecycle,
                 control: pending.control,
                 tag: ChildTag::bind(pending.tag, loan.request.child_mm),
-                _physical: admitted.physical,
+                physical: admitted.physical,
             },
         );
         self.committed_tables

@@ -930,6 +930,10 @@ path = "crates/carrick-core/tests/entry_completion.rs"
 contracts = ["core.entry.completion"]
 
 [[surfaces]]
+path = "crates/carrick-el1-abi/src/entry_binding_fatal.rs"
+contracts = ["core.entry.completion", "kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
 path = "crates/carrick-personality-linux/tests/futex_policy.rs"
 contracts = ["core.entry.completion", "kernel.el1.futex-handoff"]
 

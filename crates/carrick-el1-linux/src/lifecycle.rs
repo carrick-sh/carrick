@@ -131,7 +131,18 @@ impl<
         Ok(())
     }
     fn process_fork(&mut self, child_tid: ProcessForkChildTid) -> Option<LifecycleOutcome> {
-        Some(self.process_venue()?.fork(child_tid))
+        let outcome = super::native_fork_refusal::observe_process_venue(self.process_venue())?
+            .fork(child_tid);
+        if matches!(&outcome, LifecycleOutcome::Returned { result, .. } if result.raw() > 0) {
+            let task_index = self.frame.task_index();
+            if let (Some(slot), Some(zone)) = (self.frame.slot(), self.zone.as_mut())
+                && let Some(task) = self.current_tasks.get(task_index)
+            {
+                native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
+                    .arm_published_runnable();
+            }
+        }
+        Some(outcome)
     }
     fn process_wait4(
         &mut self,
