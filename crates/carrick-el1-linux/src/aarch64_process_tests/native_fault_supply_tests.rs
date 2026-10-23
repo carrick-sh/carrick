@@ -112,6 +112,13 @@ impl CowResolver for FaultResolver<'_> {
 
 #[test]
 fn native_child_empty_supply_resumes_cow_without_changing_parent() {
+    composed_native_supply(false);
+}
+#[test]
+fn native_backing_reply_observes_a_competing_valid_publication() {
+    composed_native_supply(true);
+}
+fn composed_native_supply(competing_publication: bool) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let window = carrick_el1_abi::EL1_COW_COPY_BASE;
@@ -819,6 +826,29 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
     assert!(
         unsafe { &*(reply.raw() as *const carrick_el1_abi::PortalGrantSlot) }.submit(window, &txn)
     );
+    if competing_publication {
+        let competing = carrick_el1_abi::PortalGrantSlot::new();
+        assert!(competing.submit(window, &txn));
+        let mm = crate::aarch64_process::Portal::for_zone(
+            NonZeroU64::MIN,
+            fixture.region.table(),
+            fixture.zone,
+        );
+        let target = carrick_core::mm::frames::grant_target(&mm, window, 0).unwrap();
+        let receipt = carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
+            &competing,
+            words,
+            residency,
+            target,
+            || {},
+        )
+        .unwrap();
+        assert!(matches!(
+            receipt.outcome,
+            carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
+        ));
+        assert!(competing.take_receipt(window, &txn).is_some());
+    }
     {
         let queue = fixture
             .zone
@@ -858,6 +888,10 @@ fn native_child_empty_supply_resumes_cow_without_changing_parent() {
         NativeResume::NoPending
     ));
     assert_eq!(frame.elr, 0x401300);
+    assert!(
+        !registry().signal_checkpoint_needed(fixture.zone, fixture.zone.record_ref(child)),
+        "a competing valid publication cannot manufacture SIGSEGV"
+    );
     assert_eq!(
         leaf(words, child_root, fresh) & AARCH64_ROOT_ADDRESS_MASK,
         rows[0].gpa.raw()

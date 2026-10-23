@@ -1116,7 +1116,14 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         if matches!(
             receipt.outcome,
             carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
+                | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied
+                        | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot
+                )
         ) {
+            // A competing publication or changed reservation invalidates this
+            // reply, not the instruction. Retry under the current mapping;
+            // the ordinary fault policy decides whether access is still valid.
             Ok(())
         } else {
             Err(MmError::Stale)
