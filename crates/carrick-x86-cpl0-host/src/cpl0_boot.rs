@@ -659,10 +659,12 @@ impl InventoryTransaction for InitialInventory {
 }
 impl Drop for InitialInventory {
     fn drop(&mut self) {
-        if self.receipt.is_some() && !self.guest_exposed && self.rollback().is_err() {
-            if let Some(receipt) = self.receipt.take() {
-                self.rollback_fault.retain(receipt);
-            }
+        if self.receipt.is_some()
+            && !self.guest_exposed
+            && self.rollback().is_err()
+            && let Some(receipt) = self.receipt.take()
+        {
+            self.rollback_fault.retain(receipt);
         }
     }
 }
