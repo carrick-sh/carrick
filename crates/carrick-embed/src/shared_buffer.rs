@@ -825,23 +825,49 @@ mod tests {
         // Initialize futex word at offset 0 to 0
         lease.write_from(0, &0u32.to_ne_bytes()).unwrap();
 
-        let lease_clone = lease.clone();
-        let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(30));
-            // Simulate guest updating futex word and waking host
-            lease_clone
-                .atomic_u32(0)
-                .unwrap()
-                .store(42, Ordering::Release)
-                .unwrap();
-            let woken = lease_clone.futex_wake(0, 1).expect("futex wake");
-            assert_eq!(woken, 1);
-        });
-
-        // Host waits for futex word at offset 0 while it equals 0
+        // A store/wake before enrollment is legal: nobody is counted, and
+        // the blocking wait observes the changed word without parking.
+        lease
+            .atomic_u32(0)
+            .unwrap()
+            .store(42, Ordering::Release)
+            .unwrap();
+        assert_eq!(lease.futex_wake(0, 1).expect("early futex wake"), 0);
         let wait_res = lease.futex_wait(0, 0, Some(Duration::from_secs(2)));
         assert!(wait_res.is_ok());
-        handle.join().expect("thread join");
+
+        // Prove the other order with an owned enrollment in the same real
+        // shared table. The continuation subscription exposes admission
+        // directly, without guessing when a blocking waiter has parked.
+        use carrick_thread::thread::FutexGenerationEnrollment;
+        let location = lease.shared_futex_location(0).unwrap();
+        let key = carrick_thread::platform_futex::carrier_shared_futex_key(location);
+        let table = lease.shared_futex.table();
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let subscription = match table.subscribe_generation(
+            table.prepare_wait(key),
+            Arc::new(move |event| {
+                let _ = wake_tx.send(event);
+            }),
+        ) {
+            FutexGenerationEnrollment::Subscribed(subscription) => subscription,
+            FutexGenerationEnrollment::Ready(_) => panic!("waiter must enroll before wake"),
+        };
+        let lease_clone = lease.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _ = completed_tx.send(lease_clone.futex_wake(0, 1));
+        });
+        wake_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("enrolled shared-buffer waiter must receive the wake");
+        let woken = completed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("enrolled futex wake must complete")
+            .expect("enrolled futex wake");
+        assert_eq!(woken, 1);
+        handle.join().expect("waker completed");
+        drop(subscription);
 
         // Timeout test: wait for value 42 (which it is) with small timeout
         let to_res = lease.futex_wait(0, 42, Some(Duration::from_millis(10)));
