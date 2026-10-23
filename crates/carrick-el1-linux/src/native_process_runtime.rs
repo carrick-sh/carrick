@@ -260,6 +260,17 @@ impl<T> FallibleBox<T> {
     }
 }
 
+impl<T: zerocopy::FromZeros> FallibleBox<T> {
+    pub fn zeroed(mut self) -> Box<T> {
+        // SAFETY: reserved typed storage; FromZeros proves all-zero validity.
+        unsafe {
+            self.0.as_mut_ptr().write_bytes(0, 1);
+            self.0.set_len(1);
+            Box::from_raw(Box::into_raw(self.0.into_boxed_slice()).cast::<T>())
+        }
+    }
+}
+
 pub fn try_box<T>(value: T) -> Result<Box<T>, NativeProcessError> {
     FallibleBox::try_reserve().map(|slot| slot.put(value))
 }
@@ -353,6 +364,12 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     );
     fn quarantine_born(&mut self, born: Self::Born);
     fn retire_mm(&mut self, mm: Self::Mm);
+    fn apply_fault_reply(
+        &mut self,
+        _slot: &carrick_el1_abi::PortalGrantSlot,
+    ) -> Result<(), carrick_core::mm::transaction::MmError> {
+        Err(carrick_core::mm::transaction::MmError::Core)
+    }
     fn wake_effects(&mut self, effects: WakeEffects);
     /// A guest drain opened ingress capacity for an owned host admission.
     fn request_ingress_producer_boundary(&mut self);
@@ -1677,7 +1694,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 {
                     let pending = super::native_process_signals::pending_summary_word();
                     let blocked = control.blocked().0;
-                    let forced = carrick_signal_core::policy::Signal::SEGV.bit()
+                    let forced = carrick_signal_core::policy::Signal::BUS.bit()
+                        | carrick_signal_core::policy::Signal::SEGV.bit()
                         | carrick_signal_core::policy::Signal::KILL.bit();
                     if pending & (!blocked | forced) == 0 {
                         return false;
@@ -3689,9 +3707,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn force_sigsegv_info(
         &mut self,
         blocked: carrick_signal_core::policy::SigBlockMask,
+        info: carrick_syscall_abi::LinuxSiginfo,
+    ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
+        self.force_fault_info(carrick_signal_core::policy::Signal::SEGV, blocked, info)
+    }
+    fn force_fault_info(
+        &mut self,
+        signal: carrick_signal_core::policy::Signal,
+        blocked: carrick_signal_core::policy::SigBlockMask,
         mut info: carrick_syscall_abi::LinuxSiginfo,
     ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
-        info.si_signo = carrick_signal_core::policy::Signal::SEGV.number();
+        info.si_signo = signal.number();
         let graph = self.runtime.graph.lock();
         let row = graph
             .owner
@@ -3700,7 +3726,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let resources = row.native().resources();
         resources
             .signals()
-            .force_sigsegv(self.record, blocked, Some(info));
+            .force_fault(self.record, signal, blocked, Some(info));
         resources.sync_non_interrupting_signals();
         Ok(())
     }

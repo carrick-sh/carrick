@@ -1590,12 +1590,7 @@ pub(crate) fn service_native_fork_stock(
                             count,
                             inherited,
                         )
-                        .map(|inherited| {
-                            crate::fork_stock::NativeChildPhysical {
-                                inherited,
-                                ..Default::default()
-                            }
-                        })
+                        .map(crate::fork_stock::NativeChildPhysical::new)
                     },
                 );
                 if let Err(refusal) = &result {

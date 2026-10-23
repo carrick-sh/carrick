@@ -198,7 +198,10 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
             return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
         };
         if publication.va != window.range.start()
-            || publication.len != window.range.len()
+            || publication.len > window.range.len()
+            || publication.len == 0
+            || !publication.len.is_multiple_of(4096)
+            || window.fault_page >= publication.va + publication.len
             || publication.writable
                 != window
                     .protection

@@ -13,10 +13,26 @@ use carrick_hal::fork_stock::{ForkStock, ForkTableLedger};
 #[derive(Default)]
 pub(crate) struct NativeChildPhysical {
     pub inherited: Vec<crate::trap::ForkPhysicalRetention>,
+    pub sources: carrick_hal::fork_stock::ForkHostBackingCustody,
     pub supplied: Option<
         carrick_hal::physical_grants::NativePhysicalGrants<std::sync::Arc<NativeFrameBacking>>,
     >,
     pub rollback: std::sync::Arc<carrick_hal::physical_grants::PhysicalGrantRollback>,
+}
+impl NativeChildPhysical {
+    pub fn new(inherited: Vec<crate::trap::ForkPhysicalRetention>) -> Self {
+        let mut sources = carrick_hal::fork_stock::ForkHostBackingCustody::default();
+        for row in &inherited {
+            if let Some(source) = row.retained_host_backing() {
+                sources.inherit(source);
+            }
+        }
+        Self {
+            inherited,
+            sources,
+            ..Default::default()
+        }
+    }
 }
 impl core::fmt::Debug for NativeChildPhysical {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -31,6 +47,7 @@ pub(crate) struct NativeFrameBacking {
     pub carrier: std::sync::Weak<CarrierVmCustody>,
     pub ipa: u64,
     pub generation: u64,
+    pub length: u64,
 }
 impl Drop for NativeFrameBacking {
     fn drop(&mut self) {
@@ -43,7 +60,7 @@ impl Drop for NativeFrameBacking {
             crate::trap::retire_global_frame_host_owner_if_generation_in(
                 &carrier,
                 self.ipa,
-                carrick_el1_abi::COW_GRANT_SIZE,
+                self.length,
                 self.generation,
             );
         }

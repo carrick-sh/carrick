@@ -43,7 +43,7 @@ struct SignalResources<'a, T> {
     actions: ActionTable,
     inbox: SignalInbox<TaskKey, T>,
     thread_pending: Vec<(carrick_sched_core::RecordRef, PendingSignals<T>)>,
-    forced_segv: Vec<carrick_sched_core::RecordRef>,
+    forced_faults: Vec<(carrick_sched_core::RecordRef, Signal)>,
     projections: Vec<(
         carrick_sched_core::RecordRef,
         Weak<NativeSignalProjection<'a, T>>,
@@ -171,8 +171,8 @@ impl<'a, T> SignalShared<'a, T> {
         for (_, pending) in &resources.thread_pending {
             present |= pending.present().bits();
         }
-        for _ in &resources.forced_segv {
-            present |= Signal::SEGV.bit();
+        for (_, signal) in &resources.forced_faults {
+            present |= signal.bit();
         }
         // A process queue change affects every member. A thread queue change
         // affects only its exact record, regardless of unrelated live members.
@@ -277,7 +277,7 @@ impl<T> NativeSignalProjection<'_, T> {
         state.projections.insert(index, (record, projection));
         let pending = state.take_thread_pending(previous);
         state.restore_thread_pending(record, pending);
-        for current in &mut state.forced_segv {
+        for (current, _) in &mut state.forced_faults {
             if *current == previous {
                 *current = record;
             }
@@ -320,7 +320,7 @@ impl<T> NativeForkSignals<T> {
                     actions: self.actions,
                     inbox: self.inbox,
                     thread_pending: Vec::new(),
-                    forced_segv: Vec::new(),
+                    forced_faults: Vec::new(),
                     projections: Vec::new(),
                 },
             )),
@@ -340,7 +340,7 @@ impl<'a, T> NativeProcessSignals<'a, T> {
                     actions: ActionTable::default(),
                     inbox: SignalInbox::new(key),
                     thread_pending: Vec::new(),
-                    forced_segv: Vec::new(),
+                    forced_faults: Vec::new(),
                     projections: Vec::new(),
                 },
             )),
@@ -389,11 +389,11 @@ impl<'a, T> NativeProcessSignals<'a, T> {
             resources.inbox.pending_mut().discard(selected);
             let SignalResources {
                 thread_pending,
-                forced_segv,
+                forced_faults,
                 ..
             } = &mut *resources;
             for (record, pending) in thread_pending.iter_mut() {
-                if signal != Signal::SEGV || !forced_segv.contains(record) {
+                if !forced_faults.contains(&(*record, signal)) {
                     pending.discard(selected);
                 }
             }
@@ -423,10 +423,18 @@ impl<'a, T> NativeProcessSignals<'a, T> {
         blocked: SigBlockMask,
         info: Option<T>,
     ) {
+        self.force_fault(tid, Signal::SEGV, blocked, info);
+    }
+    pub fn force_fault(
+        &self,
+        tid: carrick_sched_core::RecordRef,
+        signal: Signal,
+        blocked: SigBlockMask,
+        info: Option<T>,
+    ) {
         let mut resources = self.resources.lock();
-        let signal = Signal::SEGV;
-        if !resources.forced_segv.contains(&tid) {
-            resources.forced_segv.push(tid);
+        if !resources.forced_faults.contains(&(tid, signal)) {
+            resources.forced_faults.push((tid, signal));
         }
         if blocked.contains(signal)
             || resources.actions.action(signal).disposition == Disposition::Ignore
@@ -443,8 +451,8 @@ impl<'a, T> NativeProcessSignals<'a, T> {
     pub fn non_interrupting_signals(&self) -> SignalSet {
         let resources = self.resources.lock();
         let mut set = resources.actions.non_interrupting_signals();
-        if !resources.forced_segv.is_empty() {
-            set = set.without(Signal::SEGV);
+        for (_, signal) in &resources.forced_faults {
+            set = set.without(*signal);
         }
         set
     }
@@ -512,7 +520,7 @@ impl<'a, T> NativeProcessSignals<'a, T> {
             }
             selected = selected.without(signal);
         }
-        resources.forced_segv.contains(&tid)
+        resources.forced_faults.iter().any(|(id, _)| *id == tid)
     }
     pub fn take_deliverable(
         &self,
@@ -522,7 +530,10 @@ impl<'a, T> NativeProcessSignals<'a, T> {
         loop {
             let mut resources = self.resources.lock();
             let mut thread_pending = resources.take_thread_pending(tid);
-            let forced = resources.forced_segv.contains(&tid);
+            let forced = resources
+                .forced_faults
+                .iter()
+                .find_map(|(id, signal)| (*id == tid).then_some(*signal));
             let present = resources
                 .inbox
                 .pending()
@@ -530,8 +541,8 @@ impl<'a, T> NativeProcessSignals<'a, T> {
                 .union(thread_pending.present());
             let mut unblocked = if present.contains(Signal::KILL) {
                 SignalSet::EMPTY.with(Signal::KILL)
-            } else if forced {
-                SignalSet::EMPTY.with(Signal::SEGV)
+            } else if let Some(signal) = forced {
+                SignalSet::EMPTY.with(signal)
             } else {
                 blocked.select(present)
             };
@@ -557,8 +568,10 @@ impl<'a, T> NativeProcessSignals<'a, T> {
                 .refresh_summary(&resources, ProjectionUpdate::Member(tid));
             let delivery = delivery?;
             let signal = delivery.entry.signal;
-            if signal == Signal::SEGV {
-                resources.forced_segv.retain(|id| *id != tid);
+            if resources.forced_faults.contains(&(tid, signal)) {
+                resources
+                    .forced_faults
+                    .retain(|pair| *pair != (tid, signal));
                 self.resources
                     .refresh_summary(&resources, ProjectionUpdate::Member(tid));
             }
@@ -1082,6 +1095,38 @@ mod tests {
                 .disposition,
             Disposition::Default
         );
+    }
+
+    #[test]
+    fn forced_bus_is_thread_exact_and_cannot_be_blocked_or_ignored() {
+        let task = key(41, 11);
+        let signals = fresh::<u32>(task);
+        let record = carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+            incarnation: 1,
+        };
+        let other = carrick_sched_core::RecordRef {
+            incarnation: 2,
+            ..record
+        };
+        let blocked = SigBlockMask::blocking_all_of(SignalSet::EMPTY.with(Signal::BUS));
+        signals
+            .install_action(
+                task,
+                Signal::BUS,
+                Action {
+                    disposition: Disposition::Ignore,
+                    ..Action::default()
+                },
+            )
+            .unwrap();
+        signals.force_fault(record, Signal::BUS, blocked, Some(42));
+        assert!(signals.take_deliverable(other, blocked).is_none());
+        let (signal, info, action) = signals.take_deliverable(record, blocked).unwrap();
+        assert_eq!(signal, Signal::BUS);
+        assert_eq!(info, Some(42));
+        assert_eq!(action.disposition, Disposition::Default);
+        assert!(signals.take_deliverable(record, blocked).is_none());
     }
 
     #[test]

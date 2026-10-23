@@ -5,6 +5,7 @@ use carrick_core_abi::service::{ServiceError, ServiceOperation, ServiceRequest, 
 use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
 
 pub(super) struct PendingService<'a> {
+    reply: Option<Box<carrick_el1_abi::PortalGrantSlot>>,
     request: ServiceRequest,
     pub(super) wait: Option<carrick_core_abi::PortalOwnerWait>,
     claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
@@ -160,6 +161,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .service
             .bound_birth(self.key, self.binding.thread_generation, self.record)
             .map_err(service_error)?;
+        let reply = if matches!(operation, ServiceOperation::Fault(fault) if !fault.present)
+            && fault_sequence.is_some()
+        {
+            Some(FallibleBox::<carrick_el1_abi::PortalGrantSlot>::try_reserve()?.zeroed())
+        } else {
+            None
+        };
         let claim = carrick_core::terminal::NativeServiceClaim::acquire(page)
             .map_err(|_| NativeProcessError::Busy)?;
         let published = {
@@ -169,7 +177,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             } else {
                 self.control
                     .service
-                    .publish(birth, self.binding.generation, operation, fault_sequence)
+                    .publish_with_reply(
+                        birth,
+                        self.binding.generation,
+                        operation,
+                        fault_sequence,
+                        reply.as_ref().map(|slot| {
+                            carrick_guest_arch::KernelVa::new(
+                                core::ptr::from_ref(&**slot).addr() as u64
+                            )
+                        }),
+                    )
                     .map_err(service_error)
             }
         };
@@ -183,6 +201,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.runtime.graph.lock().insert_member_wait(
             self.record,
             MemberWait::Service(PendingService {
+                reply,
                 request,
                 wait: None,
                 claim,
@@ -436,8 +455,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn finish_service(
         &mut self,
         request: ServiceRequest,
-        result: ServiceResult,
-        pending: PendingService<'a>,
+        mut result: ServiceResult,
+        mut pending: PendingService<'a>,
     ) -> Result<NativeResume, NativeProcessError> {
         if pending.request != request {
             return Err(NativeProcessError::Quarantined);
@@ -457,6 +476,33 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             self.release_service_claim(pending.claim)?;
             return Ok(NativeResume::NoPending);
+        }
+        if result == ServiceResult::Supplied
+            && let Some(reply) = &pending.reply
+        {
+            match self.service.apply_fault_reply(reply) {
+                Ok(()) => {}
+                Err(carrick_core::mm::transaction::MmError::Wait(wait)) => {
+                    let next = self
+                        .control
+                        .service
+                        .begin_owner_wait(
+                            request.identity.birth,
+                            self.binding.generation,
+                            request.operation,
+                            wait,
+                        )
+                        .map_err(service_error)?;
+                    pending.request = next;
+                    pending.wait = Some(wait);
+                    self.runtime
+                        .graph
+                        .lock()
+                        .insert_member_wait(self.record, MemberWait::Service(pending));
+                    return self.park_owner_wait(next, wait);
+                }
+                Err(_) => result = ServiceResult::Refused,
+            }
         }
         // SAFETY: completion belongs to this exact selected record.
         unsafe {
@@ -489,6 +535,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 )))
             }
             (ServiceOperation::Fault(_), ServiceResult::Cancelled) => Ok(NativeResume::NoPending),
+            (ServiceOperation::Fault(fault), ServiceResult::BackingFault) => {
+                self.force_fault_info(
+                    carrick_signal_core::policy::Signal::BUS,
+                    carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                        carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+                    ),
+                    carrick_syscall_abi::LinuxSiginfo {
+                        si_code: carrick_syscall_abi::LINUX_BUS_ADRERR,
+                        si_addr: fault.address.raw(),
+                        ..carrick_syscall_abi::LinuxSiginfo::empty()
+                    },
+                )
+                .map_err(|_| NativeProcessError::Fault)?;
+                Ok(NativeResume::NoPending)
+            }
+            (_, ServiceResult::BackingFault) => Err(NativeProcessError::Quarantined),
             (ServiceOperation::Fault(fault), ServiceResult::Refused) => {
                 self.force_sigsegv_info(
                     carrick_signal_core::policy::SigBlockMask::blocking_all_of(
