@@ -29,9 +29,12 @@ jobs:
         env:
           REVIEW_PR: ${{ github.event.pull_request.number }}
           REVIEW_HEAD: ${{ github.event.pull_request.head.sha }}
+          # Authenticated: hosted runners share the unauthenticated API quota.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if ! live_head=$(curl --fail --silent --show-error --max-time 30 \
+            -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/carrick-sh/carrick/pulls/$REVIEW_PR" | jq -er '.head.sha'); then
             echo '::error::Cannot verify live PR head; refusing owner review' >&2
             exit 1

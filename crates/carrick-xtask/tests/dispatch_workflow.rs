@@ -1127,6 +1127,7 @@ fn dispatch_review_stale_head_fails_before_checkout_or_build() {
             .env_clear()
             .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
             .env("REVIEW_PR", "800")
+            .env("GH_TOKEN", "job-token")
             .env("REVIEW_HEAD", "a".repeat(40))
             .env("LIVE_HEAD", live.repeat(40))
             .output()
