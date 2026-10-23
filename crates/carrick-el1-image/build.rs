@@ -313,14 +313,6 @@ fn main() {
         .arg("--target-dir")
         .arg(&el1_target_dir);
 
-    // Optimize the freestanding image and its dependencies for loaded size.
-    // Keep this override inside the nested build: the host release profile,
-    // overflow checks, frame pointers and full DWARF remain unchanged. The
-    // compiled-frame and FP/SIMD gates below still inspect the exact image.
-    // See docs/perf-results/2026-10-23-el1-image-census.md for the measured
-    // alternatives; cross-crate LTO can erase required retained frames.
-    build_cmd.env("CARGO_PROFILE_RELEASE_OPT_LEVEL", "s");
-
     if std::env::var_os("CARGO_FEATURE_ALLOCATOR_TEST_CONTROL").is_some() {
         build_cmd.arg("--features").arg("allocator-test-control");
     }
@@ -359,7 +351,7 @@ fn main() {
 
     // Reuse the existing artifact inspection, with no additional host file
     // access. Keep the report tied to the ABI's image limit.
-    let limit = carrick_el1_abi::EL1_IMAGE_SIZE;
+    let limit = carrick_el1_abi::EL1_IMAGE_SIZE.raw();
     let headroom = limit
         .checked_sub(image_size)
         .expect("EL1 image exceeds the ABI image budget");

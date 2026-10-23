@@ -18,7 +18,7 @@ mod tests {
         // `.bss`, so the flat file may be shorter. The loader places IMAGE at
         // the start of a freshly zeroed region, which zero-fills the rest.
         assert!(IMAGE.len() as u64 <= header.image_size);
-        assert!(header.image_size <= carrick_el1_abi::EL1_IMAGE_SIZE);
+        assert!(header.image_size <= carrick_el1_abi::EL1_IMAGE_SIZE.raw());
         assert!(header.entry_offset < IMAGE.len() as u64);
         // The embedded image was built against this host's shared-record
         // layout.

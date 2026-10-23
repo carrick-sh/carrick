@@ -1,7 +1,7 @@
 //! Slot-owned temporary aliases used only on the carrier maintenance root.
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub const EL1_SERVICE_COPY_TABLE_OFFSET: u64 = 0x1B_0000;
+pub const EL1_SERVICE_COPY_TABLE_OFFSET: u64 = crate::EL1_COUNTERS_OFFSET + 0xB_0000;
 pub const EL1_SERVICE_COPY_TABLE_BASE: u64 = crate::EL1_REGION_BASE + EL1_SERVICE_COPY_TABLE_OFFSET;
 pub const EL1_SERVICE_COPY_BASE: u64 = 0x2D_3FE0_0000;
 pub const EL1_SERVICE_COPY_SIZE: u64 = crate::EL1_STACK_SLOTS * 2 * 4096;

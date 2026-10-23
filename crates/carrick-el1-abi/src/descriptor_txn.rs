@@ -171,7 +171,7 @@ impl Default for DescriptorTxnSlots {
 }
 
 /// Offset of [`DescriptorTxnSlots`] in the EL1 region: its assigned
-/// `[0x180000, 0x1A0000)` window of the counters area.
+/// 128 KiB window starting 512 KiB into the counters area.
 pub const EL1_DESCRIPTOR_TXN_OFFSET: u64 = EL1_COUNTERS_OFFSET + 0x8_0000;
 pub const EL1_DESCRIPTOR_TXN_BASE: u64 = EL1_REGION_BASE + EL1_DESCRIPTOR_TXN_OFFSET;
 
@@ -180,7 +180,7 @@ pub const EL1_DESCRIPTOR_TXN_BASE: u64 = EL1_REGION_BASE + EL1_DESCRIPTOR_TXN_OF
 /// are virtual aliases, not another frame pool or persistent backing owner.
 /// The window's VA is owned by `carrick-mmu-core`, whose stage-1 editors
 /// provision it and refuse to edit it; these names are that same window.
-pub const EL1_COW_COPY_OFFSET: u64 = 0x1A_0000;
+pub const EL1_COW_COPY_OFFSET: u64 = crate::EL1_COUNTERS_OFFSET + 0xA_0000;
 pub const EL1_COW_COPY_BASE: u64 =
     carrick_mmu_core::aarch64::descriptor_txn::copy_window::COW_COPY_WINDOW_BASE;
 pub const EL1_COW_COPY_SIZE: u64 =
@@ -197,8 +197,8 @@ const _: () = assert!(
     EL1_DESCRIPTOR_TXN_OFFSET + core::mem::size_of::<DescriptorTxnSlots>() as u64
         <= EL1_COUNTERS_OFFSET + EL1_COUNTERS_SIZE
 );
-// Counters-area assignment: counters [0x100000, 0x118000), shared
-// reservations [0x118000, 0x180000), descriptor-txn slots [0x180000, 0x1A0000).
+// Counters-area relative assignment: counters [0, 0x18000), shared
+// reservations [0x18000, 0x80000), descriptor slots [0x80000, 0xA0000).
 const _: () = assert!(EL1_DESCRIPTOR_TXN_OFFSET >= EL1_COUNTERS_OFFSET + 0x8_0000);
 const _: () = assert!(
     EL1_DESCRIPTOR_TXN_OFFSET + core::mem::size_of::<DescriptorTxnSlots>() as u64

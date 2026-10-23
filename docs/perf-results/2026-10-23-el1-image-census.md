@@ -7,15 +7,91 @@ signed HVF execution is available on this worker.
 Main advanced during verification. The initial-base measurements below are
 retained as experimental evidence; the **Rebased main** section records the
 fresh comparison on `0aa665ef5`, onto which the branch was rebased before its
-final gates. The one implementation change was kept unchanged; none was
-ported, dropped or replaced.
+initial gates. That rebase kept the experimental implementation unchanged;
+the subsequent signed rejection and replacement are recorded below.
+
+## A/B rejected opt-level=s
+
+The director's paired signed A/B on [issue #801](https://github.com/carrick-sh/carrick/issues/801)
+rejected the size optimization. Relative to the speed-optimized image:
+
+| Workload | Runtime regression with `opt-level=s` |
+|---|---:|
+| Futex ping-pong | +39% |
+| Epoll loop | +36% |
+| gettid | +28% |
+
+These are director-provided signed measurements, not measurements from this
+Linux worker. The owner authorized increasing loaded image capacity to
+**1,572,864 bytes (1.5 MiB)** while retaining speed optimization. The nested
+`opt-level=s` override is removed. The original census and experimental
+results below are retained as historical evidence, not as an accepted
+optimization or evidence for the new layout.
+
+The capacity is one typed `GuestLen` constant, `EL1_IMAGE_SIZE`, owned in
+`carrick-mmu-core::aarch64` because the neutral page-table editor must also
+know where the following COW alias window starts. `carrick-el1-abi` reexports
+it; the image gate, loader, exception PC bounds and linker all consume it.
+The linker gets its absolute capacity symbol from a Rust assembly constant,
+so its assertion no longer duplicates a literal MiB size.
+
+The 64 MiB outer region stays fixed. The following offsets change together:
+
+| Region | Old offset | New offset | Capacity |
+|---|---:|---:|---:|
+| Image | `0` | `0` | 1.5 MiB |
+| Counters and control arena | `0x100000` | `0x180000` | 1 MiB |
+| Per-CPU stacks | `0x200000` | `0x280000` | 4 MiB |
+| Current tasks and mailboxes | `0x600000` | `0x680000` | 1 MiB |
+| Bootstrap metadata | `0x700000` | `0x780000` | 9 MiB |
+| Fixed-table heap start | `0x1000000` | `0x1080000` | remainder of 64 MiB |
+| File cache | `0x1100000` | `0x1180000` | 32 MiB |
+| Inotify table | `0x3100000` | `0x3180000` | 3 MiB |
+| Name cache | `0x3400000` | `0x3480000` | 64 KiB |
+| Scheduler tables | `0x3500000` | `0x3500000` | 11 MiB |
+
+The unused gap between the name cache and scheduler tables absorbs the
+512 KiB growth. No live table, bootstrap allocator, or stack capacity is
+reduced. The shared counters/control offsets move for CPL0 too; its actual
+supervisor executable has a separate 2 MiB high-half extent and remains
+unchanged. Its `0x100000` GPA is an image **base**, not a 1 MiB capacity.
+ARM's linker base, outer IPA reservation, dynamic metadata aperture, IPC
+window, and guest RAM boundaries remain unchanged. The per-CPU physical
+stack remains 16 KiB and the registered path budget remains **12,288 bytes**.
+The ABI layout hash changes, so old images cannot attach to the new host.
+
+The VM-free `enlarged_image_and_shared_arm_x86_regions_do_not_overlap` test
+failed first against the original counters offset: a 1.5 MiB image collided
+with it. It then passed with derived offsets, checking both shared ISA
+bases, control subregions, stack capacity, metadata, heap tables and CPL0's
+separate executable extent. The host memory test additionally checks guest
+RAM reservations and real ARM page-table permissions at region boundaries.
+
+### Raised-budget image verification
+
+Both speed-optimized image builds pass the original FP/SIMD and compiled-frame
+gates with the new capacity:
+
+| Image variant | Loaded bytes | Capacity | Headroom |
+|---|---:|---:|---:|
+| Default | 1,026,160 | 1,572,864 | 546,704 |
+| `allocator-test-control` | 1,034,352 | 1,572,864 | 538,512 |
+
+The largest registered stack path is native wait copy at **11,535 / 12,288
+bytes**, for both variants. The layout shift leaves loaded image size equal
+to the speed-optimized rebased main measurements. No debug information is
+removed. Logs for this replacement are under `/tmp/el1-size-801/budget-raise/`.
+An independent read-only review found no production correctness defects;
+it confirmed the relocated ARM COW window at offset `0x220000` is provisioned
+dynamically and x86 backs the entire unchanged 64 MiB shared region.
 
 ## Measurement boundary
 
 The authoritative size is `_image_end - _image_start`, the same expression
 stored in the CEL1 header and checked by `carrick-el1-image/build.rs` and
 `carrick-el1-linux/link.ld`. It includes header, text, read-only data, data,
-BSS and intervening/trailing alignment. The limit stays **1,048,576 bytes**.
+BSS and intervening/trailing alignment. The original census used a **1,048,576-byte** limit; the owner-approved
+replacement above uses **1,572,864 bytes**.
 DWARF, ELF symbol tables and ELF container overhead are not loaded. Stripping
 DWARF would save **zero loaded bytes**. Host release settings are out of scope.
 
@@ -618,7 +694,7 @@ caveat about inlined formatting attribution was incorporated. Rebase kept the
 implementation byte-for-byte unchanged; the image builds above re-prove its
 size and stack witness against the new main source.
 
-### Final local verification
+### Historical opt-level=s local verification
 
 All commands below ran in the foreground with
 `env -u RUSTC_WRAPPER CARRICK_SCCACHE=0` and exited zero on the rebased

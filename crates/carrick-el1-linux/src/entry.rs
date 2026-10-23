@@ -6,6 +6,13 @@
 #[cfg(not(target_os = "none"))]
 fn main() {}
 
+#[cfg(target_os = "none")]
+core::arch::global_asm!(
+    ".global CARRICK_EL1_IMAGE_CAPACITY",
+    ".set CARRICK_EL1_IMAGE_CAPACITY, {bytes}",
+    bytes = const carrick_el1_abi::EL1_IMAGE_SIZE.raw(),
+);
+
 /// In-guest syscall entry point called from the EL1 exception vector.
 ///
 /// Every return toward EL0 (and every kicked interrupt leaving for the host)
