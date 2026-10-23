@@ -308,6 +308,7 @@ pub(super) enum HvpatchProductionPhase {
     ResumeOwnerZone {
         frame: carrick_hal::RawSyscall,
         resume: OwnedSyscallResume,
+        origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
     },
     ResumeRetainedOwner {
         action: Box<RetainedMemoryAction>,
@@ -325,6 +326,7 @@ pub(super) enum HvpatchProductionPhase {
     ResumeOwnerPhysical {
         frame: carrick_hal::RawSyscall,
         resume: OwnedSyscallResume,
+        origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
         wait: carrick_guest_mem::OwnedMemoryWait,
         _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
     },
@@ -3411,6 +3413,7 @@ where
             }
             self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
                 frame,
+                origin: self.state.owner_wait_origin()?,
                 resume: resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
                 wait,
                 _subscription: subscription,
@@ -4086,12 +4089,27 @@ where
     pub(super) fn cancel_native_owner_wait(
         &mut self,
         engine: &mut E,
+        origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        if self.state.owner_wait_origin()? != origin {
+            return Err(RuntimeError::Configuration(
+                "owner cancellation changed completion origin".into(),
+            )
+            .into());
+        }
         self.state.publish_external_ingress(&self.kernel)?;
         engine
-            .cancel_native_owner_wait()
+            .cancel_native_owner_wait(origin)
             .map_err(RuntimeError::Trap)?;
-        self.state.retire_syscall()?;
+        match origin {
+            carrick_hal::threaded::NativeOwnerWaitOrigin::HostTrap => {
+                self.state.retire_syscall()?
+            }
+            carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0 => {
+                self.state.ipc_user_return = None;
+                self.state.owner_read_progress = 0;
+            }
+        }
         self.state.continuation_restart = None;
         self.phase = HvpatchProductionPhase::Resident;
         Ok(executor::ExecutorExit::Syscall)
@@ -4470,12 +4488,17 @@ where
             let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
             match phase {
                 HvpatchProductionPhase::ResumeZone => return self.resume_zone(engine, control),
-                HvpatchProductionPhase::ResumeOwnerZone { frame, resume } => {
-                    return self.resume_owner_zone(engine, control, frame, resume);
+                HvpatchProductionPhase::ResumeOwnerZone {
+                    frame,
+                    resume,
+                    origin,
+                } => {
+                    return self.resume_owner_zone(engine, control, frame, resume, origin);
                 }
                 HvpatchProductionPhase::ResumeOwnerPhysical {
                     frame,
                     resume,
+                    origin,
                     wait,
                     _subscription,
                 } => {
@@ -4495,7 +4518,7 @@ where
                     }
                     if matches!(cancellation, Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::NativeFatal)) {
                         drop(_subscription);
-                        return self.cancel_native_owner_wait(engine);
+                        return self.cancel_native_owner_wait(engine, origin);
                     }
                     if cancellation
                         == Some(
@@ -4526,6 +4549,7 @@ where
                         self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
                             frame,
                             resume,
+                            origin,
                             wait,
                             _subscription,
                         };

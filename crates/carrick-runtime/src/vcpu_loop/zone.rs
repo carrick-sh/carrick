@@ -824,22 +824,30 @@ where
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match (action, syscall_state) {
                     (OwnerMemoryAction::Syscall { frame, resume }, Some((state, _, request))) => {
+                        let origin = self.state.owner_wait_origin()?;
                         let exit = self.settle_into_zone(
                             control,
                             continuation::quantum::ZoneSave {
                                 base: state,
                                 record: zone.record_ref(record),
-                                origin: if self.state.ipc_user_return.is_some() {
-                                    executor::residency::ZoneResumeOrigin::HostEl0
-                                } else {
-                                    executor::residency::ZoneResumeOrigin::HostTrap
+                                origin: match origin {
+                                    carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0 => {
+                                        executor::residency::ZoneResumeOrigin::HostEl0
+                                    }
+                                    carrick_hal::threaded::NativeOwnerWaitOrigin::HostTrap => {
+                                        executor::residency::ZoneResumeOrigin::HostTrap
+                                    }
                                 },
                             },
                             seq,
                             ZoneWaitPolicy::for_owner_resume(&resume),
                             request,
                         )?;
-                        self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame, resume };
+                        self.phase = HvpatchProductionPhase::ResumeOwnerZone {
+                            frame,
+                            resume,
+                            origin,
+                        };
                         Ok(exit)
                     }
                     (OwnerMemoryAction::Retained, None) => {
@@ -911,12 +919,13 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         frame: carrick_hal::RawSyscall,
         resume: OwnedSyscallResume,
+        origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let mut result = self.consume_owner_zone(control)?;
         use carrick_kernel::kernel::continuation::{ContinuationCompletion, OwnerWaitCancellation};
         match &result.completion {
             ContinuationCompletion::OwnerCancelled(OwnerWaitCancellation::NativeFatal) => {
-                return self.cancel_native_owner_wait(engine);
+                return self.cancel_native_owner_wait(engine, origin);
             }
             ContinuationCompletion::OwnerCancelled(OwnerWaitCancellation::GroupExit) => {
                 return self.drive_thread_exit(engine, control, 0);

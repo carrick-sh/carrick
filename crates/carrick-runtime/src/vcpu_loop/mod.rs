@@ -2407,6 +2407,24 @@ where
         self.complete_returned(engine, kernel, errno.guest_retval())
     }
 
+    pub(super) fn owner_wait_origin(
+        &self,
+    ) -> Result<carrick_hal::threaded::NativeOwnerWaitOrigin, RuntimeError> {
+        use carrick_hal::threaded::NativeOwnerWaitOrigin;
+        if self.ipc_user_return.is_some() {
+            if !self.syscall_completion.is_idle() {
+                return Err(RuntimeError::Configuration(
+                    "EL0 owner wait has conflicting guest completion ownership".into(),
+                ));
+            }
+            Ok(NativeOwnerWaitOrigin::HostEl0)
+        } else {
+            self.syscall_completion
+                .guest("trap owner wait lost guest completion ownership")?;
+            Ok(NativeOwnerWaitOrigin::HostTrap)
+        }
+    }
+
     pub(super) fn retire_syscall(&mut self) -> Result<(), RuntimeError> {
         self.owner_read_progress = 0;
         match std::mem::replace(
@@ -3735,7 +3753,19 @@ pub(crate) mod tests {
     }
 
     impl ThreadedEngine for CrashCaptureTestEngine {
-        fn cancel_native_owner_wait(&mut self) -> Result<(), TrapError> {
+        fn cancel_native_owner_wait(
+            &mut self,
+            origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
+        ) -> Result<(), TrapError> {
+            if let Some(carrick_hal::threaded::GuestCpuState::Aarch64V1(cpu)) = &self.snapshot_cpu {
+                assert_eq!(
+                    cpu.syscall_continuation.is_some(),
+                    origin == carrick_hal::threaded::NativeOwnerWaitOrigin::HostTrap
+                );
+                if origin == carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0 {
+                    assert_eq!(cpu.pstate & 0xf, 0);
+                }
+            }
             self.native_owner
                 .as_ref()
                 .expect("real native signal owner")
@@ -4944,13 +4974,19 @@ pub(crate) mod tests {
                         job.poll_with_engine(&mut engine, &mut resumed_control)
                             .unwrap()
                     } else {
-                        let HvpatchProductionPhase::ResumeOwnerZone { resume, .. } =
+                        let HvpatchProductionPhase::ResumeOwnerZone { resume, origin, .. } =
                             std::mem::replace(&mut job.phase, HvpatchProductionPhase::Resident)
                         else {
                             panic!("owner park lost its retained syscall");
                         };
-                        job.resume_owner_zone(&mut engine, &mut resumed_control, frame, resume)
-                            .unwrap()
+                        job.resume_owner_zone(
+                            &mut engine,
+                            &mut resumed_control,
+                            frame,
+                            resume,
+                            origin,
+                        )
+                        .unwrap()
                     };
                     if release_wins {
                         let executor::ExecutorExit::BlockedContinuation {
@@ -4999,11 +5035,14 @@ pub(crate) mod tests {
                                 &mut resumed_control,
                                 frame,
                                 binding::OwnedSyscallResume::CopyoutRedispatch,
+                                carrick_hal::threaded::NativeOwnerWaitOrigin::HostTrap,
                             )
                             .unwrap();
                     }
                     if killing && native {
                         assert_eq!(engine.native_owner_cancellations, 1);
+                        assert!(job.state.ipc_user_return.is_none());
+                        assert!(job.state.syscall_completion.is_idle());
                         assert!(engine.completed_syscalls.is_empty());
                         assert!(
                             carrick_el1_abi::Lifecycle::process_exit_custody(

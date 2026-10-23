@@ -971,3 +971,39 @@ fn native_owner_cancel_hook_carries_fatal_obligation_without_result() {
         "fatal checkpoint must not load a fabricated syscall result"
     );
 }
+
+#[test]
+fn native_owner_cancel_direct_el0_enters_same_fatal_hook_from_idle() {
+    for irq in [El1IrqMode::Masked, El1IrqMode::Gic] {
+        let mut machine = Machine::full_clock_vector_page(irq);
+        machine.image = Image::Idle;
+        let saved = machine.regs;
+        machine.pc = (native_owner_cancel_entry() - LINUX_EL1_VECTORS_BASE) as usize;
+        machine
+            .mem
+            .insert(machine.sp + AARCH64_SYSCALL_MAILBOX_OFF_STATE, 0);
+        // A different executor's Idle mailbox has no task continuation and
+        // need not retain the source executor's fatal selector.
+        machine
+            .mem
+            .insert(machine.sp + AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION, 0);
+        machine.mem.insert(
+            machine.sp + AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE,
+            0xdead_beef,
+        );
+        assert!(matches!(machine.run(None), Exit::Idle { .. }));
+        assert_eq!(machine.signal_check_frames.len(), 1);
+        assert_eq!(machine.signal_check_frames[0].0, 0xfffc);
+        assert_eq!(machine.signal_check_arg0, [saved[0]]);
+        let frame =
+            carrick_el1_abi::EL1_STACKS_BASE + (SLOT + 1) * carrick_el1_abi::EL1_STACK_SIZE - 0x120;
+        for (reg, expected) in saved.into_iter().enumerate() {
+            assert_eq!(machine.read(frame + (reg as u64) * 8), expected, "x{reg}");
+        }
+        assert_eq!(machine.read(frame + 248), GUEST_ELR);
+        assert_eq!(
+            machine.read(machine.sp + AARCH64_SYSCALL_MAILBOX_OFF_STATE),
+            0
+        );
+    }
+}

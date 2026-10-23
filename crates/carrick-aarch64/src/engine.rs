@@ -5280,9 +5280,12 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
-    fn cancel_native_owner_wait(&mut self) -> Result<(), TrapError> {
+    fn cancel_native_owner_wait(
+        &mut self,
+        origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
+    ) -> Result<(), TrapError> {
         self.pending_resume_pc = None;
-        self.vcpu.get_mut().cancel_native_owner_wait()
+        self.vcpu.get_mut().cancel_native_owner_wait(origin)
     }
 
     fn complete_native_signal_return(
@@ -7562,6 +7565,31 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(bootstrap_calls, 1);
+    }
+
+    #[test]
+    fn native_owner_cancel_el0_snapshot_keeps_fatal_entry_across_executor_migration() {
+        let mut source = sample();
+        source.pc = carrick_mem::memory::native_owner_cancel_entry();
+        source.pstate = 0x3c5;
+        source.elr_el1 = 0x4000;
+        source.spsr_el1 = 0x6000_0000;
+        let destination = Aarch64VcpuSnapshot {
+            sp_el1: source.sp_el1 + 256,
+            ..sample()
+        };
+        let task =
+            aarch64_task_state_from_snapshot(&source, None, None, 0, 0, 0, false, None, 23, 29)
+                .unwrap();
+        assert!(task.syscall_continuation.is_none());
+        let restored = restore_aarch64_task_state(&destination, &task).unwrap();
+        assert_eq!(restored.pc, source.pc);
+        assert_eq!(restored.pstate, source.pstate);
+        assert_eq!(restored.elr_el1, 0x4000);
+        assert_eq!(restored.spsr_el1, 0x6000_0000);
+        assert_eq!(restored.gprs, source.gprs);
+        assert_eq!(restored.sp_el0, source.sp_el0);
+        assert_eq!(restored.sp_el1, destination.sp_el1);
     }
 
     #[test]

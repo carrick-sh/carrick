@@ -301,3 +301,65 @@ No sched-core code changed relative to the landed dependency, so Loom is not
 applicable to this slice. Signed HVF qualification remains on the Mac using
 the one-artifact commands above. This branch has not been pushed, and the
 requested verification is not complete.
+
+
+## Round-2 review: native fatal custody without a mailbox request
+
+The new P1 in the review of `c21986da6` is a completion-authority mismatch.
+A pipe read resumed from an IPC record has `HostEl0` residency, no mailbox
+syscall continuation, and Idle guest completion ownership. Both
+`resume_owner_zone` and the `ResumeOwnerPhysical` arm called the same
+cancellation helper, which required a RequestReady mailbox response and then
+unconditionally called `retire_syscall`. Native SIGKILL therefore became a
+runtime error instead of an irrevocable transfer to the native terminal owner.
+
+`NativeOwnerWaitOrigin` now travels with both owner-wait phases and through
+the runtime helper, shared engine and mailbox transport. HostTrap retains its
+existing mailbox response and guest-token retirement. HostEl0 validates Idle
+completion ownership, consumes only its IPC return marker, and stages entry
+into the existing native fatal checkpoint without a syscall response or EL0
+return. The retained IPC operation drops its pin without consuming pipe bytes.
+The single killable-wake query and #739's native cancellation custody remain
+the owners of the decision and terminal work.
+
+The fatal entry PC also owns migration: a short register-preserving prefix
+re-establishes the fatal selector in the destination executor's Idle mailbox
+before branching into the existing signal hook. The source mailbox payload
+is not task state. No new signal selection or terminal implementation exists.
+The shared AArch64 adapter preserves GPRs and SP_EL0, stages ELR/SPSR and the
+executor-local SP_EL1, and publishes the entry PC last.
+
+Red evidence (VM-free, production at `c21986da6`):
+
+- `serial_host_native_ipc_owner_wait_cancellation_from_el0` and
+  `serial_host_native_ipc_physical_owner_wait_cancellation_from_el0` both failed
+  with `threaded syscall retired without guest completion ownership` (exit
+  101, `/tmp/735-r3-native-red3.log`). The physical case uses the runtime's
+  actual scheduler; the initial fixture used a different scheduler and was
+  corrected before recording this red result.
+- The actual mailbox implementation, compiled into Linux runtime tests,
+  failed `native_owner_cancel_from_el0_keeps_idle_without_syscall_authority`
+  with `UnexpectedState { expected: RequestReady, actual: 0 }` (exit 101,
+  `/tmp/735-r3-mailbox-portable-red.log`). Building the whole HVF crate natively
+  on Linux was unavailable because of its macOS APIs.
+- The emitted-vector interpreter started from a destination Idle mailbox with
+  a nonfatal selector. Before the durable prefix it observed ordinary ESR
+  `0xfffe` instead of fatal ESR `0xfffc` (exit 101,
+  `/tmp/735-r3-migration-red2.log`).
+
+The runtime witnesses retain a real six-byte pipe read, park on either exact
+owner contention or an unready physical dependency, publish native SIGKILL
+from a live sibling, and require native terminal custody without a runtime
+error. They check zero copyout commits, an empty guest completion slot,
+release of the operation's endpoint pin, and all six bytes still unread.
+The zone case reloads the actual saved residency. Component witnesses cover
+CPU capture/restore across executors, mailbox protocol authority, and actual
+emitted hook execution in both IRQ modes; no HVF execution is claimed here.
+
+P2 #2 (sleep remaining-time copyout) stays in #711 slice 2. P2 #3 remains
+open: the host-compute test proves forwarded socket completion and counted
+compute progress, but does not prove read enrollment preceded the write.
+The guest has no existing enrollment notification; the startup sleep is not
+such a proof. Adding a host admission rendezvous is outside this P1 slice.
+The original exact signed commands above still apply; run them on a freshly
+built, signed artifact containing this correction.

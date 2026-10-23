@@ -42,7 +42,7 @@ contracts = ["hvpatch.syscall.portal"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/syscall_mailbox.rs"
-contracts = ["hvpatch.syscall.portal", "kernel.el1.files.cross-process-readers"]
+contracts = ["hvpatch.syscall.portal", "kernel.el1.files.cross-process-readers", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/futex.rs"

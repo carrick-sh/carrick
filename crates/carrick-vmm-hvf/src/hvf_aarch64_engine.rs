@@ -931,16 +931,29 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         result
     }
 
-    fn cancel_native_owner_wait(&mut self) -> Result<(), TrapError> {
+    fn cancel_native_owner_wait(
+        &mut self,
+        origin: carrick_hal::threaded::NativeOwnerWaitOrigin,
+    ) -> Result<(), TrapError> {
         let live = self.live_mut()?;
         if live.mailbox.transport() != HvfSyscallTransport::Mailbox {
             return Err(TrapError::UnsupportedPlatform);
         }
-        live.mailbox.publish_native_owner_cancel().map_err(|error| {
-            TrapError::Hypervisor(format!(
-                "native owner cancellation publication failed: {error}"
-            ))
-        })
+        let mailbox = live.mailbox.slot().guest_address();
+        live.mailbox
+            .publish_native_owner_cancel(origin)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "native owner cancellation publication failed: {error}"
+                ))
+            })?;
+        if origin == carrick_hal::threaded::NativeOwnerWaitOrigin::HostEl0 {
+            carrick_aarch64::vmm::enter_native_owner_cancel_el0(
+                self,
+                carrick_guest_mem::GuestVa::new(mailbox),
+            )?;
+        }
+        Ok(())
     }
 
     fn complete_native_signal_return(
