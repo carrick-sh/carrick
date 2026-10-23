@@ -158,7 +158,7 @@ impl NativeService {
             {
                 let (_, ipa, generation) = crate::trap::allocate_grant_compound(
                     &custody,
-                    applevisor::memory::MemPerms::ReadWrite,
+                    crate::trap::hvf_mem_perms(carrick_hal::physical_grants::COW_GRANT_PERMISSIONS),
                 )?;
                 let retained = Arc::new(crate::fork_stock::NativeFrameBacking {
                     carrier: Arc::downgrade(&custody),
@@ -170,15 +170,17 @@ impl NativeService {
                     .native_frame_backings
                     .lock()
                     .insert((ipa, generation), Arc::downgrade(&retained));
-                let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
-                    Arc::clone(&physical.rollback),
-                    Arc::clone(&inventory),
-                    [carrick_guest_arch::FrameGpa::new(ipa)],
-                    0,
-                    carrick_el1_abi::COW_GRANT_SIZE,
-                    core::num::NonZeroU64::new(generation).ok_or_else(stale)?,
-                    owner,
-                )?;
+                let staged =
+                    carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
+                        Arc::clone(&physical.rollback),
+                        Arc::clone(&inventory),
+                        [carrick_guest_arch::FrameGpa::new(ipa)],
+                        0,
+                        carrick_el1_abi::COW_GRANT_SIZE,
+                        core::num::NonZeroU64::new(generation).ok_or_else(stale)?,
+                        owner,
+                        carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
+                    )?;
                 grants.publish_cow(staged, retained, pool, exclusion.proof())?;
             }
         }

@@ -8,6 +8,14 @@ use carrick_guest_arch::FrameGpa;
 use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
 use std::{num::NonZeroU64, sync::Arc};
 
+/// COW stock must also support a later executable publication. Stage-1
+/// descriptors retain access policy; physical supply cannot narrow it.
+pub const COW_GRANT_PERMISSIONS: MemPerms = MemPerms {
+    read: true,
+    write: true,
+    exec: true,
+};
+
 /// Failed unpublished rollback remains in carrier custody until the existing
 /// carrier observer reports the invariant failure. Destructors never decide
 /// terminal policy or discard the issuing authority on refusal.
@@ -40,6 +48,7 @@ pub struct StagedPhysicalGrants {
     receipt: Option<UnpublishedFrameInventoryApply<dyn FrameCowAuthority>>,
     frames: Vec<(FrameGpa, BackingIdentity)>,
     length: FrameLength,
+    permissions: MemPerms,
     grants: Vec<PhysicalFrameGrant>,
 }
 /// Publication owner custody, transferred before any descriptor can expose a
@@ -167,6 +176,7 @@ impl StagedPhysicalGrants {
             receipt: Some(receipt),
             frames: Vec::with_capacity(rows.len() - table_grants),
             length,
+            permissions,
             grants: Vec::with_capacity(rows.len()),
         };
         let receipt = staged
@@ -250,6 +260,7 @@ impl<R> NativePhysicalGrants<R> {
             || staged.owner != self.owner
             || staged.grants.len() != 1
             || staged.length.raw() != carrick_el1_abi::COW_GRANT_SIZE
+            || staged.permissions != COW_GRANT_PERMISSIONS
             || pool.ready(excluded.key()).count() >= Self::REFILL_GRANTS
         {
             drop(staged);
