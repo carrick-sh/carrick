@@ -1913,7 +1913,13 @@ is dropped before re-preparing the retained operation. This makes the separate
 adapter unnecessary without losing its guarantees. Owner receipts still use
 the existing killable zone continuation. Native pending projection and prepared
 copyout keep #739's single-writer authorities; no directory-specific signal
-query is added.
+query is added. Fatal cancellation is process-wide even when SIGKILL delivery
+would select a different thread: a carrier cancellation verdict routes directly
+through the existing `SignalDeath` terminal path, without requiring a signal
+reservation for this waiter. Two-thread witnesses keep the leader live with
+SIGKILL unblocked and run directory copyout as the non-leader; immediate and
+parked readiness both terminate with no output or shared-cursor advancement.
+Main's #739 physical resume also had this reservation-dependent fall-through.
 
 Before any successful copy, refusal outcomes are:
 

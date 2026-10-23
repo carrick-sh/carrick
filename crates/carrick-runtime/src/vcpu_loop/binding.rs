@@ -3311,24 +3311,19 @@ where
                 return self.cancel_native_owner_wait(engine);
             }
             Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::Carrier) => {
-                if let Some(reserved) =
-                    carrick_kernel::kernel::continuation::reserve_killable_wait_signal(context)
-                    && let Some(outcome) = service_signals_threaded(
-                        &self.kernel,
-                        context,
-                        engine,
-                        self.state.this_tid,
-                        self.state.fatal_image_generation,
-                        None,
-                        None,
-                        None,
-                        Some(reserved),
-                        self.traps,
-                    )?
-                {
-                    drop(pending);
-                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
-                }
+                // Fatal process cancellation applies to every waiting member.
+                // Signal-delivery reservation may belong to another thread;
+                // it cannot grant this one permission to resume the syscall.
+                let frame = pending.frame;
+                drop(pending);
+                return self.route_outcome(
+                    engine,
+                    control,
+                    frame,
+                    DispatchOutcome::SignalDeath {
+                        signum: carrick_abi::LINUX_SIGKILL,
+                    },
+                );
             }
             None => {}
         }
@@ -6990,6 +6985,8 @@ mod tests {
     enum DirectoryPhysicalScenario {
         KillParked,
         KillDuringEnrollment,
+        NonLeaderKillParked,
+        NonLeaderKillDuringEnrollment,
         ReleaseParked,
         ReleaseDuringEnrollment,
     }
@@ -7002,6 +6999,18 @@ mod tests {
     #[test]
     fn serial_host_directory_physical_sigkill_during_enrollment_precedes_ready_retry() {
         exercise_directory_physical_resume(DirectoryPhysicalScenario::KillDuringEnrollment);
+    }
+
+    #[test]
+    fn serial_host_directory_physical_nonleader_process_sigkill_precedes_ready_retry() {
+        exercise_directory_physical_resume(DirectoryPhysicalScenario::NonLeaderKillParked);
+    }
+
+    #[test]
+    fn serial_host_directory_physical_nonleader_process_sigkill_during_enrollment() {
+        exercise_directory_physical_resume(
+            DirectoryPhysicalScenario::NonLeaderKillDuringEnrollment,
+        );
     }
 
     #[test]
@@ -7051,12 +7060,21 @@ mod tests {
         }
         let kill_pending = matches!(
             scenario,
-            DirectoryPhysicalScenario::KillParked | DirectoryPhysicalScenario::KillDuringEnrollment
+            DirectoryPhysicalScenario::KillParked
+                | DirectoryPhysicalScenario::KillDuringEnrollment
+                | DirectoryPhysicalScenario::NonLeaderKillParked
+                | DirectoryPhysicalScenario::NonLeaderKillDuringEnrollment
         );
         let during_enrollment = matches!(
             scenario,
             DirectoryPhysicalScenario::KillDuringEnrollment
+                | DirectoryPhysicalScenario::NonLeaderKillDuringEnrollment
                 | DirectoryPhysicalScenario::ReleaseDuringEnrollment
+        );
+        let non_leader = matches!(
+            scenario,
+            DirectoryPhysicalScenario::NonLeaderKillParked
+                | DirectoryPhysicalScenario::NonLeaderKillDuringEnrollment
         );
         struct Restore(usize);
         impl Drop for Restore {
@@ -7075,7 +7093,7 @@ mod tests {
             dispatcher.set_rootfs_layer(
                 carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap(),
             );
-            let (_runtime, scheduler, kernel, root, process, generation) =
+            let (runtime, scheduler, kernel, root, process, generation) =
                 test_carrier_graph_with_dispatcher!(72_759, dispatcher);
             root.thread().set_affinity(carrick_hal::CpuAffinity::all(1));
             let sibling = root
@@ -7099,7 +7117,74 @@ mod tests {
                 .start_thread()
                 .unwrap()
                 .into_context();
+            let registration = scheduler
+                .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+                .unwrap();
+            let (root, sibling, generation) = if non_leader {
+                use executor::TaskBindingResolver;
+                let directory = runtime.persistent_bindings();
+                let authority = directory
+                    .take_submission_authority(root.thread().key(), generation)
+                    .unwrap();
+                let state = executor::tests::task_state(&sibling, 759);
+                let child_generation = sibling
+                    .thread()
+                    .publish_initial_task_state(state.clone())
+                    .unwrap();
+                let binding = executor::tests::hvpatch_test_binding(&sibling, &state, 759);
+                let dormant = directory
+                    .prepare_submission(
+                        &scheduler,
+                        executor::TaskSubmissionShape::SameTaskSibling {
+                            grant: (root.thread().key(), generation),
+                        },
+                        Some(&authority),
+                        Arc::clone(sibling.thread()),
+                        child_generation,
+                        Arc::clone(&binding),
+                    )
+                    .unwrap();
+                executor::tests::activate_hvpatch_test_submission(
+                    dormant,
+                    &scheduler,
+                    &sibling,
+                    &state,
+                    child_generation,
+                    binding.as_ref(),
+                );
+                directory.restore_submission_authority(authority).unwrap();
+                // Keep the live carrier-owned leader parked while the sibling
+                // executes. Its signal mask still owns process-directed kill.
+                let leader = scheduler
+                    .try_take(&registration)
+                    .unwrap()
+                    .expect("leader runnable");
+                assert_eq!(leader.thread().key(), root.thread().key());
+                scheduler
+                    .settle_blocked(
+                        leader,
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    )
+                    .unwrap();
+                (sibling, root, child_generation)
+            } else {
+                (root, sibling, generation)
+            };
             assert!(sibling.exact_thread_is_live());
+            if non_leader {
+                assert_ne!(root.thread().key().tid.raw(), root.task().key().id.raw());
+                assert_eq!(
+                    sibling.thread().key().tid.raw(),
+                    sibling.task().key().id.raw()
+                );
+                assert!(!sibling.thread().control_slot().native_signal_owner());
+                assert!(
+                    !sibling
+                        .thread()
+                        .blocked_mask()
+                        .contains(carrick_abi::LINUX_SIGKILL)
+                );
+            }
             let tid = root.thread().registry_id();
             let registry = Arc::new(ThreadRegistry::new(tid));
             let futex = Arc::new(FutexTable::new());
@@ -7150,6 +7235,19 @@ mod tests {
                     )
                     .unwrap();
                     context.signal_authority().enqueue_task_standard(kill, None);
+                    if non_leader {
+                        assert_eq!(
+                            carrick_kernel::kernel::continuation::owner_wait_cancellation(&context),
+                            Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::Carrier),
+                        );
+                        assert!(
+                            carrick_kernel::kernel::continuation::reserve_killable_wait_signal(
+                                &context
+                            )
+                            .is_none(),
+                            "the live unblocked leader owns process-signal delivery",
+                        );
+                    }
                     context.task().wake();
                 }
             };
@@ -7283,10 +7381,10 @@ mod tests {
                 ));
             let mut job =
                 suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
-            let registration = scheduler
-                .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
-                .unwrap();
-            let mut running = scheduler.take(&registration).unwrap();
+            let mut running = scheduler
+                .try_take(&registration)
+                .unwrap()
+                .expect("waiter runnable");
             assert_eq!(running.generation(), generation);
             let binding_state = executor::tests::task_state(&root, 759);
             let binding = executor::tests::hvpatch_test_binding(&root, &binding_state, 759);
@@ -7367,7 +7465,8 @@ mod tests {
                 );
                 if kill_pending {
                     kill();
-                } else {
+                }
+                if !kill_pending || non_leader {
                     let executing = reader.lock().take();
                     drop(executing);
                 }
