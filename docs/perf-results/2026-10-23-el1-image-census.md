@@ -1,8 +1,14 @@
 # EL1 image census and reclaim — 2026-10-23
 
-Issue: #801. Baseline: GitHub main `9a9b4cd1f` (confirmed against GitHub
+Issue: #801. Initial baseline: GitHub main `9a9b4cd1f` (confirmed against GitHub
 before measurement), Rust 1.96.0, Linux x86_64 worker ctb-w2. No Docker or
 signed HVF execution is available on this worker.
+
+Main advanced during verification. The initial-base measurements below are
+retained as experimental evidence; the **Rebased main** section records the
+fresh comparison on `0aa665ef5`, onto which the branch was rebased before its
+final gates. The one implementation change was kept unchanged; none was
+ported, dropped or replaced.
 
 ## Measurement boundary
 
@@ -33,7 +39,7 @@ The section census, rather than the symbol census, accounts for every loaded
 byte. Repeated demangled names identify candidate monomorphizations, not proof
 that the bodies are identical or removable.
 
-## Main baseline
+## Initial main baseline
 
 | Loaded component | Bytes |
 |---|---:|
@@ -200,7 +206,7 @@ strategy, LTO and codegen-unit defaults are unchanged. Smaller code may change
 runtime performance; this worker cannot establish the signed ARM runtime or
 throughput result. The director must run the signed gate on the final artifact.
 
-### Final default-image sections
+### Initial-base optimized default-image sections
 
 | Loaded component | Before | After | Reclaimed |
 |---|---:|---:|---:|
@@ -228,7 +234,7 @@ previously inlined into callers: for example `alloc` increases while the
 calling Carrick crates shrink. Therefore differences between per-crate totals
 must not be interpreted as independent source deletions.
 
-### Final symbol attribution and largest functions
+### Initial-base optimized symbol attribution and largest functions
 
 | Symbol crate prefix | Text bytes | Named data/BSS bytes |
 |---|---:|---:|
@@ -327,7 +333,7 @@ must not be interpreted as independent source deletions.
 | `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,NodeType>,alloc::collections::btree::node::marker::KV>::split_leaf_data` | 24 | 5228 |
 | `alloc::collections::btree::fix::<impl alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::fix_node_through_parent` | 21 | 5040 |
 
-## Image variants and stack envelopes
+## Initial-base image variants and stack envelopes
 
 Both final builds exit zero, including the unchanged individual-frame,
 retained-frame, FP/SIMD and loaded-image checks.
@@ -360,3 +366,254 @@ chain envelopes, not a new whole-program stack proof.
 The native fork-context and signal-return envelopes grow, but remain within
 the original limits. No frame-budget parser, required-symbol rule or ceiling
 was modified to admit the configuration.
+
+## Rebased main — authoritative final comparison
+
+GitHub main advanced to `0aa665ef5` during the first host-gate run, adding
+EL1 affinity/service-custody changes. The branch was rebased cleanly, the
+single optimization override was temporarily removed to rebuild the new
+baseline, then restored before rebuilding the candidate. Neither budget nor
+compiler checks were changed. The earlier interrupted host-gate run is not
+counted as final evidence (its fd-core, ABI and kernel binaries passed before
+the kernel-semantics build was stopped for the rebase).
+
+The final default image reclaims **161,552 bytes (157.8 KiB)**, exceeding the
+64 KiB target by 96,016 bytes. It leaves **183,968 bytes of headroom**.
+
+| Loaded component | Main opt 3 | Candidate opt s | Reclaimed |
+|---|---:|---:|---:|
+| `.header` | 32 | 32 | 0 |
+| `.text` | 941,176 | 776,832 | 164,344 |
+| `.rodata` | 76,824 | 79,168 | -2,344 |
+| `.data` | 40 | 40 | 0 |
+| `.bss` | 7,192 | 7,152 | 40 |
+| Alignment | 896 | 1,384 | -488 |
+| **Loaded extent** | **1,026,160** | **864,608** | **161,552** |
+| **Headroom** | **22,416** | **183,968** | |
+
+### Rebased main: symbol prefixes and top 40 functions
+
+| Symbol crate prefix | Text bytes | Named data/BSS bytes |
+|---|---:|---:|
+| `carrick_el1_linux` | 231012 | 688 |
+| `alloc` | 185388 | 0 |
+| `carrick_core` | 147876 | 8 |
+| `carrick_sched_core` | 102360 | 0 |
+| `carrick_mmu_core` | 82388 | 0 |
+| `carrick_personality_linux` | 59332 | 4096 |
+| `carrick_el1` | 44948 | 6416 |
+| `core` | 34136 | 0 |
+| `carrick_el1_abi` | 20416 | 76 |
+| `anonymous data` | 0 | 15662 |
+| `carrick_core_abi` | 11928 | 0 |
+| `carrick_pipe_core` | 3872 | 0 |
+| `carrick_fd_core` | 3820 | 0 |
+| `carrick_inotify_core` | 2648 | 0 |
+| `carrick_signal_core` | 2556 | 33 |
+| `&T as core` | 2576 | 0 |
+| `unqualified/assembly` | 1412 | 8 |
+| `compiler_builtins` | 1332 | 0 |
+| `u64 as core` | 876 | 0 |
+| `carrick_syscall_abi` | 736 | 0 |
+| `u32 as core` | 568 | 0 |
+| `__rustc` | 440 | 0 |
+| `usize as core` | 224 | 0 |
+| `T as alloc` | 144 | 0 |
+| `u8 as alloc` | 128 | 0 |
+| `str as core` | 20 | 0 |
+| `&str as core` | 16 | 0 |
+| `&dyn core` | 12 | 0 |
+| `&u64 as core` | 12 | 0 |
+
+| Rank | Function (separate monomorphizations retained) | Bytes |
+|---:|---|---:|
+| 1 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::begin_closing` | 7256 |
+| 2 | `carrick_core::mm::transaction::user_write::<impl carrick_core::mm::transaction::owner::MmPortal<P,Policy,Geometry,Venue,B,Context>>::write_user_bytes` | 6144 |
+| 3 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::exit_with_status` | 5704 |
+| 4 | `<carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S> as carrick_personality_linux::signal::ProcessSignals>::kill` | 5064 |
+| 5 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::fork_publish` | 5004 |
+| 6 | `carrick_core::mm::reservation::root::Reservations<Policy,Geometry,C>::copy_in_order` | 4988 |
+| 7 | `carrick_el1_linux::ipc::serve_ipc` | 4964 |
+| 8 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::resume_pending_lifecycle` | 4352 |
+| 9 | `carrick_sched_core::process::exit::<impl carrick_sched_core::process::registry::ProcessRegistry<C,L,Z,R,Reservation,Retired,Group,Session,Failure>>::prepare_exit_topology` | 4204 |
+| 10 | `carrick_el1_linux::native_process_runtime::NativeProcessRegistry<M,C>::drain_external_ingress` | 4160 |
+| 11 | `carrick_core::mm::transaction::owner::serve_transfer` | 4112 |
+| 12 | `<carrick_el1_linux::aarch64_process::Aarch64NativeProcessService<X> as carrick_el1_linux::native_process_runtime::NativeProcessService<carrick_sched_core::aarch64_context::Aarch64ParkedContext>>::prepare_mm` | 4088 |
+| 13 | `carrick_sched_core::spaces::notification::SpaceNotificationLease<C>::release_resource` | 3936 |
+| 14 | `carrick_personality_linux::identity::invoke` | 3664 |
+| 15 | `carrick_sched_core::ZoneTables<C>::claim_for_host` | 3480 |
+| 16 | `carrick_el1_linux::native_process_runtime::NativeProcessRuntime<M,C>::admit_fresh_root` | 3412 |
+| 17 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::send_thread_signal` | 3376 |
+| 18 | `carrick_sched_core::spaces::notification::<impl carrick_sched_core::ZoneTables<C>>::admit_space_notifications` | 3292 |
+| 19 | `carrick_sched_core::ZoneTables<C>::wake_placed` | 3284 |
+| 20 | `carrick_el1_linux::native_process_runtime::NativeProcessRegistry<M,C>::register_thread` | 3120 |
+| 21 | `carrick_el1::fault::dispatch_fault_with_descriptor_txns` | 3040 |
+| 22 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::fork_reserve` | 2852 |
+| 23 | `carrick_sched_core::ZoneTables<C>::place_in_guest` | 2848 |
+| 24 | `carrick_personality_linux::signal::invoke` | 2820 |
+| 25 | `carrick_core::mm::fork::PreparedOwnerFork<B>::publish` | 2796 |
+| 26 | `carrick_personality_linux::dispatch::dispatch` | 2760 |
+| 27 | `carrick_personality_linux::ipc::invoke` | 2724 |
+| 28 | `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::visit_entry` | 2712 |
+| 29 | `carrick_el1::memory::serve_delegated_anonymous` | 2696 |
+| 30 | `carrick_el1_linux::ipc::release_pin` | 2664 |
+| 31 | `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::visit_entry` | 2592 |
+| 32 | `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::visit_entry` | 2592 |
+| 33 | `carrick_el1_linux::ipc::epoll::serve_with` | 2544 |
+| 34 | `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::visit_entry` | 2512 |
+| 35 | `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::visit_entry` | 2512 |
+| 36 | `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::visit_entry` | 2512 |
+| 37 | `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::visit_entry` | 2512 |
+| 38 | `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::visit_entry` | 2492 |
+| 39 | `carrick_el1_linux::native_process_runtime::NativeProcessRegistry<M,C>::rehome_entry` | 2456 |
+| 40 | `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::descend` | 2412 |
+
+| Repeated demangled function family | Instances | Total text bytes |
+|---|---:|---:|
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Leaf>,alloc::collections::btree::node::marker::Edge>::insert_recursing` | 27 | 47960 |
+| `alloc::collections::btree::remove::<impl alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Leaf>,alloc::collections::btree::node::marker::KV>>::remove_leaf_kv` | 24 | 25784 |
+| `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::visit_entry` | 8 | 20436 |
+| `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::descend` | 8 | 17684 |
+| `alloc::collections::btree::node::BalancingContext<K,V>::bulk_steal_right` | 22 | 13484 |
+| `alloc::collections::btree::node::BalancingContext<K,V>::bulk_steal_left` | 22 | 11932 |
+| `alloc::collections::btree::node::BalancingContext<K,V>::do_merge` | 22 | 11404 |
+| `<alloc::collections::btree::map::BTreeMap<K,V,A> as core::ops::drop::Drop>::drop` | 21 | 10436 |
+| `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::visit_live_table` | 8 | 9776 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Internal>,alloc::collections::btree::node::marker::KV>::split` | 21 | 8784 |
+| `alloc::collections::btree::remove::<impl alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::LeafOrInternal>,alloc::collections::btree::node::marker::KV>>::remove_kv_tracking` | 24 | 8364 |
+| `alloc::collections::btree::map::BTreeMap<K,V,A>::remove` | 19 | 7072 |
+| `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::store` | 8 | 5428 |
+| `carrick_core::mm::fork::PreparedOwnerFork<B>::publish` | 2 | 5168 |
+| `carrick_sched_core::ZoneTables<C>::place_in_guest` | 2 | 5100 |
+
+### Rebased candidate: symbol prefixes and top 40 functions
+
+| Symbol crate prefix | Text bytes | Named data/BSS bytes |
+|---|---:|---:|
+| `alloc` | 213624 | 0 |
+| `carrick_el1_linux` | 180012 | 688 |
+| `carrick_core` | 94684 | 8 |
+| `carrick_sched_core` | 64316 | 0 |
+| `carrick_personality_linux` | 52868 | 4096 |
+| `carrick_mmu_core` | 49848 | 0 |
+| `carrick_el1` | 33168 | 6416 |
+| `core` | 30460 | 0 |
+| `carrick_el1_abi` | 23188 | 40 |
+| `carrick_core_abi` | 12244 | 0 |
+| `anonymous data` | 0 | 9269 |
+| `carrick_fd_core` | 4252 | 0 |
+| `carrick_pipe_core` | 3524 | 0 |
+| `carrick_inotify_core` | 2820 | 0 |
+| `carrick_signal_core` | 2332 | 33 |
+| `&T as core` | 2276 | 0 |
+| `compiler_builtins` | 1332 | 0 |
+| `unqualified/assembly` | 1320 | 8 |
+| `u64 as core` | 876 | 0 |
+| `carrick_syscall_abi` | 828 | 0 |
+| `zerocopy` | 776 | 0 |
+| `u32 as core` | 568 | 0 |
+| `__rustc` | 348 | 0 |
+| `usize as core` | 308 | 0 |
+| `T as alloc` | 280 | 0 |
+| `carrick_guest_arch` | 196 | 0 |
+| `T as core` | 184 | 0 |
+| `(U,T) as core` | 116 | 0 |
+| `W as carrick_sched_core` | 24 | 0 |
+| `str as core` | 20 | 0 |
+| `&str as core` | 16 | 0 |
+| `&dyn core` | 12 | 0 |
+| `&u64 as core` | 12 | 0 |
+
+| Rank | Function (separate monomorphizations retained) | Bytes |
+|---:|---|---:|
+| 1 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::begin_closing` | 4368 |
+| 2 | `<carrick_el1_linux::aarch64_process::Aarch64NativeProcessService<X> as carrick_el1_linux::native_process_runtime::NativeProcessService<carrick_sched_core::aarch64_context::Aarch64ParkedContext>>::prepare_mm` | 4172 |
+| 3 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::fork_publish` | 4132 |
+| 4 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::exit_with_status` | 4124 |
+| 5 | `carrick_el1_linux::native_process_runtime::NativeProcessRuntime<M,C>::admit_fresh_root` | 3652 |
+| 6 | `carrick_personality_linux::identity::invoke` | 3236 |
+| 7 | `carrick_el1_linux::native_process_runtime::NativeProcessRegistry<M,C>::register_thread` | 2996 |
+| 8 | `carrick_personality_linux::signal::invoke` | 2932 |
+| 9 | `<carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S> as carrick_personality_linux::signal::ProcessSignals>::kill` | 2908 |
+| 10 | `carrick_sched_core::process::exit::<impl carrick_sched_core::process::registry::ProcessRegistry<C,L,Z,R,Reservation,Retired,Group,Session,Failure>>::prepare_exit_topology` | 2904 |
+| 11 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::fork_reserve` | 2488 |
+| 12 | `carrick_personality_linux::ipc::invoke` | 2468 |
+| 13 | `carrick_el1_linux::native_process_runtime::NativeProcessRegistry<M,C>::rehome_entry` | 2416 |
+| 14 | `carrick_core::mm::transaction::owner::MmPortal<P,Policy,Geometry,Venue,B,Context>::select` | 2268 |
+| 15 | `carrick_core::mm::transaction::owner::MmPortal<P,Policy,Geometry,Venue,B,Context>::select` | 2236 |
+| 16 | `carrick_el1_linux::ipc::epoll::serve_with` | 2108 |
+| 17 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::send_thread_signal` | 2016 |
+| 18 | `carrick_el1::fault::dispatch_classified_fault` | 1992 |
+| 19 | `carrick_el1_linux::arm_signal::setup_arm_signal_frame` | 1920 |
+| 20 | `carrick_el1::memory::serve_delegated_anonymous` | 1884 |
+| 21 | `carrick_el1_linux::mm_portal::fork::serve_fork_hw` | 1828 |
+| 22 | `carrick_core::mm::capacity::MetadataAllocatorCore::allocate_with_metrics` | 1812 |
+| 23 | `carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxnSlot::claim_for_mm` | 1804 |
+| 24 | `carrick_core::mm::fork::copy_entry` | 1764 |
+| 25 | `carrick_el1_linux::ipc::run` | 1752 |
+| 26 | `carrick_core::mm::fork::copy_entry` | 1728 |
+| 27 | `<carrick_core::mm::transaction::owner::MmPortal<P,Policy,Geometry,Venue,B,Context> as carrick_el1_linux::mm_portal::fork::NativeForkPortal<P,B>>::prepare_fork` | 1680 |
+| 28 | `<carrick_core::mm::transaction::owner::MmPortal<P,Policy,Geometry,Venue,B,Context> as carrick_el1_linux::mm_portal::fork::NativeForkPortal<P,B>>::prepare_fork` | 1680 |
+| 29 | `carrick_personality_linux::lifecycle::serve_exit` | 1608 |
+| 30 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::resume_ipc` | 1592 |
+| 31 | `carrick_el1_linux::ipc::admit` | 1588 |
+| 32 | `carrick_personality_linux::dispatch::dispatch` | 1552 |
+| 33 | `carrick_core::mm::fork::PreparedOwnerFork<B>::publish` | 1544 |
+| 34 | `carrick_personality_linux::sysinfo::LinuxSysinfo::to_bytes` | 1540 |
+| 35 | `carrick_el1_linux::process_owner::GuestPendingExit<C,U,N,F>::publish` | 1540 |
+| 36 | `carrick_el1_linux::native_process_runtime::NativeProcessRegistry<M,C>::admit_external_event` | 1492 |
+| 37 | `carrick_el1_abi::ipc::epoll::<impl carrick_el1_abi::ipc::IpcRegion>::epoll_harvest` | 1484 |
+| 38 | `carrick_el1_linux::native_process_runtime::NativeProcessRegistry<M,C>::register_root` | 1480 |
+| 39 | `carrick_el1_linux::native_process_runtime::NativeProcessEntry<M,C,S>::wait_query` | 1452 |
+| 40 | `carrick_core::mm::cow::resolve_guest_cow` | 1448 |
+
+| Repeated demangled function family | Instances | Total text bytes |
+|---|---:|---:|
+| `alloc::collections::btree::node::BalancingContext<K,V>::do_merge` | 42 | 21592 |
+| `alloc::collections::btree::node::BalancingContext<K,V>::bulk_steal_right` | 21 | 11828 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Leaf>,alloc::collections::btree::node::marker::Edge>::insert` | 28 | 11400 |
+| `alloc::collections::btree::remove::<impl alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Leaf>,alloc::collections::btree::node::marker::KV>>::remove_leaf_kv` | 23 | 11292 |
+| `alloc::collections::btree::node::BalancingContext<K,V>::bulk_steal_left` | 21 | 11104 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Leaf>,alloc::collections::btree::node::marker::Edge>::insert_recursing` | 28 | 10184 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Internal>,alloc::collections::btree::node::marker::Edge>::insert` | 28 | 8524 |
+| `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::descend` | 6 | 7576 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Internal>,alloc::collections::btree::node::marker::KV>::split` | 28 | 7380 |
+| `alloc::collections::btree::remove::<impl alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Internal>,alloc::collections::btree::node::marker::KV>>::remove_internal_kv` | 23 | 7184 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::Internal>,alloc::collections::btree::node::marker::Edge>::insert_fit` | 24 | 6480 |
+| `alloc::collections::btree::map::entry::VacantEntry<K,V,A>::insert_entry` | 28 | 5956 |
+| `carrick_mmu_core::aarch64::descriptor_txn::Executor<W,J>::visit_entry` | 6 | 5896 |
+| `alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,NodeType>,alloc::collections::btree::node::marker::KV>::split_leaf_data` | 24 | 5228 |
+| `alloc::collections::btree::fix::<impl alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut,K,V,alloc::collections::btree::node::marker::LeafOrInternal>>::fix_node_through_parent` | 21 | 5040 |
+
+### Rebased image variants and stack envelopes
+
+| Image variant | Main loaded bytes | Candidate loaded bytes | Reclaimed | Candidate headroom |
+|---|---:|---:|---:|---:|
+| Default | 1,026,160 | 864,608 | 161,552 | 183,968 |
+| `allocator-test-control` | 1,034,352 | 868,720 | 165,632 | 179,856 |
+
+Both before/after builds of both variants exit zero. The candidate's maximum
+registered stack path is **10,080 / 12,288 bytes**, leaving 2,208 bytes below
+the unchanged budget and 6,304 bytes below the physical stack size. Candidate
+stack envelopes are identical for both image variants:
+
+| Registered stack path | Rebased main bytes | Candidate bytes |
+|---|---:|---:|
+| Native admission | 8,079 | 7,600 |
+| Native fork publication | 8,926 | 8,943 |
+| Native fork descriptors | 10,062 | 9,263 |
+| Native fork context | 2,959 | 4,048 |
+| Native wait copy | 11,535 | 10,080 |
+| Signal delivery copy | 9,983 | 8,416 |
+| Signal terminal exit | 11,519 | 8,992 |
+| Signal return | 5,871 | 5,888 |
+| Anonymous munmap | 7,040 | 6,688 |
+| Metadata grant | 7,584 | 6,912 |
+| Backing retirement | 8,848 | 9,040 |
+| Descriptor drain | 6,320 | 5,968 |
+
+Independent review reproduced the initial ELF section arithmetic and every
+symbol-census row and found no implementation defects. Its documentation
+caveat about inlined formatting attribution was incorporated. Rebase kept the
+implementation byte-for-byte unchanged; the image builds above re-prove its
+size and stack witness against the new main source.
