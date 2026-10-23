@@ -615,7 +615,7 @@ pub(crate) enum GuestIdleExit {
     Idle,
     /// A parked native continuation; physical backing custody survives the lane.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    Service(carrick_vmm_hvf::metadata_grant::NativeService),
+    Service(Box<carrick_vmm_hvf::metadata_grant::NativeService>),
     /// No guest scheduler on this backend or carrier.
     Unsupported,
 }
@@ -1451,7 +1451,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             carrick_vmm_hvf::hvf_aarch64_engine::take_worker_native_service(lifecycle, slot)?
         {
             exit?;
-            return Ok(GuestIdleExit::Service(service));
+            return Ok(GuestIdleExit::Service(Box::new(service)));
         }
         match exit? {
             carrick_aarch64::Aarch64Exit::Halt => Ok(GuestIdleExit::Idle),
