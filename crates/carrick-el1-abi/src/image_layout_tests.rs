@@ -56,24 +56,26 @@ fn enlarged_image_and_shared_arm_x86_regions_do_not_overlap() {
         }
     }
     assert_eq!(EL1_COW_COPY_BASE, EL1_REGION_BASE + EL1_COW_COPY_OFFSET);
-    // The shared heap holds fixed tables, not a second overlapping allocator.
-    assert!(EL1_CACHE_OFFSET + EL1_CACHE_SIZE <= EL1_INOTIFY_TABLE_OFFSET);
-    assert!(EL1_INOTIFY_TABLE_OFFSET + EL1_INOTIFY_TABLE_SIZE <= EL1_NAME_CACHE_OFFSET);
-    assert!(EL1_NAME_CACHE_OFFSET + EL1_NAME_CACHE_SIZE <= EL1_ZONE_OFFSET);
-    assert!(EL1_ZONE_OFFSET + EL1_ZONE_SIZE <= EL1_REGION_SIZE);
-    assert_eq!(EL1_STACK_SIZE * EL1_STACK_SLOTS, EL1_STACKS_SIZE);
-    assert!(EL1_REGION_BASE + EL1_REGION_SIZE <= EL1_DYNAMIC_METADATA_BASE);
-    assert!(EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE <= EL1_IPC_BASE);
-    assert!(disjoint(
-        X86_CPL0_SUPERVISOR_IMAGE_BASE,
-        X86_CPL0_SUPERVISOR_IMAGE_SIZE,
-        X86_CPL0_REGION_BASE,
-        EL1_REGION_SIZE
-    ));
-    assert!(disjoint(
-        X86_CPL0_BOOTSTRAP_METADATA_BASE,
-        EL1_BOOTSTRAP_METADATA_SIZE,
-        X86_CPL0_REGION_BASE,
-        EL1_REGION_SIZE
-    ));
+    const {
+        // The shared heap holds fixed tables, not a second overlapping allocator.
+        assert!(EL1_CACHE_OFFSET + EL1_CACHE_SIZE <= EL1_INOTIFY_TABLE_OFFSET);
+        assert!(EL1_INOTIFY_TABLE_OFFSET + EL1_INOTIFY_TABLE_SIZE <= EL1_NAME_CACHE_OFFSET);
+        assert!(EL1_NAME_CACHE_OFFSET + EL1_NAME_CACHE_SIZE <= EL1_ZONE_OFFSET);
+        assert!(EL1_ZONE_OFFSET + EL1_ZONE_SIZE <= EL1_REGION_SIZE);
+        assert!(EL1_STACK_SIZE * EL1_STACK_SLOTS == EL1_STACKS_SIZE);
+        assert!(EL1_REGION_BASE + EL1_REGION_SIZE <= EL1_DYNAMIC_METADATA_BASE);
+        assert!(EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE <= EL1_IPC_BASE);
+        assert!(disjoint(
+            X86_CPL0_SUPERVISOR_IMAGE_BASE,
+            X86_CPL0_SUPERVISOR_IMAGE_SIZE,
+            X86_CPL0_REGION_BASE,
+            EL1_REGION_SIZE
+        ));
+        assert!(disjoint(
+            X86_CPL0_BOOTSTRAP_METADATA_BASE,
+            EL1_BOOTSTRAP_METADATA_SIZE,
+            X86_CPL0_REGION_BASE,
+            EL1_REGION_SIZE
+        ));
+    }
 }
