@@ -72,7 +72,7 @@ pub(crate) fn provision_guest_cow_grants(
             "guest COW grants serve only a guest-owned MM".to_owned(),
         ));
     }
-    let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+    let stage2_perms = super::hvf_mem_perms(carrick_hal::physical_grants::COW_GRANT_PERMISSIONS);
     let mut published = 0;
     while published < count {
         let (new_host_ptr, new_physical_ipa, owner_generation) =
@@ -92,11 +92,7 @@ pub(crate) fn provision_guest_cow_grants(
             InventoryMappingStage {
                 gpa: new_physical_ipa,
                 length: CowArmedRanges::COMPOUND_SIZE,
-                permissions: carrick_hal::MemPerms {
-                    read: true,
-                    write: true,
-                    exec: true,
-                },
+                permissions: carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
                 backing: HvfVmState::private_backing_identity(),
                 inherited_frame: None,
                 stage2_lease: Some((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE)),

@@ -523,7 +523,7 @@ fn composed_native_supply(competing_publication: bool) {
     let mut physical_grants =
         carrick_hal::physical_grants::NativePhysicalGrants::new(physical_owner);
     for gpa in [0xa0000000, 0xa0004000] {
-        let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
+        let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
             std::sync::Arc::default(),
             physical.clone(),
             [FrameGpa::new(gpa)],
@@ -531,6 +531,7 @@ fn composed_native_supply(competing_publication: bool) {
             16384,
             NonZeroU64::MIN,
             physical_owner,
+            carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
         )
         .unwrap();
         let retained = crossing
@@ -545,6 +546,18 @@ fn composed_native_supply(competing_publication: bool) {
             .unwrap();
     }
     assert_eq!(pool.ready(identity.mm).count(), 2, "bounded first refill");
+    for grant in pool.ready(identity.mm) {
+        let row = physical
+            .bind(physical_owner)
+            .live_mapping_row(carrick_hal::MappingId::from_kernel_allocation(
+                grant.backing.mapping_id,
+            ))
+            .unwrap();
+        assert!(
+            row.permissions.exec,
+            "COW backing must permit later execution"
+        );
+    }
     let child_physical_root =
         RootGpa::page_aligned(FrameGpa::new(child_root & AARCH64_ROOT_ADDRESS_MASK)).unwrap();
     crossing
