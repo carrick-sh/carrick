@@ -1823,7 +1823,12 @@ physical, zone and supply-ready resumes. Every cancellation query consults the
 exact lifecycle page's monotonic `CancellationAuthority`; signal delivery
 reservation and native dequeue cannot erase it. Native signal state binds the
 root or freshly admitted child page. Terminal custody consumes the obligation
-without clearing its cause.
+without clearing its cause. At owner-wait enrollment and task-wake edges,
+bridge SIGKILL eligibility is authenticated against the retained process's
+native members and promoted to that same authority before settlement. Native
+ingress retains signal delivery. The bridge witnesses cover two live parked
+members, a sibling-selected process signal and a thread-directed signal,
+without dependency release or signal polling; dequeue cannot undo cancellation.
 
 A validated fatal request atomically closes effect admission. Its typed
 publication drains existing bounded effects outside signal/topology locks,

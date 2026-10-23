@@ -7495,6 +7495,72 @@ fn group_stop_preserves_published_terminal_results() {
 }
 
 #[test]
+fn serial_host_bridge_sigkill_wakes_two_native_owner_waiters() {
+    for thread_directed in [false, true] {
+        let (kernel, root) = bootstrap(15_470);
+        let plan = crate::kernel::ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .unwrap();
+        let sibling = kernel
+            .clone_thread(&root, plan, ThreadId::synthetic_for_tests(15_471), None)
+            .unwrap();
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(Arc::clone(&kernel))));
+        let mut registrations = Vec::new();
+        for context in [&root, &sibling] {
+            let generation = publish(context, 0x802);
+            let custody = carrick_core::lifecycle::MemberControlCustody::retain(
+                context.thread().control_slot(),
+            )
+            .unwrap();
+            custody.commit_registration();
+            custody.commit_native_signal_owner();
+            let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+            let write = BlockedContinuation::from_killable_owner_zone_park(
+                capture(context, generation),
+                wait,
+            );
+            let mut registration = service.prepare_registration(&write);
+            service.enroll(&mut registration).unwrap();
+            registrations.push((write, registration));
+        }
+        let tid = sibling.thread().registry_id().raw();
+        if thread_directed {
+            carrick_signal_linux::publish_pending_for(tid, carrick_abi::LINUX_SIGKILL);
+        } else {
+            carrick_signal_linux::publish_process_signal(carrick_abi::LINUX_SIGKILL);
+            assert!(carrick_signal_linux::claim_pending_in_for(
+                tid,
+                SigSet::EMPTY.with(carrick_abi::LINUX_SIGKILL),
+            ));
+        }
+        // The host pump's existing edge; neither owner dependency is released.
+        root.task().wake();
+        let events = registrations
+            .iter()
+            .map(|(_, registration)| {
+                await_event_timeout(&service, registration.wake_token(), Duration::from_secs(1))
+            })
+            .collect::<Vec<_>>();
+        let pending = carrick_signal_linux::take_pending_event_for(tid);
+        for event in events {
+            assert_eq!(
+                event.unwrap().unwrap(),
+                ContinuationEvent::OwnerCancelled(OwnerWaitCancellation::NativeFatal,)
+            );
+        }
+        assert_eq!(pending.unwrap().signum, carrick_abi::LINUX_SIGKILL);
+        for context in [&root, &sibling] {
+            assert_eq!(
+                owner_wait_cancellation(context),
+                Some(OwnerWaitCancellation::NativeFatal),
+                "bridge dequeue must not erase process cancellation"
+            );
+        }
+    }
+}
+
+#[test]
 fn terminal_zone_capture_has_no_syscall_and_keeps_signals_pending() {
     let (_kernel, context) = bootstrap(15_399);
     publish(&context, 0x704);
@@ -7698,29 +7764,18 @@ fn serial_host_native_signal_owner_killable_owner_write_ignores_sigalrm_until_si
             .signum,
         carrick_abi::LINUX_SIGALRM
     );
-    let page = context.lifecycle_page();
-    let task = carrick_sched_core::process::TaskKey {
-        id: carrick_personality_linux::identity::task_id_from_linux_pid(tid).unwrap(),
-        serial: carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
-    };
-    let signals = carrick_el1_linux::native_process_signals::NativeProcessSignals::<()>::fresh_root(
-        task, &page,
-    );
-    signals
-        .enqueue(task, carrick_signal_core::policy::Signal::KILL, None)
-        .unwrap();
+    carrick_signal_linux::publish_process_signal(carrick_abi::LINUX_SIGKILL);
+    let event = probe.event();
+    // Clean the bridge even on a red witness, before asserting.
+    let pending = carrick_signal_linux::take_pending_event_for(tid);
     assert_eq!(
-        probe.event(),
+        event,
         Some(ContinuationEvent::OwnerCancelled(
             super::OwnerWaitCancellation::NativeFatal
         )),
         "SIGKILL must wake a native killable-owner write park"
     );
-    assert_eq!(
-        signals.pending_count(),
-        1,
-        "wait probing cannot dequeue SIGKILL"
-    );
+    assert_eq!(pending.unwrap().signum, carrick_abi::LINUX_SIGKILL);
 }
 
 #[test]

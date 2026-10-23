@@ -1033,7 +1033,27 @@ pub fn owner_wait_cancellation(context: &KernelContext) -> Option<OwnerWaitCance
     use carrick_core::terminal::ProcessCancellation;
     use carrick_el1_abi::Lifecycle;
     let page = context.lifecycle_page();
-    let cause = page.process_exit_custody().cancellation()?;
+    let exit = page.process_exit_custody();
+    if exit.cancellation().is_none()
+        && context.thread().control_slot().native_signal_owner()
+        && context.exact_thread_is_live()
+    {
+        // The host bridge wakes subscriptions before native ingress can run.
+        // Authenticate its fatal request against this exact process's live
+        // native members, including a sibling chosen as the bridge recipient.
+        // Claim only SIGKILL: handled signals and stops stay deferred, and the
+        // bridge retains delivery for native ingress. No topology or bridge
+        // lock survives into the bounded effect drain.
+        let bridge = context.kernel().host_signal();
+        let kill = SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGKILL);
+        if context.task().threads().iter().any(|thread| {
+            thread.control_slot().native_signal_owner()
+                && bridge.claim_pending_in_for(thread.registry_id().raw(), kill)
+        }) {
+            exit.publish_cancellation(ProcessCancellation::FatalSignal);
+        }
+    }
+    let cause = exit.cancellation()?;
     Some(if context.thread().control_slot().native_signal_owner() {
         OwnerWaitCancellation::NativeFatal
     } else {
