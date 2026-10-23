@@ -471,6 +471,74 @@ pub(crate) fn private_environment(command: &mut Command) {
         .env("CARRICK_SCCACHE", "0");
 }
 
+struct Foreground<'a> {
+    run: &'a str,
+    name: &'a str,
+    backend: &'a str,
+    model: &'a str,
+    effort: Option<&'a str>,
+    schema: Option<&'a Path>,
+    limit: std::time::Duration,
+}
+/// Both model accounts use the same pinned foreground launcher protocol.
+fn foreground_command(state: &Path, root: &Path, launch: Foreground<'_>) -> Command {
+    let mut command = Command::new("python3");
+    command
+        .arg(state.join("director/agy-director/scripts/agy_worker.py"))
+        .arg("--home")
+        .arg(state.join("runtime"))
+        .args([
+            "--run",
+            launch.run,
+            "dispatch",
+            "--foreground",
+            "--result-file",
+        ])
+        .arg(state.join("result.json"))
+        .args(["--name", launch.name, "--dir"])
+        .arg(root)
+        .arg("--prompt-file")
+        .arg(state.join("prompt.md"));
+    if let Some(schema) = launch.schema {
+        command.arg("--schema").arg(schema);
+    }
+    command.args([
+        "--timeout",
+        &format!("{}s", launch.limit.as_secs()),
+        "--no-profile",
+        "--backend",
+        launch.backend,
+        "--model",
+        launch.model,
+    ]);
+    if let Some(effort) = launch.effort {
+        command.args(["--effort", effort]);
+    }
+    command
+}
+/// Enter an account only after clearing both the wrapper and model environments.
+fn account_command(command: &Command, user: &str, root: &Path) -> Command {
+    let mut isolated = Command::new("/usr/bin/sudo");
+    private_environment(&mut isolated);
+    isolated
+        .args(["-n", "-u", user, "--", "/usr/bin/env", "-i", "-C"])
+        .arg(root);
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            let mut assignment = key.to_os_string();
+            assignment.push("=");
+            assignment.push(value);
+            isolated.arg(assignment);
+        }
+    }
+    isolated
+        .arg(command.get_program())
+        .args(command.get_args())
+        .current_dir("/")
+        .stdin(Stdio::null());
+    isolated
+}
+
 fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
     let state = root
         .parent()
@@ -478,7 +546,6 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         .to_owned();
     let home = state.join("home");
     let schema_path = state.join("schema.json");
-    let result = state.join("result.json");
     let prompt_file = state.join("prompt.md");
     std::fs::write(&schema_path, serde_json::to_vec_pretty(&schema())?)?;
     let prompt = format!(
@@ -503,38 +570,19 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         || crate::agent_runner::job_remaining(30),
         |seconds| Ok(std::time::Duration::from_secs(seconds)),
     )?;
-    let turn_timeout = format!("{}s", limit.as_secs());
-    let mut command = Command::new("python3");
-    command
-        .arg(state.join("director/agy-director/scripts/agy_worker.py"))
-        .arg("--home")
-        .arg(state.join("runtime"))
-        .args([
-            "--run",
-            "dispatch",
-            "dispatch",
-            "--foreground",
-            "--result-file",
-        ])
-        .arg(&result)
-        .args(["--name", "worker", "--dir"])
-        .arg(root)
-        .arg("--prompt-file")
-        .arg(prompt_file)
-        .arg("--schema")
-        .arg(schema_path)
-        .args([
-            "--timeout",
-            &turn_timeout,
-            "--no-profile",
-            "--backend",
-            &dispatch.tier.backend,
-            "--model",
-            &dispatch.tier.model,
-        ]);
-    if let Some(effort) = &dispatch.tier.effort {
-        command.args(["--effort", effort]);
-    }
+    let mut command = foreground_command(
+        &state,
+        root,
+        Foreground {
+            run: "dispatch",
+            name: "worker",
+            backend: &dispatch.tier.backend,
+            model: &dispatch.tier.model,
+            effort: dispatch.tier.effort.as_deref(),
+            schema: Some(&schema_path),
+            limit,
+        },
+    );
     // Only explicit provider files enter the agent command; no runner env,
     // Actions write channels, GitHub token or inherited credential mechanism.
     private_environment(&mut command);
@@ -564,27 +612,10 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         .env("AGY_DIRECTOR_CODEX_VENV", CODEX_SDK_VENV)
         .env("AGY_DIRECTOR_ROUTES", "default")
         .current_dir(root);
-    let mut isolated = Command::new("/usr/bin/sudo");
-    private_environment(&mut isolated);
-    // Enter the private worktree only after sudo has switched credentials.
-    isolated
-        .args(["-n", "-u", AGENT_USER, "--", "/usr/bin/env", "-i", "-C"])
-        .arg(root);
-    for (key, value) in command.get_envs() {
-        if let Some(value) = value {
-            let mut assignment = key.to_os_string();
-            assignment.push("=");
-            assignment.push(value);
-            isolated.arg(assignment);
-        }
-    }
+    let mut isolated = account_command(&command, AGENT_USER, root);
     hand_over(&state)?;
     let logs = crate::agent_runner::state()?;
     isolated
-        .arg(command.get_program())
-        .args(command.get_args())
-        .current_dir("/")
-        .stdin(Stdio::null())
         .stdout(std::fs::File::create(logs.join("agent.out"))?)
         .stderr(std::fs::File::create(logs.join("agent.err"))?);
     let remaining = dispatch
@@ -1105,6 +1136,14 @@ fn snapshot(source: &Path, target: &Path, branch: &str) -> Result<(), ScalerErro
     crate::safe_copy::repository(source, target, branch)
 }
 
+fn seal_runner(root: &Path) -> Result<(), ScalerError> {
+    let temporary =
+        PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?);
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerError> {
     let base = dispatch.base.clone();
     if !sha(&base)
@@ -1115,10 +1154,7 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
     let state = crate::agent_runner::state()?;
     std::fs::create_dir_all(&state)?;
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
-    let temporary =
-        PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?);
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    seal_runner(root)?;
     let work = state.join("work");
     let package =
         PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?)
@@ -1386,9 +1422,7 @@ fn publish(
             let pr = require_owned_pr(root, dispatch)?;
             use std::io::Write;
             writeln!(
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&report_path)?,
+                std::fs::OpenOptions::new().append(true).open(report_path)?,
                 "\nExisting dispatch branch `{}` and PR #{} retained; this rerun did not replace it.",
                 dispatch.branch,
                 pr["number"]
@@ -1397,7 +1431,7 @@ fn publish(
             output(&mut push_command(
                 &work,
                 dispatch,
-                &id,
+                id,
                 &receipt.expected_tip,
             )?)?;
         }
@@ -1424,7 +1458,7 @@ fn publish(
                 dispatch.issue
             );
             let path = state.join("pr-body.md");
-            std::fs::write(&path, body.replace(&token, "[REDACTED]"))?;
+            std::fs::write(&path, body.replace(token, "[REDACTED]"))?;
             gh(
                 root,
                 &[
@@ -1438,7 +1472,7 @@ fn publish(
                     "--head",
                     &dispatch.branch,
                     "--title",
-                    &draft_pr_title(&work, &receipt.base, dispatch.issue, &token)?,
+                    &draft_pr_title(&work, &receipt.base, dispatch.issue, token)?,
                     "--body-file",
                     path.to_str().ok_or(ScalerError::Guard("body path"))?,
                 ],
@@ -2078,6 +2112,13 @@ Do it"
             validate_event(&event, TIERS, "tjfontaine").expect("owner review must continue its PR");
         assert_eq!(dispatch.branch, "work/dispatch-634-42");
         assert!(dispatch.resume);
+        let mut legacy = event.clone();
+        legacy["issue"]["body"] =
+            "## Brief\nBranch: work/dispatch-634-99\nBranch: work/elsewhere\nDo the review".into();
+        assert_eq!(
+            validate_event(&legacy, TIERS, "tjfontaine").unwrap().branch,
+            dispatch.branch
+        );
         let mut admitted = Vec::new();
         for (pointer, value) in [
             ("/review/user/login", json!("outsider")),

@@ -76,7 +76,7 @@ fn check_token(root: &Path) -> Result<(), ScalerError> {
     Ok(())
 }
 
-/// Leave time for workflow reporting before the job's 40-minute cap.
+/// Bound a phase against job admission time, reserving time for reporting.
 pub(crate) fn job_remaining(minutes: u64) -> Result<std::time::Duration, ScalerError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
