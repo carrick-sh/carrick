@@ -119,12 +119,24 @@ impl<W: CancellationWord> CancellationAuthority<W> {
 /// admission; a publisher must drain outside locks needed by bounded effects.
 #[must_use = "publish cancellation after releasing target-validation locks"]
 pub struct CancellationPublication<'a, W: CancellationWord>(&'a CancellationAuthority<W>);
+/// The atomic publication elects one caller to fan out a new wake.
+/// Repeated requests retain cancellation but must not multiply notifications.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancellationPublicationStatus {
+    First,
+    AlreadyPublished,
+}
+
 impl<W: CancellationWord> CancellationPublication<'_, W> {
-    pub fn publish(self, mut wait: impl FnMut()) {
+    pub fn publish(self, mut wait: impl FnMut()) -> CancellationPublicationStatus {
         while self.0.0.load(Ordering::Acquire) >= EFFECT {
             wait();
         }
-        self.0.0.fetch_or(PUBLISHED, Ordering::Release);
+        if self.0.0.fetch_or(PUBLISHED, Ordering::Release) & PUBLISHED == 0 {
+            CancellationPublicationStatus::First
+        } else {
+            CancellationPublicationStatus::AlreadyPublished
+        }
     }
 }
 

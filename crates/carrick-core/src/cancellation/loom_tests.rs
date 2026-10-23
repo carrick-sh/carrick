@@ -90,3 +90,29 @@ fn publication_drains_both_admitted_effects() {
         second.join().unwrap();
     });
 }
+
+#[test]
+fn concurrent_publications_elect_one_wake_owner() {
+    loom::model(|| {
+        let authority = Arc::new(CancellationAuthority::with_word(Word(AtomicU32::new(0))));
+        let publisher = authority.clone();
+        let other = thread::spawn(move || {
+            publisher
+                .request(ProcessCancellation::FatalSignal)
+                .publish(thread::yield_now)
+        });
+        let local = authority
+            .request(ProcessCancellation::FatalSignal)
+            .publish(thread::yield_now);
+        let remote = other.join().unwrap();
+        assert_ne!(local, remote, "exactly one publisher owns the process wake");
+        authority.consume();
+        assert_eq!(
+            authority
+                .request(ProcessCancellation::FatalSignal)
+                .publish(thread::yield_now),
+            CancellationPublicationStatus::AlreadyPublished,
+            "terminal consumption cannot mint a second wake owner"
+        );
+    });
+}
