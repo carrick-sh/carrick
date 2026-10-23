@@ -411,3 +411,27 @@ The macOS cross-check compiles and lints the backend; it does not execute
 HVF. Signed 5/5 proof on one artifact remains on the director's Mac using
 the exact commands above. The optional host-compute enrollment P2 remains
 open, and the sleep remaining-time copyout P2 remains #711 slice 2.
+
+## Affinity rebase and #802 handoff checkpoint
+
+The final requested rebase is onto GitHub main `0aa665ef5d`, containing the
+landed affinity stack. All 18 patches were retained; only contract bindings
+conflicted, resolved by keeping both affinity and sleep coverage. No product
+fix was ported or dropped. Independent rebase review found no major issue.
+The native cancellation fix is now `53c46f5b2`, with its red witnesses in
+`34acd46d5`. Strict CPU pinning remains unchanged.
+
+All six focused groups and `test-kernel`, `clippy`, `clippy-linux`,
+`cross-check-macos`, `fmt-check`, and `lint-domains` exited zero on this base,
+using `env -u RUSTC_WRAPPER CARRICK_SCCACHE=0`. The full `just test` is running
+last at this checkpoint; its completed groups include 621 passing runtime
+tests and no failed suite. Its final exit is not yet claimed. Fresh logs and
+statuses are `/tmp/735-r3-affinity-*`; earlier gate logs certify the earlier
+base only.
+
+Owner decision: #802 is the sole owner of owner-wait and cancellation
+consolidation. It takes these existing wait-path commits as input. #735
+retains pipe false-EOF, counted progress and strict affinity pinning. No
+further wait-path implementation is undertaken here. The optional enrollment
+P2 remains open; sleep remaining-time copyout stays #711 slice 2. Signed HVF
+qualification remains on the Mac. Nothing has been pushed.
