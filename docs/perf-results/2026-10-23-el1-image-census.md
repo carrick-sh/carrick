@@ -164,10 +164,11 @@ Most BSS is the 6,416-byte global allocator. Removing any of these without an
 ownership/initialization proof would change semantics. Unused ELF sections
 are already subject to linker garbage collection.
 
-Next measurement: enable cross-crate LTO only in the nested EL1 image build,
+The first candidates enable cross-crate LTO only in the nested EL1 image build,
 retaining optimization level 3, frame pointers, overflow checks and DWARF.
-Reject configurations that violate an existing stack-path or individual-frame
-budget. Follow with both image variants and the requested host gates.
+Configurations that violate an existing stack-path or individual-frame budget
+are rejected. The selected candidate then runs both image variants and the
+requested host gates.
 
 ## Measured configuration alternatives
 
@@ -217,8 +218,9 @@ stripped diagnostics. Text symbols containing `core::fmt` total 10,604 bytes
 before and 10,372 after; `::panicking::` totals 672 and 700 bytes, respectively.
 `unwrap_failed` remains 28 bytes. These overlapping name-based categories
 are diagnostic clues, not additive accounting buckets. The panic handler
-still publishes sentinel, line, column and MM detail. Formatting alone cannot
-supply a 64 KiB reduction at these measured sizes. ARM `::descriptor_txn::`
+still publishes sentinel, line, column and MM detail. Named formatting functions
+account for substantially less than 64 KiB; this census does not quantify their
+inlined code or associated unnamed data. ARM `::descriptor_txn::`
 text falls from 78,320 to 52,100 bytes without altering its generic API.
 
 The final image's symbol attribution shifts when the compiler outlines code
