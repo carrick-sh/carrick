@@ -908,39 +908,7 @@ impl<'a> MemView<'a> {
             .host_backing_custody
             .source(identity)
             .ok_or(LINUX_EBADF)?;
-        match source {
-            PrivateFileBacking::Description(description) => self
-                .snapshot_private_mmap_description(
-                    description.description(),
-                    identity.offset(),
-                    length,
-                )
-                .and_then(|snapshot| {
-                    if snapshot.bus_fault_offset == Some(0) {
-                        Err(LINUX_EFAULT)
-                    } else {
-                        Ok(snapshot.bytes)
-                    }
-                }),
-            PrivateFileBacking::LoadedImage {
-                initialized_offset,
-                bytes,
-            } => {
-                let mut result = vec![0; length];
-                let initialized_end = initialized_offset
-                    .checked_add(bytes.len() as u64)
-                    .ok_or(LINUX_EINVAL)?;
-                let start = identity.offset().max(initialized_offset);
-                let end = (identity.offset() + length as u64).min(initialized_end);
-                if start < end {
-                    let target = (start - identity.offset()) as usize;
-                    let source = (start - initialized_offset) as usize;
-                    let count = (end - start) as usize;
-                    result[target..target + count].copy_from_slice(&bytes[source..source + count]);
-                }
-                Ok(result)
-            }
-        }
+        read_retained_source(source, identity, length, self.linux_page_size())
     }
 
     pub(in crate::dispatch::mem) fn recover_private_repoint_failure(
@@ -1123,86 +1091,7 @@ impl<'a> MemView<'a> {
         offset: u64,
         length: usize,
     ) -> Result<PrivateMmapSnapshot, LinuxErrno> {
-        let mut bytes = vec![0; length];
-        let length_u64 = u64::try_from(length).map_err(|_| linux_errno::EOVERFLOW)?;
-        let page_size = self.linux_page_size();
-        let Some(open) = description.read_for_io() else {
-            return Err(LINUX_EBADF);
-        };
-        let offset_usize = usize::try_from(offset).map_err(|_| linux_errno::EOVERFLOW)?;
-        let bus_fault_offset = match &*open {
-            OpenDescription::File { contents, .. } => {
-                contents.read_at(offset, &mut bytes)?;
-                let file_len = contents.len()?;
-                shared_file_bus_offset(file_len, offset, length_u64, page_size)
-            }
-            OpenDescription::SyntheticFile { contents, .. } => {
-                if offset_usize < contents.len() {
-                    let available = &contents[offset_usize..];
-                    let copy_len = available.len().min(length);
-                    bytes[..copy_len].copy_from_slice(&available[..copy_len]);
-                }
-                shared_file_bus_offset(contents.len() as u64, offset, length_u64, page_size)
-            }
-            OpenDescription::ProcExecutable { executable, .. } => {
-                let source = executable.source();
-                let file_len = source.len().map_err(|error| {
-                    error
-                        .raw_os_error()
-                        .map(crate::host_to_linux_errno)
-                        .unwrap_or(linux_errno::EIO)
-                })?;
-                let contents = source.read_range(offset_usize, length).map_err(|error| {
-                    error
-                        .raw_os_error()
-                        .map(crate::host_to_linux_errno)
-                        .unwrap_or(linux_errno::EIO)
-                })?;
-                bytes[..contents.len()].copy_from_slice(&contents);
-                shared_file_bus_offset(file_len as u64, offset, length_u64, page_size)
-            }
-            OpenDescription::InMemoryFile { contents, .. } => {
-                let data = contents.read();
-                let read_bytes = data.read_range(offset_usize, length);
-                bytes[..read_bytes.len()].copy_from_slice(&read_bytes);
-                shared_file_bus_offset(data.len() as u64, offset, length_u64, page_size)
-            }
-            OpenDescription::HostFile { host_fd, .. } => {
-                let file_len = host_fd_file_len(host_fd.raw()).ok_or(linux_errno::EIO)?;
-                snapshot_private_host_file(host_fd.raw(), offset, &mut bytes)?;
-                shared_file_bus_offset(file_len, offset, length_u64, page_size)
-            }
-            OpenDescription::HostPipe { host_fd, .. } => {
-                let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                let is_chardev = unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
-                    && (st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFCHR as u32;
-                if !is_chardev {
-                    return Err(linux_errno::ENODEV);
-                }
-                None
-            }
-            OpenDescription::SyntheticDevice { kind, .. } => {
-                if *kind == carrick_vfs::SyntheticDeviceKind::Zero {
-                    None
-                } else {
-                    return Err(linux_errno::ENODEV);
-                }
-            }
-            OpenDescription::Packet { socket, .. } => {
-                let init = socket.initial_ring_bytes().ok_or(linux_errno::EINVAL)?;
-                if offset_usize < init.len() {
-                    let available = &init[offset_usize..];
-                    let copy_len = available.len().min(length);
-                    bytes[..copy_len].copy_from_slice(&available[..copy_len]);
-                }
-                None
-            }
-            _ => return Err(LINUX_EBADF),
-        };
-        Ok(PrivateMmapSnapshot {
-            bytes,
-            bus_fault_offset,
-        })
+        snapshot_private_mmap_description(description, offset, length, self.linux_page_size())
     }
 
     /// Restore mapped file identity, including after fd close or pathname
@@ -1736,3 +1625,131 @@ impl<'a> MemView<'a> {
 
 #[cfg(test)]
 mod tests;
+
+fn snapshot_private_mmap_description(
+    description: &crate::kernel::FileDescription,
+    offset: u64,
+    length: usize,
+    page_size: u64,
+) -> Result<PrivateMmapSnapshot, LinuxErrno> {
+    let mut bytes = vec![0; length];
+    let length_u64 = u64::try_from(length).map_err(|_| linux_errno::EOVERFLOW)?;
+    let Some(open) = description.read_for_io() else {
+        return Err(LINUX_EBADF);
+    };
+    let offset_usize = usize::try_from(offset).map_err(|_| linux_errno::EOVERFLOW)?;
+    let bus_fault_offset = match &*open {
+        OpenDescription::File { contents, .. } => {
+            contents.read_at(offset, &mut bytes)?;
+            let file_len = contents.len()?;
+            shared_file_bus_offset(file_len, offset, length_u64, page_size)
+        }
+        OpenDescription::SyntheticFile { contents, .. } => {
+            if offset_usize < contents.len() {
+                let available = &contents[offset_usize..];
+                let copy_len = available.len().min(length);
+                bytes[..copy_len].copy_from_slice(&available[..copy_len]);
+            }
+            shared_file_bus_offset(contents.len() as u64, offset, length_u64, page_size)
+        }
+        OpenDescription::ProcExecutable { executable, .. } => {
+            let source = executable.source();
+            let file_len = source.len().map_err(|error| {
+                error
+                    .raw_os_error()
+                    .map(crate::host_to_linux_errno)
+                    .unwrap_or(linux_errno::EIO)
+            })?;
+            let contents = source.read_range(offset_usize, length).map_err(|error| {
+                error
+                    .raw_os_error()
+                    .map(crate::host_to_linux_errno)
+                    .unwrap_or(linux_errno::EIO)
+            })?;
+            bytes[..contents.len()].copy_from_slice(&contents);
+            shared_file_bus_offset(file_len as u64, offset, length_u64, page_size)
+        }
+        OpenDescription::InMemoryFile { contents, .. } => {
+            let data = contents.read();
+            let read_bytes = data.read_range(offset_usize, length);
+            bytes[..read_bytes.len()].copy_from_slice(&read_bytes);
+            shared_file_bus_offset(data.len() as u64, offset, length_u64, page_size)
+        }
+        OpenDescription::HostFile { host_fd, .. } => {
+            let file_len = host_fd_file_len(host_fd.raw()).ok_or(linux_errno::EIO)?;
+            snapshot_private_host_file(host_fd.raw(), offset, &mut bytes)?;
+            shared_file_bus_offset(file_len, offset, length_u64, page_size)
+        }
+        OpenDescription::HostPipe { host_fd, .. } => {
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            let is_chardev = unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0
+                && (st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFCHR as u32;
+            if !is_chardev {
+                return Err(linux_errno::ENODEV);
+            }
+            None
+        }
+        OpenDescription::SyntheticDevice { kind, .. } => {
+            if *kind == carrick_vfs::SyntheticDeviceKind::Zero {
+                None
+            } else {
+                return Err(linux_errno::ENODEV);
+            }
+        }
+        OpenDescription::Packet { socket, .. } => {
+            let init = socket.initial_ring_bytes().ok_or(linux_errno::EINVAL)?;
+            if offset_usize < init.len() {
+                let available = &init[offset_usize..];
+                let copy_len = available.len().min(length);
+                bytes[..copy_len].copy_from_slice(&available[..copy_len]);
+            }
+            None
+        }
+        _ => return Err(LINUX_EBADF),
+    };
+    Ok(PrivateMmapSnapshot {
+        bytes,
+        bus_fault_offset,
+    })
+}
+
+pub(super) fn read_retained_source(
+    source: PrivateFileBacking,
+    identity: carrick_el1_abi::HostBackingIdentity,
+    length: usize,
+    page_size: u64,
+) -> Result<Vec<u8>, LinuxErrno> {
+    match source {
+        PrivateFileBacking::Description(description) => snapshot_private_mmap_description(
+            description.description(),
+            identity.offset(),
+            length,
+            page_size,
+        )
+        .and_then(|snapshot| {
+            if snapshot.bus_fault_offset == Some(0) {
+                Err(LINUX_EFAULT)
+            } else {
+                Ok(snapshot.bytes)
+            }
+        }),
+        PrivateFileBacking::LoadedImage {
+            initialized_offset,
+            bytes,
+        } => {
+            let mut result = vec![0; length];
+            let initialized_end = initialized_offset
+                .checked_add(bytes.len() as u64)
+                .ok_or(LINUX_EINVAL)?;
+            let start = identity.offset().max(initialized_offset);
+            let end = (identity.offset() + length as u64).min(initialized_end);
+            if start < end {
+                let target = (start - identity.offset()) as usize;
+                let source = (start - initialized_offset) as usize;
+                let count = (end - start) as usize;
+                result[target..target + count].copy_from_slice(&bytes[source..source + count]);
+            }
+            Ok(result)
+        }
+    }
+}
