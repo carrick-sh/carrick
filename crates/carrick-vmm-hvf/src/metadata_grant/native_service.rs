@@ -277,11 +277,10 @@ impl NativeService {
         let executable = window
             .protection
             .permits(carrick_el1_abi::ReservationProtection::EXECUTE);
-        let perms = if executable {
-            applevisor::memory::MemPerms::ReadWriteExec
-        } else {
-            applevisor::memory::MemPerms::ReadWrite
-        };
+        // Like the existing private-backing adapter, preserve physical COW
+        // and later executable-publication capacity. The exact MM's inventory
+        // and stage-1 publication below retain the selected access policy.
+        let perms = crate::trap::hvf_mem_perms(carrick_hal::physical_grants::COW_GRANT_PERMISSIONS);
         let length = prefix + data_len;
         let (host, ipa, generation) = crate::trap::allocate_grant_extent(&custody, perms, length)?;
         let retained = Arc::new(crate::fork_stock::NativeFrameBacking {
