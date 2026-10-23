@@ -380,8 +380,8 @@ fn bootstrap(root: &Path) -> Result<(), ScalerError> {
     Ok(())
 }
 
-fn auth(event: &Path) -> Result<(), ScalerError> {
-    let event: serde_json::Value = serde_json::from_slice(&std::fs::read(event)?)?;
+fn auth(root: &Path, event: &Path) -> Result<(), ScalerError> {
+    let event = crate::dispatch_worker::load_event(root, event)?;
     let dispatch = crate::dispatch_worker::validate_event(
         &event,
         include_str!("../../../.github/dispatch-tiers.toml"),
@@ -404,27 +404,39 @@ fn auth(event: &Path) -> Result<(), ScalerError> {
             &codex.join("config.toml"),
             b"cli_auth_credentials_store = \"file\"\n",
         )?;
-    } else {
+    }
+    if dispatch.tier.backend == "agy" || dispatch.review {
         let raw = std::env::var("AGY_OAUTH_TOKEN")
             .ok()
             .filter(|token| !token.is_empty())
             .ok_or(ScalerError::Guard("missing AGY_OAUTH_TOKEN"))?;
-        let gemini = home.join(".gemini");
-        private_dir(&gemini)?;
-        let agy = gemini.join("antigravity-cli");
-        private_dir(&agy)?;
-        secret_file(&agy.join("antigravity-oauth-token"), raw.as_bytes())?;
+        if dispatch.tier.backend == "agy" {
+            agy_auth(&home, &raw)?;
+        }
+        if dispatch.review {
+            let loop_home = state()?.join("loop-home");
+            private_dir(&loop_home)?;
+            agy_auth(&loop_home, &raw)?;
+        }
     }
     crate::dispatch_redaction::remember()?;
     Ok(())
 }
 
+fn agy_auth(home: &Path, raw: &str) -> Result<(), ScalerError> {
+    let gemini = home.join(".gemini");
+    private_dir(&gemini)?;
+    let agy = gemini.join("antigravity-cli");
+    private_dir(&agy)?;
+    secret_file(&agy.join("antigravity-oauth-token"), raw.as_bytes())
+}
+
 pub fn run(root: &Path, args: Args) -> Result<(), ScalerError> {
     match args.action {
         Action::Bootstrap => bootstrap(root),
-        Action::Auth { event } => auth(&event),
+        Action::Auth { event } => auth(root, &event),
         Action::Cleanup => {
-            crate::dispatch_worker::cleanup_agent_user()?;
+            crate::dispatch_worker::cleanup_dispatch_users()?;
             let state = state()?;
             match std::fs::symlink_metadata(&state) {
                 Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {

@@ -61,6 +61,7 @@ impl DiagnosticSecrets {
                 "redaction-secrets.json",
                 "home/.codex/auth.json",
                 "home/.gemini/antigravity-cli/antigravity-oauth-token",
+                "loop-home/.gemini/antigravity-cli/antigravity-oauth-token",
             ] {
                 let path = state.join(path);
                 match std::fs::symlink_metadata(&path) {

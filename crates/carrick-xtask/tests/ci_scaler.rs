@@ -1273,3 +1273,28 @@ qm() {{ printf '%s\n' "$@"; }}
         }
     }
 }
+
+#[test]
+fn template_separates_loop_worker_and_runner_accounts() {
+    let source = include_str!("../../../scripts/ci/build-template-debian.sh");
+    for user in ["carrick-dispatch-agent", "carrick-dispatch-loop"] {
+        assert!(source.contains(&format!("/usr/sbin/useradd --system --user-group --no-create-home --shell /usr/sbin/nologin {user}")), "missing separate account {user}");
+        assert!(source.contains(&format!("/usr/sbin/usermod -aG {user} runner")));
+        assert!(source.contains(&format!("runner ALL=({user}) NOPASSWD: ALL")));
+        assert!(source.contains(&format!("/etc/sudoers.d/{user}")));
+    }
+}
+
+#[test]
+fn review_dispatch_demand_and_hook_are_admitted() {
+    let mut run = standing_run("pull_request_review", "work/dispatch-799-42");
+    run["path"] = DISPATCH_WORKFLOW.into();
+    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    run["triggering_actor"] = run["actor"].clone();
+    assert!(Admission::Agent.admits_run(&run));
+    run["head_branch"] = "work/arbitrary".into();
+    assert!(!Admission::Agent.admits_run(&run));
+    let mut context = standing_context("pull_request_review", "refs/pull/42/merge");
+    context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/pull/42/merge");
+    assert!(Admission::Agent.authorize(&context).is_ok());
+}
