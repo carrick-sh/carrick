@@ -1,0 +1,16 @@
+schema_version = 1
+id = "kernel.memory.owner-wait"
+title = "Owner-memory waits have one killable settlement owner"
+guest_surfaces = ["kernel:continuation", "syscall:pipe2", "syscall:read", "syscall:write", "syscall:nanosleep", "syscall:clock_nanosleep"]
+semantic_authority = ["Owner decision #711 and #802: owner memory arbitration is a killable internal lock wait", "man 7 signal: SIGKILL cannot be blocked, caught or ignored; fatal process action applies to every thread", "man 2 read and man 2 pipe2: output and descriptor effects belong to a completed operation"]
+fixture = "production runtime with two live shared-MM threads, real owner editor or PendingContentWrite, physical readiness during enrollment and after parking, native IPC direct-EL0 completion"
+scale_points = [1, 2]
+structural_budgets = []
+rationale = "Owner waits are killable-only: handled signals and stops never complete them. Process-wide SIGKILL or group exit stops every waiter's resume, independent of signal-delivery reservation. Native terminal cancellation retains its typed mailbox-trap or direct-EL0 origin across zone materialization and physical waits. No effect is consumed before secured copyout, or after cancellation is pending. Runtime writer exclusion is released before re-preparation. Enrollment readiness and scheduler resumption use the same settlement protocol for all owner-wait users. Holders may execute only bounded internal work; they must not retain an editor across a park, stop or guest-controlled dependency. The model explores shipping settlement and atomic cancellation/effect authority with loom words. Signal queues, mailbox transport, holder audit and signed guest delivery remain separate obligations."
+
+[bindings]
+vm_free = "carrick-core::cancellation::loom_models; carrick-el1-linux::native_process_signals::tests::fatal_cancellation_survives_native_dequeue_and_fork_gets_fresh_authority; carrick-kernel::dispatch::signal::tests::{stale_thread_signal_ticket_cannot_cancel_surviving_process,accepted_fatal_signal_survives_recipient_exit_during_effect_drain}"
+
+[bindings.unresolved]
+routing = "The upper #802 layer integrates effect custody with secured output and unifies typed wait routing."
+signed = "Signed HVF acceptance is director-owned; unavailable on Linux ctb-w1."

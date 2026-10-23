@@ -830,9 +830,22 @@ impl Kernel {
                 }
             }
         }
+        let pending = task.shared().pending_signals();
+        // Exact live-target observation admits this delivery. Exit overlapping
+        // an accepted fatal cannot undo it. Drain outside locks needed by
+        // effects, then publish process-wide even if that recipient retired.
+        let generation = if let Some(request) = pending.request_fatal(signal) {
+            drop(generation);
+            request.publish(core::hint::spin_loop);
+            task.lock_signal_generation()
+        } else {
+            generation
+        };
         task.discard_opposing_job_control_signals(signal);
         task.record_job_control_signal_generation(signal);
-        if let Some(thread) = &thread {
+        if signal.raw() == carrick_abi::LINUX_SIGKILL {
+            pending.enqueue_standard(signal, siginfo);
+        } else if let Some(thread) = &thread {
             thread.update_signal_state(|pending| {
                 if signal.is_realtime() {
                     pending.enqueue_realtime(signal, siginfo);
@@ -964,6 +977,17 @@ impl Kernel {
         if task.lifecycle() != TaskLifecycle::Live {
             return false;
         }
+        let pending = task.shared().pending_signals();
+        // Exact live-target observation admits this delivery. Exit overlapping
+        // an accepted fatal cannot undo it. Drain outside locks needed by
+        // effects, then publish process-wide even if that recipient retired.
+        let generation = if let Some(request) = pending.request_fatal(signal) {
+            drop(generation);
+            request.publish(core::hint::spin_loop);
+            task.lock_signal_generation()
+        } else {
+            generation
+        };
         task.discard_opposing_job_control_signals(signal);
         task.record_job_control_signal_generation(signal);
         let pending = task.shared().pending_signals();
@@ -1107,15 +1131,31 @@ impl Kernel {
         {
             return false;
         }
+        let pending = task.shared().pending_signals();
+        // Exact live-target observation admits this delivery. Exit overlapping
+        // an accepted fatal cannot undo it. Drain outside locks needed by
+        // effects, then publish process-wide even if that recipient retired.
+        let generation = if let Some(request) = pending.request_fatal(signal) {
+            drop(generation);
+            request.publish(core::hint::spin_loop);
+            task.lock_signal_generation()
+        } else {
+            generation
+        };
         task.discard_opposing_job_control_signals(signal);
         task.record_job_control_signal_generation(signal);
-        thread.update_signal_state(|pending| {
-            if signal.is_realtime() {
-                pending.enqueue_realtime(signal, siginfo);
-            } else {
-                pending.enqueue_standard(signal, siginfo);
-            }
-        });
+        if signal.raw() == carrick_abi::LINUX_SIGKILL {
+            pending.enqueue_standard(signal, siginfo);
+        } else {
+            thread.update_signal_state(|pending| {
+                if signal.is_realtime() {
+                    pending.enqueue_realtime(signal, siginfo);
+                } else {
+                    pending.enqueue_standard(signal, siginfo);
+                }
+            });
+        }
+
         let continued = if signal.raw() == carrick_abi::LINUX_SIGCONT {
             task.continue_from_job_control()
         } else if signal.raw() == carrick_abi::LINUX_SIGKILL {

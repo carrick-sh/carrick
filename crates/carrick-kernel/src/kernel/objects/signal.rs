@@ -561,6 +561,7 @@ impl TaskPendingSignals {
         siginfo: Option<LinuxSiginfo>,
         named: Option<ThreadRef>,
     ) {
+        self.publish_fatal(signal);
         let mut queue = self.queue.lock();
         let was_pending = queue.present().contains(signal.raw());
         if signal.is_realtime() {
@@ -605,6 +606,12 @@ impl TaskPendingSignals {
 
     pub fn replace_entries(&self, entries: &[PendingSignal]) {
         let replacement = PendingQueue::from_entries(entries);
+        if replacement.present().contains(carrick_abi::LINUX_SIGKILL) {
+            use carrick_el1_abi::Lifecycle;
+            self.lifecycle
+                .process_exit_custody()
+                .publish_cancellation(carrick_core::terminal::ProcessCancellation::FatalSignal);
+        }
         let mut queue = self.queue.lock();
         if queue.queue != replacement {
             queue.queue = replacement;
@@ -617,6 +624,26 @@ impl TaskPendingSignals {
         let mut queue = self.queue.lock();
         if queue.discard(signals) {
             self.publish_queue(&queue);
+        }
+    }
+
+    pub(crate) fn request_fatal(
+        &self,
+        signal: LinuxSignal,
+    ) -> Option<carrick_core::cancellation::CancellationPublication<'_, std::sync::atomic::AtomicU32>>
+    {
+        use carrick_el1_abi::Lifecycle;
+        (signal.raw() == carrick_abi::LINUX_SIGKILL).then(|| {
+            self.lifecycle
+                .process_exit_custody()
+                .cancellation_authority()
+                .request(carrick_core::terminal::ProcessCancellation::FatalSignal)
+        })
+    }
+
+    pub(crate) fn publish_fatal(&self, signal: LinuxSignal) {
+        if let Some(request) = self.request_fatal(signal) {
+            request.publish(core::hint::spin_loop);
         }
     }
 
@@ -1193,12 +1220,14 @@ impl SignalAuthority {
     }
 
     pub fn enqueue_thread_standard(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        self.task_pending.publish_fatal(signal);
         let mut state = self.thread.signal_state.lock();
         state.enqueue_standard(signal, siginfo);
         self.thread.publish_signal_state(&state);
     }
 
     pub fn enqueue_thread_realtime(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>) {
+        self.task_pending.publish_fatal(signal);
         let mut state = self.thread.signal_state.lock();
         state.enqueue_realtime(signal, siginfo);
         self.thread.publish_signal_state(&state);
@@ -1374,6 +1403,11 @@ impl SignalAuthority {
         temporary: WaitSigMask,
         host_slot: Option<(i32, i32)>,
     ) -> Option<SignalWaitReservation> {
+        if let Some((_, signum)) = host_slot
+            && let Ok(signal) = LinuxSignal::for_signal_number(signum)
+        {
+            self.task_pending.publish_fatal(signal);
+        }
         let recipients = self.foreign_task_recipients();
         let generation_guard = self.task.lock_signal_generation();
         let mut thread = self.thread.signal_state.lock();

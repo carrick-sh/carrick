@@ -3215,7 +3215,7 @@ mod layout_manifest {
             terminal,
             carrick_core::terminal::ProcessExitCustody,
             1020,
-            8,
+            12,
             4
         );
         field!(

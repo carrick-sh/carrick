@@ -1699,7 +1699,15 @@ impl Task {
                     && signal == Some(bound.fault.signal)
             })
         };
-        if let Some(signal) = signal.filter(|_| resumed_fault.is_none()) {
+        let pending = self.shared().pending_signals();
+        let fatal = signal.and_then(|signal| pending.request_fatal(signal));
+        if fatal.is_some()
+            && let Some(signal) = signal
+        {
+            self.discard_opposing_job_control_signals(signal);
+            self.record_job_control_signal_generation(signal);
+        }
+        if let Some(signal) = signal.filter(|_| resumed_fault.is_none() && fatal.is_none()) {
             self.discard_opposing_job_control_signals(signal);
             self.record_job_control_signal_generation(signal);
             let pending = self.shared().pending_signals();
@@ -1724,6 +1732,17 @@ impl Task {
         }
         drop(lifecycle);
         drop(signal_generation);
+        if let Some(fatal) = fatal {
+            fatal.publish(core::hint::spin_loop);
+            // The validated request is process-wide even if its ptrace target
+            // exited while bounded effects drained.
+            if let Some(signal) = signal {
+                let _generation = self.lock_signal_generation();
+                self.discard_opposing_job_control_signals(signal);
+                self.record_job_control_signal_generation(signal);
+                pending.enqueue_standard(signal, None);
+            }
+        }
         self.job_control_changed.notify_all();
         true
     }

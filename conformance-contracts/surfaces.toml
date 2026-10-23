@@ -126,7 +126,7 @@ contracts = ["kernel.fork.filetable", "core.personality.files", "kernel.el1.open
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/objects/task.rs"
-contracts = ["kernel.fork.filetable", "kernel.dispatch.resource-scope"]
+contracts = ["kernel.memory.owner-wait", "kernel.fork.filetable", "kernel.dispatch.resource-scope"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/resources.rs"
@@ -724,7 +724,7 @@ contracts = ["kernel.mm.current-read-reuse", "kernel.mm.native-syscall-buffers",
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/objects/thread.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.deferred-handback-identity", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
+contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "kernel.el1.deferred-handback-identity", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/continuation/wait_service.rs"
@@ -1030,7 +1030,7 @@ contracts = ["kernel.el1.thread-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_process_signals.rs"
-contracts = ["kernel.el1.thread-lifecycle", "kernel.el1.signal-delivery-owner", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.memory.owner-wait", "kernel.el1.thread-lifecycle", "kernel.el1.signal-delivery-owner", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_process_entry.rs"
@@ -1038,7 +1038,7 @@ contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wai
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_process_runtime.rs"
-contracts = ["kernel.scheduler.runnable-progress", "kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.short-lock", "process.native.terminal-child", "process.native.arm-admission", "kernel.copyout.owner-refusal"]
+contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress", "kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.short-lock", "process.native.terminal-child", "process.native.arm-admission", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs"
@@ -1358,7 +1358,7 @@ contracts = []
 
 [[surfaces]]
 path = "crates/carrick-core/src/terminal.rs"
-contracts = ["kernel.el1.thread-lifecycle", "process.native.terminal-child"]
+contracts = ["kernel.memory.owner-wait", "kernel.el1.thread-lifecycle", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-kernel-example/src/personality.rs"
@@ -1707,7 +1707,7 @@ contracts = ["kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/continuation/readiness.rs"
-contracts = ["kernel.copyout.owner-refusal"]
+contracts = ["kernel.memory.owner-wait", "kernel.copyout.owner-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/rootfs_helpers.rs"
@@ -1740,7 +1740,7 @@ contracts = ["kernel.scheduler.runnable-progress"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/src/abi/thread.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
+contracts = ["kernel.memory.owner-wait", "kernel.scheduler.runnable-progress"]
 
 [[surfaces]]
 path = "crates/carrick-guest-arch/src/lib.rs"
@@ -1765,3 +1765,31 @@ contracts = ["kernel.scheduler.runnable-progress"]
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/image_layout_tests.rs"
 contracts = ["kernel.fork.stage1-image", "kernel.el1.metadata-allocation", "kernel.mm.image-page-permissions"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/cancellation.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/lib.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/objects/signal.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/objects/thread_control.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/operations/signal.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/signal.rs"
+contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/cancellation/loom_tests.rs"
+contracts = ["kernel.memory.owner-wait"]

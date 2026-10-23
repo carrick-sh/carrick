@@ -2984,6 +2984,13 @@ impl Thread {
     /// then read the blocked mask. A signal the returned mask does not block
     /// is the sender's to deliver; a blocked one is the masker's to find.
     pub fn post_pending_read_blocked(&self, bits: SigSet) -> SigSet {
+        if bits.contains(carrick_abi::LINUX_SIGKILL) {
+            use carrick_el1_abi::Lifecycle;
+            self.control
+                .lifecycle()
+                .process_exit_custody()
+                .publish_cancellation(carrick_core::terminal::ProcessCancellation::FatalSignal);
+        }
         let blocked = self
             .control
             .carrier_pending()

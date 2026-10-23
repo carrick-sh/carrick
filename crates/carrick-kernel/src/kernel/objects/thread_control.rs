@@ -230,6 +230,14 @@ pub struct ThreadLifecycleLease(
     Arc<std::sync::OnceLock<ThreadLedgerActivityLease>>,
 );
 
+impl carrick_core::cancellation::CancellationOwner for ThreadLifecycleLease {
+    type Word = std::sync::atomic::AtomicU32;
+    fn cancellation_authority(&self) -> &carrick_core::cancellation::CancellationAuthority {
+        use carrick_el1_abi::Lifecycle;
+        self.process_exit_custody().cancellation_authority()
+    }
+}
+
 impl ThreadLifecycleLease {
     pub(in crate::kernel) fn new() -> Self {
         Self::in_pool(Arc::new(AbiPagePool::default()), Arc::default())

@@ -1038,37 +1038,18 @@ pub enum OwnerWaitCancellation {
 }
 
 pub fn owner_wait_cancellation(context: &KernelContext) -> Option<OwnerWaitCancellation> {
+    use carrick_core::terminal::ProcessCancellation;
     use carrick_el1_abi::Lifecycle;
-    let control = context.thread().control_slot();
-    if context
-        .lifecycle_page()
-        .process_exit_custody()
-        .caller_reserved()
-    {
-        return Some(if control.native_signal_owner() {
-            OwnerWaitCancellation::NativeFatal
-        } else {
-            OwnerWaitCancellation::GroupExit
-        });
-    }
-    if control.native_signal_owner() {
-        let kill = SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGKILL);
-        let pending = SigSet::from_raw(control.pending().load().0);
-        (pending.contains(crate::linux_abi::LINUX_SIGKILL)
-            || context
-                .kernel()
-                .host_signal()
-                .claim_pending_in_for(context.thread().key().tid.raw(), kill))
-        .then_some(OwnerWaitCancellation::NativeFatal)
+    let page = context.lifecycle_page();
+    let cause = page.process_exit_custody().cancellation()?;
+    Some(if context.thread().control_slot().native_signal_owner() {
+        OwnerWaitCancellation::NativeFatal
     } else {
-        let kill = SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGKILL);
-        (context.signal_authority().has_pending_in(kill)
-            || context
-                .kernel()
-                .host_signal()
-                .claim_pending_in_for(context.thread().key().tid.raw(), kill))
-        .then_some(OwnerWaitCancellation::Carrier)
-    }
+        match cause {
+            ProcessCancellation::FatalSignal => OwnerWaitCancellation::Carrier,
+            ProcessCancellation::GroupExit => OwnerWaitCancellation::GroupExit,
+        }
+    })
 }
 
 /// Exact native owner waits which a native-signal host-work edge may notify.

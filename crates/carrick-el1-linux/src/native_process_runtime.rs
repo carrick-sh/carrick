@@ -2575,7 +2575,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             expected_host: member_host_identity(page, control)?,
         }];
         members.extend(imported.iter().map(|(member, _, _)| member.clone()));
-        let signals = NativeProcessSignals::fresh_root(key);
+        let signals = NativeProcessSignals::fresh_root(key, page);
         for member in &mut members {
             let pending = carrick_el1_abi::NativePendingCustody::try_admit(member.control.clone())
                 .map_err(|_| NativeProcessError::Busy)?;
@@ -3009,7 +3009,9 @@ struct ForkReservation<'a, M> {
     identity: TaskIdentity,
     group: u32,
     session: u32,
-    signals: NativeProcessSignals<'a, carrick_personality_linux::abi::signal::LinuxSiginfo>,
+    signals: super::native_process_signals::NativeForkSignals<
+        carrick_personality_linux::abi::signal::LinuxSiginfo,
+    >,
     parent_creds: carrick_personality_linux::identity::TaskCredentials,
     parent_rlimits: carrick_sched_core::process::RlimitSet,
     parent_umask: u32,
@@ -5275,6 +5277,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         let lifecycle = self.service.child_lifecycle(&prepared);
         let page = lifecycle.page;
+        let signals = signals.admit(page);
         let metadata = (|| {
             if core::ptr::eq(page, parent_page)
                 || page.live() != 1

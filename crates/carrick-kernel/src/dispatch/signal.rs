@@ -4118,6 +4118,91 @@ mod tests {
     }
 
     #[test]
+    fn stale_thread_signal_ticket_cannot_cancel_surviving_process() {
+        use carrick_el1_abi::Lifecycle;
+        let dispatcher = SyscallDispatcher::new();
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let tid = dispatcher
+            .register_one_task_thread(&root, crate::thread::ThreadId::synthetic_for_tests(932001))
+            .unwrap();
+        let sibling = root.kernel().context(root.task().key().id, tid).unwrap();
+        let kill = crate::kernel::LinuxSignal::for_signal_number(9).unwrap();
+        // Authorize a caught signal to avoid namespace-init policy; the exact
+        // ticket names the same admitted target for the fatal post below.
+        let crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) =
+            root.kernel().authorize_signal_target_exact(
+                &root,
+                root.task().key(),
+                Some(sibling.thread().key()),
+                None,
+            )
+        else {
+            panic!("target");
+        };
+        root.kernel().exit_thread(&sibling, None).unwrap();
+        assert_eq!(
+            root.kernel()
+                .post_guest_thread_signal_to_authorized_target(&ticket, kill, None),
+            crate::kernel::ExactThreadSignalPost::Missing
+        );
+        assert_eq!(
+            root.lifecycle_page().process_exit_custody().cancellation(),
+            None
+        );
+    }
+
+    #[test]
+    fn accepted_fatal_signal_survives_recipient_exit_during_effect_drain() {
+        use carrick_el1_abi::Lifecycle;
+        let dispatcher = SyscallDispatcher::new();
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let tid = dispatcher
+            .register_one_task_thread(&root, crate::thread::ThreadId::synthetic_for_tests(932002))
+            .unwrap();
+        let sibling = root.kernel().context(root.task().key().id, tid).unwrap();
+        let kill = crate::kernel::LinuxSignal::for_signal_number(9).unwrap();
+        let crate::kernel::ExactSignalTargetAuthorization::Allowed(ticket) =
+            root.kernel().authorize_signal_target_exact(
+                &root,
+                root.task().key(),
+                Some(sibling.thread().key()),
+                None,
+            )
+        else {
+            panic!("target");
+        };
+        let effect =
+            carrick_core::cancellation::ProcessEffect::acquire(root.lifecycle_page()).unwrap();
+        let kernel = root.kernel().clone();
+        let sender = std::thread::spawn(move || {
+            kernel.post_guest_thread_signal_to_authorized_target(&ticket, kill, None)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while root
+            .lifecycle_page()
+            .process_exit_custody()
+            .cancellation()
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fatal request did not arrive"
+            );
+            std::thread::yield_now();
+        }
+        root.kernel().exit_thread(&sibling, None).unwrap();
+        drop(effect);
+        assert!(matches!(
+            sender.join().unwrap(),
+            crate::kernel::ExactThreadSignalPost::Posted(_)
+        ));
+        assert!(
+            root.signal_authority()
+                .has_pending_in(SigSet::EMPTY.with(9))
+        );
+    }
+
+    #[test]
     fn fork_child_clears_old_and_new_pending_signal_state() {
         let d = SyscallDispatcher::new();
         let parent = d.capture_one_task_context().expect("context");

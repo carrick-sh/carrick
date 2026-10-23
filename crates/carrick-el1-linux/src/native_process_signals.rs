@@ -3,6 +3,7 @@
 extern crate alloc;
 use alloc::sync::{Arc, Weak};
 use carrick_el1::lock::SpinLock;
+use carrick_el1_abi::{Lifecycle, ThreadLifecyclePage};
 use carrick_personality_linux::signal::{EnqueueOutcome, SignalInbox, StaleTarget};
 use carrick_sched_core::process::exit::{
     DefaultSignalDisposition, ExitSignalDisposition, ExitSignalSource, ExitSignalState,
@@ -135,6 +136,7 @@ enum ProjectionUpdate {
 }
 
 struct SignalShared<'a, T> {
+    page: &'a ThreadLifecyclePage,
     state: SpinLock<SignalResources<'a, T>>,
     summary: AtomicU64,
     process_summary: AtomicU64,
@@ -145,8 +147,9 @@ struct SignalShared<'a, T> {
 }
 
 impl<'a, T> SignalShared<'a, T> {
-    fn new(resources: SignalResources<'a, T>) -> Self {
+    fn new(page: &'a ThreadLifecyclePage, resources: SignalResources<'a, T>) -> Self {
         let shared = Self {
+            page,
             state: SpinLock::new(resources),
             summary: AtomicU64::new(0),
             process_summary: AtomicU64::new(0),
@@ -300,19 +303,47 @@ pub enum SignalActionError {
     Stale,
     Action(ActionError),
 }
+/// A fork snapshot cannot receive signals before its own lifecycle is admitted.
+pub struct NativeForkSignals<T> {
+    key: TaskKey,
+    actions: ActionTable,
+    inbox: SignalInbox<TaskKey, T>,
+}
+
+impl<T> NativeForkSignals<T> {
+    pub fn admit(self, page: &ThreadLifecyclePage) -> NativeProcessSignals<'_, T> {
+        NativeProcessSignals {
+            key: self.key,
+            resources: Arc::new(SignalShared::new(
+                page,
+                SignalResources {
+                    actions: self.actions,
+                    inbox: self.inbox,
+                    thread_pending: Vec::new(),
+                    forced_segv: Vec::new(),
+                    projections: Vec::new(),
+                },
+            )),
+        }
+    }
+}
+
 impl<'a, T> NativeProcessSignals<'a, T> {
     /// Fresh native-root admission owns the initial default actions and empty
     /// pending queue. This does not claim to import another launcher's sighand.
-    pub fn fresh_root(key: TaskKey) -> Self {
+    pub fn fresh_root(key: TaskKey, page: &'a ThreadLifecyclePage) -> Self {
         Self {
             key,
-            resources: Arc::new(SignalShared::new(SignalResources {
-                actions: ActionTable::default(),
-                inbox: SignalInbox::new(key),
-                thread_pending: Vec::new(),
-                forced_segv: Vec::new(),
-                projections: Vec::new(),
-            })),
+            resources: Arc::new(SignalShared::new(
+                page,
+                SignalResources {
+                    actions: ActionTable::default(),
+                    inbox: SignalInbox::new(key),
+                    thread_pending: Vec::new(),
+                    forced_segv: Vec::new(),
+                    projections: Vec::new(),
+                },
+            )),
         }
     }
     pub fn project_member(
@@ -423,6 +454,10 @@ impl<'a, T> NativeProcessSignals<'a, T> {
         signal: Signal,
         info: Option<T>,
     ) -> Result<EnqueueOutcome, StaleTarget> {
+        if key != self.key {
+            return Err(StaleTarget);
+        }
+        self.publish_fatal(signal);
         let mut resources = self.resources.lock();
         let outcome = resources.inbox.enqueue_for(key, signal, info);
         self.resources
@@ -435,12 +470,22 @@ impl<'a, T> NativeProcessSignals<'a, T> {
         signal: Signal,
         info: Option<T>,
     ) -> EnqueueOutcome {
+        self.publish_fatal(signal);
         let mut res = self.resources.lock();
         let outcome = res.thread_pending_mut(tid).enqueue(signal, info);
         self.resources
             .refresh_summary(&res, ProjectionUpdate::Member(tid));
         outcome
     }
+    fn publish_fatal(&self, signal: Signal) {
+        if signal == Signal::KILL {
+            self.resources
+                .page
+                .process_exit_custody()
+                .publish_cancellation(carrick_core::terminal::ProcessCancellation::FatalSignal);
+        }
+    }
+
     pub fn pending_set(&self, tid: carrick_sched_core::RecordRef) -> SignalSet {
         let resources = self.resources.lock();
         let proc = resources.inbox.pending().present();
@@ -556,22 +601,17 @@ impl<'a, T> NativeProcessSignals<'a, T> {
     pub fn pending_count(&self) -> usize {
         self.resources.lock().inbox.pending().len()
     }
-    pub fn for_fork(&self, child: TaskKey) -> Option<Self> {
+    pub fn for_fork(&self, child: TaskKey) -> Option<NativeForkSignals<T>> {
         let source = self.resources.lock();
         let ActionInheritance::Copied(actions) =
             source.actions.for_clone(self.key, SighandSharing::Copy)
         else {
             return None;
         };
-        Some(Self {
+        Some(NativeForkSignals {
             key: child,
-            resources: Arc::new(SignalShared::new(SignalResources {
-                actions,
-                inbox: source.inbox.for_fork(child),
-                thread_pending: Vec::new(),
-                forced_segv: Vec::new(),
-                projections: Vec::new(),
-            })),
+            actions,
+            inbox: source.inbox.for_fork(child),
         })
     }
     pub fn autoreaps_children(&self) -> bool {
@@ -632,13 +672,50 @@ mod tests {
             serial: TaskSerial::from_raw_u64(serial).unwrap(),
         }
     }
+    fn fresh<'a, T>(key: TaskKey) -> NativeProcessSignals<'a, T> {
+        NativeProcessSignals::fresh_root(
+            key,
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(ThreadLifecyclePage::new())),
+        )
+    }
+
+    #[test]
+    fn fatal_cancellation_survives_native_dequeue_and_fork_gets_fresh_authority() {
+        let page = ThreadLifecyclePage::new();
+        let task = key(41, 11);
+        let signals = NativeProcessSignals::<()>::fresh_root(task, &page);
+        assert!(signals.enqueue(key(42, 12), Signal::KILL, None).is_err());
+        assert_eq!(page.process_exit_custody().cancellation(), None);
+        signals.enqueue(task, Signal::KILL, None).unwrap();
+        // The recipient takes delivery; cancellation remains process-wide.
+        let recipient = carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+            incarnation: 1,
+        };
+        assert_eq!(
+            signals
+                .take_deliverable(recipient, SigBlockMask::NONE)
+                .unwrap()
+                .0,
+            Signal::KILL
+        );
+        assert_eq!(signals.pending_count(), 0);
+        assert_eq!(
+            page.process_exit_custody().cancellation(),
+            Some(carrick_core::terminal::ProcessCancellation::FatalSignal)
+        );
+        let child_page = ThreadLifecyclePage::new();
+        let _child = signals.for_fork(key(42, 12)).unwrap().admit(&child_page);
+        assert_eq!(child_page.process_exit_custody().cancellation(), None);
+    }
+
     #[test]
     fn thread_signal_projection_work_is_bounded_by_lookup_depth() {
         for population in [1usize, 8, 32, 128] {
             let controls: Vec<_> = (0..population)
                 .map(|_| carrick_el1_abi::ThreadControlSlot::new())
                 .collect();
-            let signals = NativeProcessSignals::<()>::fresh_root(key(41, 11));
+            let signals = fresh::<()>(key(41, 11));
             let record = |index: usize| carrick_sched_core::RecordRef {
                 id: carrick_sched_core::RecordId::from_raw((index + 1) as u32).unwrap(),
                 incarnation: 1,
@@ -707,7 +784,7 @@ mod tests {
         let first = carrick_el1_abi::ThreadControlSlot::new();
         let second = carrick_el1_abi::ThreadControlSlot::new();
         let task = key(41, 11);
-        let signals = NativeProcessSignals::<()>::fresh_root(task);
+        let signals = fresh::<()>(task);
         let record = |id| carrick_sched_core::RecordRef {
             id: carrick_sched_core::RecordId::from_raw(id).unwrap(),
             incarnation: 1,
@@ -766,7 +843,7 @@ mod tests {
     fn native_pending_projection_keeps_exact_member_and_rehomed_queue() {
         let first = carrick_el1_abi::ThreadControlSlot::new();
         let second = carrick_el1_abi::ThreadControlSlot::new();
-        let signals = NativeProcessSignals::<()>::fresh_root(key(41, 11));
+        let signals = fresh::<()>(key(41, 11));
         let first_custody =
             Arc::new(carrick_core::lifecycle::MemberControlCustody::retain(&first).unwrap());
         let second_custody =
@@ -811,7 +888,7 @@ mod tests {
         let control = carrick_el1_abi::ThreadControlSlot::new();
         let custody =
             Arc::new(carrick_core::lifecycle::MemberControlCustody::retain(&control).unwrap());
-        let signals = NativeProcessSignals::<()>::fresh_root(key(41, 11));
+        let signals = fresh::<()>(key(41, 11));
         let record = carrick_sched_core::RecordRef {
             id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
             incarnation: 1,
@@ -837,7 +914,7 @@ mod tests {
     #[test]
     fn process_sigint_waits_for_unblocked_worker_and_survives_exec() {
         let task = key(41, 11);
-        let signals = NativeProcessSignals::<u32>::fresh_root(task);
+        let signals = fresh::<u32>(task);
         let main = carrick_sched_core::RecordRef {
             id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
             incarnation: 7,
@@ -863,7 +940,7 @@ mod tests {
     #[test]
     fn installing_ignore_discards_process_and_thread_pending() {
         let task = key(41, 11);
-        let signals = NativeProcessSignals::<u32>::fresh_root(task);
+        let signals = fresh::<u32>(task);
         let record = carrick_sched_core::RecordRef {
             id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
             incarnation: 7,
@@ -892,7 +969,7 @@ mod tests {
 
     #[test]
     fn recycled_record_cannot_consume_another_thread_incarnations_signal() {
-        let signals = NativeProcessSignals::<u32>::fresh_root(key(41, 11));
+        let signals = fresh::<u32>(key(41, 11));
         let old = carrick_sched_core::RecordRef {
             id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
             incarnation: 7,
@@ -918,7 +995,7 @@ mod tests {
     #[test]
     fn default_stop_remains_pending_until_the_job_control_owner_can_stop() {
         let task = key(41, 11);
-        let signals = NativeProcessSignals::<()>::fresh_root(task);
+        let signals = fresh::<()>(task);
         let record = carrick_sched_core::RecordRef {
             id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
             incarnation: 1,
@@ -950,7 +1027,7 @@ mod tests {
     #[test]
     fn reset_hand_is_committed_with_selected_action_snapshot() {
         let task = key(41, 11);
-        let signals = NativeProcessSignals::<()>::fresh_root(task);
+        let signals = fresh::<()>(task);
         let caught = Action {
             disposition: Disposition::Handler(HandlerAddress(0x400000)),
             flags: carrick_signal_core::policy::ActionFlags {
@@ -978,7 +1055,7 @@ mod tests {
     #[test]
     fn blocked_or_ignored_synchronous_segv_forces_default() {
         let task = key(41, 11);
-        let signals = NativeProcessSignals::<()>::fresh_root(task);
+        let signals = fresh::<()>(task);
         let caught = Action {
             disposition: Disposition::Handler(HandlerAddress(0x400000)),
             ..Action::default()
@@ -1010,7 +1087,7 @@ mod tests {
     #[test]
     fn retained_exit_handle_reads_later_action_and_actual_control_mask() {
         let key = key(41, 11);
-        let signals = NativeProcessSignals::<()>::fresh_root(key);
+        let signals = fresh::<()>(key);
         let control = Arc::new(carrick_el1_abi::ThreadControlSlot::new());
         let retained = signals.exit_source(control.clone());
         signals
@@ -1037,7 +1114,7 @@ mod tests {
     fn fork_copies_actions_without_pending_or_parent_mutation_aliases() {
         let parent_key = key(41, 11);
         let child_key = key(42, 12);
-        let parent = NativeProcessSignals::<u32>::fresh_root(parent_key);
+        let parent = fresh::<u32>(parent_key);
         let caught = Action {
             disposition: Disposition::Handler(HandlerAddress(0x400000)),
             ..Action::default()
@@ -1046,7 +1123,12 @@ mod tests {
             .install_action(parent_key, Signal::CHLD, caught)
             .unwrap();
         parent.enqueue(parent_key, Signal::CHLD, Some(7)).unwrap();
-        let child = parent.for_fork(child_key).unwrap();
+        let child = parent
+            .for_fork(child_key)
+            .unwrap()
+            .admit(alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                ThreadLifecyclePage::new(),
+            )));
         assert_eq!(child.action(Signal::CHLD), caught);
         assert_eq!(child.pending_count(), 0);
         assert_eq!(parent.pending_count(), 1);
@@ -1078,7 +1160,7 @@ mod tests {
     #[test]
     fn child_policy_reads_default_explicit_ignore_no_child_wait_and_blocked_caught() {
         let task = key(41, 11);
-        let signals = NativeProcessSignals::<()>::fresh_root(task);
+        let signals = fresh::<()>(task);
         let control = Arc::new(carrick_el1_abi::ThreadControlSlot::new());
         let retained = signals.exit_source(control.clone());
         assert!(!signals.autoreaps_children());

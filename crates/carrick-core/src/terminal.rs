@@ -106,19 +106,38 @@ impl<C> ProcessPhysicalPublication<C> {
         }
     }
 }
+pub use crate::cancellation::ProcessCancellation;
+
 /// One process incarnation owns exactly one terminal admission claim.
 #[repr(C)]
 #[derive(::core::fmt::Debug, ::core::default::Default)]
 pub struct ProcessExitCustody {
     begun: core::sync::atomic::AtomicU32,
     fork_publications: core::sync::atomic::AtomicU32,
+    cancellation: crate::cancellation::CancellationAuthority,
 }
 impl ProcessExitCustody {
     pub const fn new() -> Self {
         Self {
             begun: core::sync::atomic::AtomicU32::new(0),
             fork_publications: core::sync::atomic::AtomicU32::new(0),
+            cancellation: crate::cancellation::CancellationAuthority::new(),
         }
+    }
+
+    /// First fatal publication wins. Delivery reservation and dequeue have no
+    /// clearing operation on this authority. Consumption by terminal custody
+    /// retains the cause so every remaining member still observes cancellation.
+    pub fn publish_cancellation(&self, cause: ProcessCancellation) {
+        self.cancellation.publish(cause, core::hint::spin_loop);
+    }
+
+    pub fn cancellation(&self) -> Option<ProcessCancellation> {
+        self.cancellation.requested()
+    }
+
+    pub fn cancellation_authority(&self) -> &crate::cancellation::CancellationAuthority {
+        &self.cancellation
     }
 
     /// Whether process custody has consumed the caller's live membership.
@@ -556,6 +575,8 @@ impl TerminalCustody<Process, Live> {
     }
 
     pub fn close_admission<L: Lifecycle>(page: &L) -> ProcessExitAdmission<'_, L> {
+        page.process_exit_custody()
+            .publish_cancellation(ProcessCancellation::GroupExit);
         page.close();
         // Pair with Kernel::thread_spawned's publication-before-gate check.
         // Order the gate store before the Acquire host-born snapshot loads,
@@ -585,6 +606,9 @@ impl TerminalCustody<Process, Live> {
             }
         };
         caller.publish();
+        // Only the successful terminal owner consumes the obligation. The
+        // monotonic cause survives consumption for sibling owner waiters.
+        state.cancellation.consume();
         state.begun.store(2, Ordering::Release);
         Ok(TerminalCustody {
             identity: ProcessTerminalIdentity::from_exit(task, address, status),
