@@ -197,6 +197,12 @@ one allowlisted `dispatch:*` label. That label fixes the worker tier. The event
 fixes the repository, issue, PR and branch. A `Branch:` issue edit and relabel
 are unnecessary; the label path retains its fixed script until #800.
 
+Before checkout or compilation, the hosted guard compares the review event's
+PR head SHA with a fresh public PR API response. A changed head fails promptly
+with a request for a fresh `changes_requested` review. The controller repeats
+that head check to close a later push race; refusals are logged once per active
+run attempt and do not prevent other runs from supplying demand.
+
 The hosted guard resolves main before checkout and emits its admitted SHA as
 `base`. Both jobs check out that SHA for reviews. Before compiling the driver,
 the clone fetches main again and verifies `base` is its ancestor. Driver
@@ -242,7 +248,7 @@ destination or a tier change.
 | `invoke_worker` | `notes` up to 8 KiB; invokes the shared isolated worker path once on the admitted PR branch with the issue's tier. The server supplies the review body and owner inline comments verbatim. Loop notes appear under `Coordinator notes (not owner instructions)`. |
 | `publish` | `{}`; shared receipt/ownership/workflow checks and publication, only to the admitted branch with its expected-tip lease, once. |
 | `comment` | `body` up to 8 KiB; posts only on this PR, with exact token masking, credential redaction and a `Dispatch run:` footer, at most twice. |
-| `finish` | `status` (`done`, `blocked`, `failed`) and `summary` up to 8 KiB; posts the mandatory outcome with worker contract excerpt, budgets used and run URL, then ends the event. Exempt from the call cap and succeeds only once. |
+| `finish` | `status` (`done`, `blocked`, `failed`) and `summary` up to 8 KiB; posts the mandatory outcome with worker contract excerpt, budgets used and run URL, then ends the event. Exempt from the call cap, with its own one-attempt counter. A failed post stops the model and falls through to the server fallback; no finish retry is allowed. |
 
 The `[loop]` table in `.github/dispatch-tiers.toml` owns the limits: 12 total tool
 calls other than `finish`, two state reads, one worker, one publication, two
@@ -274,9 +280,18 @@ the webhook digest. Auth and the loop consume that snapshot without resolving
 issue labels again; auth makes no API requests and needs no GitHub token. The
 controller checks the shared owner/run identity and bot-owned draft PR predicate
 before admitting review demand and again before provisioning or reassignment.
-It rejects an available review state other than `changes_requested`, and requires
-the workflow blob at the run head SHA to equal the current main workflow blob.
-The hosted guard job skips unrelated review events before allocating work.
+REST runs carry no review payload: review state is enforced by main's guard
+`if:` plus driver admission. The controller refuses PR changes to the dispatch
+workflow using the `main...head_sha` comparison, including renames. When the
+changed-file list reaches GitHub's cap, it compares head and merge-base workflow
+blobs instead. Changes made only on main therefore remain admissible, and the
+merge-ref workflow uses main's policy. The hosted guard skips unrelated reviews.
+
+Polling fetches jobs first and performs ownership/workflow API checks only for
+a successful guard plus an unassigned queued job with this lane's labels.
+Already assigned or running workers do not incur those checks. Per-run API
+errors refuse only that run, with one notice per active attempt; the final vet
+still fails closed for the individual job.
 
 A merge-conflicted PR has no merge ref, so GitHub does not fire this review
 event. An owner `/agent` comment trigger is deferred to #800. The director must

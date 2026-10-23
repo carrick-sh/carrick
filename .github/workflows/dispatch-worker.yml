@@ -23,6 +23,23 @@ jobs:
       backend: ${{ steps.tier.outputs.backend }}
       base: ${{ steps.tier.outputs.base }}
     steps:
+      - name: Refuse stale owner reviews before checkout or build
+        id: review-head
+        if: github.event_name == 'pull_request_review'
+        env:
+          REVIEW_PR: ${{ github.event.pull_request.number }}
+          REVIEW_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if ! live_head=$(curl --fail --silent --show-error --max-time 30 \
+            "https://api.github.com/repos/carrick-sh/carrick/pulls/$REVIEW_PR" | jq -er '.head.sha'); then
+            echo '::error::Cannot verify live PR head; refusing owner review' >&2
+            exit 1
+          fi
+          if [[ "$live_head" != "$REVIEW_HEAD" ]]; then
+            echo '::error::Stale owner review: PR head changed; submit a fresh changes_requested review' >&2
+            exit 1
+          fi
       - name: Resolve trusted driver base before checkout
         id: base
         env:
