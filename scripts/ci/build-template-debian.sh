@@ -130,6 +130,10 @@ if [[ $(cat profile) == agent ]]; then
   /usr/sbin/usermod -aG carrick-dispatch-agent runner
   printf '%s\n' 'runner ALL=(carrick-dispatch-agent) NOPASSWD: ALL' > /etc/sudoers.d/carrick-dispatch-agent
   chmod 0440 /etc/sudoers.d/carrick-dispatch-agent
+  /usr/sbin/useradd --system --user-group --no-create-home --shell /usr/sbin/nologin carrick-dispatch-loop
+  /usr/sbin/usermod -aG carrick-dispatch-loop runner
+  printf '%s\n' 'runner ALL=(carrick-dispatch-loop) NOPASSWD: ALL' > /etc/sudoers.d/carrick-dispatch-loop
+  chmod 0440 /etc/sudoers.d/carrick-dispatch-loop
   /usr/sbin/visudo -c
   # The codex dispatch tier's pinned SDK, built once from hash-locked wheels.
   # Root-owned and read-only for the agent; the driver points the launcher

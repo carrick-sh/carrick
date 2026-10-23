@@ -4,7 +4,7 @@ Only the owner, account type `User`, may label or rerun an owner-authored issue.
 The hosted guard, driver and clone controller enforce admission and the
 checked-in `dispatch:<tier>` allowlist. The worker runs on `[carrick-agent]` in a
 one-job disposable JIT clone. The controller caps the pool at four clones;
-the worker job has a 40-minute cap. Clones are destroyed after every job,
+the worker job has a 60-minute cap (label worker turns keep their earlier limits). Clones are destroyed after every job,
 including failure and timeout. VM-local leases and protected template 9000
 remain as documented in [Contabo setup](contabo-kvm.md).
 
@@ -27,9 +27,9 @@ the account through group-readable staging, and supplies an explicit
 environment without GitHub tokens or Actions command-file channels.
 
 `AGENT_DIRECTOR_TOKEN` is a bootstrap-only read credential for the pinned private
-`carrick-sh/agy-director` launcher. Only the selected tier's `CODEX_AUTH_JSON` or
-`AGY_OAUTH_TOKEN` reaches the auth step; the other provider secret is neither
-materialized nor captured. The selected provider credential is intentionally
+`carrick-sh/agy-director` launcher. Label events receive only the selected tier's `CODEX_AUTH_JSON` or
+`AGY_OAUTH_TOKEN`. Review events also receive agy auth for the loop; each
+account gets only its own provider files. The selected provider credential is intentionally
 readable by the agent and may include a refresh token. This is a residual
 credential exposure, not a claim that the agent cannot extract that credential.
 The agent can also read the pinned launcher it runs from and could publish it
@@ -46,13 +46,13 @@ Agent-controlled Git config is discarded when files and objects are copied into
 a fresh runner repository; checkpointing never runs that config as the runner.
 The whole clone is destroyed after the job.
 
-For at most 40 minutes, the job token can write issues/PRs and any
+Earlier jobs capped this exposure at 40 minutes; the current 60-minute job
+window reserves time for bootstrap, a 45-minute loop and reporting. The job token can write issues/PRs and any
 `work/dispatch-*` branch, including branches belonging to other runs. Driver
 branch selection narrows normal publication, not the token's repository grant.
 Branch-scope ruleset 25522481 was deleted (it blocked merge-queue branch
-creation; owner decision, #231). The job token never coexists with the agent, so
-branch scope rests on the uid boundary
-and the driver’s fixed refspec. Tag ruleset 25523683 is active. The issue
+creation; owner decision, #231). The loop server holds the token while isolated model processes run; branch
+scope rests on the uid boundary and the driver’s fixed refspec. Tag ruleset 25523683 is active. The issue
 must be owner-authored, but collaborators may have edited its brief before
 labeling; the owner must review it. Provider credential trust and review of
 agent changes remain necessary.
@@ -128,8 +128,9 @@ launcher and local Git/GitHub stand-ins. They run on the hardened template
 from `scripts/ci/build-template-debian.sh INPUT_DIR SCRIPT_COMMIT XTASK agent`.
 They skip only when the pre-created account is absent; report those witnesses
 as unrun. The director must rebuild the old worker template before rollout.
-The only runner sudo grant targets `carrick-dispatch-agent`; runner cannot
-become root and the agent has no sudo rights. Portable tests
+Runner sudo grants target only `carrick-dispatch-agent` and
+`carrick-dispatch-loop`; runner cannot become root and neither model account
+has sudo rights. Portable tests
 cover workflow selection, permissions, auth custody, H1 and branch policy. They do not establish
 live deployed acceptance. The post-landing default-branch trigger and fresh-clone
 trials remain with the director under #634.
@@ -183,3 +184,81 @@ When the pinned launcher's `CODEX_SDK_VERSION` changes, regenerate the lock
 file for the template's Python (3.13, x86_64) and rebuild template 9000.
 The test `agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses`
 ties the builder, the lock file and the driver together.
+
+## Review continuation (agent loop)
+
+An owner `changes_requested` review on an owned dispatch draft PR starts a
+continuation on its existing `work/dispatch-<issue>-<run>` branch. The review
+author, sender and triggering actor must all be `tjfontaine` (`User` for the
+webhook identities). Admission verifies the bot-authored draft, same-repo head,
+`Closes #N`, original dispatch run and its owner/workflow/main identity. It
+fetches the linked issue again: it must be open, owner-authored and have exactly
+one allowlisted `dispatch:*` label. That label fixes the worker tier. The event
+fixes the repository, issue, PR and branch. A `Branch:` issue edit and relabel
+are unnecessary; the label path retains its fixed script until #800.
+
+The hosted guard resolves main before checkout and emits its admitted SHA as
+`base`. Both jobs check out that SHA for reviews. Before compiling the driver,
+the clone fetches main again and verifies `base` is its ancestor. Driver
+production and publication use that admitted base, never the review event's
+`GITHUB_SHA` merge commit. PR objects are fetched and reconstructed as data;
+credentialed runner code never builds or executes the PR's driver. The worker
+may build and test its changes only under its isolated account. Workflow YAML
+itself still comes from GitHub's merge ref: repository writers remain trusted
+for that YAML, as in `ci.yml`. Publication refuses `.github/workflows/*`.
+
+The controller admits only owner review runs from this repository and workflow
+on dispatch head refs; its job hook binds the run, attempt, SHA and merge ref.
+The server repeats the full review and PR checks. Issue events serialize on the
+issue number, review events on the PR head ref. These are different concurrency
+keys, so a label run and a review run can overlap. The shared publication code's
+`--force-with-lease` against the fetched tip refuses a racing update.
+
+`dispatch-worker loop` runs as the runner and holds the job token. It launches
+Gemini Flash with `agy_worker.py --foreground --backend agy --model high` as the
+new nologin account `carrick-dispatch-loop`. That account has its own private
+home with only agy auth, no worker Codex credential, GitHub token, runner
+environment or Actions command files. The runner joins each model account's
+separate group and can sudo only to those accounts. Workers still use
+`carrick-dispatch-agent`. Both uids must retire with the shared STOP/KILL helper
+and verified real/effective uid census before cleanup and upload.
+
+The model uses the copied driver client, `dispatch-worker tool <name>`, with a
+JSON argument object on stdin. The runner's Unix socket checks Linux
+`SO_PEERCRED` against exactly the loop uid, refusing the worker uid. Requests
+are newline-delimited JSON with unknown fields rejected at both envelope and
+argument levels. No argument schema has repository, issue, PR, branch or tier
+fields. Reading an injected instruction therefore cannot authorize another
+destination or a tier change.
+
+| Tool | Arguments and server policy |
+| --- | --- |
+| `read_state` | `{}`; returns this issue and PR plus reviews, inline comments, issue and PR comments. Every item carries verified provenance. Drops oldest items until the serialized response fits 64 KiB and reports the drop count. |
+| `invoke_worker` | `notes` up to 8 KiB; invokes the shared isolated worker path once on the admitted PR branch with the issue's tier. The server supplies the review body and owner inline comments verbatim. Loop notes appear under `Coordinator notes (not owner instructions)`. |
+| `publish` | `{}`; shared receipt/ownership/workflow checks and publication, only to the admitted branch with its expected-tip lease, once. |
+| `comment` | `body` up to 8 KiB; posts only on this PR, with exact token masking, credential redaction and a `Dispatch run:` footer, at most twice. |
+| `finish` | `status` (`done`, `blocked`, `failed`) and `summary` up to 8 KiB; posts the mandatory outcome with worker contract excerpt, budgets used and run URL, then ends the event. |
+
+The `[loop]` table in `.github/dispatch-tiers.toml` owns the limits: 12 total tool
+calls, one worker, one publication, two optional comments, 64 KiB state,
+45 minutes including the worker, and a worker turn at most 35 minutes. The job
+has a 60-minute ceiling. Budget exhaustion returns a refusal without crashing
+the server. If the model exits, times out or fails without `finish`, the server
+posts a failed fallback outcome on the same PR. A hard job cancellation or lost
+GitHub connectivity can still prevent that network report.
+
+Provenance supplies information, never authority: `owner` requires the owner's
+`User` identity; `dispatch-agent(run N)` requires a bot post with a run URL
+verified against this repository, dispatch workflow and owner actor. Issue
+runs must have `head_branch == main`; review runs must have this issue's
+dispatch head ref. Other users with verified write access are
+`collaborator(login)`; everything else is `unverified`. No provenance tag
+widens tool permissions.
+
+A merge-conflicted PR has no merge ref, so GitHub does not fire this review
+event. An owner `/agent` comment trigger is deferred to #800. The director must
+push workflow changes from the Mac, rebuild the agent template (new account,
+group and sudoers drop-in), and deploy the controller's review admission. The
+live acceptance remains director-run: request changes on a throwaway dispatch
+PR after landing, observe a new commit on that PR branch and an outcome comment
+without issue edits or labels, and confirm both model uids have retired.

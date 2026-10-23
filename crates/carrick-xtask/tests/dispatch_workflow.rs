@@ -18,7 +18,7 @@ fn disposable_worker_has_no_publisher_or_artifact_transfer() {
         assert!(!text.contains(removed), "retained {removed}");
     }
     let worker = &workflow["jobs"]["worker"];
-    assert_eq!(worker["timeout-minutes"].as_i64(), Some(40));
+    assert_eq!(worker["timeout-minutes"].as_i64(), Some(60));
     assert_eq!(worker["runs-on"][0].as_str(), Some("carrick-agent"));
     let permissions = worker["permissions"].as_hash().unwrap();
     assert_eq!(permissions.len(), 3);
@@ -107,14 +107,10 @@ fn disposable_worker_has_no_publisher_or_artifact_transfer() {
 #[test]
 fn provider_workflow_selects_only_the_admitted_backend() {
     let text = include_str!("../../../.github/workflows/dispatch-worker.yml");
-    for (backend, secret) in [("codex", "CODEX_AUTH_JSON"), ("agy", "AGY_OAUTH_TOKEN")] {
-        assert!(
-            text.contains(&format!(
-                "needs.guard.outputs.backend == '{backend}' && secrets.{secret} || ''"
-            )),
-            "unconditional provider secret: {secret}"
-        );
-    }
+    assert!(
+        text.contains("needs.guard.outputs.backend == 'codex' && secrets.CODEX_AUTH_JSON || ''")
+    );
+    assert!(text.contains("(needs.guard.outputs.backend == 'agy' || github.event_name == 'pull_request_review') && secrets.AGY_OAUTH_TOKEN || ''"));
     assert!(text.contains("backend: ${{ steps.tier.outputs.backend }}"));
 }
 
@@ -700,4 +696,237 @@ fn agent_step_has_no_job_token() {
 #[cfg(target_os = "linux")]
 fn failed_checkout_still_reports() {
     foreground("checkout");
+}
+
+#[test]
+fn review_workflow_pins_main_and_orders_the_loop() {
+    let docs = YamlLoader::load_from_str(include_str!(
+        "../../../.github/workflows/dispatch-worker.yml"
+    ))
+    .unwrap();
+    let w = &docs[0];
+    assert_eq!(
+        w["on"]["pull_request_review"]["types"][0].as_str(),
+        Some("submitted")
+    );
+    assert_eq!(w["jobs"]["worker"]["timeout-minutes"].as_i64(), Some(60));
+    assert_eq!(
+        w["jobs"]["guard"]["outputs"]["base"].as_str(),
+        Some("${{ steps.tier.outputs.base }}")
+    );
+    for job in ["guard", "worker"] {
+        let steps = w["jobs"][job]["steps"].as_vec().unwrap();
+        let checkout = steps
+            .iter()
+            .find(|s| s["uses"].as_str() == Some("actions/checkout@v4"))
+            .unwrap();
+        let reference = if job == "guard" {
+            "${{ steps.base.outputs.base }}"
+        } else {
+            "${{ needs.guard.outputs.base }}"
+        };
+        assert_eq!(checkout["with"]["ref"].as_str(), Some(reference));
+    }
+    let steps = w["jobs"]["worker"]["steps"].as_vec().unwrap();
+    let position = |id| {
+        steps
+            .iter()
+            .position(|s| s["id"].as_str() == Some(id))
+            .unwrap()
+    };
+    assert!(position("admission") < position("loop") && position("loop") < position("retire"));
+    for s in steps {
+        if !s["env"]["GH_TOKEN"].is_badvalue() {
+            assert!(
+                ["bootstrap", "admission", "complete", "loop"]
+                    .contains(&s["id"].as_str().unwrap_or(""))
+                    || s["name"].as_str() == Some("Mask the job token before agent execution")
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn loop_client_alias_sends_one_strict_json_request() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tools.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let alias = temp.path().join("dispatch-worker");
+    std::fs::copy(env!("CARGO_BIN_EXE_carrick-xtask"), &alias).unwrap();
+    let mut child = Command::new(&alias)
+        .args(["tool", "read_state"])
+        .env_clear()
+        .env("CARRICK_DISPATCH_SOCKET", &socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"{}").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("client did not connect: {e}");
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let mut request = String::new();
+    std::io::BufReader::new(&stream)
+        .read_line(&mut request)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&request).unwrap(),
+        serde_json::json!({"tool":"read_state","arguments":{}})
+    );
+    writeln!(stream, "{{\"ok\":true}}").unwrap();
+    drop(stream);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "{\"ok\":true}"
+    );
+}
+
+#[test]
+fn review_setup_failure_posts_fallback_only_on_the_admitted_pr() {
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let base = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(base.status.success());
+    let base = String::from_utf8(base.stdout).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    let state = temp.path().join("carrick-agent-999-1");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    let pr = json!({"number":800,"user":{"login":"github-actions[bot]","type":"Bot"},
+        "head":{"ref":"work/dispatch-799-42","repo":{"full_name":"carrick-sh/carrick"}},
+        "base":{"ref":"main"},"draft":true,"body":"Closes #799\nDispatch run: https://github.com/carrick-sh/carrick/actions/runs/42"});
+    let issue = json!({"number":799,"title":"Fixture","state":"open","user":{"login":"tjfontaine","type":"User"},"body":"## Brief\nFixture", "labels":[{"name":"dispatch:sol-high"}]});
+    let run = json!({"id":42,"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","repository":{"full_name":"carrick-sh/carrick"},"actor":{"login":"tjfontaine"}});
+    for (name, value) in [
+        ("pr.json", json!([pr.clone()])),
+        ("issue.json", issue),
+        ("run.json", run),
+    ] {
+        std::fs::write(temp.path().join(name), value.to_string()).unwrap();
+    }
+    let event = temp.path().join("event.json");
+    std::fs::write(&event, json!({"repository":{"full_name":"carrick-sh/carrick"},"action":"submitted", "sender":{"login":"tjfontaine","type":"User"}, "pull_request":pr, "review":{"id":77,"state":"changes_requested","user":{"login":"tjfontaine","type":"User"},"body":"Fix it"}}).to_string()).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$@" >> "$RUNNER_TEMP/gh.args"
+if [ "$1" = api ]; then
+  case "$2" in
+    */actions/runs/42) cat "$RUNNER_TEMP/run.json" ;;
+    */issues/799) cat "$RUNNER_TEMP/issue.json" ;;
+    *'/pulls?'*) cat "$RUNNER_TEMP/pr.json" ;;
+    *) exit 91 ;;
+  esac
+else
+  test "$1 $2 $3" = 'pr comment 800'
+  previous=''
+  for arg do
+    if [ "$previous" = --body-file ]; then cp "$arg" "$RUNNER_TEMP/posted.md"; fi
+    previous="$arg"
+  done
+fi
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args([
+            "dispatch-worker",
+            "loop",
+            "--setup-status",
+            "failure/skipped",
+            "--event",
+        ])
+        .arg(&event)
+        .current_dir(&root)
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("RUNNER_TEMP", temp.path())
+        .env("GITHUB_RUN_ID", "999")
+        .env("GITHUB_RUN_ATTEMPT", "1")
+        .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
+        .env("CARRICK_DISPATCH_BASE", base.trim())
+        .env("GITHUB_SHA", "b".repeat(40))
+        .env("GH_TOKEN", "fixture-job-token")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("fallback outcome posted"),
+        "{output:?}"
+    );
+    let report = std::fs::read_to_string(temp.path().join("posted.md")).unwrap();
+    assert!(report.contains("Review continuation: Failed"));
+    assert!(report.contains("Worker was not invoked"));
+    assert!(report.contains("\"calls\":0"));
+    assert!(
+        report.contains("Dispatch run: https://github.com/carrick-sh/carrick/actions/runs/999")
+    );
+    assert!(!report.contains("fixture-job-token"));
+    let calls = std::fs::read_to_string(temp.path().join("gh.args")).unwrap();
+    assert!(calls.contains("pr\ncomment\n800\n"));
+    assert!(!calls.contains("issue\ncomment"));
+    std::fs::create_dir(state.join("home")).unwrap();
+    let auth = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["agent-runner", "auth", "--event"])
+        .arg(&event)
+        .current_dir(&root)
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("RUNNER_TEMP", temp.path())
+        .env("GITHUB_RUN_ID", "999")
+        .env("GITHUB_RUN_ATTEMPT", "1")
+        .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
+        .env("GH_TOKEN", "fixture-job-token")
+        .env("CODEX_AUTH_JSON", "{\"token\":\"worker-codex-secret\"}")
+        .env("AGY_OAUTH_TOKEN", "loop-agy-secret")
+        .output()
+        .unwrap();
+    assert!(auth.status.success(), "{auth:?}");
+    assert!(state.join("home/.codex/auth.json").is_file());
+    assert!(!state.join("home/.gemini").exists());
+    assert!(!state.join("loop-home/.codex").exists());
+    let credential = state.join("loop-home/.gemini/antigravity-cli/antigravity-oauth-token");
+    assert_eq!(
+        std::fs::read_to_string(&credential).unwrap(),
+        "loop-agy-secret"
+    );
+    assert_eq!(
+        std::fs::metadata(credential).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }

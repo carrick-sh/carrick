@@ -3,13 +3,15 @@ name: Dispatch issue worker
 on:
   issues:
     types: [labeled]
+  pull_request_review:
+    types: [submitted]
 
 permissions:
   contents: read
 
-# Per-issue serialization; the clone controller independently caps its pool at 4.
+# Issue events serialize by issue; reviews by head ref. The push lease closes cross-key races.
 concurrency:
-  group: dispatch-worker-${{ github.event.issue.number }}
+  group: dispatch-worker-${{ github.event.issue.number || github.event.pull_request.head.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -18,13 +20,28 @@ jobs:
     timeout-minutes: 15
     outputs:
       backend: ${{ steps.tier.outputs.backend }}
+      base: ${{ steps.tier.outputs.base }}
     steps:
+      - name: Resolve trusted driver base before checkout
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          base="$EVENT_SHA"
+          if [ "$EVENT_NAME" = pull_request_review ]; then
+            base=$(git ls-remote https://github.com/carrick-sh/carrick refs/heads/main | cut -f1)
+          fi
+          [[ "$base" =~ ^[0-9a-f]{40}$ ]]
+          echo "base=$base" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ steps.base.outputs.base }}
           persist-credentials: false
       - name: Validate actor, tier and brief before requesting a worker
         id: tier
+        env:
+          CARRICK_DISPATCH_BASE: ${{ steps.base.outputs.base }}
         run: cargo run --locked --release -p carrick-xtask -- dispatch-worker guard --event "$GITHUB_EVENT_PATH"
 
   worker:
@@ -37,6 +54,7 @@ jobs:
     # H1: no runner-owned compiler server may execute agent-selected builds.
     # Environment overrides runner Cargo config for every step.
     env:
+      CARRICK_DISPATCH_BASE: ${{ needs.guard.outputs.base }}
       RUSTC_WRAPPER: ''
       RUSTC_WORKSPACE_WRAPPER: ''
       CARGO_BUILD_RUSTC_WRAPPER: ''
@@ -46,7 +64,7 @@ jobs:
       SCCACHE_SERVER_UDS: ''
       SCCACHE_SERVER_PORT: '0'
       SCCACHE_DIR: ''
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - name: Reject a pre-existing runner compiler-cache server
         run: |
@@ -65,9 +83,14 @@ jobs:
       - uses: actions/checkout@v4
         timeout-minutes: 5
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.guard.outputs.base }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Verify admitted base against freshly fetched main before building
+        run: |
+          git fetch --no-tags https://github.com/carrick-sh/carrick refs/heads/main
+          test "$(git rev-parse HEAD)" = "$CARRICK_DISPATCH_BASE"
+          git merge-base --is-ancestor "$CARRICK_DISPATCH_BASE" FETCH_HEAD
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: '1.96.0'
@@ -85,24 +108,36 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.AGENT_DIRECTOR_TOKEN }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner bootstrap'
-      - name: Materialize selected provider credentials
-        id: auth
-        env:
-          CODEX_AUTH_JSON: ${{ needs.guard.outputs.backend == 'codex' && secrets.CODEX_AUTH_JSON || '' }}
-          AGY_OAUTH_TOKEN: ${{ needs.guard.outputs.backend == 'agy' && secrets.AGY_OAUTH_TOKEN || '' }}
-        run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner auth --event "$GITHUB_EVENT_PATH"'
       - name: Admit continuation before agent execution
         id: admission
+        if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker guard --admit --event "$GITHUB_EVENT_PATH"'
+      - name: Materialize selected provider credentials
+        id: auth
+        if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' && steps.admission.outcome == 'success' }}
+        env:
+          CODEX_AUTH_JSON: ${{ needs.guard.outputs.backend == 'codex' && secrets.CODEX_AUTH_JSON || '' }}
+          AGY_OAUTH_TOKEN: ${{ (needs.guard.outputs.backend == 'agy' || github.event_name == 'pull_request_review') && secrets.AGY_OAUTH_TOKEN || '' }}
+        run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner auth --event "$GITHUB_EVENT_PATH"'
       - name: Run foreground agent and collect output
         id: worker
-        if: ${{ !cancelled() && steps.driver.outcome == 'success' && steps.admission.outcome == 'success' }}
+        if: ${{ !cancelled() && github.event_name == 'issues' && steps.driver.outcome == 'success' && steps.admission.outcome == 'success' }}
         timeout-minutes: 40
         run: >-
           "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode carrick --check-load --
           "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker run --event "$GITHUB_EVENT_PATH"
+          --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
+      - name: Continue owner review through the policy tool server
+        id: loop
+        if: ${{ !cancelled() && github.event_name == 'pull_request_review' && steps.driver.outcome == 'success' && steps.admission.outcome == 'success' }}
+        timeout-minutes: 47
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode carrick --check-load --
+          "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker loop --event "$GITHUB_EVENT_PATH"
           --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
       - name: Verify retirement before credentialed completion
         id: retire
@@ -110,17 +145,17 @@ jobs:
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker guard --retire --event "$GITHUB_EVENT_PATH"'
       - name: Scan output, push only this run branch and report its draft PR
         id: complete
-        if: ${{ !cancelled() && steps.retire.outcome == 'success' }}
+        if: ${{ !cancelled() && github.event_name == 'issues' && steps.retire.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker complete --event "$GITHUB_EVENT_PATH"'
       - uses: actions/upload-artifact@v4
         id: upload
-        if: ${{ !cancelled() && steps.complete.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.retire.outcome == 'success' && (steps.complete.outcome == 'success' || steps.loop.outcome == 'success') }}
         with:
-          name: dispatch-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dispatch-${{ github.event.issue.number || github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dispatch-output
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
       - name: Remove provider and launcher state
         if: always()
@@ -129,5 +164,5 @@ jobs:
             "$RUNNER_TEMP/carrick-dispatch-driver" agent-runner cleanup
           fi
       - name: Reflect the worker contract in the job verdict
-        if: ${{ !cancelled() && steps.complete.outputs.worker_failed == 'true' }}
+        if: ${{ !cancelled() && (steps.complete.outputs.worker_failed == 'true' || steps.loop.outputs.worker_failed == 'true') }}
         run: exit 1

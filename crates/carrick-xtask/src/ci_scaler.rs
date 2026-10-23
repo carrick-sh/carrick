@@ -523,8 +523,9 @@ impl Admission {
                 run["head_repository"]["full_name"] == REPOSITORY
                     && run["path"] == DISPATCH_WORKFLOW
                     && run["head_sha"].as_str().is_some_and(full_sha)
-                    && event == "issues"
-                    && branch == "main"
+                    && ((event == "issues" && branch == "main")
+                        || (event == "pull_request_review"
+                            && crate::dispatch_worker::dispatch_branch(branch).is_some()))
                     && run["actor"]["login"] == "tjfontaine"
                     && run["actor"]["type"] == "User"
                     && run["triggering_actor"]["login"] == "tjfontaine"
@@ -556,10 +557,17 @@ impl Admission {
                             == format!("{REPOSITORY}/{PILOT_WORKFLOW}@refs/heads/{PILOT_BRANCH}")
                 }
                 Self::Agent => {
-                    context.event == "issues"
-                        && branch == "main"
+                    ((context.event == "issues" && branch == "main")
+                        || (context.event == "pull_request_review"
+                            && context
+                                .git_ref
+                                .strip_prefix("refs/pull/")
+                                .and_then(|s| s.strip_suffix("/merge"))
+                                .is_some_and(|n| {
+                                    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                                })))
                         && context.workflow_ref
-                            == format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/heads/main")
+                            == format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@{}", context.git_ref)
                 }
                 Self::Standing => {
                     standing_event_ref(&context.event, branch)

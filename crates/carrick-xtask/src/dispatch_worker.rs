@@ -1,4 +1,4 @@
-//! Issue-label dispatch driver. Workflow input never becomes shell source.
+//! Owner-authorized dispatch driver. Workflow input never becomes shell source.
 use crate::ci_scaler::{REPOSITORY, ScalerError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -6,6 +6,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[path = "dispatch_loop.rs"]
+mod agent_loop;
+
+const LOOP_USER: &str = "carrick-dispatch-loop";
 const AGENT_USER: &str = "carrick-dispatch-agent";
 
 #[derive(clap::Args, Debug)]
@@ -15,6 +19,15 @@ pub struct DispatchArgs {
 }
 #[derive(clap::Subcommand, Debug)]
 pub enum DispatchAction {
+    /// Credentialed review coordinator and policy-enforcing Unix tool server.
+    Loop {
+        #[arg(long)]
+        event: PathBuf,
+        #[arg(long, default_value = "success/success")]
+        setup_status: String,
+    },
+    /// Token-free client: one JSON argument object on stdin.
+    Tool { name: String },
     /// Hosted, credential-free guard. Repeated on the clone before any work.
     Guard {
         #[arg(long)]
@@ -51,6 +64,8 @@ pub struct Tier {
 #[serde(deny_unknown_fields)]
 struct Tiers {
     tiers: std::collections::BTreeMap<String, Tier>,
+    #[serde(rename = "loop")]
+    loop_policy: agent_loop::Policy,
 }
 
 pub fn trusted_actor(actor: &str) -> bool {
@@ -65,6 +80,11 @@ pub struct Dispatch {
     pub branch: String,
     pub resume: bool,
     pub tier: Tier,
+    pub base: String,
+    pub review: bool,
+    pub review_text: String,
+    pub worker_seconds: Option<u64>,
+    pub loop_deadline: Option<std::time::Instant>,
 }
 
 pub fn validate_event(
@@ -74,8 +94,9 @@ pub fn validate_event(
 ) -> Result<Dispatch, ScalerError> {
     let sender = event["sender"]["login"].as_str().unwrap_or_default();
     let kind = event["sender"]["type"].as_str().unwrap_or_default();
+    let review = event.get("review").is_some();
     if event["repository"]["full_name"] != REPOSITORY
-        || event["action"] != "labeled"
+        || event["action"] != if review { "submitted" } else { "labeled" }
         || event["issue"].get("pull_request").is_some()
         || !trusted_actor(sender)
         || !trusted_actor(triggering_actor)
@@ -88,7 +109,39 @@ pub fn validate_event(
     }
     let tiers: Tiers =
         toml::from_str(tiers).map_err(|_| ScalerError::Guard("invalid dispatch tier table"))?;
-    let tier = event["label"]["name"]
+    let review_label;
+    let label = if review {
+        let pr = &event["pull_request"];
+        let issue = event["issue"]["number"].as_u64().unwrap_or_default();
+        let branch = pr["head"]["ref"].as_str().unwrap_or_default();
+        if event["review"]["state"] != "changes_requested"
+            || event["review"]["user"]["login"] != "tjfontaine"
+            || event["review"]["user"]["type"] != "User"
+            || event["issue"]["state"] != "open"
+            || !owned_pr(pr, &event["dispatch_run"], issue, branch)
+        {
+            return Err(ScalerError::Guard(
+                "review requires owner changes_requested on an owned dispatch PR and open issue",
+            ));
+        }
+        let labels: Vec<_> = event["issue"]["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v["name"].as_str())
+            .filter(|s| s.starts_with("dispatch:"))
+            .collect();
+        if labels.len() != 1 {
+            return Err(ScalerError::Guard(
+                "review requires exactly one dispatch label",
+            ));
+        }
+        review_label = json!({"name":labels[0]});
+        &review_label
+    } else {
+        &event["label"]
+    };
+    let tier = label["name"]
         .as_str()
         .and_then(|label| tiers.tiers.get(label))
         .cloned()
@@ -107,10 +160,15 @@ pub fn validate_event(
     let body = event["issue"]["body"].as_str().unwrap_or_default();
     let brief = brief_section(body)?;
     let branches = branch_directives(&brief);
-    if branches.len() > 1 {
+    if !review && branches.len() > 1 {
         return Err(ScalerError::Guard("multiple branch directives"));
     }
-    let branch = if let Some(branch) = branches.first() {
+    let branch = if review {
+        event["pull_request"]["head"]["ref"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    } else if let Some(branch) = branches.first() {
         if !valid_branch(branch) {
             return Err(ScalerError::Guard("brief branch must be a valid work/ ref"));
         }
@@ -118,7 +176,7 @@ pub fn validate_event(
     } else {
         format!("work/dispatch-{issue}-pending")
     };
-    let resume = !branches.is_empty();
+    let resume = review || !branches.is_empty();
     Ok(Dispatch {
         issue,
         title,
@@ -126,6 +184,11 @@ pub fn validate_event(
         branch,
         resume,
         tier,
+        base: String::new(),
+        review,
+        review_text: String::new(),
+        worker_seconds: None,
+        loop_deadline: None,
     })
 }
 
@@ -324,20 +387,46 @@ fn read_result(result: &Path) -> (Contract, String) {
 }
 
 fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Result<i32> {
+    wait_account(command, limit, AGENT_USER)
+}
+fn wait_account(
+    command: &mut Command,
+    limit: std::time::Duration,
+    user: &str,
+) -> std::io::Result<i32> {
+    wait_account_serving(command, limit, user, || Ok(false))
+}
+fn wait_account_serving(
+    command: &mut Command,
+    limit: std::time::Duration,
+    user: &str,
+    mut serve: impl FnMut() -> Result<bool, ScalerError>,
+) -> std::io::Result<i32> {
     use std::os::unix::process::CommandExt;
     let mut child = command.process_group(0).spawn()?;
     let pgid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
     let deadline = std::time::Instant::now() + limit;
+    let mut stopped = false;
+    let mut serving_error = None;
     loop {
+        if !stopped {
+            match serve() {
+                Ok(stop) => stopped = stop,
+                Err(error) => {
+                    serving_error = Some(std::io::Error::other(error));
+                    stopped = true;
+                }
+            }
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 // SAFETY: the foreground child created this dedicated group.
                 unsafe {
                     libc::kill(-pgid, libc::SIGKILL);
                 }
-                return Ok(status.code().unwrap_or(1));
+                return serving_error.map_or_else(|| Ok(status.code().unwrap_or(1)), Err);
             }
-            Ok(None) if std::time::Instant::now() < deadline => {
+            Ok(None) if !stopped && std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(error) => return Err(error),
@@ -345,7 +434,7 @@ fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Res
                 // The sudo wrapper and its agent belong to different UIDs.
                 // Stop every agent process before waiting for that wrapper.
                 let (_helper, mut retirement) =
-                    retirement_command().map_err(std::io::Error::other)?;
+                    retirement_command(user).map_err(std::io::Error::other)?;
                 crate::process_helper::run_checked(&mut retirement)
                     .map_err(std::io::Error::other)?;
                 // A sudo monitor can stop on the agent's job-control notification.
@@ -357,7 +446,7 @@ fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Res
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 loop {
                     if child.try_wait()?.is_some() {
-                        return Ok(124);
+                        return serving_error.map_or(Ok(if stopped { 0 } else { 124 }), Err);
                     }
                     if std::time::Instant::now() >= deadline {
                         return Err(std::io::Error::other(
@@ -400,13 +489,21 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         This is an ephemeral runner. Use local shared carrick leases for builds.\n\
         Contabo leases are per VM under owner decision #639; never acquire a hypervisor lease.\n\
         Run only gates supported by this host; report unavailable Docker, KVM or HVF honestly.\n\
-        Return the requested JSON contract, stating unrun gates and blockers honestly.\n\n{}",
-        dispatch.issue, dispatch.branch, dispatch.tier.coauthor, dispatch.brief
+        Return the requested JSON contract, stating unrun gates and blockers honestly.\n\n{}{}",
+        dispatch.issue,
+        dispatch.branch,
+        dispatch.tier.coauthor,
+        dispatch.brief,
+        dispatch.review_text
     );
     std::fs::write(&prompt_file, prompt)?;
     // Deduct checkout/build/bootstrap time rather than starting a fresh
     // 30-minute turn against a token snapshot taken at job admission.
-    let turn_timeout = format!("{}s", crate::agent_runner::job_remaining(30)?.as_secs());
+    let limit = dispatch.worker_seconds.map_or_else(
+        || crate::agent_runner::job_remaining(30),
+        |seconds| Ok(std::time::Duration::from_secs(seconds)),
+    )?;
+    let turn_timeout = format!("{}s", limit.as_secs());
     let mut command = Command::new("python3");
     command
         .arg(state.join("director/agy-director/scripts/agy_worker.py"))
@@ -490,7 +587,20 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(logs.join("agent.out"))?)
         .stderr(std::fs::File::create(logs.join("agent.err"))?);
-    let outcome = wait_agent(&mut isolated, crate::agent_runner::job_remaining(32)?);
+    let remaining = dispatch
+        .loop_deadline
+        .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+        .unwrap_or(limit);
+    let outcome = wait_agent(
+        &mut isolated,
+        remaining
+            .min(limit)
+            .min(crate::agent_runner::job_remaining(if dispatch.review {
+                58
+            } else {
+                32
+            })?),
+    );
     retire_agent()?;
     let code = outcome?;
     Ok(code)
@@ -542,8 +652,34 @@ fn checkpoint(root: &Path, dispatch: &Dispatch) -> Result<bool, ScalerError> {
     Ok(true)
 }
 
+std::thread_local! {
+    static COMMAND_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+/// Bounds synchronous tool work as well as the foreground model. Retirement
+/// and mandatory reporting run after this window is dropped.
+struct CommandWindow(Option<std::time::Instant>);
+impl CommandWindow {
+    fn until(deadline: std::time::Instant) -> Self {
+        Self(COMMAND_DEADLINE.with(|slot| slot.replace(Some(deadline))))
+    }
+}
+impl Drop for CommandWindow {
+    fn drop(&mut self) {
+        COMMAND_DEADLINE.with(|slot| slot.set(self.0));
+    }
+}
 fn output(command: &mut Command) -> Result<Vec<u8>, ScalerError> {
-    crate::ci_scaler::execute(command, &[], std::time::Duration::from_secs(120))
+    let limit = COMMAND_DEADLINE
+        .with(|slot| {
+            slot.get()
+                .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+        })
+        .unwrap_or(std::time::Duration::from_secs(120))
+        .min(std::time::Duration::from_secs(120));
+    if limit.is_zero() {
+        return Err(ScalerError::Guard("loop wall budget exhausted"));
+    }
+    crate::ci_scaler::execute(command, &[], limit)
 }
 pub(crate) fn git_invocation(root: &Path, args: &[&str]) -> Command {
     // Worktree .gitattributes is honored; it has no driver without config.
@@ -588,39 +724,48 @@ fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
         .map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
 }
 fn sudo(args: &[&str]) -> Result<(), ScalerError> {
+    sudo_as(AGENT_USER, args)
+}
+fn sudo_as(user: &str, args: &[&str]) -> Result<(), ScalerError> {
     let mut command = Command::new("/usr/bin/sudo");
     private_environment(&mut command);
-    output(command.args(["-n", "-u", AGENT_USER, "--"]).args(args))?;
+    output(command.args(["-n", "-u", user, "--"]).args(args))?;
     Ok(())
 }
 fn hand_over(path: &Path) -> Result<(), ScalerError> {
+    hand_over_to(path, AGENT_USER)
+}
+fn hand_over_to(path: &Path, user: &str) -> Result<(), ScalerError> {
     let parent = path
         .parent()
         .ok_or(ScalerError::Guard("agent staging parent"))?;
     for (program, args) in [
-        ("/usr/bin/chgrp", ["-hR", AGENT_USER]),
+        ("/usr/bin/chgrp", ["-hR", user]),
         ("/usr/bin/chmod", ["-R", "ug+rwX,o-rwx"]),
     ] {
         output(Command::new(program).args(args).arg(parent))?;
     }
     let owned = parent.join("owned");
-    sudo(&[
-        "/usr/bin/cp",
-        "-a",
-        "--no-preserve=ownership",
-        "--",
-        path.to_str().ok_or(ScalerError::Guard("agent path"))?,
-        owned
-            .to_str()
-            .ok_or(ScalerError::Guard("agent staging path"))?,
-    ])?;
+    sudo_as(
+        user,
+        &[
+            "/usr/bin/cp",
+            "-a",
+            "--no-preserve=ownership",
+            "--",
+            path.to_str().ok_or(ScalerError::Guard("agent path"))?,
+            owned
+                .to_str()
+                .ok_or(ScalerError::Guard("agent staging path"))?,
+        ],
+    )?;
     let old = parent.join("runner-staging");
     std::fs::rename(path, &old)?;
     std::fs::rename(owned, path)?;
     std::fs::remove_dir_all(old)?;
     Ok(())
 }
-fn retirement_command() -> Result<(tempfile::TempDir, Command), ScalerError> {
+fn retirement_command(user: &str) -> Result<(tempfile::TempDir, Command), ScalerError> {
     let helper = tempfile::Builder::new()
         .prefix("carrick-retire-")
         .tempdir_in("/var/tmp")?;
@@ -631,32 +776,51 @@ fn retirement_command() -> Result<(tempfile::TempDir, Command), ScalerError> {
     std::fs::copy(executable, &binary)?;
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o555))?;
     std::fs::set_permissions(helper.path(), std::fs::Permissions::from_mode(0o755))?;
-    let identity = output(Command::new("/usr/bin/id").args(["-u", AGENT_USER]))?;
+    // Retirement must remain available after the tool command deadline.
+    let identity = crate::ci_scaler::execute(
+        Command::new("/usr/bin/id").args(["-u", user]),
+        &[],
+        std::time::Duration::from_secs(10),
+    )?;
     let uid = String::from_utf8_lossy(&identity)
         .trim()
         .parse::<libc::uid_t>()
         .map_err(|_| ScalerError::Guard("invalid agent uid"))?;
-    let mut command = crate::process_helper::command(&binary, AGENT_USER, uid);
+    let mut command = crate::process_helper::command(&binary, user, uid);
     private_environment(&mut command);
     Ok((helper, command))
 }
 fn retire_agent() -> Result<(), ScalerError> {
-    let (_helper, mut command) = retirement_command()?;
-    retire_agent_with(&mut command)
+    retire_account(AGENT_USER)
 }
-fn retire_agent_with(command: &mut Command) -> Result<(), ScalerError> {
+fn retire_account(user: &str) -> Result<(), ScalerError> {
+    let (_helper, mut command) = retirement_command(user)?;
+    retire_agent_with(&mut command, user)
+}
+fn retire_agent_with(command: &mut Command, user: &str) -> Result<(), ScalerError> {
     for _ in 0..100 {
         crate::process_helper::run_checked(command)?;
-        // SAFETY: only completed children adopted by this subreaper are reaped.
-        while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
         let mut empty = true;
         for selector in ["-u", "-U"] {
             let status = Command::new("/usr/bin/pgrep")
-                .args([selector, AGENT_USER])
+                .args([selector, user])
                 .output()?;
             match status.status.code() {
                 Some(1) if status.stdout.is_empty() && status.stderr.is_empty() => {}
-                Some(0) => empty = false,
+                Some(0) => {
+                    empty = false;
+                    // Reap only this uid's adopted children. A loop launcher may
+                    // exit while a worker retires; its Child still owns its wait.
+                    for pid in String::from_utf8_lossy(&status.stdout).split_whitespace() {
+                        let pid = pid
+                            .parse::<libc::pid_t>()
+                            .map_err(|_| ScalerError::Guard("invalid retirement census pid"))?;
+                        // SAFETY: WNOHANG reaps only this named completed child.
+                        unsafe {
+                            libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG);
+                        }
+                    }
+                }
                 _ => return Err(ScalerError::Guard("cannot verify agent process retirement")),
             }
         }
@@ -669,10 +833,17 @@ fn retire_agent_with(command: &mut Command) -> Result<(), ScalerError> {
         "agent user still has processes; packaging refused",
     ))
 }
+pub(crate) fn cleanup_dispatch_users() -> Result<(), ScalerError> {
+    // Attempt both retirements even when one account census fails.
+    let agent = cleanup_agent_user();
+    let coordinator = cleanup_account(LOOP_USER);
+    agent.and(coordinator)
+}
 pub(crate) fn cleanup_agent_user() -> Result<(), ScalerError> {
-    let status = Command::new("/usr/bin/id")
-        .args(["-u", AGENT_USER])
-        .output()?;
+    cleanup_account(AGENT_USER)
+}
+fn cleanup_account(user: &str) -> Result<(), ScalerError> {
+    let status = Command::new("/usr/bin/id").args(["-u", user]).output()?;
     if status.status.success() {
         let uid = String::from_utf8_lossy(&status.stdout)
             .trim()
@@ -684,7 +855,7 @@ pub(crate) fn cleanup_agent_user() -> Result<(), ScalerError> {
             return Err(ScalerError::Guard("agent account must not be root"));
         }
         if uid != unsafe { libc::geteuid() } {
-            retire_agent()?;
+            retire_account(user)?;
         }
     } else if status.status.code() != Some(1) {
         return Err(ScalerError::Guard("cannot verify agent account cleanup"));
@@ -736,11 +907,9 @@ fn owned_pr(pr: &Value, run: &Value, issue: u64, branch: &str) -> bool {
         && pr["base"]["ref"] == "main"
         && pr["draft"] == true
         && run["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id)
-        && run["path"] == ".github/workflows/dispatch-worker.yml"
+        && agent_loop::verified_run(run, issue)
         && run["event"] == "issues"
         && run["head_branch"] == "main"
-        && run["repository"]["full_name"] == REPOSITORY
-        && run["actor"]["login"] == "tjfontaine"
         && pr["body"].as_str().is_some_and(|body| {
             body.lines().any(|line| line == format!("Closes #{issue}"))
                 && body.lines().any(|line| {
@@ -784,7 +953,69 @@ struct Receipt {
     refused_workflow: bool,
 }
 
+fn admitted_base(review: bool) -> Result<String, ScalerError> {
+    select_base(
+        review,
+        std::env::var("CARRICK_DISPATCH_BASE").ok().as_deref(),
+        std::env::var("GITHUB_SHA").ok().as_deref(),
+    )
+}
+fn select_base(
+    review: bool,
+    main: Option<&str>,
+    github_sha: Option<&str>,
+) -> Result<String, ScalerError> {
+    (if review { main } else { github_sha })
+        .filter(|s| sha(s))
+        .map(str::to_owned)
+        .ok_or(ScalerError::Guard("missing admitted base SHA"))
+}
+
+fn api(root: &Path, endpoint: &str) -> Result<Value, ScalerError> {
+    let response = if std::env::var_os("GH_TOKEN").is_some() {
+        gh(root, &["api", endpoint])?
+    } else {
+        String::from_utf8(output(Command::new("curl").args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "30",
+            &format!("https://api.github.com/{endpoint}"),
+        ]))?)
+        .map_err(|_| ScalerError::Guard("non-UTF8 public GitHub response"))?
+    };
+    Ok(serde_json::from_str(&response)?)
+}
+
+pub(crate) fn load_event(root: &Path, path: &Path) -> Result<Value, ScalerError> {
+    let mut event: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    if event.get("review").is_some() {
+        let branch = event["pull_request"]["head"]["ref"]
+            .as_str()
+            .unwrap_or_default();
+        let issue = dispatch_branch(branch).ok_or(ScalerError::Guard("not a dispatch head ref"))?;
+        let id = branch_run(issue, branch)?;
+        let run = api(root, &format!("repos/{REPOSITORY}/actions/runs/{id}"))?;
+        let issue = api(root, &format!("repos/{REPOSITORY}/issues/{issue}"))?;
+        event["dispatch_run"] = run;
+        event["issue"] = issue;
+    }
+    Ok(event)
+}
+
+pub(crate) fn dispatch_branch(branch: &str) -> Option<u64> {
+    let (issue, run) = branch.strip_prefix("work/dispatch-")?.split_once('-')?;
+    if run.is_empty() || !run.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    issue.parse::<u64>().ok().filter(|n| *n > 0)
+}
+
 pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
+    if let DispatchAction::Tool { name } = &args.action {
+        return agent_loop::client(name);
+    }
     if matches!(
         &args.action,
         DispatchAction::Run { .. } | DispatchAction::Guard { retire: true, .. }
@@ -796,6 +1027,11 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     }
     let root = root.canonicalize()?;
     let (event_path, setup, complete, admit, retire) = match args.action {
+        DispatchAction::Tool { .. } => return Err(ScalerError::Guard("tool already handled")),
+        DispatchAction::Loop {
+            event,
+            setup_status,
+        } => return agent_loop::run(&root, &event, &setup_status),
         DispatchAction::Guard {
             event,
             admit,
@@ -807,17 +1043,18 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         } => (event, Some(setup_status), false, false, false),
         DispatchAction::Complete { event } => (event, None, true, false, false),
     };
-    let event: Value = serde_json::from_slice(&std::fs::read(event_path)?)?;
+    if retire {
+        return cleanup_dispatch_users();
+    }
+    let event = load_event(&root, &event_path)?;
     let mut dispatch = validate_event(
         &event,
         include_str!("../../../.github/dispatch-tiers.toml"),
         &std::env::var("GITHUB_TRIGGERING_ACTOR").unwrap_or_default(),
     )?;
+    dispatch.base = admitted_base(dispatch.review)?;
     assigned_branch(&mut dispatch)?;
     branch_run(dispatch.issue, &dispatch.branch)?;
-    if retire {
-        return cleanup_agent_user();
-    }
     if admit {
         cleanup_agent_user()?;
         if dispatch.resume {
@@ -847,8 +1084,9 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         use std::io::Write;
         writeln!(
             std::fs::OpenOptions::new().append(true).open(path)?,
-            "backend={}",
-            dispatch.tier.backend
+            "backend={}\nbase={}",
+            dispatch.tier.backend,
+            dispatch.base
         )?;
     }
     Ok(())
@@ -868,8 +1106,7 @@ fn snapshot(source: &Path, target: &Path, branch: &str) -> Result<(), ScalerErro
 }
 
 fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerError> {
-    let base =
-        std::env::var("GITHUB_SHA").map_err(|_| ScalerError::Guard("missing admitted SHA"))?;
+    let base = dispatch.base.clone();
     if !sha(&base)
         || (setup == "success/success" && git(root, &["rev-parse", "HEAD"])?.trim() != base)
     {
@@ -1114,6 +1351,103 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
     Ok(())
 }
 
+fn publish(
+    root: &Path,
+    dispatch: &Dispatch,
+    receipt: &Receipt,
+    contract: &Contract,
+    report_path: &Path,
+    token: &str,
+) -> Result<Option<u64>, ScalerError> {
+    let state = crate::agent_runner::state()?;
+    let work = state.join("work");
+    let id = branch_run(dispatch.issue, &dispatch.branch)?;
+    if !receipt.refused_workflow
+        && work.is_dir()
+        && git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base
+    {
+        if dispatch.resume {
+            require_owned_pr(root, dispatch)?;
+        }
+        let tip = git(
+            &work,
+            &[
+                "-c",
+                "credential.helper=!gh auth git-credential",
+                "ls-remote",
+                "--heads",
+                "https://github.com/carrick-sh/carrick",
+                &format!("refs/heads/{}", dispatch.branch),
+            ],
+        )?;
+        let head = git(&work, &["rev-parse", "HEAD"])?;
+        let existing = tip.split_whitespace().next();
+        if existing.is_some() && receipt.expected_tip.is_empty() && existing != Some(head.trim()) {
+            let pr = require_owned_pr(root, dispatch)?;
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&report_path)?,
+                "\nExisting dispatch branch `{}` and PR #{} retained; this rerun did not replace it.",
+                dispatch.branch,
+                pr["number"]
+            )?;
+        } else if existing != Some(head.trim()) {
+            output(&mut push_command(
+                &work,
+                dispatch,
+                &id,
+                &receipt.expected_tip,
+            )?)?;
+        }
+        let prs = open_prs(root, &dispatch.branch)?;
+        if prs.as_array().is_some_and(|prs| !prs.is_empty()) {
+            let pr = require_owned_pr(root, dispatch)?;
+            return Ok(Some(
+                pr["number"]
+                    .as_u64()
+                    .ok_or(ScalerError::Guard("invalid PR number"))?,
+            ));
+        } else {
+            let template = include_str!("../../../.github/pull_request_template.md")
+                .replace("Closes #\n", &format!("Closes #{}\n", dispatch.issue))
+                .replace(
+                    "<!-- Approach and any candid divergence from Linux. -->",
+                    &contract.summary.chars().take(4_000).collect::<String>(),
+                )
+                .replace("NEW: none / FIXED: none", "Not compared")
+                .replace("NEW: / FIXED:", "Not compared")
+                .replace("HEAD, SHA-256, CDHash", "Not collected");
+            let body = format!(
+                "{template}\nCloses #{}\n\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/{id}\n",
+                dispatch.issue
+            );
+            let path = state.join("pr-body.md");
+            std::fs::write(&path, body.replace(&token, "[REDACTED]"))?;
+            gh(
+                root,
+                &[
+                    "pr",
+                    "create",
+                    "--repo",
+                    REPOSITORY,
+                    "--draft",
+                    "--base",
+                    "main",
+                    "--head",
+                    &dispatch.branch,
+                    "--title",
+                    &draft_pr_title(&work, &receipt.base, dispatch.issue, &token)?,
+                    "--body-file",
+                    path.to_str().ok_or(ScalerError::Guard("body path"))?,
+                ],
+            )?;
+        }
+    }
+    Ok(None)
+}
+
 fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
     cleanup_agent_user()?;
     let token = std::env::var("GH_TOKEN").map_err(|_| ScalerError::Guard("missing job token"))?;
@@ -1130,18 +1464,10 @@ fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
     }
     mask_artifacts(&package, &token)?;
     let receipt: Receipt = serde_json::from_str(&regular_text(&state.join("receipt.json"))?)?;
-    if receipt.branch != dispatch.branch
-        || !sha(&receipt.base)
-        || std::env::var("GITHUB_SHA").ok().as_deref() != Some(&receipt.base)
-    {
+    if receipt.branch != dispatch.branch || !sha(&receipt.base) || dispatch.base != receipt.base {
         return Err(ScalerError::Guard("dispatch receipt mismatch"));
     }
     let contract: Contract = serde_json::from_str(&regular_text(&package.join("contract.json"))?)?;
-    let id = if dispatch.resume {
-        branch_run(dispatch.issue, &dispatch.branch)?.to_owned()
-    } else {
-        run_id()?
-    };
     let report_path = state.join("report.md");
     let details = serde_json::to_string_pretty(&contract)?;
     // Keep API comments below GitHub's body limit; full logs/contract are artifacts.
@@ -1151,105 +1477,26 @@ fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
         run_id()?
     );
     std::fs::write(&report_path, report.replace(&token, "[REDACTED]"))?;
-    let work = state.join("work");
-    let publication = (|| -> Result<(), ScalerError> {
-        if !receipt.refused_workflow
-            && work.is_dir()
-            && git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base
-        {
-            if dispatch.resume {
-                require_owned_pr(root, dispatch)?;
-            }
-            let tip = git(
-                &work,
-                &[
-                    "-c",
-                    "credential.helper=!gh auth git-credential",
-                    "ls-remote",
-                    "--heads",
-                    "https://github.com/carrick-sh/carrick",
-                    &format!("refs/heads/{}", dispatch.branch),
-                ],
-            )?;
-            let head = git(&work, &["rev-parse", "HEAD"])?;
-            let existing = tip.split_whitespace().next();
-            if existing.is_some()
-                && receipt.expected_tip.is_empty()
-                && existing != Some(head.trim())
-            {
-                let pr = require_owned_pr(root, dispatch)?;
-                use std::io::Write;
-                writeln!(
-                    std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(&report_path)?,
-                    "\nExisting dispatch branch `{}` and PR #{} retained; this rerun did not replace it.",
-                    dispatch.branch,
-                    pr["number"]
-                )?;
-            } else if existing != Some(head.trim()) {
-                output(&mut push_command(
-                    &work,
-                    dispatch,
-                    &id,
-                    &receipt.expected_tip,
-                )?)?;
-            }
-            let prs = open_prs(root, &dispatch.branch)?;
-            if prs.as_array().is_some_and(|prs| !prs.is_empty()) {
-                let pr = require_owned_pr(root, dispatch)?;
+    let publication =
+        publish(root, dispatch, &receipt, &contract, &report_path, &token).and_then(|pr| {
+            if let Some(pr) = pr {
                 gh(
                     root,
                     &[
                         "pr",
                         "comment",
-                        &pr["number"].to_string(),
+                        &pr.to_string(),
                         "--repo",
                         REPOSITORY,
                         "--body-file",
                         report_path
                             .to_str()
-                            .ok_or(ScalerError::Guard("transcript path"))?,
-                    ],
-                )?;
-            } else {
-                let template = include_str!("../../../.github/pull_request_template.md")
-                    .replace("Closes #\n", &format!("Closes #{}\n", dispatch.issue))
-                    .replace(
-                        "<!-- Approach and any candid divergence from Linux. -->",
-                        &contract.summary.chars().take(4_000).collect::<String>(),
-                    )
-                    .replace("NEW: none / FIXED: none", "Not compared")
-                    .replace("NEW: / FIXED:", "Not compared")
-                    .replace("HEAD, SHA-256, CDHash", "Not collected");
-                let body = format!(
-                    "{template}\nCloses #{}\n\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/{id}\n",
-                    dispatch.issue
-                );
-                let path = state.join("pr-body.md");
-                std::fs::write(&path, body.replace(&token, "[REDACTED]"))?;
-                gh(
-                    root,
-                    &[
-                        "pr",
-                        "create",
-                        "--repo",
-                        REPOSITORY,
-                        "--draft",
-                        "--base",
-                        "main",
-                        "--head",
-                        &dispatch.branch,
-                        "--title",
-                        &draft_pr_title(&work, &receipt.base, dispatch.issue, &token)?,
-                        "--body-file",
-                        path.to_str().ok_or(ScalerError::Guard("body path"))?,
+                            .ok_or(ScalerError::Guard("report path"))?,
                     ],
                 )?;
             }
-        }
-        Ok(())
-    })();
+            Ok(())
+        });
     if let Err(error) = &publication {
         use std::io::Write;
         let diagnostic = crate::dispatch_redaction::redact(error.to_string().as_bytes());
@@ -1813,5 +2060,78 @@ Do it"
             "new file"
         );
         assert!(!checkpoint(root, &d).unwrap());
+    }
+    fn review_event() -> Value {
+        let mut event = event();
+        event["action"] = "submitted".into();
+        event["review"] = json!({"id":77,"state":"changes_requested","body":"Owner review verbatim","user":{"login":"tjfontaine","type":"User"}});
+        event["issue"]["state"] = "open".into();
+        event["issue"]["labels"] = json!([{"name":"dispatch:sol-high"}]);
+        event["pull_request"] = json!({"number":800,"user":{"login":"github-actions[bot]","type":"Bot"},"head":{"ref":"work/dispatch-634-42","repo":{"full_name":REPOSITORY}},"base":{"ref":"main"},"draft":true,"body":format!("Closes #634\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
+        event["dispatch_run"] = json!({"id":42,"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","repository":{"full_name":REPOSITORY},"actor":{"login":"tjfontaine"}});
+        event
+    }
+    #[test]
+    fn review_admission_requires_owner_owned_pr_and_one_label() {
+        let event = review_event();
+        let dispatch =
+            validate_event(&event, TIERS, "tjfontaine").expect("owner review must continue its PR");
+        assert_eq!(dispatch.branch, "work/dispatch-634-42");
+        assert!(dispatch.resume);
+        let mut admitted = Vec::new();
+        for (pointer, value) in [
+            ("/review/user/login", json!("outsider")),
+            ("/sender/login", json!("outsider")),
+            ("/review/state", json!("approved")),
+            ("/review/state", json!("commented")),
+            (
+                "/pull_request/head/repo/full_name",
+                json!("outsider/carrick"),
+            ),
+            ("/pull_request/head/ref", json!("work/arbitrary")),
+            ("/pull_request/draft", json!(false)),
+            ("/dispatch_run/path", json!("other.yml")),
+            ("/issue/state", json!("closed")),
+            ("/issue/user/login", json!("outsider")),
+            ("/issue/labels", json!([])),
+            (
+                "/issue/labels",
+                json!([{"name":"dispatch:sol-high"},{"name":"dispatch:opus"}]),
+            ),
+        ] {
+            let mut bad = event.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            if validate_event(&bad, TIERS, "tjfontaine").is_ok() {
+                admitted.push(pointer);
+            }
+        }
+        if validate_event(&event, TIERS, "outsider").is_ok() {
+            admitted.push("triggering_actor");
+        }
+        assert!(admitted.is_empty(), "unsafe reviews admitted: {admitted:?}");
+    }
+
+    #[test]
+    fn review_base_uses_admitted_main_and_never_the_merge_sha() {
+        let main = "a".repeat(40);
+        let merge = "b".repeat(40);
+        assert_eq!(select_base(true, Some(&main), Some(&merge)).unwrap(), main);
+        assert_eq!(
+            select_base(false, Some(&main), Some(&merge)).unwrap(),
+            merge
+        );
+        assert!(select_base(true, None, Some(&merge)).is_err());
+    }
+    #[test]
+    fn loop_deadline_refuses_commands_before_they_execute() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("executed");
+        {
+            let _window = CommandWindow::until(std::time::Instant::now());
+            assert!(output(Command::new("/usr/bin/touch").arg(&marker)).is_err());
+        }
+        assert!(!marker.exists());
+        // Reporting commands can run after the tool window closes.
+        assert!(output(&mut Command::new("/usr/bin/true")).is_ok());
     }
 }

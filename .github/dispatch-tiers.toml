@@ -14,3 +14,15 @@ coauthor = "Gemini 4 Argon <noreply@google.com>"
 backend = "agy"
 model = "opus"
 coauthor = "Claude Opus <noreply@anthropic.com>"
+
+# Owner budgets (#797). The server refuses calls beyond these per-event caps.
+[loop]
+backend = "agy"
+model = "high"
+calls = 12
+workers = 1
+publishes = 1
+comments = 2
+response_bytes = 65536
+wall_minutes = 45
+worker_minutes = 35
