@@ -10,6 +10,7 @@ use carrick_hal::guest_arch_binding::{
     GuestArchBinding,
     core_arch::{ExecutionGeneration, TaskIdentity, TaskSerial},
 };
+use carrick_hal::{FrameEventCapacity, FrameInventoryEvent};
 use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorOp as WireOp, DescriptorTxn as WireTxn, TableGrants,
 };
