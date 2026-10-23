@@ -769,6 +769,9 @@ pub struct ZoneRecord<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     /// The next record on the run queue it is queued on (0: the tail).
     /// Written only under that slot's run-queue lock.
     next: AtomicU32,
+    /// The native process owner, rather than a host scheduler thread, owns
+    /// this record's next execution. It may enter EL0 from an idle vCPU.
+    native_owned: AtomicU32,
     /// The host wants the thread back (a signal, an exit or exec drain)
     /// while EL1 held its record: the slot's executor hands it back at its
     /// next exit ([`ZoneTables::take_host_wanted`]) instead of leaving it
@@ -780,16 +783,13 @@ pub struct ZoneRecord<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     affinity: AtomicU64,
     object: object_wait::ObjectRecord,
     affinity_source: AtomicU64,
-    /// The native process owner, rather than a host scheduler thread, owns
-    /// this record's next execution. It may enter EL0 from an idle vCPU.
-    native_owned: AtomicU32,
     ctx: UnsafeCell<C>,
 }
 
 #[cfg(not(all(test, feature = "loom")))]
 const _: () = {
-    assert!(core::mem::offset_of!(ZoneRecord, ctx) == 208);
-    assert!(core::mem::size_of::<ZoneRecord>() == 1088);
+    assert!(core::mem::offset_of!(ZoneRecord, ctx) == 192);
+    assert!(core::mem::size_of::<ZoneRecord>() == 1024);
     assert!(core::mem::align_of::<ZoneRecord>() == 64);
 };
 
@@ -5270,7 +5270,7 @@ mod layout_manifest {
         field!(ZoneRecord, affinity, AtomicU64, 136, 8, 8);
         field!(ZoneRecord, object, object_wait::ObjectRecord, 144, 40, 8);
         field!(ZoneRecord, affinity_source, AtomicU64, 184, 8, 8);
-        field!(ZoneRecord, native_owned, AtomicU32, 192, 4, 4);
-        field!(ZoneRecord, ctx, UnsafeCell<ThreadCtx>, 208, 832, 16);
+        field!(ZoneRecord, native_owned, AtomicU32, 116, 4, 4);
+        field!(ZoneRecord, ctx, UnsafeCell<ThreadCtx>, 192, 832, 16);
     }
 }

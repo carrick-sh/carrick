@@ -461,6 +461,7 @@ fn arm_binding_then_native_fork_commits_on_current_stack(exec: bool) {
                 mm: root.shared().mm().id().raw(),
                 file_table: root.resources().files().id().raw(),
                 affinity: 1,
+                affinity_source: Default::default(),
                 lifecycle_page: page as *const _ as u64,
                 control_slot: control as *const _ as u64,
             },
