@@ -42,6 +42,25 @@ impl carrick_hal::VcpuKick for TestVcpuKick {
     fn kick(&self) {}
 }
 
+#[derive(Clone, Debug)]
+struct ArmedTestVcpuKick {
+    armed: Arc<AtomicBool>,
+    notification: std::sync::mpsc::Sender<()>,
+}
+
+impl carrick_hal::VcpuKick for ArmedTestVcpuKick {
+    fn kick(&self) {
+        if self.armed.load(Ordering::Acquire) {
+            let _ = self.notification.send(());
+        }
+    }
+}
+
+struct TestKickChannel {
+    notification: std::sync::mpsc::Sender<()>,
+    receiver: Option<std::sync::mpsc::Receiver<()>>,
+}
+
 fn test_hardware_kick(raw_vcpu_id: u64) -> super::ExactHardwareKick {
     super::ExactHardwareKick::new(
         Box::new(TestVcpuKick),
@@ -58,6 +77,7 @@ enum Step {
     /// Exits taken mid-EL1 (a stage-1 COW fault resolved), resumed in place.
     ResumeEl1(usize),
     ComputeUntilKick,
+    ComputeUntilNotifiedKick,
     HostWait,
     Block,
     Yield,
@@ -88,6 +108,7 @@ struct FakeBinding {
     save_fails: AtomicBool,
     audit_fails: AtomicBool,
     entered: parking_lot::Mutex<Option<Arc<Barrier>>>,
+    run_notification: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     resume: parking_lot::Mutex<Option<Arc<Barrier>>>,
     progress: AtomicUsize,
     host_wait_entered: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
@@ -159,6 +180,7 @@ impl FakeBinding {
             save_fails: AtomicBool::new(false),
             audit_fails: AtomicBool::new(false),
             entered: parking_lot::Mutex::new(None),
+            run_notification: parking_lot::Mutex::new(None),
             resume: parking_lot::Mutex::new(None),
             progress: AtomicUsize::new(0),
             host_wait_entered: parking_lot::Mutex::new(None),
@@ -442,6 +464,9 @@ struct FakeFactory {
     invalidation_gate: Arc<parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
     invalidation_resume: Arc<parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
     fail_hardware_kick: Arc<AtomicBool>,
+    notify_hardware_kicks: Arc<AtomicBool>,
+    hardware_kicks_armed: Arc<AtomicBool>,
+    hardware_kick_channels: Arc<parking_lot::Mutex<BTreeMap<ExecutorId, TestKickChannel>>>,
     drift_hardware_on_load: Arc<AtomicBool>,
     hardware_vcpu_offset: Arc<AtomicU64>,
     owner_dirty_mode: Arc<AtomicUsize>,
@@ -1033,6 +1058,9 @@ impl PersistentExecutor for FakeExecutor {
         self.factory
             .record(BackendEventKind::Run, self.id, Some((*thread, *generation)));
         binding.progress.fetch_add(1, Ordering::SeqCst);
+        if let Some(notification) = binding.run_notification.lock().take() {
+            let _ = notification.send(());
+        }
         if let Some(gate) = binding.entered.lock().take() {
             gate.wait();
         }
@@ -1127,6 +1155,29 @@ impl PersistentExecutor for FakeExecutor {
                     ))
                 }
             }
+            Step::ComputeUntilNotifiedKick => {
+                let notification = self
+                    .factory
+                    .hardware_kick_channels
+                    .lock()
+                    .get_mut(&self.id)
+                    .expect("exact executor's hardware kick channel")
+                    .receiver
+                    .take()
+                    .expect("exact executor's hardware kick receiver");
+                notification
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "fake compute task was never kicked: {error}"
+                        ))
+                    })?;
+                assert!(
+                    need_resched.load(Ordering::Acquire),
+                    "hardware kick publishes reschedule state"
+                );
+                Ok(ExecutorExit::Preempted)
+            }
             Step::Block => {
                 let continuation = binding.blocked_continuation.lock().take();
                 let vfork_activation = binding.blocked_vfork_activation.lock().take();
@@ -1178,10 +1229,35 @@ impl PersistentExecutor for FakeExecutor {
                 "injected missing exact hardware identity".to_owned(),
             ));
         }
-        Ok(test_hardware_kick(
-            u64::from(self.id.raw_for_probe())
-                + self.factory.hardware_vcpu_offset.load(Ordering::SeqCst),
-        ))
+        let raw_vcpu_id = u64::from(self.id.raw_for_probe())
+            + self.factory.hardware_vcpu_offset.load(Ordering::SeqCst);
+        if self.factory.notify_hardware_kicks.load(Ordering::Acquire) {
+            // Hardware identity audits ask for another handle to the same
+            // vCPU. They must observe the same channel as the create handle.
+            let notification = self
+                .factory
+                .hardware_kick_channels
+                .lock()
+                .entry(self.id)
+                .or_insert_with(|| {
+                    let (notification, receiver) = std::sync::mpsc::channel();
+                    TestKickChannel {
+                        notification,
+                        receiver: Some(receiver),
+                    }
+                })
+                .notification
+                .clone();
+            return super::ExactHardwareKick::new(
+                Box::new(ArmedTestVcpuKick {
+                    armed: Arc::clone(&self.factory.hardware_kicks_armed),
+                    notification,
+                }),
+                raw_vcpu_id.max(1),
+                super::current_owner_thread_port(),
+            );
+        }
+        Ok(test_hardware_kick(raw_vcpu_id))
     }
 
     fn save(&mut self, lease: ThreadExecutionLease) -> Result<SavedRunnable, ExecutorSaveError> {
@@ -5979,6 +6055,11 @@ fn host_signal_mask_boundary_error_names_the_changed_signal() {
 
 #[test]
 fn real_owner_boundary_state_fails_or_resets_and_successor_observes_clean_state() {
+    // Closed descriptor numbers can be reused by any other fixture in this
+    // process before F_GETFD observes them. Own the descriptor namespace.
+    if crate::carrier::tests::isolated_fixture_process(&[]) {
+        return;
+    }
     let (kernel, context) = bootstrap(14_550);
     let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
     let receipts = Arc::new(ReceiptLog::default());
@@ -6088,6 +6169,10 @@ fn real_owner_boundary_state_fails_or_resets_and_successor_observes_clean_state(
 
 #[test]
 fn prohibited_real_owner_state_retires_worker_and_cleanup_leaves_no_inherited_state() {
+    // This fixture also verifies closed descriptor numbers with F_GETFD.
+    if crate::carrier::tests::isolated_fixture_process(&[]) {
+        return;
+    }
     for mode in [1, 3, 4, 5, 6] {
         let (kernel, context) = bootstrap(14_560 + mode as i32);
         let scheduler = Arc::new(single_cpu_scheduler(kernel));
@@ -8133,6 +8218,10 @@ fn preemption_driver_shutdown_with_future_deadline() {
 
 #[test]
 fn preemption_driver_disabled_via_env_var() {
+    if crate::carrier::tests::isolated_fixture_process(&[("CARRICK_FAIR_PREEMPTION", "0")]) {
+        return;
+    }
+    assert_eq!(std::env::var("CARRICK_FAIR_PREEMPTION").as_deref(), Ok("0"));
     let (kernel, root) = bootstrap(68_104);
     let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
@@ -8141,26 +8230,14 @@ fn preemption_driver_disabled_via_env_var() {
     binding.notify_on_terminal_settlement(settled_tx);
     factory.install(&root, Arc::clone(&binding));
 
-    let previous = std::env::var("CARRICK_FAIR_PREEMPTION").ok();
-    unsafe { std::env::set_var("CARRICK_FAIR_PREEMPTION", "0") };
-
-    let pool_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
-        let authority = enqueue_root(&scheduler, &root, publish(&root, 401));
-        drop(authority);
-        settled_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("binding settled");
-        let report = pool.shutdown().expect("clean pool shutdown");
-        assert!(!report.fair_preemption_enabled());
-    }));
-
-    match previous {
-        Some(val) => unsafe { std::env::set_var("CARRICK_FAIR_PREEMPTION", val) },
-        None => unsafe { std::env::remove_var("CARRICK_FAIR_PREEMPTION") },
-    }
-
-    pool_res.expect("disabled pool run succeeded");
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+    let authority = enqueue_root(&scheduler, &root, publish(&root, 401));
+    drop(authority);
+    settled_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("binding settled");
+    let report = pool.shutdown().expect("clean pool shutdown");
+    assert!(!report.fair_preemption_enabled());
 }
 
 #[test]
@@ -8183,6 +8260,20 @@ fn preemption_driver_worker_failure_allows_clean_shutdown() {
 
 #[test]
 fn shutdown_kick_wakes_guest_parked_worker_and_treats_preemption_after_close_as_clean_stop() {
+    fn observe_shutdown_close(
+        scheduler: &Scheduler,
+        factory: &FakeFactory,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        scheduler.install_close_census_gate(arrived_tx, resume_rx);
+        factory.notify_hardware_kicks.store(true, Ordering::Release);
+        (arrived_rx, resume_tx)
+    }
+
+    // Ordinary preemption before close is legal. Arm the exact executor's
+    // hardware-kick notification only after the fairness driver has stopped
+    // and shutdown has published Closing, before it kicks the active worker.
     // Part (a): without the shutdown kick, a worker parked in guest at shutdown
     // does not join when the queue closes; it stays stuck until its bounded
     // guest-compute deadline fails the worker.
@@ -8190,29 +8281,31 @@ fn shutdown_kick_wakes_guest_parked_worker_and_treats_preemption_after_close_as_
         let (kernel, parked) = bootstrap(68_106);
         let scheduler = Arc::new(single_cpu_scheduler(kernel));
         let factory = Arc::new(FakeFactory::default());
-        let entered = Arc::new(Barrier::new(2));
-        let binding = FakeBinding::new(501, [Step::ComputeUntilKick]);
-        *binding.entered.lock() = Some(Arc::clone(&entered));
+        let (close_arrived, resume_close) = observe_shutdown_close(&scheduler, &factory);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let binding = FakeBinding::new(501, [Step::ComputeUntilNotifiedKick]);
+        *binding.run_notification.lock() = Some(entered_tx);
         factory.install(&parked, binding);
         let mut pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
         pool.disable_shutdown_kick_for_test();
         let authority = enqueue_root(&scheduler, &parked, publish(&parked, 501));
-        entered.wait();
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("guest compute entered");
         drop(authority);
 
         let (tx, rx) = std::sync::mpsc::channel();
+        let shutdown_deadline = Instant::now() + Duration::from_secs(5);
         let join_handle = thread::spawn(move || {
             let _ = tx.send(pool.shutdown());
         });
-        assert!(
-            matches!(
-                rx.recv_timeout(Duration::from_millis(100)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ),
-            "worker parked in guest at shutdown must not join without the shutdown kick"
-        );
+        close_arrived
+            .recv_timeout(shutdown_deadline.saturating_duration_since(Instant::now()))
+            .expect("shutdown published close before the negative kick control");
+        factory.hardware_kicks_armed.store(true, Ordering::Release);
+        resume_close.send(()).expect("release close census");
         let err = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(shutdown_deadline.saturating_duration_since(Instant::now()))
             .expect("bounded guest-park deadline completes")
             .expect_err("without shutdown kick, guest-parked worker hits its bounded deadline");
         assert!(
@@ -8240,14 +8333,21 @@ fn shutdown_kick_wakes_guest_parked_worker_and_treats_preemption_after_close_as_
             Arc::new(GuestCpuPolicy::new(2)),
         ));
         let factory = Arc::new(FakeFactory::default());
+        let (close_arrived, resume_close) = observe_shutdown_close(&scheduler, &factory);
         let (root_settled_tx, root_settled_rx) = std::sync::mpsc::channel();
         let root_binding = FakeBinding::new(502, [Step::Exit]);
         root_binding.notify_on_terminal_settlement(root_settled_tx);
         factory.install(&root, root_binding);
 
-        let peer_entered = Arc::new(Barrier::new(2));
-        let peer_binding = FakeBinding::new(503, [Step::ComputeUntilKick, Step::ComputeUntilKick]);
-        *peer_binding.entered.lock() = Some(Arc::clone(&peer_entered));
+        let (peer_entered_tx, peer_entered_rx) = std::sync::mpsc::channel();
+        let peer_binding = FakeBinding::new(
+            503,
+            [
+                Step::ComputeUntilNotifiedKick,
+                Step::ComputeUntilNotifiedKick,
+            ],
+        );
+        *peer_binding.run_notification.lock() = Some(peer_entered_tx);
         factory.install(&peer, peer_binding);
 
         let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 2);
@@ -8259,14 +8359,22 @@ fn shutdown_kick_wakes_guest_parked_worker_and_treats_preemption_after_close_as_
         root_settled_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("root task completes before shutdown");
-        peer_entered.wait();
+        peer_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("peer guest compute entered");
 
         let (tx, rx) = std::sync::mpsc::channel();
+        let shutdown_deadline = Instant::now() + Duration::from_millis(500);
         let join_handle = thread::spawn(move || {
             let _ = tx.send(pool.shutdown());
         });
+        close_arrived
+            .recv_timeout(shutdown_deadline.saturating_duration_since(Instant::now()))
+            .expect("shutdown published close before the positive kick control");
+        factory.hardware_kicks_armed.store(true, Ordering::Release);
+        resume_close.send(()).expect("release close census");
         let report = rx
-            .recv_timeout(Duration::from_millis(500))
+            .recv_timeout(shutdown_deadline.saturating_duration_since(Instant::now()))
             .expect("shutdown kick wakes guest-parked worker within bounded deadline")
             .expect("kick-induced preemption after close must be treated as a clean stop");
         join_handle.join().expect("shutdown thread joins");

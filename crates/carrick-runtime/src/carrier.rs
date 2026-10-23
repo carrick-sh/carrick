@@ -1843,11 +1843,48 @@ pub fn exit_explicit_carrier(carrier: &CarrierRuntime, status: i32) -> ! {
 pub(crate) mod tests {
     use super::*;
 
-    pub(crate) static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    /// Fixtures own the real process-wide lifecycle registry, owner gate,
+    /// generation counter, environment and descriptor namespace. Children still
+    /// run concurrently; no test resets or serializes another test's state.
+    pub(crate) fn isolated_fixture_process(environment: &[(&str, &str)]) -> bool {
+        use wait_timeout::ChildExt;
+
+        const FIXTURE: &str = "CARRICK_RUNTIME_FIXTURE_PROCESS";
+        let current = std::thread::current();
+        let name = current.name().expect("named test thread");
+        if std::env::var(FIXTURE).as_deref() == Ok(name) {
+            return false;
+        }
+
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", name, "--nocapture"])
+                .env(FIXTURE, name)
+                .envs(environment.iter().copied())
+                .spawn()
+                .expect("spawn isolated fixture process"),
+        );
+        let status = child
+            .0
+            .wait_timeout(std::time::Duration::from_secs(30))
+            .expect("wait for fixture process")
+            .unwrap_or_else(|| panic!("isolated fixture {name} did not finish within 30s"));
+        assert!(status.success(), "isolated fixture {name} failed: {status}");
+        true
+    }
 
     #[test]
     fn serial_host_watchdog_scope_survives_unprepared_and_successive_carriers() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let query: fn() -> Option<CarrierScopeId> = active_carrier_scope;
         assert_eq!(query(), None);
         let abandoned = CarrierRuntime::new_explicit().expect("unprepared carrier");
@@ -1873,6 +1910,9 @@ pub(crate) mod tests {
     /// already have read `sched_getaffinity`.
     #[test]
     fn a_second_different_scheduling_policy_is_refused_not_ignored() {
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier =
             CarrierRuntime::allocate(CarrierOwnerKind::Explicit, false).expect("allocate carrier");
         let four: Arc<dyn carrick_hal::SchedulingPolicy> =
@@ -1898,7 +1938,9 @@ pub(crate) mod tests {
 
     #[test]
     fn kernel_roots_take_installed_affinity_before_initialization() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         for (ncpu, expected) in [(1, 1u64), (64, u64::MAX)] {
             let carrier = CarrierRuntime::new_for_tests().expect("carrier");
             carrier
@@ -1977,9 +2019,9 @@ pub(crate) mod tests {
                 .iter()
                 .map(|(key, value)| {
                     let previous = std::env::var_os(key);
-                    // SAFETY: carrick-runtime tests are required to run with
-                    // RUST_TEST_THREADS=1; this guard is installed before the
-                    // test creates its shutdown threads, which only read it.
+                    // SAFETY: this fixture owns its test process. The guard
+                    // is installed before shutdown threads are created; they
+                    // only read the environment.
                     unsafe { std::env::set_var(key, value) };
                     (*key, previous)
                 })
@@ -2034,7 +2076,9 @@ pub(crate) mod tests {
 
     #[test]
     fn concurrent_kernel_boot_publishes_one_graph_and_directory() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let mut workers = Vec::new();
@@ -2084,7 +2128,9 @@ pub(crate) mod tests {
 
     #[test]
     fn failed_first_kernel_boot_rolls_slot_back_to_vacant() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let failed_container = Arc::new(Container::new(launch("failed")));
         let failed = carrick_kernel::kernel::RootBootstrap::for_reference_model(
@@ -2123,7 +2169,9 @@ pub(crate) mod tests {
 
     #[test]
     fn later_root_waits_until_first_root_activation_commits() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let first = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_410,
@@ -2171,7 +2219,9 @@ pub(crate) mod tests {
 
     #[test]
     fn dropped_first_root_activation_rolls_back_and_allows_retry() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let container = Arc::new(Container::new(launch("dropped-activation")));
         let arena = Box::leak(Box::new(
@@ -2226,7 +2276,9 @@ pub(crate) mod tests {
 
     #[test]
     fn first_root_services_publish_only_inside_final_activation() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let first = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_430,
@@ -2287,7 +2339,9 @@ pub(crate) mod tests {
 
     #[test]
     fn panicking_first_kernel_boot_retires_root_before_releasing_claim() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let failed_container = Arc::new(Container::new(launch("panic")));
         let failed = carrick_kernel::kernel::RootBootstrap::for_reference_model(
@@ -2319,7 +2373,9 @@ pub(crate) mod tests {
 
     #[test]
     fn duplicate_later_root_is_rejected_before_initializer_side_effects() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let base = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_600,
@@ -2391,7 +2447,9 @@ pub(crate) mod tests {
             }
         }
 
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let base = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_610,
@@ -2464,7 +2522,9 @@ pub(crate) mod tests {
 
     #[test]
     fn later_root_post_publication_initialization_failure_retires_only_that_root() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let base = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_620,
@@ -2523,7 +2583,9 @@ pub(crate) mod tests {
 
     #[test]
     fn carrier_runtime_owns_prepared_running_retired_and_close_transitions() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let alpha = carrier.reserve(launch("alpha")).expect("reserve alpha");
         let alpha_id = alpha.launch().container_id;
@@ -2582,7 +2644,9 @@ pub(crate) mod tests {
 
     #[test]
     fn explicit_carrier_owns_one_cleanup_scope_and_distinct_container_run_ids() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let alpha = carrier.reserve(launch("caller-alpha")).expect("alpha");
         let beta = carrier.reserve(launch("caller-beta")).expect("beta");
@@ -2616,7 +2680,9 @@ pub(crate) mod tests {
             }
         }
 
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let lease = carrier
             .reserve(launch("mount-clear-barrier"))
@@ -2670,7 +2736,9 @@ pub(crate) mod tests {
 
     #[test]
     fn prepared_close_race_never_releases_custody_before_exact_rollback() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let lease = carrier.reserve(launch("prepared-close")).expect("reserve");
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -2706,7 +2774,9 @@ pub(crate) mod tests {
 
     #[test]
     fn concurrent_shutdown_claims_the_destructor_exactly_once() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let destroy_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let destroy_entered = Arc::new(std::sync::Barrier::new(2));
@@ -2765,7 +2835,9 @@ pub(crate) mod tests {
 
     #[test]
     fn destructor_failure_releases_claim_without_publishing_close_and_retry_succeeds() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let first_calls = std::sync::atomic::AtomicUsize::new(0);
         let first = shutdown_carrier_with(&carrier, || {
@@ -2801,7 +2873,9 @@ pub(crate) mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn failed_executor_drain_still_completes_vm_teardown_before_next_container() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let topology = Arc::new(carrick_vmm_hvf::trap::VcpuTopologyTestFixture::default());
         assert_eq!(topology.begin_vm().expect("container A VM"), 1);
         let carrier = CarrierRuntime::new_for_tests().expect("carrier A");
@@ -2888,7 +2962,9 @@ pub(crate) mod tests {
 
     #[test]
     fn concurrent_public_shutdown_publishes_one_artifact_and_returns_equal_results() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let directory = tempfile::tempdir().expect("private artifact directory");
         #[cfg(unix)]
         {
@@ -2970,7 +3046,9 @@ pub(crate) mod tests {
 
     #[test]
     fn artifact_publication_failure_is_stable_and_never_retried() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let directory = tempfile::tempdir().expect("private artifact directory");
         let artifact = directory.path().join("occupied.json");
         std::fs::write(&artifact, b"existing evidence").expect("precreate artifact");
@@ -3023,7 +3101,9 @@ pub(crate) mod tests {
 
     #[test]
     fn duplicate_reserve_preserves_prepared_owner_record() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let launch = launch("duplicate-prepared");
         let owner = carrier.reserve(launch.clone()).expect("owner reserve");
@@ -3045,7 +3125,9 @@ pub(crate) mod tests {
 
     #[test]
     fn duplicate_reserve_preserves_running_owner_record_and_census() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let launch = launch("duplicate-running");
         let owner = carrier.reserve(launch.clone()).expect("owner reserve");
@@ -3065,7 +3147,9 @@ pub(crate) mod tests {
 
     #[test]
     fn independent_carrier_gate_requires_closed_generation_and_final_lease_drop() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let first = CarrierRuntime::new_explicit().expect("first carrier");
         let clone = first.clone();
         assert_eq!(first.generation(), clone.generation());
@@ -3091,7 +3175,9 @@ pub(crate) mod tests {
 
     #[test]
     fn explicit_and_implicit_owners_never_join_ambiently() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let explicit = CarrierRuntime::new_explicit().expect("explicit carrier");
         assert!(matches!(
             process_carrier(),
@@ -3110,7 +3196,9 @@ pub(crate) mod tests {
 
     #[test]
     fn abandoned_and_failed_explicit_generations_release_owner_gate() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let abandoned = CarrierRuntime::new_explicit().expect("abandoned carrier");
         drop(abandoned);
         let failed = CarrierRuntime::new_explicit().expect("replacement after abandon");
@@ -3131,7 +3219,9 @@ pub(crate) mod tests {
 
     #[test]
     fn fork_child_reset_invalidates_inherited_carrier_and_window_together() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let inherited = CarrierRuntime::new_explicit().expect("parent carrier");
         inherited.record_vm_lifecycle_for_test(0, 7);
         reset_after_fork_child();
@@ -3165,7 +3255,9 @@ pub(crate) mod tests {
 
     #[test]
     fn dropping_running_lease_marks_carrier_failed_without_decrementing_census() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let lease = carrier.reserve(launch("running-drop")).expect("reserve");
         lease.mark_running().expect("running");
@@ -3182,7 +3274,9 @@ pub(crate) mod tests {
 
     #[test]
     fn abandoned_running_lease_drains_and_closes_its_lifecycle_window() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("first carrier");
         let lease = carrier.reserve(launch("abandoned")).expect("reserve");
         let container = Arc::new(Container::new(lease.launch().clone()));
@@ -3236,7 +3330,9 @@ pub(crate) mod tests {
 
     #[test]
     fn mixed_owned_and_abandoned_leases_keep_terminal_custody_exclusive() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         for count in [1, 8, 32] {
             let carrier = CarrierRuntime::new_for_tests().expect("carrier");
             let mut leases = (0..count)
@@ -3267,7 +3363,9 @@ pub(crate) mod tests {
 
     #[test]
     fn abandoned_implicit_lease_stays_reachable_until_process_shutdown() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = process_carrier().expect("implicit carrier");
         let weak = Arc::downgrade(&carrier.inner);
         let lease = carrier
@@ -3303,7 +3401,9 @@ pub(crate) mod tests {
 
     #[test]
     fn failed_container_retirement_retains_the_exact_running_lease_for_retry() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let launch = launch("retry-retirement");
         let mut lease = carrier.reserve(launch.clone()).expect("reserve");
@@ -3359,7 +3459,9 @@ pub(crate) mod tests {
 
     #[test]
     fn lifecycle_windows_are_generation_scoped_rebased_and_capacity_safe() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let mut previous_last_sequence = 0;
         for generation_index in 0..(crate::vm_lifecycle::MAX_RECORDED_EVENTS_FOR_TEST / 4 + 3) {
             let carrier = CarrierRuntime::new_for_tests().expect("carrier generation");
@@ -3392,7 +3494,9 @@ pub(crate) mod tests {
 
     #[test]
     fn initialize_facilities_ensures_internal_fd_range_before_container_boot() {
-        let _serial = TEST_LOCK.lock();
+        if isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         carrier.initialize_facilities();
         assert!(

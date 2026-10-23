@@ -2662,7 +2662,9 @@ mod tests {
     #[test]
     fn carrier_second_root_reuses_stage1_mm_pool_and_native_fork_table_reservation() {
         use carrick_kernel::kernel::container::{Container, LaunchContext, RunId};
-        let _serial = crate::carrier::tests::TEST_LOCK.lock();
+        if crate::carrier::tests::isolated_fixture_process(&[]) {
+            return;
+        }
         let carrier = crate::carrier::CarrierRuntime::new_for_tests().expect("test carrier");
         let asids = AsidAllocator::new();
         let launch = |tag: &str| LaunchContext::unmanaged(RunId::new(format!("stage1-mm-{tag}")));
