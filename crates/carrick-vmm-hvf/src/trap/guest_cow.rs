@@ -661,24 +661,27 @@ impl CowGrantSettlement for CarrierGuestCowSettlement {
         let Some(custody) = self.custody.upgrade() else {
             return;
         };
-        match crate::metadata_grant::settle_native_cow(&custody, pool, excluded) {
-            Ok(Some(_)) => return,
-            Ok(None) => {}
-            Err(error) => carrick_fatal!("hvpatch::guest_cow", "native COW settlement: {error}"),
-        }
-        match custody.guest_cow_state(excluded.key()) {
-            Ok(Some(state)) => {
-                settle_guest_cow_completions(&state, &custody, pool, excluded);
-            }
-            // The MM retired: its inventory retires the grants EL1 used
-            // with every other mapping, and its publication's retirement
-            // releases the records.
-            Ok(None) => {}
-            Err(()) => carrick_fatal!(
-                "hvpatch::guest_cow",
-                "EL1 COW completions for MM {} whose COW runtime was never bound",
-                excluded.key()
-            ),
+        let result = crate::metadata_grant::settle_native_cow(&custody, pool, excluded).and_then(
+            |settled| {
+                if settled.is_some() {
+                    return Ok(());
+                }
+                let state = custody.guest_cow_state(excluded.key()).map_err(|()| {
+                    TrapError::Hypervisor(format!(
+                        "EL1 COW completions for MM {} whose COW runtime was never bound",
+                        excluded.key()
+                    ))
+                })?;
+                if let Some(state) = state {
+                    settle_guest_cow_completions(&state, &custody, pool, excluded);
+                }
+                // A retired MM settles its inventory and releases its records
+                // through publication retirement, without another live state.
+                Ok(())
+            },
+        );
+        if let Err(error) = result {
+            carrick_fatal!("hvpatch::guest_cow", "COW completion settlement: {error}");
         }
     }
 
