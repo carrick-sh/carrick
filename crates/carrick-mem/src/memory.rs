@@ -351,7 +351,7 @@ const _: () = assert!(
         <= carrick_el1_abi::EL1_STACKS_SIZE
 );
 const _: () = assert!(
-    carrick_el1_abi::EL1_IMAGE_OFFSET + carrick_el1_abi::EL1_IMAGE_SIZE
+    carrick_el1_abi::EL1_IMAGE_OFFSET + carrick_el1_abi::EL1_IMAGE_SIZE.raw()
         <= carrick_el1_abi::EL1_COUNTERS_OFFSET
 );
 const _: () = assert!(
@@ -788,7 +788,7 @@ pub const LINUX_ALIAS_IPA_SIZE: u64 = 0x10_0000_0000; // 64 GiB of alias space
 
 pub const LINUX_EL1_KERNEL_BASE: u64 = carrick_el1_abi::EL1_REGION_BASE;
 pub const LINUX_EL1_KERNEL_SIZE: u64 = carrick_el1_abi::EL1_REGION_SIZE;
-pub const LINUX_EL1_IMAGE_SIZE: u64 = carrick_el1_abi::EL1_IMAGE_SIZE;
+pub use carrick_el1_abi::EL1_IMAGE_SIZE as LINUX_EL1_IMAGE_SIZE;
 /// Carrier-only transient aliases; one pair for each exact executor slot.
 pub const LINUX_EL1_SERVICE_COPY: carrick_guest_mem::GuestVaRange =
     carrick_guest_mem::GuestVaRange::from_len(
@@ -817,7 +817,7 @@ impl ServiceCopyTableExtent {
     }
 }
 const _: () = assert!(
-    LINUX_EL1_KERNEL_BASE + LINUX_EL1_IMAGE_SIZE <= LINUX_EL1_SERVICE_COPY_TABLE.base().raw()
+    LINUX_EL1_KERNEL_BASE + LINUX_EL1_IMAGE_SIZE.raw() <= LINUX_EL1_SERVICE_COPY_TABLE.base().raw()
 );
 const _: () = assert!(
     LINUX_EL1_SERVICE_COPY_TABLE.base().raw() + LINUX_EL1_SERVICE_COPY_TABLE.len() as u64
@@ -2157,7 +2157,7 @@ impl AddressSpace {
     /// Install the in-guest EL1 kernel image region.
     pub fn with_el1_region(self) -> Result<Self, AddressSpaceError> {
         assert!(
-            carrick_el1_image::IMAGE.len() as u64 <= LINUX_EL1_IMAGE_SIZE,
+            carrick_el1_image::IMAGE.len() as u64 <= LINUX_EL1_IMAGE_SIZE.raw(),
             "EL1 image overlaps reserved counter/service-table storage"
         );
         // A stale image once served nothing, silently: refuse one built
@@ -4385,7 +4385,7 @@ fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
         &mut cursor,
         enc_movz_xn(
             17,
-            ((carrick_el1_abi::EL1_IMAGE_SIZE >> 16) & 0xFFFF) as u16,
+            ((carrick_el1_abi::EL1_IMAGE_SIZE.raw() >> 16) & 0xFFFF) as u16,
             1,
         ),
     );
@@ -7779,6 +7779,49 @@ mod stage1_tests {
                     assert_eq!(clock[span.clone()], reference[span.clone()]);
                     assert_eq!(clock[entry.clone()], reference[entry.clone()]);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn enlarged_el1_image_and_metadata_are_disjoint_from_guest_ram() {
+        use carrick_el1_abi::*;
+        let kernel_regions = [
+            (LINUX_EL1_KERNEL_BASE, LINUX_EL1_IMAGE_SIZE.raw()),
+            (EL1_COUNTERS_BASE, EL1_COUNTERS_SIZE),
+            (EL1_STACKS_BASE, EL1_STACKS_SIZE),
+            (EL1_CURRENT_TASKS_BASE, EL1_CURRENT_TASKS_SIZE),
+            (EL1_BOOTSTRAP_METADATA_BASE, EL1_BOOTSTRAP_METADATA_SIZE),
+            (EL1_HEAP_BASE, EL1_HEAP_SIZE),
+            (EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_SIZE),
+            (EL1_IPC_BASE, EL1_IPC_SIZE),
+        ];
+        for (index, &(base, len)) in kernel_regions.iter().enumerate() {
+            for &(other, size) in &kernel_regions[index + 1..] {
+                assert!(ranges_do_not_overlap(base, len, other, size));
+            }
+            // Includes guest heap, mmap, stack, backing inventory, Rosetta,
+            // aliases, vectors and the carrier control region.
+            for &(other, size) in GIC_WINDOW_NEIGHBOURS {
+                if other != LINUX_EL1_KERNEL_BASE {
+                    assert!(ranges_do_not_overlap(base, len, other, size));
+                }
+            }
+        }
+        // Check real stage-1 permissions at both ends of the enlarged image
+        // and each relocated control/stack/metadata range.
+        let tables = stage1_hvpatch_page_tables();
+        for &(base, len) in &kernel_regions[..6] {
+            for va in [base, base + len - 1] {
+                let descriptor = carrick_mmu_core::aarch64::terminal_descriptor(
+                    carrick_mmu_core::aarch64::walk_descriptors(
+                        &tables,
+                        LINUX_PAGE_TABLES_BASE,
+                        va,
+                    ),
+                );
+                assert_ne!(descriptor & 1, 0);
+                assert_eq!(descriptor & (3 << 6), 0, "kernel-only {va:#x}");
             }
         }
     }

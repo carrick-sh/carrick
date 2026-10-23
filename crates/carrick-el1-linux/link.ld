@@ -33,7 +33,7 @@ SECTIONS
 
     . = ALIGN(16);
     _image_end = .;
-    ASSERT(_image_end <= _image_start + 0x100000,
+    ASSERT(_image_end <= _image_start + CARRICK_EL1_IMAGE_CAPACITY,
            "EL1 image overlaps the ABI counters and service-table region")
 
     /DISCARD/ : {

@@ -16,6 +16,11 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+/// Loaded EL1 image capacity, shared by the linker, loader and aperture layout.
+/// Metadata follows this reservation in the ARM and shared CPL0 ABI region.
+pub const EL1_IMAGE_SIZE: carrick_guest_arch::GuestLen =
+    carrick_guest_arch::GuestLen::new(1536 * 1024);
+
 pub mod descriptor_txn;
 pub mod owner_fork;
 
@@ -10274,7 +10279,8 @@ mod tests {
     fn test_el1_stack_walk_after_rebase() {
         let bytes = stage1_hvpatch_page_tables();
         let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE, test_layout());
-        let stack_va = 0x2d04213ee0;
+        let stack_va =
+            carrick_mem::memory::LINUX_EL1_KERNEL_BASE + EL1_IMAGE_SIZE.raw() + 0x10_0000 + 0x13ee0;
         let leaf_before = terminal_descriptor(mgr.debug_walk(stack_va));
 
         let child_root = 0x9a_0000_0000;

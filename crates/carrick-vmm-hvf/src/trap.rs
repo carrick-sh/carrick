@@ -523,7 +523,7 @@ pub(crate) enum El1ImageExit {
 /// on an EL1-held lock waits only for EL1 instructions to retire.
 pub(crate) fn el1_image_exit(kind: RunExitKind, pstate: u64, pc: u64) -> El1ImageExit {
     let in_image = (carrick_mem::memory::LINUX_EL1_KERNEL_BASE
-        ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE + carrick_el1_abi::EL1_IMAGE_SIZE)
+        ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE + carrick_el1_abi::EL1_IMAGE_SIZE.raw())
         .contains(&pc);
     if ExecLevel::from_pstate(pstate).is_guest() || !in_image {
         return El1ImageExit::NotInImage;
@@ -8417,7 +8417,7 @@ impl HvfInner {
                     if cpsr & 0xf != 0x5
                         || !(carrick_mem::memory::LINUX_EL1_KERNEL_BASE
                             ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE
-                                + carrick_mem::memory::LINUX_EL1_IMAGE_SIZE)
+                                + carrick_mem::memory::LINUX_EL1_IMAGE_SIZE.raw())
                             .contains(&pc)
                     {
                         return Err(TrapError::Hypervisor(
@@ -8901,8 +8901,8 @@ mod el1_resume_tests {
         let el0_pstate = 0b0000; // EL0t
         let el1_img_base = carrick_mem::memory::LINUX_EL1_KERNEL_BASE;
         let el1_img_mid = el1_img_base + 0x4000;
-        let el1_img_end = el1_img_base + carrick_el1_abi::EL1_IMAGE_SIZE - 4;
-        let el1_past_img = el1_img_base + carrick_el1_abi::EL1_IMAGE_SIZE;
+        let el1_img_end = el1_img_base + carrick_el1_abi::EL1_IMAGE_SIZE.raw() - 4;
+        let el1_past_img = el1_img_base + carrick_el1_abi::EL1_IMAGE_SIZE.raw();
         let user_pc = 0x40_0000;
 
         // 1. Non-canceled exits (stage-2 aborts, syscall HVCs, faults) must NEVER
@@ -8959,7 +8959,8 @@ mod el1_resume_tests {
         let el1 = 0b0100;
         let el0 = 0b0000;
         let mid = carrick_mem::memory::LINUX_EL1_KERNEL_BASE + 0x4000;
-        let past = carrick_mem::memory::LINUX_EL1_KERNEL_BASE + carrick_el1_abi::EL1_IMAGE_SIZE;
+        let past =
+            carrick_mem::memory::LINUX_EL1_KERNEL_BASE + carrick_el1_abi::EL1_IMAGE_SIZE.raw();
         let replayable = RunExitKind::Stage2Abort {
             alias_replayable: true,
         };

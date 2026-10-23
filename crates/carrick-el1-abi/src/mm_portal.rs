@@ -120,7 +120,7 @@ pub const MM_PORTAL_MAINTENANCE_ESR: u64 = 0x4352_4d4d_424d_0001;
 
 pub const MM_PORTAL_SELECT_ESR: u64 = 0x4352_4d4d_5345_0004;
 pub const MM_PORTAL_SERVICE_ESR: u64 = 0x4352_4d4d_5452_0004;
-pub const EL1_MM_PORTAL_OFFSET: u64 = 0x1C_0000;
+pub const EL1_MM_PORTAL_OFFSET: u64 = crate::EL1_COUNTERS_OFFSET + 0xC_0000;
 pub const EL1_MM_PORTAL_BASE: u64 = crate::EL1_REGION_BASE + EL1_MM_PORTAL_OFFSET;
 pub use carrick_core_abi::PortalWaitEnrollment;
 

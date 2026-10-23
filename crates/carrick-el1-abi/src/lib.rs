@@ -8,11 +8,12 @@
 //! page tables: EL0 userspace code cannot read, write, or execute within it.
 //!
 //! Within this 64 MiB region:
-//! - `0x0000_0000..0x0010_0000` (1 MiB): Image ([`EL1_IMAGE_OFFSET`]), starting with [`ImageHeader`].
-//! - `0x0010_0000..0x0020_0000` (1 MiB): Counters ([`EL1_COUNTERS_OFFSET`]), holding [`Counters`].
-//! - `0x0020_0000..0x0060_0000` (4 MiB): Per-vCPU kernel stacks ([`EL1_STACKS_OFFSET`]),
-//!   256 slots of [`EL1_STACK_SIZE`] (16 KiB) each.
-//! - `0x0100_0000..0x0400_0000` (48 MiB): Dynamic heap ([`EL1_HEAP_OFFSET`]).
+//! - Image: [`EL1_IMAGE_OFFSET`] plus the typed [`EL1_IMAGE_SIZE`] (1.5 MiB).
+//! - Counters and control tables: [`EL1_COUNTERS_OFFSET`] (1 MiB).
+//! - Per-vCPU stacks: [`EL1_STACKS_OFFSET`] (4 MiB), 256 16 KiB slots.
+//! - Current tasks: [`EL1_CURRENT_TASKS_OFFSET`] (1 MiB).
+//! - Bootstrap metadata: [`EL1_BOOTSTRAP_METADATA_OFFSET`] (9 MiB).
+//! - Fixed-table heap: [`EL1_HEAP_OFFSET`] to the end of the region.
 //!
 //! A separate kernel-only window at [`EL1_IPC_BASE`] (after the dynamic
 //! metadata aperture) maps the host IPC authority's [`ipc::IpcDirectory`] and
@@ -83,7 +84,7 @@ pub const EL1_REGION_SIZE: u64 = 64 * 1024 * 1024;
 pub const EL1_IMAGE_OFFSET: u64 = 0x0;
 
 /// Byte offset of the per-syscall counters within the region.
-pub const EL1_COUNTERS_OFFSET: u64 = 0x10_0000;
+pub const EL1_COUNTERS_OFFSET: u64 = EL1_IMAGE_OFFSET + EL1_IMAGE_SIZE.raw();
 
 /// Base guest virtual address of the per-syscall counters page.
 pub const EL1_COUNTERS_BASE: u64 = EL1_REGION_BASE + EL1_COUNTERS_OFFSET;
@@ -99,7 +100,7 @@ pub const EL1_APERTURE_CONTROL_OFFSET: u64 =
 pub const EL1_APERTURE_CONTROL_BASE: u64 = EL1_REGION_BASE + EL1_APERTURE_CONTROL_OFFSET;
 
 /// Byte offset of the per-vCPU stack arena within the region.
-pub const EL1_STACKS_OFFSET: u64 = 0x20_0000;
+pub const EL1_STACKS_OFFSET: u64 = EL1_COUNTERS_OFFSET + EL1_COUNTERS_SIZE;
 
 /// Base guest virtual address of the per-vCPU stack arena.
 pub const EL1_STACKS_BASE: u64 = EL1_REGION_BASE + EL1_STACKS_OFFSET;
@@ -111,7 +112,7 @@ pub const EL1_STACK_SIZE: u64 = 0x4000;
 pub const EL1_STACK_SLOTS: u64 = 256;
 
 /// Byte offset of the per-vCPU current-task array within the region.
-pub const EL1_CURRENT_TASKS_OFFSET: u64 = 0x60_0000;
+pub const EL1_CURRENT_TASKS_OFFSET: u64 = EL1_STACKS_OFFSET + EL1_STACKS_SIZE;
 
 /// Base guest virtual address of the per-vCPU current-task array.
 pub const EL1_CURRENT_TASKS_BASE: u64 = EL1_REGION_BASE + EL1_CURRENT_TASKS_OFFSET;
@@ -212,7 +213,7 @@ pub const AARCH64_GIC_WINDOW_BASE: u64 = 0x2F_0000_0000;
 pub const AARCH64_GIC_WINDOW_SIZE: u64 = 0x1000_0000;
 
 /// Byte offset of the EL1 bootstrap metadata allocator arena within the region.
-pub const EL1_BOOTSTRAP_METADATA_OFFSET: u64 = 0x70_0000;
+pub const EL1_BOOTSTRAP_METADATA_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE;
 
 /// Base guest virtual address of the EL1 bootstrap metadata allocator arena.
 pub const EL1_BOOTSTRAP_METADATA_BASE: u64 = EL1_REGION_BASE + EL1_BOOTSTRAP_METADATA_OFFSET;
@@ -431,12 +432,12 @@ pub const METADATA_GRANT_PENDING: u64 = u64::MAX - 1;
 pub const SYS_CARRICK_EL1_CONTROL: u64 = 0xCA88_0001;
 
 /// Byte offset of the EL1 kernel heap within the region.
-pub const EL1_HEAP_OFFSET: u64 = 0x100_0000;
+pub const EL1_HEAP_OFFSET: u64 = EL1_BOOTSTRAP_METADATA_OFFSET + EL1_BOOTSTRAP_METADATA_SIZE;
 
 /// Base guest virtual address of the EL1 kernel heap.
 pub const EL1_HEAP_BASE: u64 = EL1_REGION_BASE + EL1_HEAP_OFFSET;
 
-/// Size of the EL1 kernel heap (48 MiB).
+/// Size of the fixed-table heap, from bootstrap metadata to the region end.
 pub const EL1_HEAP_SIZE: u64 = EL1_REGION_SIZE - EL1_HEAP_OFFSET;
 
 /// Guest VA/IPA of the shared IPC window (kernel-only, identity mapped).
@@ -696,6 +697,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
     let facts: &[u64] = &[
         EL1_REGION_BASE,
         EL1_REGION_SIZE,
+        EL1_IMAGE_SIZE.raw(),
         EL1_COUNTERS_OFFSET,
         EL1_SERVICE_COPY_TABLE_OFFSET,
         core::mem::size_of::<ServiceCopyTable>() as u64,
@@ -2231,8 +2233,8 @@ pub const fn delegated_file_cache_va(handle: u32) -> u64 {
     EL1_CACHE_BASE + ((handle - 1) as u64) * DELEGATED_FILE_MAX_SIZE
 }
 
-/// Total size of the EL1 kernel image area (1 MiB).
-pub const EL1_IMAGE_SIZE: u64 = 0x10_0000;
+/// Total size of the EL1 kernel image area (1.5 MiB).
+pub use carrick_mmu_core::aarch64::EL1_IMAGE_SIZE;
 
 /// Total size of the EL1 kernel counters area (1 MiB).
 pub const EL1_COUNTERS_SIZE: u64 = 0x10_0000;
@@ -2662,7 +2664,7 @@ impl core::fmt::Debug for Counters {
 }
 
 /// Byte offset of the inotify table within the region.
-pub const EL1_INOTIFY_TABLE_OFFSET: u64 = 0x310_0000;
+pub const EL1_INOTIFY_TABLE_OFFSET: u64 = EL1_CACHE_OFFSET + EL1_CACHE_SIZE;
 
 /// Base guest virtual address of the inotify table.
 pub const EL1_INOTIFY_TABLE_BASE: u64 = EL1_REGION_BASE + EL1_INOTIFY_TABLE_OFFSET;
@@ -2671,7 +2673,7 @@ pub const EL1_INOTIFY_TABLE_BASE: u64 = EL1_REGION_BASE + EL1_INOTIFY_TABLE_OFFS
 pub const EL1_INOTIFY_TABLE_SIZE: u64 = 0x30_0000;
 
 /// Byte offset of the name cache within the region.
-pub const EL1_NAME_CACHE_OFFSET: u64 = 0x340_0000;
+pub const EL1_NAME_CACHE_OFFSET: u64 = EL1_INOTIFY_TABLE_OFFSET + EL1_INOTIFY_TABLE_SIZE;
 
 /// Base guest virtual address of the name cache.
 pub const EL1_NAME_CACHE_BASE: u64 = EL1_REGION_BASE + EL1_NAME_CACHE_OFFSET;
@@ -2709,7 +2711,7 @@ const _: () = assert!(carrick_sched_core::ZONE_SLOTS as u64 >= EL1_STACK_SLOTS);
 
 const _: () = assert!(EL1_REGION_BASE.is_multiple_of(0x0400_0000));
 const _: () = assert!(EL1_REGION_SIZE == 64 * 1024 * 1024);
-const _: () = assert!(EL1_IMAGE_OFFSET + EL1_IMAGE_SIZE <= EL1_COUNTERS_OFFSET);
+const _: () = assert!(EL1_IMAGE_OFFSET + EL1_IMAGE_SIZE.raw() <= EL1_COUNTERS_OFFSET);
 const _: () = assert!(EL1_COUNTERS_OFFSET + EL1_COUNTERS_SIZE <= EL1_STACKS_OFFSET);
 const _: () = assert!(
     EL1_STACKS_OFFSET + EL1_STACK_SLOTS * EL1_STACK_SIZE <= EL1_STACKS_OFFSET + EL1_STACKS_SIZE
@@ -3958,7 +3960,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x2a020430fb22b5df);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x1b23e726423cc2ef);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
@@ -4111,6 +4113,83 @@ mod tests {
         assert_eq!(EL1_REGION_BASE, 0x2D_0400_0000);
         assert_eq!(EL1_REGION_SIZE, 0x0400_0000);
         assert_eq!(EL1_IPC_BASE, 0x2D_0C00_0000);
+    }
+
+    #[test]
+    fn enlarged_image_and_shared_arm_x86_regions_do_not_overlap() {
+        // Exercise the full authorized image capacity, not today's ELF length.
+        let required_image_bytes = EL1_IMAGE_SIZE.raw();
+        assert_eq!(required_image_bytes, 1536 * 1024);
+        assert!(EL1_IMAGE_OFFSET + required_image_bytes <= EL1_COUNTERS_OFFSET);
+        let regions = [
+            (EL1_IMAGE_OFFSET, required_image_bytes),
+            (EL1_COUNTERS_OFFSET, EL1_COUNTERS_SIZE),
+            (EL1_STACKS_OFFSET, EL1_STACKS_SIZE),
+            (EL1_CURRENT_TASKS_OFFSET, EL1_CURRENT_TASKS_SIZE),
+            (EL1_BOOTSTRAP_METADATA_OFFSET, EL1_BOOTSTRAP_METADATA_SIZE),
+            (EL1_HEAP_OFFSET, EL1_HEAP_SIZE),
+        ];
+        for base in [EL1_REGION_BASE, X86_CPL0_REGION_BASE] {
+            for (i, &(offset, size)) in regions.iter().enumerate() {
+                assert!(offset + size <= EL1_REGION_SIZE);
+                assert!((base + offset).is_multiple_of(4096));
+                for &(other, other_size) in &regions[i + 1..] {
+                    assert!(disjoint(base + offset, size, base + other, other_size));
+                }
+            }
+        }
+        let control = [
+            (EL1_COUNTERS_OFFSET, core::mem::size_of::<Counters>() as u64),
+            (
+                EL1_RESERVATIONS_OFFSET,
+                EL1_RESERVATIONS_END - EL1_RESERVATIONS_OFFSET,
+            ),
+            (
+                EL1_DESCRIPTOR_TXN_OFFSET,
+                core::mem::size_of::<DescriptorTxnSlots>() as u64,
+            ),
+            (EL1_COW_COPY_OFFSET, EL1_COW_COPY_SIZE),
+            (
+                EL1_SERVICE_COPY_TABLE_OFFSET,
+                core::mem::size_of::<ServiceCopyTable>() as u64,
+            ),
+            (
+                EL1_APERTURE_CONTROL_OFFSET,
+                core::mem::size_of::<ApertureControl>() as u64,
+            ),
+            (
+                EL1_MM_PORTAL_OFFSET,
+                core::mem::size_of::<MmPortalSlots>() as u64,
+            ),
+        ];
+        for (i, &(offset, size)) in control.iter().enumerate() {
+            assert!(offset >= EL1_COUNTERS_OFFSET);
+            assert!(offset + size <= EL1_STACKS_OFFSET);
+            for &(other, other_size) in &control[i + 1..] {
+                assert!(disjoint(offset, size, other, other_size));
+            }
+        }
+        assert_eq!(EL1_COW_COPY_BASE, EL1_REGION_BASE + EL1_COW_COPY_OFFSET);
+        // The shared heap holds fixed tables, not a second overlapping allocator.
+        assert!(EL1_CACHE_OFFSET + EL1_CACHE_SIZE <= EL1_INOTIFY_TABLE_OFFSET);
+        assert!(EL1_INOTIFY_TABLE_OFFSET + EL1_INOTIFY_TABLE_SIZE <= EL1_NAME_CACHE_OFFSET);
+        assert!(EL1_NAME_CACHE_OFFSET + EL1_NAME_CACHE_SIZE <= EL1_ZONE_OFFSET);
+        assert!(EL1_ZONE_OFFSET + EL1_ZONE_SIZE <= EL1_REGION_SIZE);
+        assert_eq!(EL1_STACK_SIZE * EL1_STACK_SLOTS, EL1_STACKS_SIZE);
+        assert!(EL1_REGION_BASE + EL1_REGION_SIZE <= EL1_DYNAMIC_METADATA_BASE);
+        assert!(EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE <= EL1_IPC_BASE);
+        assert!(disjoint(
+            X86_CPL0_SUPERVISOR_IMAGE_BASE,
+            X86_CPL0_SUPERVISOR_IMAGE_SIZE,
+            X86_CPL0_REGION_BASE,
+            EL1_REGION_SIZE
+        ));
+        assert!(disjoint(
+            X86_CPL0_BOOTSTRAP_METADATA_BASE,
+            EL1_BOOTSTRAP_METADATA_SIZE,
+            X86_CPL0_REGION_BASE,
+            EL1_REGION_SIZE
+        ));
     }
 
     #[test]

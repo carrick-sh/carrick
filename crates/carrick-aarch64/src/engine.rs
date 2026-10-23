@@ -2626,7 +2626,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     let in_vector = carrick_mem::memory::is_carrick_el1_vector_va(pc);
                     let in_el1_image = (carrick_mem::memory::LINUX_EL1_KERNEL_BASE
                         ..carrick_mem::memory::LINUX_EL1_KERNEL_BASE
-                            + carrick_mem::memory::LINUX_EL1_IMAGE_SIZE)
+                            + carrick_mem::memory::LINUX_EL1_IMAGE_SIZE.raw())
                         .contains(&pc);
                     if in_vector
                         || in_el1_image

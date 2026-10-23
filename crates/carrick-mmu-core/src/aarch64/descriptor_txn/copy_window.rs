@@ -7,14 +7,15 @@ const MASK: u64 = 0x0000_FFFF_FFFF_F000;
 const AP: u64 = 3 << 6;
 
 /// VA of the two idle EL1 COW copy-alias leaves every HVPatch MM image
-/// carries (`EL1_REGION_BASE + 0x1A_0000`; `carrick-el1-abi` derives
+/// carries (after the image and descriptor slots; `carrick-el1-abi` derives
 /// `EL1_COW_COPY_BASE` from this and asserts that identity). The window is
 /// Carrick-owned: only [`crate::aarch64::PageTableManager::provision_cow_copy_window`]
 /// writes its leaves offline and only [`with_cow_copy_aliases`] maps them
 /// live. Every other host range edit steps around it, never coalesces or
 /// reclaims its table, and every guest descriptor operation that names it is
 /// refused ([`DescriptorRefusal::CarrickOwnedWindow`]).
-pub const COW_COPY_WINDOW_BASE: u64 = 0x2D_0400_0000 + 0x1A_0000;
+pub const COW_COPY_WINDOW_BASE: u64 =
+    0x2D_0400_0000 + crate::aarch64::EL1_IMAGE_SIZE.raw() + 0xA_0000;
 /// Length of [`COW_COPY_WINDOW_BASE`]'s window: one source, one destination.
 pub const COW_COPY_WINDOW_LEN: u64 = 2 * PAGE;
 
