@@ -1917,3 +1917,7 @@ contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-chil
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/metadata_grant/native_service.rs"
 contracts = ["kernel.scheduler.runnable-progress"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/physical_grants.rs"
+contracts = ["kernel.x86.file-region", "kernel.el1.fork-cow", "kernel.el1.mm-exclusive-owner"]
