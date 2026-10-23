@@ -693,7 +693,7 @@ fn composed_native_supply(competing_publication: bool) {
     );
     let fresh = frame.x[0];
     assert!(
-        fresh >= VA + 8192 && fresh < VA + 0x1000_0000,
+        (VA + 8192..VA + 0x1000_0000).contains(&fresh),
         "native mmap: {fresh:#x}"
     );
     frame.esr = 0x92000046;
