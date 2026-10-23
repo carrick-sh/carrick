@@ -617,3 +617,34 @@ symbol-census row and found no implementation defects. Its documentation
 caveat about inlined formatting attribution was incorporated. Rebase kept the
 implementation byte-for-byte unchanged; the image builds above re-prove its
 size and stack witness against the new main source.
+
+### Final local verification
+
+All commands below ran in the foreground with
+`env -u RUSTC_WRAPPER CARRICK_SCCACHE=0` and exited zero on the rebased
+candidate. Logs are retained under `/tmp/el1-size-801/rebased/` on ctb-w2.
+
+| Command after the environment prefix | Log | Exit |
+|---|---|---:|
+| `cargo build -p carrick-el1-image` | `image-default.log` | 0 |
+| `cargo build -p carrick-el1-image --features allocator-test-control` | `image-allocator.log` | 0 |
+| `just test-kernel` | `test-kernel.log` | 0 |
+| `just test-loom` | `test-loom.log` | 0 |
+| `just clippy` | `clippy.log` | 0 |
+| `just clippy-linux` | `clippy-linux.log` | 0 |
+| `just cross-check-macos` | `cross-check-macos.log` | 0 |
+| `just fmt-check` | `fmt-check.log` | 0 |
+| `just lint-domains` | `lint-domains.log` | 0 |
+| `just test` | `test.log` | 0 |
+
+The full `just test` ran last. Its final three EL1 integration targets passed
+4, 3 and 4 tests respectively in the normal batch; the subsequent serial-only
+batch correctly filtered those tests out. No gate was retried to obtain a
+passing verdict. The abandoned pre-rebase run is not acceptance evidence.
+Clippy reported the existing Linux configuration warning about the
+macOS-only `libc::proc_listallpids` disallowed-method entry; it exited zero.
+
+This Linux worker has no HVF or Docker. Signed ARM execution and paired ARM
+runtime performance were not measured and remain director-side validation;
+cross-checking macOS establishes compilation, not guest runtime acceptance.
+No host release optimization or debug-information settings were changed.
