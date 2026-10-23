@@ -675,24 +675,23 @@ impl<'a> NetView<'a> {
                         {
                             use super::super::copyout::{self, UserSlot};
                             let copy_len = len.min(4096 - (buf_addr as usize & 4095));
-                            let address_length = if src_addr != 0 {
-                                let length = match copyout::read_u32_before_effects(memory, src_len_addr) {
-                                    Ok(Ok(length)) => length,
-                                    Ok(Err(fault)) => return Ok(fault.outcome()),
+                            // Retain address faults until receive succeeds. Linux
+                            // checks socket availability first and copies/consumes
+                            // payload before reporting a bad addrlen pointer.
+                            let (address_length, address_error) = if src_addr != 0 {
+                                match copyout::read_u32_before_effects(memory, src_len_addr) {
+                                    Ok(Ok(length)) if (length as i32) < 0 => (None, Some(LINUX_EINVAL)),
+                                    Ok(Ok(_)) => (Some(UserSlot::new(src_len_addr, 4)), None),
+                                    Ok(Err(_)) => (None, Some(LINUX_EFAULT)),
                                     Err(refusal) => return Ok(refusal.into_outcome()),
-                                };
-                                if (length as i32) < 0 {
-                                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                                 }
-                                Some(UserSlot::new(src_len_addr, 4))
-                            } else { None };
+                            } else { (None, None) };
                             let output = match copyout::prepare(cx.kernel, memory,
                                 [Some(UserSlot::new(buf_addr, copy_len)), address_length]) {
                                 Ok(output) => output,
                                 Err(refusal) => return Ok(refusal.into_outcome()),
                             };
-                            if output.secured_capacity(0) != copy_len
-                                || (address_length.is_some() && output.secured_capacity(1) != 4) {
+                            if output.secured_capacity(0) != copy_len {
                                 return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                             }
                             let mut target_buf = vec![0u8; copy_len];
@@ -701,6 +700,9 @@ impl<'a> NetView<'a> {
                                     if let Err(fault) = output.commit(
                                         [&target_buf[..read_len], &0u32.to_ne_bytes()]) {
                                         return Ok(fault.outcome());
+                                    }
+                                    if let Some(errno) = address_error {
+                                        return Ok(DispatchOutcome::errno(errno));
                                     }
                                     return Ok(DispatchOutcome::returned_len(read_len)?);
                                 }

@@ -450,3 +450,72 @@ fn zero_output_gettimeofday_makes_zero_owner_prepares() {
         "gettimeofday(NULL, NULL) must make zero prepare_write calls",
     );
 }
+
+#[test]
+fn recvfrom_owner_defers_addrlen_fault_until_data() {
+    for addrlen in [0, BASE + LEN as u64 + 1] {
+        let mut g = Guest::new();
+        let creds = super::net::unix_pure::LinuxUcred {
+            pid: 100,
+            uid: 1000,
+            gid: 1000,
+        };
+        let (left, right) =
+            super::net::unix_pure::PureSocketInner::pair(LINUX_SOCK_STREAM, creds, creds);
+        let install = |socket| {
+            g.dispatcher
+                .install_fd_at_or_above(
+                    3,
+                    OpenFile::from_open_description_with_status_flags(
+                        Arc::new(parking_lot::RwLock::new(OpenDescription::InMemorySocket {
+                            base: OpenDescriptionBase::new(0),
+                            socket,
+                        })),
+                        LINUX_O_RDWR,
+                        0,
+                    ),
+                )
+                .unwrap()
+        };
+        let (left, right) = (install(left), install(right));
+        let args = [
+            left as u64,
+            OUT,
+            4,
+            LinuxMsgFlags::DONTWAIT.bits() as u64,
+            OUT2,
+            addrlen,
+        ];
+        assert_eq!(
+            g.call(nr::RECVFROM.raw(), args),
+            DispatchOutcome::errno(LINUX_EAGAIN),
+            "empty nonblocking socket: errno 11 must precede addrlen errno 14"
+        );
+        let mut blocking = args;
+        blocking[3] = 0;
+        assert!(
+            matches!(
+                g.call(nr::RECVFROM.raw(), blocking),
+                DispatchOutcome::WaitOnFds { .. }
+            ),
+            "empty blocking socket must wait, not return errno 14"
+        );
+        g.memory.seed(PATH, b"data");
+        assert_eq!(g.ok(nr::WRITE.raw(), [right as u64, PATH, 4, 0, 0, 0]), 4);
+        assert_eq!(
+            g.call(nr::RECVFROM.raw(), blocking),
+            DispatchOutcome::errno(LINUX_EFAULT),
+            "data available: invalid addrlen returns errno 14"
+        );
+        assert_eq!(
+            g.memory.read_bytes(OUT, 4).unwrap(),
+            b"data",
+            "Linux copies payload before the address fault"
+        );
+        assert_eq!(
+            g.call(nr::RECVFROM.raw(), args),
+            DispatchOutcome::errno(LINUX_EAGAIN),
+            "the faulting receive consumed the payload"
+        );
+    }
+}
