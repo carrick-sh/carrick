@@ -899,6 +899,13 @@ fn internal_read_accepts_only_actual_immutable_image_header() {
 
 #[test]
 fn stopped_target_untouched_transfer_prepares_only_exact_owner_window() {
+    untouched_transfer_window(false);
+}
+#[test]
+fn bounded_backing_prefix_does_not_publish_beyond_readable_tail() {
+    untouched_transfer_window(true);
+}
+fn untouched_transfer_window(prefix: bool) {
     use carrick_mmu_core::aarch64::descriptor_txn::{
         BackingIdentity, DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan,
         TableGrants,
@@ -952,7 +959,7 @@ fn stopped_target_untouched_transfer_prepares_only_exact_owner_window() {
             publication: GuestLeafPublication {
                 va: window.range.start(),
                 ipa: IPA,
-                len: window.range.len(),
+                len: if prefix { 4096 } else { window.range.len() },
                 writable: true,
                 executable: false,
             },
@@ -1028,6 +1035,11 @@ fn stopped_target_untouched_transfer_prepares_only_exact_owner_window() {
         "{receipt:?}"
     );
     assert!(slot.take_receipt(window, &txn).is_some());
+    if prefix {
+        assert!(window.range.len() > 4096);
+        assert!(residency.lookup(mm.raw(), VA + 4096).is_none());
+        assert_eq!(tables.words[1537].load(Ordering::Acquire), 0);
+    }
     assert_eq!(transfer.offset(), 0);
     let chunk = selected(
         portal

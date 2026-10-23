@@ -81,6 +81,32 @@ impl StagedPhysicalGrants {
         owner_generation: NonZeroU64,
         owner: GuestFrameOwner,
     ) -> Result<Self, TrapError> {
+        Self::stage_with_permissions(
+            rollback,
+            source,
+            gpas,
+            table_grants,
+            frame_len,
+            owner_generation,
+            owner,
+            MemPerms {
+                read: true,
+                write: true,
+                exec: false,
+            },
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_with_permissions(
+        rollback: Arc<PhysicalGrantRollback>,
+        source: Arc<dyn PhysicalFrameInventory>,
+        gpas: impl IntoIterator<Item = FrameGpa>,
+        table_grants: usize,
+        frame_len: u64,
+        owner_generation: NonZeroU64,
+        owner: GuestFrameOwner,
+        permissions: MemPerms,
+    ) -> Result<Self, TrapError> {
         let fail = TrapError::Hypervisor;
         let authority = source.bind(owner);
         let gpas: Vec<_> = gpas.into_iter().collect();
@@ -118,11 +144,7 @@ impl StagedPhysicalGrants {
                         generation,
                         gpa: carrick_guest_mem::Gpa::new(gpa.raw()),
                         length,
-                        permissions: MemPerms {
-                            read: true,
-                            write: true,
-                            exec: false,
-                        },
+                        permissions,
                     })
                     .map_err(|error| fail(format!("initial inventory prepare: {error}")))?;
                 reservation
@@ -251,6 +273,36 @@ impl<R> NativePhysicalGrants<R> {
             .ok_or_else(fail)?;
         entry.published = Some(published);
         Ok(())
+    }
+    /// Retain an isolated backing/table publication before its reply is visible.
+    pub fn retain_backing(
+        &mut self,
+        staged: StagedPhysicalGrants,
+        retained: R,
+    ) -> Result<Vec<PhysicalFrameGrant>, TrapError> {
+        if staged.owner != self.owner
+            || staged.frames.len() != 1
+            || staged.length.raw() > carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
+            || self.grants.contains_key(&staged.frames[0].0.raw())
+        {
+            drop(staged);
+            drop(retained);
+            return Err(TrapError::Hypervisor(
+                "native backing publication mismatch".into(),
+            ));
+        }
+        let key = staged.frames[0].0.raw();
+        let grants = staged.grants.clone();
+        let custody = staged.handoff()?;
+        self.grants.insert(
+            key,
+            NativeGrant {
+                custody,
+                _retained: retained,
+                published: None,
+            },
+        );
+        Ok(grants)
     }
     /// Settle exact USED receipts while the MM editor is excluded. Live
     /// descriptor output is supplied by the ISA adapter; inventory identities,

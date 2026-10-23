@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::PortalGrantWindow;
 #[repr(C, align(64))]
+#[derive(zerocopy::FromZeros)]
 pub struct PortalGrantSlot {
     state: AtomicU64,
     window: [AtomicU64; 13],

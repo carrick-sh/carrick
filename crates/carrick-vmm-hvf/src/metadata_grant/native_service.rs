@@ -26,6 +26,8 @@ pub struct NativeService {
     custody: Arc<crate::trap::CarrierVmCustody>,
     slot: carrick_sched_core::SlotId,
     cow: Option<carrick_core_abi::service::ServiceFaultSupply>,
+    reply: Option<core::ptr::NonNull<carrick_el1_abi::PortalGrantSlot>>,
+    _reply_pin: Option<HostMetadataExtentPin>,
 }
 impl core::fmt::Debug for NativeService {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -77,8 +79,12 @@ impl NativeService {
         use carrick_sched_core::spaces::notification::{
             SpaceAccess, SpaceReleaseVenue, SpaceWaitCause, SpaceWakeDelivery,
         };
-        let Some(carrick_core_abi::service::ServiceFaultSupply::Cow(window)) = self.cow else {
-            return self.refuse();
+        let window = match self.cow {
+            Some(carrick_core_abi::service::ServiceFaultSupply::Cow(window)) => window,
+            Some(carrick_core_abi::service::ServiceFaultSupply::Backing(window)) => {
+                return self.supply_backing(window);
+            }
+            None => return self.refuse(),
         };
         let custody = Arc::clone(&self.custody);
         let region = retained_abi_region(&custody).ok_or_else(stale)?;
@@ -158,6 +164,7 @@ impl NativeService {
                     carrier: Arc::downgrade(&custody),
                     ipa,
                     generation,
+                    length: carrick_el1_abi::COW_GRANT_SIZE,
                 });
                 custody
                     .native_frame_backings
@@ -182,19 +189,191 @@ impl NativeService {
         self.complete(supplied)
     }
 
+    fn supply_backing(
+        self,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, DescriptorTxn, DescriptorTxnId, MAX_TABLE_GRANTS, PageSpan, TableGrants,
+        };
+        use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
+        let Some(reply) = self.reply else {
+            return self.refuse();
+        };
+        let custody = Arc::clone(&self.custody);
+        let handle = self.request().identity.birth.mm;
+        let mut stock = custody.fork_stock.lock();
+        if stock.owner.child_owner(handle.mm()) != Some(handle)
+            || stock.owner.is_quarantined(handle.mm())
+        {
+            return self.refuse();
+        }
+        let root = stock.owner.child_root(handle.mm()).ok_or_else(stale)?;
+        let inventory = stock.inventory().ok_or_else(stale)?;
+        let physical = stock
+            .owner
+            .child_physical_mut(handle.mm(), root)
+            .ok_or_else(stale)?;
+        let source = window
+            .host_backing
+            .map(|identity| physical.sources.retain(identity, || None).ok_or_else(stale))
+            .transpose()?;
+        // File I/O retains only its bounded source capability. It must not
+        // hold carrier-wide stock custody while another native child exits.
+        drop(stock);
+        let bytes = if let Some(source) = source {
+            let identity = window.host_backing.ok_or_else(stale)?;
+            let read = carrick_hal::fork_stock::HostBackingRead::new(
+                identity,
+                window.range.len() as usize,
+            )
+            .ok_or_else(stale)?;
+            match source.read(read) {
+                Ok(bytes) => Some(bytes),
+                Err(carrick_hal::fork_stock::HostBackingReadError::Inaccessible) => {
+                    return self.finish(None, false, true);
+                }
+                Err(_) => return self.refuse(),
+            }
+        } else {
+            None
+        };
+        let mut stock = custody.fork_stock.lock();
+        if stock.owner.child_owner(handle.mm()) != Some(handle)
+            || stock.owner.child_root(handle.mm()) != Some(root)
+            || stock.owner.is_quarantined(handle.mm())
+        {
+            return self.refuse();
+        }
+        let physical = stock
+            .owner
+            .child_physical_mut(handle.mm(), root)
+            .ok_or_else(stale)?;
+        let publication_len = bytes
+            .as_ref()
+            .map_or(window.range.len(), |bytes| bytes.len() as u64);
+        if window.fault_page >= window.range.start() + publication_len {
+            return self.finish(None, false, true);
+        }
+        let owner = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_guest_arch::MmGeneration::new(
+                core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(stale)?,
+            ),
+            root_generation: carrick_guest_arch::ContextGeneration::new(handle.incarnation()),
+        };
+        let grants = physical
+            .supplied
+            .get_or_insert_with(|| carrick_hal::physical_grants::NativePhysicalGrants::new(owner));
+        if grants.owner() != owner || physical.rollback.failed() {
+            return Err(stale());
+        }
+        let prefix = MAX_TABLE_GRANTS as u64 * 4096;
+        let data_len = publication_len.next_multiple_of(carrick_el1_abi::COW_GRANT_SIZE);
+        let executable = window
+            .protection
+            .permits(carrick_el1_abi::ReservationProtection::EXECUTE);
+        let perms = if executable {
+            applevisor::memory::MemPerms::ReadWriteExec
+        } else {
+            applevisor::memory::MemPerms::ReadWrite
+        };
+        let length = prefix + data_len;
+        let (host, ipa, generation) = crate::trap::allocate_grant_extent(&custody, perms, length)?;
+        let retained = Arc::new(crate::fork_stock::NativeFrameBacking {
+            carrier: Arc::downgrade(&custody),
+            ipa,
+            generation,
+            length,
+        });
+        custody
+            .native_frame_backings
+            .lock()
+            .insert((ipa, generation), Arc::downgrade(&retained));
+        if let Some(bytes) = bytes {
+            // SAFETY: retained writable allocation contains this bounded data span.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    host.add(prefix as usize),
+                    bytes.len(),
+                );
+            }
+        }
+        if executable {
+            // SAFETY: initialized retained backing; publication has not exposed it.
+            unsafe {
+                crate::trap::invalidate_instruction_cache(host.add(prefix as usize), data_len);
+            }
+        }
+        let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
+            Arc::clone(&physical.rollback),
+            inventory,
+            (0..MAX_TABLE_GRANTS)
+                .map(|index| carrick_guest_arch::FrameGpa::new(ipa + index as u64 * 4096))
+                .chain(core::iter::once(carrick_guest_arch::FrameGpa::new(
+                    ipa + prefix,
+                ))),
+            MAX_TABLE_GRANTS,
+            data_len,
+            core::num::NonZeroU64::new(generation).ok_or_else(stale)?,
+            owner,
+            carrick_hal::MemPerms {
+                read: true,
+                write: window
+                    .protection
+                    .permits(carrick_el1_abi::ReservationProtection::WRITE),
+                exec: executable,
+            },
+        )?;
+        let rows = grants.retain_backing(staged, retained)?;
+        let data = rows.last().ok_or_else(stale)?;
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(stale)?,
+                generation: window.operation.sequence,
+            },
+            root: SubstrateGpa(root.address().raw()),
+            op: DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: window.range.start(),
+                    ipa: data.gpa.raw(),
+                    len: publication_len,
+                    writable: window
+                        .protection
+                        .permits(carrick_el1_abi::ReservationProtection::WRITE),
+                    executable,
+                },
+                resident: PageSpan::new(window.fault_page, 4096),
+                backing: data.identity,
+            },
+            tables: TableGrants::new(
+                &rows[..MAX_TABLE_GRANTS]
+                    .iter()
+                    .map(|grant| SubstrateGpa(grant.gpa.raw()))
+                    .collect::<Vec<_>>(),
+            )
+            .ok_or_else(stale)?,
+        };
+        // SAFETY: intake pinned and authenticated the request-owned reply. The
+        // ring retains it through ACK, then revalidates and executes this slot.
+        let submitted = unsafe { reply.as_ref() }.submit(window, &txn);
+        drop(stock);
+        self.complete(submitted)
+    }
     fn complete_wait(
         self,
         wait: carrick_el1_abi::PortalOwnerWait,
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
-        self.finish(Some(wait), false)
+        self.finish(Some(wait), false, false)
     }
     fn complete(self, supplied: bool) -> Result<carrick_sched_core::WakeEffects, TrapError> {
-        self.finish(None, supplied)
+        self.finish(None, supplied, false)
     }
     fn finish(
         self,
         wait: Option<carrick_el1_abi::PortalOwnerWait>,
         supplied: bool,
+        backing_fault: bool,
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let region = retained_abi_region(&self.custody).ok_or_else(stale)?;
         let (_, zone) = stopped_records(
@@ -209,7 +388,9 @@ impl NativeService {
             .map_err(|_| stale())?;
         // Claim, cancel, and complete share this queue lock. WRITING is never
         // treated as a stale generation merely because another CPU is active.
-        if let Some(wait) = wait {
+        if backing_fault {
+            self.ticket.complete_backing_fault().map_err(|_| stale())?;
+        } else if let Some(wait) = wait {
             self.ticket.complete_wait(wait).map_err(|_| stale())?;
         } else {
             self.ticket.complete(supplied).map_err(|_| stale())?;
@@ -316,7 +497,15 @@ pub(super) fn take(
             let cow = ticket
                 .take_fault_selection(portal.grant(cpu.raw() as usize).ok_or_else(stale)?)
                 .map_err(|_| stale())?;
+            let (reply, reply_pin) = if let Some(address) = ticket.reply_address() {
+                let (pointer, pin) = retain_reply(custody, region, address)?;
+                (Some(pointer), pin)
+            } else {
+                (None, None)
+            };
             Ok(Some(NativeService {
+                reply,
+                _reply_pin: reply_pin,
                 ticket,
                 cow,
                 custody: Arc::clone(custody),
@@ -380,4 +569,65 @@ pub(crate) fn settle_native_cow(
     grants
         .settle(pool, excluded, |va| native_output(custody, root, va))
         .map(Some)
+}
+
+fn retain_reply(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    region: RetainedAbiRegion<'_>,
+    address: carrick_guest_arch::KernelVa,
+) -> Result<
+    (
+        core::ptr::NonNull<carrick_el1_abi::PortalGrantSlot>,
+        Option<HostMetadataExtentPin>,
+    ),
+    TrapError,
+> {
+    let size = core::mem::size_of::<carrick_el1_abi::PortalGrantSlot>();
+    if address.raw() < EL1_DYNAMIC_METADATA_BASE {
+        let offset = address
+            .raw()
+            .checked_sub(carrick_el1_abi::EL1_REGION_BASE)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|offset| fork_custody_in_retained_region(*offset, size))
+            .ok_or_else(stale)?;
+        return Ok((
+            core::ptr::NonNull::new(region.record_ptr(offset).ok_or_else(stale)?)
+                .ok_or_else(stale)?,
+            None,
+        ));
+    }
+    let (_, base, len) = retained_dynamic_metadata(custody, address, size).ok_or_else(stale)?;
+    let generation = custody.live_generation().ok_or_else(stale)?;
+    let pin = {
+        let aperture = metadata_aperture(custody).lock();
+        let index =
+            ((base - EL1_DYNAMIC_METADATA_BASE) / EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64) as usize;
+        let mapping = aperture
+            .slots
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or_else(stale)?;
+        aperture
+            .pin_extent(
+                MetadataExtent::new(base, len as u64, mapping.token).ok_or_else(stale)?,
+                generation.0,
+            )
+            .map_err(|_| stale())?
+    };
+    // SAFETY: the exact request retains the whole aligned ring-owned reply.
+    let pointer = unsafe {
+        pin.host_base()
+            .as_ptr()
+            .add((address.raw() - base) as usize)
+    };
+    if !pointer
+        .addr()
+        .is_multiple_of(core::mem::align_of::<carrick_el1_abi::PortalGrantSlot>())
+    {
+        return Err(stale());
+    }
+    Ok((
+        core::ptr::NonNull::new(pointer.cast()).ok_or_else(stale)?,
+        Some(pin),
+    ))
 }

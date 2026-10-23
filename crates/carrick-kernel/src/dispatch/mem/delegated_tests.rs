@@ -966,6 +966,24 @@ fn admitted_file_byte_service_preserves_last_page_and_refuses_beyond_eof() {
     )) as u64;
     let root = Root::admit(&dispatcher);
     let source = root.lock().mapping(file).unwrap().host_backing.unwrap();
+    use carrick_hal::fork_stock::{HostBackingRead, HostBackingReadError};
+    let retained = dispatcher
+        .mem_view()
+        .retain_host_backing(source.handle(), source.generation())
+        .unwrap();
+    let readable = retained
+        .read(HostBackingRead::new(source, 2 * PAGE as usize).unwrap())
+        .unwrap();
+    assert_eq!(
+        readable.len(),
+        PAGE as usize,
+        "supply must not expose pages beyond EOF"
+    );
+    assert_eq!(&readable[..9], b"file tail");
+    assert_eq!(
+        retained.read(HostBackingRead::new(source.advance(PAGE).unwrap(), PAGE as usize).unwrap()),
+        Err(HostBackingReadError::Inaccessible)
+    );
     let page = dispatcher
         .mem_view()
         .read_host_backing(source, PAGE as usize)

@@ -382,7 +382,7 @@ mod frame_inventory;
 mod guest_cow;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use guest_cow::CarrierGuestCowSettlement;
-pub(crate) use guest_cow::{allocate_grant_compound, refill_guest_cow_pool};
+pub(crate) use guest_cow::{allocate_grant_compound, allocate_grant_extent, refill_guest_cow_pool};
 mod memory_protection;
 pub(crate) use self::memory_protection::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

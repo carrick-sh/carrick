@@ -1379,9 +1379,6 @@ fn dispatch_classified_fault<
                 )
                 .ok()?;
             }
-            if window.host_backing.is_some() {
-                return None;
-            }
             let slot = owner.slots.grant(slot as usize)?;
             slot.publish_fault_selection(window.operation.sequence.get(), window)
                 .then_some(())

@@ -51,12 +51,14 @@ impl HostBackingRead {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostBackingReadError {
+    Inaccessible,
     Stale,
     Unavailable,
 }
 
 pub trait HostBackingRetention: Send + Sync {
     fn identity(&self) -> carrick_el1_abi::HostBackingIdentity;
+    /// Returns a bounded readable prefix; no bytes beyond a backing fault are supplied.
     fn read(&self, request: HostBackingRead) -> Result<Vec<u8>, HostBackingReadError>;
 }
 

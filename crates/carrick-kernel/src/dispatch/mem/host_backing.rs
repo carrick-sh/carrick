@@ -134,13 +134,20 @@ impl carrick_hal::fork_stock::HostBackingRetention for HostBackingLease {
         if identity.handle() != self.0.handle || identity.generation() != NonZeroU64::MIN {
             return Err(HostBackingReadError::Stale);
         }
-        super::backing::read_retained_source(
+        let mut snapshot = super::backing::snapshot_retained_source(
             self.0.source.clone(),
             identity,
             request.length(),
             carrick_el1_abi::GRANT_PAGE_SIZE,
         )
-        .map_err(|_| HostBackingReadError::Unavailable)
+        .map_err(|_| HostBackingReadError::Unavailable)?;
+        if let Some(offset) = snapshot.bus_fault_offset {
+            if offset == 0 {
+                return Err(HostBackingReadError::Inaccessible);
+            }
+            snapshot.bytes.truncate(offset as usize);
+        }
+        Ok(snapshot.bytes)
     }
 }
 impl Drop for Record {

@@ -1719,20 +1719,27 @@ pub(super) fn read_retained_source(
     length: usize,
     page_size: u64,
 ) -> Result<Vec<u8>, LinuxErrno> {
+    let snapshot = snapshot_retained_source(source, identity, length, page_size)?;
+    if snapshot.bus_fault_offset == Some(0) {
+        Err(LINUX_EFAULT)
+    } else {
+        Ok(snapshot.bytes)
+    }
+}
+
+pub(super) fn snapshot_retained_source(
+    source: PrivateFileBacking,
+    identity: carrick_el1_abi::HostBackingIdentity,
+    length: usize,
+    page_size: u64,
+) -> Result<PrivateMmapSnapshot, LinuxErrno> {
     match source {
         PrivateFileBacking::Description(description) => snapshot_private_mmap_description(
             description.description(),
             identity.offset(),
             length,
             page_size,
-        )
-        .and_then(|snapshot| {
-            if snapshot.bus_fault_offset == Some(0) {
-                Err(LINUX_EFAULT)
-            } else {
-                Ok(snapshot.bytes)
-            }
-        }),
+        ),
         PrivateFileBacking::LoadedImage {
             initialized_offset,
             bytes,
@@ -1749,7 +1756,10 @@ pub(super) fn read_retained_source(
                 let count = (end - start) as usize;
                 result[target..target + count].copy_from_slice(&bytes[source..source + count]);
             }
-            Ok(result)
+            Ok(PrivateMmapSnapshot {
+                bytes: result,
+                bus_fault_offset: None,
+            })
         }
     }
 }
