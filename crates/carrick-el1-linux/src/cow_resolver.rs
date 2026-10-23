@@ -162,6 +162,20 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
     }
 }
 
+/// Select the existing supply protocol for the authenticated execution lane.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) fn native_fault_supply<'a>(
+    native: bool,
+    mailboxes: carrick_el1::fault::GrantMailboxes<'a>,
+    owner: &'a carrick_el1::fault::OwnerFaultSupply<'a>,
+) -> carrick_el1::fault::FaultSupply<'a> {
+    if native {
+        carrick_el1::fault::FaultSupply::Owner(owner)
+    } else {
+        carrick_el1::fault::FaultSupply::Mailbox(mailboxes)
+    }
+}
+
 /// Dispatch an EL0 data abort at EL1.
 ///
 /// Increments `counters.fault_taken`; at EL1, requests host-published bulk
@@ -182,6 +196,14 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
             counters.fault_taken.fetch_add(1, Ordering::Relaxed);
             return Action::Forward;
         };
+        let portal = unsafe {
+            &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
+        };
+        let supply = OwnerFaultSupply::new(portal);
+        let native = zone
+            .slot(carrick_sched_core::SlotId::new(frame.slot as u8))
+            .current()
+            .is_some_and(|record| zone.record(record).is_native_owned());
         dispatch_fault_with_descriptor_txns(
             frame,
             counters,
@@ -194,10 +216,14 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 slots: carrick_el1_abi::descriptor_txn_slots_guest(),
                 applier: &mut HardwareDescriptorTxnApplier,
             }),
-            GrantMailboxes {
-                own: mailbox,
-                peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
-            },
+            native_fault_supply(
+                native,
+                GrantMailboxes {
+                    own: mailbox,
+                    peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
+                },
+                &supply,
+            ),
             Some(PreparedFaultPath::<_> {
                 residency: carrick_el1::isa::frame_grant_residency_guest(),
                 resolver: &mut HardwarePreparedResolver,

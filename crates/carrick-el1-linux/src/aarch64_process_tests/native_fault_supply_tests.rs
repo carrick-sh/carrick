@@ -1,0 +1,442 @@
+//! Actual native birth, empty physical supply and ring COW completion.
+use super::*;
+use carrick_el1::fault::{CowResolution, CowResolver, OwnerFaultSupply, OwnerFaultSupplyOutcome};
+use carrick_el1_abi::Lifecycle;
+use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+
+struct FaultMemory {
+    pages: RefCell<BTreeMap<u64, Vec<u8>>>,
+    copies: Cell<usize>,
+}
+fn leaf(words: &impl LiveDescriptorWords, root: u64, va: u64) -> u64 {
+    let mut table = root & AARCH64_ROOT_ADDRESS_MASK;
+    for (level, index) in carrick_mmu_core::aarch64::indices(va)
+        .into_iter()
+        .enumerate()
+    {
+        let descriptor = words.load(table + index as u64 * 8).unwrap();
+        if level == 3 {
+            return descriptor;
+        }
+        assert_eq!(descriptor & 3, 3);
+        table = descriptor & AARCH64_ROOT_ADDRESS_MASK;
+    }
+    unreachable!()
+}
+struct FaultResolver<'a> {
+    tables: &'a crate::mm_portal::test_support::Tables,
+    memory: &'a FaultMemory,
+    pool: &'a carrick_el1_abi::CowGrantPool,
+    residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
+}
+impl CowResolver for FaultResolver<'_> {
+    fn resolve_cow(&mut self, root: u64, mm: u64, address: u64) -> bool {
+        self.resolve_cow_outcome(root, mm, address) == CowResolution::Resolved
+    }
+    fn resolve_cow_outcome(&mut self, root: u64, mm: u64, address: u64) -> CowResolution {
+        let maintenance = CallerInvalidatesAsid;
+        let words = self.tables.live(&maintenance);
+        let root = carrick_mmu_core::aarch64::SubstrateGpa(root & AARCH64_ROOT_ADDRESS_MASK);
+        let outcome = carrick_el1::cow::resolve_guest_cow(
+            &carrick_el1::cow::GuestCowVenue {
+                words: &words,
+                root,
+                pool: self.pool,
+                residency: self.residency,
+                copy_window: carrick_core::mm::cow::CowCopyWindow::target(&words, root),
+                publish_executable: None,
+            },
+            mm,
+            address,
+            |source, destination| {
+                let from = leaf(&words, root.raw(), source);
+                let to = leaf(&words, root.raw(), destination);
+                assert_eq!(from & 1, 1);
+                assert_eq!(to & 1, 1);
+                assert_eq!(from & (3 << 6), 2 << 6);
+                assert_eq!(to & (3 << 6), 0);
+                let bytes = self.memory.pages.borrow()[&(from & AARCH64_ROOT_ADDRESS_MASK)].clone();
+                self.memory
+                    .pages
+                    .borrow_mut()
+                    .insert(to & AARCH64_ROOT_ADDRESS_MASK, bytes);
+                self.memory.copies.set(self.memory.copies.get() + 1);
+            },
+            || {},
+        );
+        carrick_el1::fault::handle_cow_outcome(outcome, &mut None)
+    }
+    fn editor_busy(&mut self) {
+        panic!("uncontended fixture");
+    }
+}
+
+#[test]
+fn native_child_empty_supply_resumes_cow_without_changing_parent() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let window = carrick_el1_abi::EL1_COW_COPY_BASE;
+    let indices = carrick_mmu_core::aarch64::indices(window);
+    let set = |address: u64, value| {
+        fixture.tables.words[((address - 0x10000) / 8) as usize].store(value, Ordering::Relaxed)
+    };
+    set(0x11000 + indices[1] as u64 * 8, 0x14000 | 3);
+    set(0x14000 + indices[2] as u64 * 8, 0x15000 | 3);
+    for page in 0..2 {
+        let alias = window + page * 4096;
+        set(
+            0x15000 + carrick_mmu_core::aarch64::indices(alias)[3] as u64 * 8,
+            alias,
+        );
+    }
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let pages: Vec<_> = (0..16).map(|index| 0x20000 + index * 4096).collect();
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&pages),
+    )
+    .with_words(words);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let mut cpu = crate::sched::FakeCpu::default();
+    frame.x[8] = 220;
+    frame.x[0] = 17;
+    arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
+    assert!((frame.x[0] as i64) > 0);
+    fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+    fixture.task.mm.key.store(0, Ordering::Release);
+    let counters = carrick_el1_abi::Counters::new();
+    let mut handoff = None;
+    let mut zone = crate::dispatch::Zone {
+        tables: fixture.zone,
+        cpu: &mut cpu,
+        user: &crate::sched::HardwareUserWord,
+    };
+    assert_eq!(
+        crate::dispatch::native_scheduler(
+            &mut zone,
+            &fixture.task,
+            &counters,
+            fixture.slot,
+            &mut handoff
+        )
+        .idle_entry(&mut frame, 0),
+        carrick_el1_abi::Action::Served
+    );
+    let child = fixture.zone.slot(fixture.slot).current().unwrap();
+    let identity = fixture.zone.record(child).identity();
+    let owner = registry()
+        .for_record(fixture.zone, fixture.zone.record_ref(child))
+        .unwrap();
+    assert!(matches!(
+        resume_selected(
+            &owner,
+            registry(),
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot
+            },
+            &fixture.task,
+            child,
+            &mut service
+        ),
+        super::super::native_process_runtime::NativeResume::NoPending
+    ));
+    let memory = FaultMemory {
+        pages: RefCell::new(
+            (0..2)
+                .map(|i| (IPA + i * 4096, vec![17 + i as u8; 4096]))
+                .collect(),
+        ),
+        copies: Cell::new(0),
+    };
+    let pool = Box::new(carrick_el1_abi::CowGrantPool::new());
+    let residency = carrick_el1::cow::test_support::residency_table();
+    assert_eq!(pool.ready(identity.mm).count(), 0);
+    let mut resolver = FaultResolver {
+        tables: &fixture.tables,
+        memory: &memory,
+        pool: &pool,
+        residency: &residency,
+    };
+    let portal = fixture.region.portal_slots();
+    assert!(portal.bind_carrier(NonZeroU64::MIN));
+    let supply = OwnerFaultSupply::new(portal);
+    let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+    frame.esr = 0x9200004f;
+    frame.far = VA + 13;
+    frame.elr = 0x401234;
+    frame.x[3] = 0x7abc;
+    let action = carrick_el1::fault::dispatch_fault_with_prepared(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+        crate::cow_resolver::native_fault_supply(
+            true,
+            carrick_el1::fault::GrantMailboxes::own(&mailbox),
+            &supply,
+        ),
+        Some(carrick_el1::fault::PreparedFaultPath {
+            residency: &residency,
+            resolver: &mut carrick_el1::fault::NoopPreparedResolver,
+            roots: Some(fixture.region.table()),
+            file_slots: Some(portal),
+        }),
+        &mut resolver,
+    );
+    assert_eq!(action, carrick_el1_abi::Action::Forward);
+    assert_eq!(
+        supply.outcome(),
+        OwnerFaultSupplyOutcome::CowSelected,
+        "native empty-pool COW must select the exact MM supply portal"
+    );
+    let (_, selected) = portal
+        .grant(0)
+        .unwrap()
+        .pending_cow_fault_selection(identity.mm, frame.far)
+        .unwrap();
+    assert_eq!(selected.operation.mm.raw(), identity.mm);
+    assert_eq!(selected.fault_page, VA);
+    assert_eq!(
+        memory.copies.get(),
+        0,
+        "selection cannot copy before physical supply"
+    );
+    use super::super::native_process_runtime::NativeResume;
+    use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+    use carrick_sched_core::object_wait::ObjectWaitKey;
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    // SAFETY: the native child retains its initialized lifecycle/control allocation.
+    let page = unsafe { &*(identity.lifecycle_page as *const ThreadLifecyclePage) };
+    let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+    let mut saved = Aarch64ParkedContext::ZERO;
+    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
+    let child_root = fixture
+        .zone
+        .spaces
+        .grant(fixture.zone.spaces.find(identity.mm).unwrap(), identity.mm)
+        .unwrap()
+        .ttbr0;
+    let fault = carrick_guest_arch::FaultInfo {
+        address: UserVa::new(frame.far),
+        access: carrick_guest_arch::Access::Write,
+        present: true,
+    };
+    assert!(matches!(
+        with_process_entry(
+            source,
+            &fixture.task,
+            &saved.native,
+            child_root,
+            page,
+            control,
+            &mut service,
+            |entry| {
+                let result = entry
+                    .begin_service(
+                        ServiceOperation::Fault(fault),
+                        Some(selected.operation.sequence),
+                    )
+                    .unwrap();
+                assert!(entry.take_handoff_receipt().is_some());
+                result
+            }
+        )
+        .unwrap(),
+        NativeResume::Left(None)
+    ));
+    let selector = fixture.task.service_notice.take().unwrap().unwrap();
+    let key = ObjectWaitKey::native_service(selector.record).unwrap();
+    let mut ticket = {
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        let member = queue.native_service_member(selector.record).unwrap();
+        unsafe { ServiceCell::claim_notice(&control.service, selector, NonZeroU64::MIN, member) }
+            .ok()
+            .unwrap()
+    };
+    let captured = ticket
+        .take_fault_selection(portal.grant(0).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        captured,
+        carrick_core_abi::service::ServiceFaultSupply::Cow(selected)
+    );
+    assert!(!portal.grant(0).unwrap().has_outstanding_for(identity.mm));
+    assert!(
+        ticket
+            .take_fault_selection(portal.grant(0).unwrap())
+            .is_err(),
+        "one selection transfer per ticket"
+    );
+    assert_eq!(
+        ticket.request().identity.birth.mm.mm().raw(),
+        selected.operation.mm.raw()
+    );
+    assert_eq!(
+        ticket.request().identity.birth.mm.incarnation(),
+        selected.operation.incarnation
+    );
+    assert_eq!(page.claimed_count(), 1);
+    // The physical supplier uses the same inventory publication as CPL0 boot.
+    // It receives only an exact-MM grant window, never a VMA/table owner.
+    let inventory = std::sync::Arc::new(carrick_kernel::kernel::FrameInventoryAuthority::new());
+    let physical = inventory.physical_projection(std::sync::Arc::new(
+        carrick_kernel::kernel::ObjectIdRegistry::new(),
+    ));
+    let physical_owner = carrick_hal::GuestFrameOwner {
+        native_mm: MmGeneration::new(NonZeroU64::new(identity.mm).unwrap()),
+        root_generation: ContextGeneration::new(selected.operation.incarnation),
+    };
+    let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+    let exclusion = access
+        .try_exclude_editor(access.find(identity.mm).unwrap(), identity.mm)
+        .unwrap();
+    let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
+        std::sync::Arc::default(),
+        physical,
+        [FrameGpa::new(0xa0000000), FrameGpa::new(0xa0004000)],
+        0,
+        16384,
+        NonZeroU64::MIN,
+        physical_owner,
+    )
+    .unwrap();
+    assert_eq!(staged.grants().len(), 2, "bounded first refill");
+    // Move the whole batch into retained MM custody before the first READY.
+    // A later partial publication can never roll back an exposed inventory row.
+    let published_inventory = staged.handoff().unwrap();
+    for grant in &published_inventory.grants {
+        pool.publish(identity.mm, grant.gpa.raw(), grant.identity)
+            .unwrap();
+    }
+    drop(exclusion);
+    {
+        let queue = fixture
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .unwrap();
+        assert!(ticket.complete(true).is_ok());
+        queue
+            .notify_object(fixture.slot, &mut Default::default())
+            .unwrap();
+    }
+    let mut handoff = None;
+    let mut zone = crate::dispatch::Zone {
+        tables: fixture.zone,
+        cpu: &mut cpu,
+        user: &crate::sched::HardwareUserWord,
+    };
+    assert_eq!(
+        crate::dispatch::native_scheduler(
+            &mut zone,
+            &fixture.task,
+            &counters,
+            fixture.slot,
+            &mut handoff
+        )
+        .idle_entry(&mut frame, 0),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
+    assert!(matches!(
+        resume_selected(
+            &owner,
+            registry(),
+            source,
+            &fixture.task,
+            child,
+            &mut service
+        ),
+        NativeResume::NoPending
+    ));
+    assert_eq!(page.claimed_count(), 0);
+    assert_eq!(frame.elr, 0x401234, "resume exact fault PC");
+    assert_eq!(frame.x[3], 0x7abc, "resume exact fault registers");
+    // ESR/FAR describe the next hardware retry of that unchanged instruction.
+    frame.esr = 0x9200004f;
+    frame.far = VA + 13;
+    assert_eq!(
+        carrick_el1::fault::dispatch_fault_with_prepared(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+            crate::cow_resolver::native_fault_supply(
+                true,
+                carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                &supply
+            ),
+            Some(carrick_el1::fault::PreparedFaultPath {
+                residency: &residency,
+                resolver: &mut carrick_el1::fault::NoopPreparedResolver,
+                roots: Some(fixture.region.table()),
+                file_slots: Some(portal)
+            }),
+            &mut resolver,
+        ),
+        carrick_el1_abi::Action::Served
+    );
+    let destination = leaf(words, child_root, VA) & AARCH64_ROOT_ADDRESS_MASK;
+    assert_ne!(destination, IPA);
+    memory.pages.borrow_mut().get_mut(&destination).unwrap()[13] = 99;
+    assert_eq!(
+        memory.pages.borrow()[&IPA][13],
+        17,
+        "parent bytes unchanged"
+    );
+    assert_eq!(memory.pages.borrow()[&destination][13], 99);
+    assert!(
+        memory.copies.get() > 0 && memory.copies.get() <= 4,
+        "at most one compound copied"
+    );
+    assert_eq!(leaf(words, 0x10000, VA) & AARCH64_ROOT_ADDRESS_MASK, IPA);
+    assert_eq!(pool.ready(identity.mm).count(), 1);
+
+    // Dispatch the child's first syscall through the real ARM native adapter.
+    frame.x[8] = 172;
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::dispatch::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(fixture),
+        page,
+        control,
+        &ThreadCtx::ZERO,
+        child_root,
+        &mut service,
+        |_| core::ptr::null_mut(),
+    )
+    .unwrap();
+    assert!(matches!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+            | carrick_personality_linux::dispatch::CompletionRoute::WithWork
+    ));
+    assert_eq!(frame.x[0], identity.tid);
+    assert_eq!(counters.served[172].load(Ordering::Acquire), 1);
+}

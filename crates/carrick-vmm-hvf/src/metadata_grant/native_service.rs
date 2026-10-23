@@ -25,11 +25,13 @@ pub struct NativeService {
     ticket: ServiceTicket<ServicePin>,
     custody: Arc<crate::trap::CarrierVmCustody>,
     slot: carrick_sched_core::SlotId,
+    cow: Option<carrick_core_abi::service::ServiceFaultSupply>,
 }
 impl core::fmt::Debug for NativeService {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("NativeService")
             .field("request", &self.request())
+            .field("cow", &self.cow)
             .finish_non_exhaustive()
     }
 }
@@ -166,11 +168,25 @@ pub(super) fn take(
     let ticket =
         unsafe { ServiceCell::claim_notice(pin, selector, custody.transfer_carrier, identity) };
     match ticket {
-        Ok(ticket) => Ok(Some(NativeService {
-            ticket,
-            custody: Arc::clone(custody),
-            slot: carrick_sched_core::SlotId::from_index(cpu.raw() as usize).ok_or_else(stale)?,
-        })),
+        Ok(mut ticket) => {
+            let portal = region
+                .record_ptr::<carrick_el1_abi::MmPortalSlots>(
+                    carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize,
+                )
+                .ok_or_else(stale)?;
+            // SAFETY: initialized portal in the retained carrier ABI region.
+            let portal = unsafe { &*portal };
+            let cow = ticket
+                .take_fault_selection(portal.grant(cpu.raw() as usize).ok_or_else(stale)?)
+                .map_err(|_| stale())?;
+            Ok(Some(NativeService {
+                ticket,
+                cow,
+                custody: Arc::clone(custody),
+                slot: carrick_sched_core::SlotId::from_index(cpu.raw() as usize)
+                    .ok_or_else(stale)?,
+            }))
+        }
         // A stale selector cannot acknowledge or complete a successor.
         Err(ServiceError::Stale) => Ok(None),
         Err(_) => Err(stale()),

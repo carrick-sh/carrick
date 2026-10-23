@@ -89,6 +89,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn begin_service(
         &mut self,
         operation: ServiceOperation,
+        fault_sequence: Option<core::num::NonZeroU64>,
     ) -> Result<NativeResume, NativeProcessError> {
         let (page, control) = {
             let graph = self.runtime.graph.lock();
@@ -124,7 +125,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             } else {
                 self.control
                     .service
-                    .publish(birth, self.binding.generation, operation)
+                    .publish(birth, self.binding.generation, operation, fault_sequence)
                     .map_err(service_error)
             }
         };

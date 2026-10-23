@@ -749,6 +749,20 @@ fn arm_native_service_exit(frame: &mut TrapFrame, action: Action) -> Option<Acti
     }
     let (page, control) = task.lifecycle_refs()?;
     let operation = native_service_operation(frame, &task.linux, action)?;
+    // This CPU still exclusively owns its portal slot. Bind its selection
+    // before park, so even a delayed first intake cannot steal a successor.
+    let fault_sequence =
+        if let carrick_core_abi::service::ServiceOperation::Fault(fault) = operation {
+            // SAFETY: fixed initialized ABI region of this carrier.
+            let portal = unsafe {
+                &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
+            };
+            portal
+                .grant(frame.slot as usize)?
+                .native_fault_sequence(task.mm.key.load(Ordering::Acquire), fault.address.raw())
+        } else {
+            None
+        };
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
     sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
@@ -762,7 +776,7 @@ fn arm_native_service_exit(frame: &mut TrapFrame, action: Action) -> Option<Acti
         control,
         &mut service,
         |process| {
-            let result = process.begin_service(operation)?;
+            let result = process.begin_service(operation, fault_sequence)?;
             if matches!(result, NativeResume::Left(_)) && process.take_handoff_receipt().is_none() {
                 return Err(super::native_process_runtime::NativeProcessError::Quarantined);
             }

@@ -3,6 +3,8 @@
 
 #[cfg(test)]
 mod native_child_handoff_tests;
+#[cfg(test)]
+mod native_fault_supply_tests;
 
 use super::aarch64_process::{Aarch64NativeProcessService, ForkStockCrossing};
 #[cfg(test)]
