@@ -1026,6 +1026,8 @@ impl SysvShmState {
 pub struct SysvIpcNamespace {
     state: Mutex<SysvShmState>,
     cleanup_claimed: AtomicBool,
+    #[cfg(test)]
+    assert_uncontended_for_test: AtomicBool,
 }
 
 impl SysvIpcNamespace {
@@ -1033,6 +1035,8 @@ impl SysvIpcNamespace {
         Self {
             state: Mutex::new(SysvShmState::new()),
             cleanup_claimed: AtomicBool::new(false),
+            #[cfg(test)]
+            assert_uncontended_for_test: AtomicBool::new(false),
         }
     }
 
@@ -1050,6 +1054,16 @@ impl SysvIpcNamespace {
     where
         F: FnOnce(&mut SysvShmState) -> R,
     {
+        // The same-shmid fixture owns an otherwise unshared namespace. Turn
+        // recursive acquisition into an immediate ordering failure there,
+        // rather than diagnosing it by racing a child-process watchdog.
+        #[cfg(test)]
+        if self.assert_uncontended_for_test.load(Ordering::Relaxed) {
+            assert!(
+                !self.state.is_locked(),
+                "same-shmid reservation rollback must acquire an unlocked namespace"
+            );
+        }
         let mut state = self.state.lock();
         f(&mut state)
     }
@@ -7060,6 +7074,13 @@ mod ipc_set_tests {
             );
 
             // Commit remapped shmat with the same shmid.
+            // No other thread can access this fixture's namespace. A held
+            // namespace at rollback is therefore a recursive acquisition,
+            // which must fail before attempting the blocking lock.
+            dispatcher
+                .sysv
+                .assert_uncontended_for_test
+                .store(true, Ordering::Relaxed);
             let mut process = dispatcher.lock_sysv_process();
             let committed_va = process.commit_remapped_shmat(shmid, 1234, reservation);
             drop(process);
@@ -7090,46 +7111,7 @@ mod ipc_set_tests {
 
         #[test]
         fn remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting() {
-            supervise_watchdog_child();
-            if std::env::var_os("CARRICK_SAME_SHMID_TEST_CHILD").is_some() {
-                run_remapped_shmat_same_shmid_worker();
-                return;
-            }
-
-            let mut command =
-                std::process::Command::new(std::env::current_exe().expect("test exe path"));
-            command
-                .env("CARRICK_SAME_SHMID_TEST_CHILD", "1")
-                .arg("--exact")
-                .arg("dispatch::sysv::ipc_set_tests::serial_host::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting")
-                .arg("--nocapture");
-            let mut child =
-                WatchdogChild::spawn(command).expect("spawn same-shmid test child process");
-
-            let start = std::time::Instant::now();
-            let timeout = std::time::Duration::from_secs(5);
-            let mut exited = false;
-            while start.elapsed() < timeout {
-                if child.try_wait().expect("child try_wait").is_some() {
-                    exited = true;
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-
-            if !exited {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!(
-                    "same-shmid remapped shmat deadlock regression timed out after 5s (killed deadlocked child subprocess)"
-                );
-            }
-
-            let status = child.wait().expect("child wait");
-            assert!(
-                status.success(),
-                "child worker failed during same-shmid remapped shmat execution"
-            );
+            run_remapped_shmat_same_shmid_worker();
         }
 
         #[test]
