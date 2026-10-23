@@ -1761,3 +1761,7 @@ contracts = ["kernel.scheduler.runnable-progress"]
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs"
 contracts = ["kernel.scheduler.runnable-progress"]
+
+[[surfaces]]
+path = "crates/carrick-el1-abi/src/image_layout_tests.rs"
+contracts = ["kernel.fork.stage1-image", "kernel.el1.metadata-allocation", "kernel.mm.image-page-permissions"]
