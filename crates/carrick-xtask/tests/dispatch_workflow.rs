@@ -1089,3 +1089,54 @@ fn guard_skips_reviews_outside_dispatch_changes_requests() {
         )
     );
 }
+
+#[test]
+fn dispatch_review_stale_head_fails_before_checkout_or_build() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let docs = YamlLoader::load_from_str(include_str!(
+        "../../../.github/workflows/dispatch-worker.yml"
+    ))
+    .unwrap();
+    let steps = docs[0]["jobs"]["guard"]["steps"].as_vec().unwrap();
+    let check = steps
+        .iter()
+        .position(|s| s["id"].as_str() == Some("review-head"))
+        .expect("hosted stale head check missing");
+    let checkout = steps
+        .iter()
+        .position(|s| s["uses"].as_str() == Some("actions/checkout@v4"))
+        .unwrap();
+    assert!(check < checkout);
+    let step = &steps[check];
+    assert_eq!(
+        step["if"].as_str(),
+        Some("github.event_name == 'pull_request_review'")
+    );
+    assert_eq!(
+        step["env"]["REVIEW_HEAD"].as_str(),
+        Some("${{ github.event.pull_request.head.sha }}")
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let curl = temp.path().join("curl");
+    std::fs::write(&curl, "#!/bin/sh\nfor arg do url=$arg; done\ntest \"$url\" = https://api.github.com/repos/carrick-sh/carrick/pulls/800 || exit 91\nprintf '{\"head\":{\"sha\":\"%s\"}}' \"$LIVE_HEAD\"\n").unwrap();
+    std::fs::set_permissions(curl, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (live, allowed) in [("a", true), ("b", false)] {
+        let output = Command::new("/bin/bash")
+            .args(["-c", step["run"].as_str().unwrap()])
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+            .env("REVIEW_PR", "800")
+            .env("REVIEW_HEAD", "a".repeat(40))
+            .env("LIVE_HEAD", live.repeat(40))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), allowed, "{output:?}");
+        if !allowed {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("Stale owner review"),
+                "{output:?}"
+            );
+        }
+    }
+}
