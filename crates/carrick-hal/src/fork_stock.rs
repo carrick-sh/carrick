@@ -286,6 +286,26 @@ impl SlotAbsence {
     }
 }
 
+/// Execution venue for a quarantine drain. A maintenance venue has no active
+/// guest MM; it is admitted only after the live hardware root matches the
+/// carrier's retained maintenance root. All-slot absence is still required.
+#[derive(Clone, Copy, Debug)]
+pub struct ReclaimExecution {
+    active: Option<ReservationMm>,
+}
+impl From<ReservationMm> for ReclaimExecution {
+    fn from(active: ReservationMm) -> Self {
+        Self {
+            active: Some(active),
+        }
+    }
+}
+impl ReclaimExecution {
+    pub fn maintenance_root(live: RootGpa, maintenance: RootGpa) -> Option<Self> {
+        (maintenance.address().raw() != 0 && live == maintenance).then_some(Self { active: None })
+    }
+}
+
 /// Grant accounting for loaned table pages, charged to the borrowing MM.
 pub trait ForkTableLedger {
     /// False refuses the grant; nothing was charged for `page`.
@@ -1491,7 +1511,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     }
 
     /// Drain quarantine. A child MM is reclaimed only when it is not
-    /// `active` and `occupancy` proves no zone slot has it installed.
+    /// active in the authenticated execution venue and `occupancy` proves no zone slot has it installed.
     /// Its tables and lifecycle record are cleared and its tag retired
     /// before anything reenters the reusable stock. A child whose release,
     /// clear or tag retirement fails is deferred (counted, still
@@ -1501,13 +1521,13 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     pub fn reclaim(
         &mut self,
         ledger: &mut impl ForkTableLedger,
-        active: ReservationMm,
+        execution: impl Into<ReclaimExecution>,
         occupancy: impl Fn(ReservationMm) -> Option<SlotAbsence>,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
         mut clear_lifecycle: impl FnMut(ForkLifecycleLoan) -> bool,
         mut release: impl FnMut(&SlotAbsence) -> bool,
     ) -> Result<usize, ForkStockServiceError> {
-        let active = MmKey::of(active);
+        let active = execution.into().active.and_then(MmKey::of);
         let candidates: Vec<(MmKey, SlotAbsence)> = self
             .quarantine
             .iter_mut()

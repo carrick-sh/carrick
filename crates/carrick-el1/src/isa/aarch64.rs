@@ -190,6 +190,29 @@ pub fn cross_hvc_wait_channel_wake(mm: u64, address: u64, cpu: u64) -> Result<()
     }
 }
 
+/// Apply the shared physical retirement owner after leaving the child's root.
+#[allow(clippy::result_unit_err)]
+pub fn cross_hvc_child_reclaim(mm: u64, cpu: u64) -> Result<(), ()> {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let mut status = carrick_el1_abi::GRANT_OP_CHILD_RECLAIM;
+        // SAFETY: synchronous crossing; the terminal slot authenticates the MM.
+        unsafe {
+            core::arch::asm!("hvc #6", inout("x0") status,
+                inlateout("x1") mm => _, inlateout("x2") 0u64 => _,
+                inlateout("x3") cpu => _, options(nostack));
+        }
+        (status == carrick_el1_abi::METADATA_GRANT_SUCCESS)
+            .then_some(())
+            .ok_or(())
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = (mm, cpu);
+        Err(())
+    }
+}
+
 /// Ask the stopped carrier to supply the COW page selected in this slot's
 /// portal record. The host authenticates that record against the live root.
 // `Err(())` is the carrier's single refusal; callers own its meaning.
