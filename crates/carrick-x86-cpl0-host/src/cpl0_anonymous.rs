@@ -1429,6 +1429,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 .ok_or_else(|| fail("owner COW GPA exhausted"))?,
         );
         let (mut inventory, _) = InitialInventory::stage(
+            Arc::clone(&self.initial_rollback_fault),
             Arc::clone(&self.frame_inventory),
             [gpa],
             0,
@@ -1727,6 +1728,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 .ok_or_else(|| fail("owner grant GPA exhausted"))?,
         );
         let (mut inventory, grants) = InitialInventory::stage(
+            Arc::clone(&self.initial_rollback_fault),
             Arc::clone(&self.frame_inventory),
             [gpa],
             0,

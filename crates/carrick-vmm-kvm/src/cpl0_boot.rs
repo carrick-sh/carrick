@@ -917,6 +917,7 @@ impl Cpl0Carrier {
         let prepare_span = anonymous_owner::prepare_table_suffix(extent_len, occupied_end)
             .ok_or_else(|| fail("initial records/grants overlap Prepare working stock"))?;
         let (mut inventory, grants) = InitialInventory::stage(
+            self.custody.rollback_fault(),
             Arc::clone(self.custody.frame_inventory()),
             (0..grant_count).map(|index| initial_grant_gpa(frame_offset, index)),
             table_grants,
@@ -930,8 +931,6 @@ impl Cpl0Carrier {
                 root_generation: ContextGeneration::new(NonZeroU64::MIN),
             },
         )?;
-        self.custody
-            .retain_rollback_fault(inventory.rollback_fault());
         let outcome = (|| -> Result<(), TrapError> {
             inventory
                 .publish()
