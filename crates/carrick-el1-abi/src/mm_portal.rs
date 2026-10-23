@@ -156,7 +156,6 @@ impl MmPortalSlots {
         receipt: PortalOwnerWait,
     ) -> Result<PortalWaitEnrollment<'a, C>, carrick_sched_core::object_wait::ObjectWaitError> {
         use carrick_sched_core::object_wait::ObjectWaitError;
-        use carrick_sched_core::spaces::notification::SpaceWaitCause;
         let portal_region =
             (self as *const Self as usize).checked_sub(EL1_MM_PORTAL_OFFSET as usize);
         let zone_region = (zone as *const _ as usize).checked_sub(crate::EL1_ZONE_OFFSET as usize);
@@ -166,21 +165,7 @@ impl MmPortalSlots {
         {
             return Err(ObjectWaitError::Stale);
         }
-        let cause = match receipt.cause() {
-            PortalWaitCause::Editor => SpaceWaitCause::Editor,
-            PortalWaitCause::Reservations => SpaceWaitCause::Reservations,
-            PortalWaitCause::PendingEdit => SpaceWaitCause::PendingEdit,
-            PortalWaitCause::Gate => SpaceWaitCause::Gate,
-            PortalWaitCause::Metadata => SpaceWaitCause::Metadata,
-            PortalWaitCause::ReservationPool => return Err(ObjectWaitError::Stale),
-        };
-        let entry = zone
-            .space_entry(
-                NonZeroU64::new(receipt.handle().mm().raw()).ok_or(ObjectWaitError::Stale)?,
-            )
-            .ok_or(ObjectWaitError::Stale)?;
-        let source = entry.notifications(receipt.handle().incarnation())?;
-        Ok(PortalWaitEnrollment::new(source, cause, receipt.revision()))
+        PortalWaitEnrollment::for_owner(zone, receipt.handle(), receipt)
     }
     pub fn fork(&self, slot: usize) -> Option<&crate::PortalForkSlot> {
         self.forks.get(slot)
