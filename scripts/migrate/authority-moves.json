@@ -15,6 +15,11 @@
       "from": "carrick_kernel::dispatch::fs::directory::FsView<'a>::getdents64",
       "to": "carrick_kernel::dispatch::fs::directory::FsView<'a>::read_directory",
       "issue": 759
+    },
+    {
+      "from": "carrick_kernel::dispatch::mem::backing::MemView<'a>::snapshot_private_mmap_description",
+      "to": "carrick_kernel::dispatch::mem::backing::snapshot_private_mmap_description",
+      "issue": 783
     }
   ],
   "terminal_custody": []
