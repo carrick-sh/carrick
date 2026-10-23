@@ -1039,18 +1039,30 @@ pub fn owner_wait_cancellation(context: &KernelContext) -> Option<OwnerWaitCance
         && context.exact_thread_is_live()
     {
         // The host bridge wakes subscriptions before native ingress can run.
-        // Authenticate its fatal request against this exact process's live
-        // native members, including a sibling chosen as the bridge recipient.
-        // Claim only SIGKILL: handled signals and stops stay deferred, and the
-        // bridge retains delivery for native ingress. No topology or bridge
-        // lock survives into the bounded effect drain.
+        // Authenticate only this exact native recipient; a membership scan in
+        // every callback would make one nonfatal wake quadratic. Claim only
+        // SIGKILL, retaining delivery for native ingress.
         let bridge = context.kernel().host_signal();
         let kill = SigSet::EMPTY.with(crate::linux_abi::LINUX_SIGKILL);
-        if context.task().threads().iter().any(|thread| {
-            thread.control_slot().native_signal_owner()
-                && bridge.claim_pending_in_for(thread.registry_id().raw(), kill)
-        }) {
-            exit.publish_cancellation(ProcessCancellation::FatalSignal);
+        #[cfg(test)]
+        context
+            .kernel()
+            .native_owner_waits
+            .bridge_claims
+            .fetch_add(1, Ordering::Relaxed);
+        if bridge.claim_pending_in_for(context.thread().registry_id().raw(), kill) {
+            let publication = exit
+                .cancellation_authority()
+                .request(ProcessCancellation::FatalSignal);
+            // Drain with no bridge, topology or subscription lock held. The
+            // atomic publication elects one rebroadcast, including when two
+            // callbacks claim the same retained signal concurrently. Siblings
+            // checked earlier in the original fanout must see cancellation too.
+            if publication.publish(core::hint::spin_loop)
+                == carrick_core::cancellation::CancellationPublicationStatus::First
+            {
+                context.task().publish_wake_subscriptions();
+            }
         }
     }
     let cause = exit.cancellation()?;
@@ -1067,9 +1079,11 @@ pub fn owner_wait_cancellation(context: &KernelContext) -> Option<OwnerWaitCance
 /// Exact native owner waits which a native-signal host-work edge may notify.
 /// Ordinary syscall boundaries never walk this registry.
 #[derive(Debug, Default)]
-pub struct NativeOwnerWaitRegistry(
-    Mutex<std::collections::BTreeMap<ThreadKey, Vec<Weak<KernelContext>>>>,
-);
+pub struct NativeOwnerWaitRegistry {
+    waits: Mutex<std::collections::BTreeMap<ThreadKey, Vec<Weak<KernelContext>>>>,
+    #[cfg(test)]
+    pub(super) bridge_claims: std::sync::atomic::AtomicUsize,
+}
 
 #[derive(Debug)]
 pub struct NativeOwnerWaitRegistration {
@@ -1084,7 +1098,7 @@ impl NativeOwnerWaitRegistration {
         let registry = Arc::clone(&context.kernel().native_owner_waits);
         let context = Arc::new(context.retain_exact());
         registry
-            .0
+            .waits
             .lock()
             .entry(context.thread().key())
             .or_default()
@@ -1094,7 +1108,7 @@ impl NativeOwnerWaitRegistration {
 }
 impl Drop for NativeOwnerWaitRegistration {
     fn drop(&mut self) {
-        let mut waits = self.registry.0.lock();
+        let mut waits = self.registry.waits.lock();
         let key = self.context.thread().key();
         if let Some(entries) = waits.get_mut(&key) {
             entries.retain(|entry| entry.as_ptr() != Arc::as_ptr(&self.context));
@@ -1108,7 +1122,7 @@ impl Kernel {
     pub(crate) fn notify_native_owner_waits(&self) {
         let contexts = self
             .native_owner_waits
-            .0
+            .waits
             .lock()
             .values()
             .flatten()

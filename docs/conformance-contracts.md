@@ -1824,11 +1824,16 @@ exact lifecycle page's monotonic `CancellationAuthority`; signal delivery
 reservation and native dequeue cannot erase it. Native signal state binds the
 root or freshly admitted child page. Terminal custody consumes the obligation
 without clearing its cause. At owner-wait enrollment and task-wake edges,
-bridge SIGKILL eligibility is authenticated against the retained process's
-native members and promoted to that same authority before settlement. Native
-ingress retains signal delivery. The bridge witnesses cover two live parked
-members, a sibling-selected process signal and a thread-directed signal,
-without dependency release or signal polling; dequeue cannot undo cancellation.
+bridge SIGKILL eligibility is authenticated against the exact native recipient
+and promoted to that same authority before settlement. Native ingress retains
+signal delivery. The atomic publication elects one subscription rebroadcast so
+siblings checked earlier also observe cancellation. The bridge witnesses cover
+two live parked members, a sibling-selected process signal and a thread-directed
+signal, without dependency release or signal polling; dequeue cannot undo
+cancellation. Nonfatal wakes perform exactly one bridge query per parked member
+at populations 1, 8 and 32 (the initial membership scan measured 1, 64 and 1024).
+The core concurrent-publication model proves that only one caller owns the
+rebroadcast, even after terminal consumption.
 
 A validated fatal request atomically closes effect admission. Its typed
 publication drains existing bounded effects outside signal/topology locks,

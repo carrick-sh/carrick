@@ -7495,6 +7495,71 @@ fn group_stop_preserves_published_terminal_results() {
 }
 
 #[test]
+fn serial_host_bridge_nonfatal_owner_wake_has_linear_work() {
+    let mut observations = Vec::new();
+    for n in [1, 8, 32] {
+        let (kernel, root) = bootstrap(15_480);
+        root.thread()
+            .set_affinity(carrick_hal::CpuAffinity::from_words(&[1]));
+        let mut contexts = vec![root.retain_exact()];
+        for index in 1..n {
+            let plan = crate::kernel::ClonePlan::from_flags(
+                LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+            )
+            .unwrap();
+            contexts.push(
+                kernel
+                    .clone_thread(
+                        &root,
+                        plan,
+                        ThreadId::synthetic_for_tests(15_480 + index),
+                        None,
+                    )
+                    .unwrap(),
+            );
+        }
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(Arc::clone(&kernel))));
+        let mut registrations = Vec::new();
+        for context in &contexts {
+            let generation = publish(context, 0x802);
+            let custody = carrick_core::lifecycle::MemberControlCustody::retain(
+                context.thread().control_slot(),
+            )
+            .unwrap();
+            custody.commit_registration();
+            custody.commit_native_signal_owner();
+            let write = BlockedContinuation::from_killable_owner_zone_park(
+                capture(context, generation),
+                ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1),
+            );
+            let mut registration = service.prepare_registration(&write);
+            service.enroll(&mut registration).unwrap();
+            registrations.push((write, registration));
+        }
+        let before = kernel
+            .native_owner_waits
+            .bridge_claims
+            .load(Ordering::Relaxed);
+        carrick_signal_linux::publish_process_timer_signal(carrick_abi::LINUX_SIGALRM, None);
+        root.task().wake();
+        let work = kernel
+            .native_owner_waits
+            .bridge_claims
+            .load(Ordering::Relaxed)
+            - before;
+        let pending =
+            carrick_signal_linux::take_pending_event_for(root.thread().registry_id().raw());
+        assert_eq!(pending.unwrap().signum, carrick_abi::LINUX_SIGALRM);
+        observations.push((n as usize, work));
+    }
+    assert_eq!(
+        observations,
+        [(1, 1), (8, 8), (32, 32)],
+        "one nonfatal wake must query the bridge once per parked member"
+    );
+}
+
+#[test]
 fn serial_host_bridge_sigkill_wakes_two_native_owner_waiters() {
     for thread_directed in [false, true] {
         let (kernel, root) = bootstrap(15_470);
