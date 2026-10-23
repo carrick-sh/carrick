@@ -2,6 +2,7 @@
 //! Root admission adopts the existing execution incarnation as a local process
 //! incarnation; it does not import a host TaskSerial or launcher credentials.
 extern crate alloc;
+mod service;
 use super::{
     native_fork_refusal::{NativeForkStage, at_busy_site, busy},
     native_process_custody::{ProcessResources, ProcessWake, RetainedProcessCustody},
@@ -299,6 +300,11 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     type Mm: Clone;
     type PreparedMm;
     type Born;
+    /// Authenticate the admitted MM incarnation, never the address generation.
+    fn service_mm_handle(
+        &self,
+        mm: &Self::Mm,
+    ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError>;
     fn prepare_mm(
         &mut self,
         parent: &Self::Mm,
@@ -879,23 +885,229 @@ struct PendingSignalWait {
     channel: Arc<WaitChannel>,
     deadline: Option<carrick_guest_arch::Deadline>,
 }
+// One member cannot suspend on a signal and on external service at once.
+// Keep both in the same owner table, with one out-of-line continuation
+// allocation per waiting member. Tree nodes only move small custody handles.
+enum MemberWait<'a> {
+    Signal(PendingSignalWait),
+    Service(service::PendingService<'a>),
+}
+
+#[derive(Default)]
+struct MemberWaitState<'a> {
+    wait: Option<MemberWait<'a>>,
+    suspend_mask: Option<carrick_signal_core::policy::SigBlockMask>,
+}
+
+// Every continuation remains separately typed and keyed, while one tree
+// implementation serves process operations, terminal custody, and member waits.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum PendingKey {
+    Operation(TaskKey),
+    Exit(TaskKey),
+    Member(RecordRef),
+}
+enum PendingState<'a> {
+    Operation(PendingContinuation),
+    Exit(PendingExit<'a>),
+    Member(MemberWaitState<'a>),
+}
+#[derive(Default)]
+struct PendingTable<'a> {
+    rows: BTreeMap<PendingKey, Box<PendingState<'a>>>,
+}
+impl<'a> PendingTable<'a> {
+    #[inline(never)]
+    fn insert_row(&mut self, key: PendingKey, state: PendingState<'a>) {
+        self.rows.insert(key, Box::new(state));
+    }
+    #[inline(never)]
+    fn take_row(&mut self, key: &PendingKey) -> Option<PendingState<'a>> {
+        self.rows.remove(key).map(|row| *row)
+    }
+    fn get(&self, key: &TaskKey) -> Option<&PendingContinuation> {
+        match self.rows.get(&PendingKey::Operation(*key))?.as_ref() {
+            PendingState::Operation(pending) => Some(pending),
+            _ => unreachable!(),
+        }
+    }
+    fn contains_key(&self, key: &TaskKey) -> bool {
+        self.get(key).is_some()
+    }
+    fn insert(&mut self, key: TaskKey, pending: PendingContinuation) {
+        self.insert_row(PendingKey::Operation(key), PendingState::Operation(pending));
+    }
+    fn remove(&mut self, key: &TaskKey) -> Option<PendingContinuation> {
+        match self.take_row(&PendingKey::Operation(*key))? {
+            PendingState::Operation(pending) => Some(pending),
+            _ => unreachable!(),
+        }
+    }
+    fn exit(&self, key: &TaskKey) -> Option<&PendingExit<'a>> {
+        match self.rows.get(&PendingKey::Exit(*key))?.as_ref() {
+            PendingState::Exit(pending) => Some(pending),
+            _ => unreachable!(),
+        }
+    }
+    fn exit_mut(&mut self, key: &TaskKey) -> Option<&mut PendingExit<'a>> {
+        match self.rows.get_mut(&PendingKey::Exit(*key))?.as_mut() {
+            PendingState::Exit(pending) => Some(pending),
+            _ => unreachable!(),
+        }
+    }
+    fn has_exit(&self, key: &TaskKey) -> bool {
+        self.exit(key).is_some()
+    }
+    fn insert_exit(&mut self, key: TaskKey, pending: PendingExit<'a>) {
+        self.insert_row(PendingKey::Exit(key), PendingState::Exit(pending));
+    }
+    fn remove_exit(&mut self, key: &TaskKey) -> Option<PendingExit<'a>> {
+        match self.take_row(&PendingKey::Exit(*key))? {
+            PendingState::Exit(pending) => Some(pending),
+            _ => unreachable!(),
+        }
+    }
+    fn member(&self, record: &RecordRef) -> Option<&MemberWaitState<'a>> {
+        match self.rows.get(&PendingKey::Member(*record))?.as_ref() {
+            PendingState::Member(state) => Some(state),
+            _ => unreachable!(),
+        }
+    }
+    fn member_mut(&mut self, record: &RecordRef) -> Option<&mut MemberWaitState<'a>> {
+        match self.rows.get_mut(&PendingKey::Member(*record))?.as_mut() {
+            PendingState::Member(state) => Some(state),
+            _ => unreachable!(),
+        }
+    }
+    #[inline(never)]
+    fn member_state(&mut self, record: RecordRef) -> &mut MemberWaitState<'a> {
+        match self
+            .rows
+            .entry(PendingKey::Member(record))
+            .or_insert_with(|| Box::new(PendingState::Member(MemberWaitState::default())))
+            .as_mut()
+        {
+            PendingState::Member(state) => state,
+            _ => unreachable!(),
+        }
+    }
+    fn remove_member(&mut self, record: &RecordRef) {
+        self.take_row(&PendingKey::Member(*record));
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.rows
+            .keys()
+            .filter(|key| matches!(key, PendingKey::Operation(_)))
+            .count()
+    }
+}
+
 struct Graph<'a, M: Clone, C: ProcessContext> {
     owner: Owner<'a, M, C>,
     root_key: TaskKey,
     namespace: Arc<SpinLock<NamespaceState>>,
     visible_namespace: VisibleNamespace,
     serials: SerialAllocator,
-    pending: BTreeMap<TaskKey, PendingContinuation>,
-    pending_exit: BTreeMap<TaskKey, PendingExit<'a>>,
-    signal_waits: BTreeMap<RecordRef, PendingSignalWait>,
-    suspend_masks: BTreeMap<RecordRef, carrick_signal_core::policy::SigBlockMask>,
+    pending: PendingTable<'a>,
     _root_roles: NativeClaim,
     uts: carrick_personality_linux::sysinfo::LinuxUtsname,
     ipc: Arc<SpinLock<IpcNamespace>>,
 }
+impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
+    fn has_member_wait(&self, record: &RecordRef) -> bool {
+        self.pending
+            .member(record)
+            .is_some_and(|state| state.wait.is_some())
+    }
+
+    // Signal-mask restoration and external service share the same retained
+    // member row. Keep allocation/publication in one bounded slow path.
+    #[inline(never)]
+    fn member_wait_state(&mut self, record: RecordRef) -> &mut MemberWaitState<'a> {
+        self.pending.member_state(record)
+    }
+
+    #[inline(never)]
+    fn insert_member_wait(&mut self, record: RecordRef, wait: MemberWait<'a>) {
+        self.member_wait_state(record).wait = Some(wait);
+    }
+
+    #[inline(never)]
+    fn take_member_wait(&mut self, record: &RecordRef) -> Option<MemberWait<'a>> {
+        let state = self.pending.member_mut(record)?;
+        let wait = state.wait.take();
+        if state.suspend_mask.is_none() {
+            self.pending.remove_member(record);
+        }
+        wait
+    }
+
+    fn has_suspend_mask(&self, record: &RecordRef) -> bool {
+        self.pending
+            .member(record)
+            .is_some_and(|state| state.suspend_mask.is_some())
+    }
+
+    #[inline(never)]
+    fn insert_suspend_mask(
+        &mut self,
+        record: RecordRef,
+        mask: carrick_signal_core::policy::SigBlockMask,
+    ) -> Option<carrick_signal_core::policy::SigBlockMask> {
+        self.member_wait_state(record).suspend_mask.replace(mask)
+    }
+
+    #[inline(never)]
+    fn remove_suspend_mask(
+        &mut self,
+        record: &RecordRef,
+    ) -> Option<carrick_signal_core::policy::SigBlockMask> {
+        let state = self.pending.member_mut(record)?;
+        let mask = state.suspend_mask.take();
+        if state.wait.is_none() {
+            self.pending.remove_member(record);
+        }
+        mask
+    }
+
+    fn service_wait(&self, record: &RecordRef) -> Option<&service::PendingService<'a>> {
+        match self.pending.member(record)?.wait.as_ref()? {
+            MemberWait::Service(pending) => Some(pending),
+            MemberWait::Signal(_) => None,
+        }
+    }
+
+    fn remove_service_wait(&mut self, record: &RecordRef) -> Option<service::PendingService<'a>> {
+        self.service_wait(record)?;
+        match self.take_member_wait(record)? {
+            MemberWait::Service(pending) => Some(pending),
+            MemberWait::Signal(_) => unreachable!(),
+        }
+    }
+
+    fn remove_signal_wait(&mut self, record: &RecordRef) -> Option<PendingSignalWait> {
+        if !matches!(
+            self.pending.member(record)?.wait.as_ref(),
+            Some(MemberWait::Signal(_))
+        ) {
+            return None;
+        }
+        match self.take_member_wait(record)? {
+            MemberWait::Signal(pending) => Some(pending),
+            MemberWait::Service(_) => unreachable!(),
+        }
+    }
+}
 impl<'a, M: Clone, C: ProcessContext> Drop for Graph<'a, M, C> {
     fn drop(&mut self) {
-        NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(self.suspend_masks.len(), Ordering::Release);
+        NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(
+            self.pending.rows
+                .values()
+                .filter(|state| matches!(state.as_ref(), PendingState::Member(member) if member.suspend_mask.is_some()))
+                .count(),
+            Ordering::Release,
+        );
     }
 }
 pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
@@ -1356,7 +1568,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         // Every refusing check precedes publication under both owner guards.
         // An adopted receipt is the slot's birth identity: renewing the
         // execution binding leaves the receipt Closing owes unchanged.
-        if let Some(pending) = graph.pending_exit.get_mut(&process) {
+        if let Some(pending) = graph.pending.exit_mut(&process) {
             if pending.outstanding.iter().any(|receipt| {
                 matches!(receipt, OutstandingExitReceipt::Adopted { birth, control: expected }
                     if core::ptr::eq(expected.control(), control) && *birth != host_identity)
@@ -1477,7 +1689,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let Ok(row) = graph.owner.task(member.process) else {
             return true;
         };
-        if graph.suspend_masks.contains_key(&record)
+        if graph.has_suspend_mask(&record)
             || row
                 .native()
                 .resources()
@@ -1646,6 +1858,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let signals = resources.signals().clone();
         let channel = resources.channel.clone();
         let wake_record = member.record;
+        let service_runtime = member.runtime.clone();
         let info = match event.source() {
             carrick_el1_abi::ExternalSignalSource::IntervalTimer => Some(
                 carrick_syscall_abi::LinuxSiginfo::kernel(event.signal().number()),
@@ -1702,6 +1915,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             )?;
         }
         if interrupt {
+            service_runtime.cancel_service(wake_record, publishing_slot, service)?;
             request_signal_reschedule(zone, service, wake_record);
         }
         if let Some(channel) = channel {
@@ -2004,7 +2218,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 });
             }
             row.native().resources().sync_non_interrupting_signals();
-            graph.pending_exit.contains_key(&process)
+            graph.pending.has_exit(&process)
         };
         state.members.insert(
             key,
@@ -2665,10 +2879,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 namespace: ns,
                 visible_namespace,
                 serials,
-                pending: BTreeMap::new(),
-                pending_exit: BTreeMap::new(),
-                signal_waits: BTreeMap::new(),
-                suspend_masks: BTreeMap::new(),
+                pending: PendingTable::default(),
                 _root_roles: root_roles,
                 uts,
                 ipc,
@@ -2754,8 +2965,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
         let owner_continuation = graph
-            .pending_exit
-            .get(&key)
+            .pending
+            .exit(&key)
             .is_some_and(|pending| core::ptr::eq(pending.caller.control(), control));
         drop(graph);
         Ok(NativeProcessEntry {
@@ -2911,8 +3122,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
         let owner_continuation = graph
-            .pending_exit
-            .get(&member.process)
+            .pending
+            .exit(&member.process)
             .is_some_and(|pending| core::ptr::eq(pending.caller.control(), member_control));
         drop(graph);
         Ok((
@@ -3070,7 +3281,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         let Ok(row) = graph.owner.task(self.key) else {
             return true;
         };
-        if graph.suspend_masks.contains_key(&self.record)
+        if graph.has_suspend_mask(&self.record)
             || row
                 .native()
                 .resources()
@@ -3306,6 +3517,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     // retain their pending signals until their owner resumes; an IPI does not
     // cancel their operation or release its queue/timer custody.
     fn interrupt_signal_record(&mut self, record: RecordRef) {
+        if let Err(error) = self
+            .runtime
+            .cancel_service(record, self.source.slot, self.service)
+        {
+            self.run_failure = Some(error.run_failure_reason());
+        }
         request_signal_reschedule(self.source.zone, self.service, record);
     }
 
@@ -3459,6 +3676,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
     /// Publish a synchronous fault payload through this exact process owner.
+    #[inline(never)]
     pub fn force_sigsegv_info(
         &mut self,
         blocked: carrick_signal_core::policy::SigBlockMask,
@@ -3504,6 +3722,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         observed: carrick_sched_core::process::wait::TaskWakeGeneration,
         deadline: Option<carrick_guest_arch::Deadline>,
     ) -> Result<bool, NativeProcessError> {
+        if self.runtime.graph.lock().has_member_wait(&self.record) {
+            return Err(NativeProcessError::Busy);
+        }
         let zone = self.source.zone;
         let record = zone
             .slot(self.source.slot)
@@ -3533,13 +3754,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             })?;
         // SAFETY: this exact record is still authenticated OnCpu under its bucket guard.
         unsafe { *zone.record(record).ctx_mut() = *self.words };
-        self.runtime.graph.lock().signal_waits.insert(
+        self.runtime.graph.lock().insert_member_wait(
             self.record,
-            PendingSignalWait {
+            MemberWait::Signal(PendingSignalWait {
                 kind,
                 channel,
                 deadline,
-            },
+            }),
         );
         let receipt = carrick_core::entry::publish_handoff_park(
             start,
@@ -3547,7 +3768,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             carrick_el1_abi::EntryRecordGeneration(sequence),
         );
         if receipt.is_none() {
-            self.runtime.graph.lock().signal_waits.remove(&self.record);
+            self.runtime.graph.lock().remove_signal_wait(&self.record);
             zone.cancel_timer_admission(self.record);
             return Err(NativeProcessError::Busy);
         }
@@ -3619,7 +3840,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// The execution lane calls this before returning a woken saved syscall to
     /// userspace. It consumes the retained wait operation instead of replaying it.
     pub fn resume_pending_wait(&mut self) -> Option<LifecycleOutcome> {
-        let signal_wait = self.runtime.graph.lock().signal_waits.remove(&self.record);
+        let signal_wait = self.runtime.graph.lock().remove_signal_wait(&self.record);
         if let Some(pending) = signal_wait {
             return Some(match self.resume_signal_wait(pending) {
                 Ok(outcome) => outcome,
@@ -4116,8 +4337,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .runtime
             .graph
             .lock()
-            .pending_exit
-            .get(&self.key)
+            .pending
+            .exit(&self.key)
             .filter(|pending| core::ptr::eq(pending.caller.control(), self.control))
             .map(|p| (p.status, p.entry));
         if let Some((status, entry)) = status {
@@ -4168,6 +4389,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn resume_checkpoint(
         &mut self,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+        if let Some(result) = self.resume_service() {
+            match result.map_err(NativeProcessError::run_failure_reason)? {
+                NativeResume::NoPending => {}
+                NativeResume::Left(status) => {
+                    if self.take_handoff_receipt().is_none() {
+                        return Ok(NativeResume::Invalid);
+                    }
+                    return Ok(NativeResume::Left(status));
+                }
+                resumed => return Ok(resumed),
+            }
+        }
         // CLONE_CHILD_SETTID is an effect in the child's MM. The selected
         // record now owns that MM, and no EL0 instruction has resumed yet.
         let pending = {
@@ -4255,7 +4488,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // before enrollment needs no wake; a later settlement owns our wake.
         let (is_owner, ready) = {
             let graph = self.runtime.graph.lock();
-            let pending = graph.pending_exit.get(&self.key);
+            let pending = graph.pending.exit(&self.key);
             let is_owner = pending
                 .is_some_and(|pending| core::ptr::eq(pending.caller.control(), self.control));
             let ready = pending.is_some_and(|pending| pending.ready_or_record(page, is_owner));
@@ -4356,11 +4589,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut member_notification = None;
         let (page, channel, first_close) = {
             let mut graph = self.runtime.graph.lock();
-            let first_close = !graph.pending_exit.contains_key(&self.key);
+            let first_close = !graph.pending.has_exit(&self.key);
             let is_owner = first_close
                 || graph
-                    .pending_exit
-                    .get(&self.key)
+                    .pending
+                    .exit(&self.key)
                     .is_some_and(|pending| core::ptr::eq(pending.caller.control(), self.control));
             let row = graph
                 .owner
@@ -4593,7 +4826,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 let wake = Some(ExitWakeCustody {
                     channel: channel.clone(),
                 });
-                graph.pending_exit.insert(
+                graph.pending.insert_exit(
                     self.key,
                     PendingExit {
                         status: wait_status,
@@ -4644,8 +4877,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             (
                 page,
                 graph
-                    .pending_exit
-                    .get(&self.key)
+                    .pending
+                    .exit(&self.key)
                     .ok_or(NativeProcessError::Quarantined)?
                     .channel
                     .clone(),
@@ -4661,6 +4894,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
         if first_close {
+            let service_records: Vec<_> = {
+                let graph = self.runtime.graph.lock();
+                graph
+                    .owner
+                    .task(self.key)
+                    .map_err(|_| NativeProcessError::Quarantined)?
+                    .native()
+                    .resources()
+                    .members
+                    .iter()
+                    .map(|member| member.record)
+                    .collect()
+            };
+            for record in service_records {
+                self.runtime
+                    .cancel_service(record, self.source.slot, self.service)?;
+            }
             // Closing requests host retirement; it does not retire live zone
             // records. A deferred control wake is owned by that record's vCPU
             // or producer until its handback reaches the host continuation.
@@ -4716,8 +4966,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let attempt = {
                 let mut graph = self.runtime.graph.lock();
                 let pending = graph
-                    .pending_exit
-                    .get_mut(&self.key)
+                    .pending
+                    .exit_mut(&self.key)
                     .ok_or(NativeProcessError::Quarantined)?;
                 let receipts = pending.completed_receipts(page);
                 let custody = pending
@@ -4844,7 +5094,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(published) => published,
                 Err(_) => return Err(NativeProcessError::Quarantined),
             };
-            graph.pending_exit.remove(&self.key);
+            graph.pending.remove_exit(&self.key);
             (page, file_table, resources, published)
         };
         let record = self
@@ -5577,6 +5827,35 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.service.quarantine_born(born);
             return Err(NativeProcessError::Quarantined);
         }
+        let child_mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(child_key)
+            .map_err(|_| NativeProcessError::Quarantined)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        let handle = self.service.service_mm_handle(&child_mm)?;
+        let service_wait = carrick_sched_core::object_wait::ObjectWaitKey::native_service(
+            self.source.zone.record_ref(record),
+        )
+        .ok_or(NativeProcessError::Stale)?;
+        self.source
+            .zone
+            .bind_object_wait(service_wait, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| NativeProcessError::Quarantined)?;
+        control
+            .service
+            .bind(carrick_core_abi::service::ServiceBirth {
+                process: child_key,
+                thread: carrick_core_abi::EntryThreadGeneration::from_raw(thread_serial.get()),
+                record: self.source.zone.record_ref(record),
+                mm: handle,
+            })
+            .map_err(|_| NativeProcessError::Quarantined)?;
         if let Some(registry) = *self.runtime.registry.lock() {
             registry
                 .register_child(
@@ -5717,14 +5996,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         let wake = {
             let mut graph = self.runtime.graph.lock();
-            if graph.pending_exit.contains_key(&self.key) {
+            if graph.pending.has_exit(&self.key) {
                 let page = graph
                     .owner
                     .task(self.key)
                     .map_err(|_| NativeProcessError::Quarantined)
                     .map(|row| row.native().resources().page);
                 page.map(|page| {
-                    let ready = graph.pending_exit.get(&self.key).is_some_and(|pending| {
+                    let ready = graph.pending.exit(&self.key).is_some_and(|pending| {
                         pending.custody.as_ref().is_some_and(|custody| {
                             pending
                                 .completed_receipts(page)
@@ -5733,8 +6012,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                     });
                     if ready {
                         graph
-                            .pending_exit
-                            .get_mut(&self.key)
+                            .pending
+                            .exit_mut(&self.key)
                             .and_then(|pending| pending.wake.take())
                     } else {
                         None
@@ -7501,8 +7780,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .runtime
             .graph
             .lock()
-            .suspend_masks
-            .insert(self.record, original)
+            .insert_suspend_mask(self.record, original)
             .is_none()
         {
             NATIVE_SIGNAL_CONTINUATIONS.fetch_add(1, Ordering::Release);
@@ -7538,8 +7816,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .runtime
                         .graph
                         .lock()
-                        .suspend_masks
-                        .remove(&self.record)
+                        .remove_suspend_mask(&self.record)
                         .is_some()
                     {
                         NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(1, Ordering::Release);
@@ -7550,7 +7827,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
     fn take_suspend_mask(&mut self) -> Option<carrick_signal_core::policy::SigBlockMask> {
-        let old = self.runtime.graph.lock().suspend_masks.remove(&self.record);
+        let old = self.runtime.graph.lock().remove_suspend_mask(&self.record);
         if old.is_some() {
             NATIVE_SIGNAL_CONTINUATIONS.fetch_sub(1, Ordering::Release);
         }
@@ -9617,13 +9894,7 @@ mod tests {
         assert!(
             matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == -11)
         );
-        assert!(
-            !runtime
-                .graph
-                .lock()
-                .signal_waits
-                .contains_key(&entry.record)
-        );
+        assert!(runtime.graph.lock().pending.member(&entry.record).is_none());
         assert!(zone.timer_owner(slot).is_none());
         if default_stop {
             assert!(
@@ -10182,8 +10453,8 @@ mod tests {
             let channel = runtime
                 .graph
                 .lock()
-                .pending_exit
-                .get(&entry.key)
+                .pending
+                .exit(&entry.key)
                 .unwrap()
                 .channel
                 .clone();
@@ -10221,8 +10492,8 @@ mod tests {
                 let channel = runtime
                     .graph
                     .lock()
-                    .pending_exit
-                    .get(&entry.key)
+                    .pending
+                    .exit(&entry.key)
                     .unwrap()
                     .channel
                     .clone();
@@ -13655,6 +13926,24 @@ mod tests {
         type Mm = AddressContext<RootGpa>;
         type PreparedMm = AddressContext<RootGpa>;
         type Born = AddressContext<RootGpa>;
+        fn service_mm_handle(
+            &self,
+            mm: &Self::Mm,
+        ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+            self.zone
+                .spaces
+                .find(mm.mm.raw().get())
+                .ok_or(NativeProcessError::Stale)?;
+            // SAFETY: this test venue owns these never-reused synthetic MM roots.
+            Ok(unsafe {
+                carrick_core_abi::El1MmHandle::from_admitted_owner(
+                    NonZeroU64::MIN,
+                    carrick_core_abi::ReservationMm::new(mm.mm.raw().get())
+                        .ok_or(NativeProcessError::Stale)?,
+                    NonZeroU64::MIN,
+                )
+            })
+        }
 
         fn prepare_mm(
             &mut self,

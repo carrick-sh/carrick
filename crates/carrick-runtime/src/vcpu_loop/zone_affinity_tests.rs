@@ -23,6 +23,12 @@ impl<'a> NativeProcessService<'a, Words> for NoPhysicalCrossings {
     type Mm = Address;
     type PreparedMm = Address;
     type Born = Address;
+    fn service_mm_handle(
+        &self,
+        _: &Address,
+    ) -> Result<carrick_el1_abi::El1MmHandle, NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
     fn prepare_mm(
         &mut self,
         _: &Address,

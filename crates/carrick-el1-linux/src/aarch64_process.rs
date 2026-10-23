@@ -142,7 +142,15 @@ pub(super) fn resume_selected<'a, X: ForkStockCrossing>(
     task.publish_visible_pid(visible_pid);
     task.publish_root_generation(address.generation);
     let mut entry = {
-        let words = Box::new(*context);
+        // Copy directly into heap storage: materializing the full parked
+        // context here retains another context-sized frame across wait copy.
+        let mut words = Box::<Aarch64ParkedContext>::new_uninit();
+        // SAFETY: the selected record is exclusively held, its context is
+        // initialized and Copy, and this allocation is distinct from it.
+        let words = unsafe {
+            core::ptr::copy_nonoverlapping(context, words.as_mut_ptr(), 1);
+            words.assume_init()
+        };
         #[cfg(target_os = "none")]
         drain_native_signal_ingress(owner_registry, source, service);
         runtime
@@ -1024,6 +1032,17 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     // paths; by value each move held another copy on the EL1 stack (#705).
     type PreparedMm = Box<Prepared<'a>>;
     type Born = Born;
+    fn service_mm_handle(
+        &self,
+        mm: &Mm,
+    ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+        self.portal()?
+            .admitted_handle(
+                ReservationMm::new(mm.mm.raw().get()).ok_or(NativeProcessError::Stale)?,
+                u32::from(self.slot.raw()),
+            )
+            .map_err(|_| NativeProcessError::Stale)
+    }
 
     /// The HVC root exit crossing becomes the host's whole-process terminal
     /// (`TrapError::NativeRootExit`), which ends every host and zone thread.

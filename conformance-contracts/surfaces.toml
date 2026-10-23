@@ -1769,3 +1769,15 @@ contracts = ["kernel.scheduler.runnable-progress"]
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/image_layout_tests.rs"
 contracts = ["kernel.fork.stage1-image", "kernel.el1.metadata-allocation", "kernel.mm.image-page-permissions"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/service.rs"
+contracts = ["kernel.scheduler.runnable-progress"]
+
+[[surfaces]]
+path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs"
+contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-child"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/metadata_grant/native_service.rs"
+contracts = ["kernel.scheduler.runnable-progress"]

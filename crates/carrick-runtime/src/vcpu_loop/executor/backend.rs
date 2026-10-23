@@ -33,7 +33,7 @@ use carrick_kernel::kernel::objects::{
     ExecutionFailure, ExecutionGeneration, ExecutorId, ThreadExecutionLease, ThreadKey,
 };
 use carrick_kernel::kernel::{Scheduler, SchedulerError};
-pub use residency::*;
+pub use residency::{ResidencyGeneration, TaskCpuResidency};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct HvpatchPersistentExecutorFactory {
@@ -599,19 +599,37 @@ pub(crate) trait PersistentExecutor: 'static {
 }
 
 /// How an executor's wait in the guest ended ([`PersistentExecutor::wait_in_guest`]).
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
+#[derive(Debug)]
 pub(crate) enum GuestIdleExit {
     /// The vCPU left for the host: host work (a control request, a kick), or
     /// a queued thread that needs this executor.
     Idle,
+    /// A parked native continuation; physical backing custody survives the lane.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    Service(carrick_vmm_hvf::metadata_grant::NativeService),
     /// No guest scheduler on this backend or carrier.
     Unsupported,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn finish_native_service(
+    service: carrick_vmm_hvf::metadata_grant::NativeService,
+    kernel: &carrick_kernel::kernel::Kernel,
+) -> Result<(), TrapError> {
+    let effects = if matches!(
+        service.request().operation,
+        carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
+    ) {
+        let doorbell = carrick_el1_abi::take_host_work_doorbell(usize::from(service.slot().raw()));
+        carrick_kernel::el1_delegation::settle_host_work_boundary(kernel, true, doorbell);
+        service.acknowledge_work()?
+    } else {
+        service.refuse()?
+    };
+    for target in effects.sgi_slots() {
+        carrick_kernel::el1_zone::resched_slot(target);
+    }
+    Ok(())
 }
 
 pub struct ExactHardwareKick {
@@ -953,7 +971,15 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             .current
             .as_mut()
             .ok_or_else(|| TrapError::Hypervisor("HVPatch executor lost loaded engine".into()))?;
-        Ok(quantum.poll_quantum_with_engine(engine, &mut control))
+        let exit = quantum.poll_quantum_with_engine(engine, &mut control);
+        if let Some(slot) = carrick_hal::ThreadedEngine::mailbox_slot(engine)
+            .and_then(carrick_el1_abi::SlotId::from_index)
+            && let Some(service) =
+                carrick_vmm_hvf::hvf_aarch64_engine::take_worker_native_service(engine.vm(), slot)?
+        {
+            finish_native_service(service, submission.scheduler.kernel())?;
+        }
+        Ok(exit)
     }
 
     fn take_cpu_receipt(&mut self) -> ExecutorCpuReceipt {
@@ -1386,10 +1412,8 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         if let Ok(ref outcome) = exit
             && !matches!(outcome, carrick_aarch64::Aarch64Exit::Halt)
         {
-            // The idle executor has no host graph thread to service an EL0
-            // exit. Preserve the stopped native record and syndrome before
-            // the worker returns its error; the next capture can distinguish
-            // a COW miss, translation fault, and host-only syscall.
+            // Preserve the raw exit before taking an owned service notice.
+            // This also diagnoses exits without an authenticated continuation.
             let record = zone.slot(slot).current();
             let native_owned = record.is_some_and(|id| zone.record(id).is_native_owned());
             let (kind, syndrome, far) = match outcome {
@@ -1410,6 +1434,12 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 syndrome,
                 far,
             );
+        }
+        if let Some(service) =
+            carrick_vmm_hvf::hvf_aarch64_engine::take_worker_native_service(lifecycle, slot)?
+        {
+            exit?;
+            return Ok(GuestIdleExit::Service(service));
         }
         match exit? {
             carrick_aarch64::Aarch64Exit::Halt => Ok(GuestIdleExit::Idle),

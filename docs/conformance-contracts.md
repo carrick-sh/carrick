@@ -265,6 +265,32 @@ establish absence of the hang under a successful fork. Signed acceptance
 of both properties remains open.
 
 `kernel.scheduler.runnable-progress` also covers pool admission and guest CPU affinity.
+Native service custody extends this contract: two real fork children can publish
+simultaneous requests through the fixture's sole execution slot. Each park must
+release that slot. The witness rejects a stale execution generation, cancels one
+request before physical acknowledgment, completes the other first, and requires
+one ring consumption per request before its terminal claim is released. A member
+retains at most one signal or service wait in the shared continuation table;
+one retained member allocation also preserves a saved signal mask after its
+wait completes, until signal delivery consumes that mask. Host
+records retain backing and observe exact identities; they do not adopt children
+into another process graph. Intake reuses the birth-bound MM identity even
+when another admitted participant holds the reservation root. The bindings include
+`native_service_intake_does_not_reacquire_the_busy_mm_root` and
+`two_native_children_service_waits_release_the_only_execution_slot` in
+`carrick-el1-linux`. Its companion cases preserve a completed result through
+cancellation, retry an effect-free syscall with its original arguments, and
+resume an interrupted instruction without changing its registers. The shared
+personality receipt distinguishes effect-free deferral from a metadata commit
+already owed. The runtime binding
+`native_service_waits_do_not_exhaust_the_default_executor_pool` uses the real
+native owner with four fork children and the default one-CPU pool (one bound
+worker, two spares). All four requests must park before any acknowledgment;
+no child gets a host task binding, and every worker must join. Its physical-idle
+test adapter does not exercise HVF metadata pin intake. Fault supply and signed
+child syscall acceptance require separate witnesses. Unsupported native requests return to the ring for its errno
+or signal decision; no generic host syscall dispatcher is introduced.
+
 Linux authority: `sched_setaffinity(2)` restricts a runnable thread to the
 allowed CPUs; `sched_getaffinity(2)` and `nproc` must describe CPUs that can
 execute it. Every scheduler CPU requires at least one bound executor; spares
@@ -311,10 +337,14 @@ this to production x86 fork, idle-peer migration and child MM retirement with
 unpublished topology. Published masks still follow Linux fork inheritance;
 empty `sched_setaffinity` requests remain invalid. Signed execution remains
 director-owned.
-For ARM native fork, `arm_native_fork_child_runs_after_parent_host_handoff`
+For ARM native fork, `arm_native_fork_child_reinstalls_mm_after_service_ack`
 binds the same runnable-progress contract after the parent has left its host
 continuation: the forked record must enter through an idle executor with no
-host task and dispatch its first child syscall. The signed shell and exec
+host task, park for service, and resume the same child after acknowledgment.
+The witness models idle entry resetting TTBRs to the carrier root and requires
+exactly one child-root installation before its first child syscall. Service
+park switches to the maintenance root before releasing installed occupancy.
+The signed shell and exec
 probe remain the execution-layer binding.
 
 `kernel.executor.empty-host-steal` covers an executor seeking host-runnable

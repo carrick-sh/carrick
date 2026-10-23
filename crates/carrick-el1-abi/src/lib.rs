@@ -49,8 +49,8 @@ pub use carrick_core_abi::{
 };
 pub use carrick_core_abi::{entry::*, lifecycle::*, mm::*, wait::*};
 pub use carrick_personality_linux::abi::entry::{
-    HostWorkDoorbell, LinuxTaskMetadata, LinuxTaskState, SERVED_COMMIT_OWED, SERVED_WAKES_OWED,
-    ServedBoundary,
+    HostWorkDoorbell, LinuxTaskMetadata, LinuxTaskState, SERVED_COMMIT_OWED, SERVED_FORWARD_WORK,
+    SERVED_WAKES_OWED, ServedBoundary,
 };
 pub use mm_portal::*;
 pub use mm_portal_fork::*;
@@ -800,6 +800,10 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(CurrentTask, metadata.lifecycle_page) as u64,
         core::mem::offset_of!(CurrentTask, metadata.control_slot) as u64,
         core::mem::offset_of!(CurrentTask, root_generation) as u64,
+        core::mem::offset_of!(CurrentTask, service_notice) as u64,
+        carrick_core_abi::service::NATIVE_SERVICE_PROTOCOL,
+        core::mem::size_of::<carrick_core_abi::service::ServiceNotice>() as u64,
+        core::mem::size_of::<carrick_core_abi::service::ServiceCell>() as u64,
         core::mem::size_of::<MetadataGrantMailbox>() as u64,
         core::mem::align_of::<MetadataGrantMailbox>() as u64,
         core::mem::offset_of!(MetadataGrantMailbox, request_generation) as u64,
@@ -953,17 +957,18 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         }
         i += 1;
     }
-    let aperture_facts = [
+    let boundary_facts = [
         EL1_APERTURE_CONTROL_OFFSET,
         core::mem::size_of::<ApertureControl>() as u64,
         core::mem::align_of::<ApertureControl>() as u64,
         core::mem::offset_of!(ApertureControl, control) as u64,
         APERTURE_CONTROL_ARM_RING_FIRST_OPT_OUT,
-        2, // control encoding: zero is strict; bit 3 opts out.
+        2,                          // control encoding: zero is strict; bit 3 opts out.
+        SERVED_FORWARD_WORK as u64, // effect-free retry differs from an owed commit.
     ];
     let mut a = 0;
-    while a < aperture_facts.len() {
-        let mut word = aperture_facts[a];
+    while a < boundary_facts.len() {
+        let mut word = boundary_facts[a];
         let mut b = 0;
         while b < 8 {
             hash ^= word & 0xff;
@@ -1196,7 +1201,7 @@ pub struct CurrentTask {
     pub mm: ExecutionMm,
     pub metadata: LinuxTaskMetadata,
     root_generation: AtomicU64,
-    _stride_padding: [u64; 4],
+    pub service_notice: carrick_core_abi::service::ServiceNotice,
 }
 
 pub const CURRENT_TASK_STRIDE_SHIFT: u32 = 7;
@@ -1231,7 +1236,7 @@ impl CurrentTask {
             mm: ExecutionMm::new(),
             metadata: LinuxTaskMetadata::new(),
             root_generation: AtomicU64::new(0),
-            _stride_padding: [0; 4],
+            service_notice: carrick_core_abi::service::ServiceNotice::new(),
         }
     }
 
@@ -3964,7 +3969,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x1b23e726423cc2ef);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xf7e02418d04b8b44);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
@@ -5529,14 +5534,21 @@ mod layout_manifest {
                      mm: _,
                      metadata: _,
                      root_generation: _,
-                     _stride_padding: _,
+                     service_notice: _,
                  }: CurrentTask| {};
         field!(CurrentTask, execution, ExecutionIdentity, 0, 16, 8);
         field!(CurrentTask, linux, LinuxTaskState, 16, 32, 8);
         field!(CurrentTask, mm, ExecutionMm, 48, 16, 8);
         field!(CurrentTask, metadata, LinuxTaskMetadata, 64, 24, 8);
         field!(CurrentTask, root_generation, AtomicU64, 88, 8, 8);
-        field!(CurrentTask, _stride_padding, [u64; 4], 96, 32, 8);
+        field!(
+            CurrentTask,
+            service_notice,
+            carrick_core_abi::service::ServiceNotice,
+            96,
+            32,
+            8
+        );
     }
 
     #[test]

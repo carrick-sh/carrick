@@ -32,7 +32,8 @@ const METADATA_WAIT_INDEX: usize = ADDRESS_SPACE_WAIT_BASE;
 const RESERVATION_POOL_WAIT_INDEX: usize = ADDRESS_SPACE_WAIT_BASE + 1 + spaces::ADDRESS_SPACES;
 pub const EXTRA_CAUSE_QUEUES: usize = 5 * spaces::ADDRESS_SPACES;
 const DELEGATED_FILE_WAIT_BASE: usize = ORIGINAL_OBJECT_WAIT_QUEUES + EXTRA_CAUSE_QUEUES;
-pub const OBJECT_WAIT_QUEUES: usize = DELEGATED_FILE_WAIT_BASE + DELEGATED_FILE_WAIT_QUEUES;
+const NATIVE_SERVICE_WAIT_BASE: usize = DELEGATED_FILE_WAIT_BASE + DELEGATED_FILE_WAIT_QUEUES;
+pub const OBJECT_WAIT_QUEUES: usize = NATIVE_SERVICE_WAIT_BASE + ZONE_RECORDS;
 
 // Every producer owns one disjoint index range. Keep this a compile-time gate
 // so adding a queue cannot silently alias another owner or its generation.
@@ -43,7 +44,8 @@ const _: () = {
         (ADDRESS_SPACE_WAIT_BASE + 1, RESERVATION_POOL_WAIT_INDEX),
         (RESERVATION_POOL_WAIT_INDEX, RESERVATION_POOL_WAIT_INDEX + 1),
         (ORIGINAL_OBJECT_WAIT_QUEUES, DELEGATED_FILE_WAIT_BASE),
-        (DELEGATED_FILE_WAIT_BASE, OBJECT_WAIT_QUEUES),
+        (DELEGATED_FILE_WAIT_BASE, NATIVE_SERVICE_WAIT_BASE),
+        (NATIVE_SERVICE_WAIT_BASE, OBJECT_WAIT_QUEUES),
     ];
     let mut i = 0;
     while i < domains.len() {
@@ -64,7 +66,7 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
-pub const OBJECT_WAIT_PROTOCOL: u64 = 11;
+pub const OBJECT_WAIT_PROTOCOL: u64 = 12;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
@@ -90,6 +92,8 @@ pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
         DELEGATED_FILE_WAIT_QUEUES as u64,
         core::mem::offset_of!(crate::ZoneTables, delegated_file_waits) as u64,
         core::mem::offset_of!(crate::ZoneTables, space_cause_waits) as u64,
+        core::mem::offset_of!(crate::ZoneTables, native_service_waits) as u64,
+        NATIVE_SERVICE_WAIT_BASE as u64,
         crate::spaces::SPACE_NOTIFICATION_LAYOUT_HASH,
         core::mem::size_of::<ObjectQueue>() as u64,
         core::mem::offset_of!(ObjectQueue, generation) as u64,
@@ -129,6 +133,18 @@ impl ObjectWaitKey {
         } else {
             Some(Self { index, generation })
         }
+    }
+
+    /// One native member owns one service queue across execution-slot reuse.
+    /// Its record incarnation separates this domain from recycled records.
+    pub const fn native_service(record: RecordRef) -> Option<Self> {
+        if record.incarnation == 0 {
+            return None;
+        }
+        Some(Self {
+            index: (NATIVE_SERVICE_WAIT_BASE + record.id.raw() as usize) as u32,
+            generation: record.incarnation,
+        })
     }
 
     /// Carrier metadata has its own queue, outside IPC's admitted indices.
@@ -806,6 +822,7 @@ const ADMISSION_RELEASED: u32 = 1 << 29;
 enum OperationDestination {
     Guest,
     Host,
+    Owner(OwnerEntry),
 }
 
 #[repr(C)]
@@ -882,6 +899,17 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for ObjectWaitGuard<'_, C
     }
 }
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
+    /// Observe the exact native member while its service queue serializes
+    /// intake against cancellation and consumption. This observation grants
+    /// no MM ownership; the member's service cell authenticates the request.
+    pub fn native_service_member(&self, record: RecordRef) -> Option<crate::ThreadIdentity> {
+        if ObjectWaitKey::native_service(record) != Some(self.key) {
+            return None;
+        }
+        let member = self.zone.live(record)?;
+        member.is_native_owned().then(|| member.identity())
+    }
+
     fn release_with(&self, mut before_unlock: impl FnMut()) {
         let queue = self.queue();
         let Some(completion) = self.completion else {
@@ -1133,6 +1161,26 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
         )
     }
 
+    /// Preserve native exception/syscall custody together with the operation
+    /// token. Cancellation must return this owner to its ring checkpoint.
+    pub fn park_owner_until(
+        &self,
+        snapshot: ObjectWaitSnapshot,
+        record: RecordId,
+        operation: OperationToken,
+        deadline: u64,
+        entry: OwnerEntry,
+    ) -> Result<(), (ObjectWaitError, OperationToken)> {
+        self.park_until_rechecked(
+            snapshot,
+            record,
+            operation,
+            deadline,
+            OperationDestination::Owner(entry),
+            || true,
+        )
+    }
+
     /// Recheck a nonblocking resource predicate after linking, before parking.
     /// The producer's revision is also checked after this predicate. A false
     /// result returns the same operation to its current execution owner.
@@ -1236,6 +1284,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
             match destination {
                 OperationDestination::Guest => 0,
                 OperationDestination::Host => OBJECT_HOST_CONTINUATION,
+                OperationDestination::Owner(OwnerEntry::Syscall) => OWNER_CONTINUATION,
+                OperationDestination::Owner(OwnerEntry::Exception) => {
+                    OWNER_CONTINUATION | OWNER_EXCEPTION_ENTRY
+                }
             },
             Ordering::Relaxed,
         );
@@ -1438,8 +1490,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             &self.object_waits[index]
         } else if index < DELEGATED_FILE_WAIT_BASE {
             &self.space_cause_waits[index - ORIGINAL_OBJECT_WAIT_QUEUES]
-        } else {
+        } else if index < NATIVE_SERVICE_WAIT_BASE {
             &self.delegated_file_waits[index - DELEGATED_FILE_WAIT_BASE]
+        } else {
+            &self.native_service_waits[index - NATIVE_SERVICE_WAIT_BASE]
         }
     }
 
@@ -1866,6 +1920,49 @@ mod host_tests {
         zone.bind_object_wait(key(1), &SpinForever).unwrap();
         zone.bind_object_wait(key(2), &SpinForever).unwrap();
         zone
+    }
+
+    #[test]
+    fn native_service_wake_preserves_exception_and_exact_operation() {
+        let zone = fixture(true);
+        let record = allocate(&zone, 101);
+        let record_ref = zone.record_ref(record);
+        let key = ObjectWaitKey::native_service(record_ref).unwrap();
+        zone.bind_object_wait(key, &SpinForever).unwrap();
+        let operation = OperationToken::new(u64::from(record.raw()), 19).unwrap();
+        {
+            let queue = zone.object_wait(key, &SpinForever).unwrap();
+            queue
+                .park_owner_until(
+                    queue.snapshot(),
+                    record,
+                    operation,
+                    0,
+                    OwnerEntry::Exception,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            zone.record(record).resume_disposition(),
+            ResumeDisposition::OwnerContinuation(OwnerEntry::Exception)
+        );
+        let queue = zone.object_wait(key, &SpinForever).unwrap();
+        let mut effects = crate::WakeEffects::default();
+        let report = queue.notify_object(SLOT, &mut effects).unwrap();
+        assert_eq!(report.visited, 1);
+        drop(queue);
+        assert_eq!(zone.switch_in(SLOT), Some(record));
+        assert_eq!(
+            zone.record(record).resume_disposition(),
+            ResumeDisposition::OwnerContinuation(OwnerEntry::Exception)
+        );
+        // SAFETY: switch_in gave this fixture exclusive OnCpu custody.
+        unsafe {
+            let completed = zone.record(record).take_object_operation().unwrap();
+            assert_eq!(completed.index(), u64::from(record.raw()));
+            assert_eq!(completed.generation(), 19);
+            assert!(zone.record(record).take_object_operation().is_none());
+        }
     }
 
     #[test]
@@ -2332,15 +2429,15 @@ mod host_tests {
         );
         assert_eq!(
             core::mem::offset_of!(ZoneTables, object_admission_handbacks),
-            core::mem::offset_of!(ZoneTables, delegated_file_waits)
-                + core::mem::size_of::<ObjectQueue>() * DELEGATED_FILE_WAIT_QUEUES
+            core::mem::offset_of!(ZoneTables, native_service_waits)
+                + core::mem::size_of::<ObjectQueue>() * ZONE_RECORDS
         );
         assert_eq!(
             core::mem::offset_of!(ZoneTables, delegated_host_pending)
                 - core::mem::offset_of!(ZoneTables, object_admission_handbacks),
             16 * OBJECT_WAIT_QUEUES
         );
-        assert_eq!(16 * OBJECT_WAIT_QUEUES, 166_912);
+        assert_eq!(16 * OBJECT_WAIT_QUEUES, 166_912 + 16 * ZONE_RECORDS);
         assert_eq!(DELEGATED_FILE_WAIT_QUEUES.div_ceil(64), 2);
     }
 

@@ -402,6 +402,17 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     type Mm = Mm;
     type PreparedMm = Prepared;
     type Born = Box<Born>;
+    fn service_mm_handle(
+        &self,
+        mm: &Mm,
+    ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+        portal()?
+            .admitted_handle(
+                ReservationMm::new(mm.mm.raw().get()).ok_or(NativeProcessError::Stale)?,
+                self.worker(),
+            )
+            .map_err(error)
+    }
     fn prepare_mm(
         &mut self,
         parent: &Mm,

@@ -3,6 +3,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const SERVED_WAKES_OWED: u32 = 1;
 pub const SERVED_COMMIT_OWED: u32 = 2;
+pub const SERVED_FORWARD_WORK: u32 = 3;
 
 #[repr(C, align(8))]
 #[derive(Debug)]
@@ -98,6 +99,9 @@ impl LinuxTaskState {
     pub fn take_served_boundary(&self) -> Option<ServedBoundary> {
         match self.served_with_work.swap(0, Ordering::AcqRel) {
             0 => None,
+            SERVED_FORWARD_WORK => Some(ServedBoundary::ForwardOriginal {
+                x0: self.orig_arg0.load(Ordering::Relaxed),
+            }),
             SERVED_COMMIT_OWED => Some(ServedBoundary::ReplayOriginal {
                 x0: self.orig_arg0.load(Ordering::Relaxed),
             }),
@@ -109,7 +113,13 @@ impl LinuxTaskState {
         self.served_with_work
             .fetch_max(SERVED_WAKES_OWED, Ordering::AcqRel);
     }
-    /// Only this Linux disposition permits original-argument replay.
+    /// No family made an effect; carrier work must settle before retrying.
+    pub fn record_forward_work(&self, original_argument0: u64) {
+        self.orig_arg0.store(original_argument0, Ordering::Relaxed);
+        self.served_with_work
+            .store(SERVED_FORWARD_WORK, Ordering::Release);
+    }
+    /// A family made an effect and still owes its metadata commit.
     pub fn record_commit_owed(&self, orig_arg0: u64) {
         self.orig_arg0.store(orig_arg0, Ordering::Relaxed);
         self.served_with_work
@@ -165,6 +175,9 @@ pub enum ServedBoundary {
     /// arguments: EL1 overwrote x0 with the result, so `x0` here is the
     /// argument 0 EL1 preserved. Never re-read x0 from the mutated frame.
     ReplayOriginal { x0: u64 },
+    /// No family made an effect. Retry the original instruction after carrier
+    /// work settles; unlike ReplayOriginal, no metadata commit is owed.
+    ForwardOriginal { x0: u64 },
 }
 
 /// Ordinal in the Linux personality's AArch64-shaped dispatch namespace.

@@ -184,7 +184,7 @@ fn test_dispatch_syscall_with_regions_entry_pending_work() {
     assert_eq!(action, Action::ServedWithWork);
     assert_eq!(
         tasks[0].linux.take_served_boundary(),
-        Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0: 3 })
+        Some(carrick_el1_abi::ServedBoundary::ForwardOriginal { x0: 3 })
     );
     assert_eq!(open_table[0].offset.load(Ordering::Relaxed), 10);
     assert_eq!(counters.served[62].load(Ordering::Relaxed), 0);

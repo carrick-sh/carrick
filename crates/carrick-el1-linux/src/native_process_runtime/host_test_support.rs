@@ -30,6 +30,25 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     type Mm = AddressContext<RootGpa>;
     type PreparedMm = AddressContext<RootGpa>;
     type Born = AddressContext<RootGpa>;
+    fn service_mm_handle(
+        &self,
+        mm: &Self::Mm,
+    ) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+        self.zone
+            .spaces
+            .find(mm.mm.raw().get())
+            .ok_or(NativeProcessError::Stale)?;
+        // SAFETY: this test venue owns these never-reused synthetic MM roots.
+        Ok(unsafe {
+            carrick_core_abi::El1MmHandle::from_admitted_owner(
+                NonZeroU64::MIN,
+                carrick_core_abi::ReservationMm::new(mm.mm.raw().get())
+                    .ok_or(NativeProcessError::Stale)?,
+                NonZeroU64::MIN,
+            )
+        })
+    }
+
     fn prepare_mm(
         &mut self,
         parent: &Self::Mm,
@@ -953,5 +972,237 @@ impl NativeOwnerSignalFixture {
         ));
         assert!(self.page.process_exit_custody().caller_reserved());
         assert!(entry.take_handoff_receipt().is_some());
+    }
+}
+
+/// Real native fork/service ownership for host executor-capacity tests. Only
+/// physical MM operations use `Physical`; no child receives a host task binding.
+pub struct NativeServiceCapacityFixture {
+    fixture: NativeSignalFixture,
+    pending: Vec<
+        carrick_core_abi::service::ServiceTicket<&'static carrick_core_abi::service::ServiceCell>,
+    >,
+    children: usize,
+}
+
+impl NativeServiceCapacityFixture {
+    pub fn new(children: usize) -> Self {
+        let fixture = NativeSignalFixture::new(
+            ExecutionBinding {
+                task: carrick_core_abi::EntryTaskKey::from_raw(7001),
+                generation: carrick_core_abi::SnapshotGeneration::INITIAL,
+                mm: carrick_core_abi::EntryMmKey::from_raw(1),
+                thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(1),
+            },
+            carrick_core_abi::EntryTaskKey::from_raw(7001),
+            carrick_core_abi::BirthSerial::of_task(TaskSerial::from_registry_allocation(
+                NonZeroU64::MIN,
+            )),
+        );
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        for _ in 0..children {
+            // Every process birth has its own lifecycle owner, just as the
+            // production fork stock does. Sharing one page hides exit bugs.
+            let mut service = fixture.service();
+            service.page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+            service.controls = Box::leak(Box::new(core::array::from_fn::<_, 9, _>(|_| {
+                ThreadControlSlot::new()
+            })));
+            let mut entry = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    source,
+                    fixture.task,
+                    fixture.address,
+                    &words(fixture.address),
+                    &mut service,
+                )
+                .unwrap();
+            assert!(
+                matches!(entry.fork(ProcessForkChildTid::NONE), LifecycleOutcome::Returned { result, .. } if result.raw() > 0)
+            );
+        }
+        let mut service = fixture.service();
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::MAX),
+                UserVa::new(0),
+                LinuxWaitOptions::empty(),
+                UserVa::new(0),
+            ),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+        drop(entry);
+        Self {
+            fixture,
+            pending: Vec::new(),
+            children,
+        }
+    }
+
+    fn select(&self) -> Option<(RecordRef, AddressContext<RootGpa>, ParkedContextWords)> {
+        let fixture = &self.fixture;
+        let selected = fixture.zone.switch_in_full(fixture.slot)?;
+        let record = fixture.zone.record_ref(selected.record);
+        let identity = fixture.zone.record(selected.record).identity();
+        let key = fixture
+            .registry
+            .state
+            .lock()
+            .members
+            .values()
+            .find(|member| member.record == record)
+            .unwrap()
+            .process;
+        let address = fixture.runtime.task_binding(key).unwrap().address;
+        fixture
+            .zone
+            .install_space(fixture.slot, identity.mm)
+            .unwrap();
+        fixture.task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(identity.tid as i32),
+            carrick_core_abi::SnapshotGeneration::from_raw(identity.generation),
+            identity.file_table,
+        );
+        fixture.task.mm.key.store(identity.mm, Ordering::Release);
+        fixture
+            .task
+            .mm
+            .thread_generation
+            .store(identity.serial, Ordering::Release);
+        fixture.task.publish_visible_pid(key.id.raw() as u32);
+        fixture
+            .task
+            .publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+        // SAFETY: the selected exact record is OnCpu on the fixture's only slot.
+        Some((record, address, unsafe {
+            *fixture.zone.record(selected.record).ctx_mut()
+        }))
+    }
+
+    /// One guest idle quantum. The caller retains no execution capacity after
+    /// this returns; all outstanding tickets remain owned by this fixture.
+    pub fn park_next(&mut self) -> Option<usize> {
+        use carrick_core_abi::service::{ServiceCell, ServiceOperation};
+        let (record, address, words) = self.select()?;
+        let fixture = &self.fixture;
+        assert!(fixture.zone.record(record.id).is_native_owned());
+        let identity = fixture.zone.record(record.id).identity();
+        let mut service = fixture.service();
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                address,
+                &words,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.resume_checkpoint().unwrap(),
+            NativeResume::NoPending
+        ));
+        assert!(matches!(
+            entry
+                .begin_service(ServiceOperation::CarrierWork {
+                    entry: carrick_sched_core::object_wait::OwnerEntry::Syscall,
+                })
+                .unwrap(),
+            NativeResume::Left(None)
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+        assert!(fixture.zone.slot(fixture.slot).current().is_none());
+        let notice = fixture.task.service_notice.take().unwrap().unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(
+                carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap(),
+                &carrick_sched_core::ShortLockSpin,
+            )
+            .unwrap();
+        assert_eq!(queue.native_service_member(record), Some(identity));
+        // SAFETY: the real native owner retains this exact control allocation;
+        // the service queue authenticates the notice and excludes cancellation.
+        let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+        let ticket = unsafe {
+            ServiceCell::claim_notice(&control.service, notice, NonZeroU64::MIN, identity)
+        }
+        .unwrap();
+        self.pending.push(ticket);
+        Some(self.pending.len())
+    }
+
+    pub fn outstanding(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn acknowledge_and_retire(&mut self) {
+        assert_eq!(self.pending.len(), self.children);
+        let fixture = &self.fixture;
+        for ticket in self.pending.drain(..) {
+            let record = ticket.request().identity.birth.record;
+            let queue = fixture
+                .zone
+                .object_wait(
+                    carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap(),
+                    &carrick_sched_core::ShortLockSpin,
+                )
+                .unwrap();
+            assert!(ticket.complete(true).is_ok());
+            queue
+                .notify_object(fixture.slot, &mut WakeEffects::default())
+                .unwrap();
+        }
+        for _ in 0..self.children {
+            let (record, address, words) = self.select().unwrap();
+            let fixture = &self.fixture;
+            assert!(fixture.zone.record(record.id).is_native_owned());
+            let mut service = fixture.service();
+            let mut entry = fixture
+                .runtime
+                .enter_registered(
+                    fixture.registry,
+                    BornInZoneSource {
+                        zone: fixture.zone,
+                        slot: fixture.slot,
+                    },
+                    fixture.task,
+                    address,
+                    &words,
+                    &mut service,
+                )
+                .unwrap();
+            assert!(matches!(
+                entry.resume_checkpoint().unwrap(),
+                NativeResume::NoPending
+            ));
+            let waiting = fixture.runtime.graph.lock().has_member_wait(&record);
+            assert!(!waiting);
+            assert!(matches!(
+                entry.exit_group(0),
+                LifecycleOutcome::Transferred { .. }
+            ));
+        }
     }
 }

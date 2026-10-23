@@ -1994,6 +1994,17 @@ pub fn invalidate_worker_asid(
     Aarch64EngineCore::<HvfAarch64Vmm>::invalidate_asid_on_vcpu(vcpu, asid, carrier_root)
 }
 
+/// Take the ring's exact owned request after the idle lane has parked it.
+pub fn take_worker_native_service(
+    vmm: &HvfAarch64Vmm,
+    slot: carrick_guest_arch::SlotId,
+) -> Result<Option<crate::metadata_grant::NativeService>, TrapError> {
+    crate::metadata_grant::take_native_service(
+        &vmm.state.carrier_vm_custody(),
+        carrick_guest_arch::CpuId::new(u32::from(slot.raw())),
+    )
+}
+
 /// Run the executor's own vCPU, with no task attached, in the EL1 scheduler
 /// (EL1 plan 1d): see `Aarch64EngineCore::run_idle_entry_on_vcpu`.
 pub fn run_worker_idle_entry(

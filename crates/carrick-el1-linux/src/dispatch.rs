@@ -663,6 +663,136 @@ pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
     action
 }
 
+/// Capture only after the final descriptor drain has selected its boundary.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub fn capture_native_service_exit(frame: &mut TrapFrame, action: Action) -> Action {
+    if matches!(action, Action::Forward | Action::ServedWithWork)
+        && let Some(owned) = arm_native_service_exit(frame, action)
+    {
+        return owned;
+    }
+    action
+}
+
+/// Interpret the final entry boundary without granting custody. Only the
+/// authenticated native owner below may publish the resulting operation.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn native_service_operation(
+    frame: &mut TrapFrame,
+    state: &carrick_el1_abi::LinuxTaskState,
+    action: Action,
+) -> Option<carrick_core_abi::service::ServiceOperation> {
+    use carrick_core_abi::service::ServiceOperation;
+    use carrick_guest_arch::{Access, FaultInfo, NativeOrdinal, UserVa};
+    use carrick_sched_core::object_wait::OwnerEntry;
+    if action == Action::ServedWithWork {
+        let entry = match state.served_word() {
+            carrick_el1_abi::SERVED_WAKES_OWED => OwnerEntry::Syscall,
+            carrick_el1_abi::SERVED_FORWARD_WORK => OwnerEntry::Exception,
+            // Metadata commits require their own operation, never a replay
+            // that could repeat an already visible effect.
+            _ => return None,
+        };
+        match state.take_served_boundary()? {
+            carrick_el1_abi::ServedBoundary::Completed => {}
+            carrick_el1_abi::ServedBoundary::ForwardOriginal { x0 } => {
+                frame.x[0] = x0;
+                frame.elr = frame.elr.checked_sub(4)?;
+            }
+            carrick_el1_abi::ServedBoundary::ReplayOriginal { .. } => return None,
+        }
+        state.mark_pending_host_work();
+        return Some(ServiceOperation::CarrierWork { entry });
+    }
+    if action != Action::Forward {
+        return None;
+    }
+    if frame.esr == 0 {
+        return state
+            .has_pending_host_work()
+            .then_some(ServiceOperation::CarrierWork {
+                entry: OwnerEntry::Exception,
+            });
+    }
+    match (frame.esr >> 26) & 0x3f {
+        kind @ (0x20 | 0x24) => Some(ServiceOperation::Fault(FaultInfo {
+            address: UserVa::new(frame.far),
+            access: if kind == 0x20 {
+                Access::Execute
+            } else if frame.esr & (1 << 6) != 0 {
+                Access::Write
+            } else {
+                Access::Read
+            },
+            present: !(0x04..=0x07).contains(&(frame.esr & 0x3f)),
+        })),
+        0x15 => Some(ServiceOperation::Crossing {
+            ordinal: NativeOrdinal::new(frame.x[8]),
+        }),
+        _ => None,
+    }
+}
+
+/// Capture the exception while its native owner still owns the trap words.
+/// The host receives a selector only after this continuation has parked.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[inline(never)]
+fn arm_native_service_exit(frame: &mut TrapFrame, action: Action) -> Option<Action> {
+    use super::native_process_runtime::NativeResume;
+    use carrick_personality_linux::lifecycle::ProcessNative;
+    let task = carrick_el1_abi::current_task_guest(frame.slot as usize)?;
+    let slot = SlotId::from_index(frame.slot as usize)?;
+    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+    let record = zone.slot(slot).current()?;
+    if !zone.record(record).is_native_owned() {
+        return None;
+    }
+    let (page, control) = task.lifecycle_refs()?;
+    let operation = native_service_operation(frame, &task.linux, action)?;
+    let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
+    sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
+    let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
+        .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    let result = super::aarch64_process::with_process_entry(
+        carrick_el1_abi::BornInZoneSource { zone, slot },
+        task,
+        &saved.native,
+        carrick_el1::isa::aarch64::hardware_live_ttbr(),
+        page,
+        control,
+        &mut service,
+        |process| {
+            let result = process.begin_service(operation)?;
+            if matches!(result, NativeResume::Left(_)) && process.take_handoff_receipt().is_none() {
+                return Err(super::native_process_runtime::NativeProcessError::Quarantined);
+            }
+            Ok(result)
+        },
+    )
+    .and_then(core::convert::identity)
+    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    Some(match result {
+        NativeResume::Left(None) => native_service_idle(zone, slot, &mut sched::HardwareCpu),
+        NativeResume::NoPending => arm_signal_user_return(frame),
+        NativeResume::Returned(result) => {
+            frame.x[0] = result.raw() as u64;
+            Action::Served
+        }
+        _ => invalid_completion(NativeInvariant::EntryBinding),
+    })
+}
+
+/// Finish the native service park before handing the executor to the host.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn native_service_idle(
+    zone: &ZoneTables,
+    slot: SlotId,
+    cpu: &mut impl sched::ThreadCpu,
+) -> Action {
+    sched::leave_space(zone, slot, cpu);
+    Action::Idle
+}
+
 /// The one native signal checkpoint at the actual EL0 return boundary. The
 /// syscall work ledger and scheduler resume result have already settled here;
 /// IRQ, fault and SVC returns all pass through the same owner.

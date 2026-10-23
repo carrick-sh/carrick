@@ -297,9 +297,9 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     }
     fn publish_forward_work(&self, original_argument0: u64) {
         if let Some(task) = self.task_state() {
-            // No family ran: after owed work drains the host must execute the
-            // original syscall, never treat its argument register as a result.
-            task.record_commit_owed(original_argument0);
+            // No family ran: after owed work drains the execution owner must
+            // retry the original call, never treat its argument as a result.
+            task.record_forward_work(original_argument0);
         }
     }
     fn publish_work(&self, commit: bool) {
@@ -1712,9 +1712,17 @@ mod ring_first_tests {
             CompletionRoute::WithWork
         );
         assert_eq!(pending.result, 0xbeef);
+        let boundary = pending.state.take_served_boundary();
+        let committed = crate::abi::entry::LinuxTaskState::new();
+        committed.record_commit_owed(42);
+        assert_ne!(
+            boundary,
+            committed.take_served_boundary(),
+            "an untouched call and a visible effect need different continuations"
+        );
         assert_eq!(
-            pending.state.take_served_boundary(),
-            Some(crate::abi::entry::ServedBoundary::ReplayOriginal { x0: 42 })
+            boundary,
+            Some(crate::abi::entry::ServedBoundary::ForwardOriginal { x0: 42 })
         );
     }
 
