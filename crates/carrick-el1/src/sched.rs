@@ -531,16 +531,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// translations, so no pause of that process kicks it, and it walks no
     /// page table a retiring address space frees.
     fn leave_space(&mut self) {
-        let (zone, slot) = (self.zone, self.slot);
-        if zone.installed_space(slot) == 0 {
-            return;
-        }
-        let idle = zone.spaces.idle_ttbr();
-        if idle == 0 {
-            return;
-        }
-        self.cpu.set_translation(idle, idle);
-        zone.release_space(slot);
+        leave_space(self.zone, self.slot, self.cpu);
     }
 
     /// Nothing is runnable on this vCPU: poll, then park in WFI, until a
@@ -854,6 +845,20 @@ pub struct FakeRegs {
     pub v: [u128; 32],
     pub fpsr: u64,
     pub fpcr: u64,
+}
+
+/// Leave a process's translations before releasing its installed occupancy.
+/// Service handoffs and scheduler idling use the same ordered transition.
+pub fn leave_space(zone: &ZoneTables, slot: SlotId, cpu: &mut impl ThreadCpu) {
+    if zone.installed_space(slot) == 0 {
+        return;
+    }
+    let idle = zone.spaces.idle_ttbr();
+    if idle == 0 {
+        return;
+    }
+    cpu.set_translation(idle, idle);
+    zone.release_space(slot);
 }
 
 /// A host-test stand-in for the CPU: the registers a switch moves, plus a
