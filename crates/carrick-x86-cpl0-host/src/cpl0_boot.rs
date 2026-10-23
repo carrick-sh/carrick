@@ -23,10 +23,9 @@ use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, RootGp
 use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
 use carrick_hal::TrapError;
 use carrick_hal::{FrameCowAuthority, PhysicalFrameInventory};
-use carrick_hal::{
-    FrameEventCapacity, FrameId, FrameInventoryEvent, FrameLength, MappingGeneration, MappingId,
-    MemPerms,
-};
+#[cfg(test)]
+use carrick_hal::{FrameEventCapacity, FrameInventoryEvent, MemPerms};
+use carrick_hal::{FrameId, FrameLength, MappingGeneration, MappingId};
 #[cfg(test)]
 use carrick_kernel::kernel::{FrameInventoryAuthority, MmId, ObjectIdRegistry};
 use carrick_mmu_core::x86::descriptor_txn::{
@@ -549,91 +548,30 @@ impl InitialInventory {
         owner: carrick_hal::GuestFrameOwner,
     ) -> Result<(Self, Vec<X86InitialBootGrant>), TrapError> {
         let mm = owner.native_mm;
-        let authority = source.bind(owner);
-        let gpas: Vec<_> = gpas.into_iter().collect();
-        if table_grants >= gpas.len() {
-            return Err(fail("initial inventory grant partition"));
-        }
-        let capacity = FrameEventCapacity::for_event_count(
-            gpas.len()
-                .checked_mul(2)
-                .ok_or_else(|| fail("initial inventory capacity"))?,
-        )
-        .map_err(|error| fail(format!("initial inventory capacity: {error}")))?;
-        let mut reservation = authority
-            .reserve(gpas.len(), gpas.len(), capacity.get())
-            .map_err(|error| fail(format!("initial inventory reserve: {error}")))?;
-        let transaction = reservation.transaction();
-        let generation = MappingGeneration::from_backend_counter(owner_generation);
-        let length = FrameLength::from_mapping_extent(
-            NonZeroU64::new(frame_len).ok_or_else(|| fail("initial frame length"))?,
-        );
-        let mut rows = Vec::with_capacity(gpas.len());
-        for (index, gpa) in gpas.into_iter().enumerate() {
-            let frame = reservation
-                .claim_frame()
-                .map_err(|error| fail(format!("initial frame candidate: {error}")))?;
-            let mapping = reservation
-                .claim_mapping()
-                .map_err(|error| fail(format!("initial mapping candidate: {error}")))?;
-            if index >= table_grants {
-                reservation
-                    .push(FrameInventoryEvent::PrepareMapping {
-                        transaction,
-                        frame,
-                        mapping,
-                        generation,
-                        gpa: carrick_guest_mem::Gpa::new(gpa.raw()),
-                        length,
-                        permissions: MemPerms {
-                            read: true,
-                            write: true,
-                            exec: false,
-                        },
-                    })
-                    .map_err(|error| fail(format!("initial inventory prepare: {error}")))?;
-                reservation
-                    .push(FrameInventoryEvent::PublishMapping {
-                        transaction,
-                        mapping,
-                        generation,
-                    })
-                    .map_err(|error| fail(format!("initial inventory publish: {error}")))?;
-            }
-            rows.push((gpa, frame, mapping, index >= table_grants));
-        }
-        let receipt = carrick_hal::UnpublishedFrameInventoryApply::apply(
-            Arc::clone(&authority),
-            reservation.commit(()),
-        )
-        .map_err(|error| fail(format!("initial inventory apply: {error}")))?;
-        let mut frames = Vec::with_capacity(rows.len() - table_grants);
-        let mut grants = Vec::with_capacity(rows.len());
-        for (gpa, frame, mapping, is_data) in rows {
-            if is_data && !receipt.authorizes(mapping, frame) {
-                return Err(fail("initial inventory missing mapping"));
-            }
-            let identity = BackingIdentity {
-                frame_id: NonZeroU64::new(frame.raw())
-                    .ok_or_else(|| fail("initial frame identity"))?,
-                mapping_id: NonZeroU64::new(mapping.raw())
-                    .ok_or_else(|| fail("initial mapping identity"))?,
-                owner_generation,
-                inventory_revision: NonZeroU64::new(receipt.revision())
-                    .ok_or_else(|| fail("initial inventory revision"))?,
-            };
-            if is_data {
-                frames.push((gpa, identity));
-            }
-            grants.push(X86InitialBootGrant {
-                gpa: gpa.raw(),
-                frame_id: frame.raw(),
-                mapping_id: mapping.raw(),
-                owner_generation: generation.raw(),
-                inventory_revision: receipt.revision(),
-            });
-        }
-        frames.sort_unstable_by_key(|(gpa, _)| gpa.raw());
+        let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
+            Arc::clone(&source),
+            gpas,
+            table_grants,
+            frame_len,
+            owner_generation,
+            owner,
+        )?
+        .handoff()?;
+        let grants = staged
+            .grants
+            .into_iter()
+            .map(|grant| X86InitialBootGrant {
+                gpa: grant.gpa.raw(),
+                frame_id: grant.identity.frame_id.get(),
+                mapping_id: grant.identity.mapping_id.get(),
+                owner_generation: grant.identity.owner_generation.get(),
+                inventory_revision: grant.identity.inventory_revision.get(),
+            })
+            .collect();
+        let authority = staged.authority;
+        let receipt = staged.receipt;
+        let frames = staged.frames;
+        let length = staged.length;
         Ok((
             Self {
                 mm,
@@ -3041,6 +2979,48 @@ mod kernel_stack_tests {
 mod initial_reply_tests {
     use super::*;
     use carrick_core_abi::{X86_INITIAL_BOOT_MAGIC, X86_INITIAL_BOOT_VERSION};
+
+    #[test]
+    fn shared_physical_staging_rolls_back_before_exposure() {
+        let authority = Arc::new(FrameInventoryAuthority::new());
+        let ids = Arc::new(ObjectIdRegistry::new());
+        let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
+            authority.physical_projection(ids),
+            [FrameGpa::new(0x2_0000_0000)],
+            0,
+            4096,
+            NonZeroU64::MIN,
+            carrick_hal::GuestFrameOwner {
+                native_mm: MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).unwrap()),
+                root_generation: ContextGeneration::new(NonZeroU64::MIN),
+            },
+        )
+        .unwrap();
+        let grant = staged.grants()[0];
+        let bound = Arc::clone(staged.authority());
+        let mapping = MappingId::from_kernel_allocation(grant.identity.mapping_id);
+        let frame = FrameId::from_kernel_allocation(grant.identity.frame_id);
+        let length = FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap());
+        let before = bound
+            .mapping_is_live(
+                mapping,
+                frame,
+                carrick_guest_mem::Gpa::new(grant.gpa.raw()),
+                length,
+            )
+            .unwrap();
+        assert!(before);
+        drop(staged);
+        let after = bound
+            .mapping_is_live(
+                mapping,
+                frame,
+                carrick_guest_mem::Gpa::new(grant.gpa.raw()),
+                length,
+            )
+            .unwrap();
+        assert!(!after);
+    }
 
     #[test]
     fn unwind_rollback_refusal_returns_control_to_the_carrier_observer() {

@@ -35,6 +35,7 @@ pub mod asid;
 pub mod birth_serial;
 pub mod el1_editor_exclusion;
 pub mod fork_stock;
+pub mod physical_grants;
 pub mod stage1_exclusive;
 pub mod stage1_mm;
 
