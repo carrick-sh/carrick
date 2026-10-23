@@ -61,9 +61,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 wait,
             )
             .map_err(|_| NativeProcessError::Stale)?;
+            let completion =
+                |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>| {
+                    crate::sched::object_wait::deliver_completion(self.zone, slot, owned);
+                };
             let queue = self
                 .zone
-                .object_wait(enrollment.key(), &carrick_sched_core::ShortLockSpin)
+                .object_wait_with_completion(
+                    enrollment.key(),
+                    &carrick_sched_core::ShortLockSpin,
+                    &completion,
+                )
                 .map_err(|_| NativeProcessError::Stale)?;
             // Recheck after queue admission: a completed wait may already have
             // moved to its successor. Cancellation remains sticky in the cell.
@@ -357,7 +365,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             zone,
             self.source.slot,
             enrollment.owner_request(operation),
-            &|_| {},
+            &|owned| {
+                crate::sched::object_wait::deliver_completion(zone, self.source.slot, owned);
+            },
             || {
                 // MM queue -> service queue is the only nested queue order.
                 let key =

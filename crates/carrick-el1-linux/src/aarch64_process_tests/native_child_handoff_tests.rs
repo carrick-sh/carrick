@@ -667,8 +667,20 @@ fn native_service_intake_does_not_reacquire_the_busy_mm_root() {
     two_native_children_service_waits(ServiceWitness::RootBusy);
 }
 
+#[test]
+fn native_mm_wait_cancellation_retains_the_exact_operation() {
+    two_native_children_service_waits(ServiceWitness::MmCancel);
+}
+
+#[test]
+fn native_mm_wait_source_release_resumes_the_exact_operation() {
+    two_native_children_service_waits(ServiceWitness::MmRelease);
+}
+
 #[derive(Clone, Copy)]
 enum ServiceWitness {
+    MmCancel,
+    MmRelease,
     RootBusy,
     Fault,
     Completed,
@@ -766,7 +778,10 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
                 fixture.task.linux.mark_pending_host_work();
                 carrick_el1_abi::Action::Forward
             }
-            ServiceWitness::Fault | ServiceWitness::RootBusy => {
+            ServiceWitness::Fault
+            | ServiceWitness::RootBusy
+            | ServiceWitness::MmCancel
+            | ServiceWitness::MmRelease => {
                 frame.esr = 0x9200004f;
                 frame.far = 0x6000000fd8;
                 carrick_el1_abi::Action::Forward
@@ -959,12 +974,49 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
     ] {
         let request = ticket.request();
         let key = ObjectWaitKey::native_service(request.identity.birth.record).unwrap();
+        let mm_wait = matches!(
+            witness,
+            ServiceWitness::MmCancel | ServiceWitness::MmRelease
+        ) && request.identity != first_request.identity;
+        let handle = request.identity.birth.mm;
+        let source = fixture
+            .zone
+            .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+            .unwrap()
+            .notifications(handle.incarnation())
+            .unwrap();
+        let observed =
+            source.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor);
+        let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
+        let editor = mm_wait.then(|| {
+            access
+                .try_begin_edit_bounded(
+                    access.find(handle.mm().raw()).unwrap(),
+                    handle.mm().raw(),
+                    NonZeroU64::new(91).unwrap(),
+                    0,
+                )
+                .unwrap()
+        });
         {
             let queue = fixture
                 .zone
                 .object_wait(key, &carrick_sched_core::ShortLockSpin)
                 .unwrap();
-            assert!(ticket.complete(true).is_ok());
+            if mm_wait {
+                // SAFETY: the exact admitted source was sampled before the
+                // conflicting editor acquisition; no resource guard is sent.
+                let wait = unsafe {
+                    carrick_core_abi::PortalOwnerWait::from_owner(
+                        handle,
+                        carrick_core_abi::PortalWaitCause::Editor,
+                        observed.revision(),
+                    )
+                };
+                assert!(ticket.complete_wait(wait).is_ok());
+            } else {
+                assert!(ticket.complete(true).is_ok());
+            }
             queue
                 .notify_object(fixture.slot, &mut Default::default())
                 .unwrap();
@@ -993,6 +1045,54 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
         );
         let child = fixture.zone.slot(fixture.slot).current().unwrap();
         assert_eq!(child, request.identity.birth.record.id);
+        if mm_wait {
+            assert!(matches!(
+                resume_selected(
+                    &owner,
+                    registry(),
+                    BornInZoneSource {
+                        zone: fixture.zone,
+                        slot: fixture.slot
+                    },
+                    &fixture.task,
+                    child,
+                    &mut service
+                ),
+                NativeResume::Left(None)
+            ));
+            assert_eq!(page.claimed_count(), 1);
+            assert!(fixture.zone.slot(fixture.slot).current().is_none());
+            if matches!(witness, ServiceWitness::MmCancel) {
+                owner
+                    .cancel_service(request.identity.birth.record, fixture.slot, &mut service)
+                    .unwrap();
+                assert_eq!(
+                    source
+                        .observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor),
+                    observed,
+                    "cancellation cannot fabricate a resource revision"
+                );
+            }
+            drop(editor);
+            let mut handoff = None;
+            let mut zone = crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            };
+            assert_eq!(
+                crate::dispatch::native_scheduler(
+                    &mut zone,
+                    &fixture.task,
+                    &counters,
+                    fixture.slot,
+                    &mut handoff
+                )
+                .idle_entry(&mut frame, 0),
+                carrick_el1_abi::Action::Served
+            );
+            assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(child));
+        }
         assert!(matches!(
             resume_selected(
                 &owner,
