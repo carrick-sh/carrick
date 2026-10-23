@@ -923,15 +923,6 @@ impl PersistentExecutor for FakeExecutor {
         self.idle_slot
     }
 
-    fn wait_in_guest(&mut self) -> Result<super::GuestIdleExit, TrapError> {
-        if let Some(entry) = self.idle_entry.take() {
-            entry();
-            Ok(super::GuestIdleExit::Idle)
-        } else {
-            Ok(super::GuestIdleExit::Unsupported)
-        }
-    }
-
     type TaskBinding = FakeBinding;
 
     fn has_physical_idle_lane(&self) -> bool {
@@ -939,6 +930,10 @@ impl PersistentExecutor for FakeExecutor {
     }
 
     fn wait_in_guest(&mut self) -> Result<super::GuestIdleExit, TrapError> {
+        if let Some(entry) = self.idle_entry.take() {
+            entry();
+            return Ok(super::GuestIdleExit::Idle);
+        }
         let Some(native) = &self.factory.native_services else {
             return Ok(super::GuestIdleExit::Unsupported);
         };
