@@ -1970,3 +1970,10 @@ fn lifecycle_alias_preparation_never_dirties_a_refused_loan() {
     );
     assert!(!control.affinity_source().is_guest_mapped());
 }
+
+#[test]
+fn maintenance_reclaim_requires_the_exact_nonzero_hardware_root() {
+    assert!(ReclaimExecution::maintenance_root(page(0x1000), page(0x2000)).is_none());
+    assert!(ReclaimExecution::maintenance_root(page(0), page(0)).is_none());
+    assert!(ReclaimExecution::maintenance_root(page(0x2000), page(0x2000)).is_some());
+}

@@ -668,6 +668,7 @@ pub trait ForkStockCrossing {
     fn cross_fork_stock(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_root_exit(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
+    fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_wait_channel_wake(
         &self,
         channel: super::native_process_runtime::ProcessWaitChannel,
@@ -680,6 +681,9 @@ pub trait ForkStockCrossing {
 }
 
 impl<T: ForkStockCrossing> ForkStockCrossing for &T {
+    fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError> {
+        (**self).cross_child_reclaim(mm, cpu)
+    }
     fn cross_cow_supply(&self, address: UserVa, cpu: u64) -> Result<(), NativeProcessError> {
         (**self).cross_cow_supply(address, cpu)
     }
@@ -714,6 +718,18 @@ impl<T: ForkStockCrossing> ForkStockCrossing for &T {
 pub struct HvcForkStockCrossing;
 
 impl ForkStockCrossing for HvcForkStockCrossing {
+    fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            carrick_el1::isa::aarch64::cross_hvc_child_reclaim(mm.raw(), cpu)
+                .map_err(|_| NativeProcessError::Fault)
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (mm, cpu);
+            Err(NativeProcessError::Unsupported)
+        }
+    }
     fn cross_cow_supply(&self, address: UserVa, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
@@ -1562,13 +1578,26 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         // The final child may be the run's last fork. Once its translation
         // has been released, let the shared MM owner retire the closed root
         // now; a still-borrowed root remains in the existing retirement queue.
-        let owner = self.portal().unwrap_or_else(|_| fatal());
-        let _retained_for_later_drain = RETIRED_SPACES.drain_portal(
-            &owner,
-            self.zone,
-            carrick_sched_core::ZONE_SLOTS,
-            self.worker(),
-        );
+        {
+            let owner = self.portal().unwrap_or_else(|_| fatal());
+            let _retained_for_later_drain = RETIRED_SPACES.drain_portal(
+                &owner,
+                self.zone,
+                carrick_sched_core::ZONE_SLOTS,
+                self.worker(),
+            );
+        }
+        // The portal borrow ends before physical table/lifecycle clearing.
+        if self
+            .crossing
+            .cross_child_reclaim(
+                ReservationMm::new(binding.mm.raw()).unwrap_or_else(|| fatal()),
+                u64::from(self.worker()),
+            )
+            .is_err()
+        {
+            fatal();
+        }
     }
     fn wake_unplaceable_wait(
         &mut self,

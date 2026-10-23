@@ -1789,3 +1789,7 @@ contracts = ["kernel.scheduler.runnable-progress"]
 [[surfaces]]
 path = "crates/carrick-hal/src/physical_grants.rs"
 contracts = ["kernel.x86.file-region", "kernel.el1.fork-cow", "kernel.el1.mm-exclusive-owner"]
+
+[[surfaces]]
+path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_retirement_tests.rs"
+contracts = ["process.native.terminal-child"]

@@ -353,6 +353,8 @@ pub const GRANT_OP_WAIT_CHANNEL_WAKE: u64 = 7;
 pub const GRANT_OP_FORK_REFUSAL: u64 = 8;
 /// Kick an excluded, host-owned execution residency on an issued CPU slot.
 pub const GRANT_OP_RESIDENCY_KICK: u64 = 9;
+/// Drain physical child stock after switching off its retired root.
+pub const GRANT_OP_CHILD_RECLAIM: u64 = 10;
 
 /// Bounded debug rendering of a typed refusal, retained on the stopped EL1 stack.
 #[repr(C, align(64))]

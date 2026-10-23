@@ -5,6 +5,8 @@
 mod native_child_handoff_tests;
 #[cfg(test)]
 mod native_fault_supply_tests;
+#[cfg(test)]
+mod native_retirement_tests;
 
 use super::aarch64_process::{Aarch64NativeProcessService, ForkStockCrossing};
 #[cfg(test)]
@@ -150,6 +152,8 @@ enum CommitFault {
 }
 
 struct TestStockCrossing {
+    #[cfg(test)]
+    physical: Option<std::sync::Mutex<native_retirement_tests::PhysicalStock>>,
     fd_map: Vec<carrick_el1_abi::FdMapSlot>,
     open_table: Vec<carrick_el1_abi::DelegatedOpenFile>,
     grant_tables: std::sync::Mutex<Vec<RootGpa>>,
@@ -174,6 +178,17 @@ struct TestStockCrossing {
 }
 
 impl TestStockCrossing {
+    fn has_physical(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.physical.is_some()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     fn new(stock_pages: &[u64]) -> Self {
         Self {
             open_table: (0..16)
@@ -188,6 +203,8 @@ impl TestStockCrossing {
                     .map(|&p| RootGpa::page_aligned(FrameGpa::new(p)).unwrap())
                     .collect(),
             ),
+            #[cfg(test)]
+            physical: None,
             total_returned_pages: AtomicU64::new(0),
             loans_requested: AtomicUsize::new(0),
             settlements_reserved: AtomicUsize::new(0),
@@ -211,6 +228,23 @@ impl TestStockCrossing {
 }
 
 impl ForkStockCrossing for TestStockCrossing {
+    fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError> {
+        let zone = self.zone.lock().unwrap().unwrap();
+        let (binding, _) = self.child.lock().unwrap().unwrap();
+        let slot = SlotId::from_index(cpu as usize).unwrap();
+        assert_eq!(binding.mm.raw(), mm.raw());
+        assert!(carrick_core::entry::terminal_matches(
+            binding,
+            BornInZoneSource { zone, slot },
+            carrick_sched_core::TerminalPhase::Retired
+        ));
+        #[cfg(test)]
+        if let Some(physical) = &self.physical {
+            physical.lock().unwrap().reclaim(zone);
+        }
+        Ok(())
+    }
+
     fn open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
         &self.open_table
     }
@@ -242,6 +276,22 @@ impl ForkStockCrossing for TestStockCrossing {
             record.refuse(carrick_el1_abi::ChildRetireRefusal::Stale);
             return Err(NativeProcessError::Stale);
         }
+        #[cfg(test)]
+        if let Some(physical) = &self.physical {
+            physical
+                .lock()
+                .unwrap()
+                .owner
+                .retire_child(
+                    carrick_hal::fork_stock::GrantExecution::new(
+                        carrick_guest_arch::CpuId::new(cpu as u32),
+                        binding,
+                        context,
+                    ),
+                    record,
+                )
+                .unwrap();
+        }
         assert!(zone.accept_terminal(
             slot,
             ThreadIdentity {
@@ -252,7 +302,9 @@ impl ForkStockCrossing for TestStockCrossing {
                 ..Default::default()
             }
         ));
-        assert!(record.accept());
+        if !self.has_physical() {
+            assert!(record.accept());
+        }
         self.retirements.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -274,6 +326,18 @@ impl ForkStockCrossing for TestStockCrossing {
             1,
             "wake follows real retirement"
         );
+        #[cfg(test)]
+        if let Some(physical) = &self.physical {
+            assert!(
+                physical
+                    .lock()
+                    .unwrap()
+                    .owner
+                    .child_root(ReservationMm::new(binding.mm.raw()).unwrap())
+                    .is_none(),
+                "terminal wake must authenticate without the reclaimed root"
+            );
+        }
         let mut transfers = Vec::new();
         let guard = zone
             .lock(
@@ -330,6 +394,13 @@ impl ForkStockCrossing for TestStockCrossing {
                 drop(tables);
                 let child_base = child_slice[0].address().raw();
                 let parent_base = parent_slice[0].address().raw();
+                #[cfg(test)]
+                if let Some(physical) = &self.physical {
+                    let mut physical = physical.lock().unwrap();
+                    let loan = physical.loan(req, exchange, child_slice, parent_slice);
+                    *self.pending_loan.lock().unwrap() = Some(loan);
+                    return Ok(());
+                }
                 let layout = std::alloc::Layout::from_size_align(
                     core::mem::size_of::<ThreadLifecyclePage>(),
                     16384,
@@ -396,7 +467,11 @@ impl ForkStockCrossing for TestStockCrossing {
                 let Some((_completion, _address, count)) = settlement.reservation(loan) else {
                     return Err(NativeProcessError::Invalid);
                 };
-                if !settlement.accept(loan) {
+                #[cfg(test)]
+                if let Some(physical) = &self.physical {
+                    physical.lock().unwrap().reserve(loan, settlement);
+                }
+                if !self.has_physical() && !settlement.accept(loan) {
                     return Err(NativeProcessError::Invalid);
                 }
                 self.reserved_custody_rows
@@ -420,10 +495,14 @@ impl ForkStockCrossing for TestStockCrossing {
                     CommitFault::MissingReply => return Ok(()),
                     CommitFault::None => {}
                 }
-                if let Some(loan) = self.pending_loan.lock().unwrap().take()
-                    && !settlement.accept(loan)
-                {
-                    return Err(NativeProcessError::Invalid);
+                if let Some(loan) = self.pending_loan.lock().unwrap().take() {
+                    #[cfg(test)]
+                    if let Some(physical) = &self.physical {
+                        physical.lock().unwrap().commit(loan, settlement);
+                    }
+                    if !self.has_physical() && !settlement.accept(loan) {
+                        return Err(NativeProcessError::Invalid);
+                    }
                 }
                 Ok(())
             }
@@ -1221,8 +1300,13 @@ fn arm_registered_sibling_wait4_wakes_through_owner_in_ring() {
 
 #[cfg(test)]
 fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
+    arm_child_wait_wake_with_stock(in_ring, sibling, false);
+}
+
+#[cfg(test)]
+fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) {
     let fixture = Fixture::new(0x10000, asid(1));
-    if in_ring {
+    if in_ring || physical {
         fixture.zone.spaces.set_idle_ttbr(0x30000);
     }
     let source = BornInZoneSource {
@@ -1251,9 +1335,14 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
         .register_root(runtime.clone(), source, &fixture.task, fixture.address)
         .unwrap();
 
-    let crossing = TestStockCrossing::new(&[
+    let mut crossing = TestStockCrossing::new(&[
         0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
     ]);
+    if physical {
+        crossing.physical = Some(std::sync::Mutex::new(
+            native_retirement_tests::PhysicalStock::new(&fixture.tables),
+        ));
+    }
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
         fixture.slot,
@@ -1439,6 +1528,10 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
         "child exit must retire its reservation root without waiting for another fork"
     );
 
+    if let Some(physical) = &crossing.physical {
+        assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
+        physical.lock().unwrap().shutdown();
+    }
     let binding = super::common_entry::execution_binding(&child_task);
     for candidate in [
         binding,
@@ -2213,6 +2306,13 @@ pub fn with_native_file_fork(
         opens: &'a [carrick_el1_abi::DelegatedOpenFile],
     }
     impl ForkStockCrossing for Crossing<'_> {
+        fn cross_child_reclaim(
+            &self,
+            mm: ReservationMm,
+            cpu: u64,
+        ) -> Result<(), NativeProcessError> {
+            self.stock.cross_child_reclaim(mm, cpu)
+        }
         fn fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
             self.fds
         }
@@ -2410,6 +2510,8 @@ impl super::thread_setup::LifecycleVenue for Fixture {
 fn arm_root_setup_enters_production_process_venue() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let mut service = fixture.process_service();
+    #[cfg(test)]
+    let physical = native_retirement_tests::PhysicalStock::new(&fixture.tables);
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
@@ -2468,6 +2570,8 @@ fn arm_root_setup_enters_production_process_venue() {
     assert_eq!(service.crossing.loans_requested.load(Ordering::Acquire), 0);
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 0);
+    #[cfg(test)]
+    physical.shutdown_without_child();
 }
 
 #[test]
