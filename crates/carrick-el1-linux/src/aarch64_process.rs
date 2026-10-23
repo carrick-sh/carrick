@@ -1559,6 +1559,16 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             roots: core::ptr::from_ref(self.roots).addr(),
             mm: ReservationMm::new(binding.mm.raw()).unwrap_or_else(|| fatal()),
         });
+        // The final child may be the run's last fork. Once its translation
+        // has been released, let the shared MM owner retire the closed root
+        // now; a still-borrowed root remains in the existing retirement queue.
+        let owner = self.portal().unwrap_or_else(|_| fatal());
+        let _retained_for_later_drain = RETIRED_SPACES.drain_portal(
+            &owner,
+            self.zone,
+            carrick_sched_core::ZONE_SLOTS,
+            self.worker(),
+        );
     }
     fn wake_unplaceable_wait(
         &mut self,

@@ -1430,6 +1430,14 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
         1,
         "terminal child must retire before parent can reap"
     );
+    assert!(
+        fixture
+            .zone
+            .spaces
+            .find(child_binding.address.mm.raw().get())
+            .is_none(),
+        "child exit must retire its reservation root without waiting for another fork"
+    );
 
     let binding = super::common_entry::execution_binding(&child_task);
     for candidate in [
