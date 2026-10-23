@@ -230,7 +230,10 @@ impl NativeService {
             .ok_or_else(stale)?;
             match source.read(read) {
                 Ok(bytes) => Some(bytes),
-                Err(carrick_hal::fork_stock::HostBackingReadError::Inaccessible) => {
+                Err(
+                    carrick_hal::fork_stock::HostBackingReadError::Inaccessible
+                    | carrick_hal::fork_stock::HostBackingReadError::Unavailable,
+                ) => {
                     return self.finish(None, false, true);
                 }
                 Err(_) => return self.refuse(),
