@@ -30,8 +30,34 @@ use crate::asid::{AsidAllocator, AsidError, AsidGeneration};
 
 /// Strong custody of an opaque byte source, independent of its original MM.
 /// The implementing source owner authenticates the handle and generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostBackingRead {
+    identity: carrick_el1_abi::HostBackingIdentity,
+    length: usize,
+}
+impl HostBackingRead {
+    pub fn new(identity: carrick_el1_abi::HostBackingIdentity, length: usize) -> Option<Self> {
+        (length != 0
+            && length as u64 <= carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
+            && identity.advance(length as u64).is_some())
+        .then_some(Self { identity, length })
+    }
+    pub fn identity(self) -> carrick_el1_abi::HostBackingIdentity {
+        self.identity
+    }
+    pub fn length(self) -> usize {
+        self.length
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostBackingReadError {
+    Stale,
+    Unavailable,
+}
+
 pub trait HostBackingRetention: Send + Sync {
     fn identity(&self) -> carrick_el1_abi::HostBackingIdentity;
+    fn read(&self, request: HostBackingRead) -> Result<Vec<u8>, HostBackingReadError>;
 }
 
 /// Sources inherited from an exact, live committed child. Source identities

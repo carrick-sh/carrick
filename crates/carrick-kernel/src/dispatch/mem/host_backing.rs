@@ -125,6 +125,23 @@ impl carrick_hal::fork_stock::HostBackingRetention for HostBackingLease {
     fn identity(&self) -> HostBackingIdentity {
         self.identity(0)
     }
+    fn read(
+        &self,
+        request: carrick_hal::fork_stock::HostBackingRead,
+    ) -> Result<Vec<u8>, carrick_hal::fork_stock::HostBackingReadError> {
+        use carrick_hal::fork_stock::HostBackingReadError;
+        let identity = request.identity();
+        if identity.handle() != self.0.handle || identity.generation() != NonZeroU64::MIN {
+            return Err(HostBackingReadError::Stale);
+        }
+        super::backing::read_retained_source(
+            self.0.source.clone(),
+            identity,
+            request.length(),
+            carrick_el1_abi::GRANT_PAGE_SIZE,
+        )
+        .map_err(|_| HostBackingReadError::Unavailable)
+    }
 }
 impl Drop for Record {
     fn drop(&mut self) {
@@ -156,6 +173,12 @@ mod tests {
             fn identity(&self) -> HostBackingIdentity {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 self.lease.identity(0)
+            }
+            fn read(
+                &self,
+                request: carrick_hal::fork_stock::HostBackingRead,
+            ) -> Result<Vec<u8>, carrick_hal::fork_stock::HostBackingReadError> {
+                self.lease.read(request)
             }
         }
 
@@ -191,6 +214,52 @@ mod tests {
                 "one identity authentication per inherited source; no repeated source scans"
             );
         }
+    }
+
+    #[test]
+    fn inherited_source_reads_bounded_bytes_after_parent_custody_is_gone() {
+        use carrick_hal::fork_stock::{
+            HostBackingRead, HostBackingReadError, HostBackingRetention,
+        };
+        let parent = Arc::new(HostBackingCustody::default());
+        let lease = parent
+            .retain_source(PrivateFileBacking::LoadedImage {
+                initialized_offset: 4,
+                bytes: Arc::new(b"parent bytes".to_vec()),
+            })
+            .unwrap();
+        let identity = lease.identity(0);
+        let child: Arc<dyn HostBackingRetention> = Arc::new(lease.clone());
+        drop(lease);
+        drop(parent);
+        let request = HostBackingRead::new(identity, 8).unwrap();
+        assert_eq!(child.read(request).unwrap(), b"\0\0\0\0pare");
+        assert_eq!(
+            child
+                .read(HostBackingRead::new(identity.advance(8).unwrap(), 7).unwrap())
+                .unwrap(),
+            b"nt bytes"[..7]
+        );
+        let wrong = HostBackingIdentity::new(identity.handle(), NonZeroU64::new(2).unwrap(), 0);
+        assert_eq!(
+            child.read(HostBackingRead::new(wrong, 1).unwrap()),
+            Err(HostBackingReadError::Stale)
+        );
+        assert!(HostBackingRead::new(identity, 0).is_none());
+        assert!(
+            HostBackingRead::new(
+                identity,
+                carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE as usize + 1
+            )
+            .is_none()
+        );
+        assert!(
+            HostBackingRead::new(
+                HostBackingIdentity::new(identity.handle(), identity.generation(), u64::MAX),
+                1
+            )
+            .is_none()
+        );
     }
 
     #[test]
