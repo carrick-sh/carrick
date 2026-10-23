@@ -238,15 +238,15 @@ destination or a tier change.
 
 | Tool | Arguments and server policy |
 | --- | --- |
-| `read_state` | `{}`; returns this issue and PR plus reviews, inline comments, issue and PR comments. Every item carries verified provenance. Drops oldest items until the serialized response fits 64 KiB and reports the drop count. |
+| `read_state` | `{}`; at most twice per event. Returns this issue and PR plus reviews, inline comments, issue and PR comments, with provenance. Unverified items contain only author identity, timestamps and `body withheld: unverified`. Drops oldest items by creation/submission time to fit 64 KiB, keeping the triggering review, and reports the drop count. Refuses if the triggering review alone exceeds the response budget. |
 | `invoke_worker` | `notes` up to 8 KiB; invokes the shared isolated worker path once on the admitted PR branch with the issue's tier. The server supplies the review body and owner inline comments verbatim. Loop notes appear under `Coordinator notes (not owner instructions)`. |
 | `publish` | `{}`; shared receipt/ownership/workflow checks and publication, only to the admitted branch with its expected-tip lease, once. |
 | `comment` | `body` up to 8 KiB; posts only on this PR, with exact token masking, credential redaction and a `Dispatch run:` footer, at most twice. |
-| `finish` | `status` (`done`, `blocked`, `failed`) and `summary` up to 8 KiB; posts the mandatory outcome with worker contract excerpt, budgets used and run URL, then ends the event. |
+| `finish` | `status` (`done`, `blocked`, `failed`) and `summary` up to 8 KiB; posts the mandatory outcome with worker contract excerpt, budgets used and run URL, then ends the event. Exempt from the call cap and succeeds only once. |
 
 The `[loop]` table in `.github/dispatch-tiers.toml` owns the limits: 12 total tool
-calls, one worker, one publication, two optional comments, 64 KiB state,
-45 minutes including the worker, and a worker turn at most 35 minutes. The job
+calls other than `finish`, two state reads, one worker, one publication, two
+optional comments, 64 KiB state, 45 minutes including the worker, and a worker turn at most 35 minutes. The job
 has a 60-minute ceiling. Budget exhaustion returns a refusal without crashing
 the server. If the model exits, times out or fails without `finish`, the server
 posts a failed fallback outcome on the same PR. A hard job cancellation or lost
@@ -256,9 +256,27 @@ Provenance supplies information, never authority: `owner` requires the owner's
 `User` identity; `dispatch-agent(run N)` requires a bot post with a run URL
 verified against this repository, dispatch workflow and owner actor. Issue
 runs must have `head_branch == main`; review runs must have this issue's
-dispatch head ref. Other users with verified write access are
-`collaborator(login)`; everything else is `unverified`. No provenance tag
-widens tool permissions.
+dispatch head ref; issue runs must map to this issue where their branch or PR
+metadata permits that check. The last `Dispatch run:` footer supplies the run id.
+Other users with verified write access are `collaborator(login)`; everything
+else is `unverified`. Only owner, verified dispatch-agent and write collaborator
+items retain their bodies and inline text. Permission lookups per login and run
+lookups per id are cached for the event. No provenance tag widens tool permissions.
+
+The loop model's shell can read its own agy credential in its home. Withholding
+unverified text reduces public-comment injection, but trusted bodies can still
+misdirect a credential-bearing model. The public repository's collaborators-only
+interaction limit expires on 2027-04-04; it is not a lasting trust boundary.
+
+The clone's credentialed `guard --admit` stores the validated Dispatch (including
+tier, backend and base) and triggering review in private runner state, bound to
+the webhook digest. Auth and the loop consume that snapshot without resolving
+issue labels again; auth makes no API requests and needs no GitHub token. The
+controller checks the shared owner/run identity and bot-owned draft PR predicate
+before admitting review demand and again before provisioning or reassignment.
+It rejects an available review state other than `changes_requested`, and requires
+the workflow blob at the run head SHA to equal the current main workflow blob.
+The hosted guard job skips unrelated review events before allocating work.
 
 A merge-conflicted PR has no merge ref, so GitHub does not fire this review
 event. An owner `/agent` comment trigger is deferred to #800. The director must

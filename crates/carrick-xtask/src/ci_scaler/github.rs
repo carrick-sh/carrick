@@ -116,17 +116,28 @@ impl Github {
         for status in ["queued", "in_progress"] {
             runs.extend(self.workflow_runs(admission, status)?);
         }
-        Self::queued_jobs(admission, labels, &runs, |run| self.jobs(run))
+        Self::queued_jobs(
+            admission,
+            labels,
+            &runs,
+            |run| self.jobs(run),
+            |run| {
+                Self::admits_run(admission, run, &mut |method, endpoint, body, paginate| {
+                    self.request(method, endpoint, body, paginate)
+                })
+            },
+        )
     }
     fn queued_jobs(
         admission: &Admission,
         labels: &[&str],
         runs: &[Value],
         mut jobs: impl FnMut(&Value) -> Result<Vec<Value>, ScalerError>,
+        mut admitted: impl FnMut(&Value) -> Result<bool, ScalerError>,
     ) -> Result<Vec<QueuedJob>, ScalerError> {
         let mut demand = Vec::new();
         for run in runs {
-            if !admission.admits_run(run) {
+            if !admission.identifies_run(run) || !admitted(run)? {
                 continue;
             }
             let run_jobs = jobs(run)?;
@@ -179,7 +190,7 @@ impl Github {
                 None,
                 false,
             )?;
-            if !Admission::Standing.admits_run(&run)
+            if !Admission::Standing.identifies_run(&run)
                 || run["event"] != "push"
                 || run["id"].as_u64() != Some(entry.key.run.0)
                 || run["head_sha"] != entry.sha
@@ -305,6 +316,73 @@ impl Github {
         )
     }
 
+    /// Both queued demand and the final pre-clone/reassignment vet use this
+    /// API-backed admission. A successful PR-supplied guard is insufficient.
+    fn admits_run(
+        admission: &Admission,
+        run: &Value,
+        request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+    ) -> Result<bool, ScalerError> {
+        if !admission.identifies_run(run) {
+            return Ok(false);
+        }
+        if !matches!(admission, Admission::Agent) || run["event"] != "pull_request_review" {
+            return Ok(true);
+        }
+        for state in [
+            run.pointer("/review/state"),
+            run.pointer("/event_payload/review/state"),
+        ] {
+            if state.is_some_and(|s| s != "changes_requested") {
+                return Ok(false);
+            }
+        }
+        let branch = run["head_branch"]
+            .as_str()
+            .ok_or(ScalerError::Guard("review branch missing"))?;
+        let Some(issue) = crate::dispatch_worker::dispatch_branch(branch) else {
+            return Ok(false);
+        };
+        let id = crate::dispatch_worker::branch_run(issue, branch)?;
+        let original = request(
+            "GET",
+            &format!("repos/{REPOSITORY}/actions/runs/{id}"),
+            None,
+            false,
+        )?;
+        let prs = request(
+            "GET",
+            &format!("repos/{REPOSITORY}/pulls?state=open&base=main&head=carrick-sh:{branch}"),
+            None,
+            false,
+        )?;
+        if !prs.as_array().into_iter().flatten().any(|pr| {
+            pr["head"]["sha"] == run["head_sha"]
+                && crate::dispatch_worker::owned_pr(pr, &original, issue, branch)
+        }) {
+            return Ok(false);
+        }
+        let mut blobs = Vec::new();
+        for reference in [
+            run["head_sha"]
+                .as_str()
+                .ok_or(ScalerError::Guard("review SHA missing"))?,
+            "main",
+        ] {
+            let blob = request(
+                "GET",
+                &format!("repos/{REPOSITORY}/contents/{DISPATCH_WORKFLOW}?ref={reference}"),
+                None,
+                false,
+            )?;
+            if blob["type"] != "file" || !blob["sha"].as_str().is_some_and(full_sha) {
+                return Ok(false);
+            }
+            blobs.push(blob["sha"].clone());
+        }
+        Ok(blobs[0] == blobs[1])
+    }
+
     fn vet_inner(
         admission: &Admission,
         key: JobKey,
@@ -316,7 +394,7 @@ impl Github {
             None,
             false,
         )?;
-        if !admission.admits_run(&run)
+        if !Self::admits_run(admission, &run, &mut request)?
             || run["id"].as_u64() != Some(key.run.0)
             || run["run_attempt"].as_u64() != Some(u64::from(key.attempt))
         {
@@ -491,6 +569,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dispatch_review_vet_checks_pr_ownership_review_and_workflow_blob() {
+        let original = json!({"id":42,"head_sha":"b".repeat(40), "head_branch":"main", "event":"issues",
+            "path":DISPATCH_WORKFLOW,"repository":{"full_name":REPOSITORY}, "head_repository":{"full_name":REPOSITORY},
+            "actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"}});
+        for (bot, blob, state, allowed) in [
+            ("github-actions[bot]", "d", "changes_requested", false),
+            ("outsider", "c", "changes_requested", false),
+            ("github-actions[bot]", "c", "approved", false),
+            ("github-actions[bot]", "c", "changes_requested", true),
+        ] {
+            let mut run = original.clone();
+            run["id"] = 99.into();
+            run["run_attempt"] = 1.into();
+            run["event"] = "pull_request_review".into();
+            run["head_branch"] = "work/dispatch-799-42".into();
+            run["head_sha"] = "a".repeat(40).into();
+            run["review"] = json!({"state":state});
+            let pr = json!({"number":800,"user":{"login":bot,"type":"Bot"},"draft":true,
+                "head":{"ref":"work/dispatch-799-42","sha":"a".repeat(40),"repo":{"full_name":REPOSITORY}},
+                "base":{"ref":"main"},"body":"Closes #799\nDispatch run: https://github.com/carrick-sh/carrick/actions/runs/42"});
+            let key = JobKey {
+                run: RunId(99),
+                attempt: 1,
+                job: JobId(9),
+            };
+            let result = Github::vet_inner(&Admission::Agent, key, |method, endpoint, _, _| {
+                assert_eq!(method, "GET");
+                if endpoint.ends_with("/99") {
+                    Ok(run.clone())
+                } else if endpoint.ends_with("/42") {
+                    Ok(original.clone())
+                } else if endpoint.contains("/pulls?") {
+                    Ok(json!([pr.clone()]))
+                } else if endpoint.contains("/contents/") {
+                    Ok(
+                        json!({"type":"file","sha":if endpoint.ends_with("ref=main") { "c".repeat(40) } else { blob.repeat(40) }}),
+                    )
+                } else if endpoint.ends_with("/jobs?per_page=100") {
+                    Ok(
+                        json!([{"jobs":[{"name":"guard","status":"completed","conclusion":"success"}]}]),
+                    )
+                } else {
+                    panic!("unexpected API endpoint: {endpoint}")
+                }
+            });
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "bot={bot}, workflow={blob}, review={state}"
+            );
+        }
+    }
+    #[test]
     fn dispatch_vet_requires_this_attempts_successful_hosted_guard() {
         let run = json!({"id":42,"run_attempt":2,"head_sha":"a".repeat(40), "head_branch":"main", "event":"issues",
             "path":DISPATCH_WORKFLOW,"repository":{"full_name":REPOSITORY}, "head_repository":{"full_name":REPOSITORY},
@@ -588,14 +719,20 @@ mod tests {
             let path = dir.path().join("ledger.json");
             let mut ledger = Ledger::default();
             let runs: Vec<_> = (1..=4).map(push_run).collect();
-            let demand = Github::queued_jobs(&Admission::Standing, labels, &runs, |run| {
-                let n = run["id"].as_u64().unwrap();
-                Ok(vec![hardware_job(
-                    n,
-                    labels,
-                    if n == 4 { "in_progress" } else { "queued" },
-                )])
-            })
+            let demand = Github::queued_jobs(
+                &Admission::Standing,
+                labels,
+                &runs,
+                |run| {
+                    let n = run["id"].as_u64().unwrap();
+                    Ok(vec![hardware_job(
+                        n,
+                        labels,
+                        if n == 4 { "in_progress" } else { "queued" },
+                    )])
+                },
+                |_| Ok(true),
+            )
             .unwrap();
             let mut cancelled = Vec::new();
             let ordered = coalesce_demand(&mut ledger, demand.clone(), &path, |entry| {

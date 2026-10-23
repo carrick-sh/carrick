@@ -243,6 +243,9 @@ fn agent_auth_is_job_scoped_private_and_always_cleanable() {
         let invoke = |args: &[&str]| {
             Command::new(xtask)
                 .args(args)
+                .env_remove("GH_TOKEN")
+                .env_remove("GITHUB_TOKEN")
+                .env("GITHUB_SHA", "a".repeat(40))
                 .env("RUNNER_TEMP", temp.path())
                 .env("GITHUB_RUN_ID", "42")
                 .env("GITHUB_RUN_ATTEMPT", "1")
@@ -252,6 +255,14 @@ fn agent_auth_is_job_scoped_private_and_always_cleanable() {
                 .output()
                 .unwrap()
         };
+        let admitted = invoke(&[
+            "dispatch-worker",
+            "guard",
+            "--admit",
+            "--event",
+            event.to_str().unwrap(),
+        ]);
+        assert!(admitted.status.success(), "{admitted:?}");
         let output = invoke(&["agent-runner", "auth", "--event", event.to_str().unwrap()]);
         assert!(output.status.success(), "{output:?}");
         for secret in ["codex-only-secret", "agy-only-secret"] {

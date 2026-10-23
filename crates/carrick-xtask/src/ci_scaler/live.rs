@@ -1253,7 +1253,7 @@ fn pending_owned_job(row: &Record, job: &Value, run: &Value, admission: &Admissi
         && labels_match(row.lane.labels(), &labels)
         && run["id"].as_u64() == Some(row.key.run.0)
         && run["run_attempt"].as_u64() == Some(u64::from(row.key.attempt))
-        && admission.admits_run(run)
+        && admission.identifies_run(run)
 }
 fn one_job_result(row: Option<&Record>) -> Result<(), ScalerError> {
     if row.is_some_and(|r| r.assigned.is_some()) {

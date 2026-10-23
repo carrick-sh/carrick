@@ -238,7 +238,7 @@ fn copy_rust_home(
     Ok(())
 }
 
-fn secret_file(path: &Path, bytes: &[u8]) -> Result<(), ScalerError> {
+pub(crate) fn secret_file(path: &Path, bytes: &[u8]) -> Result<(), ScalerError> {
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -380,13 +380,8 @@ fn bootstrap(root: &Path) -> Result<(), ScalerError> {
     Ok(())
 }
 
-fn auth(root: &Path, event: &Path) -> Result<(), ScalerError> {
-    let event = crate::dispatch_worker::load_event(root, event)?;
-    let dispatch = crate::dispatch_worker::validate_event(
-        &event,
-        include_str!("../../../.github/dispatch-tiers.toml"),
-        &std::env::var("GITHUB_TRIGGERING_ACTOR").unwrap_or_default(),
-    )?;
+fn auth(_root: &Path, event: &Path) -> Result<(), ScalerError> {
+    let dispatch = crate::dispatch_worker::read_admission(event)?.dispatch;
     let home = state()?.join("home");
     if !home.is_dir() {
         return Err(ScalerError::Guard("bootstrap must precede auth"));

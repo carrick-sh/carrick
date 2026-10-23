@@ -52,7 +52,7 @@ pub enum DispatchAction {
     },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tier {
     pub backend: String,
@@ -72,7 +72,8 @@ pub fn trusted_actor(actor: &str) -> bool {
     actor == "tjfontaine"
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Dispatch {
     pub issue: u64,
     pub title: String,
@@ -83,8 +84,51 @@ pub struct Dispatch {
     pub base: String,
     pub review: bool,
     pub review_text: String,
+    #[serde(skip)]
     pub worker_seconds: Option<u64>,
+    #[serde(skip)]
     pub loop_deadline: Option<std::time::Instant>,
+}
+
+/// Runner-private result of credentialed admission; provider setup and the
+/// coordinator consume this snapshot rather than re-resolving mutable labels.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdmittedDispatch {
+    pub dispatch: Dispatch,
+    pub review: Value,
+    event_digest: String,
+}
+fn event_digest(path: &Path) -> Result<String, ScalerError> {
+    use sha2::{Digest, Sha256};
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(regular_text(path)?.as_bytes())
+    ))
+}
+fn persist_admission(dispatch: &Dispatch, event: &Value, path: &Path) -> Result<(), ScalerError> {
+    let state = crate::agent_runner::state()?;
+    std::fs::create_dir_all(&state)?;
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+    let admission = AdmittedDispatch {
+        dispatch: dispatch.clone(),
+        review: event["review"].clone(),
+        event_digest: event_digest(path)?,
+    };
+    crate::agent_runner::secret_file(
+        &state.join("admission.json"),
+        &serde_json::to_vec(&admission)?,
+    )?;
+    Ok(())
+}
+pub(crate) fn read_admission(event: &Path) -> Result<AdmittedDispatch, ScalerError> {
+    let admission: AdmittedDispatch = serde_json::from_str(&regular_text(
+        &crate::agent_runner::state()?.join("admission.json"),
+    )?)?;
+    if admission.event_digest != event_digest(event)? {
+        return Err(ScalerError::Guard("admission belongs to another event"));
+    }
+    Ok(admission)
 }
 
 pub fn validate_event(
@@ -908,7 +952,7 @@ fn assigned_branch(dispatch: &mut Dispatch) -> Result<(), ScalerError> {
     }
     Ok(())
 }
-fn branch_run(issue: u64, branch: &str) -> Result<&str, ScalerError> {
+pub(crate) fn branch_run(issue: u64, branch: &str) -> Result<&str, ScalerError> {
     branch
         .strip_prefix(&format!("work/dispatch-{issue}-"))
         .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
@@ -927,7 +971,54 @@ fn open_prs(root: &Path, branch: &str) -> Result<Value, ScalerError> {
     )?)?)
 }
 
-fn owned_pr(pr: &Value, run: &Value, issue: u64, branch: &str) -> bool {
+/// One run-identity predicate for controller admission and comment provenance.
+/// The issue constraint is checked against every available issue/branch mapping.
+pub(crate) fn dispatch_run_identity(run: &Value, issue: Option<u64>) -> bool {
+    let branch = run["head_branch"].as_str().unwrap_or_default();
+    let review_issue = dispatch_branch(branch);
+    if run["repository"]["full_name"] != REPOSITORY
+        || run["head_repository"]["full_name"] != REPOSITORY
+        || run["path"] != ".github/workflows/dispatch-worker.yml"
+        || !run["head_sha"]
+            .as_str()
+            .is_some_and(crate::ci_scaler::full_sha)
+        || ![&run["actor"], &run["triggering_actor"]]
+            .iter()
+            .all(|actor| actor["login"] == "tjfontaine" && actor["type"] == "User")
+        || !((run["event"] == "issues" && branch == "main")
+            || (run["event"] == "pull_request_review" && review_issue.is_some()))
+    {
+        return false;
+    }
+    let Some(issue) = issue else {
+        return true;
+    };
+    let mapped_numbers = [
+        run.pointer("/issue/number"),
+        run.pointer("/event_payload/issue/number"),
+    ];
+    if review_issue.is_some_and(|mapped| mapped != issue)
+        || mapped_numbers
+            .into_iter()
+            .flatten()
+            .any(|n| n.as_u64() != Some(issue))
+    {
+        return false;
+    }
+    run["pull_requests"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(run.pointer("/event_payload/pull_request"))
+        .all(|pr| {
+            pr["head"]["ref"]
+                .as_str()
+                .and_then(dispatch_branch)
+                .is_none_or(|mapped| mapped == issue)
+        })
+}
+
+pub(crate) fn owned_pr(pr: &Value, run: &Value, issue: u64, branch: &str) -> bool {
     let Ok(id) = branch_run(issue, branch) else {
         return false;
     };
@@ -938,7 +1029,7 @@ fn owned_pr(pr: &Value, run: &Value, issue: u64, branch: &str) -> bool {
         && pr["base"]["ref"] == "main"
         && pr["draft"] == true
         && run["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id)
-        && agent_loop::verified_run(run, issue)
+        && dispatch_run_identity(run, Some(issue))
         && run["event"] == "issues"
         && run["head_branch"] == "main"
         && pr["body"].as_str().is_some_and(|body| {
@@ -1102,6 +1193,9 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
                 ],
             )?;
         }
+    }
+    if admit {
+        persist_admission(&dispatch, &event, &event_path)?;
     }
     if complete {
         return finish(&root, &dispatch);
@@ -1928,7 +2022,7 @@ Do it"
             "body":format!("Closes #634\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
         let run = json!({"id":42,"path":".github/workflows/dispatch-worker.yml",
             "event":"issues","head_branch":"main","repository":{"full_name":REPOSITORY},
-            "actor":{"login":"tjfontaine"}});
+            "actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"},"head_repository":{"full_name":REPOSITORY},"head_sha":"a".repeat(40)});
         assert!(owned_pr(&pr, &run, 634, branch));
         assert!(!owned_pr(&pr, &run, 635, branch));
         assert!(!owned_pr(&pr, &run, 634, "work/dispatch-634-43"));
@@ -2102,7 +2196,7 @@ Do it"
         event["issue"]["state"] = "open".into();
         event["issue"]["labels"] = json!([{"name":"dispatch:sol-high"}]);
         event["pull_request"] = json!({"number":800,"user":{"login":"github-actions[bot]","type":"Bot"},"head":{"ref":"work/dispatch-634-42","repo":{"full_name":REPOSITORY}},"base":{"ref":"main"},"draft":true,"body":format!("Closes #634\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
-        event["dispatch_run"] = json!({"id":42,"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","repository":{"full_name":REPOSITORY},"actor":{"login":"tjfontaine"}});
+        event["dispatch_run"] = json!({"id":42,"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","repository":{"full_name":REPOSITORY},"actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"},"head_repository":{"full_name":REPOSITORY},"head_sha":"a".repeat(40)});
         event
     }
     #[test]
