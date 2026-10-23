@@ -266,6 +266,11 @@ impl CodeContent {
         Ok((offset >> PAGE_SHIFT)..=((end - 1) >> PAGE_SHIFT))
     }
 
+    #[cfg(test)]
+    pub(crate) fn writer_count(&self) -> usize {
+        self.writers.load(Ordering::SeqCst)
+    }
+
     // Translation publication is deliberately not exposed by this witness.
     pub(crate) fn observe(
         &self,
@@ -605,8 +610,14 @@ mod tests {
             for kind in ["string", "payload"] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .arg("--exact")
-                    .arg("trap::code_content::tests::serial_host::serial_host_content_callback_panic_is_terminal_after_all_releases")
-                    .arg("--nocapture").env(CHILD, kind).output().unwrap();
+                    .arg(format!(
+                        "{}::serial_host_content_callback_panic_is_terminal_after_all_releases",
+                        module_path!().split_once("::").unwrap().1
+                    ))
+                    .arg("--nocapture")
+                    .env(CHILD, kind)
+                    .output()
+                    .unwrap();
                 assert_eq!(
                     output.status.signal(),
                     Some(libc::SIGABRT),
@@ -645,10 +656,10 @@ mod tests {
             }
             assert!(pending.is_ready());
             assert_eq!(count.load(Ordering::SeqCst), usize::from(!leave_first));
-            assert_eq!(content.writers.load(Ordering::SeqCst), 1);
+            assert_eq!(content.writer_count(), 1);
             drop(executing);
             drop(pending);
-            assert_eq!(content.writers.load(Ordering::SeqCst), 0);
+            assert_eq!(content.writer_count(), 0);
             assert_eq!(content.registry.get().unwrap().pages.lock().len(), 1);
         }
     }

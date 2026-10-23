@@ -2634,6 +2634,13 @@ mod cow_refault_watch_tests {
     }
 }
 
+// Compile the exact VM-free backing authority into the runtime test harness.
+// This keeps the production Linux feature closure free of the HVF backend.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../carrick-vmm-hvf/src/trap/code_content.rs"]
+mod code_content_test;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::binding::*;
@@ -3411,6 +3418,8 @@ pub(crate) mod tests {
         pub(crate) terminal_continuation_discards: usize,
         pub(crate) mailbox_slot: Option<usize>,
         pub(crate) prepare_dependency: Option<carrick_guest_mem::OwnedMemoryWait>,
+        // One-shot refusal and retry observation for production copyout routing tests.
+        pub(crate) copyout_prepare: Option<Box<dyn FnMut() -> Option<carrick_guest_mem::OwnedMemoryWait> + Send>>,
         pub(crate) prepared_write_context: Option<carrick_kernel::kernel::KernelContext>,
         pub(crate) prepared_cancels: usize,
         pub(crate) prepared_commits: usize,
@@ -3471,7 +3480,10 @@ pub(crate) mod tests {
 
     impl carrick_guest_mem::GuestMemory for CrashCaptureTestEngine {
         fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
-            if self.prepare_dependency.is_some() || self.copyout_owner_probe.is_some() {
+            if self.prepare_dependency.is_some()
+                || self.copyout_owner_probe.is_some()
+                || self.copyout_prepare.is_some()
+            {
                 carrick_guest_mem::UserMemoryVenue::Owner
             } else {
                 carrick_guest_mem::UserMemoryVenue::Legacy
@@ -3484,6 +3496,17 @@ pub(crate) mod tests {
             Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
             carrick_guest_mem::MemoryPrepareError,
         > {
+            if let Some(prepare) = &mut self.copyout_prepare {
+                if let Some(wait) = prepare() {
+                    return Err(carrick_guest_mem::MemoryPrepareError::Physical(wait));
+                }
+                assert_eq!(ranges.len(), 1);
+                return Ok(Box::new(TestPreparedCopyout {
+                    address: ranges[0].address().raw(),
+                    engine: self,
+                    committed: false,
+                }));
+            }
             if let Some(probe) = self.copyout_owner_probe {
                 if let Some(wait) = probe.wait_if_busy() {
                     return Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(wait));

@@ -261,6 +261,15 @@ fn owner_memory_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<Owne
     (wait_outcome, Some(resume))
 }
 
+/// One owner of the physical wait, its subscriptions and retained syscall.
+/// Enrollment and scheduler resumption settle through the same killable gate.
+pub(super) struct OwnerPhysicalResume {
+    frame: carrick_hal::RawSyscall,
+    resume: OwnedSyscallResume,
+    wait: carrick_guest_mem::OwnedMemoryWait,
+    subscription: Box<dyn std::fmt::Debug + Send + Sync>,
+}
+
 pub(super) enum HvpatchProductionPhase {
     Resident,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -323,12 +332,7 @@ pub(super) enum HvpatchProductionPhase {
     },
     /// A retained physical writer owns this dependency. Its subscription
     /// remains live while the job, not a pool worker, is blocked.
-    ResumeOwnerPhysical {
-        frame: carrick_hal::RawSyscall,
-        resume: OwnedSyscallResume,
-        wait: carrick_guest_mem::OwnedMemoryWait,
-        _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
-    },
+    ResumeOwnerPhysical(OwnerPhysicalResume),
     /// The exact unpublished physical grant must settle before EL0 can
     /// reselect this fault. No syscall completion belongs to this wait.
     ResumeFaultPhysical {
@@ -495,7 +499,7 @@ impl HvpatchProductionPhase {
             Self::Complete => 12,
             Self::BootstrapThreadChild => 13,
             Self::ResumeZone | Self::ResumeOwnerZone { .. } => 14,
-            Self::ResumeOwnerPhysical { .. } => 18,
+            Self::ResumeOwnerPhysical(_) => 18,
             Self::ResumeRetainedOwner { .. } => 19,
             Self::ResumeRetainedPhysical { .. } => 20,
             Self::RetainedMemoryRetry { .. } => 21,
@@ -3283,6 +3287,80 @@ where
         result
     }
 
+    fn resume_owner_physical(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        pending: OwnerPhysicalResume,
+        ready_at_enrollment: bool,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("physical owner resume lost context".to_owned())
+        })?;
+        // A ready dependency is not permission to finish a cancelled copyout.
+        // This query uses the task's signal owner and cannot deliver a stop or
+        // ordinary signal in the middle of an owner-memory operation.
+        let cancellation = carrick_kernel::kernel::continuation::owner_wait_cancellation(context);
+        match cancellation {
+            Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::GroupExit) => {
+                drop(pending);
+                return self.drive_thread_exit(engine, control, 0);
+            }
+            Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::NativeFatal) => {
+                drop(pending);
+                return self.cancel_native_owner_wait(engine);
+            }
+            Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::Carrier) => {
+                if let Some(reserved) =
+                    carrick_kernel::kernel::continuation::reserve_killable_wait_signal(context)
+                    && let Some(outcome) = service_signals_threaded(
+                        &self.kernel,
+                        context,
+                        engine,
+                        self.state.this_tid,
+                        self.state.fatal_image_generation,
+                        None,
+                        None,
+                        None,
+                        Some(reserved),
+                        self.traps,
+                    )?
+                {
+                    drop(pending);
+                    return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                }
+            }
+            None => {}
+        }
+        if !ready_at_enrollment && !pending.wait.0.is_ready() {
+            self.phase = HvpatchProductionPhase::ResumeOwnerPhysical(pending);
+            return Ok(self.suspend(
+                HvpatchLoopSuspension::BlockedContinuation,
+                executor::ExecutorExit::Blocked(
+                    carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                ),
+            ));
+        }
+        let OwnerPhysicalResume {
+            frame,
+            resume,
+            wait,
+            subscription,
+        } = pending;
+        drop(subscription);
+        // The retained operation drops its own dependency on entry to resume.
+        // Release our clone first: PendingContentWrite keeps writer exclusion
+        // alive until the last reference, even after readiness has published.
+        drop(wait);
+        let outcome = self.state.resume_owned_syscall(
+            &self.kernel,
+            engine,
+            resume,
+            control.submission.host_wait_context(),
+        )?;
+        self.route_outcome(engine, control, frame, outcome)
+    }
+
     pub(super) fn route_outcome(
         &mut self,
         engine: &mut E,
@@ -3384,36 +3462,21 @@ where
                 }
             };
             let (subscription, ready) = wait.0.enroll(Arc::clone(&wake));
-            // Enroll before the fatal sample: a publication on either side of
-            // enrollment is owned by the producer callback or this sample.
-            if carrick_kernel::kernel::continuation::owner_wait_cancellation(context).is_some() {
-                wake();
-            }
-            let subscription: Box<dyn std::fmt::Debug + Send + Sync> =
-                Box::new((subscription, signal_subscription, native_wait));
-            if ready || wait.0.is_ready() {
-                drop(subscription);
-                let outcome = self.state.resume_owned_syscall(
-                    &self.kernel,
-                    engine,
-                    resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
-                    control.submission.host_wait_context(),
-                )?;
-                return self.route_outcome(engine, control, frame, outcome);
-            }
-            self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
-                frame,
-                resume: resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
-                wait,
-                _subscription: subscription,
-            };
-            return Ok(self.suspend(
-                HvpatchLoopSuspension::BlockedContinuation,
-                executor::ExecutorExit::Blocked(
-                    carrick_kernel::kernel::objects::BlockedReason::HostWait,
-                ),
-            ));
+            // Both immediate readiness and a later scheduler wake must pass
+            // the same cancellation-first gate before the syscall can retry.
+            return self.resume_owner_physical(
+                engine,
+                control,
+                OwnerPhysicalResume {
+                    frame,
+                    resume: resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
+                    wait,
+                    subscription: Box::new((subscription, signal_subscription, native_wait)),
+                },
+                ready,
+            );
         }
+
         if carrick_kernel::kernel::continuation::is_blocking_dispatch_outcome(&outcome) {
             let _ = self.state.stash_parked_registers(engine);
             let request = self
@@ -4204,10 +4267,7 @@ where
                 self.kernel.wake_native_terminal_members(context)?;
             }
             if !self.phase.is_terminal_transition()
-                && !matches!(
-                    self.phase,
-                    HvpatchProductionPhase::ResumeOwnerPhysical { .. }
-                )
+                && !matches!(self.phase, HvpatchProductionPhase::ResumeOwnerPhysical(_))
             {
                 self.state.publish_external_ingress(&self.kernel)?;
             }
@@ -4465,77 +4525,8 @@ where
                 HvpatchProductionPhase::ResumeOwnerZone { frame, resume } => {
                     return self.resume_owner_zone(engine, control, frame, resume);
                 }
-                HvpatchProductionPhase::ResumeOwnerPhysical {
-                    frame,
-                    resume,
-                    wait,
-                    _subscription,
-                } => {
-                    let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
-                        RuntimeError::Configuration("physical owner resume lost context".to_owned())
-                    })?;
-                    let cancellation =
-                        carrick_kernel::kernel::continuation::owner_wait_cancellation(context);
-                    if matches!(
-                        cancellation,
-                        Some(
-                            carrick_kernel::kernel::continuation::OwnerWaitCancellation::GroupExit
-                        )
-                    ) {
-                        drop(_subscription);
-                        return self.drive_thread_exit(engine, control, 0);
-                    }
-                    if matches!(cancellation, Some(carrick_kernel::kernel::continuation::OwnerWaitCancellation::NativeFatal)) {
-                        drop(_subscription);
-                        return self.cancel_native_owner_wait(engine);
-                    }
-                    if cancellation
-                        == Some(
-                            carrick_kernel::kernel::continuation::OwnerWaitCancellation::Carrier,
-                        )
-                        && let Some(reserved) =
-                            carrick_kernel::kernel::continuation::reserve_killable_wait_signal(
-                                context,
-                            )
-                    {
-                        if let Some(outcome) = service_signals_threaded(
-                            &self.kernel,
-                            context,
-                            engine,
-                            self.state.this_tid,
-                            self.state.fatal_image_generation,
-                            None,
-                            None,
-                            None,
-                            Some(reserved),
-                            self.traps,
-                        )? {
-                            drop(_subscription);
-                            return Ok(self.enter_terminal_with_outcome(engine, outcome));
-                        }
-                    }
-                    if !wait.0.is_ready() {
-                        self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
-                            frame,
-                            resume,
-                            wait,
-                            _subscription,
-                        };
-                        return Ok(self.suspend(
-                            HvpatchLoopSuspension::BlockedContinuation,
-                            executor::ExecutorExit::Blocked(
-                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
-                            ),
-                        ));
-                    }
-                    drop(_subscription);
-                    let outcome = self.state.resume_owned_syscall(
-                        &self.kernel,
-                        engine,
-                        resume,
-                        control.submission.host_wait_context(),
-                    )?;
-                    return self.route_outcome(engine, control, frame, outcome);
+                HvpatchProductionPhase::ResumeOwnerPhysical(pending) => {
+                    return self.resume_owner_physical(engine, control, pending, false);
                 }
                 HvpatchProductionPhase::ResumeFaultPhysical {
                     wait,
@@ -6995,38 +6986,78 @@ mod tests {
         assert_eq!(pending.wait(), &MemoryReadWait::Owner(wait));
     }
 
-    /// Production dispatch, wait routing and resume, with only the physical
-    /// code-reader dependency supplied by the test engine. It remains unready
-    /// throughout SIGKILL delivery; no timer or readiness release rescues it.
+    #[derive(Clone, Copy)]
+    enum DirectoryPhysicalScenario {
+        KillParked,
+        KillDuringEnrollment,
+        ReleaseParked,
+        ReleaseDuringEnrollment,
+    }
+
     #[test]
     fn serial_host_directory_physical_dependency_sigkill_uses_owner_physical_resume() {
-        use carrick_guest_mem::{GuestVa, PhysicalMemoryWait};
-        use std::sync::atomic::{AtomicBool, Ordering};
+        exercise_directory_physical_resume(DirectoryPhysicalScenario::KillParked);
+    }
 
-        #[derive(Default)]
-        struct CodeReader {
-            ready: AtomicBool,
-            wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[test]
+    fn serial_host_directory_physical_sigkill_during_enrollment_precedes_ready_retry() {
+        exercise_directory_physical_resume(DirectoryPhysicalScenario::KillDuringEnrollment);
+    }
+
+    #[test]
+    fn serial_host_directory_physical_resume_releases_writer_before_retry() {
+        exercise_directory_physical_resume(DirectoryPhysicalScenario::ReleaseParked);
+    }
+
+    #[test]
+    fn serial_host_directory_physical_immediate_resume_releases_writer_before_retry() {
+        exercise_directory_physical_resume(DirectoryPhysicalScenario::ReleaseDuringEnrollment);
+    }
+
+    /// Real dispatch, scheduler, retained directory operation and content writer.
+    /// Only the engine and the enrollment interleaving are test-controlled.
+    fn exercise_directory_physical_resume(scenario: DirectoryPhysicalScenario) {
+        use super::super::code_content_test::{CodeContent, ContentError, PendingContentWrite};
+        use carrick_guest_mem::{GuestVa, OwnedMemoryWait, PhysicalMemoryWait};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct EnrollmentHook {
+            wait: OwnedMemoryWait,
+            hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         }
-        impl std::fmt::Debug for CodeReader {
+        impl std::fmt::Debug for EnrollmentHook {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.debug_struct("CodeReader")
-                    .field("ready", &self.ready)
+                f.debug_struct("EnrollmentHook")
+                    .field("wait", &self.wait)
                     .finish_non_exhaustive()
             }
         }
-        impl PhysicalMemoryWait for CodeReader {
+        impl PhysicalMemoryWait for EnrollmentHook {
             fn is_ready(&self) -> bool {
-                self.ready.load(Ordering::Acquire)
+                self.wait.0.is_ready()
             }
             fn enroll(
                 &self,
                 wake: Arc<dyn Fn() + Send + Sync>,
             ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
-                *self.wake.lock() = Some(wake);
-                (Box::new(()), self.is_ready())
+                let enrollment = self.wait.0.enroll(wake);
+                if let Some(hook) = self.hook.lock().take() {
+                    hook();
+                }
+                // Preserve the pre-hook sample: runtime must also handle release
+                // between enrollment and its subsequent readiness check.
+                enrollment
             }
         }
+        let kill_pending = matches!(
+            scenario,
+            DirectoryPhysicalScenario::KillParked | DirectoryPhysicalScenario::KillDuringEnrollment
+        );
+        let during_enrollment = matches!(
+            scenario,
+            DirectoryPhysicalScenario::KillDuringEnrollment
+                | DirectoryPhysicalScenario::ReleaseDuringEnrollment
+        );
         struct Restore(usize);
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -7099,9 +7130,67 @@ mod tests {
             else {
                 panic!("open directory")
             };
-            let reader = Arc::new(CodeReader::default());
+            let content = Arc::new(CodeContent::new(4096));
+            let mut executing = content.observe(0, 4).unwrap();
+            executing.begin_execution().unwrap();
+            let reader = Arc::new(Mutex::new(Some(executing)));
+            let physical = OwnedMemoryWait(Arc::new(
+                PendingContentWrite::new(content.clone(), 0, 4096).unwrap(),
+            ));
+            assert_eq!(content.writer_count(), 1);
+            assert_eq!(
+                content.observe(0, 4).unwrap_err(),
+                ContentError::WriteInProgress
+            );
+            let kill = {
+                let context = Arc::new(root.retain_exact());
+                move || {
+                    let kill = carrick_kernel::kernel::LinuxSignal::for_signal_number(
+                        carrick_abi::LINUX_SIGKILL,
+                    )
+                    .unwrap();
+                    context.signal_authority().enqueue_task_standard(kill, None);
+                    context.task().wake();
+                }
+            };
+            let enrollment_kill = kill.clone();
+            let enrollment_reader = reader.clone();
+            let mut refusal = Some(OwnedMemoryWait(Arc::new(EnrollmentHook {
+                wait: physical,
+                hook: Mutex::new(Some(Box::new(move || {
+                    if during_enrollment {
+                        if kill_pending {
+                            enrollment_kill();
+                        }
+                        let executing = enrollment_reader.lock().take();
+                        drop(executing);
+                    }
+                }))),
+            })));
+            let retries = Arc::new(AtomicUsize::new(0));
+            let prepare_retries = retries.clone();
+            let prepare_content = content.clone();
             let mut engine = CrashCaptureTestEngine {
-                prepare_dependency: Some(carrick_guest_mem::OwnedMemoryWait(reader.clone())),
+                copyout_prepare: Some(Box::new(move || {
+                    if let Some(wait) = refusal.take() {
+                        return Some(wait);
+                    }
+                    prepare_retries.fetch_add(1, Ordering::SeqCst);
+                    // The fatal race witness must reach its output/cursor checks
+                    // independently of the writer-custody assertion.
+                    if !kill_pending {
+                        assert_eq!(
+                            prepare_content.writer_count(),
+                            0,
+                            "runtime retained PendingContentWrite across re-preparation"
+                        );
+                        assert!(
+                            prepare_content.observe(0, 4).is_ok(),
+                            "sibling instruction observation still sees WriteInProgress"
+                        );
+                    }
+                    None
+                })),
                 exec_support: true,
                 snapshot_cpu: Some(executor::tests::task_state(&root, 759).cpu),
                 ..Default::default()
@@ -7171,6 +7260,17 @@ mod tests {
                 1_000,
             );
             state.service_kernel_context = Some(root.retain_exact());
+            state.guest_execution = Some(
+                kernel
+                    .dispatcher
+                    .enter_mm_executor_for_thread(
+                        Some(Arc::clone(root.thread())),
+                        Arc::clone(&state.kicker),
+                        tid,
+                        test_execution_slot(),
+                    )
+                    .unwrap(),
+            );
             state.zone_mm = Some(root.shared().mm().id().raw());
             state.syscall_completion =
                 SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
@@ -7206,84 +7306,133 @@ mod tests {
             let exit = job
                 .route_outcome(&mut engine, &mut control, frame, outcome)
                 .unwrap();
-            assert!(!reader.is_ready());
-            assert_eq!(engine.prepared_commits, 0);
-            let cursor = kernel
-                .dispatcher
-                .dispatch_threaded(
-                    &sibling,
-                    SyscallRequest::new(
-                        carrick_abi::syscall::nr::LSEEK.raw(),
-                        crate::compat::SyscallArgs([
-                            fd as u64,
-                            0,
-                            carrick_abi::LINUX_SEEK_CUR,
-                            0,
-                            0,
-                            0,
-                        ]),
-                    ),
-                    &mut path,
-                    &reporter,
-                    ThreadCtx::new(tid, &job.state.registry, &job.state.futex),
-                )
-                .unwrap();
-            assert_eq!(
-                cursor,
-                DispatchOutcome::Returned { value: 0 },
-                "suspension consumed the cursor"
-            );
-            let kill = || {
-                let kill = carrick_kernel::kernel::LinuxSignal::for_signal_number(
-                    carrick_abi::LINUX_SIGKILL,
-                )
-                .unwrap();
-                root.signal_authority().enqueue_task_standard(kill, None);
-                root.task().wake();
+            if kill_pending || !during_enrollment {
+                assert_eq!(
+                    engine.prepared_commits, 0,
+                    "fatal cancellation must precede output commit"
+                );
+            }
+            let mut directory_cursor = |state: &ThreadRuntimeState<CrashCaptureTestEngine>| {
+                kernel
+                    .dispatcher
+                    .dispatch_threaded(
+                        &sibling,
+                        SyscallRequest::new(
+                            carrick_abi::syscall::nr::LSEEK.raw(),
+                            crate::compat::SyscallArgs([
+                                fd as u64,
+                                0,
+                                carrick_abi::LINUX_SEEK_CUR,
+                                0,
+                                0,
+                                0,
+                            ]),
+                        ),
+                        &mut path,
+                        &reporter,
+                        ThreadCtx::new(tid, &state.registry, &state.futex),
+                    )
+                    .unwrap()
             };
-            assert!(matches!(exit, executor::ExecutorExit::Blocked(_)));
-            let lease = control.submission.take_execution_lease().unwrap();
-            running.restore_lease(lease).unwrap();
-            scheduler
-                .settle_blocked(
-                    running,
-                    carrick_kernel::kernel::objects::BlockedReason::HostWait,
-                )
-                .unwrap();
+            let cursor = directory_cursor(&job.state);
+            if kill_pending || !during_enrollment {
+                assert_eq!(
+                    cursor,
+                    DispatchOutcome::Returned { value: 0 },
+                    "suspension consumed the cursor"
+                );
+            }
+            let (exit, mut settled) = if during_enrollment {
+                (exit, running)
+            } else {
+                assert!(matches!(exit, executor::ExecutorExit::Blocked(_)));
+                let lease = control.submission.take_execution_lease().unwrap();
+                running.restore_lease(lease).unwrap();
+                scheduler
+                    .settle_blocked(
+                        running,
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    scheduler.queued_len(),
+                    0,
+                    "physical dependency must remain blocked"
+                );
+                root.task().wake();
+                assert_eq!(
+                    scheduler.queued_len(),
+                    0,
+                    "nonfatal notifications cannot release the wait"
+                );
+                if kill_pending {
+                    kill();
+                } else {
+                    let executing = reader.lock().take();
+                    drop(executing);
+                }
+                let mut resumed = scheduler
+                    .try_take(&registration)
+                    .unwrap()
+                    .expect("release or SIGKILL must make the task runnable");
+                control.submission.authority =
+                    executor::ExecutionLeaseAuthoritySlot::from(Some(resumed.take_lease()));
+                let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
+                (exit, resumed)
+            };
             assert_eq!(
-                scheduler.queued_len(),
+                content.writer_count(),
                 0,
-                "physical dependency must remain blocked"
+                "resume must release retained writer custody"
             );
-            // Nonfatal task notifications cannot release the owner wait.
-            root.task().wake();
-            assert_eq!(scheduler.queued_len(), 0);
-            kill();
-            let mut resumed = scheduler
-                .try_take(&registration)
-                .unwrap()
-                .expect("SIGKILL must make the task runnable");
-            control.submission.authority =
-                executor::ExecutionLeaseAuthoritySlot::from(Some(resumed.take_lease()));
-            let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
+            assert!(content.observe(0, 4).is_ok());
+            let cursor_after_resume = directory_cursor(&job.state);
+            if kill_pending {
+                assert_eq!(
+                    cursor_after_resume,
+                    DispatchOutcome::Returned { value: 0 },
+                    "fatal cancellation advanced the shared cursor"
+                );
+            } else {
+                assert!(
+                    matches!(cursor_after_resume, DispatchOutcome::Returned { value } if value > 0)
+                );
+            }
+
+            if !kill_pending {
+                assert!(
+                    matches!(exit, executor::ExecutorExit::Syscall),
+                    "copyout must complete: {exit:?}"
+                );
+                assert_eq!(retries.load(Ordering::SeqCst), 1);
+                assert_eq!(engine.prepared_commits, 1);
+                assert!(
+                    engine.guest_memory[&0x410000]
+                        .windows(9)
+                        .any(|bytes| bytes == b"module.py")
+                );
+                assert_eq!(engine.completed_syscalls.len(), 1);
+                let lease = control.submission.take_execution_lease().unwrap();
+                settled.restore_lease(lease).unwrap();
+                scheduler.settle_exited(settled).unwrap();
+                scheduler.unregister_executor(&registration).unwrap();
+                scheduler.close();
+                return;
+            }
             assert!(
                 matches!(exit, executor::ExecutorExit::Yielded),
                 "terminal drain handoff: {exit:?}"
             );
             assert!(job.phase.is_terminal_transition());
-            assert_eq!(
-                Arc::strong_count(&reader),
-                2,
-                "terminal handoff releases the retained operation and writer exclusion"
-            );
             let exit = job.poll_with_engine(&mut engine, &mut control).unwrap();
             assert!(
                 matches!(exit, executor::ExecutorExit::Exited),
                 "SIGKILL must terminate: {exit:?}"
             );
-            assert!(
-                !reader.is_ready(),
-                "termination must not require physical readiness"
+            assert_eq!(
+                retries.load(Ordering::SeqCst),
+                0,
+                "fatal cancellation must precede re-preparation"
             );
             assert_eq!(engine.prepared_commits, 0);
             assert!(!engine.guest_memory.contains_key(&0x410000));
@@ -7293,10 +7442,10 @@ mod tests {
             assert_eq!(run.terminating_signal, Some(carrick_abi::LINUX_SIGKILL));
             assert!(!root.kernel().task_key_is_live(root.task().key()));
             let lease = control.submission.take_execution_lease().unwrap();
-            resumed.restore_lease(lease).unwrap();
-            scheduler.settle_exited(resumed).unwrap();
-            reader.ready.store(true, Ordering::Release);
-            reader.wake.lock().as_ref().unwrap()();
+            settled.restore_lease(lease).unwrap();
+            scheduler.settle_exited(settled).unwrap();
+            let executing = reader.lock().take();
+            drop(executing);
             assert_eq!(
                 scheduler.queued_len(),
                 0,

@@ -257,7 +257,7 @@ impl<'a> FsView<'a> {
                 let wait = match error {
                     MemoryPrepareError::OwnerWait(wait) => MemoryReadWait::Owner(wait),
                     // Keep the real physical producer. The runtime binds a
-                    // directory suspension to its killable owner-zone resume;
+                    // directory suspension to the shared killable physical resume;
                     // relabeling this as an owner receipt would lose releases.
                     MemoryPrepareError::Physical(wait) => MemoryReadWait::Physical(wait),
                     MemoryPrepareError::Supply(MemorySupplyRequest::Metadata {

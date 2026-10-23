@@ -1903,14 +1903,17 @@ runtime errors; only `OutOfBounds` becomes EFAULT. EOF does not access the
 buffer. No owner permit or editor guard is stored in `OwnedDirectoryRead`.
 
 After rebasing onto #739, directory physical dependencies use the shared
-killable `ResumeOwnerPhysical` path. It enrolls both physical readiness and
-the task's fatal-signal authority before checking cancellation, and checks
-SIGKILL/group exit before readiness on resume. The round-1 directory-only
-zone record/source adapter is redundant and removed. Owner receipts still
-use the existing killable zone continuation. Both paths retain the selected
-directory operation without a permit or editor guard, then drop it on fatal
-cancellation. Native pending projection and prepared copyout keep #739's
-single-writer authorities; no directory-specific signal query is added.
+killable `ResumeOwnerPhysical` path. The round-1 directory-only zone adapter
+was **not fully redundant** with #739 as landed: it also settled immediate
+readiness through fatal cancellation and released its source before retry.
+Removing it at `e40cc351b` exposed both missing guarantees in the shared path.
+Enrollment and scheduler resumption now enter one cancellation-first method;
+SIGKILL/group exit wins over readiness, and runtime wait/subscription custody
+is dropped before re-preparing the retained operation. This makes the separate
+adapter unnecessary without losing its guarantees. Owner receipts still use
+the existing killable zone continuation. Native pending projection and prepared
+copyout keep #739's single-writer authorities; no directory-specific signal
+query is added.
 
 Before any successful copy, refusal outcomes are:
 
@@ -1945,10 +1948,23 @@ first failed against unchanged `411190d55`: after SIGKILL, production poll
 returned blocked while the physical dependency stayed unready (exit 101).
 It now runs production directory dispatch, physical owner-wait enrollment,
 scheduler settlement, owner resume, signal delivery and terminal publication.
-The physical dependency is a test-engine stand-in for the retained code
-reader; it stays unready throughout. The witness requires zero output commits,
-an unchanged cursor, released retained custody, and process death by signal 9.
+The physical dependency now uses the actual VM-free `CodeContent` and
+`PendingContentWrite` source in the runtime test harness. The engine supplies
+only the preparation refusal and controlled enrollment ordering. The witness
+requires zero output commits, an unchanged cursor, released writer custody,
+and process death by signal 9 while the reader has not released.
 This is a runtime witness without a VM, not live HVF code-reader evidence.
+
+The follow-up witnesses were RED against `e40cc351b` (exit 101):
+`serial_host_directory_physical_sigkill_during_enrollment_precedes_ready_retry`
+observed one output commit after SIGKILL published during enrollment and the
+reader released before the readiness check. It now requires no re-preparation,
+no output, an unchanged shared cursor and terminal signal 9.
+`serial_host_directory_physical_resume_releases_writer_before_retry` and
+`serial_host_directory_physical_immediate_resume_releases_writer_before_retry`
+both observed writer count 1 at retry. They require count 0 and a successful
+sibling instruction observation (no `WriteInProgress`) before a fresh PREPARE,
+followed by exactly one output commit and syscall completion.
 
 The retained-selection component also failed before releasing the saved wait:
 PREPARE still observed two physical references instead of the single external
