@@ -376,7 +376,19 @@ fn loop_client_alias_sends_one_strict_json_request() {
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let alias = temp.path().join("dispatch-worker");
-    std::fs::copy(env!("CARGO_BIN_EXE_carrick-xtask"), &alias).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_carrick-xtask"), &alias).unwrap();
+    // #814: deterministically retain the write description a concurrent fork
+    // can inherit during copy. Links to the original inode need no writer.
+    use std::os::unix::fs::MetadataExt;
+    let source = std::fs::metadata(env!("CARGO_BIN_EXE_carrick-xtask")).unwrap();
+    let target = std::fs::metadata(&alias).unwrap();
+    let _inherited_writer =
+        ((source.dev(), source.ino()) != (target.dev(), target.ino())).then(|| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&alias)
+                .unwrap()
+        });
     let mut child = Command::new(&alias)
         .args(["tool", "read_state"])
         .current_dir(temp.path())
@@ -692,6 +704,7 @@ fn issue_triggers_default_to_run_branch_without_parsing_body_directives() {
             let run = json!({"id":42,"repository":{"full_name":"carrick-sh/carrick"},"head_repository":{"full_name":"carrick-sh/carrick"},"path":".github/workflows/dispatch-worker.yml","event":"issues","head_branch":"main","head_sha":"a".repeat(40),"actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"}});
             let comment = json!({"id":123,"user":{"login":"tjfontaine","type":"User"},"body":"/agent do the acceptance criterion","created_at":"2026-10-24T00:00:00Z","updated_at":"2026-10-24T00:00:00Z"});
             let mut event = json!({"repository":{"full_name":"carrick-sh/carrick"},"action":"labeled","sender":{"login":"tjfontaine","type":"User"},"label":{"name":"dispatch:free text context"},"issue":{"number":587,"title":"Fixture","body":"Free-form body\nBranch: work/foreign\nThis is model context only.","user":{"login":"tjfontaine","type":"User"}}});
+            event["issue"]["state"] = "open".into();
             if trigger == "comment" {
                 event["action"] = "created".into();
                 event["comment"] = comment.clone();
