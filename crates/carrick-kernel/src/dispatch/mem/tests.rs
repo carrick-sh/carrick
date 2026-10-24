@@ -174,6 +174,127 @@ impl CountingMmapMemory {
     }
 }
 
+fn semantic_arena_retirement_fixture() -> (
+    SyscallDispatcher,
+    CountingMmapMemory,
+    Box<carrick_el1_abi::FrameGrantResidencyTable>,
+    carrick_el1_abi::FrameGrantResidencyIdentity,
+) {
+    const LENGTH: u64 = 4 * LINUX_PAGE_SIZE;
+    let dispatcher = SyscallDispatcher::new();
+    let address = LINUX_MMAP_BASE + 2 * LINUX_PAGE_SIZE;
+    let memory = CountingMmapMemory::new(LINUX_MMAP_BASE, 16 * LINUX_PAGE_SIZE as usize);
+    let residency = Box::new(carrick_el1_abi::FrameGrantResidencyTable::new());
+    let identity = carrick_el1_abi::FrameGrantResidencyIdentity {
+        mm_key: dispatcher.mm_authority().mm_id.raw(),
+        semantic_base: address,
+        physical_ipa: 0x1234_0000,
+        len: LENGTH,
+        mapping_id: 1,
+        frame_id: 1,
+        owner_generation: 1,
+        inventory_revision: 1,
+    };
+    assert!(residency.publish(identity).is_some());
+    (dispatcher, memory, residency, identity)
+}
+
+#[test]
+fn semantic_arena_fixed_retirement_refuses_before_backend_while_residency_is_pinned() {
+    let (dispatcher, mut memory, residency, identity) = semantic_arena_retirement_fixture();
+    let page = residency
+        .lookup(identity.mm_key, identity.semantic_base + LINUX_PAGE_SIZE)
+        .unwrap();
+    let transfer = residency.pin_transfer(page).unwrap();
+
+    let result = mmap::retire_anonymous_mapping_backing_with_residency_for_test(
+        &dispatcher.mem_view(),
+        &mut memory,
+        (
+            identity.semantic_base,
+            identity.len,
+            identity.len as usize,
+            true,
+            false,
+        ),
+        &residency,
+    );
+
+    assert_eq!(result, Err(MemoryError::MetadataAllocation));
+    assert!(
+        memory.unmap_log.borrow().is_empty(),
+        "backend retirement must not begin while replacement residency is pinned"
+    );
+    assert_eq!(
+        residency.lookup(identity.mm_key, identity.semantic_base + LINUX_PAGE_SIZE),
+        Some(page)
+    );
+    drop(transfer);
+}
+
+#[test]
+fn semantic_arena_fixed_retirement_commits_residency_after_backend_success() {
+    let (dispatcher, mut memory, residency, identity) = semantic_arena_retirement_fixture();
+
+    mmap::retire_anonymous_mapping_backing_with_residency_for_test(
+        &dispatcher.mem_view(),
+        &mut memory,
+        (
+            identity.semantic_base,
+            identity.len,
+            identity.len as usize,
+            true,
+            false,
+        ),
+        &residency,
+    )
+    .unwrap();
+
+    assert_eq!(
+        memory.unmap_log.into_inner(),
+        vec![(identity.semantic_base, identity.len as usize)]
+    );
+    assert!(
+        residency
+            .lookup(identity.mm_key, identity.semantic_base + LINUX_PAGE_SIZE)
+            .is_none(),
+        "retired backing must not leave an authoritative predecessor residency"
+    );
+}
+
+#[test]
+fn semantic_arena_fixed_retirement_reopens_residency_after_backend_failure() {
+    let (dispatcher, mut memory, residency, identity) = semantic_arena_retirement_fixture();
+    let page = residency
+        .lookup(identity.mm_key, identity.semantic_base + LINUX_PAGE_SIZE)
+        .unwrap();
+    memory.set_fail_unmap_at(Some(identity.semantic_base));
+
+    let result = mmap::retire_anonymous_mapping_backing_with_residency_for_test(
+        &dispatcher.mem_view(),
+        &mut memory,
+        (
+            identity.semantic_base,
+            identity.len,
+            identity.len as usize,
+            true,
+            false,
+        ),
+        &residency,
+    );
+
+    assert!(matches!(result, Err(MemoryError::HostMap(_))));
+    assert!(memory.unmap_log.borrow().is_empty());
+    assert_eq!(
+        residency.lookup(identity.mm_key, identity.semantic_base + LINUX_PAGE_SIZE),
+        Some(page)
+    );
+    assert!(
+        residency.pin_transfer(page).is_some(),
+        "backend rollback must reopen predecessor transfer admission"
+    );
+}
+
 impl GuestMemory for CountingMmapMemory {
     fn zero_pending_backing(
         &mut self,
