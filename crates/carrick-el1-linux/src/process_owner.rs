@@ -1078,10 +1078,8 @@ impl<'a, C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailur
 {
     /// Validate and retain exact member effects without publishing exit. The
     /// retained reservation rolls back on early return until publish commits.
-    pub fn begin(
-        self,
-        status: LinuxWaitStatus,
-    ) -> Result<GuestPendingExit<'a, C, U, N, F>, GuestProcessError<N::Error>> {
+    /// Keep topology and effects boxed across the nested publication frames.
+    pub fn begin(self, status: LinuxWaitStatus) -> PendingExitResult<'a, C, U, N, F> {
         let registry = self
             .registry
             .as_deref()
@@ -1097,11 +1095,11 @@ impl<'a, C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailur
         let effects = registry
             .prepare_exit_effects(self.task, topology, permit)
             .map_err(GuestProcessError::Exit)?;
-        Ok(GuestPendingExit {
+        Ok(Box::new(GuestPendingExit {
             reserved: self,
             status,
             effects,
-        })
+        }))
     }
 }
 
@@ -1119,12 +1117,22 @@ pub struct GuestPendingExit<
     status: LinuxWaitStatus,
     effects: PreparedExitEffects<N::Member, N::Resources, N::Transaction>,
 }
+pub type PendingExitResult<'a, C, U, N, F> = Result<
+    Box<GuestPendingExit<'a, C, U, N, F>>,
+    GuestProcessError<<N as NativeProcessCustody>::Error>,
+>;
 impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
     GuestPendingExit<'_, C, U, N, F>
 {
     /// All fallible admission happens before publishing task state or topology.
     /// Resources can leave this custody only after successful publication.
-    pub fn publish(mut self) -> Result<GuestPublishedExit<N>, GuestProcessError<N::Error>> {
+    /// Return heap custody directly instead of an aggregate return buffer.
+    // Unboxing at the call retains the topology/effects on the EL1 stack;
+    // boxed custody reduces publish_exit + finish_exit by 384 compiled bytes.
+    #[allow(clippy::boxed_local)]
+    pub fn publish(
+        mut self: Box<Self>,
+    ) -> Result<Box<GuestPublishedExit<N>>, GuestProcessError<N::Error>> {
         let task = self.reserved.task;
         let registry = self
             .reserved
@@ -1202,7 +1210,7 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             .after_release(released)
             .unwrap_or_else(|_| F::fail_process(GuestProcessInvariant::ExitReleaseLost(task)));
         self.reserved.registry = None;
-        Ok(GuestPublishedExit {
+        Ok(Box::new(GuestPublishedExit {
             retirement: ExitRetirementPublication {
                 task,
                 readiness: retirement,
@@ -1211,7 +1219,7 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             effects,
             resources,
             adopter,
-        })
+        }))
     }
 }
 
