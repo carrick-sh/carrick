@@ -94,3 +94,82 @@
 - [ ] **Step 4: Review `git diff` for exec/crossing/out-of-fence changes and confirm the layer remains below approximately 4,000 changed lines.**
 
 - [ ] **Step 5: Write `/tmp/740-s5-handoff.md`, commit any final tracked corrections, and post the review-ready SHA without pushing.**
+
+---
+
+## Round 2: wait4 and Pipeline Lifecycle Closure
+
+Job-control stop/continue reporting is deliberately excluded here and tracked
+by #831.  The acceptance workload is `sh -c 'ls / | head -2'`; the work below
+extends the same signal/wait/retirement owner instead of adding a pipeline-only
+or host-backed path.
+
+### Task 4: Preserve Native Signal-Death Status and Complete wait4 Selection
+
+**Files:**
+- Modify: `crates/carrick-el1-linux/src/aarch64_process_tests.rs`
+- Modify: `crates/carrick-el1-linux/src/native_process_runtime.rs`
+- Modify: `crates/carrick-el1-linux/src/signal_delivery.rs`
+
+**Interfaces:**
+- Consumes: `carrick_signal_core::policy::default_delivery`, shared
+  `wait_query`, and `ProcessWaitPid` selection.
+- Produces: literal Linux wait4 status for normal and signal death, including
+  the core bit, plus pid/-1/0/-pgid, WNOHANG, and ECHILD witnesses.
+
+- [ ] **Step 1: Add a two-process red witness that sends a default core signal through production signal delivery and checks `WIFSIGNALED`, `WTERMSIG`, and the raw core bit via wait4.**
+
+- [ ] **Step 2: Run the focused witness and retain the RED showing that native termination currently drops bit 7.**
+
+- [ ] **Step 3: Pass the typed terminating signal into the terminal owner and derive the core flag once from `carrick-signal-core`; update all callers without adding an ARM-only status encoder.**
+
+- [ ] **Step 4: Add or tighten one shared-owner selection matrix for pid, -1, 0, and -pgid, including WNOHANG while a matching child lives and numeric ECHILD (10) after its only zombie is consumed.**
+
+- [ ] **Step 5: Run the focused ARM/native wait tests and commit.**
+
+### Task 5: Bind SIGCHLD, Blocking wait4, and Pipeline SIGPIPE
+
+**Files:**
+- Modify: `crates/carrick-el1-linux/src/aarch64_process_tests.rs`
+- Modify: `crates/carrick-el1-linux/src/native_process_runtime.rs` only if
+  composition exposes a missing signal-owner seam
+- Modify: `conformance-contracts/contracts/native-child-terminal.toml`
+- Modify: `conformance-contracts/contracts/el1-signal-delivery-owner.toml`
+
+**Interfaces:**
+- Consumes: child exit publication, SIGCHLD action policy, owned wait4
+  continuation, interrupted-wait custody, and the ring IPC SIGPIPE handback.
+- Produces: one wake without polling, default-ignore zombie retention,
+  explicit SIG_IGN/SA_NOCLDWAIT auto-reap, EINTR/SA_RESTART, and SIGPIPE
+  delivery to the exact native writer.
+
+- [ ] **Step 1: Add a composed parent/child witness covering default SIGCHLD zombie retention, one blocked wait4 wake, and one reap; keep existing action-policy unit tests as the explicit-ignore/SA_NOCLDWAIT proof.**
+
+- [ ] **Step 2: Bind the existing production ARM EINTR/SA_RESTART tests and assert their literal EINTR value where missing.**
+
+- [ ] **Step 3: Connect or witness the IPC SIGPIPE handback at the native signal owner: default SIGPIPE terminates the writer with wait status 13, while ignored SIGPIPE leaves EPIPE (32) as the operation result. Do not alter slice 3's FD authority.**
+
+- [ ] **Step 4: Run focused signal, wait, and IPC continuation tests, then commit.**
+
+### Task 6: Close Reparenting and Concurrent Group Exit
+
+**Files:**
+- Modify: `crates/carrick-el1-linux/src/aarch64_process_tests.rs`
+- Modify: `crates/carrick-el1-linux/src/native_process_runtime.rs` only for a
+  witness-derived lifecycle defect
+- Modify: `conformance-contracts/contracts/native-child-terminal.toml`
+
+**Interfaces:**
+- Consumes: current-adopter selection, shared retirement owner, group-exit
+  custody, and owned participant transitions.
+- Produces: parent-exit reparent/reap with no records left, two live child
+  threads during exit_group, and late Born/ExitedInZone publication without a
+  closed participant gate.
+
+- [ ] **Step 1: Compose the existing delayed-exit and blocked-adopter fixtures into an exact no-leak assertion after both parent and child are reaped.**
+
+- [ ] **Step 2: Tighten the two-live-thread exit_group witness to prove the sibling's late lifecycle receipt settles before the one group zombie becomes reapable.**
+
+- [ ] **Step 3: Bind the exact adopter, two-thread, late Born, and late ExitedInZone witnesses to `process.native.terminal-child`, then run the focused registry checks.**
+
+- [ ] **Step 4: Commit, then execute Task 3's full portable and EL1 budget gates and refresh `/tmp/740-s5-handoff.md`.**
