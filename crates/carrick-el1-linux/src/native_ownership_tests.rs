@@ -188,6 +188,7 @@ impl AnonymousPermissionEditor for LiveProbe {
 impl AnonymousRetirementEditor for LiveProbe {
     fn retire_and_invalidate(
         &mut self,
+        _mm: carrick_el1_abi::ReservationMm,
         _ttbr0: carrick_guest_arch::AddressSpaceRegister,
         _address: carrick_guest_arch::UserVa,
         _len: carrick_guest_arch::GuestLen,

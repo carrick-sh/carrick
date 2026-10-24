@@ -35,6 +35,7 @@ impl carrick_el1::fault::PreparedPageResolver for SelectionWords<'_> {
         panic!("this fixture faults only on absent leaves or private COW leaves")
     }
 }
+
 fn leaf(words: &impl LiveDescriptorWords, root: u64, va: u64) -> u64 {
     let mut table = root & AARCH64_ROOT_ADDRESS_MASK;
     for (level, index) in carrick_mmu_core::aarch64::indices(va)
@@ -50,7 +51,10 @@ fn leaf(words: &impl LiveDescriptorWords, root: u64, va: u64) -> u64 {
     }
     unreachable!()
 }
-struct FixtureMapping<'a>(&'a dyn LiveDescriptorWords);
+struct FixtureMapping<'a> {
+    words: &'a dyn LiveDescriptorWords,
+    residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
+}
 impl carrick_el1::memory::AnonymousBackingProbe for FixtureMapping<'_> {
     fn backing(
         &mut self,
@@ -59,7 +63,7 @@ impl carrick_el1::memory::AnonymousBackingProbe for FixtureMapping<'_> {
         len: carrick_guest_arch::GuestLen,
     ) -> carrick_el1::memory::Stage1Backing {
         carrick_el1::memory::classify_stage1_range(
-            &|address| self.0.load(address).ok(),
+            &|address| self.words.load(address).ok(),
             root.raw() & AARCH64_ROOT_ADDRESS_MASK,
             va.raw(),
             len.raw(),
@@ -81,6 +85,7 @@ impl carrick_el1::memory::AnonymousPermissionEditor for FixtureMapping<'_> {
 impl carrick_el1::memory::AnonymousRetirementEditor for FixtureMapping<'_> {
     fn retire_and_invalidate(
         &mut self,
+        mm: ReservationMm,
         root: carrick_guest_arch::AddressSpaceRegister,
         address: UserVa,
         len: carrick_guest_arch::GuestLen,
@@ -89,9 +94,15 @@ impl carrick_el1::memory::AnonymousRetirementEditor for FixtureMapping<'_> {
             DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
             execute_descriptor_op,
         };
+        let Some(residency) =
+            self.residency
+                .begin_retire_overlapping(mm.raw(), address.raw(), len.raw())
+        else {
+            return Err(carrick_mmu_core::aarch64::GuestRetirementError::ResidencyBusy);
+        };
         assert!(matches!(
             execute_descriptor_op(
-                self.0,
+                self.words,
                 carrick_mmu_core::aarch64::SubstrateGpa(root.raw() & AARCH64_ROOT_ADDRESS_MASK),
                 DescriptorOp::Retire(PageSpan::new(address.raw(), len.raw())),
                 &TableGrants::NONE,
@@ -99,6 +110,7 @@ impl carrick_el1::memory::AnonymousRetirementEditor for FixtureMapping<'_> {
             ),
             DescriptorOutcome::Applied(_)
         ));
+        assert!(residency.commit());
         Ok(())
     }
 }
@@ -902,23 +914,49 @@ fn composed_native_supply(
     frame.x[8] = 222;
     let map_base = if replace_cow { VA + 4096 } else { VA + 0x10000 };
     frame.x[..6].copy_from_slice(&[map_base, 8192, 3, 0x32, u64::MAX, 0]);
-    assert_eq!(
-        carrick_el1::memory::serve_delegated_anonymous(
-            &mut frame,
-            &counters,
-            &fixture.task,
-            access,
-            fixture.region.table(),
-            &mut FixtureMapping(words),
-        ),
-        carrick_el1::memory::DelegatedAnonymous::Served
+    let transfer_pin = replace_cow.then(|| {
+        let page = residency
+            .lookup(identity.mm, map_base)
+            .expect("completed COW span retains residency");
+        residency
+            .pin_transfer(page)
+            .expect("fixture owns the live residency generation")
+    });
+    let first = carrick_el1::memory::serve_delegated_anonymous(
+        &mut frame,
+        &counters,
+        &fixture.task,
+        access,
+        fixture.region.table(),
+        &mut FixtureMapping { words, residency },
     );
-    let fresh = frame.x[0];
-    if replace_cow {
-        // serve_delegated_anonymous updates the installed global residency
-        // table on target_os=none; this fixture owns that table explicitly.
-        assert!(residency.retire_overlapping(identity.mm, fresh, 8192));
+    if let Some(pin) = transfer_pin {
+        assert_eq!(
+            first,
+            carrick_el1::memory::DelegatedAnonymous::Forward,
+            "a transfer pin must refuse before stage-1 replacement"
+        );
+        assert!(
+            residency.lookup(identity.mm, map_base).is_some(),
+            "refusal preserves the original residency"
+        );
+        drop(pin);
+        frame.x[..6].copy_from_slice(&[map_base, 8192, 3, 0x32, u64::MAX, 0]);
+        assert_eq!(
+            carrick_el1::memory::serve_delegated_anonymous(
+                &mut frame,
+                &counters,
+                &fixture.task,
+                access,
+                fixture.region.table(),
+                &mut FixtureMapping { words, residency },
+            ),
+            carrick_el1::memory::DelegatedAnonymous::Served
+        );
+    } else {
+        assert_eq!(first, carrick_el1::memory::DelegatedAnonymous::Served);
     }
+    let fresh = frame.x[0];
     assert!(fresh == map_base, "native mmap: {fresh:#x}");
     frame.esr = 0x92000046;
     frame.far = fresh + 7;

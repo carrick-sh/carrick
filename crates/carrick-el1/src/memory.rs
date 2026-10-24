@@ -321,6 +321,7 @@ pub trait AnonymousPermissionEditor {
 pub trait AnonymousRetirementEditor {
     fn retire_and_invalidate(
         &mut self,
+        mm: carrick_el1_abi::ReservationMm,
         ttbr0: carrick_guest_arch::AddressSpaceRegister,
         address: carrick_guest_arch::UserVa,
         len: carrick_guest_arch::GuestLen,
@@ -365,6 +366,7 @@ pub struct HardwareAnonymousRetirementEditor;
 impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
     fn retire_and_invalidate(
         &mut self,
+        mm: carrick_el1_abi::ReservationMm,
         ttbr0: carrick_guest_arch::AddressSpaceRegister,
         address: carrick_guest_arch::UserVa,
         len: carrick_guest_arch::GuestLen,
@@ -372,12 +374,19 @@ impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
         let ttbr0 = ttbr0.raw();
         let address = address.raw();
         let len = len.raw();
+        let Some(residency) = crate::isa::frame_grant_residency_guest().begin_retire_overlapping(
+            mm.raw(),
+            address,
+            len,
+        ) else {
+            return Err(GuestRetirementError::ResidencyBusy);
+        };
         const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
         let physical_base = ttbr0 & TTBR_BADDR_MASK;
         let words =
             carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut core::sync::atomic::AtomicU64;
         let byte_len = carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize;
-        unsafe {
+        let retired = unsafe {
             carrick_mmu_core::aarch64::retire_existing_el1_private_pages(
                 words,
                 physical_base,
@@ -385,7 +394,11 @@ impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
                 Some(carrick_el1_abi::stage1_table_pool_window()),
                 address,
                 len,
-            )?;
+            )
+        };
+        retired?;
+        if !residency.commit() {
+            return Err(GuestRetirementError::RollbackFailed);
         }
         let mut cpu = crate::substrate::sched::HardwareCpu;
         crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
@@ -728,11 +741,12 @@ impl AnonymousPermissionEditor for HardwareAnonymousEditor {
 impl AnonymousRetirementEditor for HardwareAnonymousEditor {
     fn retire_and_invalidate(
         &mut self,
+        mm: carrick_el1_abi::ReservationMm,
         ttbr0: carrick_guest_arch::AddressSpaceRegister,
         address: carrick_guest_arch::UserVa,
         len: carrick_guest_arch::GuestLen,
     ) -> Result<(), GuestRetirementError> {
-        HardwareAnonymousRetirementEditor.retire_and_invalidate(ttbr0, address, len)
+        HardwareAnonymousRetirementEditor.retire_and_invalidate(mm, ttbr0, address, len)
     }
 }
 
@@ -901,15 +915,12 @@ pub fn serve_delegated_anonymous<
                 return refuse(pending, &mut model, Leave::JournalFull);
             };
             match editor.retire_and_invalidate(
+                mm,
                 carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
                 carrick_guest_arch::UserVa::new(start),
                 carrick_guest_arch::GuestLen::new(run_len),
             ) {
-                Ok(()) => {
-                    #[cfg(target_os = "none")]
-                    crate::isa::frame_grant_residency_guest().retire_overlapping(mm_key, va, len);
-                    Some(slot)
-                }
+                Ok(()) => Some(slot),
                 Err(GuestRetirementError::RollbackFailed) => {
                     panic!("EL1 anonymous retirement rollback failed")
                 }
@@ -1028,20 +1039,18 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
         return MunmapDisposition::Forward;
     };
     match editor.retire_and_invalidate(
+        carrick_el1_abi::ReservationMm::new(mm_key).expect("admitted MM is nonzero"),
         carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
         carrick_guest_arch::UserVa::new(address),
         carrick_guest_arch::GuestLen::new(len),
     ) {
-        Ok(()) => {
-            #[cfg(target_os = "none")]
-            crate::isa::frame_grant_residency_guest().retire_overlapping(mm_key, address, len);
-            MunmapDisposition::Retired
-        }
+        Ok(()) => MunmapDisposition::Retired,
         Err(GuestRetirementError::BadRange) => MunmapDisposition::Return(-EINVAL),
         Err(
             GuestRetirementError::TableOutsidePrimary
             | GuestRetirementError::MissingTable
-            | GuestRetirementError::NotPrivateAnonymous,
+            | GuestRetirementError::NotPrivateAnonymous
+            | GuestRetirementError::ResidencyBusy,
         ) => MunmapDisposition::Forward,
         Err(GuestRetirementError::RollbackFailed) => {
             panic!("EL1 anonymous retirement rollback failed")
@@ -1368,6 +1377,7 @@ mod tests {
     impl AnonymousRetirementEditor for RecordingRetirementEditor {
         fn retire_and_invalidate(
             &mut self,
+            _mm: carrick_el1_abi::ReservationMm,
             ttbr0: carrick_guest_arch::AddressSpaceRegister,
             address: carrick_guest_arch::UserVa,
             len: carrick_guest_arch::GuestLen,
@@ -1599,6 +1609,7 @@ mod tests {
         impl AnonymousRetirementEditor for Editor {
             fn retire_and_invalidate(
                 &mut self,
+                _mm: carrick_el1_abi::ReservationMm,
                 ttbr0: carrick_guest_arch::AddressSpaceRegister,
                 address: carrick_guest_arch::UserVa,
                 len: carrick_guest_arch::GuestLen,
