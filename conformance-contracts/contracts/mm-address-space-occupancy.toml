@@ -1,3 +1,6 @@
+# Shared image import: core::mm::reservation::root::tests::
+# image_import_rolls_back_only_the_unpublished_successor and kernel occupancy
+# successor_image_import_failure_keeps_old_root_and_success_stays_closed.
 # Exec successor publication component (#785): mm_occupancy::tests::
 # retained_successor_publications_are_closed_and_rollback_in_their_own_carrier,
 # refused_retained_publication_releases_every_backing_reference, and
