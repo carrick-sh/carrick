@@ -947,6 +947,9 @@ impl<'a> MemView<'a> {
 
     pub(crate) fn commit_host_alias_mmap(&self, commit: HostAliasMmapCommit) {
         let authority = self.mm_authority();
+        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+            table.retire_overlapping(authority.mm_id.raw(), commit.start, commit.len);
+        }
         Self::commit_host_alias_mmap_on(&authority, commit);
     }
 
@@ -969,9 +972,6 @@ impl<'a> MemView<'a> {
             );
         };
         let (read, write, execute) = prot_to_proc_perms(commit.prot);
-        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
-            table.retire_overlapping(authority.mm_id.raw(), commit.start, commit.len);
-        }
         let mut mem = authority.mem.lock();
 
         // Remove only the replaced range from every classification. This is
