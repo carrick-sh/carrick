@@ -410,7 +410,7 @@ impl FsBackend for MemoryBackend {
         // its creation mode under `--fs memory`, matching `--fs host` (which
         // chmods the real inode). The contents are preserved verbatim.
         if let Some(existing) = inner.files.get(&normalized) {
-            existing.write().mode = mode;
+            existing.set_mode(mode);
             self.generation
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok(());

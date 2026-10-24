@@ -374,9 +374,12 @@ impl<'a> FsView<'a> {
                 if let Some(of) = this.open_file(fd.0) {
                     if let Some(mut open) = crate::kernel::FileDescription::write_for_io(&of.description) {
                         match &mut *open {
-                            OpenDescription::Directory { metadata, .. }
-                            | OpenDescription::File { metadata, .. } => {
+                            OpenDescription::Directory { metadata, .. } => {
                                 metadata.mode = mode;
+                            }
+                            OpenDescription::File { metadata, base, .. } => {
+                                metadata.mode = mode;
+                                base.update_exec_source_mode(mode);
                             }
                             OpenDescription::HostFile { host_fd, metadata, .. } => {
                                 metadata.mode = mode;

@@ -620,8 +620,15 @@ impl<'a> FsView<'a> {
             Ok(carrick_vfs::vfs::rootfs::OpenDispatchResult::RootFsBackedFile {
                 metadata,
                 contents,
+                object,
                 writable,
             }) => {
+                let source = object.map(|object| {
+                    crate::dispatch::executable_authority::ExecSource::shared_object(
+                        object,
+                        path.clone(),
+                    )
+                });
                 let inode = carrick_vfs::InodeIdentity::new(
                     0,
                     super::inode_for_path(std::path::Path::new(&path)),
@@ -635,7 +642,9 @@ impl<'a> FsView<'a> {
                         contents.len,
                     ),
                     offset: 0,
-                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC).with_inode(inode),
+                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC)
+                        .with_inode(inode)
+                        .with_exec_source(source),
                     writable,
                 }
             }

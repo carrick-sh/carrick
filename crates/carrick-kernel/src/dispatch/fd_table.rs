@@ -464,6 +464,8 @@ pub(super) struct TimerFdInner {
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenDescriptionBase {
+    /// File-source custody selected by the VFS at open, independent of fd flags.
+    exec_source: Option<Arc<crate::dispatch::executable_authority::ExecSource>>,
     fs_identity: Option<carrick_vfs::FsIdentity>,
     inode: Option<carrick_vfs::InodeIdentity>,
     /// SO_RCVTIMEO: bounds a blocking recv on this socket. None = block forever.
@@ -561,6 +563,7 @@ pub(crate) struct SocketMulticastMembership {
 impl OpenDescriptionBase {
     pub(crate) fn new(#[allow(unused)] status_flags: u64) -> Self {
         Self {
+            exec_source: None,
             fs_identity: None,
             inode: None,
             so_reuseaddr: false,
@@ -583,6 +586,20 @@ impl OpenDescriptionBase {
             shared_pipe: None,
             inzone_listener: None,
             inzone_cleanup: None,
+        }
+    }
+
+    pub(super) fn with_exec_source(
+        mut self,
+        source: Option<crate::dispatch::executable_authority::ExecSource>,
+    ) -> Self {
+        self.exec_source = source.map(Arc::new);
+        self
+    }
+
+    pub(super) fn update_exec_source_mode(&self, mode: u32) {
+        if let Some(source) = &self.exec_source {
+            source.set_memory_mode(mode);
         }
     }
 
@@ -2384,6 +2401,7 @@ impl OpenDescription {
     ) -> Option<&crate::dispatch::executable_authority::ExecSource> {
         match self {
             Self::ProcExecutable { executable, .. } => Some(executable.source()),
+            Self::File { base, .. } => base.exec_source.as_deref(),
             _ => None,
         }
     }

@@ -366,6 +366,7 @@ pub(super) struct PreparedExecve {
     proc_argv: Vec<String>,
     proc_env: Vec<Vec<u8>>,
     executable_source: carrick_kernel::dispatch::executable_authority::ExecSource,
+    binfmt_argv: Option<Vec<Vec<u8>>>,
     command_line: String,
     inventory_failure_injection: Option<HvpatchExecInventoryFailureInjection>,
     hvpatch_mm_reservation: Option<crate::hvpatch::ExecMmReservation>,
@@ -1380,25 +1381,28 @@ where
         let command_line = proc_argv.join(" ");
         let proc_env = env.clone();
         let requires_syscall_traps = kernel.dispatcher.requires_syscall_traps();
-        let files = kernel.dispatcher.capture_exec_files(kernel_context);
-        let loaded = match load_execve_image(
-            &kernel.dispatcher,
-            &files,
-            &path,
-            argv,
-            env,
-            requires_syscall_traps,
-        ) {
-            Ok(image) => image,
+        let files = match kernel.dispatcher.capture_exec_files(kernel_context) {
+            Ok(files) => files,
             Err(errno) => {
                 return self
                     .exec_failed_with_errno(kernel, engine, errno, origin)
                     .map(ExecvePreparation::Complete);
             }
         };
+        let loader = crate::runtime::exec::ExecLoaderCapabilities::capture(&kernel.dispatcher);
+        let loaded =
+            match load_execve_image(&loader, &files, &path, argv, env, requires_syscall_traps) {
+                Ok(image) => image,
+                Err(errno) => {
+                    return self
+                        .exec_failed_with_errno(kernel, engine, errno, origin)
+                        .map(ExecvePreparation::Complete);
+                }
+            };
         let crate::runtime::exec::LoadedExecImage {
             image,
             source: executable_source,
+            binfmt_argv,
         } = loaded;
         let inventory_failure_injection = kernel
             .hvpatch_process
@@ -1468,6 +1472,7 @@ where
             proc_argv,
             proc_env,
             executable_source,
+            binfmt_argv,
             command_line,
             inventory_failure_injection,
             hvpatch_mm_reservation,
@@ -1496,6 +1501,7 @@ where
             proc_argv,
             proc_env,
             executable_source,
+            binfmt_argv,
             command_line: cmdline,
             inventory_failure_injection,
             mut hvpatch_mm_reservation,
@@ -1782,6 +1788,9 @@ where
             proc_env,
             executable_source,
         );
+        if let Some(argv) = binfmt_argv {
+            kernel.dispatcher.enter_binfmt(&argv);
+        }
         kernel
             .dispatcher
             .reset_signal_handlers_on_execve(exec_kernel_context);
