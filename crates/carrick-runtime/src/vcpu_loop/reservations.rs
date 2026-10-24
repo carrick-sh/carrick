@@ -73,6 +73,14 @@ fn table(access: &CarrierMetadataAccess) -> Result<&SharedReservations, Refusal>
 }
 
 impl HostReservationProvider for CarrierReservations {
+    fn address_space_backing(
+        &self,
+    ) -> Option<Arc<dyn carrick_kernel::kernel::mm_occupancy::AddressSpaceBacking>> {
+        self.access.region().ok()?;
+        Some(Arc::new(CarrierPublicationBacking(Arc::clone(
+            &self.access,
+        ))))
+    }
     fn provision_metadata(&self, mm: ReservationMm) -> Result<(), Refusal> {
         // Carrier capacity publication is serialized outside all MM locks.
         let _capacity = self.capacity.lock();
@@ -173,5 +181,32 @@ impl PreparedHostReservations for PreparedView {
             &self.0.nodes,
             &carrick_el1::memory::reservations::NoRootWait,
         )
+    }
+}
+
+/// This physical view retains the exact carrier used for both publication and
+/// cleanup. It contains no process registry or lifecycle policy.
+struct CarrierPublicationBacking(Arc<CarrierMetadataAccess>);
+// SAFETY: metadata access retains the exact immutable carrier mapping inventory.
+unsafe impl carrick_kernel::kernel::mm_occupancy::AddressSpaceBacking
+    for CarrierPublicationBacking
+{
+    fn region(&self) -> Option<carrick_kernel::kernel::mm_occupancy::AddressSpaceRegion<'_>> {
+        let region = self.0.region().ok()?;
+        // SAFETY: the retained access owns the complete aligned ABI region.
+        let zone = unsafe {
+            &*region
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .cast::<carrick_el1_abi::ZoneTables>()
+        };
+        Some(carrick_kernel::kernel::mm_occupancy::AddressSpaceRegion {
+            carrier: self.0.carrier_identity(),
+            zone,
+            reservations: table(&self.0).ok()?,
+        })
+    }
+    fn settlement(&self) -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>> {
+        Some(self.0.guest_cow_settlement())
     }
 }

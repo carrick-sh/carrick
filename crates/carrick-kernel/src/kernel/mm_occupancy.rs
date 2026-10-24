@@ -616,18 +616,63 @@ fn switching_enabled() -> bool {
 /// mutations of the table; EL1 only reads it).
 static SPACES_LOCK: Mutex<()> = Mutex::new(());
 
-/// The tables a publication lives in: the zone's, or (VM-free tests) a
-/// private pair.
-#[derive(Clone, Copy)]
+/// One retained carrier's publication and cleanup venue. References returned
+/// here must remain backed for the lifetime of this owner; a retired carrier
+/// returns None. Physical providers supply this, never a host process registry.
+///
+/// # Safety
+/// Every successful `region` call must name the same initialized allocations.
+/// They must remain allocated until this owner is dropped, including after
+/// `region` starts refusing a retired carrier. Shared mutation uses the ABI's
+/// atomic/lock protocol. Publication mirrors retain this owner with their views.
+pub unsafe trait AddressSpaceBacking: Send + Sync {
+    fn region(&self) -> Option<AddressSpaceRegion<'_>>;
+    fn settlement(&self) -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>>;
+}
+
+pub struct AddressSpaceRegion<'a> {
+    pub carrier: std::num::NonZeroU64,
+    pub zone: &'a carrick_el1_abi::ZoneTables,
+    pub reservations: &'a carrick_el1::memory::reservations::SharedReservations,
+}
+
+#[derive(Clone)]
 struct SpaceTables {
     spaces: &'static AddressSpaces,
     occupancy: &'static Occupancy,
     zone: Option<&'static carrick_el1_abi::ZoneTables>,
+    backing: Option<Arc<dyn AddressSpaceBacking>>,
 }
 
 impl SpaceTables {
+    fn retained(backing: Arc<dyn AddressSpaceBacking>) -> Option<Self> {
+        let region = backing.region()?;
+        let zone = region.zone as *const carrick_el1_abi::ZoneTables;
+        // SAFETY: every private SpaceTables clone retains backing, including
+        // fence mirrors and publications. No table reference is exported.
+        let zone = unsafe { &*zone };
+        Some(Self {
+            spaces: &zone.spaces,
+            occupancy: &zone.occupancy,
+            zone: Some(zone),
+            backing: Some(backing),
+        })
+    }
+    fn reservations(&self) -> Option<&carrick_el1::memory::reservations::SharedReservations> {
+        match &self.backing {
+            Some(backing) => backing.region().map(|region| region.reservations),
+            None => carrick_el1::memory::reservations::shared_host(),
+        }
+    }
+    fn settlement(&self) -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>> {
+        match &self.backing {
+            Some(backing) => backing.settlement(),
+            None => guest_cow_settlement(),
+        }
+    }
+
     fn release_venue(
-        self,
+        &self,
     ) -> Option<
         carrick_sched_core::spaces::notification::SpaceReleaseVenue<
             'static,
@@ -658,7 +703,7 @@ impl SpaceTables {
             },
         )
     }
-    fn free(self, index: SpaceIndex) {
+    fn free(&self, index: SpaceIndex) {
         if let Some(zone) = self.zone {
             let mm = core::num::NonZeroU64::new(self.spaces.key(index)).unwrap_or_else(|| {
                 carrick_fatal!("kernel::mm_occupancy", "missing live retirement key")
@@ -674,14 +719,14 @@ impl SpaceTables {
             self.spaces.free(index);
         }
     }
-    fn lower(self, index: SpaceIndex) {
+    fn lower(&self, index: SpaceIndex) {
         if let Some(venue) = self.release_venue() {
             carrick_sched_core::spaces::notification::SpaceAccess::notified(venue).lower(index);
         } else {
             self.spaces.lower(index);
         }
     }
-    fn open(self, index: SpaceIndex) {
+    fn open(&self, index: SpaceIndex) {
         if let Some(venue) = self.release_venue() {
             carrick_sched_core::spaces::notification::SpaceAccess::notified(venue).open(index);
         } else {
@@ -691,6 +736,11 @@ impl SpaceTables {
     /// Whether the tables are still there: a publication can outlive the VM
     /// whose EL1 region held the zone.
     fn live(&self) -> bool {
+        if let Some(backing) = &self.backing {
+            return backing
+                .region()
+                .is_some_and(|region| std::ptr::eq(&region.zone.spaces, self.spaces));
+        }
         self.zone.is_none()
             || crate::el1_zone::zone().is_some_and(|zone| std::ptr::eq(&zone.spaces, self.spaces))
     }
@@ -717,13 +767,13 @@ fn guest_cow_settlement() -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>
 /// Run right after the host excluded an MM's EL1 editor in `tables`: fold
 /// every guest COW EL1 completed for the MM into the host authorities while
 /// no EL1 editor can add another.
-fn settle_excluded(tables: SpaceTables, excluded: &carrick_sched_core::ExcludedEditor<'_>) {
+fn settle_excluded(tables: &SpaceTables, excluded: &carrick_sched_core::ExcludedEditor<'_>) {
     // Private (VM-free test) tables have no EL1 region; their tests install
     // a recording settlement to observe exactly when this runs.
     if tables.zone.is_none() && !cfg!(test) {
         return;
     }
-    if let Some(settlement) = guest_cow_settlement() {
+    if let Some(settlement) = tables.settlement() {
         settlement.settle(excluded);
     }
 }
@@ -741,7 +791,7 @@ impl carrick_thread::fork_quiesce::FenceMirror for SpaceGate {
                 .tables
                 .spaces
                 .raise_and_wait_for_editor(self.index, core::hint::spin_loop);
-            settle_excluded(self.tables, &excluded);
+            settle_excluded(&self.tables, &excluded);
         }
     }
 
@@ -788,6 +838,7 @@ pub fn exclude_el1_editor(mm: MmId) -> Option<El1EditorExclusion> {
             spaces: &zone.spaces,
             occupancy: &zone.occupancy,
             zone: Some(zone),
+            backing: None,
         },
         mm,
     )
@@ -799,7 +850,7 @@ fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclu
     let excluded = tables
         .spaces
         .raise_and_wait_for_editor(index, core::hint::spin_loop);
-    settle_excluded(tables, &excluded);
+    settle_excluded(&tables, &excluded);
     let held = Some(carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded));
     Some(El1EditorExclusion {
         tables,
@@ -887,6 +938,16 @@ impl UnpublishedInitialAddressSpace {
     }
 }
 
+/// An exec successor has backing and a closed reservation root, but no
+/// permission to enter EL0 or use the initial host BIND service. Its eventual
+/// adoption belongs to the process owner; dropping it rolls back this root.
+pub struct UnpublishedExecAddressSpace(AddressSpacePublication);
+impl UnpublishedExecAddressSpace {
+    pub fn mm(&self) -> MmId {
+        self.0.mm
+    }
+}
+
 /// A fork root exists for owner construction but is not installable by EL1.
 /// Dropping this proof uses normal exact-MM publication retirement.
 pub struct UnpublishedForkAddressSpace(AddressSpacePublication);
@@ -900,14 +961,18 @@ impl UnpublishedForkAddressSpace {
         self,
         child: carrick_el1_abi::El1MmHandle,
     ) -> Result<AddressSpacePublication, Self> {
-        use carrick_el1::memory::reservations::shared_host;
         if child.mm().raw() != self.0.mm.raw() {
             return Err(self);
         }
-        let Some(roots) = shared_host() else {
+        let Some(roots) = self.0.tables.reservations() else {
             return Err(self);
         };
-        if !roots.admitted(self.0.index.index(), child.mm()) {
+        if self.0.tables.backing.as_ref().is_some_and(|backing| {
+            backing
+                .region()
+                .is_none_or(|region| region.carrier != child.carrier())
+        }) || !roots.admitted(self.0.index.index(), child.mm())
+        {
             return Err(self);
         }
         let valid = self
@@ -1017,6 +1082,21 @@ unsafe impl carrick_hal::PreAdmissionOwner for PreAdmissionGuard {
     }
 }
 impl PreAdmissionGuard {
+    pub(crate) fn acquire_for_provider(
+        mm: MmId,
+        provider: Option<&Arc<dyn crate::dispatch::mem::el1_reservations::HostReservationProvider>>,
+    ) -> Option<Self> {
+        if !switching_enabled() {
+            return None;
+        }
+        match provider {
+            Some(provider) => Self::acquire_in(
+                SpaceTables::retained(provider.address_space_backing()?)?,
+                mm,
+            ),
+            None => Self::acquire(mm),
+        }
+    }
     pub(crate) fn acquire(mm: MmId) -> Option<Self> {
         if !switching_enabled() {
             return None;
@@ -1027,6 +1107,7 @@ impl PreAdmissionGuard {
                 spaces: &zone.spaces,
                 occupancy: &zone.occupancy,
                 zone: Some(zone),
+                backing: None,
             },
             mm,
         )
@@ -1053,6 +1134,7 @@ impl PreAdmissionGuard {
                 spaces,
                 occupancy,
                 zone: None,
+                backing: None,
             },
             mm,
         )
@@ -1125,6 +1207,7 @@ impl PreAdmissionGuard {
         unsafe {
             drop(core::ptr::read(&publication.fence));
             drop(core::ptr::read(&publication.reservation_provider));
+            drop(core::ptr::read(&publication.tables));
         }
     }
 }
@@ -1142,7 +1225,7 @@ pub fn publish_closed_fork_address_space(
     mmap_next: u64,
     root: ReservationRootPublication,
 ) -> Option<UnpublishedForkAddressSpace> {
-    let guard = PreAdmissionGuard::acquire(mm)?;
+    let guard = PreAdmissionGuard::acquire_for_provider(mm, root.provider.as_ref())?;
     publish_in_held(
         &guard,
         fence,
@@ -1159,6 +1242,37 @@ pub fn publish_closed_fork_address_space(
     .map(UnpublishedForkAddressSpace)
 }
 
+/// Publish a successor into an explicitly retained carrier, with neither
+/// execution admission nor the initial BIND permission. Image preparation and
+/// file I/O must finish before entering this short publication reservation.
+#[allow(clippy::too_many_arguments)]
+pub fn publish_closed_address_space_in(
+    backing: Arc<dyn AddressSpaceBacking>,
+    mm: MmId,
+    fence: &MmFence,
+    ttbr0: u64,
+    ttbr1: u64,
+    brk_current: u64,
+    mmap_next: u64,
+    root: ReservationRootPublication,
+) -> Option<UnpublishedExecAddressSpace> {
+    let guard = PreAdmissionGuard::acquire_in(SpaceTables::retained(backing)?, mm)?;
+    publish_in_held(
+        &guard,
+        fence,
+        ttbr0,
+        ttbr1,
+        Anchors {
+            brk_current,
+            mmap_next,
+            limits: root.limits,
+            reservation_provider: root.provider,
+        },
+        PublicationAdmission::OwnerForkClosed,
+    )
+    .map(UnpublishedExecAddressSpace)
+}
+
 /// Publish `mm`, whose translation roots are `ttbr0`/`ttbr1`, with initial
 /// `brk_current` and `mmap_next` layout anchors for guest EL1 to install and
 /// the publishing process's `limits` for its reservation root.
@@ -1171,17 +1285,9 @@ pub fn publish_address_space_with_layout(
     mmap_next: u64,
     root: ReservationRootPublication,
 ) -> Option<AddressSpacePublication> {
-    if !switching_enabled() {
-        return None;
-    }
-    let zone = crate::el1_zone::zone()?;
-    publish_in_with_layout(
-        SpaceTables {
-            spaces: &zone.spaces,
-            occupancy: &zone.occupancy,
-            zone: Some(zone),
-        },
-        mm,
+    let guard = PreAdmissionGuard::acquire_for_provider(mm, root.provider.as_ref())?;
+    publish_in_held(
+        &guard,
         fence,
         ttbr0,
         ttbr1,
@@ -1191,6 +1297,7 @@ pub fn publish_address_space_with_layout(
             limits: root.limits,
             reservation_provider: root.provider,
         },
+        PublicationAdmission::Open,
     )
 }
 
@@ -1256,7 +1363,7 @@ fn publish_in_held(
     anchors: Anchors,
     admission: PublicationAdmission,
 ) -> Option<AddressSpacePublication> {
-    let tables = guard.tables;
+    let tables = guard.tables.clone();
     let mm = guard.mm;
     let Anchors {
         brk_current,
@@ -1264,6 +1371,17 @@ fn publish_in_held(
         limits,
         reservation_provider,
     } = anchors;
+    if let (Some(backing), Some(provider)) = (&tables.backing, &reservation_provider) {
+        let expected = backing.region()?;
+        let selected = provider.address_space_backing()?;
+        let selected = selected.region()?;
+        if expected.carrier != selected.carrier
+            || !std::ptr::eq(expected.zone, selected.zone)
+            || !std::ptr::eq(expected.reservations, selected.reservations)
+        {
+            return None;
+        }
+    }
     let spaces = tables.spaces;
     if spaces.find(mm.raw()).is_some() {
         crate::probes::hvpatch_el1_root_prepublish(mm.raw(), 5);
@@ -1279,12 +1397,13 @@ fn publish_in_held(
     // gate is closed. The dispatcher imports exact VMAs/limits before T2 opts
     // into reservation decisions; an unimported root refuses guest service.
     if tables.zone.is_some() {
-        use carrick_el1::memory::reservations::{Layout, shared_host};
+        use carrick_el1::memory::reservations::Layout;
         use carrick_el1_abi::{ReservationMm, ReservationRange};
         let installed = (|| {
             let heap_base = carrick_mem::memory::LINUX_HEAP_BASE;
             let arena_base = carrick_mem::memory::LINUX_MMAP_BASE;
-            shared_host()?
+            tables
+                .reservations()?
                 .publish(
                     index.index(),
                     ReservationMm::new(mm.raw())?,
@@ -1318,9 +1437,12 @@ fn publish_in_held(
     }
     // Bound while closed: a pause in force now raises the gate before it
     // opens, and every later pause raises it before its occupancy scan.
-    if !fence.bind_mirror(Arc::new(SpaceGate { tables, index })) {
+    if !fence.bind_mirror(Arc::new(SpaceGate {
+        tables: tables.clone(),
+        index,
+    })) {
         crate::probes::hvpatch_el1_root_prepublish(mm.raw(), 8);
-        retire_reservation_root(tables, index, mm, reservation_provider.as_ref());
+        retire_reservation_root(&tables, index, mm, reservation_provider.as_ref());
         tables.free(index);
         return None;
     }
@@ -1353,7 +1475,7 @@ impl AddressSpacePublication {
         self.close();
         drain_space(self.tables.occupancy, self.mm);
         retire_reservation_root(
-            self.tables,
+            &self.tables,
             self.index,
             self.mm,
             self.reservation_provider.as_ref(),
@@ -1387,6 +1509,7 @@ fn publish_for_test(
             spaces,
             occupancy,
             zone: None,
+            backing: None,
         },
         mm,
         fence,
@@ -1408,13 +1531,13 @@ impl Drop for AddressSpacePublication {
         // The MM is gone: its guest COW grants and unsettled completions
         // retire with its inventory; only their pool records remain to free.
         if self.tables.zone.is_some()
-            && let Some(settlement) = guest_cow_settlement()
+            && let Some(settlement) = self.tables.settlement()
         {
             settlement.release(&excluded);
         }
         drain_space(self.tables.occupancy, self.mm);
         retire_reservation_root(
-            self.tables,
+            &self.tables,
             self.index,
             self.mm,
             self.reservation_provider.as_ref(),
@@ -1425,7 +1548,7 @@ impl Drop for AddressSpacePublication {
 }
 
 fn retire_reservation_root(
-    tables: SpaceTables,
+    tables: &SpaceTables,
     index: carrick_sched_core::SpaceIndex,
     mm: MmId,
     provider: Option<&Arc<dyn crate::dispatch::mem::el1_reservations::HostReservationProvider>>,
@@ -1433,8 +1556,8 @@ fn retire_reservation_root(
     if tables.zone.is_none() {
         return;
     }
-    use carrick_el1::memory::reservations::{Refusal, shared_host};
-    let Some(table) = shared_host() else {
+    use carrick_el1::memory::reservations::Refusal;
+    let Some(table) = tables.reservations() else {
         return;
     };
     let Some(key) = carrick_el1_abi::ReservationMm::new(mm.raw()) else {

@@ -1,3 +1,8 @@
+# Exec successor publication component (#785): mm_occupancy::tests::
+# retained_successor_publications_are_closed_and_rollback_in_their_own_carrier,
+# refused_retained_publication_releases_every_backing_reference, and
+# retained_host_publication_obeys_switching_policy (also run with the hatch off).
+# These cover exact retained publication/cleanup venues, not image adoption.
 # VMX entry audit (#253): carrier_cpu reconstructs its retained TR using
 # the typed busy-TSS constructor, preserving base and selector. MM load,
 # unload, occupancy and drain operations are unchanged. The KVM lib tests
