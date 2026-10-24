@@ -91,6 +91,7 @@ struct Used {
     reads: u32,
     workers: u32,
     refused_workers: u32,
+    capacity_probes: u32,
     publishes: u32,
     comments: u32,
     finishes: u32,
@@ -893,7 +894,7 @@ struct Server<'a> {
     finished: bool,
     setup: &'a str,
     launcher: Box<dyn WorkerLauncher>,
-    capacity: Option<Result<Value, String>>,
+    capacity: Option<Value>,
 }
 impl Server<'_> {
     fn post(&self, body: &str) -> Result<(), ScalerError> {
@@ -1069,14 +1070,24 @@ impl Server<'_> {
         Ok(())
     }
     fn capacity(&mut self) -> Result<Value, ScalerError> {
-        self.capacity
-            .get_or_insert_with(|| {
-                self.launcher
-                    .capacity(self.deadline)
-                    .map_err(|error| masked(&error.to_string(), &self.token))
-            })
-            .clone()
-            .map_err(ScalerError::Usage)
+        if let Some(report) = &self.capacity {
+            return Ok(report.clone());
+        }
+        if self.used.capacity_probes
+            >= self
+                .policy
+                .workers
+                .saturating_add(self.policy.refused_workers)
+        {
+            return Err(ScalerError::Guard("capacity probe budget exhausted"));
+        }
+        self.used.capacity_probes += 1;
+        let report = self
+            .launcher
+            .capacity(self.deadline)
+            .map_err(|error| ScalerError::Usage(masked(&error.to_string(), &self.token)))?;
+        self.capacity = Some(report.clone());
+        Ok(report)
     }
     fn admit_worker(&mut self, selection: &Notes, capacity: &Value) -> Result<(), ScalerError> {
         self.check_worker(selection)?;
@@ -1090,6 +1101,9 @@ impl Server<'_> {
             }),
             &self.policy,
         )?;
+        // Each admitted worker consumes its snapshot. The next admission
+        // must query live capacity again; transient failures are never cached.
+        self.capacity = None;
         self.dispatch.worker = worker;
         self.choices.push(
             json!({"backend":selection.backend,"model":selection.model,"reason":selection.notes}),
@@ -1830,13 +1844,18 @@ mod tests {
         limits: Vec<u64>,
     }
     struct FixtureLauncher {
-        capacity: Value,
+        reports: std::collections::VecDeque<Result<Value, &'static str>>,
         record: std::rc::Rc<std::cell::RefCell<LaunchRecord>>,
     }
     impl WorkerLauncher for FixtureLauncher {
         fn capacity(&mut self, _: Instant) -> Result<Value, ScalerError> {
             self.record.borrow_mut().queries += 1;
-            Ok(self.capacity.clone())
+            if self.reports.len() > 1 {
+                self.reports.pop_front().unwrap()
+            } else {
+                self.reports.front().unwrap().clone()
+            }
+            .map_err(ScalerError::Guard)
         }
         fn produce(
             &mut self,
@@ -1909,7 +1928,7 @@ mod tests {
     ) -> std::rc::Rc<std::cell::RefCell<LaunchRecord>> {
         let record = std::rc::Rc::new(std::cell::RefCell::new(LaunchRecord::default()));
         server.launcher = Box::new(FixtureLauncher {
-            capacity,
+            reports: std::collections::VecDeque::from([Ok(capacity)]),
             record: record.clone(),
         });
         record
@@ -1937,6 +1956,11 @@ mod tests {
             server.used.worker_millis += 60_000;
             server.execute(worker_request()).unwrap();
             assert_eq!(server.used.workers, 2);
+            assert_eq!(
+                record.borrow().queries,
+                2,
+                "second worker reused stale capacity"
+            );
             let record = record.borrow();
             for text in ["first implementation", "cargo test passed", "needs review"] {
                 assert!(
@@ -1950,6 +1974,54 @@ mod tests {
             );
             assert_eq!(server.history.len(), 2);
         });
+    }
+    #[test]
+    fn transient_capacity_failure_recovers_before_worker_admission() {
+        shared_fixture(|temporary| {
+            let root = temporary.join("base");
+            std::fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]).unwrap();
+            git(&root, &["commit", "--allow-empty", "-m", "base"]).unwrap();
+            let mut server = server(&root);
+            server.dispatch.base = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().into();
+            server.dispatch.resume = false;
+            server.dispatch.review = false;
+            let record = std::rc::Rc::new(std::cell::RefCell::new(LaunchRecord::default()));
+            server.launcher = Box::new(FixtureLauncher {
+                reports: std::collections::VecDeque::from([
+                    Err("temporary capacity outage"),
+                    Ok(live_capacity()),
+                ]),
+                record: record.clone(),
+            });
+            assert!(server.execute(worker_request()).is_err());
+            assert!(
+                server.execute(worker_request()).is_ok(),
+                "cached transient probe failure prevented recovery"
+            );
+            assert_eq!((server.used.workers, server.used.refused_workers), (1, 1));
+            assert_eq!(record.borrow().queries, 2);
+        });
+    }
+    #[test]
+    fn failed_capacity_probes_are_bounded_even_through_read_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = server(root.path());
+        let record = std::rc::Rc::new(std::cell::RefCell::new(LaunchRecord::default()));
+        server.launcher = Box::new(FixtureLauncher {
+            reports: std::collections::VecDeque::from([Err("temporary capacity outage")]),
+            record: record.clone(),
+        });
+        let limit = server.policy.workers + server.policy.refused_workers;
+        for _ in 0..limit + 2 {
+            assert!(server.execute(Request::ReadCapacity(Empty {})).is_err());
+        }
+        assert_eq!(
+            record.borrow().queries,
+            limit,
+            "failed probe cache or unbounded probing"
+        );
+        assert_eq!(server.used.workers, 0);
     }
     #[test]
     fn refused_workers_are_bounded_and_share_one_capacity_report() {
