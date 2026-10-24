@@ -22,6 +22,11 @@ pub(super) struct Policy {
     response_bytes: usize,
     wall_minutes: u64,
     worker_minutes: u64,
+    #[serde(default = "default_harvest_seconds")]
+    harvest_seconds: u64,
+}
+fn default_harvest_seconds() -> u64 {
+    180
 }
 impl Policy {
     fn load() -> Result<Self, ScalerError> {
@@ -40,6 +45,9 @@ impl Policy {
             || p.wall_minutes > 45
             || p.worker_minutes > 35
             || p.worker_minutes == 0
+            || p.worker_minutes > p.wall_minutes
+            || p.harvest_seconds == 0
+            || p.harvest_seconds >= p.worker_minutes * 60
             || p.wall_minutes == 0
         {
             return Err(ScalerError::Guard("invalid loop policy"));
@@ -247,6 +255,10 @@ fn list(root: &Path, path: &str) -> Result<Vec<Value>, ScalerError> {
         .flat_map(|p| p.as_array().into_iter().flatten())
         .cloned()
         .collect())
+}
+fn unavailable(source: &str, error: &ScalerError) -> Value {
+    json!({"kind":"source","source":source,"status":"unavailable",
+        "error":crate::dispatch_redaction::redact(error.to_string().as_bytes())})
 }
 fn state_item(kind: &str, provenance: &str, mut data: Value) -> Value {
     if provenance == "unverified" {
@@ -963,6 +975,16 @@ fn worker_handoff(contracts: &[Contract]) -> Result<String, ScalerError> {
     ))
 }
 
+fn artifacts_ready(value: bool) -> Result<(), ScalerError> {
+    if let Some(path) = std::env::var_os("GITHUB_OUTPUT") {
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(path)?,
+            "artifacts_ready={value}"
+        )?;
+    }
+    Ok(())
+}
+
 trait WorkerLauncher {
     fn capacity(&mut self, deadline: Instant) -> Result<Value, ScalerError>;
     fn produce(&mut self, root: &Path, dispatch: &Dispatch, setup: &str)
@@ -980,8 +1002,9 @@ impl WorkerLauncher for NativeLauncher {
         setup: &str,
     ) -> Result<(), ScalerError> {
         if let Err(error) = produce(root, dispatch, setup) {
-            cleanup_agent_user()?;
-            produce(root, dispatch, &error.to_string())?;
+            let retirement = cleanup_agent_user();
+            record_worker_failure(&error)?;
+            retirement?;
         }
         Ok(())
     }
@@ -1034,16 +1057,7 @@ impl Server<'_> {
         Ok(())
     }
     fn outcome(&mut self, status: ContractStatus, summary: &str) -> Result<(), ScalerError> {
-        let ready = |value: bool| -> Result<(), ScalerError> {
-            if let Some(path) = std::env::var_os("GITHUB_OUTPUT") {
-                writeln!(
-                    std::fs::OpenOptions::new().append(true).open(path)?,
-                    "artifacts_ready={value}"
-                )?;
-            }
-            Ok(())
-        };
-        ready(false)?;
+        artifacts_ready(false)?;
         let path = PathBuf::from(
             std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?,
         )
@@ -1061,6 +1075,8 @@ impl Server<'_> {
             risks: self.history.iter().flat_map(|c| c.risks.clone()).collect(),
         };
         let artifacts = (|| -> Result<(), ScalerError> {
+            loop_transcript()?;
+            loop_log(json!({"phase":"outcome","status":status}))?;
             let package = path.parent().ok_or(ScalerError::Guard("artifact parent"))?;
             std::fs::create_dir_all(package)?;
             for name in ["raw.log", "transcript.md", "diffstat.txt"] {
@@ -1079,7 +1095,7 @@ impl Server<'_> {
                 masked(&error.to_string(), &self.token)
             ));
         } else {
-            ready(true)?;
+            artifacts_ready(true)?;
         }
         let details = serde_json::to_string_pretty(&outcome_preview(&outcome))?;
         let summary = summary.chars().take(2048).collect::<String>();
@@ -1171,7 +1187,13 @@ impl Server<'_> {
             }),
             &self.policy,
         )?;
-        if self.used.worker_millis.saturating_add(1000) > self.policy.worker_minutes * 60_000
+        if self
+            .used
+            .worker_millis
+            .saturating_add((self.policy.harvest_seconds + 1) * 1000)
+            > self.policy.worker_minutes * 60_000
+            || self.deadline.saturating_duration_since(Instant::now())
+                <= Duration::from_secs(self.policy.harvest_seconds + 1)
             || self.used.publishes != 0
         {
             return Err(ScalerError::Guard(
@@ -1196,9 +1218,7 @@ impl Server<'_> {
             return Err(ScalerError::Guard("capacity probe budget exhausted"));
         }
         self.used.capacity_probes += 1;
-        let report = self
-            .launcher
-            .capacity(self.deadline)
+        let report = timed_phase("capacity", || self.launcher.capacity(self.deadline))
             .map_err(|error| ScalerError::Usage(masked(&error.to_string(), &self.token)))?;
         self.capacity = Some(report.clone());
         Ok(report)
@@ -1226,7 +1246,13 @@ impl Server<'_> {
     }
     fn read_state(&mut self) -> Result<Value, ScalerError> {
         let mut items = vec![state_item("trigger", "owner", self.trigger.clone())];
-        let prs = linked_prs(self.root, self.dispatch.issue, "all")?;
+        let prs = match linked_prs(self.root, self.dispatch.issue, "all") {
+            Ok(prs) => prs,
+            Err(error) => {
+                items.push(unavailable("linked_prs", &error));
+                Vec::new()
+            }
+        };
         let mut earlier = std::collections::BTreeSet::new();
         let mut commits = Vec::new();
         let mut published_tips = std::collections::BTreeSet::new();
@@ -1244,9 +1270,13 @@ impl Server<'_> {
             ),
         ];
         for pr in prs {
-            let number = pr["number"]
-                .as_u64()
-                .ok_or(ScalerError::Guard("invalid linked PR"))?;
+            let Some(number) = pr["number"].as_u64() else {
+                items.push(unavailable(
+                    "linked_pr",
+                    &ScalerError::Guard("invalid linked PR"),
+                ));
+                continue;
+            };
             let origin = pr["head"]["ref"]
                 .as_str()
                 .and_then(|branch| branch_run(self.dispatch.issue, branch).ok())
@@ -1285,10 +1315,18 @@ impl Server<'_> {
         }
         for (kind, endpoint, many) in endpoints {
             let endpoint = format!("repos/{REPOSITORY}/{endpoint}");
-            let data = if many {
-                list(self.root, &endpoint)?
+            let result = if many {
+                list(self.root, &endpoint)
             } else {
-                vec![api(self.root, &endpoint)?]
+                api(self.root, &endpoint).map(|item| vec![item])
+            };
+            let data = match result {
+                Ok(data) => data,
+                Err(error) if kind == "issue" => return Err(error),
+                Err(error) => {
+                    items.push(unavailable(&endpoint, &error));
+                    continue;
+                }
             };
             for item in data {
                 if kind == "commit" {
@@ -1316,13 +1354,19 @@ impl Server<'_> {
                 items.push(state_item(kind, &provenance, item));
             }
         }
-        let earlier = issue_artifact_runs(
+        let earlier = match issue_artifact_runs(
             self.root,
             &issue,
             self.dispatch.issue,
             &mut self.runs,
-            earlier,
-        )?;
+            earlier.clone(),
+        ) {
+            Ok(runs) => runs,
+            Err(error) => {
+                items.push(unavailable("artifact_census", &error));
+                earlier
+            }
+        };
         for RunId(id_number) in earlier {
             let id = id_number.to_string();
             if id == run_id()? {
@@ -1399,6 +1443,10 @@ impl Server<'_> {
                 "message":if published { commit["commit"]["message"].as_str().unwrap_or_default() } else { "message withheld: unpublished commit" }
             })));
         }
+        GITHUB_FAILURES.with(|failures| {
+            items.extend(failures.borrow().iter().map(|(endpoint, error)|
+                json!({"kind":"source","source":endpoint,"status":"unavailable","error":error})));
+        });
         let mut response = bounded_state(
             items,
             self.policy.response_bytes.saturating_sub(512),
@@ -1406,7 +1454,7 @@ impl Server<'_> {
         )?;
         response["branch"] = self.dispatch.branch.clone().into();
         response["pr"] = self.pr.into();
-        response["board"] = json!({"available":false,"reason":"GITHUB_TOKEN has no organization Projects v2 access; director maintains board status"});
+        response["board"] = json!({"available":false,"status":"unavailable","reason":"GITHUB_TOKEN has no organization Projects v2 access; director maintains board status"});
         Ok(response)
     }
     fn execute(&mut self, request: Request) -> Result<Value, ScalerError> {
@@ -1469,6 +1517,12 @@ impl Server<'_> {
                     let remaining = self.policy.worker_minutes * 60_000 - self.used.worker_millis;
                     let worker_deadline =
                         (started + Duration::from_millis(remaining)).min(self.deadline);
+                    let agent_deadline = worker_deadline
+                        .checked_sub(Duration::from_secs(self.policy.harvest_seconds))
+                        .filter(|deadline| *deadline > Instant::now())
+                        .ok_or(ScalerError::Guard(
+                            "insufficient worker time for harvest reserve",
+                        ))?;
                     let _commands = CommandWindow::until(worker_deadline);
                     let inline = if self.dispatch.review {
                         list(
@@ -1489,10 +1543,13 @@ impl Server<'_> {
                         .review_text
                         .push_str(&worker_handoff(&self.history)?);
                     self.dispatch.worker_seconds = Some(
-                        (self.policy.worker_minutes * 60_000 - self.used.worker_millis) / 1000,
+                        agent_deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_secs(),
                     );
                     self.write_handoff()?;
-                    self.dispatch.loop_deadline = Some(worker_deadline);
+                    self.dispatch.loop_deadline = Some(agent_deadline);
+                    self.dispatch.harvest_deadline = Some(worker_deadline);
                     if self.dispatch.resume && self.history.is_empty() {
                         git(
                             self.root,
@@ -1506,8 +1563,9 @@ impl Server<'_> {
                             ],
                         )?;
                     }
-                    self.launcher
-                        .produce(self.root, &self.dispatch, self.setup)?;
+                    timed_phase("worker.produce", || {
+                        self.launcher.produce(self.root, &self.dispatch, self.setup)
+                    })?;
                     let package = PathBuf::from(
                         std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?,
                     )
@@ -1578,11 +1636,35 @@ impl Server<'_> {
         }
     }
     fn respond(&mut self, bytes: &[u8]) -> Value {
+        let started = Instant::now();
+        // Log only allowlisted selectors and text lengths, never notes or bodies.
+        // Redact before clipping, including malformed/rejected requests.
+        let request: Value = serde_json::from_slice(bytes).unwrap_or(Value::Null);
+        let short = |value: &Value| {
+            masked(value.as_str().unwrap_or_default(), &self.token)
+                .chars()
+                .take(100)
+                .collect::<String>()
+        };
+        let arguments = &request["arguments"];
+        let summary = json!({"tool":short(&request["tool"]),
+            "backend":short(&arguments["backend"]),"model":short(&arguments["model"]),
+            "branch":short(&arguments["branch"]),"name":short(&arguments["name"]),
+            "run":arguments["run"].as_u64(),"status":short(&arguments["status"]),
+            "notes_bytes":arguments["notes"].as_str().map(str::len),
+            "body_bytes":arguments["body"].as_str().map(str::len),
+            "summary_bytes":arguments["summary"].as_str().map(str::len)});
+        let _ = loop_log(json!({"request":summary,"outcome":"started"}));
         let result = self
             .used
             .parse(bytes, &self.policy)
             .and_then(|r| self.execute(r));
-        result.unwrap_or_else(|e| json!({"ok":false,"refusal":masked(&e.to_string(), &self.token)}))
+        let response = result
+            .unwrap_or_else(|e| json!({"ok":false,"refusal":masked(&e.to_string(), &self.token)}));
+        let _ = loop_log(
+            json!({"request":summary,"outcome":if response["ok"] == false { response["refusal"].clone() } else { json!("ok") },"duration_ms":started.elapsed().as_millis()}),
+        );
+        response
     }
 }
 
@@ -1736,7 +1818,7 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
     };
     let policy = Policy::load()?;
     let limit =
-        Duration::from_secs(policy.wall_minutes * 60).min(crate::agent_runner::job_remaining(58)?);
+        Duration::from_secs(policy.wall_minutes * 60).min(crate::agent_runner::job_remaining(55)?);
     let mut server = Server {
         root,
         dispatch,
@@ -1841,7 +1923,37 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
                 Err(e) => return Err(e.into()),
             }
             Ok(server.should_stop())
-        })?;
+        });
+        timed_phase("loop.retirement", || cleanup_account(LOOP_USER))?;
+        // The result belongs to the loop uid. Retire it, then return group
+        // access before treating the foreground transcript as untrusted data.
+        sudo_as(
+            LOOP_USER,
+            &[
+                "/usr/bin/chmod",
+                "-R",
+                "g+rX",
+                actor
+                    .to_str()
+                    .ok_or(ScalerError::Guard("loop actor path"))?,
+            ],
+        )?;
+        capture_loop_foreground(&actor)?;
+        if server.finished {
+            artifacts_ready(false)?;
+        }
+        loop_transcript()?;
+        if server.finished {
+            mask_artifacts(
+                &PathBuf::from(
+                    std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?,
+                )
+                .join("dispatch-output"),
+                &server.token,
+            )?;
+            artifacts_ready(true)?;
+        }
+        let code = code?;
         if code != 0 && !server.finished {
             return Err(ScalerError::Guard(
                 "loop exited or timed out without finish",
@@ -1896,6 +2008,7 @@ mod tests {
                 review_text: String::new(),
                 worker_seconds: None,
                 loop_deadline: None,
+                harvest_deadline: None,
             },
             pr: Some(800),
             trigger: json!({"id":77}),
@@ -1906,7 +2019,7 @@ mod tests {
             used: Used::default(),
             provenance: ProvenanceCache::default(),
             runs: RunCache::default(),
-            deadline: Instant::now() + Duration::from_secs(60),
+            deadline: Instant::now() + Duration::from_secs(3600),
             token: "fixture-token".into(),
             finished: false,
             setup: "success/success",
@@ -2070,6 +2183,99 @@ mod tests {
             backend: "codex".into(),
             model: "gpt-6.1-sol".into(),
         })
+    }
+    struct TimeoutLauncher;
+    impl WorkerLauncher for TimeoutLauncher {
+        fn capacity(&mut self, _: Instant) -> Result<Value, ScalerError> {
+            Ok(live_capacity())
+        }
+        fn produce(
+            &mut self,
+            root: &Path,
+            dispatch: &Dispatch,
+            _: &str,
+        ) -> Result<(), ScalerError> {
+            let actor = tempfile::tempdir()?;
+            let target = actor.path().join("work");
+            let state = crate::agent_runner::state()?;
+            std::fs::create_dir_all(&state)?;
+            worker_checkout(root, &state.join("work"), &target, dispatch, None)?;
+            // The foreground fixture writes partial work and logs, then exceeds
+            // the actual agent deadline. The normal command runner kills it.
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("printf partial > unfinished; printf 'worker started\n' > \"$1\"; sleep 10")
+                .arg("fixture")
+                .arg(state.join("agent.out"))
+                .current_dir(&target)
+                .stdout(std::fs::File::create(state.join("agent.out"))?)
+                .stderr(std::fs::File::create(state.join("agent.err"))?);
+            let result = crate::ci_scaler::execute(
+                &mut command,
+                &[],
+                dispatch
+                    .loop_deadline
+                    .unwrap()
+                    .saturating_duration_since(Instant::now()),
+            );
+            assert!(result.is_err(), "fixture agent did not time out");
+            let work = state.join("work");
+            let (contract, _, diffstat, _) =
+                harvest_worker(actor.path(), &work, dispatch, Ok(124))?;
+            let package = root.parent().unwrap().join("dispatch-output");
+            std::fs::create_dir_all(&package)?;
+            std::fs::write(
+                package.join("raw.log"),
+                regular_text(&state.join("agent.out"))?,
+            )?;
+            for name in ["transcript.md", "diffstat.txt"] {
+                std::fs::write(package.join(name), "")?;
+            }
+            std::fs::write(package.join("diffstat.txt"), diffstat)?;
+            std::fs::write(
+                package.join("contract.json"),
+                serde_json::to_vec(&contract)?,
+            )?;
+            Ok(())
+        }
+    }
+    #[test]
+    fn timed_out_worker_retains_checkpoint_logs_and_failed_contract() {
+        shared_fixture(|temporary| {
+            let root = temporary.join("base");
+            std::fs::create_dir(&root).unwrap();
+            git(&root, &["init", "-b", "main"]).unwrap();
+            git(&root, &["commit", "--allow-empty", "-m", "base"]).unwrap();
+            let mut server = server(&root);
+            server.dispatch.base = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().into();
+            server.dispatch.resume = false;
+            server.dispatch.review = false;
+            server.policy.worker_minutes = 1;
+            server.policy.harvest_seconds = 30;
+            server.used.worker_millis = 28_000;
+            server.launcher = Box::new(TimeoutLauncher);
+            server
+                .execute(worker_request())
+                .expect("timeout lost mandatory harvest");
+            let work = crate::agent_runner::state().unwrap().join("work");
+            assert!(
+                git(&work, &["log", "-1", "--format=%s"])
+                    .unwrap()
+                    .contains("checkpoint")
+            );
+            let package = temporary.join("dispatch-output");
+            assert!(!regular_text(&package.join("raw.log")).unwrap().is_empty());
+            let contract: Contract =
+                serde_json::from_str(&regular_text(&package.join("contract.json")).unwrap())
+                    .unwrap();
+            assert_eq!(contract.status, ContractStatus::Failed);
+            assert!(
+                contract.summary.contains("timed out"),
+                "{}",
+                contract.summary
+            );
+        });
     }
     #[test]
     fn second_worker_sees_commits_handoff_and_shares_total_time() {
@@ -2294,6 +2500,9 @@ fi
 slurp=0
 for arg do test "$arg" != --slurp || slurp=1; endpoint=$arg; done
 printf '%s\n' "$endpoint" >> "$RUNNER_TEMP/api-endpoints"
+if test -f "$RUNNER_TEMP/fail-endpoint"; then
+ case "$endpoint" in *"$(cat "$RUNNER_TEMP/fail-endpoint")"*) printf 'gh: Resource not accessible fixture-token (HTTP 403)\n' >&2; exit 1 ;; esac
+fi
 case "$endpoint" in
  *'/pulls?'*'head=carrick-sh:work/dispatch-799-43') echo '[]' ;;
  *'/pulls?state=open'* ) if test -f "$RUNNER_TEMP/closed-only"; then echo '[]'; else cat "$RUNNER_TEMP/prs.json"; fi ;;
@@ -2519,7 +2728,7 @@ esac
             );
             assert!(server.dispatch.resume, "rerun discarded its owned PR");
             let package = root.join("dispatch-output");
-            std::fs::create_dir(&package).unwrap();
+            std::fs::create_dir_all(&package).unwrap();
             std::os::unix::fs::symlink(root.join("contract.json"), package.join("raw.log"))
                 .unwrap();
             server
@@ -2576,6 +2785,199 @@ esac
             assert!(
                 server.select_branch("work/dispatch-799-42").is_err(),
                 "cached authority revived a closed PR branch"
+            );
+        });
+    }
+    #[test]
+    fn artifact_census_403_preserves_state() {
+        shared_fixture(|root| {
+            for endpoint in ["actions/workflows/", "/artifacts?"] {
+                std::fs::write(root.join("fail-endpoint"), endpoint).unwrap();
+                let state = server(root)
+                    .read_state()
+                    .expect("optional artifact census refused read_state");
+                let text = state.to_string();
+                assert!(text.contains("Free-form shared issue"));
+                assert!(
+                    text.contains("unavailable") && text.contains("HTTP 403"),
+                    "{text}"
+                );
+                assert!(text.contains(endpoint));
+                assert!(!text.contains("fixture-token"));
+                let log = regular_text(&root.join("dispatch-output/loop.log")).unwrap();
+                assert!(log.contains("HTTP 403") && log.contains(endpoint));
+                assert!(!log.contains("fixture-token"));
+            }
+        });
+    }
+    #[test]
+    fn optional_pr_sources_degrade_but_issue_read_is_mandatory() {
+        shared_fixture(|root| {
+            for endpoint in ["/pulls?", "/pulls/800/reviews", "/actions/runs/42"] {
+                std::fs::write(root.join("fail-endpoint"), endpoint).unwrap();
+                let text = server(root)
+                    .read_state()
+                    .expect("optional PR source refused state")
+                    .to_string();
+                assert!(
+                    text.contains("Free-form shared issue") && text.contains("unavailable"),
+                    "{text}"
+                );
+            }
+            std::fs::write(root.join("fail-endpoint"), "/issues/799").unwrap();
+            let error = server(root)
+                .read_state()
+                .expect_err("mandatory issue body ignored")
+                .to_string();
+            assert!(error.contains("issues/799") && error.contains("HTTP 403"));
+        });
+    }
+    #[test]
+    fn permission_403_marks_item_and_preserves_state() {
+        shared_fixture(|root| {
+            std::fs::write(root.join("fail-endpoint"), "/permission").unwrap();
+            std::fs::write(root.join("comments.json"), json!([[{"user":{"login":"collaborator","type":"User"},"body":"untrusted comment"}]]).to_string()).unwrap();
+            let state = server(root).read_state().unwrap();
+            let text = state.to_string();
+            assert!(text.contains("Free-form shared issue"));
+            assert!(text.contains("unverified"));
+            assert!(
+                text.contains("collaborators/collaborator/permission") && text.contains("HTTP 403"),
+                "permission error lost: {text}"
+            );
+            assert!(!text.contains("fixture-token"));
+        });
+    }
+    #[test]
+    fn harvest_failure_contract_preserves_original_error_and_logs() {
+        shared_fixture(|root| {
+            let state = crate::agent_runner::state().unwrap();
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::write(state.join("agent.out"), "partial output fixture-token\n").unwrap();
+            std::fs::write(state.join("agent.err"), "stderr evidence\n").unwrap();
+            let package = root.join("dispatch-output");
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(
+                package.join("raw.log"),
+                "earlier verbose worker\n".repeat(100_000),
+            )
+            .unwrap();
+            let error = ScalerError::Guard("snapshot refused candidate symlink");
+            record_worker_failure(&error).unwrap();
+            let package = root.join("dispatch-output");
+            mask_artifacts(&package, "fixture-token").unwrap();
+            let contract: Contract =
+                serde_json::from_str(&regular_text(&package.join("contract.json")).unwrap())
+                    .unwrap();
+            assert!(
+                contract
+                    .summary
+                    .contains("snapshot refused candidate symlink")
+            );
+            assert!(!contract.summary.contains("setup did not complete"));
+            assert!(
+                regular_text(&package.join("raw.log"))
+                    .unwrap()
+                    .contains("stderr evidence")
+            );
+        });
+    }
+    #[test]
+    fn fixture_run_records_bounded_redacted_loop_log() {
+        shared_fixture(|root| {
+            let mut server = server(root);
+            let response = server.respond(br#"{"tool":"read_state","arguments":{}}"#);
+            assert!(response["state"].is_array(), "{response}");
+            let log = root.join("dispatch-output/loop.log");
+            assert!(log.exists(), "loop.log missing after fixture run");
+            for _ in 0..400 {
+                server.respond(
+                    format!(
+                        r#"{{"tool":"comment","arguments":{{"body":"fixture-token {}"}}}}"#,
+                        "x".repeat(8000)
+                    )
+                    .as_bytes(),
+                );
+            }
+            loop_log(json!({"phase":"harvest-after-bound","outcome":"ok","duration_ms":1}))
+                .unwrap();
+            let text = regular_text(&log).unwrap();
+            assert!(
+                text.contains("harvest-after-bound"),
+                "bounded log lost recent harvest"
+            );
+            assert!(text.contains("read_state") && text.contains("duration_ms"));
+            assert!(!text.contains("fixture-token"));
+            assert!(text.len() <= 64 * 1024, "loop.log exceeded 64 KiB");
+            let state = crate::agent_runner::state().unwrap();
+            std::fs::create_dir_all(&state).unwrap();
+            std::fs::write(
+                state.join("loop.out"),
+                format!(
+                    "foreground fixture-token\n{}",
+                    "large output\n".repeat(100_000)
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                state.join("loop-result.json"),
+                "final foreground fixture-token\n",
+            )
+            .unwrap();
+            let actor = root.join("loop-actor");
+            std::fs::create_dir_all(actor.join("runtime/dispatch-loop")).unwrap();
+            std::fs::write(
+                actor.join("runtime/dispatch-loop/loop.log"),
+                "actual foreground events fixture-token\n",
+            )
+            .unwrap();
+            std::fs::write(
+                actor.join("result.json"),
+                "final foreground fixture-token\n",
+            )
+            .unwrap();
+            capture_loop_foreground(&actor).unwrap();
+            loop_transcript().unwrap();
+            let package = root.join("dispatch-output");
+            for name in ["raw.log", "transcript.md", "diffstat.txt"] {
+                std::fs::write(package.join(name), "fixture-token").unwrap();
+            }
+            std::fs::copy(root.join("contract.json"), package.join("contract.json")).unwrap();
+            mask_artifacts(&package, "fixture-token").unwrap();
+            for entry in std::fs::read_dir(&package).unwrap() {
+                assert!(
+                    !regular_text(&entry.unwrap().path())
+                        .unwrap()
+                        .contains("fixture-token")
+                );
+            }
+            assert!(
+                regular_text(&package.join("loop-transcript.log"))
+                    .unwrap()
+                    .contains("final foreground")
+            );
+            assert!(
+                regular_text(&package.join("loop-transcript.log"))
+                    .unwrap()
+                    .contains("actual foreground events")
+            );
+            assert!(
+                std::fs::metadata(package.join("loop-transcript.log"))
+                    .unwrap()
+                    .len()
+                    <= TRANSCRIPT_BYTES as u64
+            );
+            std::fs::rename(actor.join("runtime"), actor.join("saved-runtime")).unwrap();
+            let outside = root.join("outside/dispatch-loop");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("loop.log"), "SENTINEL-OUTSIDE-TRANSCRIPT").unwrap();
+            std::os::unix::fs::symlink(root.join("outside"), actor.join("runtime")).unwrap();
+            capture_loop_foreground(&actor).unwrap();
+            loop_transcript().unwrap();
+            assert!(
+                !regular_text(&package.join("loop-transcript.log"))
+                    .unwrap()
+                    .contains("SENTINEL-OUTSIDE-TRANSCRIPT")
             );
         });
     }

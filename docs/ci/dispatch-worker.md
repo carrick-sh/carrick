@@ -93,7 +93,7 @@ boundary. The private launcher is not secret (owner decision #231). Trusted
 bodies can still misdirect a credential-bearing model. The collaborators-only
 interaction limit expires on 2027-04-04 and is not a lasting trust boundary.
 Earlier jobs capped exposure at 40 minutes; the current window reserves time
-for bootstrap, a 45-minute loop and reporting. The job token can write branches belonging to other runs: the uid split and fixed refspec enforce normal scope, not its
+for bootstrap, a 42-minute loop and reporting. The job token can write branches belonging to other runs: the uid split and fixed refspec enforce normal scope, not its
 repository grant. Ruleset 25522481 was deleted after it blocked merge queue
 creation; tag ruleset 25523683 is active.
 
@@ -112,7 +112,7 @@ There are no tool arguments for issue, PR, repository or scope. Only `select_bra
 
 | Tool | Policy |
 | --- | --- |
-| `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, commits, issue/PR comments, earlier verified runs with URLs, conclusions, artifact names and outcome contracts. Includes their outcome comments and available branch candidates; board status is explicitly unavailable with this token. Includes the label/comment/review trigger verbatim and provenance. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
+| `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, commits, issue/PR comments, earlier verified runs with URLs, conclusions, artifact names and outcome contracts. Includes their outcome comments and available branch candidates; board status is explicitly unavailable with this token. Includes the label/comment/review trigger verbatim and provenance. Optional sources degrade individually to `unavailable` with endpoint, HTTP status when available, and bounded redacted stderr; unverifiable authors remain `unverified`. Only trigger/issue reads are mandatory. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
 | `select_branch {branch}` | Before workers begin, selects the new run branch or an authenticated issue-linked branch. Reads and retains its remote tip for the publication lease. |
 | `read_artifact {run, name}` | Reads one fixed text filename (`contract.json`, `handoff.json`, `raw.log`, `transcript.md`, `diffstat.txt`) from a completed earlier run. Verifies workflow/run/owner identity, a completed `carrick-agent` worker with successful upload, and the issue-derived upload bundle name. Review runs must keep the workflow blob from their head’s merge base with main. The returned contract, handoff or worker-transcript text is tagged with its dispatch provenance and marked untrusted. Rejects another issue, workflow, current run, expired/oversized bundle or unknown filename. Download is runner-private and the final read refuses symlinks and exceeds neither 64 KiB nor the event wall budget. |
 | `read_capacity {}` | Runs pinned `agy_worker.py capacity --json` as the worker account. Reads the real `backends` map from `capacity_report`, with `installed`, `free_slots`, `quota_free`, `score` and agy `quota.groups`/`group_scores`. Augments it with exact current IDs from the launcher's live `models --backend` roster, excluding superseded IDs. Returns numeric capacity and model IDs only, never credentials or raw diagnostics. Only successful capacity reports are cached. Each admitted worker consumes its snapshot, so the next worker requires a fresh report; refused choices can reuse the current successful report. Total probes are capped at `workers + refused_workers`. Each subprocess/output is bounded (120 s, 64 KiB) inside the event wall budget. |
@@ -123,8 +123,17 @@ There are no tool arguments for issue, PR, repository or scope. Only `select_bra
 
 The only ceilings are `[loop]` in `.github/dispatch-tiers.toml`: 12 tool calls,
 two state reads, three workers, three refused worker requests, one publication,
-two optional comments, 64 KiB state, 45 wall minutes including at most 35 total
-worker minutes. There
+two optional comments, 64 KiB state, 42 wall minutes including at most 35 total
+worker minutes. Each worker allocation includes `[loop].harvest_seconds`
+(default 180 seconds): the agent deadline is that much earlier than the
+worker deadline. Retirement, permission hand-back, snapshot, checkpoint and
+result collection use the reserved window. A timed-out worker retains partial
+work and logs with a failed timeout contract. Harvest failures name the original
+error and refuse publication; production is never rerun as a setup failure.
+The reserve is deducted from worker and wall time, rather than added after
+either budget. The 42-minute default leaves five minutes within the 47-minute
+loop step for retirement and reporting; the loop also stops by job minute 55
+to leave five minutes of the 60-minute job for finalization and upload. There
 are no dispatch tier tables or tier-selected credentials. The loop chooses
 from live capacity and explains its choice in the outcome. No retries or
 budget increases occur on refusals. If the loop exits or times out without
@@ -155,8 +164,17 @@ widen tool permissions. Admission is bound to the webhook digest in private
 runner state; auth and the loop consume it without reinterpreting labels.
 
 Output is token-masked and scanned before upload: `raw.log`, `transcript.md`,
-`contract.json`, `handoff.json` and `diffstat.txt`, retained 30 days after successful or failed loop outcomes once uid retirement and artifact scanning succeed. The final contract and handoff persist each worker's claims and publication context for future runs; runs share no local state. Unknown or nonregular
-files are refused. Worker contracts are claims for review; incomplete contracts
+`contract.json`, `handoff.json`, `diffstat.txt`, `loop.log` and
+`loop-transcript.log`, retained 30 days after successful or failed loop outcomes once uid retirement and artifact scanning succeed. The final contract and handoff persist each worker's claims and publication context for future runs; runs share no local state. Unknown or nonregular
+files are refused. `loop.log` is capped at 64 KiB and records tool selectors,
+text lengths (never note or comment bodies), outcomes and durations, plus
+GitHub source, capacity, worker and harvest phase timings. It keeps opening
+context and recent records, marking dropped older diagnostics. The loop's
+foreground event log, stderr, stdout and available final launcher response are
+saved as `loop-transcript.log`,
+capped at 512 KiB like the worker transcript artifacts. Redaction precedes
+clipping and the token scan covers every uploaded file. The workflow uploads
+the whole `dispatch-output` directory, including these diagnostics. Worker contracts are claims for review; incomplete contracts
 fail the job. PR review and repository gates establish correctness.
 
 ## Compiler isolation

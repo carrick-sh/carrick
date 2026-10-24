@@ -1303,7 +1303,24 @@ fn execute_with_failure(
             .as_ref()
             .ok()
             .and_then(|result| result.as_ref().ok())
-            .map(|bytes| crate::dispatch_redaction::redact(bytes))
+            .map(|bytes| {
+                // gh puts its HTTP status in stderr. Preserve only a validated
+                // numeric status before redaction can suppress a secret-bearing
+                // line; never retain the original external line beside it.
+                let text = String::from_utf8_lossy(bytes);
+                let http = (program == "gh")
+                    .then(|| {
+                        text.split("(HTTP ").skip(1).find_map(|part| {
+                            let status = part.get(..3)?;
+                            (status.bytes().all(|b| b.is_ascii_digit())
+                                && part.as_bytes().get(3) == Some(&b')'))
+                            .then(|| format!("HTTP {status}; "))
+                        })
+                    })
+                    .flatten()
+                    .unwrap_or_default();
+                format!("{http}{}", crate::dispatch_redaction::redact(bytes))
+            })
             .unwrap_or_default();
         ScalerError::CommandFailed(if diagnostic.is_empty() {
             reason
