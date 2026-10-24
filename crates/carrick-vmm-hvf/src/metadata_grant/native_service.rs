@@ -45,6 +45,17 @@ impl NativeService {
     /// An unsupported service is refused to its ring owner, which alone
     /// chooses errno or signal. There is no host syscall dispatch fallback.
     pub fn refuse(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let request = self.request();
+        if let carrick_core_abi::service::ServiceOperation::Crossing { ordinal } = request.operation
+        {
+            carrick_observability::probes::hvpatch_native_crossing_refused(
+                request.identity.birth.mm.mm().raw(),
+                request.identity.birth.mm.incarnation().get(),
+                u32::from(request.identity.birth.record.id.raw()),
+                request.identity.sequence.get(),
+                ordinal.raw(),
+            );
+        }
         self.complete(false)
     }
 
@@ -79,6 +90,31 @@ impl NativeService {
         use carrick_sched_core::spaces::notification::{
             SpaceAccess, SpaceReleaseVenue, SpaceWaitCause, SpaceWakeDelivery,
         };
+        if let Some(selection) = self.cow {
+            use carrick_core_abi::service::ServiceFaultSupply;
+            use carrick_observability::probes::HvpatchNativeFaultPhase;
+            let (phase, window) = match selection {
+                ServiceFaultSupply::Cow(window) => (HvpatchNativeFaultPhase::Cow, window),
+                ServiceFaultSupply::Backing(window) => (HvpatchNativeFaultPhase::Backing, window),
+            };
+            carrick_observability::probes::hvpatch_native_fault_supply(
+                self.request().identity.birth.mm.mm().raw(),
+                self.request().identity.sequence.get(),
+                phase,
+                window.fault_page,
+                window.range.len(),
+            );
+        } else if let carrick_core_abi::service::ServiceOperation::Fault(fault) =
+            self.request().operation
+        {
+            carrick_observability::probes::hvpatch_native_fault_supply(
+                self.request().identity.birth.mm.mm().raw(),
+                self.request().identity.sequence.get(),
+                carrick_observability::probes::HvpatchNativeFaultPhase::Unselected,
+                fault.address.raw() & !4095,
+                0,
+            );
+        }
         let window = match self.cow {
             Some(carrick_core_abi::service::ServiceFaultSupply::Cow(window)) => window,
             Some(carrick_core_abi::service::ServiceFaultSupply::Backing(window)) => {
@@ -377,6 +413,7 @@ impl NativeService {
         supplied: bool,
         backing_fault: bool,
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let request = self.request();
         let region = retained_abi_region(&self.custody).ok_or_else(stale)?;
         let (_, zone) = stopped_records(
             region,
@@ -401,6 +438,28 @@ impl NativeService {
         queue
             .notify_object(self.slot, &mut effects)
             .map_err(|_| stale())?;
+        if matches!(
+            request.operation,
+            carrick_core_abi::service::ServiceOperation::Fault(_)
+        ) {
+            use carrick_observability::probes::HvpatchNativeFaultPhase;
+            let phase = if backing_fault {
+                HvpatchNativeFaultPhase::BackingFault
+            } else if wait.is_some() {
+                HvpatchNativeFaultPhase::OwnerWait
+            } else if supplied {
+                HvpatchNativeFaultPhase::Supplied
+            } else {
+                HvpatchNativeFaultPhase::Refused
+            };
+            carrick_observability::probes::hvpatch_native_fault_supply(
+                request.identity.birth.mm.mm().raw(),
+                request.identity.sequence.get(),
+                phase,
+                0,
+                0,
+            );
+        }
         Ok(effects)
     }
 }

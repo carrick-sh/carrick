@@ -316,6 +316,19 @@ pub enum HvpatchExecutorLifecyclePhase {
     InvalidateAsid = 5,
 }
 
+/// Native physical service boundaries; stable USDT ordinals, append only.
+#[derive(Clone, Copy, Debug)]
+#[repr(u32)]
+pub enum HvpatchNativeFaultPhase {
+    Cow = 0,
+    Backing = 1,
+    Supplied = 2,
+    Refused = 3,
+    OwnerWait = 4,
+    BackingFault = 5,
+    Unselected = 6,
+}
+
 impl HvpatchExecutorLifecyclePhase {
     pub const fn raw(self) -> u32 {
         self as u32
@@ -6199,6 +6212,10 @@ mod real {
         fn hvpatch__executor__load__failure(_: u64, _: u64, _: u32, _: &str) {}
         /// Owner-thread lifecycle failure, including unbound native service.
         fn hvpatch__executor__failure(_: u32, _: &str) {}
+        /// Native crossing refusal: MM, MM incarnation, record, sequence, ordinal.
+        fn hvpatch__native__crossing__refused(_: u64, _: u64, _: u32, _: u64, _: u64) {}
+        /// Native fault supply: MM, sequence, phase, fault page, selected length.
+        fn hvpatch__native__fault__supply(_: u64, _: u64, _: u32, _: u64, _: u64) {}
         /// One scheduler wake edge against a kernel thread. Args: ThreadSerial,
         /// wake kind (`HvpatchSchedulerWakeKind`), the execution state the
         /// wake found (`HvpatchThreadExecutionStateKind`), that state's
@@ -7042,6 +7059,38 @@ mod real {
     /// that has no host task binding or logical terminal result of its own.
     pub fn hvpatch_executor_failure(executor: u32, error: &str) {
         carrick_usdt::hvpatch__executor__failure!(|| (executor, error));
+    }
+
+    pub fn hvpatch_native_crossing_refused(
+        mm: u64,
+        incarnation: u64,
+        record: u32,
+        sequence: u64,
+        ordinal: u64,
+    ) {
+        carrick_usdt::hvpatch__native__crossing__refused!(|| (
+            mm,
+            incarnation,
+            record,
+            sequence,
+            ordinal
+        ));
+    }
+
+    pub fn hvpatch_native_fault_supply(
+        mm: u64,
+        sequence: u64,
+        phase: super::HvpatchNativeFaultPhase,
+        fault_page: u64,
+        length: u64,
+    ) {
+        carrick_usdt::hvpatch__native__fault__supply!(|| (
+            mm,
+            sequence,
+            phase as u32,
+            fault_page,
+            length
+        ));
     }
 
     /// Exact scheduler wake edge, recorded after the thread state machine
@@ -9735,6 +9784,8 @@ mod stub {
         error: &str
     ));
     stub!(hvpatch_executor_failure(executor: u32, error: &str));
+    stub!(hvpatch_native_crossing_refused(mm: u64, incarnation: u64, record: u32, sequence: u64, ordinal: u64));
+    stub!(hvpatch_native_fault_supply(mm: u64, sequence: u64, phase: super::HvpatchNativeFaultPhase, fault_page: u64, length: u64));
     stub!(hvpatch_scheduler_wake(
         thread_serial: u64,
         kind: super::HvpatchSchedulerWakeKind,
