@@ -7,6 +7,14 @@ use super::*;
 use crate::dispatch::mm_authority::DispatchMmAuthority;
 
 pub trait HostReservationProvider: Send + Sync {
+    /// Exact retained carrier venue for publication and final cleanup. Providers
+    /// used only for isolated root fixtures need not expose a carrier region.
+    fn address_space_backing(
+        &self,
+    ) -> Option<Arc<dyn crate::kernel::mm_occupancy::AddressSpaceBacking>> {
+        None
+    }
+
     /// Called before taking an MM permit. Return MetadataRequired if the
     /// existing metadata service must provision storage before resubmission.
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal>;

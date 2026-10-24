@@ -576,10 +576,14 @@ impl SyscallDispatcher {
         &'a self,
         participation: &'a mut crate::dispatch::MmExecutorParticipation,
     ) -> Option<BoundAddressSpaceAdmission<'a>> {
-        self.begin_address_space_admission_with(
-            participation,
-            crate::kernel::mm_occupancy::PreAdmissionGuard::acquire,
-        )
+        self.begin_address_space_admission_with(participation, |mm| {
+            crate::kernel::mm_occupancy::PreAdmissionGuard::acquire_for_provider(
+                mm,
+                self.mm_authority()
+                    .reservation_provider_for_publication()
+                    .as_ref(),
+            )
+        })
     }
     fn begin_address_space_admission_with<'a>(
         &'a self,
