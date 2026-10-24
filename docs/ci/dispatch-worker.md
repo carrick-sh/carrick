@@ -140,10 +140,14 @@ blob to equal the head’s merge-base blob. Available issue/PR mappings must
 match; artifact reads additionally require an issue-scoped uploaded bundle. Commit authors never grant owner or collaborator provenance: commits
 are tagged `commit(author-claimed)`, and their messages are withheld unless
 their SHAs belong to an authenticated handoff’s published-tip parent chain.
-Deleted or invalid linked runs are skipped. History discovery inspects at
-most 32 prior run candidates, combining linked branches and comment footers
-with completed issue/comment runs of this workflow after issue creation; it
-never scans the repository-wide artifact inventory. Contracts from verified
+Deleted or invalid linked runs are skipped. History discovery retains all
+known run IDs from linked branches and comment footers. An additional census
+of at most 32 completed issue/comment runs of this workflow after issue
+creation checks issue-derived artifact-name prefixes before authenticating
+runs; it never scans the repository-wide artifact inventory. Each server
+authenticates a run once and reuses its artifact listing and downloaded text.
+Unchanged branch selections reuse history verification while rechecking live
+remote tips and all-state PR ownership before admission or publication. Contracts from verified
 artifacts take precedence over comment previews, and the server’s outcome
 block precedes all model text. Write collaborators are tagged
 `collaborator(login)`; all others are `unverified`, with bodies withheld. Lookups are cached. No provenance tag can

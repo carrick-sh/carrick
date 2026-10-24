@@ -201,13 +201,13 @@ fn provenance_with(
 #[derive(Default)]
 struct ProvenanceCache {
     permissions: std::collections::BTreeMap<String, bool>,
-    runs: std::collections::BTreeMap<String, Option<ArtifactRun>>,
 }
 impl ProvenanceCache {
     fn classify(
         &mut self,
         item: &Value,
         issue: u64,
+        runs: &mut RunCache,
         mut lookup: impl FnMut(&str) -> Option<Value>,
     ) -> String {
         let user = &item["user"];
@@ -229,14 +229,8 @@ impl ProvenanceCache {
             item,
             issue,
             |id| {
-                self.runs
-                    .entry(id.to_owned())
-                    .or_insert_with(|| {
-                        let run = lookup(&format!("repos/{REPOSITORY}/actions/runs/{id}"))?;
-                        let run = authenticate_artifact_run(run, issue, &mut lookup).ok()?;
-                        Some(run)
-                    })
-                    .clone()
+                let id = RunId(id.parse().ok()?);
+                runs.authenticate_with(issue, id, &mut lookup).ok()
             },
             write,
         )
@@ -604,38 +598,142 @@ fn artifact_scope(run: &Value, artifacts: &[Value], issue: u64) -> Result<Value,
         .cloned()
         .ok_or(ScalerError::Guard("no issue-linked dispatch artifact"))
 }
-fn run_artifacts(
-    root: &Path,
-    issue: u64,
-    id: RunId,
-) -> Result<(ArtifactRun, Vec<Value>), ScalerError> {
-    let id_number = id.0;
-    if id_number.to_string() == run_id()? {
-        return Err(ScalerError::Guard("current run is not a prior run"));
+/// Completed-run evidence is immutable for this server invocation. Share it
+/// across provenance, artifacts and branch selection, including failed checks.
+#[derive(Default)]
+pub(super) struct RunCache {
+    authenticated: std::collections::BTreeMap<(u64, RunId), Option<ArtifactRun>>,
+    artifacts: std::collections::BTreeMap<RunId, Option<Vec<Value>>>,
+    bundles: std::collections::BTreeMap<
+        (u64, RunId),
+        Option<std::collections::BTreeMap<String, String>>,
+    >,
+    branches: std::collections::BTreeMap<(u64, String), BranchSnapshot>,
+}
+struct BranchSnapshot {
+    prs: Value,
+    target: BranchTarget,
+}
+impl RunCache {
+    fn authenticate_with(
+        &mut self,
+        issue: u64,
+        id: RunId,
+        mut lookup: impl FnMut(&str) -> Option<Value>,
+    ) -> Result<ArtifactRun, ScalerError> {
+        self.authenticated
+            .entry((issue, id))
+            .or_insert_with(|| {
+                let run = lookup(&format!("repos/{REPOSITORY}/actions/runs/{}", id.0))?;
+                if run["id"].as_u64() != Some(id.0) {
+                    return None;
+                }
+                authenticate_artifact_run(run, issue, &mut lookup).ok()
+            })
+            .clone()
+            .ok_or(ScalerError::Guard("unverified dispatch run"))
     }
-    let run = api(
-        root,
-        &format!("repos/{REPOSITORY}/actions/runs/{id_number}"),
-    )?;
-    if run["id"].as_u64() != Some(id_number) {
-        return Err(ScalerError::Guard("prior run identity mismatch"));
+    fn authenticate(
+        &mut self,
+        root: &Path,
+        issue: u64,
+        id: RunId,
+    ) -> Result<ArtifactRun, ScalerError> {
+        self.authenticate_with(issue, id, |endpoint| api(root, endpoint).ok())
     }
-    let run = authenticate_artifact_run(run, issue, |endpoint| api(root, endpoint).ok())?;
-    if !run.1 {
-        return Err(ScalerError::Guard("prior run upload did not succeed"));
+    fn artifacts(&mut self, root: &Path, id: RunId) -> Result<Vec<Value>, ScalerError> {
+        self.artifacts
+            .entry(id)
+            .or_insert_with(|| {
+                let data = api(
+                    root,
+                    &format!(
+                        "repos/{REPOSITORY}/actions/runs/{}/artifacts?per_page=100",
+                        id.0
+                    ),
+                )
+                .ok()?;
+                let artifacts = data["artifacts"].as_array()?;
+                (artifacts.len() < 100).then(|| artifacts.clone())
+            })
+            .clone()
+            .ok_or(ScalerError::Guard(
+                "invalid or oversized prior artifact list",
+            ))
     }
-    let data = api(
-        root,
-        &format!("repos/{REPOSITORY}/actions/runs/{id_number}/artifacts?per_page=100"),
-    )?;
-    let artifacts = data["artifacts"]
-        .as_array()
-        .ok_or(ScalerError::Guard("invalid artifact list"))?
-        .clone();
-    if artifacts.len() >= 100 {
-        return Err(ScalerError::Guard("prior run artifact count exceeds bound"));
+    fn run_artifacts(
+        &mut self,
+        root: &Path,
+        issue: u64,
+        id: RunId,
+    ) -> Result<(ArtifactRun, Vec<Value>), ScalerError> {
+        if id.0.to_string() == run_id()? {
+            return Err(ScalerError::Guard("current run is not a prior run"));
+        }
+        let run = self.authenticate(root, issue, id)?;
+        if !run.1 {
+            return Err(ScalerError::Guard("prior run upload did not succeed"));
+        }
+        Ok((run, self.artifacts(root, id)?))
     }
-    Ok((run, artifacts))
+    fn prior_artifact(
+        &mut self,
+        root: &Path,
+        issue: u64,
+        id: RunId,
+        name: &str,
+    ) -> Result<String, ScalerError> {
+        if !ARTIFACT_FILES.contains(&name) {
+            return Err(ScalerError::Guard("artifact file is not allowlisted"));
+        }
+        let (run, artifacts) = self.run_artifacts(root, issue, id)?;
+        let artifact = artifact_scope(&run.0, &artifacts, issue)?;
+        let bundle = self.bundles.entry((issue, id)).or_insert_with(|| {
+            (|| -> Result<_, ScalerError> {
+                let name_on_github = artifact["name"]
+                    .as_str()
+                    .ok_or(ScalerError::Guard("artifact name"))?;
+                let directory = tempfile::tempdir()?;
+                // Only an issue-authenticated bundle is extracted. Final
+                // bounded reads refuse links, and only allowlisted text stays.
+                gh(
+                    root,
+                    &[
+                        "run",
+                        "download",
+                        &id.0.to_string(),
+                        "--repo",
+                        REPOSITORY,
+                        "--name",
+                        name_on_github,
+                        "--dir",
+                        directory
+                            .path()
+                            .to_str()
+                            .ok_or(ScalerError::Guard("artifact directory"))?,
+                    ],
+                )?;
+                Ok(ARTIFACT_FILES
+                    .iter()
+                    .filter_map(|name| {
+                        let text =
+                            crate::safe_copy::text(&directory.path().join(name), REQUEST_BYTES)
+                                .ok()?;
+                        Some((
+                            (*name).to_owned(),
+                            crate::dispatch_redaction::redact(text.as_bytes()),
+                        ))
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>())
+            })()
+            .ok()
+        });
+        bundle
+            .as_ref()
+            .and_then(|b| b.get(name))
+            .cloned()
+            .ok_or(ScalerError::Guard("artifact text unavailable or unsafe"))
+    }
 }
 const PRIOR_RUN_LIMIT: usize = 32;
 /// Bound discovery to this workflow after the issue's creation. Known branch
@@ -643,8 +741,11 @@ const PRIOR_RUN_LIMIT: usize = 32;
 fn issue_artifact_runs(
     root: &Path,
     issue: &Value,
+    issue_number: u64,
+    cache: &mut RunCache,
     mut runs: std::collections::BTreeSet<RunId>,
 ) -> Result<std::collections::BTreeSet<RunId>, ScalerError> {
+    let mut census = std::collections::BTreeSet::new();
     if let Some(created) = issue["created_at"].as_str().filter(|s| {
         !s.is_empty()
             && s.bytes()
@@ -670,62 +771,78 @@ fn issue_artifact_runs(
                         .is_some_and(|date| date >= created)
                     && let Some(id) = run["id"].as_u64()
                 {
-                    runs.insert(RunId(id));
+                    census.insert(RunId(id));
                 }
             }
         }
     }
-    Ok(runs.into_iter().rev().take(PRIOR_RUN_LIMIT).collect())
-}
-fn prior_artifact(root: &Path, issue: u64, id: RunId, name: &str) -> Result<String, ScalerError> {
-    if !ARTIFACT_FILES.contains(&name) {
-        return Err(ScalerError::Guard("artifact file is not allowlisted"));
+    for id in census.into_iter().rev().take(PRIOR_RUN_LIMIT) {
+        // The run list cannot filter an issue. Inspect the issue-derived
+        // artifact prefix before paying for workflow/job authentication.
+        if !runs.contains(&id)
+            && cache.artifacts(root, id).is_ok_and(|artifacts| {
+                artifacts.iter().any(|a| {
+                    a["name"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with(&format!("dispatch-{issue_number}-")))
+                })
+            })
+        {
+            runs.insert(id);
+        }
     }
-    let (run, artifacts) = run_artifacts(root, issue, id)?;
-    let artifact = artifact_scope(&run.0, &artifacts, issue)?;
-    let name_on_github = artifact["name"]
-        .as_str()
-        .ok_or(ScalerError::Guard("artifact name"))?;
-    let directory = tempfile::tempdir()?;
-    // Only the server-selected, issue-authenticated bundle is downloaded.
-    // gh's ZIP reader confines extraction; the final bounded read refuses links.
-    gh(
-        root,
-        &[
-            "run",
-            "download",
-            &id.0.to_string(),
-            "--repo",
-            REPOSITORY,
-            "--name",
-            name_on_github,
-            "--dir",
-            directory
-                .path()
-                .to_str()
-                .ok_or(ScalerError::Guard("artifact directory"))?,
-        ],
-    )?;
-    let text = crate::safe_copy::text(&directory.path().join(name), REQUEST_BYTES)?;
-    Ok(crate::dispatch_redaction::redact(text.as_bytes()))
+    Ok(runs)
 }
+#[cfg(test)]
+fn prior_artifact(root: &Path, issue: u64, id: RunId, name: &str) -> Result<String, ScalerError> {
+    RunCache::default().prior_artifact(root, issue, id, name)
+}
+#[derive(Clone)]
 pub(super) struct BranchTarget {
     pr: Option<u64>,
     tip: String,
 }
 /// An open owned PR or an authenticated prior publication binds the branch
 /// to this issue. A suggestive name alone never grants branch authority.
-pub(super) fn verified_branch(
+#[cfg(test)]
+fn verified_branch(root: &Path, issue: u64, branch: &str) -> Result<BranchTarget, ScalerError> {
+    verified_branch_cached(root, issue, branch, &mut RunCache::default())
+}
+pub(super) fn verified_branch_cached(
     root: &Path,
     issue: u64,
     branch: &str,
+    cache: &mut RunCache,
 ) -> Result<BranchTarget, ScalerError> {
     let id = branch_run(issue, branch)?
         .parse::<u64>()
         .map_err(|_| ScalerError::Guard("branch run id"))?;
-    let run = api(root, &format!("repos/{REPOSITORY}/actions/runs/{id}"))?;
-    authenticate_artifact_run(run.clone(), issue, |endpoint| api(root, endpoint).ok())?;
+    let run = cache.authenticate(root, issue, RunId(id))?.0;
     let prs = branch_prs(root, branch, "all")?;
+    let remote = git(
+        root,
+        &[
+            "-c",
+            "credential.helper=!gh auth git-credential",
+            "ls-remote",
+            "--heads",
+            "https://github.com/carrick-sh/carrick",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    let tip = remote
+        .split_whitespace()
+        .next()
+        .filter(|s| sha(s))
+        .ok_or(ScalerError::Guard("linked branch is absent"))?
+        .to_owned();
+    let key = (issue, branch.to_owned());
+    if let Some(snapshot) = cache.branches.get(&key)
+        && snapshot.prs == prs
+        && snapshot.target.tip == tip
+    {
+        return Ok(snapshot.target.clone());
+    }
     let pr = select_owned_pr(
         issue,
         prs.as_array()
@@ -756,11 +873,11 @@ pub(super) fn verified_branch(
             }
         }
         let mut latest = None;
-        for prior in issue_artifact_runs(root, &issue_data, ids)? {
-            let Ok((run, _)) = run_artifacts(root, issue, prior) else {
+        for prior in issue_artifact_runs(root, &issue_data, issue, cache, ids)? {
+            let Ok((run, _)) = cache.run_artifacts(root, issue, prior) else {
                 continue;
             };
-            let Ok(text) = prior_artifact(root, issue, prior, "handoff.json") else {
+            let Ok(text) = cache.prior_artifact(root, issue, prior, "handoff.json") else {
                 continue;
             };
             let Ok(handoff) = serde_json::from_str::<Value>(&text) else {
@@ -788,29 +905,20 @@ pub(super) fn verified_branch(
         );
         None
     };
-    let remote = git(
-        root,
-        &[
-            "-c",
-            "credential.helper=!gh auth git-credential",
-            "ls-remote",
-            "--heads",
-            "https://github.com/carrick-sh/carrick",
-            &format!("refs/heads/{branch}"),
-        ],
-    )?;
-    let tip = remote
-        .split_whitespace()
-        .next()
-        .filter(|s| sha(s))
-        .ok_or(ScalerError::Guard("linked branch is absent"))?
-        .to_owned();
     if expected.is_some_and(|expected| tip != expected) {
         return Err(ScalerError::Guard(
             "branch tip moved since last server publication",
         ));
     }
-    Ok(BranchTarget { pr, tip })
+    let target = BranchTarget { pr, tip };
+    cache.branches.insert(
+        key,
+        BranchSnapshot {
+            prs,
+            target: target.clone(),
+        },
+    );
+    Ok(target)
 }
 fn outcome_contract(body: &str) -> Option<Contract> {
     let json = body
@@ -889,6 +997,7 @@ struct Server<'a> {
     policy: Policy,
     used: Used,
     provenance: ProvenanceCache,
+    runs: RunCache,
     deadline: Instant,
     token: String,
     finished: bool,
@@ -1040,7 +1149,12 @@ impl Server<'_> {
         {
             None
         } else {
-            Some(verified_branch(self.root, self.dispatch.issue, branch)?)
+            Some(verified_branch_cached(
+                self.root,
+                self.dispatch.issue,
+                branch,
+                &mut self.runs,
+            )?)
         };
         self.dispatch.branch = branch.to_owned();
         self.dispatch.resume = target.is_some();
@@ -1138,9 +1252,11 @@ impl Server<'_> {
                 .and_then(|branch| branch_run(self.dispatch.issue, branch).ok())
                 .and_then(|id| id.parse::<u64>().ok())
                 .and_then(|id| {
-                    api(self.root, &format!("repos/{REPOSITORY}/actions/runs/{id}")).ok()
-                })
-                .filter(|run| dispatch_run_identity(run, Some(self.dispatch.issue)));
+                    self.runs
+                        .authenticate(self.root, self.dispatch.issue, RunId(id))
+                        .ok()
+                        .map(|run| run.0)
+                });
             let Some(origin) = origin else {
                 items.push(state_item("pr", "unverified", pr));
                 continue;
@@ -1150,13 +1266,7 @@ impl Server<'_> {
                 && let Ok(id_number) = id.parse::<u64>()
             {
                 earlier.insert(RunId(id_number));
-                if pr["state"] == "open"
-                    && owned_pr(&pr, &origin, self.dispatch.issue, branch)
-                    && authenticate_artifact_run(origin, self.dispatch.issue, |endpoint| {
-                        api(self.root, endpoint).ok()
-                    })
-                    .is_ok()
-                {
+                if pr["state"] == "open" && owned_pr(&pr, &origin, self.dispatch.issue, branch) {
                     items.push(json!({"kind":"branch_candidate","provenance":format!("dispatch-agent(run {id})"),"data":{"branch":branch,"pr":number}}));
                 }
             }
@@ -1185,11 +1295,12 @@ impl Server<'_> {
                     commits.push(item);
                     continue;
                 }
-                let provenance = self
-                    .provenance
-                    .classify(&item, self.dispatch.issue, |endpoint| {
-                        api(self.root, endpoint).ok()
-                    });
+                let provenance = self.provenance.classify(
+                    &item,
+                    self.dispatch.issue,
+                    &mut self.runs,
+                    |endpoint| api(self.root, endpoint).ok(),
+                );
                 if provenance.starts_with("dispatch-agent(")
                     && let Some(id) = run_from_body(item["body"].as_str().unwrap_or_default())
                 {
@@ -1205,32 +1316,47 @@ impl Server<'_> {
                 items.push(state_item(kind, &provenance, item));
             }
         }
-        let earlier = issue_artifact_runs(self.root, &issue, earlier)?;
+        let earlier = issue_artifact_runs(
+            self.root,
+            &issue,
+            self.dispatch.issue,
+            &mut self.runs,
+            earlier,
+        )?;
         for RunId(id_number) in earlier {
             let id = id_number.to_string();
             if id == run_id()? {
                 continue;
             }
-            let Ok((run, artifacts)) =
-                run_artifacts(self.root, self.dispatch.issue, RunId(id_number))
+            let Ok(run) = self
+                .runs
+                .authenticate(self.root, self.dispatch.issue, RunId(id_number))
             else {
                 continue;
             };
-            if artifact_scope(&run.0, &artifacts, self.dispatch.issue).is_err() {
-                continue;
-            }
+            let artifacts = self
+                .runs
+                .run_artifacts(self.root, self.dispatch.issue, RunId(id_number))
+                .ok()
+                .filter(|(run, artifacts)| {
+                    artifact_scope(&run.0, artifacts, self.dispatch.issue).is_ok()
+                })
+                .map(|(_, artifacts)| artifacts)
+                .unwrap_or_default();
             // The uploaded contract is server-built. Model-authored comment
             // text can contain a forged contract block even in a bot comment.
-            let contract: Option<Contract> = prior_artifact(
-                self.root,
-                self.dispatch.issue,
-                RunId(id_number),
-                "contract.json",
-            )
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .or_else(|| contracts.remove(&id));
-            if let Ok(text) = prior_artifact(
+            let contract: Option<Contract> = self
+                .runs
+                .prior_artifact(
+                    self.root,
+                    self.dispatch.issue,
+                    RunId(id_number),
+                    "contract.json",
+                )
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .or_else(|| contracts.remove(&id));
+            if let Ok(text) = self.runs.prior_artifact(
                 self.root,
                 self.dispatch.issue,
                 RunId(id_number),
@@ -1309,7 +1435,7 @@ impl Server<'_> {
                 };
                 let response = json!({"ok":true,"run":run,"name":name,"kind":kind,
                     "provenance":format!("dispatch-agent(run {})", run.0),
-                    "data":{"untrusted":true,"text":prior_artifact(self.root, self.dispatch.issue, run, &name)?}});
+                    "data":{"untrusted":true,"text":self.runs.prior_artifact(self.root, self.dispatch.issue, run, &name)?}});
                 if serde_json::to_vec(&response)?.len() > self.policy.response_bytes {
                     return Err(ScalerError::Guard("artifact response exceeds byte budget"));
                 }
@@ -1325,7 +1451,12 @@ impl Server<'_> {
                     let capacity = self.capacity()?;
                     available_worker(&capacity, &selection.backend, &selection.model)?;
                     if self.dispatch.resume {
-                        verified_branch(self.root, self.dispatch.issue, &self.dispatch.branch)?;
+                        verified_branch_cached(
+                            self.root,
+                            self.dispatch.issue,
+                            &self.dispatch.branch,
+                            &mut self.runs,
+                        )?;
                     }
                     self.admit_worker(&selection, &capacity)
                 })();
@@ -1399,9 +1530,6 @@ impl Server<'_> {
                     return Err(ScalerError::Guard("invoke worker before publishing"));
                 }
                 cleanup_agent_user()?;
-                if self.dispatch.resume {
-                    verified_branch(self.root, self.dispatch.issue, &self.dispatch.branch)?;
-                }
                 let state = crate::agent_runner::state()?;
                 let receipt: Receipt =
                     serde_json::from_str(&regular_text(&state.join("receipt.json"))?)?;
@@ -1428,6 +1556,7 @@ impl Server<'_> {
                     &contract,
                     &report,
                     &self.token,
+                    &mut self.runs,
                 )? {
                     self.pr = Some(pr);
                     self.write_handoff()?;
@@ -1619,6 +1748,7 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
         policy,
         used: Used::default(),
         provenance: ProvenanceCache::default(),
+        runs: RunCache::default(),
         deadline: Instant::now() + limit,
         token: std::env::var("GH_TOKEN")
             .ok()
@@ -1775,6 +1905,7 @@ mod tests {
             policy: Policy::load().unwrap(),
             used: Used::default(),
             provenance: ProvenanceCache::default(),
+            runs: RunCache::default(),
             deadline: Instant::now() + Duration::from_secs(60),
             token: "fixture-token".into(),
             finished: false,
@@ -2150,6 +2281,7 @@ if test "$1 $2" = 'issue comment'; then
 fi
 if test "$1 $2" = 'run download'; then
  download_run=$3
+ printf 'download/%s\n' "$download_run" >> "$RUNNER_TEMP/api-endpoints"
  while test "$1" != --dir; do shift; done
  cp "$RUNNER_TEMP/contract.json" "$2/contract.json"
  if test -f "$RUNNER_TEMP/handoff-$download_run.json"; then
@@ -2176,6 +2308,13 @@ case "$endpoint" in
  */compare/main...*) printf '{"files":[],"merge_base_commit":{"sha":"%040d"}}' 1 ;;
  */contents/.github/workflows/dispatch-worker.yml*)
    case "$endpoint" in *ref=main) printf '{"type":"file","sha":"%040d"}' 0 ;; *ref=0000000000000000000000000000000000000001) if test -f "$RUNNER_TEMP/workflow-base.json"; then cat "$RUNNER_TEMP/workflow-base.json"; else printf '{"type":"file","sha":"%040d"}' 0; fi ;; *) cat "$RUNNER_TEMP/workflow.json" ;; esac ;;
+ */actions/runs/10??/artifacts*)
+   census_id=${endpoint#*/actions/runs/}; census_id=${census_id%%/*}
+   if test -f "$RUNNER_TEMP/census-this-issue"; then
+    printf '{"artifacts":[{"id":1,"name":"dispatch-799-%s-1","expired":false,"size_in_bytes":100}]}' "$census_id"
+   else echo '{"artifacts":[]}'; fi ;;
+ */actions/runs/10??)
+   census_id=${endpoint##*/}; sed "s/\"id\":42/\"id\":$census_id/" "$RUNNER_TEMP/run.json" ;;
  */actions/runs/42/artifacts*) cat "$RUNNER_TEMP/artifacts.json" ;;
  */actions/runs/43/artifacts*) if test -f "$RUNNER_TEMP/artifacts-43.json"; then cat "$RUNNER_TEMP/artifacts-43.json"; else echo '{"artifacts":[]}'; fi ;;
  */actions/runs/44/artifacts*) echo '{"artifacts":[{"id":9,"name":"dispatch-587-44-1","expired":false,"size_in_bytes":100}]}' ;;
@@ -2398,6 +2537,117 @@ esac
             assert!(
                 outputs.contains("artifacts_ready=false")
                     && !outputs.contains("artifacts_ready=true")
+            );
+        });
+    }
+    #[test]
+    fn branch_history_is_cached_but_live_tip_and_pr_state_are_rechecked() {
+        shared_fixture(|root| {
+            std::fs::write(root.join("prs.json"), "[]").unwrap();
+            let mut server = server(root);
+            server.dispatch.review = false;
+            for _ in 0..2 {
+                server.select_branch("work/dispatch-799-42").unwrap();
+            }
+            let endpoints = regular_text(&root.join("api-endpoints")).unwrap();
+            assert_eq!(
+                endpoints.lines().filter(|e| e.contains("/jobs?")).count(),
+                1,
+                "unchanged branch reauthenticated its origin"
+            );
+            assert_eq!(
+                endpoints
+                    .lines()
+                    .filter(|e| e.contains("/workflows/dispatch-worker.yml/runs?"))
+                    .count(),
+                2,
+                "unchanged branch repeated the history census"
+            );
+            std::fs::write(root.join("remote-tip"), "b".repeat(40)).unwrap();
+            assert!(
+                server.select_branch("work/dispatch-799-42").is_err(),
+                "cached authority admitted a moved tip"
+            );
+            std::fs::write(root.join("remote-tip"), "a".repeat(40)).unwrap();
+            let mut pr: Value =
+                serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+            pr["state"] = "closed".into();
+            std::fs::write(root.join("prs.json"), json!([pr]).to_string()).unwrap();
+            assert!(
+                server.select_branch("work/dispatch-799-42").is_err(),
+                "cached authority revived a closed PR branch"
+            );
+        });
+    }
+    #[test]
+    fn known_handoff_branch_survives_newer_unrelated_runs() {
+        shared_fixture(|root| {
+            std::fs::write(root.join("prs.json"), "[]").unwrap();
+            std::fs::write(root.join("comments.json"), "[[]]").unwrap();
+            let runs: Vec<_> = (1000..1040).map(|id| json!({"id":id,"event":"issues","head_branch":"main","created_at":"2026-10-24T00:00:00Z"})).collect();
+            std::fs::write(
+                root.join("workflow-runs.json"),
+                json!({"workflow_runs":runs}).to_string(),
+            )
+            .unwrap();
+            let mut server = server(root);
+            server.dispatch.review = false;
+            assert!(
+                server.select_branch("work/dispatch-799-42").is_ok(),
+                "newer unrelated census runs displaced known handoff origin"
+            );
+            let endpoints = regular_text(&root.join("api-endpoints")).unwrap();
+            assert!(
+                !endpoints
+                    .lines()
+                    .any(|e| e.contains("/10") && e.contains("/jobs?")),
+                "unrelated census run authenticated before issue filtering"
+            );
+        });
+    }
+    #[test]
+    fn state_history_api_volume_is_small_and_linear() {
+        shared_fixture(|root| {
+            let count = 8;
+            std::fs::write(root.join("census-this-issue"), "").unwrap();
+            let runs: Vec<_> = (1000..1000 + count).map(|id| json!({"id":id,"event":"issues","head_branch":"main","created_at":"2026-10-24T00:00:00Z"})).collect();
+            std::fs::write(
+                root.join("workflow-runs.json"),
+                json!({"workflow_runs":runs}).to_string(),
+            )
+            .unwrap();
+            let mut server = server(root);
+            server.read_state().unwrap();
+            server.read_state().unwrap();
+            let endpoints = regular_text(&root.join("api-endpoints")).unwrap();
+            for id in std::iter::once(42).chain(1000..1000 + count) {
+                for suffix in [
+                    format!("/actions/runs/{id}"),
+                    format!("/actions/runs/{id}/jobs?filter=latest&per_page=100"),
+                    format!("/actions/runs/{id}/artifacts?per_page=100"),
+                ] {
+                    assert_eq!(
+                        endpoints.lines().filter(|e| e.ends_with(&suffix)).count(),
+                        1,
+                        "run metadata was refetched: {suffix}"
+                    );
+                }
+                assert_eq!(
+                    endpoints
+                        .lines()
+                        .filter(|e| *e == format!("download/{id}"))
+                        .count(),
+                    1,
+                    "bundle downloaded more than once for run {id}"
+                );
+            }
+            let api_calls = endpoints
+                .lines()
+                .filter(|e| !e.starts_with("download/"))
+                .count();
+            assert!(
+                api_calls <= 26 + 3 * (count as usize + 1),
+                "nonlinear state API volume: {api_calls}"
             );
         });
     }
@@ -2710,8 +2960,19 @@ esac
             assert!(response.to_string().contains("prior result"));
             let issue: Value =
                 serde_json::from_str(&regular_text(&root.join("issue.json")).unwrap()).unwrap();
-            let runs = issue_artifact_runs(root, &issue, (1..1000).map(RunId).collect()).unwrap();
-            assert_eq!(runs.len(), 32);
+            let runs = issue_artifact_runs(
+                root,
+                &issue,
+                799,
+                &mut RunCache::default(),
+                (1..1000).map(RunId).collect(),
+            )
+            .unwrap();
+            assert_eq!(
+                runs.len(),
+                999,
+                "known run IDs were truncated by census bound"
+            );
             let calls = regular_text(&root.join("api-endpoints")).unwrap();
             for event in ["issues", "issue_comment"] {
                 assert!(calls.lines().any(|line| {
@@ -3031,13 +3292,14 @@ esac
     #[test]
     fn repeated_state_items_reuse_permission_and_run_lookups() {
         let mut cache = ProvenanceCache::default();
+        let mut runs = RunCache::default();
         let mut calls = Vec::new();
         for _ in 0..2 {
             for item in [
                 json!({"user":{"login":"writer","type":"User"},"body":"hello"}),
                 json!({"user":{"login":"github-actions[bot]","type":"Bot"},"body":"Dispatch run: https://github.com/carrick-sh/carrick/actions/runs/42"}),
             ] {
-                cache.classify(&item, 799, |endpoint| {
+                cache.classify(&item, 799, &mut runs, |endpoint| {
                     calls.push(endpoint.to_owned());
                     None
                 });
