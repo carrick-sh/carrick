@@ -93,6 +93,25 @@ impl ExecFiles {
     }
 
     pub fn acquire(&self, path: &str) -> Result<ExecSource, ExecSourceError> {
+        self.acquire_from(path, None)
+    }
+
+    /// The embedding loader supplies physical host-file access for bare-run
+    /// images. The retained filesystem decides whether fallback is permitted;
+    /// magic-link refusals never reach this service.
+    pub fn acquire_with_host_file_service(
+        &self,
+        path: &str,
+        open: &dyn Fn(&str) -> std::io::Result<std::fs::File>,
+    ) -> Result<ExecSource, ExecSourceError> {
+        self.acquire_from(path, Some(open))
+    }
+
+    fn acquire_from(
+        &self,
+        path: &str,
+        host_open: Option<&dyn Fn(&str) -> std::io::Result<std::fs::File>>,
+    ) -> Result<ExecSource, ExecSourceError> {
         use super::fs::proc_synthetic::{proc_self_fd_number, proc_self_magic_link};
         super::fs::check_path_length(path).map_err(ExecSourceError::Linux)?;
         let path = self.resolve_path(path);
@@ -135,6 +154,7 @@ impl ExecFiles {
             &normalized,
             directory_required,
             self.context.proc_caller,
+            host_open,
             |candidate| {
                 // Only the captured thread's directory may select its retained
                 // executable or descriptors; another thread is not this caller.
@@ -176,10 +196,6 @@ impl ExecFiles {
         source.exec_access_errno(self.context.fsuid, self.context.fsgid)
     }
 
-    pub fn read_interpreter(&self, path: &str) -> Option<Vec<u8>> {
-        self.acquire(path).ok()?.read_all().ok()
-    }
-
     pub fn notify_exec(&self, path: &str) {
         let Some(caller) = self.context.proc_caller else {
             return;
@@ -208,6 +224,7 @@ impl ExecFilesystem {
         path: &str,
         directory_required: bool,
         proc_caller: Option<super::fs::pathres::RetainedProcCaller>,
+        host_open: Option<&dyn Fn(&str) -> std::io::Result<std::fs::File>>,
         special: impl Fn(&str) -> Option<Result<ExecSource, ExecSourceError>>,
     ) -> Result<ExecSource, ExecSourceError> {
         // A retained magic source is authoritative even in bare-run mode.
@@ -256,7 +273,10 @@ impl ExecFilesystem {
                 if !self.host_fallback || path.starts_with("/proc/") {
                     return Err(error);
                 }
-                let file = std::fs::File::open(path).map_err(ExecSourceError::Host)?;
+                let Some(open) = host_open else {
+                    return Err(error);
+                };
+                let file = open(path).map_err(ExecSourceError::Host)?;
                 if directory_required && !file.metadata().map_err(ExecSourceError::Host)?.is_dir() {
                     return Err(ExecSourceError::Linux(carrick_abi::LINUX_ENOTDIR));
                 }
