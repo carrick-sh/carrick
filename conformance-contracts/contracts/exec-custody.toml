@@ -1,0 +1,18 @@
+schema_version = 1
+id = "process.exec.custody"
+title = "Exec settles predecessor siblings before releasing process admission"
+guest_surfaces = ["syscall:execve", "syscall:execveat", "kernel:thread-lifecycle"]
+semantic_authority = ["execve(2): failed preparation preserves the old image; after the point of no return the old image cannot resume"]
+fixture = "Shared exec guard with two independently retained reservations and exact sibling-disposition/release observations"
+scale_points = [1, 2]
+# The unit fixture asserts exactly one disposition per drain. It does not emit
+# a WorkObservation; do not manufacture an evaluator metric for these callbacks.
+structural_budgets = []
+rationale = "The production Kernel exec path consumes the shared no_std custody guard. Each admitted drain is consumed once; rollback resumes before admission release, while no-return terminates before release. This extraction preserves existing behavior and is a prerequisite for #785, not a ring exec implementation. The callback fixture proves resource ordering only, not two executing guest processes."
+
+[bindings]
+vm_free = "carrick-sched-core::process::exec::tests::{rollback_settles_siblings_before_releasing_admission,no_return_drop_terminates_and_never_resumes_siblings,independent_custody_survives_peer_rollback_and_settles_once,second_drain_is_returned_without_losing_either_custody}; existing carrick-kernel and carrick-kernel-example exec tests exercise the production adapter"
+
+[bindings.unresolved]
+embed_structural = "Ring file/mapping services, nonleader replacement, CLOEXEC authority binding, and exact old-MM completion rejection remain #785 work. No signed ring exec witness is claimed."
+docker = "No new Linux semantics in this guard extraction. The complete exec transaction still requires native arm64 errno and replacement differential witnesses."

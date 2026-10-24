@@ -25,7 +25,13 @@ struct ExecReservation {
     birth_admission: Option<super::thread_ledger::BirthAdmissionGuard>,
 }
 
-impl ExecReservation {
+impl carrick_sched_core::process::exec::ExecReservation for ExecReservation {
+    type Transaction = KernelTransactionId;
+
+    fn transaction(&self) -> Self::Transaction {
+        self.transaction
+    }
+
     fn commit(&mut self) {
         self.active = false;
         if let Some(admission) = &mut self.birth_admission {
@@ -51,52 +57,16 @@ impl Drop for ExecReservation {
     }
 }
 
-struct ExecOperationGuard {
-    reservation: Option<ExecReservation>,
-    drain: Option<ExecDrain>,
-    no_return: bool,
-}
+type ExecOperationGuard =
+    carrick_sched_core::process::exec::ExecOperationGuard<ExecReservation, ExecDrain>;
 
-impl ExecOperationGuard {
-    fn terminate_siblings(&mut self) {
-        if let Some(drain) = self.drain.take() {
-            drain.terminate_and_wait();
-        }
+impl carrick_sched_core::process::exec::ExecSiblingDrain for ExecDrain {
+    fn resume(self) {
+        self.resume_and_wait();
     }
 
-    fn commit_reservation(&mut self) {
-        if let Some(mut reservation) = self.reservation.take() {
-            reservation.commit();
-        }
-    }
-
-    fn enter_no_return(&mut self) {
-        self.no_return = true;
-    }
-
-    fn transaction(&self) -> Option<KernelTransactionId> {
-        self.reservation
-            .as_ref()
-            .map(|reservation| reservation.transaction)
-    }
-}
-
-impl Drop for ExecOperationGuard {
-    fn drop(&mut self) {
-        if self.no_return {
-            // MM authority has already moved forward. Resuming a parked
-            // predecessor sibling would run it against an authority graph
-            // that no longer belongs to the old image.
-            self.terminate_siblings();
-            drop(self.reservation.take());
-            return;
-        }
-        // Rollback order is load-bearing: runners resume and acknowledge that
-        // they left the park before another task mutator may acquire the ID.
-        if let Some(drain) = self.drain.take() {
-            drain.resume_and_wait();
-        }
-        drop(self.reservation.take());
+    fn terminate(self) {
+        self.terminate_and_wait();
     }
 }
 
@@ -403,14 +373,10 @@ impl Kernel {
             active: true,
             birth_admission: None,
         };
-        let mut guard = ExecOperationGuard {
-            reservation: Some(reservation),
-            drain: None,
-            no_return: false,
-        };
+        let mut guard = ExecOperationGuard::new(reservation);
         let admission = super::thread_ledger::BirthAdmissionGuard::acquire(context.task())
             .map_err(|_| ExecError::TaskBusy)?;
-        if let Some(reservation) = &mut guard.reservation {
+        if let Some(reservation) = guard.reservation_mut() {
             reservation.birth_admission = Some(admission);
         }
         // A claimant that won before close is now fully recorded. Settle it
@@ -429,7 +395,12 @@ impl Kernel {
         // distinct task may still share that table through CLONE_FILES, so the
         // table-wide freeze below supplies the cross-task exec linearization
         // point and remains held through registry publication.
-        guard.drain = Some(context.task.drain_exec_siblings(context.thread.key()));
+        if let Err(drain) =
+            guard.attach_drain(context.task.drain_exec_siblings(context.thread.key()))
+        {
+            drop(drain);
+            return Err(ExecError::TaskBusy);
+        }
         let custody =
             super::fd_exec::HostTableCustody::capture(self, context).map_err(|error| {
                 ExecError::Descriptors(super::fd_exec::prepare_errno(
@@ -505,7 +476,7 @@ impl Kernel {
         let predecessor_thread = prepared.caller;
         let predecessor_mm = prepared.old_mm.id();
         let task_key = prepared.task;
-        let Some(reservation) = prepared.guard.reservation.as_ref() else {
+        let Some(reservation) = prepared.guard.reservation() else {
             return Err(ExecError::ReservationLost);
         };
         if !Arc::ptr_eq(&reservation.kernel, self) {
