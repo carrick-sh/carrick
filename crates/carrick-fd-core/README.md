@@ -168,9 +168,10 @@ transaction. Existing fork/CLONE_FILES/exec/pin algorithms are reused, with
   Before committing, authorize append-only attributes, NOATIME credentials,
   DIRECT support and async notification in the backing personality. O_PATH
   allows duplication and descriptor flags but rejects setfl with BadFd.
-- Map BadFd to EBADF, InvalidArgument to EINVAL, TooManyFiles to EMFILE and
+- Map BadFd to EBADF, Busy to EBUSY (16), InvalidArgument to EINVAL, TooManyFiles to EMFILE and
   NoMemory to ENOMEM. StaleTable, StalePin and BadBacking are venue ownership
-  bugs, not guest errnos; Contended means "forward before effects".
+  bugs, not guest errnos; Contended returns custody before effects so the
+  venue can suspend the owned operation.
   Resource exhaustion differs from the per-table soft fd ceiling. Existing
   descriptors remain usable after lowering the soft limit, including dup2 onto
   self, fork and close-on-exec above the new limit. A storage request is not
@@ -218,3 +219,24 @@ pool after retirement. The two-venue Loom model checks overlapping allocation
 and release using the production lock/tree operations. `HostTable`'s repeated
 fork/grow/destroy witness verifies the same pool returns to zero allocations.
 These prove backing custody, not native process FD admission or syscall routing.
+
+## Prepared exec and numeric reservations
+
+`exec::prepare_close_on_exec(exact_task, table_custody)` returns the non-Clone
+`exec::PreparedCloseOnExec<Stage>`. The shared loop selects CLOEXEC entries;
+venue staging freezes/unshares, prepares metadata and retains release work.
+`exec::commit(prepared)` moves `(surviving custody, physical releases)` without
+allocation or another descriptor scan. Dropping preparation rolls back. The
+host graph adapter is `carrick_kernel::kernel::fd_exec`: its private lifecycle
+owner publishes the staged table before committing and dropping releases.
+The native adapter is pending shared numeric namespace integration.
+
+`reservation::SlotReservation` owns an exact table incarnation and numeric
+claim. `Authority::{reserve_min,reserve_exact}` exclude that number from all
+allocators and exact installs while leaving any previous descriptor readable.
+Close may remove that descriptor but cannot cancel another operation's claim.
+Fork copies entries, not claims; backing growth preserves both. Commit/cancel
+consume the receipt, and refusal returns it for the owned continuation. Like
+`OfdPin`, the raw core receipt requires explicit settlement; host
+`HostSlotReservation` provides cancellation on Drop, including table retirement.
+These primitives do not yet replace FileTable's host selectors or projection.

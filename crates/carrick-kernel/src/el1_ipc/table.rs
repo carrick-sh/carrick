@@ -9,6 +9,28 @@ use carrick_el1_abi::ipc::{IPC_MAX_OFDS, fd};
 enum PhysicalRelease {
     Description(fd::Description),
     RetiredTables,
+    Reservation(fd::reservation::SlotReservation),
+}
+
+impl AdmissionError {
+    /// Linux errors for numeric reservation admission/settlement. A busy
+    /// target is an ordinary dup/open race (EBUSY), never object-creation
+    /// corruption. Storage requests must be handled before reaching dispatch.
+    pub fn reservation_errno(self) -> carrick_abi::LinuxErrno {
+        use carrick_abi::{
+            LINUX_EBADF, LINUX_EBUSY, LINUX_EINVAL, LINUX_EMFILE, LINUX_ENFILE, LINUX_ENOMEM,
+        };
+        use carrick_el1_abi::ipc::IpcError;
+        match self {
+            Self::Shared(IpcError::Fd(fd::Error::Busy)) => LINUX_EBUSY,
+            Self::Shared(IpcError::Fd(fd::Error::BadFd)) => LINUX_EBADF,
+            Self::Shared(IpcError::Fd(fd::Error::InvalidArgument)) => LINUX_EINVAL,
+            Self::Shared(IpcError::Fd(fd::Error::TooManyFiles)) => LINUX_EMFILE,
+            Self::NoMemory | Self::Shared(IpcError::Fd(fd::Error::NoMemory)) => LINUX_ENOMEM,
+            Self::Shared(IpcError::ZoneLimit) => LINUX_ENFILE,
+            error => super::CreateError::from_admission(error).errno(),
+        }
+    }
 }
 
 impl HostIpc {
@@ -24,6 +46,68 @@ pub struct HostTable {
     capacity: usize,
 }
 
+/// An in-flight host operation owns one shared numeric claim. Dropping it
+/// cancels admission; table retirement also revokes its exact incarnation.
+#[must_use]
+#[derive(Debug)]
+pub struct HostSlotReservation {
+    owner: Arc<HostIpc>,
+    claim: Option<fd::reservation::SlotReservation>,
+}
+
+impl HostSlotReservation {
+    pub fn fd(&self) -> Option<fd::Fd> {
+        self.claim
+            .as_ref()
+            .map(fd::reservation::SlotReservation::fd)
+    }
+
+    /// Refusal preserves custody for retry or cancellation. Success retains
+    /// the source pin and transfers any displaced physical release outside the
+    /// table lock, using the same owner as ordinary close and table teardown.
+    pub fn commit(
+        &mut self,
+        description: &HostDescriptionFlags,
+        cloexec: bool,
+    ) -> Result<(), AdmissionError> {
+        if !Arc::ptr_eq(&self.owner, &description.owner) {
+            return Err(fd::Error::StalePin.into());
+        }
+        let retired = {
+            let state = description.state.lock();
+            let HostDescriptionState::Live(pin) = &*state else {
+                return Err(fd::Error::StalePin.into());
+            };
+            let claim = self.claim.take().ok_or(fd::Error::InvalidArgument)?;
+            match self
+                .owner
+                .region()
+                .fd(HostLockWait)
+                .commit_reservation(claim, pin, cloexec)
+            {
+                Ok(retired) => retired,
+                Err(refused) => {
+                    let error = refused.error();
+                    self.claim = Some(refused.into_reservation());
+                    return Err(error.into());
+                }
+            }
+        };
+        if let Some(retired) = retired {
+            HostTable::release(&self.owner, PhysicalRelease::Description(retired));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HostSlotReservation {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            HostTable::release(&self.owner, PhysicalRelease::Reservation(claim));
+        }
+    }
+}
+
 impl HostTable {
     pub fn create(
         owner: Arc<HostIpc>,
@@ -36,6 +120,39 @@ impl HostTable {
             id,
             capacity,
         })
+    }
+
+    /// Select through the shared bitmap, growing its storage before retrying.
+    pub fn reserve_min(&mut self, min: fd::Fd) -> Result<HostSlotReservation, AdmissionError> {
+        self.reserve(|authority, id| authority.reserve_min(id, min))
+    }
+
+    pub fn reserve_exact(&mut self, target: fd::Fd) -> Result<HostSlotReservation, AdmissionError> {
+        self.reserve(|authority, id| authority.reserve_exact(id, target))
+    }
+
+    fn reserve(
+        &mut self,
+        operation: impl Fn(
+            &carrick_el1_abi::ipc::IpcFdAuthority<'_, HostLockWait>,
+            fd::TableId,
+        ) -> Result<fd::reservation::SlotReservation, fd::Error>,
+    ) -> Result<HostSlotReservation, AdmissionError> {
+        loop {
+            let region = self.owner.region();
+            match operation(&region.fd(HostLockWait), self.id) {
+                Ok(claim) => {
+                    return Ok(HostSlotReservation {
+                        owner: Arc::clone(&self.owner),
+                        claim: Some(claim),
+                    });
+                }
+                Err(fd::Error::NeedsBacking { descriptors }) => {
+                    self.ensure_capacity(descriptors.next_power_of_two())?
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     pub fn id(&self) -> fd::TableId {
@@ -134,6 +251,13 @@ impl HostTable {
                 .map(|_| ())
                 .map_err(AdmissionError::from),
             PhysicalRelease::RetiredTables => owner.drain_retired_tables().map(|_| ()),
+            PhysicalRelease::Reservation(claim) => {
+                match owner.region().fd(HostLockWait).cancel_reservation(claim) {
+                    Ok(()) => Ok(()),
+                    Err(refused) if refused.error() == fd::Error::StaleTable => Ok(()),
+                    Err(refused) => Err(refused.error().into()),
+                }
+            }
         };
         result.unwrap_or_else(|_| {
             carrick_fatal::carrick_fatal!("ipc::table", "invalid retired descriptor resource")
@@ -163,6 +287,48 @@ impl Drop for HostTable {
 mod tests {
     use super::*;
     use carrick_el1_abi::ipc::{IpcBacking, pipe::EventMode};
+
+    #[test]
+    fn serial_host_el1_ipc_reservations_cancel_commit_and_retire_once() {
+        let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+        let mut parent = HostTable::create(owner.clone(), 64, 4).unwrap();
+        let mut peer = parent.fork().unwrap();
+        let claim = parent.reserve_min(fd::Fd(0)).unwrap();
+        assert_eq!(claim.fd(), Some(fd::Fd(0)));
+        let busy = parent.reserve_exact(fd::Fd(0)).unwrap_err();
+        assert_eq!(busy.reservation_errno().get(), 16);
+        let second = parent.reserve_min(fd::Fd(0)).unwrap();
+        assert_eq!(second.fd(), Some(fd::Fd(1)));
+        let peer_claim = peer.reserve_min(fd::Fd(0)).unwrap();
+        assert_eq!(peer_claim.fd(), Some(fd::Fd(0)));
+        drop(claim);
+        let mut replacement = parent.reserve_min(fd::Fd(0)).unwrap();
+        assert_eq!(replacement.fd(), Some(fd::Fd(0)));
+        // Growth preserves the other pending claim; dropped reservations free
+        // their exact slot even after backing has moved.
+        drop(parent.reserve_exact(fd::Fd(32)).unwrap());
+        drop(second);
+        assert_eq!(parent.reserve_min(fd::Fd(1)).unwrap().fd(), Some(fd::Fd(1)));
+        let token = owner.retain_host_resource(Box::new(42_u32)).unwrap();
+        let description = owner
+            .admit_description(fd::Description::new(
+                IpcBacking::Host(token).encode(),
+                fd::AccessMode::ReadWrite,
+                fd::StatusFlags::default(),
+            ))
+            .unwrap();
+        let flags = description.flags();
+        replacement.commit(&flags, true).unwrap();
+        assert_eq!(replacement.fd(), None);
+        assert!(replacement.commit(&flags, false).is_err(), "consumed once");
+        drop((description, flags, replacement));
+        assert_eq!(owner.retained_host_resources(), 1);
+        drop(parent);
+        assert_eq!(owner.retained_host_resources(), 0);
+        drop(peer);
+        drop(peer_claim); // retirement already revoked this exact table
+        assert_eq!(owner.retained_host_resources(), 0);
+    }
 
     #[test]
     fn serial_host_el1_ipc_owned_table_releases_resources_after_unlocking() {

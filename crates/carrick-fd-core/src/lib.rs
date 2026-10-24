@@ -18,6 +18,7 @@ use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 pub mod exec;
 pub mod handle;
+pub mod reservation;
 pub mod storage;
 
 #[cfg(test)]
@@ -66,6 +67,8 @@ pub struct StatusFlags {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     BadFd,
+    /// An exact replacement target is owned by another in-flight operation.
+    Busy,
     InvalidArgument,
     TooManyFiles,
     /// Authority storage exhausted (not the process's RLIMIT_NOFILE).
@@ -207,6 +210,7 @@ struct Entry {
     cloexec: bool,
 }
 const SLOT_CLOEXEC: u64 = 1 << 63;
+const SLOT_RESERVED: u64 = 1 << 62;
 const SLOT_INDEX: u64 = u32::MAX as u64;
 const fn encode_entry(entry: Option<Entry>) -> u64 {
     match entry {
@@ -263,8 +267,9 @@ impl<B: SlotBacking, W: LockWait, const T: usize> Drop for RetiredTable<'_, '_, 
 }
 
 /// One descriptor slot in venue-provided (possibly shared) memory:
-/// 0 = empty, otherwise OFD index + 1 with bit 63 = FD_CLOEXEC. Accessed only
-/// under the owning table's lock.
+/// Low 32 bits = OFD index + 1 (zero means no descriptor); bit 63 is
+/// FD_CLOEXEC and bit 62 is a pending numeric claim. A claim may coexist with
+/// a readable descriptor. Accessed only under the owning table's lock.
 #[repr(transparent)]
 #[derive(Debug, Default)]
 pub struct DescriptorSlot(pub(crate) AtomicU64);
@@ -388,10 +393,28 @@ impl<'a> TableStorage<'a> {
             .and_then(|slot| decode_entry(slot.0.load(Ordering::Relaxed)))
     }
     fn set(&self, fd: usize, entry: Option<Entry>) {
+        let reserved = self.entries[fd].0.load(Ordering::Relaxed) & SLOT_RESERVED;
         self.entries[fd]
             .0
-            .store(encode_entry(entry), Ordering::Relaxed);
-        self.mark_free(fd, entry.is_none());
+            .store(encode_entry(entry) | reserved, Ordering::Relaxed);
+        self.mark_free(fd, entry.is_none() && reserved == 0);
+    }
+    fn reserved(&self, fd: usize) -> bool {
+        self.entries
+            .get(fd)
+            .is_some_and(|slot| slot.0.load(Ordering::Relaxed) & SLOT_RESERVED != 0)
+    }
+    fn reserve(&self, fd: usize) {
+        self.entries[fd]
+            .0
+            .fetch_or(SLOT_RESERVED, Ordering::Relaxed);
+        self.mark_free(fd, false);
+    }
+    fn unreserve(&self, fd: usize) {
+        let word = self.entries[fd]
+            .0
+            .fetch_and(!SLOT_RESERVED, Ordering::Relaxed);
+        self.mark_free(fd, word & SLOT_INDEX == 0);
     }
     pub(crate) fn clear(&self) {
         for slot in self.entries {
@@ -404,7 +427,7 @@ impl<'a> TableStorage<'a> {
             word.store(0, Ordering::Relaxed);
         }
         for (fd, slot) in self.entries.iter().enumerate() {
-            if slot.0.load(Ordering::Relaxed) & SLOT_INDEX == 0 {
+            if slot.0.load(Ordering::Relaxed) & (SLOT_INDEX | SLOT_RESERVED) == 0 {
                 self.bitmap[fd / 64].fetch_or(1 << (fd % 64), Ordering::Relaxed);
             }
         }
@@ -693,7 +716,7 @@ const fn str_eq(a: &str, b: &str) -> bool {
 }
 
 /// Named layout facts a shared-memory venue folds into its ABI layout hash.
-pub const NAMED_LAYOUT_FACTS: [(&str, u64); 58] = [
+pub const NAMED_LAYOUT_FACTS: [(&str, u64); 59] = [
     ("TABLE_RETIRED", TABLE_RETIRED as u64),
     (
         "Core.retired_tables",
@@ -726,6 +749,7 @@ pub const NAMED_LAYOUT_FACTS: [(&str, u64); 58] = [
         core::mem::offset_of!(OfdRecord, mode) as u64,
     ),
     ("SLOT_CLOEXEC", SLOT_CLOEXEC),
+    ("SLOT_RESERVED", SLOT_RESERVED),
     ("MODE_MUTABLE", MODE_MUTABLE),
     (
         "Core.ofd_count",
@@ -1685,6 +1709,9 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
                 descriptors: new.0 as usize + 1,
             });
         }
+        if t.storage.reserved(new.0 as usize) {
+            return Err(Error::Busy);
+        }
         // Retain first, so replacing an alias cannot temporarily finalize it.
         self.retain(ofd, REF)?;
         let released = match self.close_locked(t, new) {
@@ -2098,6 +2125,9 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             return Err(Error::NeedsBacking {
                 descriptors: target.0 as usize + 1,
             });
+        }
+        if t.storage.reserved(target.0 as usize) {
+            return Err(Error::Busy);
         }
         if t.storage.get(target.0 as usize).is_some() {
             return Err(Error::TooManyFiles);

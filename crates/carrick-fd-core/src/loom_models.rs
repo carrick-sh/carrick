@@ -650,3 +650,99 @@ fn two_retiring_tables_transfer_final_release_once() {
         assert_eq!(backing.ofd.holds.load(Ordering::Acquire), 0);
     });
 }
+
+#[test]
+fn reserved_target_close_and_settlement_preserve_owned_claim() {
+    struct Tables {
+        slots: [DescriptorSlot; 2],
+        bitmap: [AtomicU64; 2],
+        ofd: OfdRecord,
+    }
+    impl SlotBacking for Tables {
+        fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
+            let index = usize::try_from(extent.token).ok()?;
+            Some((
+                self.slots.get(index..index + 1)?,
+                self.bitmap.get(index..index + 1)?,
+            ))
+        }
+        fn ofd(&self, index: usize) -> Option<&OfdRecord> {
+            (index == 0).then_some(&self.ofd)
+        }
+    }
+    model(|| {
+        let core = Arc::new(Core::<2>::new().unwrap());
+        let backing = Arc::new(Tables {
+            slots: core::array::from_fn(|_| DescriptorSlot::default()),
+            bitmap: core::array::from_fn(|_| AtomicU64::new(0)),
+            ofd: OfdRecord::default(),
+        });
+        let view = core.bind(&*backing, NoWait);
+        view.publish_ofds(1).unwrap();
+        let table = view
+            .create_table(
+                1,
+                &mut Extent {
+                    token: 0,
+                    capacity: 1,
+                },
+            )
+            .unwrap();
+        view.open(
+            table,
+            Fd(0),
+            Description::new(
+                BackingToken(7),
+                AccessMode::ReadWrite,
+                StatusFlags::default(),
+            ),
+            false,
+        )
+        .unwrap();
+        let peer = view
+            .fork(
+                table,
+                &mut Extent {
+                    token: 1,
+                    capacity: 1,
+                },
+            )
+            .unwrap();
+        let claim = view.reserve_exact(table, Fd(0)).unwrap();
+        let (pin, _) = view.pin(peer, Fd(0)).unwrap();
+        let closing_core = core.clone();
+        let closing_backing = backing.clone();
+        let close = thread::spawn(move || {
+            closing_core
+                .bind(&*closing_backing, NoWait)
+                .close(table, Fd(0))
+        });
+        let settling_core = core.clone();
+        let settling_backing = backing.clone();
+        let settle = thread::spawn(move || {
+            let view = settling_core.bind(&*settling_backing, NoWait);
+            let result = view.commit_reservation(claim, &pin, true);
+            (result, pin)
+        });
+        assert!(matches!(
+            close.join().unwrap(),
+            Ok(None) | Err(Error::Contended)
+        ));
+        let (settled, pin) = settle.join().unwrap();
+        if let Err(refused) = settled {
+            assert_eq!(refused.error(), Error::Contended);
+            view.cancel_reservation(refused.into_reservation()).unwrap();
+        }
+        assert_eq!(
+            view.unpin(pin),
+            Ok(None),
+            "live peer retains the description"
+        );
+        let mut releases = 0;
+        for table in [table, peer] {
+            view.destroy_table(table, |_| releases += 1).unwrap();
+        }
+        assert_eq!(releases, 1);
+        assert_eq!(backing.ofd.holds.load(Ordering::Acquire), 0);
+    });
+}
