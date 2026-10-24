@@ -1066,22 +1066,33 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     ) -> Result<(), carrick_core::mm::transaction::MmError> {
         use carrick_core::mm::transaction::MmError;
         let owner = self.portal().map_err(|_| MmError::Stale)?;
-        let window = slot.window().ok_or(MmError::Stale)?;
-        let target = carrick_core::mm::frames::grant_target(&owner, window, self.worker())?;
+        // `Supplied` authenticates the host's retained reply, not continued
+        // ownership of the faulting instruction. Replacement can make any
+        // pre-claim identity below stale. Retry the unchanged fault so the
+        // current mapping, rather than this old reply, decides its validity.
+        let Some(window) = slot.window() else {
+            return Ok(());
+        };
+        let target = match carrick_core::mm::frames::grant_target(&owner, window, self.worker()) {
+            Ok(target) => target,
+            Err(MmError::Stale) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let root = target.grant().ttbr0;
         let live = if let Some(words) = self.words {
             PreparedWords::Borrowed(words)
         } else {
             #[cfg(all(target_os = "none", target_arch = "aarch64"))]
             {
-                PreparedWords::Owned(Box::new(
-                    super::mm_portal::production::current_mm_words(
-                        carrick_el1::isa::aarch64::hardware_live_ttbr(),
-                        root,
-                        &CURRENT_MM_MAINTENANCE,
-                    )
-                    .map_err(|_| MmError::Stale)?,
-                ))
+                let words = match super::mm_portal::production::current_mm_words(
+                    carrick_el1::isa::aarch64::hardware_live_ttbr(),
+                    root,
+                    &CURRENT_MM_MAINTENANCE,
+                ) {
+                    Ok(words) => words,
+                    Err(_) => return Ok(()),
+                };
+                PreparedWords::Owned(Box::new(words))
             }
             #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
             {
@@ -1100,7 +1111,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 return Err(MmError::Core);
             }
         };
-        let receipt = carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
+        let Some(receipt) = carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
             slot,
             &*live,
             residency,
@@ -1111,8 +1122,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
                 let _ = root;
             },
-        )
-        .ok_or(MmError::Stale)?;
+        ) else {
+            return Ok(());
+        };
         if matches!(
             receipt.outcome,
             carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
