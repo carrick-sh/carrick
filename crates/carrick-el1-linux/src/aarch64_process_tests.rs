@@ -7083,9 +7083,23 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
 }
 
 #[test]
-fn native_fork_two_children_inherit_the_complete_ipc_namespace() {
+fn serial_host_native_fork_two_children_inherit_the_complete_ipc_namespace() {
+    native_child_resources(None);
+}
+
+#[test]
+fn serial_host_native_fork_restored_view_mapping_outlives_children() {
+    native_child_resources(Some(true));
+}
+
+#[test]
+fn serial_host_native_fork_children_outlive_restored_view_mapping() {
+    native_child_resources(Some(false));
+}
+
+fn native_child_resources(mapping_last: Option<bool>) {
     use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
-    use carrick_kernel::el1_ipc::{HostIpc, HostTable};
+    use carrick_kernel::el1_ipc::{HostIpc, HostTable, IpcLimits};
     use carrick_sched_core::ShortLockSpin;
     use std::sync::Arc;
 
@@ -7106,7 +7120,16 @@ fn native_fork_two_children_inherit_the_complete_ipc_namespace() {
         parked,
     )
     .unwrap();
-    let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+    let owner = Arc::new(
+        HostIpc::with_limits(
+            1 << 20,
+            IpcLimits {
+                descriptions: carrick_el1_abi::ipc::IPC_OFD_SEGMENT,
+                ..IpcLimits::ZONE
+            },
+        )
+        .unwrap(),
+    );
     let table = HostTable::create(Arc::clone(&owner), 64, 64).unwrap();
     let object = owner.create_pipe(65536).unwrap();
     let reader = owner
@@ -7133,6 +7156,11 @@ fn native_fork_two_children_inherit_the_complete_ipc_namespace() {
         .unwrap();
     reader.install(table.id(), fd::Fd(3), false).unwrap();
     writer.install(table.id(), fd::Fd(4), true).unwrap();
+    let mut host_file = carrick_kernel::dispatch::NativeFileWitness::new(&table, 5).unwrap();
+    let mut mapping = mapping_last.map(|_| host_file.mapping().unwrap());
+    if mapping_last.is_some() {
+        host_file.restore_parent_view().unwrap();
+    }
     // Aligned, zero-initialized ABI storage; no process-global fixture pointer.
     let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
     let map = unsafe {
@@ -7176,6 +7204,33 @@ fn native_fork_two_children_inherit_the_complete_ipc_namespace() {
     assert_ne!(children[0], children[1]);
     let ipc = owner.region();
     let authority = ipc.fd(ShortLockSpin);
+    // Both native children remain live while a new host capsule's OFD
+    // admission refuses. Rollback must neither close their file nor leak a
+    // resource token. These pressure pins have no physical backing.
+    let mut pressure = Vec::new();
+    for _ in 0..ipc.ofd_count() {
+        match authority.create_pinned(fd::Description::new(
+            fd::BackingToken(0),
+            fd::AccessMode::ReadWrite,
+            fd::StatusFlags::default(),
+        )) {
+            Ok(pin) => pressure.push(pin),
+            Err(fd::Error::NeedsOfds) => break,
+            other => panic!("unexpected pressure admission: {other:?}"),
+        }
+    }
+    assert_eq!(
+        carrick_kernel::dispatch::NativeFileWitness::new(&table, 6)
+            .err()
+            .unwrap()
+            .raw_os_error(),
+        Some(23),
+        "shared OFD exhaustion is ENFILE, errno 23"
+    );
+    assert_eq!(owner.retained_host_resources(), 1);
+    for pin in pressure {
+        assert!(authority.unpin(pin).unwrap().is_some());
+    }
     let child_tables = children.map(|child| {
         fd::TableId::from_raw(
             map.lookup(child)
@@ -7239,7 +7294,24 @@ fn native_fork_two_children_inherit_the_complete_ipc_namespace() {
     }
     drop(writer);
     table.close(fd::Fd(4)).unwrap();
+    table.close(fd::Fd(5)).unwrap();
+    host_file.close_parent();
+    assert_eq!(owner.retained_host_resources(), 1);
+    let mut bytes = [0; 5];
+    assert_eq!(
+        host_file.read(&mut bytes).map_err(|e| e.raw_os_error()),
+        Ok(5),
+        "both native children retain the real host file; EBADF is errno 9"
+    );
+    assert_eq!(&bytes, b"child");
+    if mapping_last == Some(false) {
+        drop(mapping.take());
+        assert_eq!(host_file.read(&mut bytes).unwrap(), 5);
+    }
     service.retire_fd_table(children[0]);
+    assert_eq!(owner.drain_retired_tables().unwrap(), 1);
+    assert_eq!(host_file.read(&mut bytes).unwrap(), 5);
+    assert_eq!(owner.retained_host_resources(), 1);
     assert!(
         map.lookup(children[0]).is_none(),
         "retired native namespace remains published"
@@ -7278,7 +7350,16 @@ fn native_fork_two_children_inherit_the_complete_ipc_namespace() {
         ipc.lock(object, &ShortLockSpin).is_err(),
         "final pipe release leaked the object"
     );
-    assert_eq!(owner.drain_retired_tables().unwrap(), 2);
+    assert_eq!(owner.drain_retired_tables().unwrap(), 1);
+    assert_eq!(owner.retained_host_resources(), 0);
+    if mapping_last == Some(true) {
+        assert_eq!(host_file.read(&mut bytes).unwrap(), 5);
+        drop(mapping.take());
+    }
+    assert_eq!(
+        host_file.read(&mut bytes).unwrap_err().raw_os_error(),
+        Some(9)
+    );
     assert_eq!(
         ipc.descriptor_allocations(),
         1,

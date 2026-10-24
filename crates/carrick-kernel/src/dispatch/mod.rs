@@ -662,6 +662,8 @@ pub(crate) use epoll_shim::{
     register_epoll_kqueue, unregister_epoll_kqueue,
 };
 pub(crate) mod fd_table;
+#[cfg(feature = "test-support")]
+pub use fd_table::NativeFileWitness;
 pub(crate) mod fifo_beacon;
 pub(crate) mod ioring;
 #[macro_use]
