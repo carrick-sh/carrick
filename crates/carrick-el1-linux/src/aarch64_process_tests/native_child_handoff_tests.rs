@@ -658,6 +658,11 @@ fn deferred_native_service_retries_original_instruction_after_carrier_work() {
 }
 
 #[test]
+fn native_child_exec_refusal_parks_once_and_resumes_with_enosys() {
+    two_native_children_service_waits(ServiceWitness::ExecRefusal);
+}
+
+#[test]
 fn interrupted_native_service_preserves_instruction_and_registers() {
     two_native_children_service_waits(ServiceWitness::Interrupt);
 }
@@ -762,6 +767,7 @@ enum ServiceWitness {
     Fault,
     Completed,
     Retry,
+    ExecRefusal,
     Interrupt,
     Exception {
         esr: u64,
@@ -854,6 +860,20 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
                 frame.x[0] = 0xbeef;
                 carrick_el1_abi::Action::ServedWithWork
             }
+            ServiceWitness::ExecRefusal => {
+                frame.x[8] = 221;
+                frame.x[0] = 0x6000_0010;
+                let action = super::super::dispatch::resolve_arm_process_route(
+                    carrick_personality_linux::dispatch::CompletionRoute::Forward,
+                    page,
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                );
+                assert_eq!(action, carrick_el1_abi::Action::ServedWithWork);
+                assert_eq!(frame.x[0] as i64, -38);
+                action
+            }
             ServiceWitness::Interrupt => {
                 frame.esr = 0;
                 fixture.task.linux.mark_pending_host_work();
@@ -879,6 +899,12 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             action,
         )
         .unwrap();
+        if matches!(witness, ServiceWitness::ExecRefusal) {
+            assert!(matches!(
+                operation,
+                carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
+            ));
+        }
         saved.native.x[0] = frame.x[0];
         saved.native.pc = frame.elr;
         let grant = fixture
@@ -1211,6 +1237,7 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
         let retained = unsafe { &fixture.zone.record(child).ctx_mut().native };
         let expected = match witness {
             ServiceWitness::Retry => (42, 0x4000),
+            ServiceWitness::ExecRefusal => ((-38_i64) as u64, 0x4004),
             _ => (73, 0x4004),
         };
         assert_eq!((retained.x[0], retained.pc), expected);
