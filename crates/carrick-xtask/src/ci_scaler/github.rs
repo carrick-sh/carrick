@@ -378,6 +378,115 @@ impl Github {
         )
     }
 
+    /// issue_comment runs use main, so their REST run has no issue/PR mapping.
+    /// Successful trusted-main guard steps expose only the webhook IDs and
+    /// observed head. Fetch the authoritative objects before admitting demand.
+    fn admits_comment(
+        run: &Value,
+        request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+    ) -> Result<bool, ScalerError> {
+        let id = run["id"]
+            .as_u64()
+            .ok_or(ScalerError::Guard("missing run id"))?;
+        let attempt = run["run_attempt"]
+            .as_u64()
+            .ok_or(ScalerError::Guard("missing run attempt"))?;
+        let data = request(
+            "GET",
+            &format!("repos/{REPOSITORY}/actions/runs/{id}/attempts/{attempt}/jobs?per_page=100"),
+            None,
+            true,
+        )?;
+        let jobs = pages(&data, "jobs")?;
+        if !guard_ready(&Admission::Agent, &jobs) {
+            return Ok(false);
+        }
+        let guard = jobs
+            .iter()
+            .find(|j| j["name"] == "guard")
+            .ok_or(ScalerError::Guard("missing guard"))?;
+        let steps: Vec<_> = guard["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|s| s["conclusion"] == "success")
+            .collect();
+        let markers: Vec<_> = steps
+            .iter()
+            .filter_map(|s| s["name"].as_str()?.strip_prefix("Dispatch comment "))
+            .collect();
+        if markers.len() != 1 {
+            return Ok(false);
+        }
+        let numbers: Vec<_> = markers[0]
+            .split_whitespace()
+            .map(str::parse::<u64>)
+            .collect::<Result<_, _>>()
+            .map_err(|_| ScalerError::Guard("invalid comment marker"))?;
+        let [number, comment_id] = numbers.as_slice() else {
+            return Ok(false);
+        };
+        let comment = request(
+            "GET",
+            &format!("repos/{REPOSITORY}/issues/comments/{comment_id}"),
+            None,
+            false,
+        )?;
+        if comment["id"].as_u64() != Some(*comment_id)
+            || comment["issue_url"]
+                != format!("https://api.github.com/repos/{REPOSITORY}/issues/{number}")
+            || !crate::dispatch_worker::agent_comment(&comment)
+        {
+            return Ok(false);
+        }
+        let mut issue = request(
+            "GET",
+            &format!("repos/{REPOSITORY}/issues/{number}"),
+            None,
+            false,
+        )?;
+        if issue.get("pull_request").is_some() {
+            let pr = request(
+                "GET",
+                &format!("repos/{REPOSITORY}/pulls/{number}"),
+                None,
+                false,
+            )?;
+            let branch = pr["head"]["ref"].as_str().unwrap_or_default();
+            let Some(issue_number) = crate::dispatch_worker::dispatch_branch(branch) else {
+                return Ok(false);
+            };
+            let original_id = crate::dispatch_worker::branch_run(issue_number, branch)?;
+            let original = request(
+                "GET",
+                &format!("repos/{REPOSITORY}/actions/runs/{original_id}"),
+                None,
+                false,
+            )?;
+            let heads: Vec<_> = steps
+                .iter()
+                .filter_map(|s| s["name"].as_str()?.strip_prefix("Dispatch head "))
+                .collect();
+            if heads.len() != 1
+                || !full_sha(heads[0])
+                || pr["head"]["sha"] != heads[0]
+                || pr["state"] != "open"
+                || !crate::dispatch_worker::owned_pr(&pr, &original, issue_number, branch)
+            {
+                return Ok(false);
+            }
+            issue = request(
+                "GET",
+                &format!("repos/{REPOSITORY}/issues/{issue_number}"),
+                None,
+                false,
+            )?;
+        }
+        Ok(issue["user"]["login"] == "tjfontaine"
+            && issue["user"]["type"] == "User"
+            && issue["state"] == "open")
+    }
+
     /// Both queued demand and the final pre-clone/reassignment vet use this
     /// API-backed admission. A successful PR-supplied guard is insufficient.
     fn admits_run(
@@ -388,6 +497,9 @@ impl Github {
         let checked = (|| -> Result<bool, ScalerError> {
             if !admission.identifies_run(run) {
                 return Ok(false);
+            }
+            if matches!(admission, Admission::Agent) && run["event"] == "issue_comment" {
+                return Self::admits_comment(run, request);
             }
             if !matches!(admission, Admission::Agent) || run["event"] != "pull_request_review" {
                 return Ok(true);
@@ -661,6 +773,64 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    #[test]
+    fn agent_comment_controller_rechecks_owner_unedited_comment_and_owned_pr() {
+        let mut run = review_run(99);
+        run["event"] = "issue_comment".into();
+        run["head_branch"] = "main".into();
+        let mut original = review_run(42);
+        original["event"] = "issues".into();
+        original["head_branch"] = "main".into();
+        for (case, allowed) in [
+            ("issue", true),
+            ("pr", true),
+            ("outsider", false),
+            ("edited", false),
+            ("wrong_command", false),
+            ("unowned", false),
+            ("stale", false),
+            ("other_issue_author", false),
+            ("no_guard", false),
+            ("wrong_issue", false),
+        ] {
+            let mut comment = json!({"id":123,"issue_url":format!("https://api.github.com/repos/{REPOSITORY}/issues/800"),"user":{"login":"tjfontaine","type":"User"},"created_at":"2026-10-24T00:00:00Z","updated_at":"2026-10-24T00:00:00Z","body":"/agent resolve the conflict"});
+            if case == "outsider" {
+                comment["user"]["login"] = "outsider".into();
+            }
+            if case == "edited" {
+                comment["updated_at"] = "2026-10-24T00:01:00Z".into();
+            }
+            if case == "wrong_command" {
+                comment["body"] = "/agentish".into();
+            }
+            if case == "wrong_issue" {
+                comment["issue_url"] =
+                    "https://api.github.com/repos/outsider/repo/issues/800".into();
+            }
+            let pr_case = ["pr", "unowned", "stale"].contains(&case);
+            let issue = json!({"state":"open","number":799,"user":{"login":if case == "other_issue_author" { "outsider" } else { "tjfontaine" },"type":"User"}});
+            let mut pr = json!({"state":"open","number":800,"user":{"login":"github-actions[bot]","type":"Bot"},"head":{"ref":"work/dispatch-799-42","sha":"a".repeat(40),"repo":{"full_name":REPOSITORY}},"base":{"ref":"main"},"draft":true,"body":format!("Closes #799\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
+            if case == "unowned" {
+                pr["user"]["login"] = "outsider".into();
+            }
+            if case == "stale" {
+                pr["head"]["sha"] = "b".repeat(40).into();
+            }
+            let mut calls = Vec::new();
+            let admitted = Github::admits_run(&Admission::Agent, &run, &mut |_, endpoint, _, _| {
+                calls.push(endpoint.to_owned());
+                Ok(if endpoint.contains("/jobs?") {
+                    json!([{"jobs":[{"name":"guard","status":"completed","conclusion":if case=="no_guard" {"failure"} else {"success"},"steps":[{"name":"Dispatch comment 800 123","conclusion":"success"},{"name":format!("Dispatch head {}","a".repeat(40)),"conclusion":"success"}]}]}])
+                } else if endpoint.ends_with("/issues/comments/123") { comment.clone() }
+                else if endpoint.ends_with("/issues/800") { if pr_case { json!({"pull_request":{}}) } else { issue.clone() } }
+                else if endpoint.ends_with("/pulls/800") { pr.clone() }
+                else if endpoint.ends_with("/actions/runs/42") { original.clone() }
+                else if endpoint.ends_with("/issues/799") { issue.clone() }
+                else { panic!("unexpected endpoint {endpoint}") })
+            }).unwrap();
+            assert_eq!(admitted, allowed, "controller case {case}; {calls:?}");
+        }
+    }
     #[test]
     fn dispatch_review_refusals_log_once_per_active_attempt() {
         let mut notices = AdmissionNotices::default();
