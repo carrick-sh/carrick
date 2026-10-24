@@ -1975,6 +1975,7 @@ impl Drop for ExactSlotReservation {
 pub struct EpollDetachReservation<'a> {
     table: &'a FileTable,
     fd: i32,
+    reservation_id: u64,
     active: bool,
 }
 
@@ -1982,6 +1983,8 @@ impl EpollDetachReservation<'_> {
     pub fn release(mut self) {
         if self.active {
             self.table.lock_reserved_slots().remove(&self.fd);
+            self.table
+                .cancel_ipc_reservation(self.fd, self.reservation_id);
             self.active = false;
         }
     }
@@ -1991,6 +1994,8 @@ impl Drop for EpollDetachReservation<'_> {
     fn drop(&mut self) {
         if self.active {
             self.table.lock_reserved_slots().remove(&self.fd);
+            self.table
+                .cancel_ipc_reservation(self.fd, self.reservation_id);
             self.active = false;
         }
     }
@@ -2488,7 +2493,11 @@ impl FileTable {
     }
 
     fn copy_private(id: FileTableId, parent: &Self, purpose: TableCopyPurpose) -> Self {
-        let open_files = parent.open_files.read().clone();
+        let mut open_files = parent.open_files.read().clone();
+        let _ = *parent.next_fd.lock();
+        let mut stdio_cloexec = *parent.stdio_cloexec.lock();
+        let mut closed_stdio = *parent.closed_stdio.lock();
+        parent.reconcile_copy_from_ipc(&mut open_files, &mut stdio_cloexec, &mut closed_stdio);
         for slot in open_files.values() {
             if matches!(purpose, TableCopyPurpose::Fork) {
                 crate::el1_delegation::recall_if_delegated(&slot.description);
@@ -2503,9 +2512,6 @@ impl FileTable {
             };
             child_next_fd = next;
         }
-        let _ = *parent.next_fd.lock();
-        let stdio_cloexec = *parent.stdio_cloexec.lock();
-        let closed_stdio = *parent.closed_stdio.lock();
         let fd_open_paths = {
             let guard = parent.fd_open_paths.read();
             if guard.is_empty() {
@@ -2634,6 +2640,7 @@ impl FileTable {
             return Err(crate::linux_abi::LINUX_EBUSY);
         }
         let reservation_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
+        self.reserve_ipc_exact(fd, reservation_id)?;
         reserved.insert(fd, reservation_id);
         drop(reserved);
 
@@ -2654,9 +2661,26 @@ impl FileTable {
             .functional_gate
             .acquire_mutation()
             .ok_or(crate::linux_abi::LINUX_EBADF)?;
-        let open_files = self.read_open_files();
         let mut next_fd = self.lock_next_fd();
         let mut reserved = self.lock_reserved_slots();
+        let reservation_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(selected) = self.reserve_ipc_min(min_fd, limit, reservation_id) {
+            let fd = selected?;
+            reserved.insert(fd, reservation_id);
+            if fd >= 3 && fd == *next_fd {
+                *next_fd = fd.saturating_add(1);
+            }
+            drop(reserved);
+            drop(next_fd);
+            return Ok(FileSlotReservation {
+                table: Arc::clone(self),
+                fd,
+                reservation_id,
+                committed: false,
+            });
+        }
+
+        let open_files = self.read_open_files();
         let closed_stdio = self.lock_closed_stdio();
 
         let mut fd = None;
@@ -2709,7 +2733,6 @@ impl FileTable {
             return Err(crate::linux_abi::LINUX_EMFILE);
         }
 
-        let reservation_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
         reserved.insert(fd, reservation_id);
 
         if fd >= 3 && fd == *next_fd {
@@ -2754,6 +2777,7 @@ impl FileTable {
                 let mut reserved = self.lock_reserved_slots();
                 if reserved.get(&fd).copied() == Some(reservation_id) {
                     reserved.remove(&fd);
+                    self.cancel_ipc_reservation(fd, reservation_id);
                     if fd < *next_fd {
                         *next_fd = fd;
                     }
@@ -2765,6 +2789,7 @@ impl FileTable {
         let mut reserved = self.lock_reserved_slots();
         if reserved.get(&fd).copied() == Some(reservation_id) {
             reserved.remove(&fd);
+            self.cancel_ipc_reservation(fd, reservation_id);
             true
         } else {
             false
@@ -2774,10 +2799,12 @@ impl FileTable {
     pub(crate) fn reserve_slot_for_epoll_detach(&self, fd: i32) -> EpollDetachReservation<'_> {
         let mut reserved = self.lock_reserved_slots();
         let res_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.reserve_ipc_exact(fd, res_id);
         reserved.insert(fd, res_id);
         EpollDetachReservation {
             table: self,
             fd,
+            reservation_id: res_id,
             active: true,
         }
     }
@@ -2792,6 +2819,7 @@ impl FileTable {
             .ok_or(crate::linux_abi::LINUX_EBADF)?;
         let mut open_files = self.write_open_files();
         let mut reserved = self.lock_reserved_slots();
+        let ipc_bound = matches!(*self.ipc.lock(), Some(Ok(_)));
 
         // All authentication and occupancy checks precede publication. The
         // cursor was advanced at admission; cancellation, not commit, rewinds it.
@@ -2801,14 +2829,22 @@ impl FileTable {
             {
                 return Err(crate::linux_abi::LINUX_EBADF);
             }
-            if open_files.contains_key(fd) {
+            if !ipc_bound && open_files.contains_key(fd) {
                 return Err(crate::linux_abi::LINUX_EBUSY);
             }
         }
-        for (fd, _, slot) in claims {
+        for (fd, reservation_id, slot) in claims {
             slot.description.retain_fd_ref();
             reserved.remove(&fd);
-            open_files.insert(fd, slot);
+            let displaced = open_files.insert_committed(fd, slot);
+            if let Some(stale) = displaced
+                && stale.description.fd_ref_count() != 0
+            {
+                stale.description.release_fd_ref();
+            }
+            if let Some(installed) = open_files.get(&fd) {
+                self.commit_ipc_reservation(fd, reservation_id, installed);
+            }
             if (0..3).contains(&fd) {
                 self.lock_closed_stdio()[fd as usize] = false;
             }
@@ -2835,7 +2871,10 @@ impl FileTable {
         }
 
         reserved.remove(&fd);
-        let replaced = open_files.insert(fd, slot);
+        let replaced = open_files.insert_committed(fd, slot);
+        if let Some(installed) = open_files.get(&fd) {
+            self.commit_ipc_reservation(fd, reservation_id, installed);
+        }
 
         if (0..3).contains(&fd) {
             self.lock_closed_stdio()[fd as usize] = false;
@@ -3083,6 +3122,12 @@ impl FileTable {
     pub(crate) fn read_open_files(&self) -> RwLockReadGuard<'_, FileSlotMap> {
         #[cfg(test)]
         crate::dispatch::budget_meter::record_table_read_lock();
+        let guard = self.open_files.read();
+        if !self.ipc_flags_dirty(&guard) {
+            return guard;
+        }
+        drop(guard);
+        self.refresh_ipc_flags(&mut self.open_files.write());
         self.open_files.read()
     }
 
@@ -3310,9 +3355,9 @@ impl Drop for FileTable {
 /// fd-fill loop quadratic — `dup` at 20k open fds cost ~1 ms, 6000x Linux.)
 #[derive(Default)]
 struct TouchedSlots {
-    inline: [(i32, Option<FileDescriptionId>); 4],
+    inline: [(i32, Option<(FileDescriptionId, bool)>); 4],
     len: usize,
-    heap: Vec<(i32, Option<FileDescriptionId>)>,
+    heap: Vec<(i32, Option<(FileDescriptionId, bool)>)>,
 }
 
 impl TouchedSlots {
@@ -3324,7 +3369,7 @@ impl TouchedSlots {
         }
     }
 
-    fn push(&mut self, item: (i32, Option<FileDescriptionId>)) {
+    fn push(&mut self, item: (i32, Option<(FileDescriptionId, bool)>)) {
         if self.heap.is_empty() && self.len < 4 {
             self.inline[self.len] = item;
             self.len += 1;
@@ -3333,7 +3378,7 @@ impl TouchedSlots {
         }
     }
 
-    fn iter(&self) -> impl Iterator<Item = &(i32, Option<FileDescriptionId>)> {
+    fn iter(&self) -> impl Iterator<Item = &(i32, Option<(FileDescriptionId, bool)>)> {
         self.inline[..self.len].iter().chain(self.heap.iter())
     }
 
@@ -3353,7 +3398,7 @@ impl TouchedSlots {
         self.push((number, None));
     }
 
-    fn take(&mut self) -> impl Iterator<Item = (i32, Option<FileDescriptionId>)> {
+    fn take(&mut self) -> impl Iterator<Item = (i32, Option<(FileDescriptionId, bool)>)> {
         let inline_items = self.inline;
         let inline_len = self.len;
         self.len = 0;
@@ -3371,10 +3416,10 @@ pub struct FileTableWriteGuard<'a> {
     table: FileTableId,
     subscriptions: &'a FileSlotSubscriptions,
     /// Slot numbers this guard mutated. `None` marks an insert or a remove
-    /// (the slot's identity is new or gone either way); `Some(id)` records the
-    /// description a slot carried when it was first borrowed mutably, so an
-    /// in-place description swap is detected on release while an fd-flag
-    /// update keeps the slot's identity.
+    /// (the slot's identity is new or gone either way); `Some((id, cloexec))`
+    /// records the description and fd flags a slot carried when it was first
+    /// borrowed mutably, so an in-place description swap or flag update is
+    /// detected on release.
     touched: TouchedSlots,
 }
 
@@ -3391,10 +3436,7 @@ impl FileTableWriteGuard<'_> {
         self.touched.mark_replaced(number);
     }
 
-    /// Install `slot` at `number`, returning the slot it displaced. The
-    /// installed slot always receives a fresh generation: a number that is
-    /// (re)populated is a new slot identity, whatever the caller built it from.
-    pub(crate) fn insert(&mut self, number: i32, mut slot: FileSlot) -> Option<FileSlot> {
+    fn insert_committed(&mut self, number: i32, mut slot: FileSlot) -> Option<FileSlot> {
         #[cfg(test)]
         crate::dispatch::budget_meter::record_table_lookup();
         slot.generation = next_file_slot_generation();
@@ -3403,18 +3445,30 @@ impl FileTableWriteGuard<'_> {
         self.guard.insert(number, slot)
     }
 
+    /// Install `slot` at `number`, returning the slot it displaced. The
+    /// installed slot always receives a fresh generation: a number that is
+    /// (re)populated is a new slot identity, whatever the caller built it from.
+    pub(crate) fn insert(&mut self, number: i32, slot: FileSlot) -> Option<FileSlot> {
+        let displaced = self.insert_committed(number, slot);
+        if let Some(installed) = self.guard.get(&number) {
+            self.owner.install_ipc_slot(number, installed);
+        }
+        displaced
+    }
+
     pub(crate) fn remove(&mut self, number: &i32) -> Option<FileSlot> {
         #[cfg(test)]
         crate::dispatch::budget_meter::record_table_lookup();
+        let removed = self.guard.remove(number);
+        if removed.is_some() {
+            self.mark_replaced(*number);
+        }
+        self.owner.remove_ipc_slot(*number);
         // Removing a standard descriptor also removes its implicit stream.
         // Do this under the namespace guard so rollback cannot resurrect bare
         // stdin/stdout/stderr between removal and projection publication.
         if (0..3).contains(number) {
             self.owner.lock_closed_stdio()[*number as usize] = true;
-        }
-        let removed = self.guard.remove(number);
-        if removed.is_some() {
-            self.mark_replaced(*number);
         }
         removed
     }
@@ -3424,7 +3478,8 @@ impl FileTableWriteGuard<'_> {
         crate::dispatch::budget_meter::record_table_lookup();
         let slot = self.guard.get_mut(number)?;
         if !self.touched.iter().any(|(touched, _)| touched == number) {
-            self.touched.push((*number, Some(slot.description.id())));
+            self.touched
+                .push((*number, Some((slot.description.id(), slot.close_on_exec()))));
         }
         Some(slot)
     }
@@ -3446,17 +3501,19 @@ impl Drop for FileTableWriteGuard<'_> {
         };
 
         for (number, before) in self.touched.take() {
-            self.owner.sync_ipc_slot(number, self.guard.get(&number));
             match before {
                 None => push_changed(number),
-                Some(before) => {
+                Some((before_id, before_cloexec)) => {
                     let Some(slot) = self.guard.get_mut(&number) else {
                         push_changed(number);
                         continue;
                     };
-                    if slot.description.id() != before {
+                    if slot.description.id() != before_id {
                         slot.generation = next_file_slot_generation();
+                        self.owner.install_ipc_slot(number, slot);
                         push_changed(number);
+                    } else if slot.close_on_exec() != before_cloexec {
+                        self.owner.set_ipc_cloexec(number, slot.close_on_exec());
                     }
                 }
             }
