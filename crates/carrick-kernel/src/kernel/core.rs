@@ -1353,6 +1353,7 @@ impl Kernel {
     pub(crate) fn deliver_ipc_host_wakes(&self) {
         let owner = self.ipc.lock().clone();
         if let Some(owner) = owner {
+            owner.service_retired_tables();
             owner.region().drain_host_wake_candidates(|object| {
                 owner.service_host_wake(object);
             });

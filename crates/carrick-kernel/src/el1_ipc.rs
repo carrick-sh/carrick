@@ -993,6 +993,27 @@ impl HostIpc {
         }
         Ok(released)
     }
+
+    /// Finish a bounded batch of ring-revoked tables. Receipts retain the
+    /// table on refusal; resource destruction runs after all core locks.
+    pub fn drain_retired_tables(&self) -> Result<usize, AdmissionError> {
+        let region = self.region();
+        let authority = region.fd(HostLockWait);
+        let mut count = 0;
+        for _ in 0..carrick_el1_abi::ipc::IPC_FD_TABLES {
+            let Some(mut receipt) = authority.take_retired_table() else {
+                break;
+            };
+            let mut releases = Vec::with_capacity(receipt.capacity().min(region.ofd_count()));
+            let extent = receipt.finish(|description| releases.push(description));
+            for description in releases {
+                self.release(description.backing)?;
+            }
+            self.reclaim_descriptors(extent?)?;
+            count += 1;
+        }
+        Ok(count)
+    }
 }
 
 #[cfg(test)]

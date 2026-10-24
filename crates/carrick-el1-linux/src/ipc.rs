@@ -35,6 +35,8 @@
 //!   other argument register is untouched, and the record says what to do
 //!   ([`IpcHandback`]) and carries the original `x0` and syscall number.
 
+extern crate alloc;
+
 use super::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1::substrate::file::UserCopy;
 use carrick_el1::substrate::ipc::{
@@ -90,6 +92,87 @@ pub struct IpcVenue<'a> {
 
 /// How a read/write reached the IPC adapter ended.
 pub use carrick_personality_linux::dispatch::IpcServed;
+
+/// Retire a native namespace through the same OFD owner used by host tables.
+/// In-zone releases happen now; host resources and the table extent remain
+/// owned by the core's retirement queue until a host boundary drains them.
+pub fn retire_namespace<C: carrick_el1_abi::EntryContext>(
+    region: &IpcRegion<'_>,
+    table: carrick_el1_abi::ipc::fd::TableId,
+    zone: &carrick_sched_core::ZoneTables<C>,
+    slot: carrick_el1_abi::SlotId,
+    task: &CurrentTask,
+) -> Result<(), carrick_el1_abi::ipc::IpcError> {
+    use carrick_el1_abi::ipc::IpcError;
+    let authority = region.fd(carrick_sched_core::ShortLockSpin);
+    let capacity = authority.backing_capacity(table).map_err(IpcError::Fd)?;
+    let mut releases = alloc::vec::Vec::with_capacity(capacity.min(region.ofd_count()));
+    authority
+        .retire_table(
+            table,
+            |description| {
+                !matches!(
+                    IpcBacking::decode(description.backing),
+                    Some(IpcBacking::Host(_))
+                )
+            },
+            |description| releases.push(description),
+        )
+        .map_err(IpcError::Fd)?;
+    task.linux.mark_pending_host_work();
+    for description in releases {
+        release_native_description(region, description, zone, slot, task)?;
+    }
+    Ok(())
+}
+
+fn release_native_description<C: carrick_el1_abi::EntryContext>(
+    region: &IpcRegion<'_>,
+    description: carrick_el1_abi::ipc::fd::Description,
+    zone: &carrick_sched_core::ZoneTables<C>,
+    slot: carrick_el1_abi::SlotId,
+    task: &CurrentTask,
+) -> Result<(), carrick_el1_abi::ipc::IpcError> {
+    use carrick_el1_abi::ipc::IpcError;
+    match region.release_backing(description.backing, &Finish)? {
+        IpcReleased::Object { wake, freed } => {
+            if wake.host_owed {
+                task.linux.mark_pending_host_work();
+            }
+            let targets = [
+                (!freed && wake.readers, wake.object, WaitFor::Readable),
+                (!freed && wake.writers, wake.object, WaitFor::Writable),
+            ];
+            for (due, object, lane) in targets.into_iter().chain(
+                wake.epolls
+                    .iter()
+                    .map(|object| (true, object, WaitFor::Readable)),
+            ) {
+                let Some(key) = due.then(|| wait_key(object, lane)).flatten() else {
+                    continue;
+                };
+                let result = loop {
+                    match carrick_core::wait::notify_object(zone, slot, key) {
+                        Err(ObjectWaitError::Busy) => core::hint::spin_loop(),
+                        other => break other,
+                    }
+                };
+                let (report, effects) = match result {
+                    Ok(result) => result,
+                    Err(ObjectWaitError::Stale) => continue,
+                    Err(_) => return Err(IpcError::Corrupt),
+                };
+                if report.deferred != 0 {
+                    task.linux.mark_pending_host_work();
+                }
+                crate::sched::object_wait::deliver_wake_effects(zone, slot, effects);
+            }
+        }
+        IpcReleased::Epoll => {}
+        IpcReleased::Host(_) => return Err(IpcError::Corrupt),
+    }
+    Ok(())
+}
 
 /// Tables resolved through the host-published [`IpcTableMap`], keyed by the
 /// running task's host file table (which an EL1 switch-in updates): a table
