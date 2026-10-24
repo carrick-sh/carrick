@@ -3118,7 +3118,11 @@ impl FileTable {
     pub fn slot(&self, number: FileSlotNumber) -> Option<FileSlot> {
         #[cfg(test)]
         crate::dispatch::budget_meter::record_table_lookup();
-        self.open_files.read().get(&number.raw()).cloned()
+        let mut slot = self.open_files.read().get(&number.raw()).cloned()?;
+        if let Some(Ok(flags)) = self.ipc_fd_flags(number.raw()) {
+            slot.fd_flags = (slot.fd_flags & !crate::linux_abi::LINUX_FD_CLOEXEC) | flags;
+        }
+        Some(slot)
     }
 
     pub fn slot_count(&self) -> usize {
@@ -3128,12 +3132,6 @@ impl FileTable {
     pub(crate) fn read_open_files(&self) -> RwLockReadGuard<'_, FileSlotMap> {
         #[cfg(test)]
         crate::dispatch::budget_meter::record_table_read_lock();
-        let guard = self.open_files.read();
-        if !self.ipc_flags_dirty(&guard) {
-            return guard;
-        }
-        drop(guard);
-        self.refresh_ipc_flags(&mut self.open_files.write());
         self.open_files.read()
     }
 

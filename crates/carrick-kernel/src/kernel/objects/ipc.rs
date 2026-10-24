@@ -84,8 +84,8 @@ impl Binding {
         for (&number, slot) in slots.iter() {
             binding.install_slot(number, slot)?;
         }
-        for number in 0..3 {
-            binding.set_stdio_closed(number, closed_stdio[number])?;
+        for (number, &closed) in closed_stdio.iter().enumerate() {
+            binding.set_stdio_closed(number, closed)?;
         }
         for (&fd, &reservation_id) in reserved_slots.iter() {
             let claim = binding.table.reserve_exact(fd::Fd(fd))?;
@@ -239,12 +239,18 @@ impl Binding {
         }
     }
 
-    fn has_dirty_flags(&self, slots: &FileSlotMap) -> bool {
+    fn get_fd_flags(&self, number: i32) -> Option<Result<u64, crate::linux_abi::LinuxErrno>> {
+        if number < 0 {
+            return Some(Err(crate::linux_abi::LINUX_EBADF));
+        }
         let region = self.owner.region();
         let authority = region.fd(crate::el1_zone::HostLockWait);
-        slots.iter().any(|(&fd, slot)| {
-            authority.getfd(self.table.id(), fd::Fd(fd)) == Ok(!slot.close_on_exec())
-        })
+        match authority.getfd(self.table.id(), fd::Fd(number)) {
+            Ok(true) => Some(Ok(crate::linux_abi::LINUX_FD_CLOEXEC)),
+            Ok(false) => Some(Ok(0)),
+            Err(fd::Error::BadFd) => Some(Err(crate::linux_abi::LINUX_EBADF)),
+            Err(_) => None,
+        }
     }
 
     fn refresh_flags(&self, slots: &mut FileSlotMap) {
@@ -324,7 +330,7 @@ impl FileTable {
             .ok_or(fd::Error::StaleTable)?;
         let slots = self.open_files.read();
         // Global lock order: open files, reserved slots, stdio flags, closed stdio, IPC binding.
-        let reserved = self.reserved_slots.lock();
+        let reserved = self.lock_reserved_slots();
         let cloexec = self.stdio_cloexec.lock();
         let closed = self.closed_stdio.lock();
         let mut ipc = self.ipc.lock();
@@ -418,19 +424,15 @@ impl FileTable {
         }
     }
 
-    pub(super) fn ipc_flags_dirty(&self, slots: &FileSlotMap) -> bool {
+    pub(crate) fn ipc_fd_flags(
+        &self,
+        number: i32,
+    ) -> Option<Result<u64, crate::linux_abi::LinuxErrno>> {
         let ipc = self.ipc.lock();
         let Some(Ok(binding)) = &*ipc else {
-            return false;
+            return None;
         };
-        binding.has_dirty_flags(slots)
-    }
-
-    pub(super) fn refresh_ipc_flags(&self, slots: &mut FileSlotMap) {
-        let ipc = self.ipc.lock();
-        if let Some(Ok(binding)) = &*ipc {
-            binding.refresh_flags(slots);
-        }
+        binding.get_fd_flags(number)
     }
 
     pub(super) fn reconcile_copy_from_ipc(
@@ -565,8 +567,13 @@ mod tests {
         let peer_id = fd::TableId::from_raw(map.lookup(peer.id().raw()).unwrap());
         authority.setfd(shared, fd::Fd(3), true).unwrap();
         assert_eq!(authority.getfd(peer_id, fd::Fd(3)), Ok(false));
-        assert_eq!(peer.read_open_files().get(&3).unwrap().fd_flags, 0);
-        let host_flag = parent.read_open_files().get(&3).unwrap().fd_flags != 0;
+        let fd3 = FileSlotNumber::for_open_fd(3).unwrap();
+        assert_eq!(peer.slot(fd3).unwrap().fd_flags, 0);
+        assert_eq!(
+            parent.ipc_fd_flags(3),
+            Some(Ok(crate::linux_abi::LINUX_FD_CLOEXEC))
+        );
+        let host_flag = parent.slot(fd3).unwrap().fd_flags != 0;
         assert!(host_flag, "host slot flags diverge from shared authority");
     }
 

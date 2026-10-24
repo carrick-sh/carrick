@@ -274,10 +274,12 @@ impl<'a> FsView<'a> {
     pub(in crate::dispatch) fn open_file(&self, fd: i32) -> Option<OpenFile> {
         #[cfg(test)]
         crate::dispatch::budget_meter::record_table_lookup();
-        self.captured_file_table()
-            .read_open_files()
-            .get(&fd)
-            .cloned()
+        let table = self.captured_file_table();
+        let mut slot = table.read_open_files().get(&fd).cloned()?;
+        if let Some(Ok(flags)) = table.ipc_fd_flags(fd) {
+            slot.fd_flags = (slot.fd_flags & !crate::linux_abi::LINUX_FD_CLOEXEC) | flags;
+        }
+        Some(slot)
     }
 
     pub(in crate::dispatch) fn open_file_with_authority(
