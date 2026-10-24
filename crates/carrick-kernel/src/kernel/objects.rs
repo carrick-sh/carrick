@@ -370,6 +370,7 @@ impl FileDescriptionFinalizerKey {
     }
 }
 
+#[derive(Clone)]
 struct OpaqueFileDescriptionBacking(Arc<dyn FileDescriptionBacking>);
 
 impl OpaqueFileDescriptionBacking {
@@ -821,12 +822,10 @@ pub struct DescriptionCommon {
     /// A shared routing record for descriptions whose effects remain host-owned.
     /// This pin ends with functional fd ownership, never diagnostic Arc lifetime.
     ipc_forwarding: Mutex<Option<crate::el1_ipc::HostDescription>>,
-    /// Number of Linux fd-table entries naming this description across every
-    /// process namespace. Deliberately excludes transient Rust `Arc` clones
-    /// held by in-flight syscalls: Linux removes an event-poll interest only after
-    /// the last fd referring to the description closes, and `Arc::strong_count`
-    /// cannot express that.
-    fd_refs: AtomicUsize,
+    /// Physical lifetime shared by host functional references, mappings, and
+    /// shared OFD backing capsules. Observational Rust Arcs do not own a
+    /// functional reference or decide when to close the backing.
+    physical: Arc<DescriptionPhysicalLifetime>,
     /// `F_SETLEASE`/`F_GETLEASE`: `F_RDLCK`(0)/`F_WRLCK`(1)/`F_UNLCK`(2).
     lease: AtomicI32,
     /// `F_SETSIG`: the signal delivered on async I/O (0 = the default SIGIO).
@@ -857,7 +856,7 @@ impl DescriptionCommon {
             status_flags: AtomicU64::new(status_flags),
             ipc_status_flags: std::sync::OnceLock::new(),
             ipc_forwarding: Mutex::new(None),
-            fd_refs: AtomicUsize::new(0),
+            physical: Arc::new(DescriptionPhysicalLifetime::default()),
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
             secretmem: AtomicBool::new(false),
@@ -879,7 +878,7 @@ impl DescriptionCommon {
             status_flags: AtomicU64::new(status_flags),
             ipc_status_flags: std::sync::OnceLock::new(),
             ipc_forwarding: Mutex::new(None),
-            fd_refs: AtomicUsize::new(0),
+            physical: Arc::new(DescriptionPhysicalLifetime::default()),
             lease: AtomicI32::new(crate::linux_abi::LINUX_F_UNLCK),
             async_sig: AtomicI32::new(0),
             secretmem: AtomicBool::new(false),
@@ -937,11 +936,11 @@ impl DescriptionCommon {
     }
 
     pub(crate) fn fd_refs(&self) -> usize {
-        self.fd_refs.load(Ordering::Relaxed)
+        self.physical.fd_refs.load(Ordering::Relaxed)
     }
 
     pub(crate) fn retain_fd_ref(&self) -> usize {
-        self.fd_refs.fetch_add(1, Ordering::Relaxed) + 1
+        self.physical.fd_refs.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Returns the count AFTER the release. Aborts on underflow: a negative
@@ -949,7 +948,7 @@ impl DescriptionCommon {
     /// track of an event-poll interest's lifetime, and continuing would leak or
     /// double-free a registration.
     pub(crate) fn release_fd_ref(&self) -> usize {
-        let previous = self.fd_refs.fetch_sub(1, Ordering::Relaxed);
+        let previous = self.physical.fd_refs.fetch_sub(1, Ordering::Relaxed);
         if previous == 0 {
             carrick_fatal!(
                 "kernel::file_description_refs",
@@ -1091,7 +1090,58 @@ impl DescriptionCommon {
 struct DescriptionLifecycle {
     shared_open: Option<carrick_el1_abi::AdmittedOpenReference>,
     mapping_refs: usize,
+    ipc_holds: usize,
     terminal_finalizers: Vec<Arc<dyn FileDescriptionFinalizer>>,
+}
+
+/// Shared across restored wrappers, without a backlink to the publication
+/// pin or HostIpc. A shared OFD can retain this owner after all host slots die.
+#[derive(Debug, Default)]
+struct DescriptionPhysicalLifetime {
+    fd_refs: AtomicUsize,
+    transition: Mutex<DescriptionLifecycle>,
+}
+
+struct IpcPhysicalHold {
+    physical: Arc<DescriptionPhysicalLifetime>,
+    backing: Option<OpaqueFileDescriptionBacking>,
+    admitted: Arc<AtomicBool>,
+}
+
+fn finish_description(
+    backing: Option<&OpaqueFileDescriptionBacking>,
+    lifecycle: &mut DescriptionLifecycle,
+) -> Vec<Arc<dyn FileDescriptionFinalizer>> {
+    if let Some(backing) = backing {
+        backing.0.on_last_fd_ref();
+        if lifecycle.mapping_refs == 0 {
+            backing.0.on_last_resource_ref();
+        }
+    }
+    std::mem::take(&mut lifecycle.terminal_finalizers)
+}
+
+impl Drop for IpcPhysicalHold {
+    fn drop(&mut self) {
+        // Failed admission never acquired a physical hold. Its rollback can
+        // destroy the capsule while the admission transition is still locked.
+        if !self.admitted.load(Ordering::Acquire) {
+            return;
+        }
+        let finalizers = {
+            let mut lifecycle = self.physical.transition.lock();
+            // Each admitted, non-Clone capsule owns exactly one increment.
+            lifecycle.ipc_holds -= 1;
+            if lifecycle.ipc_holds == 0 && self.physical.fd_refs.load(Ordering::Relaxed) == 0 {
+                finish_description(self.backing.as_ref(), &mut lifecycle)
+            } else {
+                Vec::new()
+            }
+        };
+        for finalizer in finalizers {
+            finalizer.finalize();
+        }
+    }
 }
 
 /// Keeps a mapped file's backing alive without retaining a logical fd slot.
@@ -1109,14 +1159,17 @@ impl MappedFileReference {
 
 impl Drop for MappedFileReference {
     fn drop(&mut self) {
-        let mut lifecycle = self.description.lifecycle_transition.lock();
+        let mut lifecycle = self.description.common.physical.transition.lock();
         lifecycle.mapping_refs = lifecycle.mapping_refs.checked_sub(1).unwrap_or_else(|| {
             carrick_fatal!(
                 "kernel::file_description_refs",
                 "mapped file reference count underflow"
             );
         });
-        if lifecycle.mapping_refs == 0 && self.description.common.fd_refs() == 0 {
+        if lifecycle.mapping_refs == 0
+            && lifecycle.ipc_holds == 0
+            && self.description.common.fd_refs() == 0
+        {
             if let FileDescriptionKind::Concrete(backing) = &self.description.kind {
                 backing.0.on_last_resource_ref();
             }
@@ -1130,7 +1183,6 @@ pub struct FileDescription {
     id: FileDescriptionId,
     kind: FileDescriptionKind,
     common: Arc<DescriptionCommon>,
-    lifecycle_transition: Mutex<DescriptionLifecycle>,
     epoll_registrations: Mutex<BTreeMap<(FileDescriptionId, i32), Weak<FileDescription>>>,
     revision: ObjectRevision,
     delegation_handle: std::sync::atomic::AtomicU32,
@@ -1145,7 +1197,7 @@ impl FileDescription {
         owner: &Arc<crate::el1_ipc::HostIpc>,
     ) -> Result<Arc<crate::el1_ipc::HostDescriptionFlags>, crate::el1_ipc::AdmissionError> {
         use carrick_el1_abi::ipc::{IpcBacking, fd};
-        let _lifecycle = self.lifecycle_transition.lock();
+        let mut lifecycle = self.common.physical.transition.lock();
         if self.common.fd_refs() == 0 {
             return Err(fd::Error::StalePin.into());
         }
@@ -1157,9 +1209,7 @@ impl FileDescription {
             };
         }
         let mut forwarding = self.common.ipc_forwarding.lock();
-        // Restored views can share DescriptionCommon while carrying distinct
-        // wrapper lifecycle locks. Recheck under the same cell final close
-        // takes, so a queued admission cannot recreate a retired host pin.
+        // Restored views share physical lifetime and publication custody.
         if self.common.fd_refs() == 0 {
             return Err(fd::Error::StalePin.into());
         }
@@ -1171,10 +1221,19 @@ impl FileDescription {
                 Err(fd::Error::StalePin.into())
             };
         }
-        // EL1 forwards Host backing before interpreting its access/flag words.
-        // This record identifies routing and lifetime; Linux file semantics and
-        // the actual host resource remain in this FileDescription authority.
-        let token = owner.retain_host_resource(Box::new(self.id))?;
+        // The capsule owns the real backing, not a diagnostic FileDescription
+        // or a host fd lease. Neither the common publication pin nor HostIpc
+        // is reachable through its physical lifetime record.
+        let admitted = Arc::new(AtomicBool::new(false));
+        let backing = match &self.kind {
+            FileDescriptionKind::Concrete(backing) => Some(backing.clone()),
+            _ => None,
+        };
+        let token = owner.retain_host_resource(Box::new(IpcPhysicalHold {
+            physical: Arc::clone(&self.common.physical),
+            backing,
+            admitted: Arc::clone(&admitted),
+        }))?;
         let backing = IpcBacking::Host(token).encode();
         let description = match owner.admit_description(fd::Description::new(
             backing,
@@ -1189,6 +1248,8 @@ impl FileDescription {
                 return Err(error);
             }
         };
+        lifecycle.ipc_holds += 1;
+        admitted.store(true, Ordering::Release);
         let flags = description.flags();
         *forwarding = Some(description);
         Ok(flags)
@@ -1217,7 +1278,6 @@ impl FileDescription {
             id: super::ids::allocate_file_description_id()?,
             kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
             common,
-            lifecycle_transition: Mutex::new(DescriptionLifecycle::default()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
             delegation_handle: std::sync::atomic::AtomicU32::new(0),
@@ -1252,7 +1312,6 @@ impl FileDescription {
             id: super::ids::restore_file_description_id(stable_id)?,
             kind: FileDescriptionKind::Concrete(OpaqueFileDescriptionBacking::new(backing)),
             common,
-            lifecycle_transition: Mutex::new(DescriptionLifecycle::default()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
             delegation_handle: std::sync::atomic::AtomicU32::new(0),
@@ -1281,7 +1340,6 @@ impl FileDescription {
             id,
             kind: FileDescriptionKind::Regular,
             common: Arc::new(DescriptionCommon::new(0)),
-            lifecycle_transition: Mutex::new(DescriptionLifecycle::default()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
             delegation_handle: std::sync::atomic::AtomicU32::new(0),
@@ -1294,7 +1352,6 @@ impl FileDescription {
             id,
             kind: FileDescriptionKind::Epoll(Mutex::new(BTreeMap::new())),
             common: Arc::new(DescriptionCommon::new(0)),
-            lifecycle_transition: Mutex::new(DescriptionLifecycle::default()),
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
             delegation_handle: std::sync::atomic::AtomicU32::new(0),
@@ -1316,7 +1373,7 @@ impl FileDescription {
         &self,
         publish: impl FnOnce() -> Option<carrick_el1_abi::AdmittedOpenReference>,
     ) -> bool {
-        let mut lifecycle = self.lifecycle_transition.lock();
+        let mut lifecycle = self.common.physical.transition.lock();
         if self.common.fd_refs() == 0 || lifecycle.shared_open.is_some() {
             return false;
         }
@@ -1327,14 +1384,14 @@ impl FileDescription {
         true
     }
     pub(crate) fn admitted_open_reference(&self) -> Option<carrick_el1_abi::AdmittedOpenReference> {
-        self.lifecycle_transition.lock().shared_open
+        self.common.physical.transition.lock().shared_open
     }
     pub(crate) fn open_reference(&self) -> Option<carrick_core_abi::OpenReferenceKey> {
         self.admitted_open_reference()
             .map(|admitted| admitted.key())
     }
     pub(crate) fn retire_open_reference(&self, key: carrick_core_abi::OpenReferenceKey) {
-        let mut lifecycle = self.lifecycle_transition.lock();
+        let mut lifecycle = self.common.physical.transition.lock();
         if lifecycle.shared_open.map(|admitted| admitted.key()) == Some(key) {
             lifecycle.shared_open = None;
         }
@@ -1354,7 +1411,7 @@ impl FileDescription {
     }
 
     pub(crate) fn has_active_mappings(&self) -> bool {
-        self.lifecycle_transition.lock().mapping_refs > 0
+        self.common.physical.transition.lock().mapping_refs > 0
     }
 
     pub const fn id(&self) -> FileDescriptionId {
@@ -1499,7 +1556,7 @@ impl FileDescription {
         capacity: i64,
         accounting: PipeCapacityAccounting,
     ) -> Result<u64, PipeCapacityMutationError> {
-        let _guard = self.lifecycle_transition.lock();
+        let _guard = self.common.physical.transition.lock();
         let FileDescriptionKind::Concrete(backing) = &self.kind else {
             return Err(PipeCapacityMutationError::NotPipe);
         };
@@ -1515,7 +1572,7 @@ impl FileDescription {
         // not an ownership change: EL1 serves only the published fd, and
         // every other reference forwards to the host, which serves the same
         // zone records (`el1_delegation::serve_on_host`).
-        let _guard = self.lifecycle_transition.lock();
+        let _guard = self.common.physical.transition.lock();
         let count = self.common.retain_fd_ref();
         if count == 1 {
             if let FileDescriptionKind::Concrete(backing) = &self.kind {
@@ -1527,12 +1584,12 @@ impl FileDescription {
 
     /// Retain an exact live descriptor authority for asynchronous I/O.
     ///
-    /// The check and increment share `lifecycle_transition` with final close:
+    /// The check and increment share the physical transition with final close:
     /// callers can therefore retain a live endpoint before acquiring an
     /// endpoint-specific lock, but can never resurrect a description after its
     /// final fd reference has published its close side effects.
     pub(crate) fn retain_fd_lease(self: &Arc<Self>) -> Option<FileDescriptionFdLease> {
-        let _guard = self.lifecycle_transition.lock();
+        let _guard = self.common.physical.transition.lock();
         if self.common.fd_refs() == 0 {
             return None;
         }
@@ -1553,7 +1610,7 @@ impl FileDescription {
         &self,
         finalizer: Arc<dyn FileDescriptionFinalizer>,
     ) -> bool {
-        let mut lifecycle = self.lifecycle_transition.lock();
+        let mut lifecycle = self.common.physical.transition.lock();
         if self.common.fd_refs() == 0 {
             return false;
         }
@@ -1572,7 +1629,7 @@ impl FileDescription {
         let mut retired_ipc = None;
         let mut recall_lease = None;
         let terminal_finalizers = {
-            let mut lifecycle = self.lifecycle_transition.lock();
+            let mut lifecycle = self.common.physical.transition.lock();
             // Transfer the last functional reference to cleanup before it can
             // reach zero. The releasing pool thread never waits for recall.
             if self.common.fd_refs() == 1
@@ -1586,13 +1643,15 @@ impl FileDescription {
             let count = self.common.release_fd_ref();
             if count == 0 {
                 retired_ipc = self.common.ipc_forwarding.lock().take();
-                if let FileDescriptionKind::Concrete(backing) = &self.kind {
-                    backing.0.on_last_fd_ref();
-                    if lifecycle.mapping_refs == 0 {
-                        backing.0.on_last_resource_ref();
-                    }
+                if lifecycle.ipc_holds == 0 {
+                    let backing = match &self.kind {
+                        FileDescriptionKind::Concrete(backing) => Some(backing),
+                        _ => None,
+                    };
+                    finish_description(backing, &mut lifecycle)
+                } else {
+                    Vec::new()
                 }
-                std::mem::take(&mut lifecycle.terminal_finalizers)
             } else {
                 Vec::new()
             }
@@ -1612,7 +1671,7 @@ impl FileDescription {
     /// recalled first, and a mapped description is never delegated.
     pub(crate) fn retain_mapping(self: &Arc<Self>) -> Option<Arc<MappedFileReference>> {
         crate::el1_delegation::recall_if_delegated(self);
-        let mut lifecycle = self.lifecycle_transition.lock();
+        let mut lifecycle = self.common.physical.transition.lock();
         if self.common.fd_refs() == 0 {
             return None;
         }
