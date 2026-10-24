@@ -109,6 +109,7 @@ struct FakeBinding {
     audit_fails: AtomicBool,
     entered: parking_lot::Mutex<Option<Arc<Barrier>>>,
     run_notification: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    shutdown_kick_armed: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     resume: parking_lot::Mutex<Option<Arc<Barrier>>>,
     progress: AtomicUsize,
     host_wait_entered: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
@@ -181,6 +182,7 @@ impl FakeBinding {
             audit_fails: AtomicBool::new(false),
             entered: parking_lot::Mutex::new(None),
             run_notification: parking_lot::Mutex::new(None),
+            shutdown_kick_armed: parking_lot::Mutex::new(None),
             resume: parking_lot::Mutex::new(None),
             progress: AtomicUsize::new(0),
             host_wait_entered: parking_lot::Mutex::new(None),
@@ -1156,6 +1158,19 @@ impl PersistentExecutor for FakeExecutor {
                 }
             }
             Step::ComputeUntilNotifiedKick => {
+                let armed = binding
+                    .shutdown_kick_armed
+                    .lock()
+                    .take()
+                    .expect("shutdown kick arming receiver");
+                // Setup has its own outer guard, covering the coordinator's
+                // bounded root/entry observations and close handshake. The
+                // two-second compute bound starts only after shutdown is armed.
+                armed
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("shutdown kick was never armed: {error}"))
+                    })?;
                 let notification = self
                     .factory
                     .hardware_kick_channels
@@ -8285,6 +8300,8 @@ fn shutdown_kick_wakes_guest_parked_worker_and_treats_preemption_after_close_as_
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let binding = FakeBinding::new(501, [Step::ComputeUntilNotifiedKick]);
         *binding.run_notification.lock() = Some(entered_tx);
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+        *binding.shutdown_kick_armed.lock() = Some(armed_rx);
         factory.install(&parked, binding);
         let mut pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
         pool.disable_shutdown_kick_for_test();
@@ -8303,6 +8320,7 @@ fn shutdown_kick_wakes_guest_parked_worker_and_treats_preemption_after_close_as_
             .recv_timeout(shutdown_deadline.saturating_duration_since(Instant::now()))
             .expect("shutdown published close before the negative kick control");
         factory.hardware_kicks_armed.store(true, Ordering::Release);
+        armed_tx.send(()).expect("arm guest compute kick wait");
         resume_close.send(()).expect("release close census");
         let err = rx
             .recv_timeout(shutdown_deadline.saturating_duration_since(Instant::now()))
@@ -8348,6 +8366,8 @@ fn shutdown_kick_wakes_guest_parked_worker_and_treats_preemption_after_close_as_
             ],
         );
         *peer_binding.run_notification.lock() = Some(peer_entered_tx);
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+        *peer_binding.shutdown_kick_armed.lock() = Some(armed_rx);
         factory.install(&peer, peer_binding);
 
         let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 2);
@@ -8372,6 +8392,7 @@ fn shutdown_kick_wakes_guest_parked_worker_and_treats_preemption_after_close_as_
             .recv_timeout(shutdown_deadline.saturating_duration_since(Instant::now()))
             .expect("shutdown published close before the positive kick control");
         factory.hardware_kicks_armed.store(true, Ordering::Release);
+        armed_tx.send(()).expect("arm guest compute kick wait");
         resume_close.send(()).expect("release close census");
         let report = rx
             .recv_timeout(shutdown_deadline.saturating_duration_since(Instant::now()))
