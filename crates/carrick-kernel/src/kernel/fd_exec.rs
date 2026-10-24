@@ -133,42 +133,31 @@ impl TableCustody for HostTableCustody {
                 .object_ids()
                 .file_table_id()
                 .map_err(|_| HostPrepareError::NoMemory)?;
-            let successor = Arc::new(FileTable::stage_exec_copy(id, &self.files));
-            let slots = successor.read_open_files();
+            let mut successor = FileTable::stage_exec_copy(id, &self.files);
+            let (capacity, descriptors) = successor.exec_descriptors();
             let mut entries = Vec::new();
             entries
-                .try_reserve_exact(slots.len() + 3)
+                .try_reserve_exact(capacity)
                 .map_err(|_| HostPrepareError::NoMemory)?;
             let mut closed = Vec::new();
             closed
-                .try_reserve_exact(slots.len())
+                .try_reserve_exact(capacity)
                 .map_err(|_| HostPrepareError::NoMemory)?;
             let mut events = Vec::new();
             events
-                .try_reserve_exact(slots.len())
+                .try_reserve_exact(capacity)
                 .map_err(|_| HostPrepareError::NoMemory)?;
-            for (&fd, slot) in slots.iter() {
-                entries.push(ExecDescriptor {
-                    fd: Fd(fd),
-                    close_on_exec: slot.close_on_exec(),
-                });
-                events.push(FileCloseEvent {
-                    fd,
-                    slot: slot.clone(),
-                    disposition: FileCloseDisposition::Transferred,
-                });
-            }
-            let stdio_flags = successor.lock_stdio_cloexec();
-            let stdio_closed = successor.lock_closed_stdio();
-            for number in 0..3 {
-                if !stdio_closed[number] && !slots.contains_key(&(number as i32)) {
-                    entries.push(ExecDescriptor {
-                        fd: Fd(number as i32),
-                        close_on_exec: stdio_flags[number],
+            for (descriptor, slot) in descriptors {
+                if let Some(slot) = slot {
+                    events.push(FileCloseEvent {
+                        fd: descriptor.fd.0,
+                        slot,
+                        disposition: FileCloseDisposition::Transferred,
                     });
                 }
+                entries.push(descriptor);
             }
-            drop((stdio_flags, stdio_closed, slots));
+            let successor = Arc::new(successor);
             let batch = Box::new(FileCloseBatch {
                 table: self.files.id(),
                 events,
@@ -206,19 +195,15 @@ impl CloseOnExecStage for HostCloseOnExecStage {
         self.entries.next()
     }
     fn retain_closed(&mut self, fd: Fd) -> Result<(), Self::Error> {
-        if let Some(hold) = self.successor.files.stage_exec_close(fd) {
+        let files = Arc::get_mut(&mut self.successor.files).ok_or(HostPrepareError::Draining)?;
+        if let Some(hold) = files.stage_exec_close(fd) {
             self.closed.push(hold);
         }
         Ok(())
     }
     fn finish_preparation(&mut self) -> Result<(), Self::Error> {
-        self.successor.files.finish_exec_stage();
-        let slots = self.successor.files.read_open_files();
-        for event in &mut self.batch.events {
-            if !slots.contains_key(&event.fd) {
-                event.disposition = FileCloseDisposition::Closed;
-            }
-        }
+        let files = Arc::get_mut(&mut self.successor.files).ok_or(HostPrepareError::Draining)?;
+        files.finish_exec_stage(&mut self.batch.events);
         Ok(())
     }
     fn rollback(self) -> Self::Custody {
