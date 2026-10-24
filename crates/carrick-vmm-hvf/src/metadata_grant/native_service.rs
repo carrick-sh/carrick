@@ -51,7 +51,7 @@ impl NativeService {
             carrick_observability::probes::hvpatch_native_crossing_refused(
                 request.identity.birth.mm.mm().raw(),
                 request.identity.birth.mm.incarnation().get(),
-                u32::from(request.identity.birth.record.id.raw()),
+                request.identity.birth.record.id.raw(),
                 request.identity.sequence.get(),
                 ordinal.raw(),
             );

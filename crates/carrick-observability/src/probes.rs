@@ -317,7 +317,7 @@ pub enum HvpatchExecutorLifecyclePhase {
 }
 
 /// Native physical service boundaries; stable USDT ordinals, append only.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 #[repr(u32)]
 pub enum HvpatchNativeFaultPhase {
     Cow = 0,
