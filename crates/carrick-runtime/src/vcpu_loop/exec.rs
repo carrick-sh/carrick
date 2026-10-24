@@ -355,8 +355,8 @@ enum RuntimeArmedExec {
 }
 
 enum RuntimePublishedExec {
-    Hvpatch(crate::hvpatch::PublishedProcessExec),
-    Other(carrick_kernel::kernel::PreparedExec),
+    Hvpatch(Box<crate::hvpatch::PublishedProcessExec>),
+    Other(Box<carrick_kernel::kernel::PreparedExec>),
 }
 
 pub(super) struct PreparedExecve {
@@ -1969,7 +1969,7 @@ where
         let published_kernel_exec = match (kernel.hvpatch_process.as_ref(), armed_kernel_exec) {
             (Some(process), RuntimeArmedExec::Hvpatch(armed)) => {
                 match process.publish_exec_mm(armed) {
-                    Ok(published) => RuntimePublishedExec::Hvpatch(published),
+                    Ok(published) => RuntimePublishedExec::Hvpatch(Box::new(published)),
                     Err(error) => {
                         return Self::exec_failed_past_no_return(
                             kernel,
@@ -1980,7 +1980,9 @@ where
                     }
                 }
             }
-            (None, RuntimeArmedExec::Other(prepared)) => RuntimePublishedExec::Other(prepared),
+            (None, RuntimeArmedExec::Other(prepared)) => {
+                RuntimePublishedExec::Other(Box::new(prepared))
+            }
             _ => {
                 carrick_fatal!(
                     "hvpatch::exec_backend",
@@ -2095,10 +2097,10 @@ where
         self.fail_exec_terminal_context_for_test(ExecTerminalContextFailpoint::BeforeKernelCommit)?;
         let committed = match (kernel.hvpatch_process.as_ref(), published_kernel_exec) {
             (Some(process), RuntimePublishedExec::Hvpatch(published)) => process
-                .complete_exec(published, prepared_dispatch_mm_exec.take())
+                .complete_exec(*published, prepared_dispatch_mm_exec.take())
                 .map(|committed| (committed.context().retain_exact(), Some(committed))),
             (None, RuntimePublishedExec::Other(prepared)) => {
-                let committed = kernel.dispatcher.commit_one_task_kernel_exec(prepared);
+                let committed = kernel.dispatcher.commit_one_task_kernel_exec(*prepared);
                 if committed.is_ok()
                     && let Some(prepared) = prepared_dispatch_mm_exec.take()
                 {

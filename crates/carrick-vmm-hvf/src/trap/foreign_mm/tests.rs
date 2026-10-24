@@ -12852,7 +12852,7 @@ mod guest_cow {
         transport.register(&child.snapshot, &child.state);
         // As every COW runtime binding does, the carrier records the MM's state.
         custody.register_guest_cow_state(mm, &child.state);
-        let settlement = CarrierGuestCowSettlement::new(&custody).with_pool(pool);
+        let settlement = CarrierGuestCowSettlement::for_test(&custody, pool);
         settlement.settle(&spaces.unpublished(mm + 1).unwrap());
         assert_eq!(
             pool.completions(&spaces.unpublished(mm).unwrap()).count(),
@@ -12935,8 +12935,7 @@ mod guest_cow {
         ));
         custody.register_guest_cow_state(mm, &child.state);
         let spaces = AddressSpaces::new();
-        CarrierGuestCowSettlement::new(&custody)
-            .with_pool(pool)
+        CarrierGuestCowSettlement::for_test(&custody, pool)
             .settle(&spaces.unpublished(mm).unwrap());
         assert_eq!(
             pool.completions(&spaces.unpublished(mm).unwrap()).count(),
