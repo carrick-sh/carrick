@@ -41,15 +41,15 @@
 - Consumes: `route_shared(ordinal, allocator_control) -> Family` and `NativeProcessEntry: ProcessSignals`.
 - Produces: ARM `Family::Signal` routing for kill/tkill/tgkill, rt_sigsuspend, rt_sigpending, rt_sigtimedwait, rt_sigqueueinfo, and rt_tgsigqueueinfo.
 
-- [ ] **Step 1: Replace the existing “stays unported” assertion with a production-route test covering ordinals 129, 130, 131, 133, 136, 137, 138, and 240.**
+- [x] **Step 1: Replace the existing “stays unported” assertion with a production-route test covering ordinals 129, 130, 131, 133, 136, 137, 138, and 240.**
 
-- [ ] **Step 2: Run the focused test and retain the expected RED: ordinal 133 (and peers) are `Family::Unported`.**
+- [x] **Step 2: Run the focused test and retain the expected RED: ordinal 133 (and peers) are `Family::Unported`.**
 
-- [ ] **Step 3: Remove the ARM-only unported override so these calls use `route_shared`; keep pidfd and crossing policy unchanged.**
+- [x] **Step 3: Remove the ARM-only unported override so these calls use `route_shared`; keep pidfd and crossing policy unchanged.**
 
-- [ ] **Step 4: Run the focused route and ARM signal setup tests; expect PASS.**
+- [x] **Step 4: Run the focused route and ARM signal setup tests; expect PASS.**
 
-- [ ] **Step 5: Commit with the issue-linked Why/What/Verified body and exact Codex trailer.**
+- [x] **Step 5: Commit with the issue-linked Why/What/Verified body and exact Codex trailer.**
 
 ### Task 2: Bind Native Signal-Wait and Terminal Composition
 
@@ -63,17 +63,17 @@
 - Consumes: production ARM dispatch, `NativeProcessRuntime` signal wait continuation, shared wait owner, terminal retirement owner, and reparent projection.
 - Produces: contract bindings for child sigsuspend wake, exit/signal status, WNOHANG, single reap, adopter notification, two-thread group exit, and late lifecycle publication.
 
-- [ ] **Step 1: Add a production ARM-dispatch witness that enters an owned signal wait and verifies the call suspends instead of forwarding/refusing. Name the production route mutation it catches.**
+- [x] **Step 1: Add a production ARM-dispatch witness that enters an owned signal wait and verifies the call suspends instead of forwarding/refusing. Name the production route mutation it catches.**
 
-- [ ] **Step 2: Run it before any additional production change; expect RED on the unported base, or record that Task 1 is the minimal implementation making this later witness green.**
+- [x] **Step 2: Run it before any additional production change; expect RED on the unported base, or record that Task 1 is the minimal implementation making this later witness green.**
 
-- [ ] **Step 3: Extend status/reap assertions only where the existing native tests do not already prove literal Linux errno/status values and exactly-once consumption.**
+- [x] **Step 3: Extend status/reap assertions only where the existing native tests do not already prove literal Linux errno/status values and exactly-once consumption.**
 
-- [ ] **Step 4: Register exact VM-free bindings in both contract descriptors, including existing reparent, two-live-thread, and late Born/ExitedInZone tests. Do not claim signed or Docker evidence.**
+- [x] **Step 4: Register exact VM-free bindings in both contract descriptors, including existing reparent, two-live-thread, and late Born/ExitedInZone tests. Do not claim signed or Docker evidence.**
 
-- [ ] **Step 5: Run focused ARM/native owner tests and the contract registry checks; expect PASS.**
+- [x] **Step 5: Run focused ARM/native owner tests and the contract registry checks; expect PASS.**
 
-- [ ] **Step 6: Commit with the issue-linked Why/What/Verified body and exact Codex trailer.**
+- [x] **Step 6: Commit with the issue-linked Why/What/Verified body and exact Codex trailer.**
 
 ### Task 3: Portable and EL1 Budget Gates
 
@@ -85,15 +85,15 @@
 - Consumes: Tasks 1–2 branch.
 - Produces: portable gate evidence, both EL1 image size/stack reports, changed-line boundary, and rebase handoff for slice 4.
 
-- [ ] **Step 1: Run focused tests and `just test-kernel`; run `just test-loom` only if concurrency code changed.**
+- [x] **Step 1: Run focused tests and `just test-kernel`; run `just test-loom` only if concurrency code changed.**
 
-- [ ] **Step 2: Run `just clippy`, `just clippy-linux`, `just cross-check-macos`, `just fmt-check`, `just lint-domains`, and `just check-contract-change <main> HEAD`, all with the requested wrapper/cache environment.**
+- [x] **Step 2: Run `just clippy`, `just clippy-linux`, `just cross-check-macos`, `just fmt-check`, `just lint-domains`, and `just check-contract-change <main> HEAD`, all with the requested wrapper/cache environment.**
 
-- [ ] **Step 3: Build both EL1 images and record loaded/raw size plus maximum checked stack. Stop if the stack exceeds 12,175 bytes.**
+- [x] **Step 3: Build both EL1 images and record loaded/raw size plus maximum checked stack. Stop if the stack exceeds 12,175 bytes.**
 
-- [ ] **Step 4: Review `git diff` for exec/crossing/out-of-fence changes and confirm the layer remains below approximately 4,000 changed lines.**
+- [x] **Step 4: Review `git diff` for exec/crossing/out-of-fence changes and confirm the layer remains below approximately 4,000 changed lines.**
 
-- [ ] **Step 5: Write `/tmp/740-s5-handoff.md`, commit any final tracked corrections, and post the review-ready SHA without pushing.**
+- [x] **Step 5: Write `/tmp/740-s5-handoff.md`, commit any final tracked corrections, and post the review-ready SHA without pushing.**
 
 ---
 
@@ -172,4 +172,4 @@ or host-backed path.
 
 - [x] **Step 3: Bind the exact adopter, two-thread, late Born, and late ExitedInZone witnesses to `process.native.terminal-child`, then run the focused registry checks.**
 
-- [ ] **Step 4: Commit, then execute Task 3's full portable and EL1 budget gates and refresh `/tmp/740-s5-handoff.md`.**
+- [x] **Step 4: Commit, then execute Task 3's full portable and EL1 budget gates and refresh `/tmp/740-s5-handoff.md`.**
