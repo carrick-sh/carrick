@@ -1166,13 +1166,13 @@ impl CarrierVmCustody {
     pub(crate) fn publish_stage2_record_using(
         &self,
         spec: CarrierStage2RecordSpec,
-        map: impl FnOnce() -> i32,
+        map: impl FnOnce(CarrierStage2RecordIdentity) -> i32,
     ) -> Result<CarrierStage2RecordIdentity, TrapError> {
         let mut state = self.state.lock();
         let identity = Self::register_stage2_record_locked(&mut state, spec).map_err(|error| {
             TrapError::Hypervisor(format!("stage-2 record admission: {error:?}"))
         })?;
-        let rc = map();
+        let rc = map(identity);
         if rc != 0 {
             let _ = state.remove_record(identity.record_id);
             return Err(TrapError::Hypervisor(format!(

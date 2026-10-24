@@ -335,6 +335,71 @@ struct PreparedExecRegion {
     root: Option<crate::frame_pool::PooledRootSlotHandle>,
 }
 
+/// Physically mapped successor image whose exact carrier records own every
+/// backend map and IPA reservation. It is still unpublished to a process/MM.
+/// Consumers must either publish it or settle rollback explicitly.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[must_use]
+struct InstalledExecBacking {
+    plan: GuestMappingPlan,
+    regions: Vec<InstalledExecRegion>,
+    custody: std::sync::Arc<CarrierVmCustody>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct InstalledExecRegion {
+    region: HvfMappedRegion,
+    record: Option<CarrierStage2RecordIdentity>,
+    root: Option<crate::frame_pool::PooledRootSlotHandle>,
+    structural_epoch: Option<StructuralEpoch>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct ExecBackingInstallError {
+    error: TrapError,
+    retained: Option<Box<InstalledExecBacking>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl core::fmt::Debug for ExecBackingInstallError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ExecBackingInstallError")
+            .field("error", &self.error)
+            .field("retained", &self.retained.is_some())
+            .finish()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct ExecBackingRollbackError {
+    error: TrapError,
+    installed: Box<InstalledExecBacking>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct PublishedExecBacking {
+    plan: GuestMappingPlan,
+    regions: Vec<HvfMappedRegion>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl core::fmt::Debug for ExecBackingRollbackError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ExecBackingRollbackError")
+            .field("error", &self.error)
+            .field(
+                "remaining_records",
+                &self
+                    .installed
+                    .regions
+                    .iter()
+                    .filter(|region| region.record.is_some())
+                    .count(),
+            )
+            .finish()
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PreparedExecBacking {
     fn prepare(
@@ -397,6 +462,263 @@ impl PreparedExecBacking {
             map_backings_started,
             custody,
         })
+    }
+
+    /// Admit each exact carrier record before invoking its backend map. A
+    /// partial failure retires every earlier record in reverse order. If an
+    /// unmap refuses, the returned error retains the complete unresolved
+    /// backing/root/record owner for transfer to carrier cleanup.
+    fn install_using(
+        self,
+        mut map: impl FnMut(ExecStage2Install, CarrierStage2RecordIdentity) -> i32,
+        mut unmap: impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    ) -> Result<InstalledExecBacking, ExecBackingInstallError> {
+        let Self {
+            plan,
+            regions,
+            private_file_artifacts_elapsed_ns: _,
+            map_backings_started: _,
+            custody,
+        } = self;
+        let mut installed = InstalledExecBacking {
+            plan,
+            regions: Vec::new(),
+            custody,
+        };
+        for PreparedExecRegion {
+            region,
+            mut lease,
+            root,
+        } in regions
+        {
+            let pre_mapped = root.is_some();
+            if pre_mapped {
+                lease.mark_pre_mapped();
+            } else {
+                // The record presented to publication names the map that the
+                // callback is about to install. Ownership transfers only
+                // after that callback succeeds.
+                lease.mark_mapped();
+            }
+            let install = ExecStage2Install {
+                ipa: lease.base,
+                size: region.physical_size,
+                host: region.host_addr,
+                perms: u64::from(region.perms),
+                replay_registered: false,
+                pre_mapped,
+            };
+            let vm_generation = match installed.custody.setup_generation() {
+                Some(generation) => generation,
+                None => {
+                    lease.forget_backend_mapping();
+                    let error = TrapError::Hypervisor(
+                        "exec successor installation has no creating/live carrier".to_owned(),
+                    );
+                    return Err(ExecBackingInstallError {
+                        error,
+                        retained: rollback_after_install_failure(installed, &mut unmap),
+                    });
+                }
+            };
+            let structural_epoch =
+                if is_reusable_global_frame_extent(install.ipa, install.size as u64) {
+                    None
+                } else {
+                    match next_structural_epoch() {
+                        Ok(epoch) => Some(epoch),
+                        Err(error) => {
+                            lease.forget_backend_mapping();
+                            return Err(ExecBackingInstallError {
+                                error,
+                                retained: rollback_after_install_failure(installed, &mut unmap),
+                            });
+                        }
+                    }
+                };
+            let logical_owner = match structural_epoch {
+                Some(epoch) => CarrierLogicalOwner {
+                    id: epoch.raw(),
+                    generation: epoch.raw(),
+                },
+                None => match installed.custody.allocate_logical_owner() {
+                    Ok(owner) => owner,
+                    Err(reason) => {
+                        lease.forget_backend_mapping();
+                        let error = TrapError::Hypervisor(format!(
+                            "allocate exec successor physical owner: {reason:?}"
+                        ));
+                        return Err(ExecBackingInstallError {
+                            error,
+                            retained: rollback_after_install_failure(installed, &mut unmap),
+                        });
+                    }
+                },
+            };
+            let spec = CarrierStage2RecordSpec {
+                vm_generation,
+                ipa: install.ipa,
+                len: install.size,
+                host_addr: install.host as usize,
+                mapped: true,
+                backend_map_installed: !pre_mapped,
+                release_ipa: lease.release_ipa,
+                perms: install.perms,
+                logical_owner: Some(logical_owner),
+            };
+            let record = match installed
+                .custody
+                .publish_stage2_record_using(spec, |identity| map(install, identity))
+            {
+                Ok(record) => record,
+                Err(error) => {
+                    // A failed callback removed its unpublished record. It did
+                    // not install a map, so ordinary lease rollback is sound.
+                    lease.forget_backend_mapping();
+                    return Err(ExecBackingInstallError {
+                        error,
+                        retained: rollback_after_install_failure(installed, &mut unmap),
+                    });
+                }
+            };
+            let Some(snapshot) = installed.custody.stage2_record_snapshot(record.record_id) else {
+                let error = TrapError::Hypervisor(
+                    "exec successor stage-2 record disappeared after map".to_owned(),
+                );
+                installed.regions.push(InstalledExecRegion {
+                    region,
+                    record: Some(record),
+                    root,
+                    structural_epoch,
+                });
+                return Err(ExecBackingInstallError {
+                    error,
+                    retained: rollback_after_install_failure(installed, &mut unmap),
+                });
+            };
+            if let Err(error) = lease.transfer_to_record(snapshot) {
+                installed.regions.push(InstalledExecRegion {
+                    region,
+                    record: Some(record),
+                    root,
+                    structural_epoch,
+                });
+                return Err(ExecBackingInstallError {
+                    error,
+                    retained: rollback_after_install_failure(installed, &mut unmap),
+                });
+            }
+            installed.regions.push(InstalledExecRegion {
+                region,
+                record: Some(record),
+                root,
+                structural_epoch,
+            });
+        }
+        Ok(installed)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn rollback_after_install_failure(
+    installed: InstalledExecBacking,
+    unmap: &mut impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> Option<Box<InstalledExecBacking>> {
+    installed
+        .rollback_using(unmap)
+        .err()
+        .map(|failure| failure.installed)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl InstalledExecBacking {
+    fn publish(mut self, successor_root_slot: (u64, u64)) -> PublishedExecBacking {
+        for index in 0..self.regions.len() {
+            let Some(identity) = self.regions[index].record else {
+                continue;
+            };
+            let result = match (
+                self.regions[index].root.take(),
+                self.regions[index].structural_epoch,
+            ) {
+                (Some(handle), Some(epoch)) => publish_installed_pooled_exec_root_in(
+                    &self.custody,
+                    &mut self.regions[index].region,
+                    identity,
+                    epoch,
+                    handle,
+                ),
+                (None, Some(epoch)) => publish_installed_exec_structure_in(
+                    &self.custody,
+                    &mut self.regions[index].region,
+                    identity,
+                    epoch,
+                    successor_root_slot,
+                ),
+                (None, None) => publish_installed_exec_region_owner_in(
+                    &self.custody,
+                    &mut self.regions[index].region,
+                    identity,
+                ),
+                (Some(_), None) => Err(TrapError::Hypervisor(
+                    "pooled exec root has no structural epoch".to_owned(),
+                )),
+            };
+            result.unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::exec_commit",
+                    "publish installed exec backing: {error}"
+                )
+            });
+            self.regions[index].record = None;
+        }
+        PublishedExecBacking {
+            plan: self.plan,
+            regions: self
+                .regions
+                .into_iter()
+                .map(|installed| installed.region)
+                .collect(),
+        }
+    }
+
+    fn rollback_using(
+        mut self,
+        mut unmap: impl FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    ) -> Result<(), ExecBackingRollbackError> {
+        for index in (0..self.regions.len()).rev() {
+            let Some(identity) = self.regions[index].record else {
+                continue;
+            };
+            let outcome = self
+                .custody
+                .retire_stage2_record_using(identity, &mut unmap);
+            match outcome {
+                CarrierStage2RetireOutcome::RetiredUnmapped
+                | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+                    if let Err(error) = finalize_terminal_stage2_record_using(
+                        &self.custody,
+                        identity,
+                        &mut release_retired_stage2_ipa,
+                    ) {
+                        return Err(ExecBackingRollbackError {
+                            error,
+                            installed: Box::new(self),
+                        });
+                    }
+                    self.regions[index].record = None;
+                }
+                other => {
+                    return Err(ExecBackingRollbackError {
+                        error: TrapError::Hypervisor(format!(
+                            "rollback exec successor stage-2 record: {other:?}"
+                        )),
+                        installed: Box::new(self),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -559,6 +881,7 @@ impl ExecStage2Install {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn switch_exec_stage2_transaction(
     old: &[ExecStage2Install],
     new: &[ExecStage2Install],
@@ -1059,11 +1382,17 @@ impl HvfVmState {
         let custody = self.carrier_vm_custody();
         let predecessor_mm_root_slot = self.mm_root_slot;
         let replacement_mm_root_slot = if self.persistent_vm_lifecycle {
-            self.pending_exec_mm_root_slot.ok_or_else(|| {
+            let successor = self.pending_exec_mm_root_slot.ok_or_else(|| {
                 TrapError::Hypervisor(
                     "HVPatch exec began without a fresh root-slot lease".to_owned(),
                 )
-            })?
+            })?;
+            if Some(successor) == predecessor_mm_root_slot {
+                return Err(TrapError::Hypervisor(
+                    "HVPatch exec successor reused the predecessor root-slot lease".to_owned(),
+                ));
+            }
+            successor
         } else {
             self.mm_root_slot.unwrap_or((0, 0))
         };
@@ -1089,14 +1418,17 @@ impl HvfVmState {
             None
         };
         let frame_plan_started = std::time::Instant::now();
-        let global = self.global_frame_exec_plan(plan)?;
+        let mut global = Some(self.global_frame_exec_plan(plan)?);
         self.pending_exec_mm_root_slot = None;
         self.pending_exec_asid = None;
         let frame_plan_elapsed_ns = frame_plan_started
             .elapsed()
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
-        let replacement_mapping_count = global
+        let global_plan = global.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor("exec global plan disappeared before preparation".to_owned())
+        })?;
+        let replacement_mapping_count = global_plan
             .plan
             .mappings
             .iter()
@@ -1105,7 +1437,7 @@ impl HvfVmState {
                     && !is_persistent_executor_carrier_guest_mapping(mapping)
             })
             .count() as u64;
-        let replacement_mapped_bytes = global
+        let replacement_mapped_bytes = global_plan
             .plan
             .mappings
             .iter()
@@ -1127,40 +1459,28 @@ impl HvfVmState {
         // transaction marks leases mapped. Retain its carrier through transfer
         // into installed ownership; the nonpersistent path keeps unused leases
         // through the same scope as before this extraction.
-        let (
-            global_plan,
-            mut prepared_exec_regions,
-            private_file_artifacts_elapsed_ns,
-            map_backings_started,
-            _unmaterialized_leases,
-            _prepared_carrier,
-        ) = if self.persistent_vm_lifecycle {
-            let PreparedExecBacking {
-                plan,
-                regions,
-                private_file_artifacts_elapsed_ns,
-                map_backings_started,
-                custody,
-            } = PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), global)?;
-            (
-                plan,
-                regions,
-                private_file_artifacts_elapsed_ns,
-                map_backings_started,
-                None,
-                Some(custody),
-            )
+        let mut prepared_exec_backing = if self.persistent_vm_lifecycle {
+            Some(PreparedExecBacking::prepare(
+                std::sync::Arc::clone(&custody),
+                global.take().ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "exec global plan disappeared during preparation".to_owned(),
+                    )
+                })?,
+            )?)
         } else {
-            (
-                global.plan,
-                Vec::new(),
-                0,
-                std::time::Instant::now(),
-                Some(global.stage2_leases),
-                None,
-            )
+            None
         };
-        let plan = &global_plan;
+        let private_file_artifacts_elapsed_ns = prepared_exec_backing
+            .as_ref()
+            .map_or(0, |prepared| prepared.private_file_artifacts_elapsed_ns);
+        let map_backings_started = prepared_exec_backing
+            .as_ref()
+            .map_or_else(std::time::Instant::now, |prepared| {
+                prepared.map_backings_started
+            });
+        let mut published_exec_plan = None;
+        let mut published_exec_regions = Vec::new();
         let emit_replace_stage =
             |phase: carrick_observability::probes::HvpatchExecReplaceStagePhase,
              started: std::time::Instant| {
@@ -1206,58 +1526,21 @@ impl HvfVmState {
             })?;
             let extents =
                 final_exec_physical_extents(&self.frame_inventory.lock(), authority.as_ref())?;
-            let replacement = plan
-                .mappings
-                .iter()
-                .filter(|mapping| {
-                    !is_sparse_hvpatch_mmap_mapping(mapping)
-                        && !is_persistent_executor_carrier_guest_mapping(mapping)
-                })
-                .zip(prepared_exec_regions.iter())
-                .map(|(mapping, prepared)| {
-                    exec_stage2_install(mapping, &prepared.region, prepared.root.is_some())
-                })
-                .collect::<Vec<_>>();
             let authority_before = self.exec_authority_fingerprint();
-            let switch_result = switch_exec_stage2_transaction(
-                &[],
-                &replacement,
-                exec_stage2_fail_after_maps(),
-                |extent| {
+            let fail_after = exec_stage2_fail_after_maps();
+            let mut maps_completed = 0usize;
+            let prepared = prepared_exec_backing.take().ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "persistent exec lost its prepared physical backing".to_owned(),
+                )
+            })?;
+            let installed = prepared.install_using(
+                |extent, _record| {
                     if extent.pre_mapped {
-                        return Ok(());
+                        return 0;
                     }
-                    crate::probes::hvpatch_exec_stage2(
-                        carrick_observability::probes::HvpatchExecStage2::new(
-                            carrick_observability::probes::HvpatchExecStage2Phase::UnmapBegin,
-                            extent.ipa,
-                            extent.size as u64,
-                            u64::MAX,
-                            0,
-                        ),
-                    );
-                    let rc = unsafe { inventory_hv_vm_unmap(extent.ipa, extent.size) };
-                    crate::probes::hvpatch_exec_stage2(
-                        carrick_observability::probes::HvpatchExecStage2::new(
-                            carrick_observability::probes::HvpatchExecStage2Phase::UnmapEnd,
-                            extent.ipa,
-                            extent.size as u64,
-                            u64::MAX,
-                            if rc == 0 { 0 } else { -1 },
-                        ),
-                    );
-                    if rc == 0 {
-                        Ok(())
-                    } else {
-                        Err(TrapError::Hypervisor(format!(
-                            "unmap HVPatch exec predecessor IPA 0x{:x} size {} failed: 0x{rc:x}",
-                            extent.ipa, extent.size
-                        )))
-                    }
-                },
-                |extent| {
-                    if extent.pre_mapped {
-                        return Ok(());
+                    if fail_after.is_some_and(|limit| maps_completed >= limit) {
+                        return -1;
                     }
                     crate::probes::hvpatch_exec_stage2(
                         carrick_observability::probes::HvpatchExecStage2::new(
@@ -1297,29 +1580,40 @@ impl HvfVmState {
                         ),
                     );
                     if rc == 0 {
+                        maps_completed += 1;
+                    }
+                    rc as i32
+                },
+                |ipa, len| {
+                    let rc = unsafe { inventory_hv_vm_unmap(ipa, len) };
+                    if rc == 0 {
                         Ok(())
                     } else {
-                        Err(TrapError::Hypervisor(format!(
-                            "map HVPatch exec replacement IPA 0x{:x} size {} failed: 0x{rc:x}",
-                            extent.ipa, extent.size
-                        )))
+                        Err(CarrierStage2BackendError::HvReturn(rc as u32))
                     }
                 },
             );
-            if let Err(error) = switch_result {
-                let authority_after = self.exec_authority_fingerprint();
-                if let Err(rollback_error) =
-                    verify_exec_authority_rollback(&authority_before, &authority_after)
-                {
-                    carrick_fatal!("hvpatch::exec_commit", "{rollback_error}");
+            match installed {
+                Ok(installed) => {
+                    let published = installed.publish(replacement_mm_root_slot);
+                    published_exec_plan = Some(published.plan);
+                    published_exec_regions = published.regions;
                 }
-                return Err(error);
-            }
-            for prepared in &mut prepared_exec_regions {
-                if prepared.root.is_some() {
-                    prepared.lease.mark_pre_mapped();
-                } else {
-                    prepared.lease.mark_mapped();
+                Err(failure) => {
+                    if failure.retained.is_some() {
+                        carrick_fatal!(
+                            "hvpatch::exec_commit",
+                            "exec successor map rollback retained unresolved custody: {}",
+                            failure.error
+                        );
+                    }
+                    let authority_after = self.exec_authority_fingerprint();
+                    if let Err(rollback_error) =
+                        verify_exec_authority_rollback(&authority_before, &authority_after)
+                    {
+                        carrick_fatal!("hvpatch::exec_commit", "{rollback_error}");
+                    }
+                    return Err(failure.error);
                 }
             }
             if let Some((Some(retired), _)) = inventory_reservations.as_mut() {
@@ -1394,6 +1688,16 @@ impl HvfVmState {
             pending_exec_vcpu = Some(new_vcpu);
             pending_exec_vm = Some(new_vm);
             std::collections::BTreeSet::new()
+        };
+        let plan = if let Some(published) = published_exec_plan.as_ref() {
+            published
+        } else {
+            &global
+                .as_ref()
+                .ok_or_else(|| {
+                    TrapError::Hypervisor("mature exec lost its global plan".to_owned())
+                })?
+                .plan
         };
         emit_replace_stage(
             carrick_observability::probes::HvpatchExecReplaceStagePhase::AddressSpaceTeardown,
@@ -1594,33 +1898,12 @@ impl HvfVmState {
             page_tables_started,
         );
 
-        // Stage-2 is already switched transactionally on HVPatch. Publish its
-        // host owners only after predecessor retirement can no longer roll
-        // back. Mature VMM still maps through the historical helper here.
+        // HVPatch's physical transaction already admitted exact records and
+        // bound their host owners before successor-MM publication. Transfer
+        // those regions into the live MM index here. Mature VMM still maps
+        // through the historical helper.
         if self.persistent_vm_lifecycle {
-            for PreparedExecRegion {
-                mut region,
-                lease,
-                root,
-            } in prepared_exec_regions.drain(..)
-            {
-                match root {
-                    Some(handle) => {
-                        publish_pooled_exec_root_owner_in(&custody, &mut region, lease, handle)
-                    }
-                    None => publish_exec_region_host_owner_in(
-                        &custody,
-                        &mut region,
-                        lease,
-                        Some(replacement_mm_root_slot),
-                    ),
-                }
-                .unwrap_or_else(|error| {
-                    carrick_fatal!(
-                        "hvpatch::frame_inventory",
-                        "publish HVPatch exec global-frame owner: {error}"
-                    )
-                });
+            for region in published_exec_regions.drain(..) {
                 if let Some(owner) = region.structural_owner.as_ref() {
                     self.mm_access
                         .install_structural_mapping_authority(
@@ -1950,18 +2233,22 @@ impl HvfVmState {
 mod backing_preparation_tests {
     use super::*;
 
-    fn plan(invalid_second: bool) -> Result<GlobalExecPlan, TrapError> {
+    fn plan(mapping_count: usize, invalid_second: bool) -> Result<GlobalExecPlan, TrapError> {
         let mut leases = std::collections::BTreeMap::new();
         let mut mappings = Vec::new();
-        for index in 0..if invalid_second { 2 } else { 1 } {
+        for index in 0..mapping_count {
             let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x20_0000)?;
             let ipa = lease.key().0;
             leases.insert((ipa, 0x4000), lease);
             mappings.push(GuestMapping {
-                guest_start: 0x20_0000 + index * 0x4000,
+                guest_start: 0x20_0000 + index as u64 * 0x4000,
                 ipa_start: ipa,
                 mapped_size: 0x4000,
-                offset_in_mapping: if index == 1 { u64::MAX } else { 0 },
+                offset_in_mapping: if invalid_second && index == 1 {
+                    u64::MAX
+                } else {
+                    0
+                },
                 payload_size: 4,
                 perms: carrick_mem::elf::SegmentPerms::default(),
                 shared: false,
@@ -1992,14 +2279,14 @@ mod backing_preparation_tests {
         let weak = std::sync::Arc::downgrade(&custody);
         let baseline = global_frame_ipa_allocator().lock().live.clone();
         let peer =
-            PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), plan(false).unwrap())
+            PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), plan(1, false).unwrap())
                 .unwrap();
         let peer_live = global_frame_ipa_allocator().lock().live.clone();
         assert_ne!(peer_live, baseline);
         // The first extent is materialized; the second has an invalid payload.
         // Unwinding must release both acquired and unused allocator custody.
         assert!(
-            PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), plan(true).unwrap())
+            PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), plan(2, true).unwrap())
                 .is_err()
         );
         assert_eq!(global_frame_ipa_allocator().lock().live, peer_live);
@@ -2014,6 +2301,70 @@ mod backing_preparation_tests {
         );
         drop(peer);
         assert!(weak.upgrade().is_none());
+        assert_eq!(global_frame_ipa_allocator().lock().live, baseline);
+    }
+
+    #[test]
+    fn exec_backing_install_registers_before_map_and_rolls_back_as_one_owner() {
+        let _serialize = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let prepared =
+            PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), plan(1, false).unwrap())
+                .unwrap();
+        let mut map_saw_record = false;
+        let installed = prepared
+            .install_using(
+                |_install, identity| {
+                    map_saw_record = identity.record_id.0 != 0;
+                    0
+                },
+                |_ipa, _len| Ok(()),
+            )
+            .unwrap();
+        assert!(map_saw_record, "record admission must precede backend map");
+        installed
+            .rollback_using(|_ipa, _len| Ok(()))
+            .expect("rollback must settle every installed record");
+        assert!(custody.stage2_record_identities().is_empty());
+    }
+
+    #[test]
+    fn exec_backing_partial_install_restores_allocator_and_preserves_peer() {
+        let _serialize = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let baseline = global_frame_ipa_allocator().lock().live.clone();
+        let peer =
+            PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), plan(1, false).unwrap())
+                .unwrap();
+        let peer_live = global_frame_ipa_allocator().lock().live.clone();
+        let transaction =
+            PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), plan(2, false).unwrap())
+                .unwrap();
+        let mut maps = 0;
+        let mut unmaps = Vec::new();
+        let failure = match transaction.install_using(
+            |_install, _identity| {
+                maps += 1;
+                if maps == 2 { -1 } else { 0 }
+            },
+            |ipa, len| {
+                unmaps.push((ipa, len));
+                Ok(())
+            },
+        ) {
+            Ok(_) => panic!("second backend map unexpectedly succeeded"),
+            Err(failure) => failure,
+        };
+        assert!(failure.retained.is_none(), "rollback retained custody");
+        assert_eq!(maps, 2);
+        assert_eq!(unmaps.len(), 1, "only the installed prefix is unmapped");
+        assert!(custody.stage2_record_identities().is_empty());
+        assert_eq!(global_frame_ipa_allocator().lock().live, peer_live);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(peer.regions[0].region.host_addr, 4) },
+            b"peer"
+        );
+        drop(peer);
         assert_eq!(global_frame_ipa_allocator().lock().live, baseline);
     }
 }
