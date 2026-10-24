@@ -6,14 +6,14 @@ use super::{AdmissionError, HostDescriptionFlags, HostDescriptionState, HostIpc}
 use crate::el1_zone::HostLockWait;
 use carrick_el1_abi::ipc::{IPC_MAX_OFDS, fd};
 
-fn invalid_retirement() -> ! {
-    carrick_fatal::carrick_fatal!("ipc::table", "invalid owned table retirement")
+enum PhysicalRelease {
+    Description(fd::Description),
+    RetiredTables,
 }
 
 impl HostIpc {
     pub(crate) fn service_retired_tables(&self) {
-        self.drain_retired_tables()
-            .unwrap_or_else(|_| invalid_retirement());
+        HostTable::release(self, PhysicalRelease::RetiredTables);
     }
 }
 
@@ -93,7 +93,7 @@ impl HostTable {
                 .replace_pin(self.id, target, pin, cloexec)?
         };
         if let Some(retired) = retired {
-            self.release(retired);
+            Self::release(&self.owner, PhysicalRelease::Description(retired));
         }
         Ok(())
     }
@@ -105,7 +105,7 @@ impl HostTable {
             .fd(HostLockWait)
             .close(self.id, target)?
         {
-            self.release(retired);
+            Self::release(&self.owner, PhysicalRelease::Description(retired));
         }
         Ok(())
     }
@@ -119,14 +119,24 @@ impl HostTable {
             .fd(HostLockWait)
             .exec(self.id, |d| retired.push(d))?;
         for description in retired {
-            self.release(description);
+            Self::release(&self.owner, PhysicalRelease::Description(description));
         }
         Ok(())
     }
 
-    fn release(&self, description: fd::Description) {
-        self.owner.release(description.backing).unwrap_or_else(|_| {
-            carrick_fatal::carrick_fatal!("ipc::table", "invalid retired description backing")
+    fn release(owner: &HostIpc, release: PhysicalRelease) {
+        // The table's physical-release owner also settles ring-retired tables.
+        // Both paths run after namespace locks and share the same corruption
+        // policy; an ordinary admission refusal never reaches this owner.
+        let result = match release {
+            PhysicalRelease::Description(description) => owner
+                .release(description.backing)
+                .map(|_| ())
+                .map_err(AdmissionError::from),
+            PhysicalRelease::RetiredTables => owner.drain_retired_tables().map(|_| ()),
+        };
+        result.unwrap_or_else(|_| {
+            carrick_fatal::carrick_fatal!("ipc::table", "invalid retired descriptor resource")
         });
     }
 }
@@ -140,9 +150,11 @@ impl Drop for HostTable {
             .destroy_table(self.id, |d| retired.push(d))
             .map_err(AdmissionError::from)
             .and_then(|extent| self.owner.reclaim_descriptors(extent))
-            .unwrap_or_else(|_| invalid_retirement());
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("ipc::table", "invalid owned table retirement")
+            });
         for description in retired {
-            self.release(description);
+            Self::release(&self.owner, PhysicalRelease::Description(description));
         }
     }
 }
