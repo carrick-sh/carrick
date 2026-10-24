@@ -201,3 +201,20 @@ slot into a low slot and closes the source during filtering. Filtering and
 terminal finalizers run outside the parent lock; parent destruction cannot
 remove a retained candidate. Every accepted or rejected reference is released
 exactly once, including rollback after partial snapshot retention.
+
+## Shared descriptor backing
+
+`storage::Storage` owns a pointer-free buddy tree in shared metadata. Host and
+ring venues allocate offsets from the same descriptor-only pool; no host
+allocator headers or locks cross the mapping boundary. Allocation and release
+hold one short lock and visit O(log(pool pages)) tree nodes. Data pages remain
+lazily backed, and the descriptor core clears recycled storage before use.
+An extent is returned only after table destruction/growth yields ownership,
+or after admission refuses it. Zero-capacity consumed extents own nothing.
+
+The VM-free storage witnesses keep multiple differently sized extents live,
+reject malformed returns without releasing a neighbor, and recover the entire
+pool after retirement. The two-venue Loom model checks overlapping allocation
+and release using the production lock/tree operations. `HostTable`'s repeated
+fork/grow/destroy witness verifies the same pool returns to zero allocations.
+These prove backing custody, not native process FD admission or syscall routing.

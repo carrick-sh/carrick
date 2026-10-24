@@ -128,6 +128,7 @@ pub const IPC_STOCK_RING_BYTES: u64 = (pipe::DEFAULT_PIPE_PAGES * IPC_PIPE_PAGE_
 pub const IPC_PIPE_PAGE_SIZE: usize = 4096;
 /// Alignment of every pool extent (a pipe ring starts on a guest page).
 pub const IPC_POOL_ALIGN: u64 = IPC_PIPE_PAGE_SIZE as u64;
+const IPC_DESCRIPTOR_STORAGE_NODES: usize = (crate::EL1_IPC_POOL_SPAN / IPC_POOL_ALIGN) as usize;
 /// Region magic: "CRKIPC" + ABI version 5 (elastic object and description
 /// stores, three-level host wake index, zone epoll records).
 pub const IPC_MAGIC: u64 = u64::from_le_bytes(*b"CRKIPC\x00\x05");
@@ -454,6 +455,7 @@ pub struct IpcDirectory {
     object_count: AtomicU64,
     _reserved: [u64; 5],
     fd: IpcFdCore,
+    descriptor_storage: fd::storage::Storage<IPC_DESCRIPTOR_STORAGE_NODES>,
     free_operations: AtomicU64,
     /// Ring stock: two tagged lock-free stacks over `ring_stock` slots, the
     /// provisioned rings and the empty slots.
@@ -527,6 +529,7 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::align_of::<IpcDirectory>() as u64,
     core::mem::offset_of!(IpcDirectory, owed_host_wakes_without_target) as u64,
     core::mem::offset_of!(IpcDirectory, fd) as u64,
+    core::mem::offset_of!(IpcDirectory, descriptor_storage) as u64,
     core::mem::size_of::<IpcFdCore>() as u64,
     core::mem::size_of::<IpcObjectRecord>() as u64,
     core::mem::offset_of!(IpcObjectRecord, generation) as u64,
@@ -946,6 +949,9 @@ impl<'a> IpcRegion<'a> {
             return Err(IpcError::BadRegion);
         }
         d.fd.initialize(identity).map_err(IpcError::Fd)?;
+        d.descriptor_storage
+            .initialize(pool_len as u64 / IPC_POOL_AREAS)
+            .map_err(|_| IpcError::BadRegion)?;
         let region = Self {
             dir: d,
             base: dir.cast(),
@@ -1029,6 +1035,55 @@ impl<'a> IpcRegion<'a> {
     /// The shared descriptor authority, with this venue's lock policy.
     pub fn fd<W: LockWait>(&'a self, wait: W) -> IpcFdAuthority<'a, W> {
         self.dir.fd.bind(self, wait)
+    }
+
+    /// Allocate table backing from the same pointer-free pool in either venue.
+    pub fn provision_descriptors(
+        &self,
+        capacity: usize,
+        wait: &impl LockWait,
+    ) -> Result<Extent, fd::storage::StorageError> {
+        if capacity == 0 || capacity > i32::MAX as usize {
+            return Err(fd::storage::StorageError::Invalid);
+        }
+        let allocation = self
+            .dir
+            .descriptor_storage
+            .allocate(descriptor_extent_bytes(capacity), wait)?;
+        Ok(Extent {
+            token: ipc_descriptor_area(self.pool_len).start + allocation.offset,
+            capacity: capacity as u64,
+        })
+    }
+
+    /// Consume backing returned by table destruction/growth, or refused before
+    /// installation. A consumed (zero-capacity) extent owns nothing.
+    pub fn reclaim_descriptors(
+        &self,
+        extent: Extent,
+        wait: &impl LockWait,
+    ) -> Result<(), fd::storage::StorageError> {
+        if extent.capacity == 0 {
+            return Ok(());
+        }
+        if extent.capacity > i32::MAX as u64 {
+            return Err(fd::storage::StorageError::Invalid);
+        }
+        let offset = extent
+            .token
+            .checked_sub(ipc_descriptor_area(self.pool_len).start)
+            .ok_or(fd::storage::StorageError::Invalid)?;
+        let bytes = descriptor_extent_bytes(extent.capacity as usize)
+            .next_multiple_of(IPC_POOL_ALIGN)
+            .checked_next_power_of_two()
+            .ok_or(fd::storage::StorageError::Invalid)?;
+        self.dir
+            .descriptor_storage
+            .release(fd::storage::Allocation { offset, bytes }, wait)
+    }
+
+    pub fn descriptor_allocations(&self) -> u32 {
+        self.dir.descriptor_storage.live_allocations()
     }
 
     /// Pool bytes `[offset, offset+len)`, authenticated against the pool.

@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 pub mod handle;
+pub mod storage;
 
 #[cfg(test)]
 extern crate std;
