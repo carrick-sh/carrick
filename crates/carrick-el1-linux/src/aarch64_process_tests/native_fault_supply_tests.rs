@@ -81,11 +81,25 @@ impl carrick_el1::memory::AnonymousPermissionEditor for UntouchedMapping<'_> {
 impl carrick_el1::memory::AnonymousRetirementEditor for UntouchedMapping<'_> {
     fn retire_and_invalidate(
         &mut self,
-        _: carrick_guest_arch::AddressSpaceRegister,
-        _: UserVa,
-        _: carrick_guest_arch::GuestLen,
+        root: carrick_guest_arch::AddressSpaceRegister,
+        address: UserVa,
+        len: carrick_guest_arch::GuestLen,
     ) -> Result<(), carrick_mmu_core::aarch64::GuestRetirementError> {
-        panic!("new mapping has no resident retirement work")
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
+            execute_descriptor_op,
+        };
+        assert!(matches!(
+            execute_descriptor_op(
+                self.0,
+                carrick_mmu_core::aarch64::SubstrateGpa(root.raw() & AARCH64_ROOT_ADDRESS_MASK),
+                DescriptorOp::Retire(PageSpan::new(address.raw(), len.raw())),
+                &TableGrants::NONE,
+                &mut InlineJournal::new(),
+            ),
+            DescriptorOutcome::Applied(_)
+        ));
+        Ok(())
     }
 }
 
@@ -137,21 +151,29 @@ impl CowResolver for FaultResolver<'_> {
 
 #[test]
 fn native_child_empty_supply_resumes_cow_without_changing_parent() {
-    composed_native_supply(false, None);
+    composed_native_supply(false, None, false);
 }
 #[test]
 fn native_backing_reply_observes_a_competing_valid_publication() {
-    composed_native_supply(true, None);
+    composed_native_supply(true, None, false);
 }
 #[test]
 fn native_child_backing_selection_excludes_inherited_live_neighbor() {
-    composed_native_supply(false, Some(1));
+    composed_native_supply(false, Some(1), false);
 }
 #[test]
 fn native_child_backing_selection_excludes_inherited_live_suffix() {
-    composed_native_supply(false, Some(0));
+    composed_native_supply(false, Some(0), false);
 }
-fn composed_native_supply(competing_publication: bool, absent_page: Option<usize>) {
+#[test]
+fn native_child_fixed_over_cow_preserves_parent_bytes_and_retires() {
+    composed_native_supply(false, None, true);
+}
+fn composed_native_supply(
+    competing_publication: bool,
+    absent_page: Option<usize>,
+    replace_cow: bool,
+) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     if let Some(absent_page) = absent_page {
         // Parent's two-page reservation has only one page resident.
@@ -829,11 +851,13 @@ fn composed_native_supply(competing_publication: bool, absent_page: Option<usize
     ));
     assert_eq!(frame.x[0], identity.tid);
     assert_eq!(counters.served[172].load(Ordering::Acquire), 1);
-    // A second, untouched mapping exercises the request-owned backing reply
-    // through native park/resume and the shared descriptor publication owner.
+    // Exercise request-owned backing through native park/resume. The fixed
+    // variant replaces the second page of the completed COW span while its
+    // USED receipt is still pending; the first page and parent remain live.
     frame.esr = 0x15 << 26;
     frame.x[8] = 222;
-    frame.x[..6].copy_from_slice(&[VA + 0x10000, 8192, 3, 0x32, u64::MAX, 0]);
+    let map_base = if replace_cow { VA + 4096 } else { VA + 0x10000 };
+    frame.x[..6].copy_from_slice(&[map_base, 8192, 3, 0x32, u64::MAX, 0]);
     assert_eq!(
         carrick_el1::memory::serve_delegated_anonymous(
             &mut frame,
@@ -846,10 +870,12 @@ fn composed_native_supply(competing_publication: bool, absent_page: Option<usize
         carrick_el1::memory::DelegatedAnonymous::Served
     );
     let fresh = frame.x[0];
-    assert!(
-        (VA + 8192..VA + 0x1000_0000).contains(&fresh),
-        "native mmap: {fresh:#x}"
-    );
+    if replace_cow {
+        // serve_delegated_anonymous updates the installed global residency
+        // table on target_os=none; this fixture owns that table explicitly.
+        residency.retire_overlapping(identity.mm, fresh, 8192);
+    }
+    assert!(fresh == map_base, "native mmap: {fresh:#x}");
     frame.esr = 0x92000046;
     frame.far = fresh + 7;
     frame.elr = 0x401300;
@@ -1054,11 +1080,35 @@ fn composed_native_supply(competing_publication: bool, absent_page: Option<usize
         0,
         "unreadable suffix must remain absent"
     );
-    assert_eq!(
-        leaf(words, 0x10000, fresh),
-        0,
-        "parent acquires no child backing"
-    );
+    if replace_cow {
+        assert_eq!(fresh % 16384, 4096, "exercise a sub-compound boundary");
+        assert_eq!(
+            leaf(words, 0x10000, fresh) & AARCH64_ROOT_ADDRESS_MASK,
+            IPA + 4096
+        );
+        assert_eq!(memory.pages.borrow()[&(IPA + 4096)][13], 18);
+        // The fixture's physical memory model gives fresh anonymous backing
+        // zero bytes, just as the real physical allocator does.
+        let replacement = rows[0].gpa.raw();
+        memory.pages.borrow_mut().insert(replacement, vec![0; 4096]);
+        let child_output = leaf(words, child_root, fresh) & AARCH64_ROOT_ADDRESS_MASK;
+        assert!(
+            memory.pages.borrow()[&child_output]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        memory.pages.borrow_mut().get_mut(&child_output).unwrap()[13] = 77;
+        assert_eq!(memory.pages.borrow()[&child_output][13], 77);
+        assert_eq!(memory.pages.borrow()[&(IPA + 4096)][13], 18);
+        assert_eq!(memory.pages.borrow()[&destination][13], 99);
+        assert_eq!(memory.pages.borrow()[&IPA][13], 17);
+    } else {
+        assert_eq!(
+            leaf(words, 0x10000, fresh),
+            0,
+            "parent acquires no child backing"
+        );
+    }
     assert_eq!(page.claimed_count(), 0);
     let exclusion = access
         .try_exclude_editor(access.find(identity.mm).unwrap(), identity.mm)
