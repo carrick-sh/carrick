@@ -369,6 +369,22 @@ impl ForkTableLedger for El1FrameGrantLedger {
         }
     }
 }
+
+/// Accounting venue used by every native fork-stock crossing.
+pub(crate) fn fork_table_accounting(custody: &CarrierVmCustody) -> impl ForkTableLedger + '_ {
+    ForkGrantAccounting(custody.el1_frame_grants.lock())
+}
+
+struct ForkGrantAccounting<'a>(parking_lot::MutexGuard<'a, El1FrameGrantLedger>);
+
+impl ForkTableLedger for ForkGrantAccounting<'_> {
+    fn grant(&mut self, page: RootGpa, mm: carrick_el1_abi::ReservationMm) -> bool {
+        self.0.grant(page, mm)
+    }
+    fn give_back(&mut self, page: RootGpa, mm: carrick_el1_abi::ReservationMm) {
+        self.0.give_back(page, mm);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +396,141 @@ mod tests {
     use carrick_guest_arch::{AddressContext, ContextGeneration, CpuId, KernelVa, MmGeneration};
     fn page(addr: u64) -> RootGpa {
         RootGpa::page_aligned(FrameGpa::new(addr)).unwrap()
+    }
+
+    #[test]
+    fn child_reclaim_and_terminal_finalization_do_not_invert_accounting_lock() {
+        use carrick_hal::fork_stock::{ForkControlCapacity, ForkStock, SlotAbsence, UntaggedRoots};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use std::time::Duration;
+
+        // A bounded directory acquisition detects the live #569 ABBA schedule
+        // without leaving deadlocked test threads behind. The ledger adapter
+        // and loan/reserve/commit/retire/reclaim transitions are production code.
+        struct PhysicalPin {
+            directory: Arc<parking_lot::Mutex<()>>,
+            entered: mpsc::Sender<()>,
+            finalized: Arc<AtomicBool>,
+        }
+        impl Drop for PhysicalPin {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                let acquired = self.directory.try_lock_for(Duration::from_secs(2));
+                self.finalized.store(acquired.is_some(), Ordering::SeqCst);
+            }
+        }
+
+        let custody = Arc::new(CarrierVmCustody::new());
+        let directory = Arc::new(parking_lot::Mutex::new(()));
+        let finalized = Arc::new(AtomicBool::new(false));
+        let (entered, dropping) = mpsc::channel();
+        let mut stock = ForkStock::<UntaggedRoots, PhysicalPin>::new(
+            NonZeroU64::new(7).unwrap(),
+            ForkControlCapacity::unused(0x1_0000_0000),
+            UntaggedRoots,
+        );
+        stock
+            .install(
+                (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+                vec![ForkLifecycleLoan::ARM_DEFAULT],
+            )
+            .unwrap();
+        let parent = test_execution(41, 0, 301);
+        let mut exchange = ForkStockExchange::new(test_request(parent, 302, 2, 1)).unwrap();
+        let loan = stock
+            .loan(
+                &mut fork_table_accounting(&custody),
+                parent,
+                &mut exchange,
+                |_| true,
+            )
+            .unwrap();
+        let completion = carrick_el1_abi::PortalForkCompletion {
+            request: loan.request,
+            // SAFETY: the fixture uses the exact admitted child identity.
+            child: unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(7).unwrap(),
+                    loan.request.child_mm,
+                    NonZeroU64::MIN,
+                )
+            },
+            parent_generation: ReservationGeneration::INITIAL,
+            child_tables_used: 4096,
+            parent_tables_used: 0,
+        };
+        let mut reserve = carrick_el1_abi::ForkStockSettlement::reserve(
+            loan,
+            completion,
+            KernelVa::new(0x1000),
+            0,
+        )
+        .unwrap();
+        stock
+            .reserve_custody(
+                parent,
+                &mut reserve,
+                |_| true,
+                |_| true,
+                |_, _, _| {
+                    Ok(PhysicalPin {
+                        directory: Arc::clone(&directory),
+                        entered,
+                        finalized: Arc::clone(&finalized),
+                    })
+                },
+            )
+            .unwrap();
+        let mut commit =
+            carrick_el1_abi::ForkStockSettlement::commit_reserved(loan, completion).unwrap();
+        stock
+            .settle(
+                &mut fork_table_accounting(&custody),
+                parent,
+                &mut commit,
+                |_| true,
+                |_| true,
+                |_| true,
+            )
+            .unwrap();
+        let mut child = test_execution(42, 1, 302);
+        child.context.root = page(loan.request.child_tables.base);
+        let mut retire =
+            carrick_el1_abi::NativeChildRetire::new(child.binding, child.context).unwrap();
+        stock.retire_child(child, &mut retire).unwrap();
+
+        let (locked, ready) = mpsc::channel();
+        let other_custody = Arc::clone(&custody);
+        let other_directory = Arc::clone(&directory);
+        let terminal = std::thread::spawn(move || {
+            let _directory = other_directory.lock();
+            locked.send(()).unwrap();
+            dropping.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Terminal publication holds the directory while accounting for
+            // its return, just as finalize_global_frame_owner_record does.
+            crate::trap::El1FrameGrantObserver::new(&other_custody).snapshot()
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let reclaimed = stock
+            .reclaim(
+                &mut fork_table_accounting(&custody),
+                ReservationMm::new(301).unwrap(),
+                |mm| SlotAbsence::scan(mm, [0]),
+                |_| true,
+                |_| true,
+                |_| true,
+            )
+            .unwrap();
+        terminal.join().unwrap();
+        assert_eq!(reclaimed, 1);
+        assert!(
+            finalized.load(Ordering::SeqCst),
+            "child physical destruction held the grant ledger while terminal finalization held the directory (#569)"
+        );
     }
 
     fn test_execution(task: u64, cpu: u32, mm: u64) -> GrantExecution {
