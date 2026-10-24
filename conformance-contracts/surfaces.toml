@@ -1637,6 +1637,10 @@ path = "crates/carrick-fd-core/src/lib.rs"
 contracts = ["kernel.fork.filetable", "kernel.el1.ipc-fd-authority", "core.personality.handle-table"]
 
 [[surfaces]]
+path = "crates/carrick-fd-core/src/storage.rs"
+contracts = ["kernel.el1.ipc-fd-authority"]
+
+[[surfaces]]
 path = "crates/carrick-fd-core/src/handle.rs"
 contracts = ["core.personality.handle-table"]
 

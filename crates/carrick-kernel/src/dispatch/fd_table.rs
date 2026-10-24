@@ -4130,7 +4130,7 @@ mod tests {
         let extent = authority
             .destroy_table(table, |_| panic!("empty table"))
             .unwrap();
-        owner.reclaim_descriptors(extent);
+        owner.reclaim_descriptors(extent).unwrap();
     }
 
     #[test]
@@ -4177,7 +4177,7 @@ mod tests {
         let extent = authority
             .destroy_table(table, |_| panic!("empty table"))
             .unwrap();
-        owner.reclaim_descriptors(extent);
+        owner.reclaim_descriptors(extent).unwrap();
     }
 
     #[test]
