@@ -241,15 +241,21 @@ impl PhysicalStock {
         &mut self,
         staged: &carrick_hal::physical_grants::StagedPhysicalGrants,
         len: u64,
+        physical_generation: NonZeroU64,
     ) -> SupplyBacking {
         let grant = *staged.grants().last().unwrap();
         let id = CarrierStage2RecordId(self.supplied_records.len() as u64 + 2);
         let identity = CarrierStage2RecordIdentity {
             record_id: id,
+            logical_owner: Some(CarrierLogicalOwner {
+                id: grant.gpa.raw(),
+                generation: physical_generation.get(),
+            }),
             ..self.identity
         };
         let mut snapshot = self.record.lock().unwrap().snapshot;
         snapshot.record_id = id;
+        snapshot.logical_owner = identity.logical_owner;
         snapshot.ipa = grant.gpa.raw();
         snapshot.len = len as usize;
         snapshot.pin_count = 0;
