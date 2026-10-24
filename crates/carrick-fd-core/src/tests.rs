@@ -2467,3 +2467,34 @@ fn task_inherit_preserves_attach_error_when_cleanup_fails() {
     host.exit_task(parent, |b| finalized.push(b)).unwrap();
     assert_eq!(finalized, vec![BackingToken(77), BackingToken(88)]);
 }
+
+#[test]
+fn revoked_namespace_releases_outside_the_descriptor_lock() {
+    let c = authority::<2, 2>();
+    let parent = c.create_table(8, &mut storage(8)).unwrap();
+    let peer = c.create_table(8, &mut storage(8)).unwrap();
+    let fd = c.open(parent, Fd(0), description(1), false).unwrap();
+    c.open(peer, Fd(0), description(2), false).unwrap();
+    let mut releases = 0;
+    c.retire_table(
+        parent,
+        |_| true,
+        |_| {
+            releases += 1;
+            assert_eq!(c.get(parent, fd), Err(Error::StaleTable));
+            assert_eq!(c.set_limit(parent, 8), Err(Error::StaleTable));
+            assert_eq!(c.get(peer, fd).unwrap().backing, BackingToken(2));
+            assert!(
+                c.take_retired_table().is_none(),
+                "release owns the unpublished retirement"
+            );
+        },
+    )
+    .unwrap();
+    assert_eq!(releases, 1);
+    c.take_retired_table()
+        .unwrap()
+        .finish(|_| panic!("already released"))
+        .unwrap();
+    c.destroy_table(peer, |_| {}).unwrap();
+}
