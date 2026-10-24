@@ -392,16 +392,25 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceNotificationLease<'a,
         let mut release = ResourceRelease {
             word,
             unlocked,
-            publications: core::array::from_fn(|_| None),
+            publications: [const { None }; 6],
         };
-        for (i, cause) in SpaceWaitCause::ALL.into_iter().enumerate() {
-            if causes.contains(&cause) {
-                release.publications[i] = Some(
-                    self.reserve(cause)
-                        .advance_revision(venue.waker, &completion),
-                );
-            }
+        macro_rules! retain {
+            ($index:literal, $cause:expr) => {
+                if causes.contains(&$cause) {
+                    release.publications[$index] = Some(
+                        self.reserve($cause)
+                            .advance_revision(venue.waker, &completion),
+                    );
+                }
+            };
         }
+        let _: [(); 6] = [(); SpaceWaitCause::ALL.len()];
+        retain!(0, SpaceWaitCause::PreparedOverlap);
+        retain!(1, SpaceWaitCause::Editor);
+        retain!(2, SpaceWaitCause::Reservations);
+        retain!(3, SpaceWaitCause::PendingEdit);
+        retain!(4, SpaceWaitCause::Gate);
+        retain!(5, SpaceWaitCause::Metadata);
         drop(release);
     }
 

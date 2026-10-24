@@ -2504,6 +2504,41 @@ impl<'a, M, C: ProcessContext> NativeResources<'a, M, C> {
     pub fn file_table(&self) -> u64 {
         self.file_table
     }
+    /// Stage this exact process's descriptor cutover. The caller must retain
+    /// the returned prepared authority until the ring transaction commits or
+    /// rolls back; no descriptor changes before that commit.
+    pub fn prepare_close_on_exec<'b>(
+        &self,
+        exact_task: TaskKey,
+        fd_map: &'b [carrick_el1_abi::FdMapSlot],
+        open_table: &'b [carrick_el1_abi::DelegatedOpenFile],
+    ) -> Result<
+        carrick_fd_core::exec::PreparedCloseOnExec<crate::file_table::NativeCloseOnExecStage<'b>>,
+        crate::file_table::NativeExecFdError,
+    > {
+        if !self
+            .members
+            .iter()
+            .any(|member| member.process == exact_task)
+        {
+            return Err(crate::file_table::NativeExecFdError::InvalidTable);
+        }
+        carrick_fd_core::exec::prepare_close_on_exec(
+            exact_task,
+            crate::file_table::NativeTableCustody::capture(
+                exact_task,
+                self.file_table,
+                fd_map,
+                open_table,
+            )?,
+        )
+        .map_err(|error| match error.into_parts().0 {
+            carrick_fd_core::exec::PreparationError::WrongTask => {
+                crate::file_table::NativeExecFdError::InvalidTable
+            }
+            carrick_fd_core::exec::PreparationError::Venue(error) => error,
+        })
+    }
     fn record_identity_mm(&self) -> u64 {
         self.zone.record(self.record.id).identity().mm
     }
@@ -2834,6 +2869,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         } else {
             1
         };
+        NonZeroU64::new(file_table).ok_or(NativeProcessError::Stale)?;
         let mut members = vec![NativeMember {
             thread: execution,
             process: key,
@@ -3258,6 +3294,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let graph = self.graph.lock();
         let row = graph.owner.task(key).ok()?;
         Some(row.parent())
+    }
+    /// Capability retained by this native process tree at root admission.
+    /// Fork changes descriptor-table identity, but inherits this root-owned
+    /// file/loader capability without introducing a second lifetime table.
+    pub fn exec_capability(&self) -> Option<carrick_core_abi::service::ExecCapabilityId> {
+        let graph = self.graph.lock();
+        let root = graph.owner.task(graph.root_key).ok()?;
+        let raw = NonZeroU64::new(root.native().resources().file_table)?;
+        Some(carrick_core_abi::service::ExecCapabilityId::new(raw))
     }
 }
 /// What a fork reserves and captures from its parent before preparing the
@@ -11204,6 +11249,12 @@ mod tests {
                 row.native().resources().record,
             )
         };
+        let child_exec_capability = runtime.exec_capability().unwrap();
+        assert_eq!(
+            child_exec_capability.raw().get(),
+            5,
+            "fork inherits the retained file/loader capability"
+        );
         assert_eq!(zone.switch_in_full(slot).unwrap().record, child_record.id);
         zone.install_space(slot, child_address.mm.raw().get())
             .unwrap();
