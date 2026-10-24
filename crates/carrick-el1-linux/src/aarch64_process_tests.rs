@@ -7225,6 +7225,51 @@ fn native_fork_two_children_inherit_the_complete_ipc_namespace() {
     assert_ne!(children[0], children[1]);
     let ipc = owner.region();
     let authority = ipc.fd(ShortLockSpin);
+    let child_tables = children.map(|child| {
+        fd::TableId::from_raw(
+            map.lookup(child)
+                .expect("native child has no IPC namespace"),
+        )
+    });
+    authority
+        .set_offset(child_tables[0], fd::Fd(3), fd::Offset(73))
+        .unwrap();
+    authority
+        .setfl(
+            child_tables[0],
+            fd::Fd(4),
+            fd::StatusFlags {
+                nonblock: true,
+                ..fd::StatusFlags::default()
+            },
+        )
+        .unwrap();
+    authority.setfd(child_tables[0], fd::Fd(4), false).unwrap();
+    assert_eq!(
+        authority.get(table.id(), fd::Fd(3)).unwrap().offset,
+        fd::Offset(73)
+    );
+    assert_eq!(
+        authority.get(child_tables[1], fd::Fd(3)).unwrap().offset,
+        fd::Offset(73)
+    );
+    assert!(authority.getfl(table.id(), fd::Fd(4)).unwrap().1.nonblock);
+    assert!(
+        authority
+            .getfl(child_tables[1], fd::Fd(4))
+            .unwrap()
+            .1
+            .nonblock
+    );
+    assert_eq!(authority.getfd(table.id(), fd::Fd(4)), Ok(true));
+    assert_eq!(authority.getfd(child_tables[1], fd::Fd(4)), Ok(true));
+    authority.setfd(child_tables[0], fd::Fd(4), true).unwrap();
+    let (pin, _) = authority.pin(table.id(), fd::Fd(4)).unwrap();
+    assert_eq!(authority.holds(&pin), Ok((3, 2)));
+    assert!(authority.unpin(pin).unwrap().is_none());
+    let mut guard = ipc.lock(object, &ShortLockSpin).unwrap();
+    assert_eq!(guard.pipe().unwrap().references(End::Writer), 1);
+    drop(guard);
     for child in children {
         let raw = map
             .lookup(child)
