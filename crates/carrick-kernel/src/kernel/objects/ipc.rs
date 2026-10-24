@@ -358,7 +358,16 @@ mod tests {
         let ids = ObjectIdRegistry::new();
         let owner = Arc::new(HostIpc::new(1 << 16).unwrap());
         let map = map();
-        let parent = FileTable::new(ids.file_table_id().unwrap());
+        let (kernel, context) = crate::kernel::Kernel::bootstrap_root(
+            crate::kernel::RootBootstrap::for_reference_model(
+                9120,
+                carrick_hal::ThreadId::synthetic_for_tests(9120),
+                "ipc exec".into(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let parent = context.resources().files();
         let description = Arc::new(FileDescription::regular(ids.file_description_id().unwrap()));
         description.retain_fd_ref();
         parent.install(
@@ -368,19 +377,31 @@ mod tests {
         );
         parent.lock_stdio_cloexec()[1] = true;
         parent.publish_ipc(Arc::clone(&owner), map).unwrap();
-        let child = FileTable::for_fork_copy(ids.file_table_id().unwrap(), &parent);
+        let child_context = kernel
+            .fork_task(
+                &context,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .unwrap(),
+                carrick_hal::ThreadId::synthetic_for_tests(9121),
+                "ipc child".into(),
+                None,
+            )
+            .unwrap();
+        let child = child_context.resources().files();
         child.publish_ipc(Arc::clone(&owner), map).unwrap();
-        let exec = FileTable::for_exec(ids.file_table_id().unwrap(), &child);
-        exec.publish_ipc(Arc::clone(&owner), map).unwrap();
         let region = owner.region();
         let authority = region.fd(crate::el1_zone::HostLockWait);
         let parent_id = fd::TableId::from_raw(map.lookup(parent.id().raw()).unwrap());
         let child_id = fd::TableId::from_raw(map.lookup(child.id().raw()).unwrap());
-        let exec_id = fd::TableId::from_raw(map.lookup(exec.id().raw()).unwrap());
         assert_eq!(
             authority.get(parent_id, fd::Fd(3)).unwrap(),
             authority.get(child_id, fd::Fd(3)).unwrap()
         );
+        let prepared = kernel.prepare_exec(&child_context, None).unwrap();
+        let committed = kernel.commit_exec(prepared, None).unwrap();
+        let exec = committed.resources().files();
+        exec.publish_ipc(Arc::clone(&owner), map).unwrap();
+        let exec_id = fd::TableId::from_raw(map.lookup(exec.id().raw()).unwrap());
         assert_eq!(authority.get(exec_id, fd::Fd(3)), Err(fd::Error::BadFd));
         assert_eq!(authority.get(exec_id, fd::Fd(1)), Err(fd::Error::BadFd));
         assert!(authority.get(parent_id, fd::Fd(1)).is_ok());
@@ -401,7 +422,7 @@ mod tests {
         assert_eq!(parent.slot_count(), 2);
         assert!(authority.pinned(&operation).is_ok());
         assert!(parent.publish_ipc(Arc::clone(&owner), map).is_err());
-        assert!(map.lookup(child.id().raw()).is_some());
+        assert!(map.lookup(child.id().raw()).is_none());
         assert!(authority.unpin(operation).unwrap().is_none());
         let child_key = child.id();
         drop(child);

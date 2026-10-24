@@ -12,8 +12,8 @@ use super::core::{
 };
 use super::ids::{LinuxTid, MmId, TaskId};
 use super::objects::{
-    ExecDrain, FileTable, FileTableExecFreeze, Mm, ObjectGraphError, PreparedThreadSet, TaskKey,
-    TaskShared, ThreadKey, ThreadRef, ThreadResources,
+    ExecDrain, FileTable, Mm, ObjectGraphError, PreparedThreadSet, TaskKey, TaskShared, ThreadKey,
+    ThreadRef, ThreadResources,
 };
 use super::operations::{KernelFailpoint, TaskGraphReservation};
 
@@ -103,17 +103,19 @@ impl Drop for ExecOperationGuard {
 /// Fully prepared exec replacement. Dropping it resumes stopped siblings and
 /// releases the operation reservation without changing the published graph.
 pub struct PreparedExec {
-    guard: ExecOperationGuard,
     task: TaskKey,
     caller: ThreadKey,
     revision: TaskRevision,
     old_mm: Arc<Mm>,
     shared: Arc<TaskShared>,
     resources: Arc<ThreadResources>,
-    _file_table_freeze: FileTableExecFreeze,
     old_caller: ThreadRef,
     replacement: ThreadRef,
     thread_set: PreparedThreadSet,
+    // Rollback drops every private resource before thawing the table, then
+    // resumes siblings only after the descriptor transaction has disappeared.
+    files: carrick_fd_core::exec::PreparedCloseOnExec<super::fd_exec::HostCloseOnExecStage>,
+    guard: ExecOperationGuard,
 }
 
 /// Kernel-minted proof of one committed exec cutover. It is deliberately not
@@ -428,10 +430,16 @@ impl Kernel {
         // table-wide freeze below supplies the cross-task exec linearization
         // point and remains held through registry publication.
         guard.drain = Some(context.task.drain_exec_siblings(context.thread.key()));
-        let caller_files = context.resources.files();
-        let file_table_freeze = caller_files
-            .freeze_for_exec()
-            .ok_or(ExecError::FileTableDraining)?;
+        let custody =
+            super::fd_exec::HostTableCustody::capture(self, context).map_err(|error| {
+                ExecError::Descriptors(super::fd_exec::prepare_errno(
+                    &carrick_fd_core::exec::PreparationError::Venue(error),
+                ))
+            })?;
+        let files = carrick_fd_core::exec::prepare_close_on_exec(context.task.key(), custody)
+            .map_err(|error| {
+                ExecError::Descriptors(super::fd_exec::prepare_errno(error.reason()))
+            })?;
 
         // Only the validated caller supplies exec survivors. K1 gives the new
         // image, staged file table, and caught-handler reset fresh identities;
@@ -446,10 +454,7 @@ impl Kernel {
             self.object_ids(),
             mm,
         )?);
-        let resources = Arc::new(crate::kernel::ThreadResources::for_exec(
-            &context.resources,
-            self.object_ids(),
-        )?);
+        let resources = Arc::new(context.resources.with_files(files.stage().files()));
         let leader_tid = LinuxTid::for_task_leader(context.task.key().id);
         let replacement = context.task.prepare_exec_thread(
             ThreadKey {
@@ -473,7 +478,7 @@ impl Kernel {
             old_mm: context.shared.mm(),
             shared,
             resources,
-            _file_table_freeze: file_table_freeze,
+            files,
             old_caller: Arc::clone(&context.thread),
             replacement,
             thread_set,
@@ -500,7 +505,6 @@ impl Kernel {
         let predecessor_thread = prepared.caller;
         let predecessor_mm = prepared.old_mm.id();
         let task_key = prepared.task;
-        let old_files = prepared.old_file_table();
         let Some(reservation) = prepared.guard.reservation.as_ref() else {
             return Err(ExecError::ReservationLost);
         };
@@ -663,7 +667,8 @@ impl Kernel {
             .unwrap_or(super::objects::ExecutionGeneration::INITIAL);
         self.auditors()
             .exec_committed(task_key, generation_before, generation_after);
-        self.retire_file_table_after_exec(&old_files, &prepared.resources.files());
+        let (_surviving_custody, releases) = carrick_fd_core::exec::commit(prepared.files);
+        drop(releases);
         self.retire_mm_io_state_if_unreferenced(&prepared.old_mm);
         let context = KernelContext::from_parts(
             self.clone(),
@@ -792,6 +797,8 @@ pub enum ExecError {
     InvariantLostAfterDrain,
     #[error("exec caller's file table is already draining")]
     FileTableDraining,
+    #[error("descriptor preparation refused: {0:?}")]
+    Descriptors(LinuxErrno),
     #[error("exec caller exited before commit")]
     CallerExited,
     #[error("prepared exec targets another task")]
@@ -912,6 +919,7 @@ impl ExecPrepareError {
                 | ExecError::StalePublication => LINUX_EAGAIN,
                 ExecError::TaskExited | ExecError::CallerExited => LINUX_ESRCH,
                 ExecError::FileTableDraining => LINUX_EBADF,
+                ExecError::Descriptors(errno) => *errno,
                 ExecError::ThreadExecution(_)
                 | ExecError::RevisionExhausted
                 | ExecError::RetiredThreadCapacity(_) => LINUX_ENOMEM,
@@ -994,6 +1002,143 @@ mod tests {
         )
         .expect("bootstrap input");
         Kernel::bootstrap_root(input).expect("kernel")
+    }
+
+    #[test]
+    fn prepared_cloexec_two_live_tasks_preserve_peer_and_rollback() {
+        use crate::kernel::fd_exec::HostTableCustody;
+        use carrick_fd_core::exec::{PreparationError, prepare_close_on_exec};
+        let (kernel, parent) = bootstrap(9110);
+        let child = kernel
+            .fork_task(
+                &parent,
+                ClonePlan::from_flags(LinuxCloneFlags::FILES).unwrap(),
+                ThreadId::synthetic_for_tests(9111),
+                "cloexec peer".into(),
+                None,
+            )
+            .unwrap();
+        let parent = kernel
+            .context(parent.task.key().id, parent.thread.key().tid)
+            .unwrap();
+        let files = parent.resources.files();
+        assert!(Arc::ptr_eq(&files, &child.resources.files()));
+        let fd = FileSlotNumber::for_open_fd(4).unwrap();
+        let description = Arc::new(FileDescription::regular(
+            kernel.object_ids().file_description_id().unwrap(),
+        ));
+        description.retain_fd_ref();
+        files.install(fd, Arc::clone(&description), true);
+        files.lock_stdio_cloexec()[0] = true;
+        let custody = HostTableCustody::capture(&kernel, &parent).unwrap();
+        let refused = prepare_close_on_exec(child.task.key(), custody)
+            .err()
+            .unwrap();
+        assert!(matches!(refused.reason(), PreparationError::WrongTask));
+        assert_eq!(
+            crate::kernel::fd_exec::prepare_errno(refused.reason()).get(),
+            3
+        );
+        drop(refused);
+        let prepared = kernel.prepare_exec(&parent, None).unwrap();
+        assert!(files.slot(fd).is_some());
+        assert!(prepared.files.stage().files().slot(fd).is_none());
+        drop(prepared);
+        assert!(!files.functional_gate_is_frozen());
+        assert_eq!(description.fd_ref_count(), 1);
+        assert!(child.resources.files().slot(fd).is_some());
+        let prepared = kernel.prepare_exec(&parent, None).unwrap();
+        let committed = kernel.commit_exec(prepared, None).unwrap();
+        assert!(committed.resources.files().slot(fd).is_none());
+        assert_eq!(
+            committed
+                .resources
+                .files()
+                .reserve_slot_at_or_above(0, 64)
+                .unwrap()
+                .fd(),
+            0
+        );
+        assert!(!child.resources.files().lock_closed_stdio()[0]);
+        assert!(child.resources.files().slot(fd).is_some());
+        assert_eq!(description.fd_ref_count(), 1);
+        assert!(!files.functional_gate_is_frozen());
+    }
+
+    #[test]
+    fn prepared_cloexec_retains_physical_releases_until_consumed_once() {
+        use crate::kernel::objects::{FileDescriptionFinalizer, FileDescriptionFinalizerKey};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Finalized(AtomicUsize);
+        impl FileDescriptionFinalizer for Finalized {
+            fn key(&self) -> FileDescriptionFinalizerKey {
+                FileDescriptionFinalizerKey::typed::<Self>(0, 0)
+            }
+            fn finalize(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (kernel, parent) = bootstrap(9140);
+        let child = kernel
+            .fork_task(
+                &parent,
+                ClonePlan::from_flags(LinuxCloneFlags::empty()).unwrap(),
+                ThreadId::synthetic_for_tests(9141),
+                "live peer".into(),
+                None,
+            )
+            .unwrap();
+        let parent = kernel
+            .context(parent.task.key().id, parent.thread.key().tid)
+            .unwrap();
+        let files = parent.resources.files();
+        let closed = Arc::new(FileDescription::regular(
+            kernel.object_ids().file_description_id().unwrap(),
+        ));
+        let kept = Arc::new(FileDescription::regular(
+            kernel.object_ids().file_description_id().unwrap(),
+        ));
+        let finalizer = Arc::new(Finalized(AtomicUsize::new(0)));
+        closed.retain_fd_ref();
+        kept.retain_fd_ref();
+        let lease = closed.retain_fd_lease().unwrap();
+        assert!(closed.register_terminal_finalizer(finalizer.clone()));
+        drop(lease);
+        files.install(
+            FileSlotNumber::for_open_fd(4).unwrap(),
+            closed.clone(),
+            true,
+        );
+        files.install(FileSlotNumber::for_open_fd(5).unwrap(), kept.clone(), false);
+        let prepared = kernel.prepare_exec(&parent, None).unwrap();
+        assert_eq!(closed.fd_ref_count(), 2);
+        assert_eq!(kept.fd_ref_count(), 2);
+        let committed = kernel.commit_exec(prepared, None).unwrap();
+        assert_eq!(closed.fd_ref_count(), 1, "predecessor release stays owned");
+        assert_eq!(kept.fd_ref_count(), 2);
+        assert_eq!(finalizer.0.load(Ordering::SeqCst), 0);
+        assert!(
+            kernel
+                .context(child.task.key().id, child.thread.key().tid)
+                .is_ok()
+        );
+        let dispatcher = crate::dispatch::SyscallDispatcher::new();
+        for _ in 0..2 {
+            dispatcher.close_draining_file_table(
+                &kernel,
+                &files,
+                Some(parent.task.key()),
+                Some(&committed.resources.files()),
+            );
+            assert_eq!(closed.fd_ref_count(), 0);
+            assert_eq!(kept.fd_ref_count(), 1);
+            assert_eq!(
+                finalizer.0.load(Ordering::SeqCst),
+                1,
+                "observational Arc cannot delay or repeat final release"
+            );
+        }
     }
 
     #[test]

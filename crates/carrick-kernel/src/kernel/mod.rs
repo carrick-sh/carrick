@@ -18,6 +18,7 @@ pub mod crash_capture;
 pub mod debug;
 pub mod exec;
 pub mod fd_ceiling;
+pub mod fd_exec;
 pub mod frame_inventory;
 pub mod identity_page;
 pub mod ids;

@@ -559,7 +559,7 @@ pub struct Kernel {
     hvpatch_child_token_verifier: Arc<carrick_hal::HvpatchChildTokenVerifier>,
     pub(super) observations: Mutex<ObservationInventory>,
     pub(super) exit_subscribers: TaskExitSubscribers,
-    pub(super) pending_file_closes: Mutex<Vec<FileCloseEvent>>,
+    pub(super) pending_file_closes: Mutex<Option<Box<FileCloseBatch>>>,
     reservation_gate: ReservationGate,
     /// The VM-wide kernel keyring store (`keyrings(7)`).
     ///
@@ -814,10 +814,27 @@ pub enum FileCloseDisposition {
 
 #[derive(Clone, Debug)]
 pub struct FileCloseEvent {
-    pub(crate) table: FileTableId,
     pub(crate) fd: i32,
     pub(crate) slot: FileSlot,
     pub(crate) disposition: FileCloseDisposition,
+}
+
+/// A preallocated retirement batch can enter the queue after exec publication
+/// without allocating. A table generation retires at most once.
+#[derive(Debug)]
+pub(super) struct FileCloseBatch {
+    pub table: FileTableId,
+    pub events: Vec<FileCloseEvent>,
+    pub next: Option<Box<FileCloseBatch>>,
+}
+
+impl Drop for FileCloseBatch {
+    fn drop(&mut self) {
+        // An idle consumer may accumulate many generations; drain iteratively.
+        while let Some(mut next) = self.next.take() {
+            self.next = next.next.take();
+        }
+    }
 }
 
 /// Kernel-owned, non-authoritative index of successfully published K1 object
@@ -1552,7 +1569,7 @@ impl Kernel {
             hvpatch_child_token_verifier,
             observations: Mutex::new(observations),
             exit_subscribers: TaskExitSubscribers::default(),
-            pending_file_closes: Mutex::new(Vec::new()),
+            pending_file_closes: Mutex::new(None),
             reservation_gate: ReservationGate::default(),
             #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
             schedule_hooks: super::schedule::Hooks::default(),
