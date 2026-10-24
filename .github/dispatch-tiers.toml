@@ -1,20 +1,3 @@
-# Only this table selects executables/models. Issue text is always prompt data.
-[tiers."dispatch:sol-high"]
-backend = "codex"
-model = "gpt-6.1-sol"
-effort = "high"
-coauthor = "GPT-6.1 Sol <noreply@openai.com>"
-
-[tiers."dispatch:argon-high"]
-backend = "agy"
-model = "argon-high"
-coauthor = "Gemini 4 Argon <noreply@google.com>"
-
-[tiers."dispatch:opus"]
-backend = "agy"
-model = "opus"
-coauthor = "Claude Opus <noreply@anthropic.com>"
-
 # Owner budgets (#797). The server refuses calls beyond these per-event caps.
 [loop]
 backend = "agy"

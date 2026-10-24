@@ -547,7 +547,8 @@ impl Admission {
                             == format!("{REPOSITORY}/{PILOT_WORKFLOW}@refs/heads/{PILOT_BRANCH}")
                 }
                 Self::Agent => {
-                    ((context.event == "issues" && branch == "main")
+                    ((matches!(context.event.as_str(), "issues" | "issue_comment")
+                        && branch == "main")
                         || (context.event == "pull_request_review"
                             && context
                                 .git_ref

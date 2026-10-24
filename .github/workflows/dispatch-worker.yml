@@ -3,6 +3,8 @@ name: Dispatch issue worker
 on:
   issues:
     types: [labeled]
+  issue_comment:
+    types: [created]
   pull_request_review:
     types: [submitted]
 
@@ -16,12 +18,12 @@ concurrency:
 
 jobs:
   guard:
-    if: github.event_name == 'issues' || (github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-'))
+    if: github.actor == 'tjfontaine' && (github.event_name == 'issues' || (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/agent')) || (github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-')))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
-      backend: ${{ steps.tier.outputs.backend }}
-      base: ${{ steps.tier.outputs.base }}
+      base: ${{ steps.validate.outputs.base }}
+      head: ${{ steps.validate.outputs.head }}
     steps:
       - name: Refuse stale owner reviews before checkout or build
         id: review-head
@@ -50,7 +52,7 @@ jobs:
           EVENT_SHA: ${{ github.sha }}
         run: |
           base="$EVENT_SHA"
-          if [ "$EVENT_NAME" = pull_request_review ]; then
+          if [ "$EVENT_NAME" != issues ]; then
             base=$(git ls-remote https://github.com/carrick-sh/carrick refs/heads/main | cut -f1)
           fi
           [[ "$base" =~ ^[0-9a-f]{40}$ ]]
@@ -59,11 +61,20 @@ jobs:
         with:
           ref: ${{ steps.base.outputs.base }}
           persist-credentials: false
-      - name: Validate actor, tier and brief before requesting a worker
-        id: tier
+      - name: Validate owner trigger and scope before requesting a worker
+        id: validate
         env:
           CARRICK_DISPATCH_BASE: ${{ steps.base.outputs.base }}
         run: cargo run --locked --release -p carrick-xtask -- dispatch-worker guard --event "$GITHUB_EVENT_PATH"
+
+      # REST run metadata omits issue_comment payloads. The controller uses
+      # these trusted-main step names to fetch and independently verify them.
+      - name: Dispatch comment ${{ github.event.issue.number }} ${{ github.event.comment.id }}
+        if: github.event_name == 'issue_comment'
+        run: ':'
+      - name: Dispatch head ${{ steps.validate.outputs.head }}
+        if: github.event_name == 'issue_comment' && github.event.issue.pull_request
+        run: ':'
 
   worker:
     needs: guard
@@ -76,6 +87,7 @@ jobs:
     # Environment overrides runner Cargo config for every step.
     env:
       CARRICK_DISPATCH_BASE: ${{ needs.guard.outputs.base }}
+      CARRICK_DISPATCH_HEAD: ${{ needs.guard.outputs.head }}
       RUSTC_WRAPPER: ''
       RUSTC_WORKSPACE_WRAPPER: ''
       CARGO_BUILD_RUSTC_WRAPPER: ''
@@ -135,24 +147,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker guard --admit --event "$GITHUB_EVENT_PATH"'
-      - name: Materialize selected provider credentials
+      - name: Materialize available worker and loop credentials
         id: auth
         if: ${{ !cancelled() && steps.bootstrap.outcome == 'success' && steps.admission.outcome == 'success' }}
         env:
-          CODEX_AUTH_JSON: ${{ steps.admission.outputs.backend == 'codex' && secrets.CODEX_AUTH_JSON || '' }}
-          AGY_OAUTH_TOKEN: ${{ (steps.admission.outputs.backend == 'agy' || github.event_name == 'pull_request_review') && secrets.AGY_OAUTH_TOKEN || '' }}
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          AGY_OAUTH_TOKEN: ${{ secrets.AGY_OAUTH_TOKEN }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner auth --event "$GITHUB_EVENT_PATH"'
-      - name: Run foreground agent and collect output
-        id: worker
-        if: ${{ !cancelled() && github.event_name == 'issues' && steps.driver.outcome == 'success' && steps.admission.outcome == 'success' }}
-        timeout-minutes: 40
-        run: >-
-          "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode carrick --check-load --
-          "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker run --event "$GITHUB_EVENT_PATH"
-          --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
-      - name: Continue owner review through the policy tool server
+      - name: Run owner dispatch through the policy tool server
         id: loop
-        if: ${{ !cancelled() && github.event_name == 'pull_request_review' && steps.driver.outcome == 'success' && steps.admission.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.driver.outcome == 'success' && steps.admission.outcome == 'success' }}
         timeout-minutes: 47
         env:
           GH_TOKEN: ${{ github.token }}
@@ -164,15 +168,9 @@ jobs:
         id: retire
         if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker guard --retire --event "$GITHUB_EVENT_PATH"'
-      - name: Scan output, push only this run branch and report its draft PR
-        id: complete
-        if: ${{ !cancelled() && github.event_name == 'issues' && steps.retire.outcome == 'success' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: '"$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker complete --event "$GITHUB_EVENT_PATH"'
       - uses: actions/upload-artifact@v4
         id: upload
-        if: ${{ !cancelled() && steps.retire.outcome == 'success' && (steps.complete.outcome == 'success' || steps.loop.outcome == 'success') }}
+        if: ${{ !cancelled() && steps.retire.outcome == 'success' && steps.loop.outcome == 'success' }}
         with:
           name: dispatch-${{ github.event.issue.number || github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dispatch-output
@@ -185,5 +183,5 @@ jobs:
             "$RUNNER_TEMP/carrick-dispatch-driver" agent-runner cleanup
           fi
       - name: Reflect the worker contract in the job verdict
-        if: ${{ !cancelled() && (steps.complete.outputs.worker_failed == 'true' || steps.loop.outputs.worker_failed == 'true') }}
+        if: ${{ !cancelled() && steps.loop.outputs.worker_failed == 'true' }}
         run: exit 1

@@ -37,24 +37,11 @@ pub enum DispatchAction {
         #[arg(long, conflicts_with = "admit")]
         retire: bool,
     },
-    /// Finish this job: scan artifacts, push its branch and report the contract.
-    Complete {
-        #[arg(long)]
-        event: PathBuf,
-    },
-    /// Foreground worker and artifact producer.
-    Run {
-        #[arg(long)]
-        event: PathBuf,
-        /// Actions bootstrap/auth outcomes; failure reports without starting tools.
-        #[arg(long, default_value = "success/success")]
-        setup_status: String,
-    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Tier {
+pub struct Worker {
     pub backend: String,
     pub model: String,
     pub effort: Option<String>,
@@ -62,8 +49,7 @@ pub struct Tier {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Tiers {
-    tiers: std::collections::BTreeMap<String, Tier>,
+struct LoopConfig {
     #[serde(rename = "loop")]
     loop_policy: agent_loop::Policy,
 }
@@ -77,10 +63,10 @@ pub fn trusted_actor(actor: &str) -> bool {
 pub struct Dispatch {
     pub issue: u64,
     pub title: String,
-    pub brief: String,
+    pub body: String,
     pub branch: String,
     pub resume: bool,
-    pub tier: Tier,
+    pub worker: Worker,
     pub base: String,
     pub review: bool,
     pub review_text: String,
@@ -96,7 +82,7 @@ pub struct Dispatch {
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdmittedDispatch {
     pub dispatch: Dispatch,
-    pub review: Value,
+    pub trigger: Value,
     event_digest: String,
 }
 fn event_digest(path: &Path) -> Result<String, ScalerError> {
@@ -112,7 +98,13 @@ fn persist_admission(dispatch: &Dispatch, event: &Value, path: &Path) -> Result<
     std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
     let admission = AdmittedDispatch {
         dispatch: dispatch.clone(),
-        review: event["review"].clone(),
+        trigger: if event.get("review").is_some() {
+            event["review"].clone()
+        } else if event.get("comment").is_some() {
+            event["comment"].clone()
+        } else {
+            event["label"].clone()
+        },
         event_digest: event_digest(path)?,
     };
     crate::agent_runner::secret_file(
@@ -131,206 +123,101 @@ pub(crate) fn read_admission(event: &Path) -> Result<AdmittedDispatch, ScalerErr
     Ok(admission)
 }
 
+pub(crate) fn dispatch_label(label: &str) -> bool {
+    label == "dispatch" || label.starts_with("dispatch:")
+}
+
+/// Used by the guard and controller; text is context, never executable policy.
+pub(crate) fn agent_comment(comment: &Value) -> bool {
+    let body = comment["body"].as_str().unwrap_or_default();
+    comment["user"]["login"] == "tjfontaine"
+        && comment["user"]["type"] == "User"
+        && comment["created_at"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+        && comment["created_at"] == comment["updated_at"]
+        && (body == "/agent"
+            || body
+                .strip_prefix("/agent")
+                .is_some_and(|s| s.starts_with(char::is_whitespace)))
+}
+
 pub fn validate_event(
     event: &Value,
-    tiers: &str,
+    _config: &str,
     triggering_actor: &str,
 ) -> Result<Dispatch, ScalerError> {
-    let sender = event["sender"]["login"].as_str().unwrap_or_default();
-    let kind = event["sender"]["type"].as_str().unwrap_or_default();
     let review = event.get("review").is_some();
+    let comment = event.get("comment").is_some();
     if event["repository"]["full_name"] != REPOSITORY
-        || event["action"] != if review { "submitted" } else { "labeled" }
-        || event["issue"].get("pull_request").is_some()
-        || !trusted_actor(sender)
+        || !trusted_actor(event["sender"]["login"].as_str().unwrap_or_default())
         || !trusted_actor(triggering_actor)
-        || kind != "User"
+        || event["sender"]["type"] != "User"
         || event["issue"]["user"]["login"] != "tjfontaine"
+        || event["issue"].get("pull_request").is_some()
     {
         return Err(ScalerError::Guard(
-            "dispatch requires the owner labeling an owner-authored issue",
+            "dispatch requires owner actors and an owner-authored issue",
         ));
-    }
-    let tiers: Tiers =
-        toml::from_str(tiers).map_err(|_| ScalerError::Guard("invalid dispatch tier table"))?;
-    let review_label;
-    let label = if review {
-        let pr = &event["pull_request"];
-        let issue = event["issue"]["number"].as_u64().unwrap_or_default();
-        let branch = pr["head"]["ref"].as_str().unwrap_or_default();
-        if event["review"]["state"] != "changes_requested"
-            || event["review"]["user"]["login"] != "tjfontaine"
-            || event["review"]["user"]["type"] != "User"
-            || event["issue"]["state"] != "open"
-            || !owned_pr(pr, &event["dispatch_run"], issue, branch)
-        {
-            return Err(ScalerError::Guard(
-                "review requires owner changes_requested on an owned dispatch PR and open issue",
-            ));
-        }
-        let labels: Vec<_> = event["issue"]["labels"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v["name"].as_str())
-            .filter(|s| s.starts_with("dispatch:"))
-            .collect();
-        if labels.len() != 1 {
-            return Err(ScalerError::Guard(
-                "review requires exactly one dispatch label",
-            ));
-        }
-        review_label = json!({"name":labels[0]});
-        &review_label
-    } else {
-        &event["label"]
-    };
-    let tier = label["name"]
-        .as_str()
-        .and_then(|label| tiers.tiers.get(label))
-        .cloned()
-        .ok_or(ScalerError::Guard("dispatch label is not allowlisted"))?;
-    if !matches!(tier.backend.as_str(), "codex" | "agy") {
-        return Err(ScalerError::Guard("unknown dispatch backend"));
     }
     let issue = event["issue"]["number"]
         .as_u64()
         .filter(|n| *n > 0)
         .ok_or(ScalerError::Guard("missing issue number"))?;
-    let title = event["issue"]["title"]
-        .as_str()
-        .ok_or(ScalerError::Guard("missing issue title"))?
-        .to_owned();
-    let body = event["issue"]["body"].as_str().unwrap_or_default();
-    let brief = brief_section(body)?;
-    let branches = branch_directives(&brief);
-    if !review && branches.len() > 1 {
-        return Err(ScalerError::Guard("multiple branch directives"));
-    }
-    let branch = if review {
-        event["pull_request"]["head"]["ref"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned()
-    } else if let Some(branch) = branches.first() {
-        if !valid_branch(branch) {
-            return Err(ScalerError::Guard("brief branch must be a valid work/ ref"));
+    if review {
+        if event["action"] != "submitted"
+            || event["review"]["state"] != "changes_requested"
+            || event["review"]["user"]["login"] != "tjfontaine"
+            || event["review"]["user"]["type"] != "User"
+        {
+            return Err(ScalerError::Guard(
+                "review requires owner changes_requested",
+            ));
         }
-        (*branch).to_owned()
+    } else if comment {
+        if event["action"] != "created" || !agent_comment(&event["comment"]) {
+            return Err(ScalerError::Guard(
+                "comment requires an unedited owner /agent creation",
+            ));
+        }
+    } else if event["action"] != "labeled"
+        || !event["label"]["name"].as_str().is_some_and(dispatch_label)
+    {
+        return Err(ScalerError::Guard("not a dispatch label event"));
+    }
+    let resume = event.get("pull_request").is_some();
+    let branch = if resume {
+        let pr = &event["pull_request"];
+        let branch = pr["head"]["ref"].as_str().unwrap_or_default();
+        if event["issue"]["state"] != "open" || !owned_pr(pr, &event["dispatch_run"], issue, branch)
+        {
+            return Err(ScalerError::Guard(
+                "trigger requires an open issue and owned dispatch PR",
+            ));
+        }
+        branch.to_owned()
     } else {
         format!("work/dispatch-{issue}-pending")
     };
-    let resume = review || !branches.is_empty();
     Ok(Dispatch {
         issue,
-        title,
-        brief,
+        title: event["issue"]["title"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        body: event["issue"]["body"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
         branch,
         resume,
-        tier,
+        worker: Worker::default(),
         base: String::new(),
         review,
         review_text: String::new(),
         worker_seconds: None,
         loop_deadline: None,
     })
-}
-
-fn branch_directives(brief: &str) -> Vec<&str> {
-    let mut fence: Option<(char, usize)> = None;
-    let mut branches = Vec::new();
-    let mut comment = false;
-    for line in brief.lines() {
-        if line.contains("<!--") {
-            comment = true;
-        }
-        if comment {
-            if line.contains("-->") {
-                comment = false;
-            }
-            continue;
-        }
-        let trimmed = line.trim();
-        if advance_fence(trimmed, &mut fence) {
-            continue;
-        }
-        if fence.is_none()
-            && let Some(branch) = line.strip_prefix("Branch: ")
-        {
-            branches.push(branch);
-        }
-    }
-    branches
-}
-fn advance_fence(trimmed: &str, fence: &mut Option<(char, usize)>) -> bool {
-    let Some(marker @ ('`' | '~')) = trimmed.chars().next() else {
-        return false;
-    };
-    let count = trimmed.chars().take_while(|c| *c == marker).count();
-    if count < 3 {
-        return false;
-    }
-    match *fence {
-        None => *fence = Some((marker, count)),
-        Some((open, length))
-            if open == marker && count >= length && trimmed[count..].trim().is_empty() =>
-        {
-            *fence = None
-        }
-        _ => {}
-    }
-    true
-}
-
-pub fn brief_section(body: &str) -> Result<String, ScalerError> {
-    let mut in_brief = false;
-    let mut found = false;
-    let mut lines = Vec::new();
-    // Markdown fences may contain headings; they do not delimit sections.
-    let mut fence = None;
-    let mut comment = false;
-    for line in body.lines() {
-        if line.contains("<!--") {
-            comment = true;
-        }
-        if comment {
-            if line.contains("-->") {
-                comment = false;
-            }
-            if in_brief {
-                lines.push(line);
-            }
-            continue;
-        }
-        let trimmed = line.trim();
-        if advance_fence(trimmed, &mut fence) {
-            if in_brief {
-                lines.push(line);
-            }
-            continue;
-        }
-        if fence.is_none() && trimmed == "## Brief" {
-            if found {
-                return Err(ScalerError::Guard("multiple Brief sections"));
-            }
-            found = true;
-            in_brief = true;
-            continue;
-        }
-        if fence.is_none() && (trimmed.starts_with("## ") || trimmed.starts_with("# ")) {
-            in_brief = false;
-        }
-        if in_brief {
-            lines.push(line);
-        }
-    }
-    let brief = lines.join("\n").trim().to_owned();
-    if brief.is_empty() {
-        return Err(ScalerError::Guard(
-            "issue requires a nonempty ## Brief section",
-        ));
-    }
-    Ok(brief)
 }
 
 pub fn valid_branch(branch: &str) -> bool {
@@ -603,8 +490,8 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         Return the requested JSON contract, stating unrun gates and blockers honestly.\n\n{}{}",
         dispatch.issue,
         dispatch.branch,
-        dispatch.tier.coauthor,
-        dispatch.brief,
+        dispatch.worker.coauthor,
+        dispatch.body,
         dispatch.review_text
     );
     std::fs::write(&prompt_file, prompt)?;
@@ -620,9 +507,9 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         Foreground {
             run: "dispatch",
             name: "worker",
-            backend: &dispatch.tier.backend,
-            model: &dispatch.tier.model,
-            effort: dispatch.tier.effort.as_deref(),
+            backend: &dispatch.worker.backend,
+            model: &dispatch.worker.model,
+            effort: dispatch.worker.effort.as_deref(),
             schema: Some(&schema_path),
             limit,
         },
@@ -650,7 +537,7 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         .env("AGY_BIN", state.join("bin/agy"))
         // The template's read-only, hash-locked SDK (#773) carries the whole
         // codex package (codex, codex-code-mode-host, rg, bwrap); a lone
-        // codex binary override cannot run tools. The tier table names the
+        // codex binary override cannot run tools. The loop names the
         // backend, so the launcher's own route default must not report the
         // dispatch as overriding an owner pause.
         .env("AGY_DIRECTOR_CODEX_VENV", CODEX_SDK_VENV)
@@ -670,11 +557,7 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         &mut isolated,
         remaining
             .min(limit)
-            .min(crate::agent_runner::job_remaining(if dispatch.review {
-                58
-            } else {
-                32
-            })?),
+            .min(crate::agent_runner::job_remaining(58)?),
     );
     retire_agent()?;
     let code = outcome?;
@@ -721,7 +604,7 @@ fn checkpoint(root: &Path, dispatch: &Dispatch) -> Result<bool, ScalerError> {
     }
     let message = format!(
         "chore(ci): checkpoint issue {} worker progress\n\nWhy: preserve unfinished work before this ephemeral clone is destroyed.\n\nWhat: record the worker's current changes for review and continuation.\n\nVerified: see the dispatch issue contract; this is a WIP checkpoint.\n\nCo-Authored-By: {}",
-        dispatch.issue, dispatch.tier.coauthor
+        dispatch.issue, dispatch.worker.coauthor
     );
     git(root, &["commit", "-m", &message])?;
     Ok(true)
@@ -985,7 +868,8 @@ pub(crate) fn dispatch_run_identity(run: &Value, issue: Option<u64>) -> bool {
         || ![&run["actor"], &run["triggering_actor"]]
             .iter()
             .all(|actor| actor["login"] == "tjfontaine" && actor["type"] == "User")
-        || !((run["event"] == "issues" && branch == "main")
+        || !((matches!(run["event"].as_str(), Some("issues" | "issue_comment"))
+            && branch == "main")
             || (run["event"] == "pull_request_review" && review_issue.is_some()))
     {
         return false;
@@ -1030,8 +914,6 @@ pub(crate) fn owned_pr(pr: &Value, run: &Value, issue: u64, branch: &str) -> boo
         && pr["draft"] == true
         && run["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id)
         && dispatch_run_identity(run, Some(issue))
-        && run["event"] == "issues"
-        && run["head_branch"] == "main"
         && pr["body"].as_str().is_some_and(|body| {
             body.lines().any(|line| line == format!("Closes #{issue}"))
                 && body.lines().any(|line| {
@@ -1110,20 +992,105 @@ fn api(root: &Path, endpoint: &str) -> Result<Value, ScalerError> {
     Ok(serde_json::from_str(&response)?)
 }
 
+/// Resolve only server-owned scope. Model text is never parsed for branches.
 pub(crate) fn load_event(root: &Path, path: &Path) -> Result<Value, ScalerError> {
     let mut event: Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    if event.get("review").is_some() {
+    if !trusted_actor(event["sender"]["login"].as_str().unwrap_or_default()) {
+        return Err(ScalerError::Guard("untrusted event actor"));
+    }
+    if event.get("comment").is_some() {
+        let id = event["comment"]["id"]
+            .as_u64()
+            .ok_or(ScalerError::Guard("missing comment id"))?;
+        let live = api(root, &format!("repos/{REPOSITORY}/issues/comments/{id}"))?;
+        if !agent_comment(&live)
+            || ["id", "body", "created_at", "updated_at", "user"]
+                .iter()
+                .any(|k| live[k] != event["comment"][k])
+        {
+            return Err(ScalerError::Guard("triggering comment changed"));
+        }
+        if event["issue"].get("pull_request").is_some() {
+            let number = event["issue"]["number"]
+                .as_u64()
+                .ok_or(ScalerError::Guard("missing PR number"))?;
+            event["pull_request"] = api(root, &format!("repos/{REPOSITORY}/pulls/{number}"))?;
+        }
+    }
+    if event.get("pull_request").is_some() {
         let branch = event["pull_request"]["head"]["ref"]
             .as_str()
-            .unwrap_or_default();
-        let issue = dispatch_branch(branch).ok_or(ScalerError::Guard("not a dispatch head ref"))?;
-        let id = branch_run(issue, branch)?;
-        let run = api(root, &format!("repos/{REPOSITORY}/actions/runs/{id}"))?;
-        let issue = api(root, &format!("repos/{REPOSITORY}/issues/{issue}"))?;
-        event["dispatch_run"] = run;
-        event["issue"] = issue;
+            .unwrap_or_default()
+            .to_owned();
+        let issue =
+            dispatch_branch(&branch).ok_or(ScalerError::Guard("not a dispatch head ref"))?;
+        let id = branch_run(issue, &branch)?;
+        let number = event["pull_request"]["number"]
+            .as_u64()
+            .ok_or(ScalerError::Guard("missing PR number"))?;
+        let live = api(root, &format!("repos/{REPOSITORY}/pulls/{number}"))?;
+        let expected = std::env::var("CARRICK_DISPATCH_HEAD")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                event["pull_request"]["head"]["sha"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            });
+        if !sha(&expected) || live["head"]["sha"] != expected {
+            return Err(ScalerError::Guard("stale PR head"));
+        }
+        event["pull_request"] = live;
+        event["dispatch_run"] = api(root, &format!("repos/{REPOSITORY}/actions/runs/{id}"))?;
+        event["issue"] = api(root, &format!("repos/{REPOSITORY}/issues/{issue}"))?;
     }
     Ok(event)
+}
+
+/// Select a single open owned PR, authenticating the original branch run.
+fn select_owned_pr(
+    issue: u64,
+    prs: &[Value],
+    mut run: impl FnMut(&str) -> Result<Value, ScalerError>,
+) -> Result<Option<Value>, ScalerError> {
+    let mut selected = None;
+    for pr in prs.iter().filter(|pr| pr["state"] == "open") {
+        let branch = pr["head"]["ref"].as_str().unwrap_or_default();
+        if dispatch_branch(branch) != Some(issue) {
+            continue;
+        }
+        let original = run(branch_run(issue, branch)?)?;
+        if owned_pr(pr, &original, issue, branch) {
+            if selected.is_some() {
+                return Err(ScalerError::Guard("multiple open owned dispatch PRs"));
+            }
+            selected = Some(pr.clone());
+        }
+    }
+    Ok(selected)
+}
+
+fn linked_prs(root: &Path, issue: u64, state: &str) -> Result<Vec<Value>, ScalerError> {
+    let mut result = Vec::new();
+    for page in 1.. {
+        let data = api(
+            root,
+            &format!("repos/{REPOSITORY}/pulls?state={state}&base=main&per_page=100&page={page}"),
+        )?;
+        let prs = data
+            .as_array()
+            .ok_or(ScalerError::Guard("invalid PR list"))?;
+        result.extend(
+            prs.iter()
+                .filter(|pr| pr["head"]["ref"].as_str().and_then(dispatch_branch) == Some(issue))
+                .cloned(),
+        );
+        if prs.len() < 100 {
+            break;
+        }
+    }
+    Ok(result)
 }
 
 pub(crate) fn dispatch_branch(branch: &str) -> Option<u64> {
@@ -1138,80 +1105,61 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     if let DispatchAction::Tool { name } = &args.action {
         return agent_loop::client(name);
     }
-    if matches!(
-        &args.action,
-        DispatchAction::Run { .. } | DispatchAction::Guard { retire: true, .. }
-    ) && ["GH_TOKEN", "GITHUB_TOKEN"]
-        .iter()
-        .any(|key| std::env::var_os(key).is_some())
-    {
-        return Err(ScalerError::Guard("agent phase received a job token"));
+    if matches!(&args.action, DispatchAction::Guard { retire: true, .. }) {
+        if ["GH_TOKEN", "GITHUB_TOKEN"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some())
+        {
+            return Err(ScalerError::Guard("agent phase received a job token"));
+        }
+        return cleanup_dispatch_users();
     }
     let root = root.canonicalize()?;
-    let (event_path, setup, complete, admit, retire) = match args.action {
+    let (event_path, admit) = match args.action {
         DispatchAction::Tool { .. } => return Err(ScalerError::Guard("tool already handled")),
         DispatchAction::Loop {
             event,
             setup_status,
         } => return agent_loop::run(&root, &event, &setup_status),
-        DispatchAction::Guard {
-            event,
-            admit,
-            retire,
-        } => (event, None, false, admit, retire),
-        DispatchAction::Run {
-            event,
-            setup_status,
-        } => (event, Some(setup_status), false, false, false),
-        DispatchAction::Complete { event } => (event, None, true, false, false),
+        DispatchAction::Guard { event, admit, .. } => (event, admit),
     };
-    if retire {
-        return cleanup_dispatch_users();
-    }
-    let event = load_event(&root, &event_path)?;
+    let mut event = load_event(&root, &event_path)?;
     let mut dispatch = validate_event(
         &event,
         include_str!("../../../.github/dispatch-tiers.toml"),
         &std::env::var("GITHUB_TRIGGERING_ACTOR").unwrap_or_default(),
     )?;
     dispatch.base = admitted_base(dispatch.review)?;
+    if admit {
+        cleanup_agent_user()?;
+        if !dispatch.resume {
+            let prs = linked_prs(&root, dispatch.issue, "open")?;
+            if let Some(pr) = select_owned_pr(dispatch.issue, &prs, |id| {
+                api(&root, &format!("repos/{REPOSITORY}/actions/runs/{id}"))
+            })? {
+                dispatch.branch = pr["head"]["ref"].as_str().unwrap_or_default().to_owned();
+                dispatch.resume = true;
+                event["pull_request"] = pr;
+            }
+        }
+    }
     assigned_branch(&mut dispatch)?;
     branch_run(dispatch.issue, &dispatch.branch)?;
     if admit {
-        cleanup_agent_user()?;
         if dispatch.resume {
             require_owned_pr(&root, &dispatch)?;
-            git(
-                &root,
-                &[
-                    "-c",
-                    "credential.helper=!gh auth git-credential",
-                    "fetch",
-                    "--no-tags",
-                    "https://github.com/carrick-sh/carrick",
-                    &format!("refs/heads/{0}:refs/heads/{0}", dispatch.branch),
-                ],
-            )?;
         }
-    }
-    if admit {
         persist_admission(&dispatch, &event, &event_path)?;
     }
-    if complete {
-        return finish(&root, &dispatch);
-    }
-    if let Some(setup) = setup {
-        if let Err(error) = produce(&root, &dispatch, &setup) {
-            cleanup_agent_user()?;
-            produce(&root, &dispatch, &error.to_string())?;
-        }
-    } else if let Some(path) = std::env::var_os("GITHUB_OUTPUT") {
+    if let Some(path) = std::env::var_os("GITHUB_OUTPUT") {
         use std::io::Write;
         writeln!(
             std::fs::OpenOptions::new().append(true).open(path)?,
-            "backend={}\nbase={}",
-            dispatch.tier.backend,
-            dispatch.base
+            "base={}\nhead={}",
+            dispatch.base,
+            event["pull_request"]["head"]["sha"]
+                .as_str()
+                .unwrap_or_default()
         )?;
     }
     Ok(())
@@ -1571,109 +1519,182 @@ fn publish(
                     path.to_str().ok_or(ScalerError::Guard("body path"))?,
                 ],
             )?;
+            return Ok(require_owned_pr(root, dispatch)?["number"].as_u64());
         }
     }
     Ok(None)
 }
 
-fn finish(root: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
-    cleanup_agent_user()?;
-    let token = std::env::var("GH_TOKEN").map_err(|_| ScalerError::Guard("missing job token"))?;
-    let state = crate::agent_runner::state()?;
-    let package =
-        PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?)
-            .join("dispatch-output");
-    if !state.join("receipt.json").exists() {
-        produce(
-            root,
-            dispatch,
-            "Worker phase failed before producing a receipt",
-        )?;
-    }
-    mask_artifacts(&package, &token)?;
-    let receipt: Receipt = serde_json::from_str(&regular_text(&state.join("receipt.json"))?)?;
-    if receipt.branch != dispatch.branch || !sha(&receipt.base) || dispatch.base != receipt.base {
-        return Err(ScalerError::Guard("dispatch receipt mismatch"));
-    }
-    let contract: Contract = serde_json::from_str(&regular_text(&package.join("contract.json"))?)?;
-    let report_path = state.join("report.md");
-    let details = serde_json::to_string_pretty(&contract)?;
-    // Keep API comments below GitHub's body limit; full logs/contract are artifacts.
-    let excerpt = details.chars().take(8_000).collect::<String>();
-    let report = format!(
-        "Dispatch run: https://github.com/{REPOSITORY}/actions/runs/{}\n\nWorker contract (claims for review):\n\n```json\n{excerpt}\n```\n\nFull contract and transcript are attached to the workflow run.\n",
-        run_id()?
-    );
-    std::fs::write(&report_path, report.replace(&token, "[REDACTED]"))?;
-    let publication =
-        publish(root, dispatch, &receipt, &contract, &report_path, &token).and_then(|pr| {
-            if let Some(pr) = pr {
-                gh(
-                    root,
-                    &[
-                        "pr",
-                        "comment",
-                        &pr.to_string(),
-                        "--repo",
-                        REPOSITORY,
-                        "--body-file",
-                        report_path
-                            .to_str()
-                            .ok_or(ScalerError::Guard("report path"))?,
-                    ],
-                )?;
-            }
-            Ok(())
-        });
-    if let Err(error) = &publication {
-        use std::io::Write;
-        let diagnostic = crate::dispatch_redaction::redact(error.to_string().as_bytes());
-        writeln!(
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&report_path)?,
-            "\nPublication failed: {}",
-            diagnostic.chars().take(4_000).collect::<String>()
-        )?;
-    }
-    if let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY") {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(summary)?
-            .write_all(regular_text(&report_path)?.as_bytes())?;
-    }
-    // The workflow owns reporting. The agent cannot access its command-file channels.
-    gh(
-        root,
-        &[
-            "issue",
-            "comment",
-            &dispatch.issue.to_string(),
-            "--repo",
-            REPOSITORY,
-            "--body-file",
-            report_path
-                .to_str()
-                .ok_or(ScalerError::Guard("transcript path"))?,
-        ],
-    )?;
-    if publication.is_err() || receipt.exit_code != 0 || contract.status != ContractStatus::Done {
-        // Report failure separately, so scanned artifacts remain available on failed runs.
-        if let Some(path) = std::env::var_os("GITHUB_OUTPUT") {
-            use std::io::Write;
-            writeln!(
-                std::fs::OpenOptions::new().append(true).open(path)?,
-                "worker_failed=true"
-            )?;
-        }
-    }
-    Ok(())
-}
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn label_publication_creates_draft_and_continues_the_owned_branch() {
+        const CHILD: &str = "CARRICK_TEST_DISPATCH_PUBLICATION";
+        if std::env::var_os(CHILD).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            for (name, script) in [
+                (
+                    "git",
+                    r#"#!/bin/sh
+for arg do
+ case "$arg" in
+ ls-remote) if test -f "$RUNNER_TEMP/remote-tip"; then cat "$RUNNER_TEMP/remote-tip"; fi; exit 0 ;;
+ push) printf '%s\n' "$@" >> "$RUNNER_TEMP/push.args"; /usr/bin/git rev-parse HEAD > "$RUNNER_TEMP/remote-tip"; exit 0 ;;
+ esac
+done
+exec /usr/bin/git "$@"
+"#,
+                ),
+                (
+                    "gh",
+                    r#"#!/bin/sh
+printf '%s\n' "$@" >> "$RUNNER_TEMP/gh.args"
+if test "$1" = api; then
+ case "$2" in
+ */actions/runs/42) cat "$RUNNER_TEMP/original.json" ;;
+ *'/pulls?'*) if test -f "$RUNNER_TEMP/created"; then cat "$RUNNER_TEMP/pr.json"; else echo '[]'; fi ;;
+ *) exit 91 ;;
+ esac
+elif test "$1 $2" = 'pr create'; then
+ test ! -f "$RUNNER_TEMP/created" || exit 92
+ touch "$RUNNER_TEMP/created"
+ echo 'https://github.com/carrick-sh/carrick/pull/800'
+else exit 93
+fi
+"#,
+                ),
+            ] {
+                let path = bin.join(name);
+                std::fs::write(&path, script).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "dispatch_worker::tests::label_publication_creates_draft_and_continues_the_owned_branch", "--nocapture"])
+                .env(CHILD, "1").env("RUNNER_TEMP", temp.path())
+                .env("GITHUB_RUN_ID", "42").env("GITHUB_RUN_ATTEMPT", "1")
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout).to_string()
+                    + &String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let outer = PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap());
+        let state = crate::agent_runner::state().unwrap();
+        let work = state.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        fixture_repository(&work);
+        let base = git(&work, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        let mut event = event();
+        event["label"]["name"] = "dispatch".into();
+        let mut dispatch = validate_event(&event, TIERS, "tjfontaine").unwrap();
+        dispatch.base = base.clone();
+        assigned_branch(&mut dispatch).unwrap();
+        assert_eq!(dispatch.branch, "work/dispatch-634-42");
+        git(&work, &["checkout", "-b", &dispatch.branch]).unwrap();
+        let subject = "fix(ci): implement the owner issue";
+        git(&work, &["commit", "--allow-empty", "-m", subject]).unwrap();
+        let pr = json!({"state":"open","number":800,"user":{"login":"github-actions[bot]","type":"Bot"},"head":{"ref":dispatch.branch,"repo":{"full_name":REPOSITORY}},"base":{"ref":"main"},"draft":true,"body":format!("Closes #634\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
+        let run = review_event()["dispatch_run"].clone();
+        std::fs::write(outer.join("original.json"), run.to_string()).unwrap();
+        std::fs::write(outer.join("pr.json"), json!([pr.clone()]).to_string()).unwrap();
+        let contract = Contract {
+            status: ContractStatus::Done,
+            summary: "implemented".into(),
+            tests: vec![],
+            risks: vec![],
+        };
+        let mut receipt = Receipt {
+            base,
+            branch: dispatch.branch.clone(),
+            exit_code: 0,
+            expected_tip: String::new(),
+            refused_workflow: false,
+        };
+        let report = state.join("report.md");
+        std::fs::write(&report, "").unwrap();
+        assert_eq!(
+            publish(
+                &work,
+                &dispatch,
+                &receipt,
+                &contract,
+                &report,
+                "fixture-token"
+            )
+            .unwrap(),
+            Some(800)
+        );
+        let body = regular_text(&state.join("pr-body.md")).unwrap();
+        assert!(body.contains("Closes #634") && body.contains("Dispatch run:"));
+        let calls = regular_text(&outer.join("gh.args")).unwrap();
+        assert!(calls.contains(&format!(
+            "--draft\n--base\nmain\n--head\n{}\n--title\n{subject}",
+            dispatch.branch
+        )));
+        let selected = select_owned_pr(dispatch.issue, &[pr.clone()], |_| Ok(run.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected["head"]["ref"], dispatch.branch);
+        let mut unowned = pr;
+        unowned["user"]["login"] = "outsider".into();
+        assert!(
+            select_owned_pr(dispatch.issue, &[unowned], |_| Ok(run.clone()))
+                .unwrap()
+                .is_none()
+        );
+        dispatch.resume = true;
+        receipt.expected_tip = git(&work, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        git(
+            &work,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fix(ci): apply owner follow-up",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            publish(
+                &work,
+                &dispatch,
+                &receipt,
+                &contract,
+                &report,
+                "fixture-token"
+            )
+            .unwrap(),
+            Some(800)
+        );
+        let calls = regular_text(&outer.join("gh.args")).unwrap();
+        assert_eq!(calls.lines().filter(|s| *s == "create").count(), 1);
+        let pushes = regular_text(&outer.join("push.args")).unwrap();
+        assert_eq!(
+            pushes
+                .lines()
+                .filter(|s| *s == "HEAD:refs/heads/work/dispatch-634-42")
+                .count(),
+            2
+        );
+        assert!(pushes.contains(&format!(
+            "--force-with-lease=refs/heads/{}:{}",
+            dispatch.branch, receipt.expected_tip
+        )));
+    }
     #[test]
     fn draft_pr_title_uses_the_first_branch_commit_subject() {
         let temp = tempfile::tempdir().unwrap();
@@ -1948,18 +1969,6 @@ mod tests {
         }
     }
     #[test]
-    fn html_comments_do_not_select_a_branch() {
-        assert!(
-            branch_directives(
-                "<!--
-Branch: work/foreign
--->
-Do it"
-            )
-            .is_empty()
-        );
-    }
-    #[test]
     fn agent_environment_has_no_github_token_or_config() {
         let mut cmd = Command::new("/usr/bin/env");
         cmd.env("GH_TOKEN", "planted")
@@ -2094,6 +2103,53 @@ Do it"
             "sender":{"login":"tjfontaine","type":"User"},"label":{"name":"dispatch:sol-high"},
             "issue":{"number":634,"user":{"login":"tjfontaine"},"title":"Dispatch workers!","body":"## Why\ncontext\n## Brief\nImplement it\n### Verify\nCheck it\n## Notes\nnot prompt"}})
     }
+    #[test]
+    fn issue_587_as_written_reaches_the_loop() {
+        let mut value = event();
+        value["issue"]["number"] = json!(587);
+        value["issue"]["body"] = json!(
+            "From the #548 independent review: `crates/carrick-xtask/src/ci_scaler/security_tests.rs` (around :47 and the new test near :428) still sets `set_read_timeout(2s)` on the fixture stream.\n\nFailure: if curl is descheduled for more than 2 s between connect and sending its request, `stream.read().unwrap()` panics and the test fails on speed rather than correctness. That is a load-dependent verdict.\n\nAcceptance: use the same 60 s hang bound as `execute`/`http_fixture`, or an event-driven bound; no wall-clock speed assertion."
+        );
+        assert!(
+            validate_event(&value, TIERS, "tjfontaine").is_ok(),
+            "#587 free-form body refused"
+        );
+    }
+    #[test]
+    fn unsuffixed_dispatch_is_owner_context() {
+        let mut value = event();
+        for label in ["dispatch", "dispatch:any owner context"] {
+            value["label"]["name"] = label.into();
+            assert!(
+                validate_event(&value, TIERS, "tjfontaine").is_ok(),
+                "label {label} refused"
+            );
+        }
+    }
+    #[test]
+    fn agent_comment_requires_owner_and_unedited_creation() {
+        let mut value = event();
+        value.as_object_mut().unwrap().remove("label");
+        value["action"] = "created".into();
+        value["comment"] = json!({"user":{"login":"tjfontaine","type":"User"},"body":"/agent please continue","created_at":"2026-10-24T00:00:00Z","updated_at":"2026-10-24T00:00:00Z"});
+        assert!(
+            validate_event(&value, TIERS, "tjfontaine").is_ok(),
+            "owner /agent refused"
+        );
+        for (pointer, bad) in [
+            ("/comment/user/login", "outsider"),
+            ("/comment/updated_at", "2026-10-24T00:01:00Z"),
+            ("/action", "edited"),
+            ("/comment/body", "/agentish"),
+        ] {
+            let mut other = value.clone();
+            *other.pointer_mut(pointer).unwrap() = bad.into();
+            assert!(
+                validate_event(&other, TIERS, "tjfontaine").is_err(),
+                "{pointer} admitted"
+            );
+        }
+    }
     fn fixture_repository(root: &Path) {
         git(root, &["init", "-b", "work/dispatch-634-pending"]).unwrap();
         std::fs::write(root.join("base"), "base").unwrap();
@@ -2139,36 +2195,6 @@ Do it"
         assert!(validate_event(&value, TIERS, "tjfontaine").is_err());
     }
     #[test]
-    fn brief_and_branch_syntax() {
-        assert!(brief_section("## Brief\n\n## Other\nx").is_err());
-        assert!(brief_section("## Brief\nx\n## Brief\ny").is_err());
-        for branch in [
-            "main",
-            "work/",
-            "work/x..y",
-            "work/.x",
-            "work/x.lock",
-            "work/x;id",
-            "work/$(id)",
-            "work/x\ny",
-            "work//x",
-            "work/x/",
-        ] {
-            assert!(!valid_branch(branch), "{branch}");
-        }
-        assert!(valid_branch("work/existing-634"));
-    }
-    #[test]
-    fn branch_directives_inside_fences_do_not_select_a_branch() {
-        let mut value = event();
-        value["issue"]["body"] =
-            "## Brief\nImplement it\n```text\nBranch: work/foreign-799\n```".into();
-        assert_eq!(
-            validate_event(&value, TIERS, "tjfontaine").unwrap().branch,
-            "work/dispatch-634-pending"
-        );
-    }
-    #[test]
     fn wip_checkpoint_preserves_trailer_and_excludes_target_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -2177,7 +2203,8 @@ Do it"
         std::fs::write(root.join("new file"), "work in progress").unwrap();
         std::fs::create_dir(root.join("conformance-probes")).unwrap();
         std::os::unix::fs::symlink("/tmp", root.join("conformance-probes/target")).unwrap();
-        let d = validate_event(&event(), TIERS, "tjfontaine").unwrap();
+        let mut d = validate_event(&event(), TIERS, "tjfontaine").unwrap();
+        d.worker.coauthor = "GPT-6.1 Sol <noreply@openai.com>".into();
         assert!(checkpoint(root, &d).unwrap());
         let message = git(root, &["log", "-1", "--format=%B"]).unwrap();
         assert!(message.contains("Co-Authored-By: GPT-6.1 Sol <noreply@openai.com>"));
@@ -2200,7 +2227,7 @@ Do it"
         event
     }
     #[test]
-    fn review_admission_requires_owner_owned_pr_and_one_label() {
+    fn review_admission_requires_owner_owned_pr() {
         let event = review_event();
         let dispatch =
             validate_event(&event, TIERS, "tjfontaine").expect("owner review must continue its PR");
@@ -2228,11 +2255,6 @@ Do it"
             ("/dispatch_run/path", json!("other.yml")),
             ("/issue/state", json!("closed")),
             ("/issue/user/login", json!("outsider")),
-            ("/issue/labels", json!([])),
-            (
-                "/issue/labels",
-                json!([{"name":"dispatch:sol-high"},{"name":"dispatch:opus"}]),
-            ),
         ] {
             let mut bad = event.clone();
             *bad.pointer_mut(pointer).unwrap() = value;

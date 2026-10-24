@@ -223,7 +223,7 @@ fn serial_host_reserved_standing_job_cannot_bypass_controller_rendezvous() {
 }
 
 #[test]
-fn agent_auth_is_job_scoped_private_and_always_cleanable() {
+fn agent_auth_provisions_all_worker_credentials_and_only_agy_for_loop() {
     use std::os::unix::fs::PermissionsExt;
     let xtask = env!("CARGO_BIN_EXE_carrick-xtask");
     for backend in ["codex", "agy"] {
@@ -255,14 +255,10 @@ fn agent_auth_is_job_scoped_private_and_always_cleanable() {
                 .output()
                 .unwrap()
         };
-        let admitted = invoke(&[
-            "dispatch-worker",
-            "guard",
-            "--admit",
-            "--event",
-            event.to_str().unwrap(),
-        ]);
-        assert!(admitted.status.success(), "{admitted:?}");
+        use sha2::Digest;
+        let digest = format!("{:x}", sha2::Sha256::digest(std::fs::read(&event).unwrap()));
+        let admission = serde_json::json!({"dispatch":carrick_xtask::dispatch_worker::validate_event(&serde_json::from_str(&std::fs::read_to_string(&event).unwrap()).unwrap(), "", "tjfontaine").unwrap(), "trigger":{"name":label}, "event_digest":digest});
+        std::fs::write(state.join("admission.json"), admission.to_string()).unwrap();
         let output = invoke(&["agent-runner", "auth", "--event", event.to_str().unwrap()]);
         assert!(output.status.success(), "{output:?}");
         for secret in ["codex-only-secret", "agy-only-secret"] {
@@ -288,12 +284,11 @@ fn agent_auth_is_job_scoped_private_and_always_cleanable() {
         } else {
             "codex-only-secret"
         };
-        assert!(
-            !remembered.contains(unselected),
-            "captured unselected provider {unselected}"
-        );
-        assert_eq!(home.join(".codex").exists(), backend == "codex");
-        assert_eq!(home.join(".gemini").exists(), backend == "agy");
+        assert!(remembered.contains(unselected));
+        assert!(home.join(".codex").exists());
+        assert!(home.join(".gemini").exists());
+        assert!(!state.join("loop-home/.codex").exists());
+        assert!(state.join("loop-home/.gemini").exists());
         assert!(
             !invoke(&["agent-runner", "auth", "--event", event.to_str().unwrap()])
                 .status

@@ -1298,3 +1298,15 @@ fn review_dispatch_demand_and_hook_are_admitted() {
     context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/pull/42/merge");
     assert!(Admission::Agent.authorize(&context).is_ok());
 }
+
+#[test]
+fn owner_comment_dispatch_run_is_admitted() {
+    let mut run = standing_run("issue_comment", "main");
+    run["path"] = DISPATCH_WORKFLOW.into();
+    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    run["triggering_actor"] = run["actor"].clone();
+    assert!(
+        Admission::Agent.identifies_run(&run),
+        "owner comment run refused"
+    );
+}

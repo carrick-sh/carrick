@@ -16,7 +16,7 @@ pub struct Args {
 pub enum Action {
     /// Install checked-in, digest-pinned tools and the private launcher.
     Bootstrap,
-    /// Materialize only this dispatch tier's protected environment secrets.
+    /// Materialize all available worker credentials and the separate loop credential.
     Auth {
         #[arg(long)]
         event: PathBuf,
@@ -381,14 +381,14 @@ fn bootstrap(root: &Path) -> Result<(), ScalerError> {
 }
 
 fn auth(_root: &Path, event: &Path) -> Result<(), ScalerError> {
-    let dispatch = crate::dispatch_worker::read_admission(event)?.dispatch;
+    crate::dispatch_worker::read_admission(event)?;
     let home = state()?.join("home");
     if !home.is_dir() {
         return Err(ScalerError::Guard("bootstrap must precede auth"));
     }
-    if dispatch.tier.backend == "codex" {
-        let auth = std::env::var("CODEX_AUTH_JSON")
-            .map_err(|_| ScalerError::Guard("missing CODEX_AUTH_JSON"))?;
+    if let Ok(auth) = std::env::var("CODEX_AUTH_JSON")
+        && !auth.is_empty()
+    {
         if !serde_json::from_str::<serde_json::Value>(&auth).is_ok_and(|v| v.is_object()) {
             return Err(ScalerError::Guard("invalid CODEX_AUTH_JSON"));
         }
@@ -400,20 +400,14 @@ fn auth(_root: &Path, event: &Path) -> Result<(), ScalerError> {
             b"cli_auth_credentials_store = \"file\"\n",
         )?;
     }
-    if dispatch.tier.backend == "agy" || dispatch.review {
-        let raw = std::env::var("AGY_OAUTH_TOKEN")
-            .ok()
-            .filter(|token| !token.is_empty())
-            .ok_or(ScalerError::Guard("missing AGY_OAUTH_TOKEN"))?;
-        if dispatch.tier.backend == "agy" {
-            agy_auth(&home, &raw)?;
-        }
-        if dispatch.review {
-            let loop_home = state()?.join("loop-home");
-            private_dir(&loop_home)?;
-            agy_auth(&loop_home, &raw)?;
-        }
-    }
+    let raw = std::env::var("AGY_OAUTH_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or(ScalerError::Guard("missing AGY_OAUTH_TOKEN for loop"))?;
+    agy_auth(&home, &raw)?;
+    let loop_home = state()?.join("loop-home");
+    private_dir(&loop_home)?;
+    agy_auth(&loop_home, &raw)?;
     crate::dispatch_redaction::remember()?;
     Ok(())
 }
