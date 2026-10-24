@@ -1822,14 +1822,40 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         parent_table: u64,
         child_table: u64,
     ) -> Result<(), NativeProcessError> {
-        super::file_table::fork_fd_map(
+        if !super::file_table::fork_fd_map(
             self.crossing.fd_map(),
             self.crossing.open_table(),
             parent_table,
             child_table,
-        )
-        .then_some(())
-        .ok_or(NativeProcessError::Exhausted)
+        ) {
+            return Err(NativeProcessError::Exhausted);
+        }
+        if let Some((region, map)) = self.crossing.ipc_binding() {
+            let result = map
+                .lookup(parent_table)
+                .ok_or(NativeProcessError::Stale)
+                .and_then(|parent| {
+                    region
+                        .fork_descriptors(
+                            carrick_el1_abi::ipc::fd::TableId::from_raw(parent),
+                            &carrick_sched_core::ShortLockSpin,
+                            |child| {
+                                map.publish(child_table, child.to_raw())
+                                    .map_err(|_| carrick_el1_abi::ipc::fd::Error::NoMemory)
+                            },
+                        )
+                        .map_err(|_| NativeProcessError::Exhausted)
+                });
+            if let Err(error) = result {
+                super::file_table::retire_fd_map(
+                    self.crossing.fd_map(),
+                    self.crossing.open_table(),
+                    child_table,
+                );
+                return Err(error);
+            }
+        }
+        Ok(())
     }
     fn retire_fd_table(&mut self, table: u64) {
         super::file_table::retire_fd_map(self.crossing.fd_map(), self.crossing.open_table(), table);

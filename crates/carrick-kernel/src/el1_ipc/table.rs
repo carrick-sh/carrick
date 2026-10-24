@@ -52,16 +52,10 @@ impl HostTable {
     }
 
     pub fn fork(&self) -> Result<Self, AdmissionError> {
-        let mut storage = self.owner.provision_descriptors(self.capacity)?;
-        let result = self
+        let id = self
             .owner
             .region()
-            .fd(HostLockWait)
-            .fork(self.id, &mut storage);
-        if result.is_err() {
-            self.owner.reclaim_descriptors(storage)?;
-        }
-        let id = result?;
+            .fork_descriptors(self.id, &HostLockWait, |_| Ok(()))?;
         Ok(Self {
             owner: Arc::clone(&self.owner),
             id,
