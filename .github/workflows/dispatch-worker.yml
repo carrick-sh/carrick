@@ -161,10 +161,11 @@ jobs:
         timeout-minutes: 47
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode carrick --check-load --
-          "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker loop --event "$GITHUB_EVENT_PATH"
-          --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
+        run: |
+          export CARRICK_DISPATCH_STEP_STARTED_AT=$(date +%s)
+          "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode carrick --check-load -- \
+            "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker loop --event "$GITHUB_EVENT_PATH" \
+            --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
       - name: Verify retirement before credentialed completion
         id: retire
         if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
