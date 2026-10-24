@@ -2107,24 +2107,28 @@ fn publish_installed_structural_owner(
         record_identity: parking_lot::Mutex::new(identity),
         owner_retired: std::sync::atomic::AtomicBool::new(false),
     });
-    if custody
-        .structural_backings
-        .lock()
-        .insert(identity.record_id, std::sync::Arc::clone(&retained))
-        .is_some()
-    {
-        carrick_fatal!(
-            "hvpatch::exec_commit",
-            "installed exec structural record published twice"
-        );
-    }
-    region.structural_owner = Some(std::sync::Arc::new(StructuralBackingOwner {
+    let owner = std::sync::Arc::new(StructuralBackingOwner {
         custody: std::sync::Arc::downgrade(custody),
-        retained,
+        retained: std::sync::Arc::clone(&retained),
         epoch,
         physical_ipa: snapshot.ipa,
         physical_size: snapshot.len,
-    }));
+    });
+    let mut structural_backings = custody.structural_backings.lock();
+    if structural_backings.contains_key(&identity.record_id) {
+        drop(structural_backings);
+        // Keep the newly installed mapping owned while the exec transaction's
+        // terminal error reaches its one fail-stop owner.  Replacing the live
+        // entry would strand the prior incarnation; dropping this owner here
+        // would begin retirement before the fail-stop is published.
+        region.structural_owner = Some(owner);
+        return Err(TrapError::Hypervisor(
+            "installed exec structural record published twice".to_owned(),
+        ));
+    }
+    structural_backings.insert(identity.record_id, retained);
+    drop(structural_backings);
+    region.structural_owner = Some(owner);
     region.owner_generation = epoch.raw();
     Ok(epoch.raw())
 }
