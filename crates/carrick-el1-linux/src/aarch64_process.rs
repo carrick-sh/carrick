@@ -1111,7 +1111,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 return Err(MmError::Core);
             }
         };
-        let Some(receipt) = carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
+        let receipt = carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
             slot,
             &*live,
             residency,
@@ -1122,7 +1122,38 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
                 let _ = root;
             },
-        ) else {
+        );
+        let owner_handle = unsafe {
+            // SAFETY: the portal authenticated this exact window and owner
+            // before the descriptor was claimed. The carrier reauthenticates
+            // the stopped execution and root during settlement.
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                window.operation.carrier,
+                window.operation.mm,
+                window.operation.incarnation,
+            )
+        };
+        let reply_address =
+            carrick_guest_arch::KernelVa::new(core::ptr::from_ref(slot).addr() as u64);
+        let mut settlement = carrick_el1_abi::NativeDescriptorSettlement::new(
+            owner_handle,
+            window.operation.sequence,
+            reply_address,
+        )
+        .ok_or(MmError::Stale)?;
+        let crossed = self.crossing.cross_fork_stock(
+            &raw mut settlement as *mut _ as u64,
+            u64::from(self.worker()),
+        );
+        match settlement.take(owner_handle, window.operation.sequence, reply_address) {
+            Some(Ok(())) => crossed.map_err(|_| MmError::Stale)?,
+            Some(Err(())) => return Err(MmError::Stale),
+            None => {
+                crossed.map_err(|_| MmError::Stale)?;
+                return Err(MmError::Stale);
+            }
+        }
+        let Some(receipt) = receipt else {
             return Ok(());
         };
         if matches!(

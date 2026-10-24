@@ -353,19 +353,18 @@ impl NativeService {
         )?;
         let rows = grants.retain_backing(staged, retained)?;
         let data = rows.first().ok_or_else(stale)?;
-        let table_reservation = stock
-            .owner
-            .reserve_native_descriptor_tables(
-                &mut crate::fork_stock::fork_table_accounting(&custody),
-                handle,
-                root,
-                MAX_TABLE_GRANTS,
-            )
-            .map_err(|error| {
-                TrapError::Hypervisor(format!(
-                    "native backing descriptor table reservation: {error:?}"
-                ))
-            })?;
+        let table_reservation = match stock.owner.reserve_native_descriptor_tables(
+            &mut crate::fork_stock::fork_table_accounting(&custody),
+            handle,
+            root,
+            MAX_TABLE_GRANTS,
+        ) {
+            Ok(reservation) => reservation,
+            Err(_) => {
+                drop(stock);
+                return self.refuse();
+            }
+        };
         let txn = DescriptorTxn {
             id: DescriptorTxnId {
                 mm_key: core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(stale)?,
@@ -387,18 +386,31 @@ impl NativeService {
             },
             tables: table_reservation.descriptor_tables(),
         };
+        if stock
+            .owner
+            .track_native_descriptor_tables(
+                &mut crate::fork_stock::fork_table_accounting(&custody),
+                table_reservation,
+                txn,
+            )
+            .is_err()
+        {
+            drop(stock);
+            return self.refuse();
+        }
         // SAFETY: intake pinned and authenticated the request-owned reply. The
         // ring retains it through ACK, then revalidates and executes this slot.
         let submitted = unsafe { reply.as_ref() }.submit(window, &txn);
-        if submitted {
+        if !submitted {
             stock
                 .owner
-                .commit_native_descriptor_tables(table_reservation);
-        } else {
-            stock.owner.cancel_native_descriptor_tables(
-                &mut crate::fork_stock::fork_table_accounting(&custody),
-                table_reservation,
-            );
+                .cancel_submitted_native_descriptor_tables(
+                    &mut crate::fork_stock::fork_table_accounting(&custody),
+                    handle,
+                    root,
+                    txn.id.generation,
+                )
+                .map_err(|_| stale())?;
         }
         drop(stock);
         self.complete(submitted)
@@ -629,7 +641,76 @@ pub(crate) fn settle_native_cow(
     grants.settle(pool, excluded).map(Some)
 }
 
-fn retain_reply(
+/// Consume the exact reply-slot receipt while the native child still owns its
+/// synchronous service continuation. A refused or unclaimed submission returns
+/// all table grants; an applied receipt retains only its linked prefix.
+pub(super) fn settle_native_descriptor_reply(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    region: RetainedAbiRegion<'_>,
+    execution: carrick_hal::fork_stock::GrantExecution,
+    settlement: &mut carrick_el1_abi::NativeDescriptorSettlement,
+) -> bool {
+    let accepted = (|| -> Result<(), ()> {
+        let (owner, generation, reply_address) = settlement.request().ok_or(())?;
+        if execution.binding.mm.raw() != owner.mm().raw() {
+            return Err(());
+        }
+        let (reply, _pin) = retain_reply(custody, region, reply_address).map_err(|_| ())?;
+        // SAFETY: retain_reply pins the complete aligned slot until settlement.
+        let reply = unsafe { reply.as_ref() };
+        let window = reply.window().ok_or(())?;
+        if window.operation.carrier != owner.carrier()
+            || window.operation.mm != owner.mm()
+            || window.operation.incarnation != owner.incarnation()
+            || window.operation.sequence != generation
+        {
+            return Err(());
+        }
+        let mut stock = custody.fork_stock.lock();
+        if stock.owner.child_owner(owner.mm()) != Some(owner)
+            || stock.owner.child_root(owner.mm()) != Some(execution.context.root)
+        {
+            return Err(());
+        }
+        let txn = stock
+            .owner
+            .pending_native_descriptor_transaction(owner, execution.context.root, generation)
+            .ok_or(())?;
+        let mut ledger = crate::fork_stock::fork_table_accounting(custody);
+        if let Some(receipt) = reply.take_receipt(window, &txn) {
+            stock
+                .owner
+                .settle_native_descriptor_tables(
+                    &mut ledger,
+                    owner,
+                    execution.context.root,
+                    &receipt,
+                )
+                .map_err(|_| ())?;
+        } else if reply.withdraw(window, &txn) {
+            stock
+                .owner
+                .cancel_submitted_native_descriptor_tables(
+                    &mut ledger,
+                    owner,
+                    execution.context.root,
+                    generation,
+                )
+                .map_err(|_| ())?;
+        } else {
+            return Err(());
+        }
+        Ok(())
+    })()
+    .is_ok();
+    if accepted {
+        settlement.accept()
+    } else {
+        settlement.refuse()
+    }
+}
+
+pub(super) fn retain_reply(
     custody: &Arc<crate::trap::CarrierVmCustody>,
     region: RetainedAbiRegion<'_>,
     address: carrick_guest_arch::KernelVa,
