@@ -1,9 +1,9 @@
 //! Exact native service operations. The ring retains semantic custody until
 //! an exact completion or cancellation acknowledgment is consumed.
 use crate::{El1MmHandle, EntryThreadGeneration, SnapshotGeneration};
-use carrick_guest_arch::{Access, FaultInfo, NativeOrdinal};
+use carrick_guest_arch::{Access, FaultInfo, GuestLen, GuestVa, NativeOrdinal};
 use carrick_sched_core::{RecordRef, object_wait::OwnerEntry, process::TaskKey};
-use core::num::NonZeroU64;
+use core::num::{NonZeroU32, NonZeroU64};
 use core::ops::Deref;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -80,6 +80,37 @@ pub enum ServiceOperation {
     CarrierWork {
         entry: OwnerEntry,
     },
+    /// Prepare one executable image from a bounded payload in guest memory.
+    /// The exact service birth/MM authenticates the stage-1 translation; this
+    /// descriptor is never a host pointer.
+    Exec {
+        payload: ExecPayloadDescriptor,
+    },
+}
+
+/// A bounded variable-length input owned by the requesting guest continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecPayloadDescriptor {
+    address: GuestVa,
+    length: GuestLen,
+}
+pub const MAX_EXEC_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024;
+impl ExecPayloadDescriptor {
+    pub const fn checked(address: GuestVa, length: GuestLen) -> Option<Self> {
+        if length.raw() == 0
+            || length.raw() > MAX_EXEC_PAYLOAD_BYTES
+            || address.raw().checked_add(length.raw()).is_none()
+        {
+            return None;
+        }
+        Some(Self { address, length })
+    }
+    pub const fn address(self) -> GuestVa {
+        self.address
+    }
+    pub const fn length(self) -> GuestLen {
+        self.length
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServiceRequest {
@@ -95,6 +126,23 @@ pub enum ServiceResult {
     Refused,
     Cancelled,
     Wait(crate::PortalOwnerWait),
+    Failed(ServiceFailureCode),
+}
+
+/// Personality-interpreted failure number returned by a typed service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct ServiceFailureCode(NonZeroU32);
+impl ServiceFailureCode {
+    pub const fn new(raw: u32) -> Option<Self> {
+        match NonZeroU32::new(raw) {
+            Some(raw) => Some(Self(raw)),
+            None => None,
+        }
+    }
+    pub const fn raw(self) -> u32 {
+        self.0.get()
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceError {
@@ -111,7 +159,7 @@ pub enum PreparedDeliveryError {
     Service(ServiceError),
 }
 
-pub const NATIVE_SERVICE_PROTOCOL: u64 = 5;
+pub const NATIVE_SERVICE_PROTOCOL: u64 = 6;
 
 /// Transport selector only: authority remains in the member's retained cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -387,6 +435,9 @@ impl ServiceCell {
             ServiceOperation::Exception(exception) => {
                 (4, exception.kind.encode(), exception.address.raw())
             }
+            ServiceOperation::Exec { payload } => {
+                (5, payload.address().raw(), payload.length().raw())
+            }
         };
         for (index, value) in [(8, execution.raw()), (9, kind), (10, first), (11, second)] {
             self.words[index].store(value, Ordering::Relaxed);
@@ -515,6 +566,13 @@ impl ServiceCell {
                         cell.words[11].load(Ordering::Relaxed),
                     ),
                 }),
+                5 => ServiceOperation::Exec {
+                    payload: ExecPayloadDescriptor::checked(
+                        GuestVa::new(first),
+                        GuestLen::new(cell.words[11].load(Ordering::Relaxed)),
+                    )
+                    .ok_or(ServiceError::Stale)?,
+                },
                 _ => return Err(ServiceError::Stale),
             };
             let fault_sequence = NonZeroU64::new(cell.result.load(Ordering::Relaxed));
@@ -590,6 +648,11 @@ impl ServiceCell {
                 cell.words[9].load(Ordering::Relaxed) == 4
                     && cell.words[10].load(Ordering::Relaxed) == exception.kind.encode()
                     && cell.words[11].load(Ordering::Relaxed) == exception.address.raw()
+            }
+            ServiceOperation::Exec { payload } => {
+                cell.words[9].load(Ordering::Relaxed) == 5
+                    && cell.words[10].load(Ordering::Relaxed) == payload.address().raw()
+                    && cell.words[11].load(Ordering::Relaxed) == payload.length().raw()
             }
         };
         if !operation_matches
@@ -680,6 +743,8 @@ impl ServiceCell {
             ServiceResult::BackingFault
         } else if self.result.load(Ordering::Relaxed) == 1 {
             ServiceResult::Supplied
+        } else if let Some(failure) = decode_failure(self.result.load(Ordering::Relaxed)) {
+            ServiceResult::Failed(failure)
         } else if let Some(cause) =
             crate::PortalWaitCause::decode(self.result.load(Ordering::Relaxed).saturating_sub(2))
         {
@@ -795,6 +860,9 @@ impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
     pub fn complete(self, supplied: bool) -> Result<(), (ServiceError, Self)> {
         self.acknowledge(u64::from(supplied), 0)
     }
+    pub fn complete_failure(self, failure: ServiceFailureCode) -> Result<(), (ServiceError, Self)> {
+        self.acknowledge(FAILURE_TAG | u64::from(failure.raw()), 0)
+    }
     /// Acknowledge physical service and transfer the same continuation to an
     /// exact-MM producer. No physical resource guard survives this call.
     pub fn complete_wait(self, wait: crate::PortalOwnerWait) -> Result<(), (ServiceError, Self)> {
@@ -877,6 +945,14 @@ fn fault_bits(fault: FaultInfo) -> u64 {
     access | (u64::from(fault.present) << 2)
 }
 
+const FAILURE_TAG: u64 = 1 << 63;
+fn decode_failure(raw: u64) -> Option<ServiceFailureCode> {
+    (raw & FAILURE_TAG != 0)
+        .then(|| u32::try_from(raw & !FAILURE_TAG).ok())
+        .flatten()
+        .and_then(ServiceFailureCode::new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,6 +992,103 @@ mod tests {
             access: Access::Write,
             present: true,
         })
+    }
+
+    fn exec_payload(address: u64, bytes: u64) -> ExecPayloadDescriptor {
+        ExecPayloadDescriptor::checked(
+            carrick_guest_arch::GuestVa::new(address),
+            carrick_guest_arch::GuestLen::new(bytes),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn exec_payload_round_trips_without_fixed_word_truncation() {
+        let cell = ServiceCell::new();
+        let owner = birth(1, 7);
+        cell.bind(owner).unwrap();
+        let payload = exec_payload(0x4000_0000, 2 * 1024 * 1024);
+        let request = cell
+            .publish(
+                owner,
+                SnapshotGeneration::INITIAL,
+                ServiceOperation::Exec { payload },
+                None,
+            )
+            .unwrap();
+        let ticket = cell.claim(request).unwrap();
+        assert_eq!(
+            ticket.request().operation,
+            ServiceOperation::Exec { payload }
+        );
+        assert!(ticket.complete(true).is_ok());
+        assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Supplied));
+    }
+
+    #[test]
+    fn exec_payload_rejects_zero_overflow_and_arg_max_excess() {
+        use carrick_guest_arch::{GuestLen, GuestVa};
+        let max = GuestLen::new(MAX_EXEC_PAYLOAD_BYTES);
+        assert!(ExecPayloadDescriptor::checked(GuestVa::new(0x1000), GuestLen::new(0)).is_none());
+        assert!(ExecPayloadDescriptor::checked(GuestVa::new(u64::MAX), GuestLen::new(2)).is_none());
+        assert!(
+            ExecPayloadDescriptor::checked(GuestVa::new(0x1000), GuestLen::new(max.raw() + 1),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn exec_failure_preserves_the_exact_errno_number() {
+        let cell = ServiceCell::new();
+        let owner = birth(1, 9);
+        cell.bind(owner).unwrap();
+        for errno in [2, 13, 8] {
+            let request = cell
+                .publish(
+                    owner,
+                    SnapshotGeneration::INITIAL,
+                    ServiceOperation::Exec {
+                        payload: exec_payload(0x5000_0000, 64),
+                    },
+                    None,
+                )
+                .unwrap();
+            let failure = ServiceFailureCode::new(errno).unwrap();
+            assert!(
+                cell.claim(request)
+                    .unwrap()
+                    .complete_failure(failure)
+                    .is_ok()
+            );
+            assert_eq!(
+                cell.consume(request.identity),
+                Ok(ServiceResult::Failed(failure))
+            );
+        }
+    }
+
+    #[test]
+    fn exec_claim_rejects_old_mm_and_sequence() {
+        let cell = ServiceCell::new();
+        let owner = birth(1, 11);
+        cell.bind(owner).unwrap();
+        let request = cell
+            .publish(
+                owner,
+                SnapshotGeneration::INITIAL,
+                ServiceOperation::Exec {
+                    payload: exec_payload(0x6000_0000, 256),
+                },
+                None,
+            )
+            .unwrap();
+        let mut stale = request;
+        stale.identity.birth.mm = birth(1, 10).mm;
+        assert!(matches!(cell.claim(stale), Err(ServiceError::Stale)));
+        stale = request;
+        stale.identity.sequence = NonZeroU64::new(request.identity.sequence.get() + 1).unwrap();
+        assert!(matches!(cell.claim(stale), Err(ServiceError::Stale)));
+        assert!(cell.claim(request).unwrap().complete(true).is_ok());
     }
 
     #[test]

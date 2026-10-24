@@ -330,7 +330,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         .ok_or(NativeProcessError::Stale)?;
         let entry = match request.operation {
             ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => OwnerEntry::Exception,
-            ServiceOperation::Crossing { .. } => OwnerEntry::Syscall,
+            ServiceOperation::Crossing { .. } | ServiceOperation::Exec { .. } => {
+                OwnerEntry::Syscall
+            }
             ServiceOperation::CarrierWork { entry } => entry,
         };
         let mut completion = None;
@@ -538,7 +540,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => {
                             OwnerEntry::Exception
                         }
-                        ServiceOperation::Crossing { .. } => OwnerEntry::Syscall,
+                        ServiceOperation::Crossing { .. } | ServiceOperation::Exec { .. } => {
+                            OwnerEntry::Syscall
+                        }
                         ServiceOperation::CarrierWork { entry } => entry,
                     });
             }
@@ -630,6 +634,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(NativeResume::NoPending)
             }
             (_, ServiceResult::BackingFault) => Err(NativeProcessError::Quarantined),
+            (ServiceOperation::Exec { .. }, ServiceResult::Failed(failure)) => Ok(
+                NativeResume::Returned(SyscallResult::new(-i64::from(failure.raw()))),
+            ),
+            (_, ServiceResult::Failed(_)) => Err(NativeProcessError::Quarantined),
             (ServiceOperation::Fault(fault), ServiceResult::Refused) => {
                 self.force_sigsegv_info(
                     carrick_signal_core::policy::SigBlockMask::blocking_all_of(
@@ -676,6 +684,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             (ServiceOperation::Exception(_), ServiceResult::Supplied) => {
                 Err(NativeProcessError::Quarantined)
+            }
+            (ServiceOperation::Exec { .. }, ServiceResult::Supplied) => {
+                // The successor adoption route consumes successful preparation
+                // before this ordinary syscall-return mapping is reachable.
+                Err(NativeProcessError::Quarantined)
+            }
+            (ServiceOperation::Exec { .. }, ServiceResult::Refused) => Ok(NativeResume::Returned(
+                SyscallResult::new(carrick_syscall_abi::LINUX_ENOSYS.guest_retval()),
+            )),
+            (ServiceOperation::Exec { .. }, ServiceResult::Cancelled) => {
+                Ok(NativeResume::Returned(SyscallResult::new(
+                    carrick_syscall_abi::LINUX_EINTR.guest_retval(),
+                )))
             }
         })();
         // Mapping/signal completion still needs the exact member/MM. Release
