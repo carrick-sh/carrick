@@ -1595,14 +1595,6 @@ impl RootFsVfs {
                                 writable: true,
                             });
                         }
-                        if let Some(entry) = self.overlay.shared_file_entry(path, false) {
-                            return Ok(OpenDispatchResult::RootFsBackedFile {
-                                metadata: entry.metadata,
-                                contents: entry.contents,
-                                object: entry.object,
-                                writable: true,
-                            });
-                        }
                         return Ok(OpenDispatchResult::RootFsBackedFile {
                             object: None,
                             metadata,

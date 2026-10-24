@@ -86,8 +86,13 @@ impl ExecFiles {
     }
 
     pub fn resolve_path(&self, path: &str) -> String {
-        // This spelling is also passed as the script argument to a shebang
-        // interpreter. Keep `..` until filesystem traversal follows symlinks.
+        resolve_exec_path(path, &self.context.cwd)
+    }
+
+    fn lookup_path(&self, path: &str) -> String {
+        // Filesystem traversal must retain `..` until it has followed each
+        // preceding symlink. This is deliberately distinct from the normalized
+        // guest-visible spelling returned by `resolve_path`.
         if path.starts_with('/') {
             path.to_owned()
         } else {
@@ -117,7 +122,7 @@ impl ExecFiles {
     ) -> Result<ExecSource, ExecSourceError> {
         use super::fs::proc_synthetic::{proc_self_fd_number, proc_self_magic_link};
         super::fs::check_path_length(path).map_err(ExecSourceError::Linux)?;
-        let path = self.resolve_path(path);
+        let path = self.lookup_path(path);
         super::fs::check_path_length(&path).map_err(ExecSourceError::Linux)?;
         let visible = self
             .context
