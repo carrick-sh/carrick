@@ -1723,17 +1723,142 @@ impl ForkTableLedger for RecordingLedger {
     }
 }
 
+fn backing_txn(
+    owner: El1MmHandle,
+    root: RootGpa,
+    generation: u64,
+    tables: carrick_mmu_core::aarch64::descriptor_txn::TableGrants,
+) -> carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn {
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan,
+    };
+    use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
+
+    DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: NonZeroU64::new(owner.mm().raw()).unwrap(),
+            generation: NonZeroU64::new(generation).unwrap(),
+        },
+        root: SubstrateGpa(root.address().raw()),
+        op: DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: 0x6000_0000 + generation * 0x1_0000,
+                ipa: 0x8000_0000 + generation * 0x1_0000,
+                len: 0x1_0000,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(0x6000_0000 + generation * 0x1_0000, 4096),
+            backing: BackingIdentity {
+                frame_id: NonZeroU64::new(generation).unwrap(),
+                mapping_id: NonZeroU64::new(generation).unwrap(),
+                owner_generation: NonZeroU64::MIN,
+                inventory_revision: NonZeroU64::MIN,
+            },
+        },
+        tables,
+    }
+}
+
+fn applied_backing_receipt(
+    txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    tables_linked: u8,
+) -> carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt {
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        DescriptorApplied, DescriptorOutcome, DescriptorReceipt, ReclaimedTables,
+    };
+    let carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::Prepare {
+        publication,
+        resident,
+        ..
+    } = txn.op
+    else {
+        unreachable!()
+    };
+    DescriptorReceipt {
+        id: txn.id,
+        digest: txn.digest(),
+        outcome: DescriptorOutcome::Applied(DescriptorApplied {
+            pages: publication.len / 4096,
+            resident,
+            tables_linked,
+            reclaimed: ReclaimedTables::NONE,
+            live_stores: 1,
+            flush_required: false,
+        }),
+    }
+}
+
+fn refused_backing_receipt(
+    txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+) -> carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt {
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        DescriptorOutcome, DescriptorReceipt, DescriptorRefusal,
+    };
+    DescriptorReceipt {
+        id: txn.id,
+        digest: txn.digest(),
+        outcome: DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot),
+    }
+}
+
 #[test]
-fn native_descriptor_tables_are_preclaimed_from_child_stock_until_retirement() {
+fn many_native_backing_supplies_return_unused_tables_across_two_children() {
     use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
 
-    let mut stock = stock(UntaggedRoots, 10, 1);
-    let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
-    commit(&mut stock, parent(), granted, 1, 0).unwrap();
-    let child = child_of(granted, 44);
-    let owner = stock.child_owner(granted.request.child_mm).unwrap();
-    let before = stock.table_stock().to_vec();
+    let mut stock = stock(UntaggedRoots, 40, 2);
+    let first = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), first, 1, 0).unwrap();
+    let second = loan(&mut stock, parent(), 303, 1, 1).unwrap();
+    commit(&mut stock, parent(), second, 1, 0).unwrap();
+    let children = [child_of(first, 44), child_of(second, 45)];
+    let before = stock.table_stock().len();
+    let mut linked = 0;
 
+    for generation in 1..=512 {
+        let child = children[generation as usize % children.len()];
+        let owner = stock.child_owner(mm(child.binding.mm.raw())).unwrap();
+        let reservation = stock
+            .reserve_native_descriptor_tables(
+                &mut NoTableLedger,
+                owner,
+                child.context.root,
+                MAX_TABLE_GRANTS,
+            )
+            .unwrap();
+        let txn = backing_txn(
+            owner,
+            child.context.root,
+            generation,
+            reservation.descriptor_tables(),
+        );
+        stock
+            .track_native_descriptor_tables(&mut NoTableLedger, reservation, txn)
+            .unwrap();
+        let refused = generation % 63 == 0;
+        let tables_linked = u8::from(!refused && generation % 64 == 0);
+        linked += usize::from(tables_linked);
+        let receipt = if refused {
+            refused_backing_receipt(&txn)
+        } else {
+            applied_backing_receipt(&txn, tables_linked)
+        };
+        stock
+            .settle_native_descriptor_tables(
+                &mut NoTableLedger,
+                owner,
+                child.context.root,
+                &receipt,
+            )
+            .unwrap();
+        assert_eq!(stock.table_stock().len(), before - linked);
+    }
+
+    assert_eq!(linked, 8);
+    assert_eq!(stock.table_stock().len(), before - linked);
+
+    let child = children[0];
+    let owner = stock.child_owner(mm(child.binding.mm.raw())).unwrap();
     let reservation = stock
         .reserve_native_descriptor_tables(
             &mut NoTableLedger,
@@ -1742,27 +1867,56 @@ fn native_descriptor_tables_are_preclaimed_from_child_stock_until_retirement() {
             MAX_TABLE_GRANTS,
         )
         .unwrap();
-    let descriptor_tables = reservation.descriptor_tables();
-    let reserved = reservation.pages().to_vec();
-    assert_eq!(descriptor_tables.len(), MAX_TABLE_GRANTS);
-    assert!(reserved.iter().all(|page| before.contains(page)));
-    stock.commit_native_descriptor_tables(reservation);
-    assert!(
-        reserved
-            .iter()
-            .all(|page| !stock.table_stock().contains(page)),
-        "a submitted transaction's grants stay charged to the child"
+    let txn = backing_txn(
+        owner,
+        child.context.root,
+        513,
+        reservation.descriptor_tables(),
     );
+    stock
+        .track_native_descriptor_tables(&mut NoTableLedger, reservation, txn)
+        .unwrap();
+    stock
+        .cancel_submitted_native_descriptor_tables(
+            &mut NoTableLedger,
+            owner,
+            child.context.root,
+            txn.id.generation,
+        )
+        .unwrap();
+    assert_eq!(stock.table_stock().len(), before - linked);
 
-    retire(&mut stock, child).unwrap();
+    for child in children {
+        retire(&mut stock, child).unwrap();
+    }
     let cleared = RefCell::new(Vec::new());
-    assert_eq!(reclaim(&mut stock, |_| true, &cleared), 1);
-    assert!(reserved.iter().all(|page| cleared.borrow().contains(page)));
-    assert!(
-        reserved
-            .iter()
-            .all(|page| stock.table_stock().contains(page))
-    );
+    assert_eq!(reclaim(&mut stock, |_| true, &cleared), 2);
+    assert_eq!(cleared.borrow().len(), linked + children.len());
+    assert_eq!(stock.table_stock().len(), 40);
+}
+
+#[test]
+fn native_backing_table_exhaustion_is_counted_without_losing_stock() {
+    use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
+
+    let mut stock = stock(UntaggedRoots, 8, 1);
+    let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    let child = child_of(granted, 44);
+    let owner = stock.child_owner(granted.request.child_mm).unwrap();
+    let before = stock.table_stock().to_vec();
+
+    assert!(matches!(
+        stock.reserve_native_descriptor_tables(
+            &mut NoTableLedger,
+            owner,
+            child.context.root,
+            MAX_TABLE_GRANTS,
+        ),
+        Err(ForkStockServiceError::DescriptorTableCapacity)
+    ));
+    assert_eq!(stock.table_stock(), before);
+    assert_eq!(stock.counters().descriptor_capacity_refusals, 1);
 }
 
 #[derive(Debug)]

@@ -1532,6 +1532,21 @@ pub(crate) fn service_native_fork_stock(
             }
             result.is_ok()
         }
+        Some(ForkStockKind::Descriptor) => {
+            let Some(pointer) =
+                abi_stack_ptr::<carrick_el1_abi::NativeDescriptorSettlement>(region, cpu, address)
+            else {
+                return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+            };
+            // SAFETY: the synchronous crossing exclusively retains this
+            // complete aligned settlement record on the stopped CPU stack.
+            let settlement = unsafe { &mut *pointer };
+            let Some(execution) = execution else {
+                settlement.refuse();
+                return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+            };
+            native_service::settle_native_descriptor_reply(custody, region, execution, settlement)
+        }
         Some(ForkStockKind::Reserve | ForkStockKind::Commit | ForkStockKind::Abort) => {
             let Some(pointer) = abi_stack_ptr::<ForkStockSettlement>(region, cpu, address) else {
                 return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);

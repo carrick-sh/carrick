@@ -647,6 +647,9 @@ pub struct ForkStockCounters {
     pub loans: u64,
     /// Loans refused for capacity (the guest lowers each to `EAGAIN`).
     pub capacity_refusals: u64,
+    /// Native backing supplies refused because fewer than one bounded grant
+    /// set remained; the carrier stays live and the stock is unchanged.
+    pub descriptor_capacity_refusals: u64,
     /// Loans refused because the request named another execution or carrier.
     pub stale_refusals: u64,
     /// Loans refused for a malformed request or loan geometry.
@@ -673,6 +676,10 @@ impl ForkStockCounters {
         [
             ("loan", self.loans),
             ("capacity_refusal", self.capacity_refusals),
+            (
+                "descriptor_capacity_refusal",
+                self.descriptor_capacity_refusals,
+            ),
             ("stale_refusal", self.stale_refusals),
             ("invalid_refusal", self.invalid_refusals),
             ("inventory_refusal", self.inventory_refusals),
@@ -753,8 +760,17 @@ pub struct NativeForkStockResources {
 pub struct NativeDescriptorTableReservation {
     key: MmKey,
     mm: ReservationMm,
+    root: RootGpa,
     pages: Vec<RootGpa>,
     descriptor_tables: carrick_mmu_core::aarch64::descriptor_txn::TableGrants,
+}
+
+#[derive(Debug)]
+struct PendingNativeDescriptorTables {
+    mm: ReservationMm,
+    root: RootGpa,
+    pages: Vec<RootGpa>,
+    txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
 }
 
 impl NativeDescriptorTableReservation {
@@ -797,6 +813,9 @@ pub struct ForkStock<T: ChildAddressTags, C = ()> {
     children: BTreeMap<MmKey, CommittedChild<T::Tag, C>>,
     /// Table pages each live MM consumed, as a child or as a fork parent.
     committed_tables: BTreeMap<MmKey, Vec<RootGpa>>,
+    /// Submitted native backing transactions awaiting their exact EL1 receipt.
+    /// Unused grants are not terminal child custody and return to stock here.
+    pending_descriptor_tables: BTreeMap<(MmKey, u64), PendingNativeDescriptorTables>,
     /// Quarantined children; `true` once their carrier release succeeded,
     /// so a later reclaim never releases the same MM twice.
     quarantine: BTreeMap<MmKey, QuarantinedChild>,
@@ -820,6 +839,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             next_loan: NonZeroU64::MIN,
             children: BTreeMap::new(),
             committed_tables: BTreeMap::new(),
+            pending_descriptor_tables: BTreeMap::new(),
             quarantine: BTreeMap::new(),
             last_refusal: None,
             tags,
@@ -875,6 +895,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             || !self.lifecycles.is_empty()
             || !self.children.is_empty()
             || !self.committed_tables.is_empty()
+            || !self.pending_descriptor_tables.is_empty()
             || self.pending.iter().any(Option::is_some)
         {
             return Err(ForkStockServiceError::InvalidRecord);
@@ -965,6 +986,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             return Err(ForkStockServiceError::StaleExecution);
         }
         if self.tables.len() < count {
+            self.counters.descriptor_capacity_refusals =
+                self.counters.descriptor_capacity_refusals.saturating_add(1);
             return Err(ForkStockServiceError::DescriptorTableCapacity);
         }
         self.tables
@@ -976,6 +999,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                     ledger.give_back(*page, mm);
                 }
                 self.tables.extend(pages);
+                self.counters.descriptor_capacity_refusals =
+                    self.counters.descriptor_capacity_refusals.saturating_add(1);
                 return Err(ForkStockServiceError::DescriptorTableCapacity);
             }
         }
@@ -995,20 +1020,141 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         Ok(NativeDescriptorTableReservation {
             key,
             mm,
+            root,
             pages,
             descriptor_tables,
         })
     }
 
-    /// Bind a submitted table reservation to the child's normal retirement.
-    pub fn commit_native_descriptor_tables(
+    /// Bind a submitted reservation to its exact transaction until EL1
+    /// reports which prefix it linked. Invalid or duplicate submissions return
+    /// every grant immediately; they never consume shared stock.
+    pub fn track_native_descriptor_tables(
         &mut self,
+        ledger: &mut impl ForkTableLedger,
         reservation: NativeDescriptorTableReservation,
-    ) {
-        self.committed_tables
-            .entry(reservation.key)
-            .or_default()
-            .extend(reservation.pages);
+        txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> Result<(), ForkStockServiceError> {
+        let key = (reservation.key, txn.id.generation.get());
+        if txn.id.mm_key != reservation.key.0
+            || txn.tables != reservation.descriptor_tables
+            || self.pending_descriptor_tables.contains_key(&key)
+        {
+            self.cancel_native_descriptor_tables(ledger, reservation);
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
+        self.pending_descriptor_tables.insert(
+            key,
+            PendingNativeDescriptorTables {
+                mm: reservation.mm,
+                root: reservation.root,
+                pages: reservation.pages,
+                txn,
+            },
+        );
+        Ok(())
+    }
+
+    /// The exact transaction awaiting settlement for one live child.
+    pub fn pending_native_descriptor_transaction(
+        &self,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+        generation: core::num::NonZeroU64,
+    ) -> Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn> {
+        let key = MmKey::of(owner.mm())?;
+        let pending = self
+            .pending_descriptor_tables
+            .get(&(key, generation.get()))?;
+        (self.child_owner(owner.mm()) == Some(owner) && pending.root == root).then_some(pending.txn)
+    }
+
+    /// Settle a submitted reservation from EL1's authenticated receipt. Only
+    /// the linked prefix remains charged to child retirement; refused,
+    /// rolled-back and unused grants return to the shared stock exactly once.
+    pub fn settle_native_descriptor_tables(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<(), ForkStockServiceError> {
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+
+        let key = MmKey::of(owner.mm()).ok_or(ForkStockServiceError::StaleExecution)?;
+        let pending_key = (key, receipt.id.generation.get());
+        let pending = self
+            .pending_descriptor_tables
+            .get(&pending_key)
+            .ok_or(ForkStockServiceError::StaleExecution)?;
+        if self.child_owner(owner.mm()) != Some(owner)
+            || pending.root != root
+            || receipt.id != pending.txn.id
+            || receipt.digest != pending.txn.digest()
+        {
+            return Err(ForkStockServiceError::StaleExecution);
+        }
+        let linked = match receipt.outcome {
+            DescriptorOutcome::Applied(_) => {
+                let verified = pending
+                    .txn
+                    .verify_receipt(receipt)
+                    .map_err(|_| ForkStockServiceError::InvalidRecord)?;
+                pending
+                    .pages
+                    .len()
+                    .checked_sub(verified.unused_table_grants().len())
+                    .ok_or(ForkStockServiceError::InvalidRecord)?
+            }
+            DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_) => 0,
+            DescriptorOutcome::Indeterminate(_) => {
+                return Err(ForkStockServiceError::InvalidRecord);
+            }
+        };
+        let mut pending = self
+            .pending_descriptor_tables
+            .remove(&pending_key)
+            .ok_or(ForkStockServiceError::InvalidRecord)?;
+        let unused = pending.pages.split_off(linked);
+        if !pending.pages.is_empty() {
+            self.committed_tables
+                .entry(key)
+                .or_default()
+                .extend(pending.pages);
+        }
+        for page in &unused {
+            ledger.give_back(*page, pending.mm);
+        }
+        self.tables.extend(unused);
+        Ok(())
+    }
+
+    /// Return all grants after the guest withdrew an unclaimed submission.
+    pub fn cancel_submitted_native_descriptor_tables(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+        generation: core::num::NonZeroU64,
+    ) -> Result<(), ForkStockServiceError> {
+        let key = MmKey::of(owner.mm()).ok_or(ForkStockServiceError::StaleExecution)?;
+        let pending_key = (key, generation.get());
+        let pending = self
+            .pending_descriptor_tables
+            .get(&pending_key)
+            .ok_or(ForkStockServiceError::StaleExecution)?;
+        if self.child_owner(owner.mm()) != Some(owner) || pending.root != root {
+            return Err(ForkStockServiceError::StaleExecution);
+        }
+        let pending = self
+            .pending_descriptor_tables
+            .remove(&pending_key)
+            .ok_or(ForkStockServiceError::InvalidRecord)?;
+        for page in &pending.pages {
+            ledger.give_back(*page, pending.mm);
+        }
+        self.tables.extend(pending.pages);
+        Ok(())
     }
 
     /// Return a reservation whose descriptor transaction was not submitted.
@@ -1061,6 +1207,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             || !self.lifecycles.is_empty()
             || !self.children.is_empty()
             || !self.committed_tables.is_empty()
+            || !self.pending_descriptor_tables.is_empty()
             || self.pending.iter().any(Option::is_some)
         {
             return Err(ForkStockServiceError::InvalidRecord);
@@ -1640,6 +1787,10 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                     .get(key)
                     .is_some_and(|child| child.root == execution.context.root)
                 && !self.quarantine.contains_key(key)
+                && !self
+                    .pending_descriptor_tables
+                    .keys()
+                    .any(|(pending, _)| pending == key)
         });
         let Some(key) = admitted else {
             retire.refuse(ChildRetireRefusal::Stale);

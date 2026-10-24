@@ -32,6 +32,7 @@ pub enum ForkStockKind {
     Reserve,
     Commit,
     Abort,
+    Descriptor,
 }
 
 impl ForkStockKind {
@@ -41,13 +42,116 @@ impl ForkStockKind {
             Self::Reserve => 0x4352_464b_5253_5256,
             Self::Commit => 0x4352_464b_434f_4d4d,
             Self::Abort => 0x4352_464b_4142_4f52,
+            Self::Descriptor => 0x4352_464b_4453_4352,
         }
     }
 
     pub fn decode(word: u64) -> Option<Self> {
-        [Self::Loan, Self::Reserve, Self::Commit, Self::Abort]
-            .into_iter()
-            .find(|kind| kind.word() == word)
+        [
+            Self::Loan,
+            Self::Reserve,
+            Self::Commit,
+            Self::Abort,
+            Self::Descriptor,
+        ]
+        .into_iter()
+        .find(|kind| kind.word() == word)
+    }
+}
+
+/// Exact native backing-descriptor completion. The reply slot stays owned by
+/// the guest until this synchronous crossing lets the carrier consume its
+/// receipt or withdraw an unclaimed submission. No descriptor enum is read
+/// from guest bytes.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct NativeDescriptorSettlement {
+    words: [u64; 8],
+}
+
+impl NativeDescriptorSettlement {
+    const PENDING: u64 = 0;
+    const ACCEPTED: u64 = 1;
+    const REFUSED: u64 = 2;
+    const CONSUMED: u64 = 3;
+
+    pub fn new(owner: crate::El1MmHandle, generation: NonZeroU64, reply: KernelVa) -> Option<Self> {
+        if reply.raw() == 0
+            || !reply
+                .raw()
+                .is_multiple_of(core::mem::align_of::<crate::PortalGrantSlot>() as u64)
+        {
+            return None;
+        }
+        Some(Self {
+            words: [
+                ForkStockKind::Descriptor.word(),
+                owner.carrier().get(),
+                owner.mm().raw(),
+                owner.incarnation().get(),
+                generation.get(),
+                reply.raw(),
+                Self::PENDING,
+                0,
+            ],
+        })
+    }
+
+    pub fn request(&self) -> Option<(crate::El1MmHandle, NonZeroU64, KernelVa)> {
+        if ForkStockKind::decode(self.words[0]) != Some(ForkStockKind::Descriptor)
+            || self.words[6] != Self::PENDING
+        {
+            return None;
+        }
+        let carrier = NonZeroU64::new(self.words[1])?;
+        let mm = ReservationMm::new(self.words[2])?;
+        let incarnation = NonZeroU64::new(self.words[3])?;
+        let generation = NonZeroU64::new(self.words[4])?;
+        // SAFETY: this wire record grants no authority; the carrier verifies
+        // the exact live child owner, stopped execution and root.
+        let owner = unsafe { crate::El1MmHandle::from_admitted_owner(carrier, mm, incarnation) };
+        Some((owner, generation, KernelVa::new(self.words[5])))
+    }
+
+    pub fn accept(&mut self) -> bool {
+        self.reply(Self::ACCEPTED)
+    }
+
+    pub fn refuse(&mut self) -> bool {
+        self.reply(Self::REFUSED)
+    }
+
+    fn reply(&mut self, state: u64) -> bool {
+        if self.request().is_none() {
+            return false;
+        }
+        self.words[6] = state;
+        true
+    }
+
+    pub fn take(
+        &mut self,
+        owner: crate::El1MmHandle,
+        generation: NonZeroU64,
+        reply: KernelVa,
+    ) -> Option<Result<(), ()>> {
+        let state = self.words[6];
+        if ForkStockKind::decode(self.words[0]) != Some(ForkStockKind::Descriptor)
+            || self.words[1] != owner.carrier().get()
+            || self.words[2] != owner.mm().raw()
+            || self.words[3] != owner.incarnation().get()
+            || self.words[4] != generation.get()
+            || self.words[5] != reply.raw()
+        {
+            return None;
+        }
+        let result = match state {
+            Self::ACCEPTED => Ok(()),
+            Self::REFUSED => Err(()),
+            _ => return None,
+        };
+        self.words[6] = Self::CONSUMED;
+        Some(result)
     }
 }
 
@@ -749,11 +853,13 @@ const _: () = {
     // 1. Wire size constants (exact bytes matching origin/main x86 layout)
     assert!(core::mem::size_of::<ForkStockExchange>() == 24 * 8);
     assert!(core::mem::size_of::<ForkStockSettlement>() == 16 * 8);
+    assert!(core::mem::size_of::<NativeDescriptorSettlement>() == 8 * 8);
     assert!(core::mem::size_of::<NativeChildRetire>() == 8 * 8);
 
     // 2. Wire alignment constants
     assert!(core::mem::align_of::<ForkStockExchange>() == 64);
     assert!(core::mem::align_of::<ForkStockSettlement>() == 64);
+    assert!(core::mem::align_of::<NativeDescriptorSettlement>() == 64);
     assert!(core::mem::align_of::<NativeChildRetire>() == 64);
 
     // 3. Exact field byte offsets against the previous x86 layout (origin/main)
@@ -764,6 +870,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ForkStockExchange, _reserved) == 184);
 
     assert!(core::mem::offset_of!(ForkStockSettlement, words) == 0);
+    assert!(core::mem::offset_of!(NativeDescriptorSettlement, words) == 0);
 
     // 4. Magic words and port numbers
     assert!(ForkStockKind::Loan.word() == 0x4352_464b_4c4f_414e);
@@ -782,6 +889,24 @@ const _: () = {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn native_descriptor_settlement_is_exact_and_consumed_once() {
+        let owner = unsafe {
+            crate::El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(7).unwrap(),
+                ReservationMm::new(9).unwrap(),
+                NonZeroU64::new(11).unwrap(),
+            )
+        };
+        let generation = NonZeroU64::new(13).unwrap();
+        let reply = KernelVa::new(0xffff_8000_0001_0000);
+        let mut settlement = NativeDescriptorSettlement::new(owner, generation, reply).unwrap();
+        assert_eq!(settlement.request(), Some((owner, generation, reply)));
+        assert!(settlement.accept());
+        assert_eq!(settlement.take(owner, generation, reply), Some(Ok(())));
+        assert_eq!(settlement.take(owner, generation, reply), None);
+    }
     use crate::{EntryMmKey, EntryTaskKey, EntryThreadGeneration, SnapshotGeneration};
     use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
 

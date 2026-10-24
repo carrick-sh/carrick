@@ -1312,6 +1312,17 @@ VM-free bindings:
   a refusal after the loan was granted aborts it, so later forks on the
   CPU are not refused for capacity.
 
+Native lazy backing uses the same fixed table stock. Each descriptor supply
+may preclaim the bounded eight-page grant record, but only the prefix named by
+the authenticated EL1 receipt becomes live child custody. The unused suffix,
+and every grant from a refused, rolled-back or unclaimed transaction, returns
+before the service continuation releases. Capacity exhaustion is a counted
+`descriptor_capacity_refusal`; it refuses the fault service without a carrier
+fatal and without changing stock. The VM-free bindings
+`many_native_backing_supplies_return_unused_tables_across_two_children` and
+`native_backing_table_exhaustion_is_counted_without_losing_stock` drive 512
+alternating supplies across two live children and the exact exhaustion edge.
+
 KVM binding:
 `native_runtime_wait_wakes_once_only_after_real_mm_retirement` holds the
 real CPL0 child-retire crossing pending. The parent observes WNOHANG zero,

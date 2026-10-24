@@ -534,6 +534,15 @@ impl ForkStockCrossing for TestStockCrossing {
                 }
                 Ok(())
             }
+            Some(ForkStockKind::Descriptor) => {
+                let settlement = unsafe {
+                    &mut *(record_gpa as *mut carrick_el1_abi::NativeDescriptorSettlement)
+                };
+                settlement
+                    .accept()
+                    .then_some(())
+                    .ok_or(NativeProcessError::Invalid)
+            }
             _ => Err(NativeProcessError::Invalid),
         }
     }
