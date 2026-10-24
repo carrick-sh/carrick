@@ -151,6 +151,16 @@ impl Description {
     }
 }
 
+/// Final-reference outcome when a venue defers selected physical releases
+/// (`retired_ofds`) to a host boundary.
+#[must_use = "an immediate final description owns backing resources to release"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeferredRelease {
+    None,
+    Now(Description),
+    Deferred,
+}
+
 /// Exact identity of one open file description incarnation. Copyable:
 /// naming a description does not retain it (an [`OfdPin`] does).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -695,7 +705,7 @@ pub struct Core<const T: usize> {
     /// ([`Authority::publish_objects`]): indices below it resolve; it only grows.
     pub(crate) object_count: AtomicU64,
     retired_tables: AtomicU64,
-    _reserved: [u64; 1],
+    retired_ofds: AtomicU64,
     pub(crate) tables: [TableRecord; T],
 }
 
@@ -716,11 +726,15 @@ const fn str_eq(a: &str, b: &str) -> bool {
 }
 
 /// Named layout facts a shared-memory venue folds into its ABI layout hash.
-pub const NAMED_LAYOUT_FACTS: [(&str, u64); 59] = [
+pub const NAMED_LAYOUT_FACTS: [(&str, u64); 60] = [
     ("TABLE_RETIRED", TABLE_RETIRED as u64),
     (
         "Core.retired_tables",
         core::mem::offset_of!(Core<1>, retired_tables) as u64,
+    ),
+    (
+        "Core.retired_ofds",
+        core::mem::offset_of!(Core<1>, retired_ofds) as u64,
     ),
     (
         "TableRecord.size",
@@ -1018,7 +1032,7 @@ impl<const T: usize> Core<T> {
             free_objects: AtomicU64::new(0),
             object_count: AtomicU64::new(0),
             retired_tables: AtomicU64::new(0),
-            _reserved: [0; 1],
+            retired_ofds: AtomicU64::new(0),
             tables: core::array::from_fn(|_| TableRecord::default()),
         };
         let identity = NEXT_AUTHORITY
@@ -1427,6 +1441,57 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         self.drop_hold(entry.ofd, REF)
     }
 
+    fn drop_hold_filtered(
+        &self,
+        index: u32,
+        amount: u64,
+        release_here: impl FnOnce(Description) -> bool,
+    ) -> Result<DeferredRelease, Error> {
+        let ofd = self.ofd(index)?;
+        let mut current = ofd.holds.load(Ordering::Relaxed);
+        loop {
+            let half = if amount == REF {
+                current >> 32
+            } else {
+                current & FREE_INDEX
+            };
+            if half == 0 {
+                return Err(Error::StalePin);
+            }
+            match ofd.holds.compare_exchange_weak(
+                current,
+                current - amount,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(seen) => current = seen,
+            }
+        }
+        if current != amount {
+            return Ok(DeferredRelease::None);
+        }
+        let released = self.snapshot(index)?;
+        if release_here(released) {
+            self.free_ofd(index)?;
+            Ok(DeferredRelease::Now(released))
+        } else {
+            push(&self.core.retired_ofds, index as usize, &ofd.next_free);
+            Ok(DeferredRelease::Deferred)
+        }
+    }
+
+    fn close_locked_filtered(
+        &self,
+        table: &Table<'a>,
+        fd: Fd,
+        release_here: impl FnOnce(Description) -> bool,
+    ) -> Result<DeferredRelease, Error> {
+        let entry = table.entry(fd)?;
+        table.storage.set(fd.0 as usize, None);
+        self.drop_hold_filtered(entry.ofd, REF, release_here)
+    }
+
     fn publish(&self, index: usize, limit: usize, storage: Extent) -> TableId {
         let record = &self.core.tables[index];
         let generation = record.generation.load(Ordering::Relaxed) + 1;
@@ -1729,6 +1794,102 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     pub fn close(&self, table: TableId, fd: Fd) -> Result<Option<Description>, Error> {
         let (_guard, t) = self.lock(table)?;
         self.close_locked(&t, fd)
+    }
+
+    fn replace_exact_filtered(
+        &self,
+        t: &Table<'a>,
+        ofd: u32,
+        new: Fd,
+        cloexec: bool,
+        release_here: impl FnOnce(Description) -> bool,
+    ) -> Result<DeferredRelease, Error> {
+        if new.0 < 0 || new.0 as usize >= t.limit {
+            return Err(Error::BadFd);
+        }
+        if new.0 as usize >= t.storage.capacity() {
+            return Err(Error::NeedsBacking {
+                descriptors: new.0 as usize + 1,
+            });
+        }
+        if t.storage.reserved(new.0 as usize) {
+            return Err(Error::Busy);
+        }
+        self.retain(ofd, REF)?;
+        let released = match self.close_locked_filtered(t, new, release_here) {
+            Ok(d) => d,
+            Err(Error::BadFd) => DeferredRelease::None,
+            Err(e) => return Err(e),
+        };
+        t.storage.set(new.0 as usize, Some(Entry { ofd, cloexec }));
+        Ok(released)
+    }
+
+    /// Ring-side `dup2` that defers physical release of host-backed OFDs to
+    /// [`Authority::take_retired_ofd`].
+    pub fn dup2_filtered(
+        &self,
+        table: TableId,
+        old: Fd,
+        new: Fd,
+        release_here: impl FnOnce(Description) -> bool,
+    ) -> Result<DeferredRelease, Error> {
+        let (_guard, t) = self.lock(table)?;
+        let entry = t.entry(old)?;
+        if old == new {
+            return Ok(DeferredRelease::None);
+        }
+        self.replace_exact_filtered(&t, entry.ofd, new, false, release_here)
+    }
+
+    /// Ring-side `dup3` that defers physical release of host-backed OFDs to
+    /// [`Authority::take_retired_ofd`].
+    pub fn dup3_filtered(
+        &self,
+        table: TableId,
+        old: Fd,
+        new: Fd,
+        cloexec: bool,
+        release_here: impl FnOnce(Description) -> bool,
+    ) -> Result<DeferredRelease, Error> {
+        if old == new {
+            return Err(Error::InvalidArgument);
+        }
+        let (_guard, t) = self.lock(table)?;
+        let entry = t.entry(old)?;
+        self.replace_exact_filtered(&t, entry.ofd, new, cloexec, release_here)
+    }
+
+    /// Ring-side `close` that defers physical release of host-backed OFDs to
+    /// [`Authority::take_retired_ofd`].
+    pub fn close_filtered(
+        &self,
+        table: TableId,
+        fd: Fd,
+        release_here: impl FnOnce(Description) -> bool,
+    ) -> Result<DeferredRelease, Error> {
+        let (_guard, t) = self.lock(table)?;
+        self.close_locked_filtered(&t, fd, release_here)
+    }
+
+    /// Pop and free one finalized OFD whose physical backing release was
+    /// deferred to the host (`close_filtered` / `dup2_filtered` / `dup3_filtered`).
+    pub fn take_retired_ofd(&self) -> Result<Option<Description>, Error> {
+        let count = self.core.ofd_count.load(Ordering::Acquire) as usize;
+        let Some(index) = pop(&self.core.retired_ofds, |i| {
+            if i >= count {
+                return None;
+            }
+            self.backing
+                .ofd(i)
+                .map(|ofd| ofd.next_free.load(Ordering::Relaxed))
+        }) else {
+            return Ok(None);
+        };
+        let index = index as u32;
+        let released = self.snapshot(index)?;
+        self.free_ofd(index)?;
+        Ok(Some(released))
     }
     /// Inclusive range, bounded by storage even for last=u32::MAX.
     /// CLOSE_RANGE_UNSHARE is fork + venue publication + this operation; it
