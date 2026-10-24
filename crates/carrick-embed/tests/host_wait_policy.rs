@@ -3,6 +3,9 @@
 
 use std::sync::Arc;
 
+#[path = "common/host_read_enrollment.rs"]
+mod host_read_enrollment;
+
 use carrick_abi::LinuxCloneFlags;
 use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 use carrick_hal::{CpuAffinity, GuestCpuId, SchedulingPolicy, ThreadId};
@@ -16,6 +19,85 @@ use carrick_kernel::kernel::{
 #[derive(Debug, Default)]
 struct TestKick {
     binding: parking_lot::Mutex<Option<ExecutorBinding>>,
+}
+
+#[test]
+fn host_read_witness_requires_a_live_enrolled_registration() {
+    use carrick_abi::{PollEvents, WaitSigMask};
+    use carrick_kernel::dispatch::{DispatchOutcome, FdWaitCompletion, SyscallRequest, WaitFds};
+    use carrick_kernel::kernel::continuation::{
+        BlockedContinuation, CarrierWaitService, ContinuationCapture, RestartClass,
+    };
+    use std::os::fd::AsRawFd;
+
+    let bootstrap = RootBootstrap::for_reference_model(
+        61_500,
+        ThreadId::synthetic_for_tests(61_500),
+        "host read enrollment".into(),
+    )
+    .unwrap();
+    let (kernel, root) = Kernel::bootstrap_root(bootstrap).unwrap();
+    root.thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    publish_task(&root, 300);
+    let scheduler = Arc::new(Scheduler::new(kernel));
+    let owner = scheduler
+        .register_executor_bound(
+            Arc::new(TestKick::default()),
+            Some(GuestCpuId::new(0)),
+            false,
+        )
+        .unwrap();
+    scheduler.make_runnable(root.thread().key()).unwrap();
+    let running = scheduler.take(&owner).unwrap();
+    let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let request = SyscallRequest::new(
+        carrick_abi::syscall::nr::READ.raw(),
+        carrick_kernel::compat::SyscallArgs::from([0; 6]),
+    );
+    let capture =
+        ContinuationCapture::from_lease(&root, running.lease(), request, RestartClass::Never)
+            .unwrap();
+    let mut wait = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnFds {
+            fds: WaitFds::host_readiness(vec![(
+                carrick_el1_abi::HostBoundFd::new(reader.as_raw_fd()).unwrap(),
+                PollEvents::from_bits(libc::POLLIN),
+            )]),
+            timeout: None,
+            sig_mask: WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd { on_timeout: 0 },
+        },
+        capture,
+    )
+    .unwrap();
+    assert!(!host_read_enrollment::enrolled_read(None));
+    assert!(!host_read_enrollment::enrolled_read(Some(
+        &wait.diagnostic()
+    )));
+    let service = CarrierWaitService::new(scheduler.clone());
+    let mut registration = service.prepare_registration(&wait);
+    assert!(!host_read_enrollment::enrolled_read(Some(
+        &wait.diagnostic()
+    )));
+    service.enroll(&mut registration).unwrap();
+    wait.attach_registration(registration).unwrap();
+    let diagnostic = wait.diagnostic();
+    assert!(host_read_enrollment::enrolled_read(Some(&diagnostic)));
+    for state in ["prepared", "ready", "consumed", "absent"] {
+        let mut invalid = diagnostic.clone();
+        invalid.registration.as_mut().unwrap().state = state.into();
+        assert!(
+            !host_read_enrollment::enrolled_read(Some(&invalid)),
+            "{state}"
+        );
+    }
+    drop(service);
+    assert!(!host_read_enrollment::enrolled_read(Some(
+        &wait.diagnostic()
+    )));
+    drop(wait);
+    scheduler.settle_exited(running).unwrap();
 }
 
 impl ExecutorKick for TestKick {

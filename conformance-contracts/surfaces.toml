@@ -336,7 +336,7 @@ contracts = ["kernel.scheduler.host-wait-handoff"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/host_wait_policy.rs"
-contracts = ["kernel.scheduler.host-wait-handoff"]
+contracts = ["kernel.scheduler.host-wait-handoff", "kernel.el1.guest-run-queue"]
 
 [[surfaces]]
 path = "crates/carrick-embed/tests/scheduler_preemption.rs"
@@ -1841,3 +1841,11 @@ contracts = ["kernel.memory.owner-wait"]
 [[surfaces]]
 path = "crates/carrick-core/src/cancellation/loom_tests.rs"
 contracts = ["kernel.memory.owner-wait"]
+
+[[surfaces]]
+path = "crates/carrick-embed/tests/common/host_read_enrollment.rs"
+contracts = ["kernel.el1.guest-run-queue"]
+
+[[surfaces]]
+path = "fixtures/embed-el1-sched/src/host_read_gate.rs"
+contracts = ["kernel.el1.guest-run-queue"]
