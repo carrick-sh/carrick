@@ -341,6 +341,39 @@ fn fork_shares_description_but_not_descriptor_flags() {
 }
 
 #[test]
+fn refused_fork_publication_restores_identity_storage_and_holds() {
+    let c = authority::<3, 2>();
+    let parent = c.create_table(8, &mut storage(8)).unwrap();
+    let fd = c.open(parent, Fd(0), description(1), true).unwrap();
+    let peer = c.fork(parent, &mut storage(8)).unwrap();
+    let mut extent = storage(8);
+    for _ in 0..16 {
+        let before = extent;
+        let mut refused_id = None;
+        assert_eq!(
+            c.fork_published(parent, &mut extent, |child| {
+                refused_id = Some(child);
+                Err(Error::NoMemory)
+            }),
+            Err(Error::NoMemory)
+        );
+        assert_eq!(extent, before);
+        assert_eq!(c.refcount(parent, fd), Ok(2));
+        assert_eq!(c.get(refused_id.unwrap(), fd), Err(Error::StaleTable));
+    }
+    let child = c.fork(parent, &mut extent).unwrap();
+    assert_eq!(c.refcount(parent, fd), Ok(3));
+    assert_eq!(extent, Extent::EMPTY);
+    c.destroy_table(child, |_| panic!("parent and peer still live"))
+        .unwrap();
+    c.destroy_table(peer, |_| panic!("parent still live"))
+        .unwrap();
+    let mut releases = 0;
+    c.destroy_table(parent, |_| releases += 1).unwrap();
+    assert_eq!(releases, 1);
+}
+
+#[test]
 fn setfl_preserves_immutable_flags_and_access() {
     for access in [
         AccessMode::ReadOnly,

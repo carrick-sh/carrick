@@ -1751,6 +1751,19 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     /// Caller supplies backing at least as large as the parent's current backing.
     /// No partial retain or consumed storage on a capacity failure.
     pub fn fork(&self, parent: TableId, storage: &mut Extent) -> Result<TableId, Error> {
+        self.fork_published(parent, storage, |_| Ok(()))
+    }
+
+    /// Publish a fork's binding while the parent's namespace remains locked.
+    /// Refusal restores storage and every retained reference before unlocking;
+    /// rollback cannot be a final release while the parent still owns its slots.
+    /// The publisher must not reenter this authority or publish on refusal.
+    pub fn fork_published(
+        &self,
+        parent: TableId,
+        storage: &mut Extent,
+        publish: impl FnOnce(TableId) -> Result<(), Error>,
+    ) -> Result<TableId, Error> {
         let (_parent_guard, p) = self.lock(parent)?;
         let capacity = p.storage.capacity();
         if (storage.capacity as usize) < capacity {
@@ -1790,8 +1803,30 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         }
         child.rebuild();
         let id = self.publish(index, p.limit, core::mem::take(storage));
+        if let Err(error) = publish(id) {
+            for fd in 0..capacity {
+                if let Some(entry) = child.get(fd) {
+                    self.drop_hold(entry.ofd, REF)?;
+                }
+            }
+            *storage = Self::record_extent(guard.record);
+            guard.record.begin_write();
+            guard.record.extent_token.store(0, Ordering::Relaxed);
+            guard.record.extent_capacity.store(0, Ordering::Relaxed);
+            guard.record.state.store(TABLE_FREE, Ordering::Release);
+            guard.record.end_write();
+            drop(guard);
+            self.push_table(index);
+            return Err(error);
+        }
         drop(guard);
         Ok(id)
+    }
+
+    /// Snapshot the backing requirement; fork revalidates it under its lock.
+    pub fn backing_capacity(&self, table: TableId) -> Result<usize, Error> {
+        let (_, _, storage) = self.read_table(table)?;
+        Ok(storage.capacity())
     }
     /// Venue must unshare a CLONE_FILES table before exec; otherwise siblings
     /// would observe this sweep. Releases are delivered exactly once, under
