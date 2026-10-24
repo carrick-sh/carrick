@@ -755,7 +755,7 @@ impl<'a> FsView<'a> {
 
 /// Exact namespace identities captured with retained file resources. This
 /// permits traversal to those resources; it does not publish process liveness.
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(in crate::dispatch) struct RetainedProcCaller {
     pub pid: super::super::NsPid,
     pub tid: super::super::NsPid,
