@@ -23,6 +23,16 @@ mod storage;
 pub use prepared::ClaimedPreparedCopy;
 pub use storage::ResolvedReservationNodes;
 
+/// One prepared image mapping. The caller retains every referenced backing
+/// until the unpublished MM is adopted or its physical rollback settles.
+#[derive(Clone, Copy, Debug)]
+pub struct ImportedMapping {
+    pub range: ReservationRange,
+    pub protection: ReservationProtection,
+    pub flags: ReservationNodeFlags,
+    pub backing: Option<HostBackingIdentity>,
+}
+
 /// Test-only census of how many activations of each tree walk are live at
 /// once. A walk over an explicit work stack holds one activation however
 /// deep the tree is; a recursive walk holds one per level, which is what
@@ -3217,6 +3227,42 @@ impl<
         let tree = self.insert(self.state().tree, id);
         self.state_mut().tree = tree;
     }
+    /// Import one complete prepared image into an empty, unadmitted root.
+    /// This seals reservation policy only; the execution owner separately
+    /// commits physical publication and grants permission to run the MM.
+    /// A refused import returns all nodes and restores the initial layout.
+    pub fn import_image(
+        &mut self,
+        layout: impl Into<Layout>,
+        rows: impl IntoIterator<Item = ImportedMapping>,
+        external_charges: impl FnOnce(&mut Self) -> Result<(u64, u64), Refusal>,
+    ) -> Result<(), Refusal> {
+        // Do not roll back a root owned by another admitted/import operation.
+        if self.is_admitted() || self.state().tree != 0 {
+            return Err(Refusal::Stale);
+        }
+        let original = self.layout();
+        let result = (|| {
+            self.configure_import(layout)?;
+            for row in rows {
+                match row.backing {
+                    Some(backing) => {
+                        self.import_with_backing(row.range, row.protection, row.flags, backing)?
+                    }
+                    None => self.import_with(row.range, row.protection, row.flags)?,
+                }
+            }
+            let (address, data) = external_charges(self)?;
+            self.set_external_charges(address, data);
+            self.finish_import()
+        })();
+        if result.is_err() {
+            self.abort_import()?;
+            self.configure_import(original)?;
+        }
+        result
+    }
+
     /// Seal the host's complete import before serving any decision. Imports
     /// cannot later overwrite an independently evolving guest authority.
     pub fn finish_import(&mut self) -> Result<(), Refusal> {
@@ -5368,6 +5414,81 @@ mod tests {
         let _reused_parent = admitted(&table, 0, 15);
         let _reused_child = admitted(&table, 1, 16);
         assert_eq!(table.allocated.load(Ordering::Relaxed), 2 * HOST_RESERVE);
+    }
+
+    #[test]
+    fn image_import_rolls_back_only_the_unpublished_successor() {
+        let table = table();
+        let mut old = admitted(&table, 0, 13);
+        old.insert_opaque(
+            range(0x200000, 0x204000),
+            ReservationProtection::READ_WRITE,
+            ReservationNodeFlags::PRIVATE,
+        )
+        .unwrap();
+        let old_charges = old.charges();
+        let successor = ReservationMm::new(14).unwrap();
+        table.publish(1, successor, layout()).unwrap();
+        let mut new = table.lock(1, successor).unwrap();
+        let before = table.allocated.load(Ordering::Relaxed);
+        let row = ImportedMapping {
+            range: range(0x300000, 0x304000),
+            protection: ReservationProtection::READ_WRITE,
+            flags: ReservationNodeFlags::ANONYMOUS_PRIVATE,
+            backing: None,
+        };
+        let source = HostBackingIdentity::new(
+            core::num::NonZeroU64::new(17).unwrap(),
+            core::num::NonZeroU64::new(3).unwrap(),
+            0,
+        );
+        let file = ImportedMapping {
+            range: range(0x400000, 0x404000),
+            flags: ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+            backing: Some(source),
+            ..row
+        };
+        assert_eq!(
+            new.import_image(layout(), [row, file], |_| Err(Refusal::Invalid)),
+            Err(Refusal::Invalid)
+        );
+        assert!(!new.is_admitted());
+        assert_eq!(new.charges().bytes, 0);
+        assert_eq!(
+            new.source_ref_count(source.handle(), source.generation()),
+            0
+        );
+        // `allocated` is the pool high-water mark, not its live population.
+        // Exhaust the free pool to prove the refused import returned its node.
+        let nodes: Vec<_> = (before as usize..NODES)
+            .map(|_| new.pool_node().expect("rollback returned every image node"))
+            .collect();
+        assert_eq!(new.pool_node(), Err(Refusal::MetadataRequired));
+        for node in nodes {
+            table.release(node, new.banks);
+        }
+        assert!(old.is_admitted());
+        assert_eq!(old.charges(), old_charges);
+        new.import_image(layout(), [row, file], |_| Ok((0, 0)))
+            .unwrap();
+        assert!(new.is_admitted());
+        assert_eq!(new.charges().bytes, 0x8000);
+        assert_eq!(
+            new.source_ref_count(source.handle(), source.generation()),
+            0x4000
+        );
+        assert_eq!(
+            new.import_image(layout(), [], |_| panic!(
+                "admitted roots cannot be reimported"
+            )),
+            Err(Refusal::Stale)
+        );
+        assert_eq!(new.charges().bytes, 0x8000);
+        assert_eq!(
+            new.source_ref_count(source.handle(), source.generation()),
+            0x4000
+        );
+        assert_eq!(old.charges(), old_charges);
     }
 
     #[test]
