@@ -663,6 +663,83 @@ fn interrupted_native_service_preserves_instruction_and_registers() {
 }
 
 #[test]
+fn native_el0_sync_exceptions_have_owned_service_operations() {
+    use carrick_core_abi::service::{NativeExceptionKind, ServiceOperation};
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut frame = carrick_el1_abi::TrapFrame {
+        elr: 0x401000,
+        far: 0x402003,
+        ..Default::default()
+    };
+    for (name, esr, kind, address) in [
+        (
+            "brk",
+            0x3c << 26,
+            NativeExceptionKind::Breakpoint,
+            frame.elr,
+        ),
+        (
+            "udf",
+            1 << 25,
+            NativeExceptionKind::UndefinedInstruction,
+            frame.elr,
+        ),
+        (
+            "pc alignment",
+            0x22 << 26,
+            NativeExceptionKind::Alignment,
+            frame.far,
+        ),
+        (
+            "sp alignment",
+            0x26 << 26,
+            NativeExceptionKind::Alignment,
+            frame.far,
+        ),
+        (
+            "fp access",
+            0x07 << 26,
+            NativeExceptionKind::FloatingPoint,
+            frame.elr,
+        ),
+        (
+            "fp exception",
+            0x2c << 26,
+            NativeExceptionKind::FloatingPoint,
+            frame.elr,
+        ),
+    ] {
+        frame.esr = esr;
+        let operation = super::super::dispatch::native_service_operation(
+            &mut frame,
+            &fixture.task.linux,
+            carrick_el1_abi::Action::Forward,
+        )
+        .unwrap_or_else(|| panic!("{name} must park under the shared exception owner"));
+        assert_eq!(
+            operation,
+            ServiceOperation::Exception(carrick_core_abi::service::NativeException {
+                kind,
+                address: carrick_guest_arch::UserVa::new(address),
+            })
+        );
+    }
+}
+
+#[test]
+fn native_sync_exception_refusals_queue_shared_owner_signals() {
+    use carrick_signal_core::policy::Signal;
+    for (esr, signal) in [
+        (0x3c << 26, Signal::TRAP),
+        (1 << 25, Signal::ILL),
+        (0x22 << 26, Signal::BUS),
+        (0x07 << 26, Signal::ILL),
+    ] {
+        two_native_children_service_waits(ServiceWitness::Exception { esr, signal });
+    }
+}
+
+#[test]
 fn native_service_intake_does_not_reacquire_the_busy_mm_root() {
     two_native_children_service_waits(ServiceWitness::RootBusy);
 }
@@ -686,6 +763,10 @@ enum ServiceWitness {
     Completed,
     Retry,
     Interrupt,
+    Exception {
+        esr: u64,
+        signal: carrick_signal_core::policy::Signal,
+    },
 }
 
 fn two_native_children_service_waits(witness: ServiceWitness) {
@@ -776,6 +857,11 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             ServiceWitness::Interrupt => {
                 frame.esr = 0;
                 fixture.task.linux.mark_pending_host_work();
+                carrick_el1_abi::Action::Forward
+            }
+            ServiceWitness::Exception { esr, .. } => {
+                frame.esr = esr;
+                frame.far = 0x6000000fd8;
                 carrick_el1_abi::Action::Forward
             }
             ServiceWitness::Fault
@@ -1015,7 +1101,11 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
                 };
                 assert!(ticket.complete_wait(wait).is_ok());
             } else {
-                assert!(ticket.complete(true).is_ok());
+                assert!(
+                    ticket
+                        .complete(!matches!(witness, ServiceWitness::Exception { .. }))
+                        .is_ok()
+                );
             }
             queue
                 .notify_object(fixture.slot, &mut Default::default())
@@ -1107,6 +1197,16 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             ),
             NativeResume::NoPending
         ));
+        if let ServiceWitness::Exception { signal, .. } = witness {
+            let signals = owner.current_signals(&fixture.task).unwrap();
+            assert_eq!(
+                signals
+                    .pending_set(request.identity.birth.record)
+                    .contains(signal),
+                request.identity != first_request.identity,
+                "only the refused exception, not the cancelled sibling, queues its signal"
+            );
+        }
         assert_eq!(page.claimed_count(), 0);
         let retained = unsafe { &fixture.zone.record(child).ctx_mut().native };
         let expected = match witness {

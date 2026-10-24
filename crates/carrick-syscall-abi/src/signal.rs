@@ -48,6 +48,10 @@ pub const LINUX_SEGV_MAPERR: i32 = 1;
 pub const LINUX_SEGV_ACCERR: i32 = 2;
 pub const LINUX_BUS_ADRALN: i32 = 1;
 pub const LINUX_BUS_ADRERR: i32 = 2;
+pub const LINUX_ILL_ILLOPC: i32 = 1;
+pub const LINUX_TRAP_BRKPT: i32 = 1;
+pub const LINUX_TRAP_TRACE: i32 = 2;
+pub const LINUX_TRAP_HWBKPT: i32 = 4;
 pub const LINUX_SIGVTALRM: i32 = 26;
 pub const LINUX_SIGPROF: i32 = 27;
 pub const LINUX_SIGWINCH: i32 = 28; // default action = Ignore

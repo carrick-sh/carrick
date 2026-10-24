@@ -27,9 +27,52 @@ pub enum ServiceFaultSupply {
     Backing(crate::PortalGrantWindow),
 }
 
+/// EL0 synchronous exception selected by the ISA boundary. The Linux
+/// personality owns the signal policy; the host transport only refuses the
+/// physical service request back to that owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeExceptionKind {
+    Breakpoint,
+    SingleStep,
+    HardwareBreakpoint,
+    UndefinedInstruction,
+    Alignment,
+    FloatingPoint,
+}
+impl NativeExceptionKind {
+    const fn encode(self) -> u64 {
+        match self {
+            Self::Breakpoint => 1,
+            Self::SingleStep => 2,
+            Self::HardwareBreakpoint => 3,
+            Self::UndefinedInstruction => 4,
+            Self::Alignment => 5,
+            Self::FloatingPoint => 6,
+        }
+    }
+    const fn decode(raw: u64) -> Option<Self> {
+        Some(match raw {
+            1 => Self::Breakpoint,
+            2 => Self::SingleStep,
+            3 => Self::HardwareBreakpoint,
+            4 => Self::UndefinedInstruction,
+            5 => Self::Alignment,
+            6 => Self::FloatingPoint,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeException {
+    pub kind: NativeExceptionKind,
+    pub address: carrick_guest_arch::UserVa,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceOperation {
     Fault(FaultInfo),
+    Exception(NativeException),
     Crossing {
         ordinal: NativeOrdinal,
     },
@@ -60,7 +103,7 @@ pub enum ServiceError {
     Exhausted,
 }
 
-pub const NATIVE_SERVICE_PROTOCOL: u64 = 4;
+pub const NATIVE_SERVICE_PROTOCOL: u64 = 5;
 
 /// Transport selector only: authority remains in the member's retained cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -333,6 +376,9 @@ impl ServiceCell {
             ServiceOperation::CarrierWork { entry } => {
                 (3, u64::from(entry == OwnerEntry::Syscall), 0)
             }
+            ServiceOperation::Exception(exception) => {
+                (4, exception.kind.encode(), exception.address.raw())
+            }
         };
         for (index, value) in [(8, execution.raw()), (9, kind), (10, first), (11, second)] {
             self.words[index].store(value, Ordering::Relaxed);
@@ -455,6 +501,12 @@ impl ServiceCell {
                         },
                     }
                 }
+                4 => ServiceOperation::Exception(NativeException {
+                    kind: NativeExceptionKind::decode(first).ok_or(ServiceError::Stale)?,
+                    address: carrick_guest_arch::UserVa::new(
+                        cell.words[11].load(Ordering::Relaxed),
+                    ),
+                }),
                 _ => return Err(ServiceError::Stale),
             };
             let fault_sequence = NonZeroU64::new(cell.result.load(Ordering::Relaxed));
@@ -525,6 +577,11 @@ impl ServiceCell {
                     && cell.words[10].load(Ordering::Relaxed)
                         == u64::from(entry == OwnerEntry::Syscall)
                     && cell.words[11].load(Ordering::Relaxed) == 0
+            }
+            ServiceOperation::Exception(exception) => {
+                cell.words[9].load(Ordering::Relaxed) == 4
+                    && cell.words[10].load(Ordering::Relaxed) == exception.kind.encode()
+                    && cell.words[11].load(Ordering::Relaxed) == exception.address.raw()
             }
         };
         if !operation_matches
@@ -971,6 +1028,53 @@ mod tests {
         );
         assert!(ticket.complete(false).is_ok());
         assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Refused));
+    }
+
+    #[test]
+    fn native_exception_kinds_round_trip_through_notice_claim() {
+        let cell = ServiceCell::new();
+        let owner = birth(1, 1);
+        cell.bind(owner).unwrap();
+        for (index, kind) in [
+            NativeExceptionKind::Breakpoint,
+            NativeExceptionKind::SingleStep,
+            NativeExceptionKind::HardwareBreakpoint,
+            NativeExceptionKind::UndefinedInstruction,
+            NativeExceptionKind::Alignment,
+            NativeExceptionKind::FloatingPoint,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let operation = ServiceOperation::Exception(NativeException {
+                kind,
+                address: UserVa::new(0x4000 + index as u64 * 4),
+            });
+            let request = cell
+                .publish(owner, SnapshotGeneration::INITIAL, operation, None)
+                .unwrap();
+            let member = carrick_sched_core::ThreadIdentity {
+                tid: 1,
+                serial: owner.thread.raw(),
+                mm: owner.mm.mm().raw(),
+                generation: SnapshotGeneration::INITIAL.raw(),
+                ..Default::default()
+            };
+            // SAFETY: the local cell and synthetic exact member remain alive
+            // for the claim and use the same immutable birth identity.
+            let ticket = unsafe {
+                ServiceCell::claim_notice(
+                    &cell,
+                    request.identity.into(),
+                    owner.mm.carrier(),
+                    member,
+                )
+            }
+            .unwrap();
+            assert_eq!(ticket.request().operation, operation);
+            assert!(ticket.complete(false).is_ok());
+            assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Refused));
+        }
     }
 
     fn supply_window(owner: ServiceBirth) -> crate::PortalGrantWindow {

@@ -690,7 +690,7 @@ pub(super) fn native_service_operation(
     state: &carrick_el1_abi::LinuxTaskState,
     action: Action,
 ) -> Option<carrick_core_abi::service::ServiceOperation> {
-    use carrick_core_abi::service::ServiceOperation;
+    use carrick_core_abi::service::{NativeException, NativeExceptionKind, ServiceOperation};
     use carrick_guest_arch::{Access, FaultInfo, NativeOrdinal, UserVa};
     use carrick_sched_core::object_wait::OwnerEntry;
     if action == Action::ServedWithWork {
@@ -737,6 +737,30 @@ pub(super) fn native_service_operation(
         0x15 => Some(ServiceOperation::Crossing {
             ordinal: NativeOrdinal::new(frame.x[8]),
         }),
+        0x3c => Some(ServiceOperation::Exception(NativeException {
+            kind: NativeExceptionKind::Breakpoint,
+            address: UserVa::new(frame.elr),
+        })),
+        0x32 | 0x33 => Some(ServiceOperation::Exception(NativeException {
+            kind: NativeExceptionKind::SingleStep,
+            address: UserVa::new(frame.elr),
+        })),
+        0x30 | 0x31 | 0x34 | 0x35 => Some(ServiceOperation::Exception(NativeException {
+            kind: NativeExceptionKind::HardwareBreakpoint,
+            address: UserVa::new(frame.elr),
+        })),
+        0x00 | 0x0e => Some(ServiceOperation::Exception(NativeException {
+            kind: NativeExceptionKind::UndefinedInstruction,
+            address: UserVa::new(frame.elr),
+        })),
+        0x22 | 0x26 => Some(ServiceOperation::Exception(NativeException {
+            kind: NativeExceptionKind::Alignment,
+            address: UserVa::new(frame.far),
+        })),
+        0x07 | 0x2c => Some(ServiceOperation::Exception(NativeException {
+            kind: NativeExceptionKind::FloatingPoint,
+            address: UserVa::new(frame.elr),
+        })),
         _ => None,
     }
 }

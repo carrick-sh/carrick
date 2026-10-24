@@ -21,6 +21,8 @@ use crate::SignalSet;
 pub struct Signal(u8);
 
 impl Signal {
+    pub const ILL: Self = Self(4);
+    pub const TRAP: Self = Self(5);
     pub const KILL: Self = Self(9);
     pub const BUS: Self = Self(7);
     pub const SEGV: Self = Self(11);
