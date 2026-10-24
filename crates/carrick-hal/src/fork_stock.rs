@@ -186,6 +186,8 @@ pub enum ForkStockServiceError {
     /// Quarantined stock is waiting, but the carrier holds no zone
     /// occupancy authority to prove its MM runs nowhere.
     OccupancyUnavailable,
+    /// The exact live child has no reusable authenticated table stock.
+    DescriptorTableCapacity,
 }
 
 /// Per-child address-space tag. AArch64 tags every forked root with a
@@ -742,6 +744,29 @@ pub struct NativeForkStockResources {
     pub tables: std::sync::Arc<dyn NativeForkTableReservation>,
     pub inventory: std::sync::Arc<dyn crate::PhysicalFrameInventory>,
 }
+
+/// Authenticated table pages removed from reusable fork stock for one live
+/// native child. Only [`ForkStock::reserve_native_descriptor_tables`] creates
+/// this value, so a descriptor transaction cannot substitute data frames for
+/// EL1-reachable page-table frames.
+#[must_use = "submit and commit the reservation, or cancel it back to fork stock"]
+pub struct NativeDescriptorTableReservation {
+    key: MmKey,
+    mm: ReservationMm,
+    pages: Vec<RootGpa>,
+    descriptor_tables: carrick_mmu_core::aarch64::descriptor_txn::TableGrants,
+}
+
+impl NativeDescriptorTableReservation {
+    /// The descriptor executor's bounded table-grant record.
+    pub fn descriptor_tables(&self) -> carrick_mmu_core::aarch64::descriptor_txn::TableGrants {
+        self.descriptor_tables
+    }
+
+    pub fn pages(&self) -> &[RootGpa] {
+        &self.pages
+    }
+}
 impl NativeForkStockResources {
     /// True when both resource bundles name the same carrier's reserved
     /// fork-table arenas and physical frame inventory.
@@ -915,6 +940,87 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
 
     pub fn child_lifecycle(&self, mm: ReservationMm) -> Option<ForkLifecycleLoan> {
         Some(self.children.get(&MmKey::of(mm)?)?.lifecycle)
+    }
+
+    /// Preclaim authenticated EL1 table-pool pages for one exact live child.
+    /// The caller submits only the typed result, then either commits it to the
+    /// child's terminal custody or cancels it before the guest can execute.
+    pub fn reserve_native_descriptor_tables(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        owner: carrick_el1_abi::El1MmHandle,
+        root: RootGpa,
+        count: usize,
+    ) -> Result<NativeDescriptorTableReservation, ForkStockServiceError> {
+        use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
+
+        let mm = owner.mm();
+        let key = MmKey::of(mm).ok_or(ForkStockServiceError::StaleExecution)?;
+        if count == 0
+            || count > MAX_TABLE_GRANTS
+            || self.child_owner(mm) != Some(owner)
+            || self.child_root(mm) != Some(root)
+            || self.quarantine.contains_key(&key)
+        {
+            return Err(ForkStockServiceError::StaleExecution);
+        }
+        if self.tables.len() < count {
+            return Err(ForkStockServiceError::DescriptorTableCapacity);
+        }
+        self.tables
+            .sort_unstable_by_key(|page| page.address().raw());
+        let pages = self.tables.split_off(self.tables.len() - count);
+        for (charged, page) in pages.iter().enumerate() {
+            if !ledger.grant(*page, mm) {
+                for page in pages.iter().take(charged) {
+                    ledger.give_back(*page, mm);
+                }
+                self.tables.extend(pages);
+                return Err(ForkStockServiceError::DescriptorTableCapacity);
+            }
+        }
+        let raw_pages: Vec<_> = pages
+            .iter()
+            .map(|page| carrick_mmu_core::aarch64::SubstrateGpa(page.address().raw()))
+            .collect();
+        let Some(descriptor_tables) =
+            carrick_mmu_core::aarch64::descriptor_txn::TableGrants::new(&raw_pages)
+        else {
+            for page in &pages {
+                ledger.give_back(*page, mm);
+            }
+            self.tables.extend(pages);
+            return Err(ForkStockServiceError::InvalidRecord);
+        };
+        Ok(NativeDescriptorTableReservation {
+            key,
+            mm,
+            pages,
+            descriptor_tables,
+        })
+    }
+
+    /// Bind a submitted table reservation to the child's normal retirement.
+    pub fn commit_native_descriptor_tables(
+        &mut self,
+        reservation: NativeDescriptorTableReservation,
+    ) {
+        self.committed_tables
+            .entry(reservation.key)
+            .or_default()
+            .extend(reservation.pages);
+    }
+
+    /// Return a reservation whose descriptor transaction was not submitted.
+    pub fn cancel_native_descriptor_tables(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        reservation: NativeDescriptorTableReservation,
+    ) {
+        for page in &reservation.pages {
+            ledger.give_back(*page, reservation.mm);
+        }
+        self.tables.extend(reservation.pages);
     }
 
     /// True when some retired child is waiting for reclaim.
