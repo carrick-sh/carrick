@@ -84,3 +84,14 @@ Native owner waits include the direct service admission frame and both
 parking paths. Native backing replies additionally charge the retained
 service continuation, grant authentication and the descriptor executor,
 including its four table levels and allocation/notification tails.
+
+FD inheritance has its own envelope, separate from page-table descriptor work.
+It retains the native fork entry, the FD service and shared-core fork/storage
+frames, including publication refusal and storage/reference rollback. Native
+FD retirement runs after exit publication returns, so its envelope takes the
+exit or failed-fork prefix without nesting underneath `finish_exit`. It charges
+namespace revocation, final-description callbacks, object/epoll release, and
+the larger of queue notification and wake delivery. Optional helpers may inline
+in one image feature closure and remain emitted in another; both forms are
+charged. Synthetic cumulative-overflow tests reject both FD paths even when
+every individual frame remains below its separate ceiling.

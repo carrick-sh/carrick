@@ -1703,7 +1703,7 @@ contracts = ["kernel.el1.signal-delivery-owner"]
 # The host build inspects the actual release ARM image's retained entry frames.
 [[surfaces]]
 path = "crates/carrick-el1-image/frame_budget.rs"
-contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle"]
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle", "kernel.el1.ipc-fd-authority"]
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/loom_models.rs"
