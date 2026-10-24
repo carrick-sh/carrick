@@ -374,6 +374,46 @@ fn refused_fork_publication_restores_identity_storage_and_holds() {
 }
 
 #[test]
+fn revoked_table_retains_physical_releases_through_dropped_custody() {
+    let c = authority::<2, 2>();
+    let parent = c.create_table(8, &mut storage(8)).unwrap();
+    let external = c.open(parent, Fd(0), description(1), false).unwrap();
+    let local = c.open(parent, Fd(0), description(2), false).unwrap();
+    let peer = c.fork(parent, &mut storage(8)).unwrap();
+    c.retire_table(
+        parent,
+        |d| d.backing == BackingToken(2),
+        |_| panic!("peer owns both"),
+    )
+    .unwrap();
+    assert_eq!(c.get(parent, external), Err(Error::StaleTable));
+    assert_eq!(c.refcount(peer, external), Ok(2));
+    assert_eq!(c.refcount(peer, local), Ok(1));
+    drop(c.take_retired_table().unwrap());
+    assert_eq!(c.refcount(peer, external), Ok(2));
+    assert_eq!(c.close(peer, external), Ok(None));
+    assert_eq!(
+        c.close(peer, local).unwrap().unwrap().backing,
+        BackingToken(2)
+    );
+    let mut custody = c.take_retired_table().unwrap();
+    assert_eq!(custody.capacity(), 8);
+    let mut releases = Vec::new();
+    let extent = custody.finish(|d| releases.push(d.backing)).unwrap();
+    assert_eq!(releases, [BackingToken(1)]);
+    assert_eq!(extent.capacity, 8);
+    assert_eq!(
+        custody.finish(|_| panic!("duplicate release")),
+        Err(Error::StaleTable)
+    );
+    drop(custody);
+    assert!(c.take_retired_table().is_none());
+    c.destroy_table(peer, |_| panic!("peer is empty")).unwrap();
+    c.create_table(8, &mut storage(8)).unwrap();
+    c.create_table(8, &mut storage(8)).unwrap();
+}
+
+#[test]
 fn setfl_preserves_immutable_flags_and_access() {
     for access in [
         AccessMode::ReadOnly,

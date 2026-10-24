@@ -7237,4 +7237,42 @@ fn native_fork_two_children_inherit_the_complete_ipc_namespace() {
         );
         assert_eq!(authority.getfd(child_table, fd::Fd(4)), Ok(true));
     }
+    drop(writer);
+    table.close(fd::Fd(4)).unwrap();
+    service.retire_fd_table(children[0]);
+    assert!(
+        map.lookup(children[0]).is_none(),
+        "retired native namespace remains published"
+    );
+    assert_eq!(
+        ipc.lock(object, &ShortLockSpin)
+            .unwrap()
+            .pipe()
+            .unwrap()
+            .references(End::Writer),
+        1
+    );
+    service.retire_fd_table(children[1]);
+    assert!(map.lookup(children[1]).is_none());
+    assert_eq!(
+        ipc.lock(object, &ShortLockSpin)
+            .unwrap()
+            .pipe()
+            .unwrap()
+            .references(End::Writer),
+        0,
+        "EOF is due only after both child writer descriptions close"
+    );
+    table.close(fd::Fd(3)).unwrap();
+    drop(reader);
+    assert!(
+        ipc.lock(object, &ShortLockSpin).is_err(),
+        "final pipe release leaked the object"
+    );
+    assert_eq!(owner.drain_retired_tables().unwrap(), 2);
+    assert_eq!(
+        ipc.descriptor_allocations(),
+        1,
+        "only the live parent retains table backing"
+    );
 }
