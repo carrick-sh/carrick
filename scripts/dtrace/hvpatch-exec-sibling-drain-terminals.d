@@ -38,6 +38,14 @@
  * - carrick*:::hvpatch-executor-load-failure args: thread serial u64,
  *   execution generation u64, executor u32, error C string. Source-qualified;
  *   a capture must see this row before attributing a backend load refusal.
+ * - carrick*:::hvpatch-executor-failure args: executor u32, error C string.
+ *   Source-qualified; covers the whole worker lifecycle, including native
+ *   service on idle executors without a host task binding.
+ *   Live-qualified on cloudmac 2026-10-23: executor 4 reports a fresh
+ *   inventory mapping with generation 5 where the owner requires 1, after
+ *   reason-6 settlement of the root's zone continuation (detail 14).
+ * - carrick*:::trace-witness-exit args: external launcher's raw wait status.
+ *   Ends captures of scripts/test-signed.sh after its scoped cleanup.
  *
  * PERTURBATION: LOW — only the selected syscalls and lifecycle edges print;
  * the sched_yield storm the reproducer generates is not instrumented.
@@ -92,6 +100,14 @@ carrick*:::hvpatch-exec-runtime-stage
         timestamp - started, tid, arg0, arg1, arg2, arg3);
 }
 
+carrick*:::hvpatch-executor-failure
+/pid == $target || progenyof($target)/
+{
+    printf("%12d host_tid=%d executor-failure executor=%d error=%s\n",
+        timestamp - started, tid, arg0, copyinstr(arg1));
+    ustack(32);
+}
+
 carrick*:::hvpatch-syscall-service-begin
 /(pid == $target || progenyof($target)) && (arg3 == 221 || arg3 == 93 || arg3 == 94)/
 {
@@ -110,6 +126,13 @@ proc:::exit
 /pid == $target/
 {
     printf("%12d target-exit\n", timestamp - started);
+    exit(lifecycle == 0 ? 1 : 0);
+}
+
+carrick*:::trace-witness-exit
+/pid == $target/
+{
+    printf("%12d witness-exit wait_status=%d\n", timestamp - started, arg0);
     exit(lifecycle == 0 ? 1 : 0);
 }
 

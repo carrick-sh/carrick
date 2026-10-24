@@ -197,6 +197,9 @@ where
             Some("executor post-create lifecycle panicked; exact lease failed closed".to_owned())
         }
     };
+    if let Some(error) = &failure {
+        crate::probes::hvpatch_executor_failure(executor_id.raw_for_probe(), error);
+    }
     if !startup_sent {
         let message = failure
             .clone()
