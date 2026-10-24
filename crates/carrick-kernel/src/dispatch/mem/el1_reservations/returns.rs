@@ -51,21 +51,6 @@ pub(crate) fn owed_returns(
     (owed, through)
 }
 
-/// Final-MM settlement of a root: acknowledge every owed return, then retire
-/// the root. Only for the final settlement of the MM: its address space is
-/// closed and drained (no EL1 can journal again), and its frame inventory
-/// retires as a whole with the MM, owed extents included, so nothing is
-/// reconciled range by range. Returns the number of extents released.
-pub(crate) fn settle_final_root(mut model: Reservations<'_>) -> Result<usize, Refusal> {
-    let (_, through) = owed_returns(&model);
-    let released = match through {
-        Some(through) => model.acknowledge_deferred_returns(through)?,
-        None => 0,
-    };
-    model.retire()?;
-    Ok(released)
-}
-
 impl MemView<'_> {
     pub(in crate::dispatch) fn fork_backing_is_unsettled(&self) -> bool {
         let authority = self.mem();

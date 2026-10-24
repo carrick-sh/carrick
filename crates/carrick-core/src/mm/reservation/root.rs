@@ -3262,13 +3262,21 @@ impl<
     /// Called after final-MM descriptor/backing settlement, never sibling exit.
     /// Owed returns must be reconciled first: the MM's frames are only
     /// settled once every EL1-retired extent has its inventory receipt.
-    pub fn retire(mut self) -> Result<(), Refusal> {
+    pub fn retire(self) -> Result<(), Refusal> {
+        if self.deferred().next().is_some() {
+            return Err(Refusal::Busy);
+        }
+        self.retire_final().map(|_| ())
+    }
+    /// Final-MM settlement: retire the closed root and its owed returns together.
+    /// The caller retains all physical custody until whole-MM inventory
+    /// retirement; no range is made reusable by acknowledging its journal.
+    /// Unlike ordinary retirement (also used for fork rollback), this consumes
+    /// deferred returns because the entire MM is being destroyed. Refusal
+    /// preserves the journal, so a still-borrowed root can be retried safely.
+    pub fn retire_final(mut self) -> Result<usize, Refusal> {
         self.reap_prepared();
-        if self.has_prepared_copy()
-            || self.pending().is_some()
-            || self.state().fork_pending
-            || self.deferred().next().is_some()
-        {
+        if self.has_prepared_copy() || self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Busy);
         }
         self.reap_prepared();
@@ -3296,6 +3304,7 @@ impl<
             self.retiring_notifications = true;
             self.unlocked = ResourceUnlocked::Plain;
         }
+        let released = self.deferred().count();
         for slot in self.deferred_slots() {
             slot.mm.store(0, Ordering::Release);
         }
@@ -3317,7 +3326,7 @@ impl<
             .store(self.state().generation.raw(), Ordering::Relaxed);
         self.table.set_admitted(self.index(), false);
         self.root.key.store(0, Ordering::Release);
-        Ok(())
+        Ok(released)
     }
     /// Return every node of the tree at `id` to the pool without a stack:
     /// rotate each left child up over its parent until the head has no left

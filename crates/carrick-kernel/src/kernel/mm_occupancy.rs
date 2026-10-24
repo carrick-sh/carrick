@@ -1443,9 +1443,9 @@ fn retire_reservation_root(
     // The space is closed and drained: EL1 journals no return again, and
     // the owed extents' frames retire with the MM's own inventory.
     let settled = match provider {
-        Some(provider) => provider.prepare().and_then(|view| {
-            crate::dispatch::mem::el1_reservations::settle_final_root(view.lock(key)?)
-        }),
+        Some(provider) => provider
+            .prepare()
+            .and_then(|view| view.lock(key)?.retire_final()),
         None => tables
             .release_venue()
             .ok_or(Refusal::Stale)
@@ -1459,7 +1459,7 @@ fn retire_reservation_root(
                     &carrick_el1::memory::reservations::NoRootWait,
                 )
             })
-            .and_then(crate::dispatch::mem::el1_reservations::settle_final_root),
+            .and_then(|root| root.retire_final()),
     };
     match settled {
         Ok(_) | Err(Refusal::Stale) => {}

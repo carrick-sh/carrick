@@ -284,7 +284,6 @@ impl PhysicalStock {
             let exclusion = access
                 .try_exclude_editor(access.find(mm).unwrap(), mm)
                 .unwrap();
-            let (words, base, len) = self.tables;
             let root = execution.context.root;
             if let Some(grants) = self
                 .owner
@@ -293,32 +292,7 @@ impl PhysicalStock {
                 .supplied
                 .as_mut()
             {
-                self.settled += grants
-                    .settle(pool, exclusion.proof(), |va| {
-                        let mut table = root.address().raw();
-                        for (level, index) in carrick_mmu_core::aarch64::indices(va)
-                            .into_iter()
-                            .enumerate()
-                        {
-                            let offset =
-                                ((table.checked_add(index as u64 * 8)?.checked_sub(base)?) / 8)
-                                    as usize;
-                            if offset >= len {
-                                return None;
-                            }
-                            let word = unsafe { words.as_ptr().add(offset).as_ref()? }
-                                .load(Ordering::Acquire);
-                            if word & 3 != 3 {
-                                return None;
-                            }
-                            if level == 3 {
-                                return Some(word & AARCH64_ROOT_ADDRESS_MASK);
-                            }
-                            table = word & AARCH64_ROOT_ADDRESS_MASK;
-                        }
-                        None
-                    })
-                    .unwrap();
+                self.settled += grants.settle(pool, exclusion.proof()).unwrap();
             }
             pool.release_mm(exclusion.proof());
         }
