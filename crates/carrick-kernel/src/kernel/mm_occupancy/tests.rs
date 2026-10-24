@@ -814,6 +814,7 @@ fn every_host_exclusion_settles_guest_cow_after_the_editor_leaves() {
             spaces,
             occupancy,
             zone: None,
+            backing: None,
         },
         mm(42_301),
     )
@@ -830,6 +831,7 @@ fn pre_admission_owner_blocks_publication_and_refuses_without_relocking() {
         spaces,
         occupancy,
         zone: None,
+        backing: None,
     };
     let key = mm(42_901);
     let guard = PreAdmissionGuard::acquire_in(tables, key).unwrap();
@@ -906,6 +908,7 @@ fn initial_closed_publication_releases_legacy_facts_before_owner_guard() {
             spaces,
             occupancy,
             zone: None,
+            backing: None,
         },
         key,
     )
@@ -978,6 +981,7 @@ fn owner_fork_publication_keeps_child_unswitchable_until_completion() {
         spaces,
         occupancy,
         zone: None,
+        backing: None,
     };
     let child = mm(42_990);
     let guard = PreAdmissionGuard::acquire_in(tables, child).unwrap();
@@ -1014,4 +1018,173 @@ fn owner_fork_publication_keeps_child_unswitchable_until_completion() {
     drop(guard);
     drop(publication);
     assert!(spaces.find(child.raw()).is_none());
+}
+
+struct RetainedPublicationFixture {
+    bytes: Box<carrick_test_support::TestEl1Region>,
+    carrier: std::num::NonZeroU64,
+    released: Arc<parking_lot::Mutex<Vec<u64>>>,
+}
+// SAFETY: this owner retains one aligned, initialized ABI allocation.
+unsafe impl AddressSpaceBacking for RetainedPublicationFixture {
+    fn region(&self) -> Option<AddressSpaceRegion<'_>> {
+        // SAFETY: aligned, zero-initialized ABI fixture; this owner retains it.
+        Some(unsafe {
+            AddressSpaceRegion {
+                carrier: self.carrier,
+                zone: &*self
+                    .bytes
+                    .as_ptr()
+                    .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                    .cast::<carrick_el1_abi::ZoneTables>(),
+                reservations: &*self
+                    .bytes
+                    .as_ptr()
+                    .add(carrick_el1_abi::EL1_RESERVATIONS_OFFSET as usize)
+                    .cast::<carrick_el1::memory::reservations::SharedReservations>(),
+            }
+        })
+    }
+    fn settlement(&self) -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>> {
+        Some(Arc::new(RecordRetainedSettlement(self.released.clone())))
+    }
+}
+struct RecordRetainedSettlement(Arc<parking_lot::Mutex<Vec<u64>>>);
+impl carrick_el1_abi::CowGrantSettlement for RecordRetainedSettlement {
+    fn settle(&self, _: &carrick_sched_core::ExcludedEditor<'_>) {}
+    fn release(&self, excluded: &carrick_sched_core::ExcludedEditor<'_>) {
+        self.0.lock().push(excluded.key());
+    }
+}
+
+#[test]
+fn retained_successor_publications_are_closed_and_rollback_in_their_own_carrier() {
+    let first = Arc::new(RetainedPublicationFixture {
+        bytes: carrick_test_support::TestEl1Region::zeroed(),
+        carrier: std::num::NonZeroU64::new(91).unwrap(),
+        released: Arc::default(),
+    });
+    let second = Arc::new(RetainedPublicationFixture {
+        bytes: carrick_test_support::TestEl1Region::zeroed(),
+        carrier: std::num::NonZeroU64::new(92).unwrap(),
+        released: Arc::default(),
+    });
+    let prepare = |backing: Arc<dyn AddressSpaceBacking>| {
+        publish_closed_address_space_in(
+            backing,
+            mm(42_999),
+            &fence(),
+            0x20_000,
+            0x20_000,
+            0,
+            0,
+            ReservationRootPublication {
+                limits: ReservationLimits {
+                    address: u64::MAX,
+                    data: u64::MAX,
+                },
+                provider: None,
+            },
+        )
+        .unwrap()
+    };
+    let a = prepare(first.clone());
+    let b = prepare(second.clone());
+    for backing in [&first, &second] {
+        let region = backing.region().unwrap();
+        let index = region.zone.spaces.find(42_999).unwrap();
+        assert!(!region.zone.spaces.is_open(42_999));
+        assert!(region.zone.spaces.grant(index, 42_999).is_none());
+        assert!(
+            region
+                .zone
+                .spaces
+                .closed_root_identity(index, 42_999)
+                .is_none()
+        );
+    }
+    let released_second = second.released.clone();
+    drop(a);
+    assert_eq!(*first.released.lock(), vec![42_999]);
+    assert!(released_second.lock().is_empty());
+    assert!(first.region().unwrap().zone.spaces.find(42_999).is_none());
+    assert!(second.region().unwrap().zone.spaces.find(42_999).is_some());
+    let weak = Arc::downgrade(&second);
+    drop(second);
+    assert!(
+        weak.upgrade().is_some(),
+        "unpublished successor retains its carrier"
+    );
+    drop(b);
+    assert_eq!(*released_second.lock(), vec![42_999]);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn refused_retained_publication_releases_every_backing_reference() {
+    let backing = Arc::new(RetainedPublicationFixture {
+        bytes: carrick_test_support::TestEl1Region::zeroed(),
+        carrier: std::num::NonZeroU64::new(93).unwrap(),
+        released: Arc::default(),
+    });
+    let weak = Arc::downgrade(&backing);
+    let guard =
+        PreAdmissionGuard::acquire_in(SpaceTables::retained(backing.clone()).unwrap(), mm(43_000))
+            .unwrap();
+    let publication = guard
+        .publish_closed(
+            &fence(),
+            0x20_000,
+            0x20_000,
+            0,
+            0,
+            ReservationRootPublication {
+                limits: ReservationLimits {
+                    address: u64::MAX,
+                    data: u64::MAX,
+                },
+                provider: None,
+            },
+        )
+        .unwrap();
+    guard.refuse(publication);
+    assert!(backing.region().unwrap().zone.spaces.find(43_000).is_none());
+    drop(guard);
+    drop(backing);
+    assert!(
+        weak.upgrade().is_none(),
+        "refusal must release the retained carrier"
+    );
+}
+
+struct RetainedTestProvider(Arc<RetainedPublicationFixture>);
+impl crate::dispatch::mem::el1_reservations::HostReservationProvider for RetainedTestProvider {
+    fn address_space_backing(&self) -> Option<Arc<dyn AddressSpaceBacking>> {
+        Some(self.0.clone())
+    }
+    fn prepare(
+        &self,
+    ) -> Result<
+        Box<dyn crate::dispatch::mem::el1_reservations::PreparedHostReservations>,
+        carrick_el1::memory::reservations::Refusal,
+    > {
+        Err(carrick_el1::memory::reservations::Refusal::MetadataRequired)
+    }
+}
+
+#[test]
+fn retained_host_publication_obeys_switching_policy() {
+    // Also run in a fresh process with CARRICK_EL1_MM_SWITCH=0; no env mutation.
+    let backing = Arc::new(RetainedPublicationFixture {
+        bytes: carrick_test_support::TestEl1Region::zeroed(),
+        carrier: std::num::NonZeroU64::new(94).unwrap(),
+        released: Arc::default(),
+    });
+    let provider: Arc<dyn crate::dispatch::mem::el1_reservations::HostReservationProvider> =
+        Arc::new(RetainedTestProvider(backing.clone()));
+    assert_eq!(
+        PreAdmissionGuard::acquire_for_provider(mm(43_001), Some(&provider)).is_some(),
+        switching_enabled()
+    );
+    assert!(backing.region().unwrap().zone.spaces.find(43_001).is_none());
 }

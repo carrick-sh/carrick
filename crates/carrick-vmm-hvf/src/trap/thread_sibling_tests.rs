@@ -1001,3 +1001,67 @@ fn negative_host_address_probes_live_in_the_serial_lane() {
         }
     }
 }
+
+#[test]
+fn cow_settlement_observes_two_exact_carrier_pools() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let make = || {
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let start = carrick_el1_abi::EL1_REGION_BASE;
+        let size = carrick_el1_abi::EL1_REGION_SIZE as usize;
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            size,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .unwrap();
+        let address = host.as_ptr();
+        let mut mapping = mapped_region(start, start + size as u64, start);
+        mapping.host_addr = address;
+        mapping.host_mapping = Some(host.into());
+        mapping.stage2_lease = Some(GlobalFrameStage2Lease::fixed(start, size as u64));
+        let carrier = std::sync::Arc::new(PersistentCarrierMappings {
+            mappings: TaskMappingIndex::from_region(mapping),
+            custody: std::sync::Arc::clone(&custody),
+            vm_destroyed_after_custody_commit: std::sync::atomic::AtomicBool::new(false),
+            fd_ceiling_publisher: parking_lot::Mutex::new(None),
+        });
+        let weak = std::sync::Arc::downgrade(&carrier);
+        let settlement = CarrierGuestCowSettlement::new(carrier.clone());
+        (
+            custody,
+            carrier,
+            weak,
+            settlement,
+            address as usize + carrick_el1_abi::EL1_COW_GRANT_POOL_OFFSET as usize,
+        )
+    };
+    let (a, ca, wa, first, pa) = make();
+    let (b, cb, wb, second, pb) = make();
+    assert_ne!(pa, pb);
+    assert_eq!(
+        first.with_pool(|pool| pool as *const _ as usize).unwrap(),
+        pa
+    );
+    assert_eq!(
+        second.with_pool(|pool| pool as *const _ as usize).unwrap(),
+        pb
+    );
+    let generation = a.live_generation().unwrap();
+    a.begin_destroy(generation).unwrap();
+    a.commit_destroy(generation).unwrap();
+    assert!(first.with_pool(|_| ()).is_none());
+    assert_eq!(
+        second.with_pool(|pool| pool as *const _ as usize).unwrap(),
+        pb
+    );
+    assert!(wa.upgrade().is_some());
+    drop(ca);
+    assert!(wa.upgrade().is_none());
+    assert!(first.with_pool(|_| ()).is_none());
+    let generation = b.live_generation().unwrap();
+    b.begin_destroy(generation).unwrap();
+    b.commit_destroy(generation).unwrap();
+    drop(cb);
+    assert!(wb.upgrade().is_none());
+    assert!(second.with_pool(|_| ()).is_none());
+}

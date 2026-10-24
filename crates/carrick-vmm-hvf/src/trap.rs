@@ -2726,7 +2726,7 @@ pub(crate) struct PersistentExecutorSpec {
 impl PersistentExecutorSpec {
     /// The carrier's guest COW settlement over its MM directory.
     pub(crate) fn guest_cow_settlement(&self) -> CarrierGuestCowSettlement {
-        CarrierGuestCowSettlement::new(&self.carrier_foreign_mm_transport.custody)
+        CarrierGuestCowSettlement::new(std::sync::Arc::clone(&self.carrier_mappings))
     }
 
     pub(crate) fn reservation_metadata_access(
