@@ -103,6 +103,14 @@ pub enum ServiceError {
     Exhausted,
 }
 
+/// Refusal to transfer a prepared result. Both the ticket and the resource
+/// remain owned by the caller, including while cancellation cleanup is pending.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedDeliveryError {
+    Cancelled,
+    Service(ServiceError),
+}
+
 pub const NATIVE_SERVICE_PROTOCOL: u64 = 5;
 
 /// Transport selector only: authority remains in the member's retained cell.
@@ -795,37 +803,68 @@ impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
         }
         self.acknowledge(2 + wait.cause().encode(), wait.revision())
     }
-    fn acknowledge(mut self, result: u64, revision: u64) -> Result<(), (ServiceError, Self)> {
+    /// Transfer a prepared result to its established owner before publishing
+    /// the exact completion. The transfer must be a bounded, infallible custody
+    /// handoff; all I/O, allocation and fallible preparation precede this call.
+    ///
+    /// This is delivery, not process/MM adoption. The receiving owner retains
+    /// the result even if the ring cancels after delivery. On cancellation
+    /// before delivery no callback runs and no acknowledgment is published:
+    /// the returned ticket must survive rollback (including cleanup refusal).
+    pub fn publish_prepared<T>(
+        mut self,
+        prepared: T,
+        transfer: impl FnOnce(T),
+    ) -> Result<(), (PreparedDeliveryError, Self, T)> {
+        let cancelled = match self.reserve_acknowledgment() {
+            Ok(cancelled) => cancelled,
+            Err(error) => return Err((PreparedDeliveryError::Service(error), self, prepared)),
+        };
+        if cancelled {
+            self.cell.state.store(CANCEL_REQUESTED, Ordering::Release);
+            return Err((PreparedDeliveryError::Cancelled, self, prepared));
+        }
+        transfer(prepared);
+        self.finish_acknowledgment(1, 0, false);
+        Ok(())
+    }
+
+    fn reserve_acknowledgment(&self) -> Result<bool, ServiceError> {
         let cell = &**self.cell;
         let state = cell.state.load(Ordering::Acquire);
         if !matches!(state, SERVICING | CANCEL_REQUESTED) {
-            return Err((
-                if state == WRITING {
-                    ServiceError::Busy
-                } else {
-                    ServiceError::Stale
-                },
-                self,
-            ));
+            return Err(if state == WRITING {
+                ServiceError::Busy
+            } else {
+                ServiceError::Stale
+            });
         }
-        if let Err(error) = cell.lock_exact(state, self.request.identity) {
-            return Err((error, self));
-        }
+        cell.lock_exact(state, self.request.identity)?;
+        Ok(state == CANCEL_REQUESTED)
+    }
+
+    fn acknowledge(mut self, result: u64, revision: u64) -> Result<(), (ServiceError, Self)> {
+        let cancelled = match self.reserve_acknowledgment() {
+            Ok(cancelled) => cancelled,
+            Err(error) => return Err((error, self)),
+        };
+        self.finish_acknowledgment(result, revision, cancelled);
+        Ok(())
+    }
+
+    fn finish_acknowledgment(&mut self, result: u64, revision: u64, cancelled: bool) {
+        let cell = &**self.cell;
         cell.result.store(result, Ordering::Relaxed);
         cell.wait_revision.store(revision, Ordering::Relaxed);
         cell.state.store(
-            if state == CANCEL_REQUESTED {
-                CANCELLED
-            } else {
-                COMPLETED
-            },
+            if cancelled { CANCELLED } else { COMPLETED },
             Ordering::Release,
         );
-        // Only acknowledgment releases the physical mapping pin.
-        // SAFETY: complete consumes this ticket; ManuallyDrop has no drop
-        // glue, and no successful acknowledgment can use this pin again.
+        // Only acknowledgment releases the physical mapping pin. Every caller
+        // first reserves the exact request and consumes this ticket on success.
+        // SAFETY: ManuallyDrop has no drop glue, and a successful acknowledgment
+        // is the terminal operation on this ticket.
         unsafe { core::mem::ManuallyDrop::drop(&mut self.cell) };
-        Ok(())
     }
 }
 
@@ -877,6 +916,110 @@ mod tests {
             access: Access::Write,
             present: true,
         })
+    }
+
+    #[test]
+    fn prepared_delivery_retains_cancelled_resources_until_cleanup_ack() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::AtomicUsize;
+        struct Prepared(Arc<AtomicUsize>);
+        impl Drop for Prepared {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let first = Arc::new(ServiceCell::new());
+        let second = Arc::new(ServiceCell::new());
+        let a = birth(1, 1);
+        let b = birth(2, 1);
+        first.bind(a).unwrap();
+        second.bind(b).unwrap();
+        let a_request = first
+            .publish(a, SnapshotGeneration::INITIAL, fault(), None)
+            .unwrap();
+        let b_request = second
+            .publish(b, SnapshotGeneration::INITIAL, fault(), None)
+            .unwrap();
+        let a_ticket = ServiceCell::claim_owned(first.clone(), a_request).unwrap();
+        let b_ticket = ServiceCell::claim_owned(second.clone(), b_request).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        assert!(!first.cancel(a_request.identity).unwrap());
+        let failed = a_ticket.publish_prepared(Prepared(drops.clone()), |_| {
+            panic!("cancelled result must never publish");
+        });
+        let Err((PreparedDeliveryError::Cancelled, ticket, prepared)) = failed else {
+            panic!("cancelled delivery must return its complete custody");
+        };
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(Arc::strong_count(&first), 2);
+        assert_eq!(first.consume(a_request.identity), Err(ServiceError::Busy));
+        // Another operation can transfer custody while cleanup remains pending.
+        let mut published = None;
+        assert!(
+            b_ticket
+                .publish_prepared(Prepared(drops.clone()), |resource| {
+                    published = Some(resource);
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            second.consume(b_request.identity),
+            Ok(ServiceResult::Supplied)
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        // Cleanup refusal simply keeps these owners: there is no premature ACK.
+        assert_eq!(first.reset_unpublished(), Err(ServiceError::Busy));
+        drop(prepared);
+        assert!(ticket.complete(false).is_ok());
+        assert_eq!(
+            first.consume(a_request.identity),
+            Ok(ServiceResult::Cancelled)
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        drop(published);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn prepared_delivery_rejects_old_mm_and_sequence_without_losing_custody() {
+        let cell = ServiceCell::new();
+        let owner = birth(1, 2);
+        cell.bind(owner).unwrap();
+        let request = cell
+            .publish(owner, SnapshotGeneration::INITIAL, fault(), None)
+            .unwrap();
+        let mut ticket = cell.claim(request).unwrap();
+        for stale_mm in [true, false] {
+            if stale_mm {
+                ticket.request.identity.birth.mm = birth(1, 1).mm;
+            } else {
+                ticket.request.identity.sequence = NonZeroU64::new(2).unwrap();
+            }
+            let Err((PreparedDeliveryError::Service(ServiceError::Stale), returned, resource)) =
+                ticket.publish_prepared(42, |_| panic!("stale result published"))
+            else {
+                panic!("stale delivery lost its owners")
+            };
+            assert_eq!(resource, 42);
+            assert_eq!(cell.consume(request.identity), Err(ServiceError::Busy));
+            ticket = returned;
+            ticket.request = request;
+        }
+        let mut retained = None;
+        assert!(
+            ticket
+                .publish_prepared(42, |resource| {
+                    // No cancellation/consumption can cut between custody transfer and ACK.
+                    assert_eq!(cell.cancel(request.identity), Err(ServiceError::Busy));
+                    assert_eq!(cell.consume(request.identity), Err(ServiceError::Busy));
+                    retained = Some(resource);
+                })
+                .is_ok()
+        );
+        // A later cancellation belongs to the recipient, which still owns the result.
+        assert!(cell.cancel(request.identity).unwrap());
+        assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Cancelled));
+        assert_eq!(retained.take(), Some(42));
     }
 
     #[test]
