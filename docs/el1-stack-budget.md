@@ -99,12 +99,30 @@ every individual frame remains below its separate ceiling.
 ## Headroom measurement for the #740 stack (2026-10-24)
 
 On ctb-w4, with the pinned Rust 1.96.0 toolchain and the slice 3b base,
-**both** the ordinary and `allocator-test-control` images measured 11,343
-checked bytes. The task brief's 12,175-byte observation did not reproduce
-on this host. Both builds used `env -u RUSTC_WRAPPER CARRICK_SCCACHE=0`.
-The 12,288-byte envelope ceiling and 3,072-byte individual ceiling are unchanged.
+ordinary image builds measured 11,343 checked bytes, while clippy-driven image
+builds reproduced the task brief's tighter **12,175-byte** measurement. Both
+use `env -u RUSTC_WRAPPER CARRICK_SCCACHE=0`. The 12,288-byte envelope ceiling
+and 3,072-byte individual ceiling are unchanged.
 
-These are the five largest baseline envelopes, identical in both images:
+There is one calculator: `Frames::check` in
+`crates/carrick-el1-image/frame_budget.rs` computes the limit as
+`stack_size * 3 / 4`. `build.rs::check_process_exit_frames` supplies the
+16,384-byte ABI stack size and checks the nested release ELF. The xtask
+`el1_image_sysroot` test includes that build script to test the checker;
+it does not independently calculate a clippy stack limit. The nested build
+preserves the clippy compiler-wrapper environment. Its compiled frames differ
+from an ordinary build even with the same release profile, target, features
+and frame-pointer flags. These are two compiler invocations of the same
+release-image checker, not a comparison with host debug frames.
+
+The tight measurement can be reproduced without the rest of the workspace:
+
+```sh
+env -u RUSTC_WRAPPER CARRICK_SCCACHE=0 cargo clippy -p carrick-el1-image --all-targets -- -D warnings
+```
+
+These are the five largest ordinary-build baseline envelopes, identical in
+the default and `allocator-test-control` images:
 
 | Envelope | Checked bytes |
 |---|---:|
@@ -190,23 +208,116 @@ buffer in `finish_exit`. There is one additional fixed-size allocation per
 pending exit; the published-result allocation already existed. No new unsafe
 code, Linux behavior, stack layout or chain accounting is introduced.
 
-| Measurement | Before (both images) | After (both images) |
+| Ordinary-build measurement | Before (both images) | After (both images) |
 |---|---:|---:|
 | Maximum checked envelope | 11,343 | 10,975 |
 | Signal terminal exit | 11,343 | 10,959 |
 | `publish_exit` frame | 1,296 | 1,040 |
 | `finish_exit` frame | 1,744 | 1,616 |
 
-The deepest remaining standalone envelope is native backing reply. The macOS
-cross-check reports 10,975 in one image closure and 11,263 in its broader
-closures. Linux clippy feature closures produce different compiled frames and
-reach 11,311 bytes. These results are distinct from the two standalone
-measurements above and still pass 12,288.
+The tighter default-feature clippy build's five largest envelopes are below.
+Before/after measurements restore only the two changed production files to
+slice 3b and then restore the boxed exit change, keeping the same toolchain
+and commands.
 
-A tighter limit is mechanically possible by replacing `stack_size * 3 / 4`
-in `Frames::check` with a lower ceiling. An 11 KiB ceiling (11,264 bytes)
-leaves 289 bytes above the standalone maximum but would reject the Linux
-clippy feature closures; those need further headroom first. This is a proposal
-for the director, not a budget change. The ARM gate still does not prove CPL0
-chain depth or guard pages; shared ownership changes compile for CPL0 through
-`clippy-linux`.
+| Clippy-build envelope | Before | After |
+|---|---:|---:|
+| signal terminal exit | 12,175 | 11,311 |
+| native backing reply | 11,311 | 11,311 |
+| native wait copy | 11,263 | 11,263 |
+| signal delivery copy | 10,863 | 10,863 |
+| native fork descriptors | 10,701 | 10,701 |
+
+Every nonzero charged frame in those five clippy chains is expanded below.
+Column letters and multiplicities match the ordinary-build table (`T`, `B`,
+`W`, `F`, `S`), despite the different ranking of `F` and `S`. Signal delivery
+is charged twice for forced SIGSEGV. Only `publish_exit` and `finish_exit`
+change across these five compositions.
+
+| Clippy frame | Before bytes | After bytes | T | B | W | F | S |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| vector record | 288 | 288 | 1 | 1 | 1 | 1 | 1 |
+| `carrick_el1_syscall` | 112 | 112 | 1 | 1 | 1 | 1 | 1 |
+| `dispatch_entry` | 112 | 112 | 1 | 1 | 1 | 1 | 1 |
+| `dispatch_syscall` | 576 | 576 | 1 | — | — | 1 | 1 |
+| `with_process_entry` | 831 | 831 | 1 | — | — | 1 | 1 |
+| `deliver_on_user_return` | 608 | 608 | 1 | — | — | — | 1 |
+| `deliver_signal_on_syscall_return` | 656 | 656 | 2 | — | — | — | 2 |
+| `force_delivery_fault` | 208 | 208 | 1 | — | — | — | 1 |
+| `exit_with_status` | 1024 | 1024 | 1 | — | — | — | — |
+| `publish_exit` | 1728 | 1328 | 1 | — | — | — | — |
+| `finish_exit` | 1984 | 1520 | 1 | — | — | — | — |
+| `publish_exit_receipt` | 704 | 704 | 1 | — | — | — | — |
+| `BTreeMap::insert_recursing` | 1440 | 1440 | 1 | — | — | — | — |
+| `MetadataStorage::allocate` | 96 | 96 | 1 | 1 | — | 1 | — |
+| `service_mailbox` | 144 | 144 | 1 | 1 | — | 1 | — |
+| `publish_pending_return` | 144 | 144 | 1 | 1 | — | 1 | — |
+| `ObjectWaitGuard::drop` | 336 | 336 | 1 | 1 | 1 | 1 | 1 |
+| `place_in_guest` | 240 | 240 | 1 | 1 | 1 | 1 | 1 |
+| `find_idle_except` | 64 | 64 | 1 | 1 | 1 | 1 | 1 |
+| `accepts` | 64 | 64 | 1 | 1 | 1 | 1 | 1 |
+| `running_raw` | 16 | 16 | 1 | 1 | 1 | 1 | 1 |
+| `panic_bounds_check` | 64 | 64 | 1 | 1 | 1 | 1 | 1 |
+| `panic_fmt` | 64 | 64 | 1 | 1 | 1 | 1 | 1 |
+| `rust_begin_unwind` | 16 | 16 | 1 | 1 | 1 | 1 | 1 |
+| `preempt_record` | 128 | 128 | — | 1 | 1 | — | — |
+| `idle` | 256 | 256 | — | 1 | 1 | — | — |
+| `load` | 256 | 256 | — | 1 | 1 | — | — |
+| `resume_production` | 703 | 703 | — | 1 | 1 | — | — |
+| `resume_selected` | 192 | 192 | — | 1 | 1 | — | — |
+| `resume_checkpoint` | 512 | 512 | — | 1 | 1 | — | — |
+| `resume_pending_lifecycle` | 832 | 832 | — | 1 | 1 | — | — |
+| `park_owner_wait` | 416 | 416 | — | 1 | — | — | — |
+| `finish_owner_wait` | 512 | 512 | — | 1 | — | — | — |
+| `finish_service` | 528 | 528 | — | 1 | — | — | — |
+| `apply_fault_reply` | 848 | 848 | — | 1 | — | — | — |
+| `apply_grant` | 1152 | 1152 | — | 1 | — | — | — |
+| `execute_descriptor_txn` | 688 | 688 | — | 1 | — | 1 | — |
+| `visit_live_table` | 128 | 128 | — | 4 | — | 4 | — |
+| `visit_entry` | 160 | 160 | — | 4 | — | 4 | — |
+| `descend` | 288 | 288 | — | 4 | — | 4 | — |
+| `store` | 128 | 128 | — | 1 | — | 1 | — |
+| `unlink` | 96 | 96 | — | 1 | — | 1 | — |
+| `wait_query` | 1248 | 1248 | — | — | 1 | — | — |
+| `copy_with` | 112 | 112 | — | — | 1 | — | — |
+| `copy_signal_bytes` | 432 | 432 | — | — | 1 | — | 1 |
+| `write_user_bytes` | 2192 | 2192 | — | — | 1 | — | 1 |
+| `authorize` | 592 | 592 | — | — | 1 | — | 1 |
+| `root_for` | 496 | 496 | — | — | 1 | — | 1 |
+| `root_any` | 448 | 448 | — | — | 1 | — | 1 |
+| `lock_using` | 400 | 400 | — | — | 1 | — | 1 |
+| `Reservations::drop_in_place` | 96 | 96 | — | — | 1 | — | 1 |
+| `SpaceNotificationLease::release_retiring_resource` | 112 | 112 | — | — | 1 | — | 1 |
+| `SpaceNotificationLease::release_resource` | 880 | 880 | — | — | 1 | — | 1 |
+| `setup_arm_signal_frame` | 304 | 304 | — | — | — | — | 1 |
+| `fork_owned` | 703 | 703 | — | — | — | 1 | — |
+| `prepare_mm` | 2367 | 2367 | — | — | — | 1 | — |
+| `prepare_fork` | 1248 | 1248 | — | — | — | 1 | — |
+| **Weighted sum** | | | **12175 → 11311** | **11311** | **11263** | **10701** | **10863** |
+
+The boxed exit change therefore reduces the ordinary maximum by 368 bytes
+(11,343 → 10,975), and the clippy maximum by **864 bytes** (12,175 → 11,311).
+It already meets the revised clippy target of at most 11,500 bytes, with
+189 bytes to spare. Terminal exit and backing reply now tie in clippy;
+backing reply is the largest ordinary envelope. The evidence correction adds
+no further kernel change or stack reduction.
+
+Paired maximum measurements for both compiler invocations and feature variants:
+
+| Compiler invocation | Features | Before boxed exit | After boxed exit |
+|---|---|---:|---:|
+| `cargo build` | default | 11,343 | 10,975 |
+| `cargo build` | `allocator-test-control` | 11,343 | 10,975 |
+| `cargo clippy --all-targets` | default | 12,175 | 11,311 |
+| `cargo clippy --all-targets` | `allocator-test-control` | 12,079 | 11,263 |
+
+With allocator test control enabled, clippy's terminal exit drops from 12,079
+to 11,215 bytes; wait copy becomes the maximum at 11,263 bytes.
+
+A tighter limit is mechanically possible in `Frames::check`. A ceiling of
+11,500 bytes would retain 525 bytes above the ordinary maximum and 189 above
+the clippy maximum. An 11 KiB ceiling (11,264 bytes) would reject clippy by
+47 bytes. A common ceiling must account for both invocations. This is a
+proposal for the director, not a budget change. The ARM gate still does not
+prove CPL0 chain depth or guard pages; shared ownership changes compile for
+CPL0 through `clippy-linux`.
