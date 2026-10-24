@@ -6,6 +6,15 @@ use carrick_guest_mem::*;
 use carrick_vfs::ProcMapSharing;
 use std::os::fd::{FromRawFd, OwnedFd};
 
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
+struct AnonymousBackingRetirement {
+    address: u64,
+    length: u64,
+    length_usize: usize,
+    fixed: bool,
+    sparse: bool,
+}
+
 fn retire_anonymous_mapping_backing(
     dispatcher: &MemView<'_>,
     memory: &mut impl CurrentMmMemory,
@@ -15,11 +24,78 @@ fn retire_anonymous_mapping_backing(
     fixed: bool,
     sparse: bool,
 ) -> Result<(), MemoryError> {
-    if fixed || sparse {
-        memory.unmap_range(address, length_usize)?;
-        dispatcher.remove_mapping_metadata(address, length);
+    retire_anonymous_mapping_backing_with_residency(
+        dispatcher,
+        memory,
+        AnonymousBackingRetirement {
+            address,
+            length,
+            length_usize,
+            fixed,
+            sparse,
+        },
+        carrick_el1_abi::frame_grant_residency_host(),
+    )
+}
+
+fn retire_anonymous_mapping_backing_with_residency(
+    dispatcher: &MemView<'_>,
+    memory: &mut impl CurrentMmMemory,
+    request: AnonymousBackingRetirement,
+    residency: Option<&carrick_el1_abi::FrameGrantResidencyTable>,
+) -> Result<(), MemoryError> {
+    if request.fixed || request.sparse {
+        // The descriptor backend and the grant-window table are one
+        // publication. Close transfer admission before changing stage-1;
+        // dropping the token on backend failure reopens it without retiring
+        // the predecessor. Committing after backend success prevents the next
+        // backing grant from observing a stale COW generation.
+        let residency_retirement = residency
+            .map(|residency| {
+                residency
+                    .begin_retire_overlapping(
+                        dispatcher.mm_authority().mm_id.raw(),
+                        request.address,
+                        request.length,
+                    )
+                    .ok_or(MemoryError::MetadataAllocation)
+            })
+            .transpose()?;
+        memory.unmap_range(request.address, request.length_usize)?;
+        if residency_retirement.is_some_and(|retirement| !retirement.commit()) {
+            // The backend edit is already live. Returning a Linux errno would
+            // let the MM continue with two answers for the replacement, so use
+            // the anonymous authority's existing fail-closed invariant path.
+            super::anonymous::broken_root(
+                "a semantic-arena residency retirement commit",
+                carrick_el1::memory::reservations::Refusal::Stale,
+            );
+        }
+        dispatcher.remove_mapping_metadata(request.address, request.length);
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn retire_anonymous_mapping_backing_with_residency_for_test(
+    dispatcher: &MemView<'_>,
+    memory: &mut impl CurrentMmMemory,
+    request: (u64, u64, usize, bool, bool),
+    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+) -> Result<(), MemoryError> {
+    let (address, length, length_usize, fixed, sparse) = request;
+    retire_anonymous_mapping_backing_with_residency(
+        dispatcher,
+        memory,
+        AnonymousBackingRetirement {
+            address,
+            length,
+            length_usize,
+            fixed,
+            sparse,
+        },
+        Some(residency),
+    )
 }
 
 /// Why a guest `mmap` was refused — and whether the guest can work that out
