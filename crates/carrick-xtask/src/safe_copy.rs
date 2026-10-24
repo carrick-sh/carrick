@@ -21,7 +21,7 @@ fn copy(
     links: Links,
     hook: &mut impl FnMut(),
 ) -> io::Result<()> {
-    directory(&open_root(source)?, target, count, links, hook)
+    directory(&open_root(source)?, target, count, links, hook, None)
 }
 fn open_root(source: &Path) -> io::Result<File> {
     use std::path::Component;
@@ -115,11 +115,14 @@ fn directory(
     count: &mut usize,
     links: Links,
     hook: &mut impl FnMut(),
+    deadline: Option<std::time::Instant>,
 ) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    check_deadline(deadline)?;
     std::fs::create_dir(target)?;
     std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o700))?;
     for name in crate::prune_fs::entries(source)? {
+        check_deadline(deadline)?;
         if name
             .to_str()
             .is_some_and(|name| name == "target" || name.eq_ignore_ascii_case(".git"))
@@ -136,13 +139,13 @@ fn directory(
             Ok(mut file) => {
                 let metadata = file.metadata()?;
                 if metadata.is_dir() {
-                    directory(&file, &dest, count, links, hook)?;
+                    directory(&file, &dest, count, links, hook, deadline)?;
                 } else if metadata.is_file() {
                     let mut out = std::fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
                         .open(&dest)?;
-                    io::copy(&mut file, &mut out)?;
+                    copy_file(&mut file, &mut out, deadline)?;
                     out.set_permissions(std::fs::Permissions::from_mode(
                         metadata.permissions().mode() & 0o777,
                     ))?;
@@ -160,6 +163,30 @@ fn directory(
         }
     }
     Ok(())
+}
+fn check_deadline(deadline: Option<std::time::Instant>) -> io::Result<()> {
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "snapshot deadline exhausted",
+        ));
+    }
+    Ok(())
+}
+fn copy_file(
+    source: &mut impl io::Read,
+    target: &mut impl io::Write,
+    deadline: Option<std::time::Instant>,
+) -> io::Result<()> {
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        check_deadline(deadline)?;
+        let bytes = source.read(&mut buffer)?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        target.write_all(&buffer[..bytes])?;
+    }
 }
 fn read_link(parent: &File, name: &std::ffi::OsStr) -> io::Result<std::path::PathBuf> {
     use std::os::fd::AsRawFd;
@@ -188,8 +215,7 @@ fn read_link(parent: &File, name: &std::ffi::OsStr) -> io::Result<std::path::Pat
 pub fn text(path: &Path, limit: u64) -> io::Result<String> {
     read_text(path, limit, || {})
 }
-fn read_text(path: &Path, limit: u64, hook: impl FnOnce()) -> io::Result<String> {
-    use std::io::Read;
+pub fn open_text(path: &Path) -> io::Result<File> {
     let parent = open_root(
         path.parent()
             .ok_or_else(|| io::Error::other("text parent"))?,
@@ -200,8 +226,15 @@ fn read_text(path: &Path, limit: u64, hook: impl FnOnce()) -> io::Result<String>
             .ok_or_else(|| io::Error::other("text name"))?,
         false,
     )?;
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.len() > limit {
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("unsafe text"));
+    }
+    Ok(file)
+}
+fn read_text(path: &Path, limit: u64, hook: impl FnOnce()) -> io::Result<String> {
+    use std::io::Read;
+    let file = open_text(path)?;
+    if file.metadata()?.len() > limit {
         return Err(io::Error::other("unsafe or oversized text"));
     }
     hook();
@@ -254,12 +287,17 @@ pub fn git_command(root: &Path, args: &[&str]) -> std::process::Command {
         .current_dir(root);
     cmd
 }
-fn git(root: &Path, args: &[&str]) -> Result<String, crate::ci_scaler::ScalerError> {
-    let bytes = crate::ci_scaler::execute(
-        &mut git_command(root, args),
-        &[],
-        std::time::Duration::from_secs(120),
-    )?;
+fn git(
+    root: &Path,
+    args: &[&str],
+    deadline: Option<std::time::Instant>,
+) -> Result<String, crate::ci_scaler::ScalerError> {
+    check_deadline(deadline)?;
+    let limit = deadline
+        .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+        .unwrap_or(std::time::Duration::from_secs(120))
+        .min(std::time::Duration::from_secs(120));
+    let bytes = crate::ci_scaler::execute(&mut git_command(root, args), &[], limit)?;
     String::from_utf8(bytes)
         .map_err(|_| crate::ci_scaler::ScalerError::Guard("non-UTF8 git output"))
 }
@@ -268,13 +306,23 @@ pub fn repository(
     source: &Path,
     target: &Path,
     branch: &str,
+    deadline: Option<std::time::Instant>,
 ) -> Result<(), crate::ci_scaler::ScalerError> {
     use crate::ci_scaler::ScalerError;
+    check_deadline(deadline)?;
     let source = open_root(source)?;
     let dotgit = crate::prune_fs::open(&source, std::ffi::OsStr::new(".git"), true)?;
-    directory(&source, target, &mut 0, Links::Preserve, &mut || {})?;
-    git(target, &["init"])?;
+    directory(
+        &source,
+        target,
+        &mut 0,
+        Links::Preserve,
+        &mut || {},
+        deadline,
+    )?;
+    git(target, &["init"], deadline)?;
     for name in ["HEAD", "packed-refs", "refs", "objects"] {
+        check_deadline(deadline)?;
         let file = match crate::prune_fs::open(&dotgit, std::ffi::OsStr::new(name), false) {
             Ok(file) => file,
             Err(error)
@@ -303,22 +351,33 @@ pub fn repository(
                         return Err(ScalerError::Guard("unexpected object directory"));
                     }
                     let child = crate::prune_fs::open(&file, &entry, true)?;
-                    directory(&child, &dest.join(entry), &mut 0, Links::Refuse, &mut || {})?;
+                    directory(
+                        &child,
+                        &dest.join(entry),
+                        &mut 0,
+                        Links::Refuse,
+                        &mut || {},
+                        deadline,
+                    )?;
                 }
             } else {
-                directory(&file, &dest, &mut 0, Links::Refuse, &mut || {})?;
+                directory(&file, &dest, &mut 0, Links::Refuse, &mut || {}, deadline)?;
             }
         } else if file.metadata()?.is_file() && matches!(name, "HEAD" | "packed-refs") {
-            io::copy(&mut &file, &mut File::create(dest)?)?;
+            copy_file(&mut &file, &mut File::create(dest)?, deadline)?;
         } else {
             return Err(ScalerError::Guard("nonregular repository data"));
         }
     }
-    if git(target, &["symbolic-ref", "--short", "HEAD"])?.trim() != branch {
+    if git(target, &["symbolic-ref", "--short", "HEAD"], deadline)?.trim() != branch {
         return Err(ScalerError::Guard("candidate changed branch"));
     }
-    git(target, &["rev-parse", "--verify", "HEAD^{commit}"])?;
-    git(target, &["read-tree", "HEAD"])?;
+    git(
+        target,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        deadline,
+    )?;
+    git(target, &["read-tree", "HEAD"], deadline)?;
     Ok(())
 }
 
@@ -326,6 +385,9 @@ pub fn repository(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    fn git(root: &Path, args: &[&str]) -> Result<String, crate::ci_scaler::ScalerError> {
+        super::git(root, args, None)
+    }
     #[test]
     fn non_root_symlink_ancestor_is_refused() {
         use std::os::unix::fs::MetadataExt;
@@ -389,7 +451,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        repository(&source, &target, "work/test").unwrap();
+        repository(&source, &target, "work/test", None).unwrap();
         assert_eq!(
             git(&source, &["rev-parse", "HEAD"]).unwrap(),
             git(&target, &["rev-parse", "HEAD"]).unwrap()

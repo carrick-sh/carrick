@@ -75,6 +75,8 @@ pub struct Dispatch {
     pub worker_seconds: Option<u64>,
     #[serde(skip)]
     pub loop_deadline: Option<std::time::Instant>,
+    #[serde(skip)]
+    pub harvest_deadline: Option<std::time::Instant>,
 }
 
 /// Runner-private result of credentialed admission; provider setup and the
@@ -226,6 +228,7 @@ pub fn validate_event(event: &Value, triggering_actor: &str) -> Result<Dispatch,
         review_text: String::new(),
         worker_seconds: None,
         loop_deadline: None,
+        harvest_deadline: None,
     })
 }
 
@@ -575,6 +578,7 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
             .min(limit)
             .min(crate::agent_runner::job_remaining(58)?),
     );
+    let _harvest = dispatch.harvest_deadline.map(CommandWindow::until);
     retire_agent()?;
     let code = outcome?;
     Ok(code)
@@ -626,7 +630,196 @@ fn checkpoint(root: &Path, dispatch: &Dispatch) -> Result<bool, ScalerError> {
     Ok(true)
 }
 
+const LOOP_LOG_BYTES: usize = 64 * 1024;
+const TRANSCRIPT_BYTES: usize = 512 * 1024;
+
+fn clip_diagnostic(mut text: String, limit: usize) -> String {
+    if text.len() > limit {
+        let end = text.as_bytes()[..limit.saturating_sub(32)]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |n| n + 1);
+        text.truncate(end);
+        text.push_str("[diagnostic truncated]\n");
+    }
+    text
+}
+/// The caller owns the ancestors and retires the model before reading model
+/// files. Refuse entry links/devices; retain complete lines at the byte bound.
+fn diagnostic_text(path: &Path) -> Result<String, ScalerError> {
+    use std::io::Read;
+    let file = crate::safe_copy::open_text(path)?;
+    let mut bytes = Vec::new();
+    file.take(TRANSCRIPT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > TRANSCRIPT_BYTES {
+        let end = bytes[..TRANSCRIPT_BYTES]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |n| n + 1);
+        bytes.truncate(end);
+        bytes.extend_from_slice(b"[diagnostic truncated]\n");
+    }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if let Ok(token) = std::env::var("GH_TOKEN")
+        && !token.is_empty()
+    {
+        text = text.replace(&token, "[REDACTED]");
+    }
+    Ok(clip_diagnostic(
+        crate::dispatch_redaction::redact(text.as_bytes()),
+        TRANSCRIPT_BYTES,
+    ))
+}
+fn loop_log(event: Value) -> Result<(), ScalerError> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    let package =
+        PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?)
+            .join("dispatch-output");
+    std::fs::create_dir_all(&package)?;
+    std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o700))?;
+    let line = crate::dispatch_redaction::redact(format!("{event}\n").as_bytes());
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(package.join("loop.log"))?;
+    if !file.metadata()?.is_file() {
+        return Err(ScalerError::Guard("loop.log is not a regular file"));
+    }
+    let size = file.metadata()?.len() as usize;
+    if size.saturating_add(line.len()) <= LOOP_LOG_BYTES {
+        file.write_all(line.as_bytes())?;
+    } else {
+        // Keep the opening context and most recent records so a verbose source
+        // census cannot displace the worker's later harvest diagnostics.
+        file.seek(SeekFrom::Start(0))?;
+        let mut previous = String::new();
+        (&mut file)
+            .take(LOOP_LOG_BYTES as u64)
+            .read_to_string(&mut previous)?;
+        let prefix_limit = previous.len().min(8192);
+        let prefix_end = previous.as_bytes()[..prefix_limit]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |n| n + 1);
+        let marker = "[older loop.log records truncated]\n";
+        let available = LOOP_LOG_BYTES.saturating_sub(prefix_end + marker.len());
+        let mut tail = format!("{}{line}", &previous[prefix_end..]);
+        while tail.len() > available {
+            let end = tail.find('\n').map_or(tail.len(), |n| n + 1);
+            tail.drain(..end);
+        }
+        file.set_len(0)?;
+        file.write_all(&previous.as_bytes()[..prefix_end])?;
+        file.write_all(marker.as_bytes())?;
+        file.write_all(tail.as_bytes())?;
+    }
+    Ok(())
+}
+fn timed_phase<T>(
+    phase: &str,
+    operation: impl FnOnce() -> Result<T, ScalerError>,
+) -> Result<T, ScalerError> {
+    let started = std::time::Instant::now();
+    let _ = loop_log(json!({"phase":phase,"outcome":"started"}));
+    let result = operation();
+    let outcome = result
+        .as_ref()
+        .err()
+        .map_or_else(|| "ok".to_owned(), |error| error.to_string());
+    let _ = loop_log(
+        json!({"phase":phase,"outcome":outcome,"duration_ms":started.elapsed().as_millis()}),
+    );
+    result
+}
+fn capture_loop_foreground(actor: &Path) -> Result<(), ScalerError> {
+    let state = crate::agent_runner::state()?;
+    for (source, target) in [
+        ("result.json", "loop-result.json"),
+        ("runtime/dispatch-loop/loop.log", "loop-events.log"),
+        ("runtime/dispatch-loop/loop.err", "loop-events.err"),
+    ] {
+        let text = diagnostic_text(&actor.join(source))
+            .unwrap_or_else(|error| format!("unavailable: {error}\n"));
+        std::fs::write(state.join(target), text)?;
+    }
+    Ok(())
+}
+fn loop_transcript() -> Result<(), ScalerError> {
+    let state = crate::agent_runner::state()?;
+    let mut text = String::new();
+    for name in [
+        "loop-result.json",
+        "loop-events.log",
+        "loop-events.err",
+        "loop.out",
+        "loop.err",
+    ] {
+        text.push_str(&format!("=== {name} ===\n"));
+        match diagnostic_text(&state.join(name)) {
+            Ok(log) => text.push_str(&log),
+            Err(error) => text.push_str(&format!("unavailable: {error}\n")),
+        }
+    }
+    let package =
+        PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?)
+            .join("dispatch-output");
+    std::fs::create_dir_all(&package)?;
+    std::fs::write(
+        package.join("loop-transcript.log"),
+        clip_diagnostic(text, TRANSCRIPT_BYTES),
+    )?;
+    Ok(())
+}
+fn record_worker_failure(error: &ScalerError) -> Result<(), ScalerError> {
+    let state = crate::agent_runner::state()?;
+    let package =
+        PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?)
+            .join("dispatch-output");
+    std::fs::create_dir_all(&package)?;
+    // A previous receipt must never authorize publication after failed harvest.
+    match std::fs::remove_file(state.join("receipt.json")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let contract = Contract {
+        status: ContractStatus::Failed,
+        summary: format!("Worker production/harvest failed: {error}"),
+        tests: vec![],
+        risks: vec!["Harvest incomplete; publication refused".into()],
+    };
+    std::fs::write(
+        package.join("contract.json"),
+        serde_json::to_vec_pretty(&contract)?,
+    )?;
+    let previous = diagnostic_text(&package.join("raw.log")).unwrap_or_default();
+    let mut raw = format!("Worker production/harvest failed: {error}\n");
+    for name in ["agent.out", "agent.err"] {
+        raw.push_str(&format!("=== {name} ===\n"));
+        raw.push_str(
+            &diagnostic_text(&state.join(name)).unwrap_or_else(|e| format!("unavailable: {e}\n")),
+        );
+    }
+    raw.push_str("=== Earlier worker evidence ===\n");
+    raw.push_str(&previous);
+    std::fs::write(
+        package.join("raw.log"),
+        clip_diagnostic(raw, TRANSCRIPT_BYTES),
+    )?;
+    std::fs::write(package.join("transcript.md"), &contract.summary)?;
+    if !package.join("diffstat.txt").exists() {
+        std::fs::write(package.join("diffstat.txt"), "")?;
+    }
+    Ok(())
+}
+
 std::thread_local! {
+    static GITHUB_FAILURES: std::cell::RefCell<std::collections::BTreeMap<String, String>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
     static COMMAND_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 /// Bounds synchronous tool work as well as the foreground model. Retirement
@@ -694,8 +887,47 @@ fn draft_pr_title(work: &Path, base: &str, issue: u64, token: &str) -> Result<St
 }
 
 fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
-    String::from_utf8(output(Command::new("gh").args(args).current_dir(root))?)
-        .map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
+    let endpoint = match args {
+        ["api", rest @ ..] => rest
+            .iter()
+            .find(|s| !s.starts_with('-'))
+            .copied()
+            .unwrap_or("api")
+            .to_owned(),
+        ["issue", "comment", number, ..] => format!("repos/{REPOSITORY}/issues/{number}/comments"),
+        ["pr", "create", ..] => format!("repos/{REPOSITORY}/pulls"),
+        ["run", "download", number, ..] => {
+            format!("repos/{REPOSITORY}/actions/runs/{number}/artifacts")
+        }
+        _ => "GitHub operation".into(),
+    };
+    let result = timed_phase(&format!("github:{endpoint}"), || {
+        output(Command::new("gh").args(args).current_dir(root))
+            .and_then(|bytes| {
+                String::from_utf8(bytes).map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
+            })
+            .map_err(|error| {
+                // execute already drains and redacts a bounded stderr prefix. Mask
+                // again before clipping so a cut credential cannot escape.
+                let detail = crate::dispatch_redaction::redact(error.to_string().as_bytes());
+                ScalerError::Usage(format!(
+                    "GitHub {endpoint}: {}",
+                    detail.chars().take(2048).collect::<String>()
+                ))
+            })
+    });
+    GITHUB_FAILURES.with(|failures| {
+        let mut failures = failures.borrow_mut();
+        match &result {
+            Ok(_) => {
+                failures.remove(&endpoint);
+            }
+            Err(error) => {
+                failures.insert(endpoint, error.to_string());
+            }
+        }
+    });
+    result
 }
 fn sudo(args: &[&str]) -> Result<(), ScalerError> {
     sudo_as(AGENT_USER, args)
@@ -1203,7 +1435,12 @@ fn copy_tree(
     Ok(crate::safe_copy::tree(source, target, count, links)?)
 }
 fn snapshot(source: &Path, target: &Path, branch: &str) -> Result<(), ScalerError> {
-    crate::safe_copy::repository(source, target, branch)
+    crate::safe_copy::repository(
+        source,
+        target,
+        branch,
+        COMMAND_DEADLINE.with(std::cell::Cell::get),
+    )
 }
 
 fn seal_runner(root: &Path) -> Result<(), ScalerError> {
@@ -1303,6 +1540,72 @@ fn prepare_worker_actor(state: &Path, actor: &Path, backend: &str) -> Result<(),
     }
     Ok(())
 }
+/// Read candidate data only after the caller has verified uid retirement.
+fn harvest_worker(
+    actor: &Path,
+    work: &Path,
+    dispatch: &Dispatch,
+    result: Result<i32, ScalerError>,
+) -> Result<(Contract, bool, String, i32), ScalerError> {
+    if work.exists() {
+        std::fs::remove_dir_all(work)?;
+    }
+    timed_phase("worker.snapshot", || {
+        snapshot(&actor.join("work"), work, &dispatch.branch)
+    })?;
+    let (mut contract, _) = timed_phase("worker.read_result", || {
+        Ok(read_result(&actor.join("result.json")))
+    })?;
+    let code = match result {
+        Ok(124) => {
+            contract.status = ContractStatus::Failed;
+            contract.summary = "Worker timed out; partial work harvested for continuation".into();
+            124
+        }
+        Ok(code) => {
+            if code != 0 {
+                contract.status = ContractStatus::Failed;
+                contract
+                    .risks
+                    .push(format!("Worker launcher exited with code {code}"));
+            }
+            code
+        }
+        Err(error) => {
+            contract.status = ContractStatus::Failed;
+            contract.summary = format!("Worker failed: {error}");
+            1
+        }
+    };
+    if timed_phase("worker.checkpoint", || checkpoint(work, dispatch))? {
+        contract.status = ContractStatus::Failed;
+        contract
+            .risks
+            .push("Workflow checkpointed unfinished changes".into());
+    }
+    let refused_workflow = git(
+        work,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            &dispatch.base,
+            "HEAD",
+        ],
+    )?
+    .split('\0')
+    .any(|path| path.starts_with(".github/workflows/"));
+    if refused_workflow {
+        contract.status = ContractStatus::Failed;
+        contract
+            .risks
+            .push("Refused workflow changes: job token cannot publish .github/workflows/*".into());
+    }
+    let diffstat = git(work, &["diff", "--stat", &dispatch.base, "HEAD"])?;
+    Ok((contract, refused_workflow, diffstat, code))
+}
+
 fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerError> {
     let base = dispatch.base.clone();
     if !sha(&base)
@@ -1344,6 +1647,7 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
     let mut diffstat = String::new();
     let mut refused_workflow = setup != "success/success";
     if setup == "success/success" {
+        let commands = dispatch.loop_deadline.map(CommandWindow::until);
         #[cfg(target_os = "linux")]
         // SAFETY: adopt and reap detached children before scanning agent bytes.
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
@@ -1368,7 +1672,9 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         let actor = outer.path().join("agent");
         std::fs::create_dir(&actor)?;
         std::fs::set_permissions(&actor, std::fs::Permissions::from_mode(0o700))?;
-        prepare_worker_actor(&state, &actor, &dispatch.worker.backend)?;
+        timed_phase("worker.prepare", || {
+            prepare_worker_actor(&state, &actor, &dispatch.worker.backend)
+        })?;
         let actor_work = actor.join("work");
         let previous: Option<Receipt> = if work.is_dir() {
             Some(serde_json::from_str(&regular_text(
@@ -1377,7 +1683,9 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         } else {
             None
         };
-        expected_tip = worker_checkout(root, &work, &actor_work, dispatch, previous.as_ref())?;
+        expected_tip = timed_phase("worker.checkout", || {
+            worker_checkout(root, &work, &actor_work, dispatch, previous.as_ref())
+        })?;
         git(&actor_work, &["config", "user.name", "github-actions[bot]"])?;
         git(
             &actor_work,
@@ -1387,45 +1695,46 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
                 "41898282+github-actions[bot]@users.noreply.github.com",
             ],
         )?;
-        let result = agent(&actor_work, dispatch);
+        let result = timed_phase("worker.agent", || agent(&actor_work, dispatch));
+        drop(commands);
+        let _harvest = dispatch.harvest_deadline.map(CommandWindow::until);
         // This is mandatory even on launcher failure, before scanning or hand-back.
-        cleanup_agent_user()?;
+        timed_phase("worker.retirement", cleanup_agent_user)?;
         // Read agent files only as data after verified uid retirement. The
         // pre-created private group lets runner read without becoming root.
         let actor_path = actor.to_str().ok_or(ScalerError::Guard("agent state"))?;
-        sudo(&["/usr/bin/chgrp", "-hR", AGENT_USER, actor_path])?;
-        sudo(&["/usr/bin/chmod", "-R", "ug+rwX,o-rwx", actor_path])?;
-        code = result?;
-        if work.exists() {
-            std::fs::remove_dir_all(&work)?;
-        }
-        snapshot(&actor_work, &work, &dispatch.branch)?;
-        let evidence;
-        (contract, evidence) = read_result(&actor.join("result.json"));
-        for name in ["agent.out", "agent.err"] {
-            raw.push_str(&format!("=== {name} ===\n"));
-            raw.push_str(&regular_text(&state.join(name))?);
-        }
+        timed_phase("worker.hand_back", || {
+            sudo(&["/usr/bin/chgrp", "-hR", AGENT_USER, actor_path])?;
+            sudo(&["/usr/bin/chmod", "-R", "ug+rwX,o-rwx", actor_path])
+        })?;
+        let (_, evidence) = read_result(&actor.join("result.json"));
+        let previous = std::mem::take(&mut raw);
         raw.push_str(&evidence);
-        if checkpoint(&work, dispatch)? {
-            contract.status = ContractStatus::Failed;
-            contract
-                .risks
-                .push("Workflow checkpointed unfinished changes".into());
-        }
-        refused_workflow = git(
-            &work,
-            &["diff", "--name-only", "--no-renames", "-z", &base, "HEAD"],
-        )?
-        .split('\0')
-        .any(|path| path.starts_with(".github/workflows/"));
-        if refused_workflow {
-            contract.status = ContractStatus::Failed;
-            contract.risks.push(
-                "Refused workflow changes: job token cannot publish .github/workflows/*".into(),
+        for name in ["runtime/dispatch/worker.log", "runtime/dispatch/worker.err"] {
+            raw.push_str(&format!("=== {name} ===\n"));
+            raw.push_str(
+                &diagnostic_text(&actor.join(name))
+                    .unwrap_or_else(|e| format!("unavailable: {e}\n")),
             );
         }
-        diffstat = git(&work, &["diff", "--stat", &base, "HEAD"])?;
+        for name in ["agent.out", "agent.err"] {
+            raw.push_str(&format!("=== {name} ===\n"));
+            raw.push_str(
+                &diagnostic_text(&state.join(name))
+                    .unwrap_or_else(|e| format!("unavailable: {e}\n")),
+            );
+        }
+        raw.push_str("=== Earlier worker evidence ===\n");
+        raw.push_str(&previous);
+        // Retain bounded foreground evidence even if snapshot/checkpoint fails.
+        raw = clip_diagnostic(
+            crate::dispatch_redaction::redact(raw.as_bytes()),
+            TRANSCRIPT_BYTES,
+        );
+        std::fs::write(package.join("raw.log"), &raw)?;
+        (contract, refused_workflow, diffstat, code) = timed_phase("worker.harvest", || {
+            harvest_worker(&actor, &work, dispatch, result)
+        })?;
     }
     std::fs::write(package.join("raw.log"), &raw)?;
     let transcript = format!(
@@ -1441,7 +1750,12 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         .collect::<String>();
     std::fs::write(
         package.join("transcript.md"),
-        format!("{transcript}\n## Agent transcript\n\n{rendered_log}"),
+        clip_diagnostic(
+            crate::dispatch_redaction::redact(
+                format!("{transcript}\n## Agent transcript\n\n{rendered_log}").as_bytes(),
+            ),
+            TRANSCRIPT_BYTES,
+        ),
     )?;
     std::fs::write(
         package.join("contract.json"),
@@ -1514,6 +1828,8 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
             "contract.json",
             "diffstat.txt",
             "handoff.json",
+            "loop.log",
+            "loop-transcript.log",
         ]
         .contains(&name)
         {
@@ -1551,6 +1867,13 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
             serde_json::to_string_pretty(&value)?
         } else {
             mask(&text)
+        };
+        let masked = match name {
+            "loop.log" => clip_diagnostic(masked, LOOP_LOG_BYTES),
+            "raw.log" | "transcript.md" | "loop-transcript.log" => {
+                clip_diagnostic(masked, TRANSCRIPT_BYTES)
+            }
+            _ => masked,
         };
         std::fs::write(entry.path(), masked)?;
         names.insert(name.to_owned());
@@ -2540,6 +2863,19 @@ fi
             merge
         );
         assert!(select_base(true, None, Some(&merge)).is_err());
+    }
+    #[test]
+    fn snapshot_obeys_harvest_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        fixture_repository(&source);
+        let branch = git(&source, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        let _window = CommandWindow::until(std::time::Instant::now());
+        assert!(
+            snapshot(&source, &temp.path().join("snapshot"), branch.trim()).is_err(),
+            "snapshot ignored expired harvest deadline"
+        );
     }
     #[test]
     fn loop_deadline_refuses_commands_before_they_execute() {
