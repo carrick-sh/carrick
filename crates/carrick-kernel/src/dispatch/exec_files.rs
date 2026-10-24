@@ -7,6 +7,9 @@ use carrick_abi::{LinuxErrno, NsGid, NsUid};
 use super::SyscallDispatcher;
 use super::executable_authority::{ExecSource, ExecSourceError};
 
+/// Physical host-file access supplied by the embedding loader.
+pub type ExecHostFileService<'a> = dyn Fn(&str) -> std::io::Result<std::fs::File> + 'a;
+
 /// Identity attached by the owner at admission. The host adapter disappears
 /// with host exec ownership; it uses the same file capability implementation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,7 +105,7 @@ impl ExecFiles {
     pub fn acquire_with_host_file_service(
         &self,
         path: &str,
-        open: &dyn Fn(&str) -> std::io::Result<std::fs::File>,
+        open: &ExecHostFileService<'_>,
     ) -> Result<ExecSource, ExecSourceError> {
         self.acquire_from(path, Some(open))
     }
@@ -110,7 +113,7 @@ impl ExecFiles {
     fn acquire_from(
         &self,
         path: &str,
-        host_open: Option<&dyn Fn(&str) -> std::io::Result<std::fs::File>>,
+        host_open: Option<&ExecHostFileService<'_>>,
     ) -> Result<ExecSource, ExecSourceError> {
         use super::fs::proc_synthetic::{proc_self_fd_number, proc_self_magic_link};
         super::fs::check_path_length(path).map_err(ExecSourceError::Linux)?;
@@ -224,7 +227,7 @@ impl ExecFilesystem {
         path: &str,
         directory_required: bool,
         proc_caller: Option<super::fs::pathres::RetainedProcCaller>,
-        host_open: Option<&dyn Fn(&str) -> std::io::Result<std::fs::File>>,
+        host_open: Option<&ExecHostFileService<'_>>,
         special: impl Fn(&str) -> Option<Result<ExecSource, ExecSourceError>>,
     ) -> Result<ExecSource, ExecSourceError> {
         // A retained magic source is authoritative even in bare-run mode.
