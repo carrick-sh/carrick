@@ -3327,6 +3327,32 @@ pub struct NativeProcessEntry<
 impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'r, 'a, M, C, S>
 {
+    /// Move standard signals admitted by an in-zone host completion into the
+    /// shared native pending owner for this exact thread. The atomic take is
+    /// the only carrier-to-native transfer; `enqueue_thread` provides Linux
+    /// standard-signal coalescence and disposition selection from here on.
+    pub fn import_in_zone_standard_signals(&mut self) -> Result<(), NativeProcessError> {
+        if !self.control.has_in_zone_standard_signal() {
+            return Ok(());
+        }
+        let graph = self.runtime.graph.lock();
+        let row = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?;
+        let signals = row.native().resources().signals().clone();
+        drop(graph);
+        let mut pending = self.control.take_in_zone_standard_signals();
+        while let Some(number) = pending.lowest() {
+            let Some(signal) = carrick_signal_core::policy::Signal::from_number(number) else {
+                break;
+            };
+            signals.enqueue_thread(self.record, signal, None);
+            pending = pending.without(signal);
+        }
+        Ok(())
+    }
+
     /// Test pending native work before the ISA saves FP/SIMD for delivery.
     /// A suspended mask needs its restoration even if no signal is pending.
     pub fn signal_checkpoint_needed(&self) -> bool {

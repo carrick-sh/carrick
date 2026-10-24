@@ -1398,19 +1398,11 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
             panic!("matching child process group must not park");
         };
         assert_eq!(result.raw(), 0, "-pgid selects the regrouped live child");
-        if matches!(
-            terminal,
-            Wait4TerminalCase::CoreSignal | Wait4TerminalCase::PipeSignal
-        ) {
-            let signal = match terminal {
-                Wait4TerminalCase::CoreSignal => 11,
-                Wait4TerminalCase::PipeSignal => 13,
-                Wait4TerminalCase::Exited => unreachable!(),
-            };
+        if matches!(terminal, Wait4TerminalCase::CoreSignal) {
             parent_entry
                 .kill(
                     SignalProcessSelector::from_abi(u64::from(child_pid)),
-                    SignalRequest::from_abi(signal).unwrap(),
+                    SignalRequest::from_abi(11).unwrap(),
                     SignalInfo::Generated(None),
                 )
                 .unwrap();
@@ -1500,9 +1492,6 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
                 ));
             }
             Wait4TerminalCase::CoreSignal | Wait4TerminalCase::PipeSignal => {
-                assert!(child_entry.signal_checkpoint_needed());
-                let mut frame = carrick_el1_abi::TrapFrame::default();
-                let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
                 let child_control_address = fixture
                     .zone
                     .record(child_binding.record.id)
@@ -1513,6 +1502,23 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
                 let child_control = unsafe {
                     &*(child_control_address as *const carrick_el1_abi::ThreadControlSlot)
                 };
+                if matches!(terminal, Wait4TerminalCase::PipeSignal) {
+                    child_control
+                        .post_in_zone_standard_signal(carrick_signal_core::policy::Signal::PIPE)
+                        .unwrap();
+                    child_control
+                        .post_in_zone_standard_signal(carrick_signal_core::policy::Signal::PIPE)
+                        .unwrap();
+                    child_entry.import_in_zone_standard_signals().unwrap();
+                    assert!(
+                        !child_control.has_in_zone_standard_signal(),
+                        "the exact-thread handoff moves once into the signal owner"
+                    );
+                }
+                assert!(child_entry.signal_checkpoint_needed());
+                let mut frame = carrick_el1_abi::TrapFrame::default();
+                frame.x[0] = carrick_syscall_abi::LinuxErrno::new(32).guest_retval() as u64;
+                let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
                 assert_eq!(
                     super::signal_delivery::deliver_signal_with_control(
                         &child_task,
@@ -1525,7 +1531,8 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
                             backend: ArmWaitSignalBackend,
                         },
                     ),
-                    Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended)
+                    Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended),
+                    "default SIGPIPE owns terminal disposition before EPIPE reaches EL0"
                 );
             }
         }

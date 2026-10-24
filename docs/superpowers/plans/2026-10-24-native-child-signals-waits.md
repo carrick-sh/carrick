@@ -173,3 +173,50 @@ or host-backed path.
 - [x] **Step 3: Bind the exact adopter, two-thread, late Born, and late ExitedInZone witnesses to `process.native.terminal-child`, then run the focused registry checks.**
 
 - [x] **Step 4: Commit, then execute Task 3's full portable and EL1 budget gates and refresh `/tmp/740-s5-handoff.md`.**
+
+---
+
+## Round 3: Backpressured SIGPIPE Completion
+
+Issue #835 retains the unrelated P2 review findings.  This round fixes only
+the P1 standard-signal admission failure and records the owner-approved ARM
+ring census changes.
+
+### Task 7: Merge Exact-Thread SIGPIPE Before Exposing EPIPE
+
+**Files:**
+- Modify: `crates/carrick-personality-linux/src/abi/thread.rs`
+- Modify: `crates/carrick-runtime/src/vcpu_loop/signal_ingress_producer.rs`
+- Modify: `crates/carrick-runtime/src/vcpu_loop/zone.rs`
+- Modify: `crates/carrick-el1-linux/src/aarch64_process.rs`
+- Modify: `crates/carrick-el1-linux/src/dispatch.rs`
+- Modify: `crates/carrick-el1-linux/src/native_process_runtime.rs`
+- Modify: signal-owner and native-terminal contract bindings
+- Modify: `docs/design/arm-ring-first-flip.tsv`
+
+**Interfaces:**
+- Consumes: the retained exact thread control, the native signal return
+  checkpoint, and the shared `NativeProcessSignals` owner.
+- Produces: one atomic per-thread standard-signal admission that coalesces
+  duplicate SIGPIPE independently of the bounded payload ingress queue.
+
+- [x] **Step 1: Add and run a red producer witness: a full ingress queue plus
+  two exact-thread SIGPIPE publications must not return a configuration error
+  and must leave one pending standard signal.**
+
+- [x] **Step 2: Add a typed per-thread standard-signal handoff in existing
+  control-slot padding.  Publish SIGPIPE there before forming EPIPE, merge by
+  bit, and have the native checkpoint move the bit into the shared signal
+  owner.  Do not add a queue scan, poll, or executor wait.**
+
+- [x] **Step 3: Add a VM-free ARM witness that a default-disposition writer
+  consumes SIGPIPE at the native return checkpoint, before its EPIPE return
+  can reach EL0.**
+
+- [x] **Step 4: Update the two contract descriptors and the owner-approved
+  TSV rows 95, 129-131, and 133-138 to their production in-ring venues.  Leave
+  #835's P2 findings untouched.**
+
+- [x] **Step 5: Run focused tests, the portable/concurrency gates, both EL1
+  image builds, and the stack budget.  Commit with the exact Codex trailer and
+  refresh `/tmp/740-s5-handoff.md`; do not push.**
