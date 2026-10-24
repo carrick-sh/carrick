@@ -7097,6 +7097,7 @@ fn serial_host_native_fork_children_outlive_restored_view_mapping() {
     native_child_resources(Some(false));
 }
 
+#[cfg(test)]
 fn native_child_resources(mapping_last: Option<bool>) {
     use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
     use carrick_kernel::el1_ipc::{HostIpc, HostTable, IpcLimits};
