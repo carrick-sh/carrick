@@ -8,6 +8,7 @@ use carrick_el1_abi::ipc_tables::IpcTableMap;
 /// owns only their shared projection; pipe/eventfd descriptions and flags
 /// already use the same OFD authority in both venues.
 pub(super) struct Binding {
+    reservations: HashMap<i32, (u64, crate::el1_ipc::HostSlotReservation)>,
     table: HostTable,
     owner: Arc<HostIpc>,
     map: &'static IpcTableMap,
@@ -32,16 +33,25 @@ impl Binding {
         map: &'static IpcTableMap,
         file_table: FileTableId,
         slots: &FileSlotMap,
+        reserved_slots: &HashMap<i32, u64>,
         closed_stdio: [bool; 3],
         stdio_cloexec: [bool; 3],
     ) -> Result<Self, AdmissionError> {
-        let capacity = slots.keys().copied().max().unwrap_or(2).max(2) as usize + 1;
+        let max_slot = slots
+            .keys()
+            .chain(reserved_slots.keys())
+            .copied()
+            .max()
+            .unwrap_or(2)
+            .max(2) as usize;
+        let capacity = max_slot + 1;
         let table = HostTable::create(
             Arc::clone(&owner),
             i32::MAX as usize + 1,
             capacity.next_power_of_two(),
         )?;
         let mut binding = Self {
+            reservations: HashMap::new(),
             table,
             owner,
             map,
@@ -72,10 +82,14 @@ impl Binding {
             binding.stdio.push(description);
         }
         for (&number, slot) in slots.iter() {
-            binding.sync_slot(number, Some(slot))?;
+            binding.install_slot(number, slot)?;
         }
         for number in 0..3 {
-            binding.sync_stdio(number)?;
+            binding.set_stdio_closed(number, closed_stdio[number])?;
+        }
+        for (&fd, &reservation_id) in reserved_slots.iter() {
+            let claim = binding.table.reserve_exact(fd::Fd(fd))?;
+            binding.reservations.insert(fd, (reservation_id, claim));
         }
         // No guest can observe a partial namespace. Publish only after every
         // real descriptor and implicit host stream has been represented.
@@ -94,11 +108,49 @@ impl Binding {
         }
     }
 
-    fn sync_stdio(&self, number: usize) -> Result<(), AdmissionError> {
+    fn install_slot(&mut self, number: i32, slot: &FileSlot) -> Result<(), AdmissionError> {
+        if number < 0 {
+            return Err(fd::Error::BadFd.into());
+        }
+        if number < 3 {
+            self.explicit_stdio[number as usize] = true;
+            self.closed_stdio[number as usize] = false;
+        }
+        // Geometric growth: repeated adjacent opens do not copy the whole
+        // descriptor extent at each insertion.
+        self.table
+            .ensure_capacity((number as usize + 1).next_power_of_two())?;
+        self.table.replace_slot(fd::Fd(number), slot)
+    }
+
+    fn remove_slot(&mut self, number: i32) -> Result<(), AdmissionError> {
+        if number < 0 {
+            return Err(fd::Error::BadFd.into());
+        }
+        if number < 3 {
+            self.explicit_stdio[number as usize] = false;
+            self.closed_stdio[number as usize] = true;
+        }
+        self.close(number)
+    }
+
+    fn set_cloexec(&self, number: i32, cloexec: bool) -> Result<(), AdmissionError> {
+        if number < 0 {
+            return Err(fd::Error::BadFd.into());
+        }
+        self.owner
+            .region()
+            .fd(crate::el1_zone::HostLockWait)
+            .setfd(self.table.id(), fd::Fd(number), cloexec)
+            .map_err(Into::into)
+    }
+
+    fn set_stdio_closed(&mut self, number: usize, closed: bool) -> Result<(), AdmissionError> {
+        self.closed_stdio[number] = closed;
         if self.explicit_stdio[number] {
             return Ok(());
         }
-        if self.closed_stdio[number] {
+        if closed {
             self.close(number as i32)
         } else {
             self.table.replace(
@@ -109,23 +161,124 @@ impl Binding {
         }
     }
 
-    fn sync_slot(&mut self, number: i32, slot: Option<&FileSlot>) -> Result<(), AdmissionError> {
-        if number < 0 {
-            return Err(fd::Error::BadFd.into());
+    fn set_stdio_cloexec(&mut self, number: usize, cloexec: bool) -> Result<(), AdmissionError> {
+        self.stdio_cloexec[number] = cloexec;
+        if self.explicit_stdio[number] || self.closed_stdio[number] {
+            return Ok(());
         }
-        if number < 3 {
-            self.explicit_stdio[number as usize] = slot.is_some();
+        self.set_cloexec(number as i32, cloexec)
+    }
+
+    fn reserve_min(
+        &mut self,
+        min_fd: i32,
+        limit: i32,
+        reservation_id: u64,
+    ) -> Result<i32, crate::linux_abi::LinuxErrno> {
+        if min_fd >= limit {
+            return Err(crate::linux_abi::LINUX_EMFILE);
         }
-        if let Some(slot) = slot {
-            // Geometric growth: repeated adjacent opens do not copy the whole
-            // descriptor extent at each insertion.
-            self.table
-                .ensure_capacity((number as usize + 1).next_power_of_two())?;
-            self.table.replace_slot(fd::Fd(number), slot)
-        } else if number < 3 {
-            self.sync_stdio(number as usize)
+        let claim = self
+            .table
+            .reserve_min(fd::Fd(min_fd.max(0)))
+            .map_err(AdmissionError::reservation_errno)?;
+        let fd = claim.fd().ok_or(crate::linux_abi::LINUX_EBADF)?.0;
+        if fd >= limit {
+            drop(claim);
+            return Err(crate::linux_abi::LINUX_EMFILE);
+        }
+        self.reservations.insert(fd, (reservation_id, claim));
+        Ok(fd)
+    }
+
+    fn reserve_exact(
+        &mut self,
+        fd: i32,
+        reservation_id: u64,
+    ) -> Result<(), crate::linux_abi::LinuxErrno> {
+        let claim = self
+            .table
+            .reserve_exact(fd::Fd(fd))
+            .map_err(AdmissionError::reservation_errno)?;
+        self.reservations.insert(fd, (reservation_id, claim));
+        Ok(())
+    }
+
+    fn take_reservation(
+        &mut self,
+        fd: i32,
+        reservation_id: u64,
+    ) -> Option<crate::el1_ipc::HostSlotReservation> {
+        if self
+            .reservations
+            .get(&fd)
+            .is_some_and(|(id, _)| *id == reservation_id)
+        {
+            self.reservations.remove(&fd).map(|(_, claim)| claim)
         } else {
-            self.close(number)
+            None
+        }
+    }
+
+    fn commit_reservation(
+        &mut self,
+        fd: i32,
+        reservation_id: u64,
+        slot: &FileSlot,
+    ) -> Result<(), AdmissionError> {
+        if let Some(mut claim) = self.take_reservation(fd, reservation_id) {
+            let description = slot.description.ipc_description(&self.owner)?;
+            claim.commit(&description, slot.close_on_exec())?;
+            if (0..3).contains(&fd) {
+                self.explicit_stdio[fd as usize] = true;
+                self.closed_stdio[fd as usize] = false;
+            }
+            Ok(())
+        } else {
+            self.install_slot(fd, slot)
+        }
+    }
+
+    fn has_dirty_flags(&self, slots: &FileSlotMap) -> bool {
+        let region = self.owner.region();
+        let authority = region.fd(crate::el1_zone::HostLockWait);
+        slots.iter().any(|(&fd, slot)| {
+            authority.getfd(self.table.id(), fd::Fd(fd)) == Ok(!slot.close_on_exec())
+        })
+    }
+
+    fn refresh_flags(&self, slots: &mut FileSlotMap) {
+        let region = self.owner.region();
+        let authority = region.fd(crate::el1_zone::HostLockWait);
+        for (&fd, slot) in slots.iter_mut() {
+            if let Ok(cloexec) = authority.getfd(self.table.id(), fd::Fd(fd)) {
+                if cloexec {
+                    slot.fd_flags |= crate::linux_abi::LINUX_FD_CLOEXEC;
+                } else {
+                    slot.fd_flags &= !crate::linux_abi::LINUX_FD_CLOEXEC;
+                }
+            }
+        }
+    }
+
+    fn refresh_stdio(&mut self) {
+        let region = self.owner.region();
+        let authority = region.fd(crate::el1_zone::HostLockWait);
+        for number in 0..3 {
+            if self.explicit_stdio[number] {
+                continue;
+            }
+            match authority.getfd(self.table.id(), fd::Fd(number as i32)) {
+                Ok(cloexec) => {
+                    self.closed_stdio[number] = false;
+                    self.stdio_cloexec[number] = cloexec;
+                }
+                Err(fd::Error::BadFd) => {
+                    self.closed_stdio[number] = true;
+                    self.stdio_cloexec[number] = false;
+                }
+                Err(_) => {}
+            }
         }
     }
 }
@@ -170,7 +323,8 @@ impl FileTable {
             .acquire_mutation()
             .ok_or(fd::Error::StaleTable)?;
         let slots = self.open_files.read();
-        // Global lock order: open files, stdio flags, closed stdio, IPC binding.
+        // Global lock order: open files, reserved slots, stdio flags, closed stdio, IPC binding.
+        let reserved = self.reserved_slots.lock();
         let cloexec = self.stdio_cloexec.lock();
         let closed = self.closed_stdio.lock();
         let mut ipc = self.ipc.lock();
@@ -185,20 +339,112 @@ impl FileTable {
                 Err(error) => Err(*error),
             };
         }
-        let admitted = Binding::new(owner, map, self.id, &slots, *closed, *cloexec);
+        let admitted = Binding::new(owner, map, self.id, &slots, &reserved, *closed, *cloexec);
         let result = admitted.as_ref().map(|_| ()).map_err(|error| *error);
         *ipc = Some(admitted);
         result
     }
 
-    pub(super) fn sync_ipc_slot(&self, number: i32, slot: Option<&FileSlot>) {
+    pub(super) fn reserve_ipc_min(
+        &self,
+        min_fd: i32,
+        limit: i32,
+        reservation_id: u64,
+    ) -> Option<Result<i32, crate::linux_abi::LinuxErrno>> {
+        let mut ipc = self.ipc.lock();
+        let Some(Ok(binding)) = &mut *ipc else {
+            return None;
+        };
+        Some(binding.reserve_min(min_fd, limit, reservation_id))
+    }
+
+    pub(super) fn reserve_ipc_exact(
+        &self,
+        fd: i32,
+        reservation_id: u64,
+    ) -> Result<(), crate::linux_abi::LinuxErrno> {
+        let mut ipc = self.ipc.lock();
+        if let Some(Ok(binding)) = &mut *ipc {
+            binding.reserve_exact(fd, reservation_id)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn cancel_ipc_reservation(&self, fd: i32, reservation_id: u64) {
+        let claim = self
+            .ipc
+            .lock()
+            .as_mut()
+            .and_then(|binding| binding.as_mut().ok())
+            .and_then(|binding| binding.take_reservation(fd, reservation_id));
+        drop(claim);
+    }
+
+    pub(super) fn commit_ipc_reservation(&self, fd: i32, reservation_id: u64, slot: &FileSlot) {
         let mut ipc = self.ipc.lock();
         if let Some(Ok(binding)) = &mut *ipc
-            && let Err(error) = binding.sync_slot(number, slot)
+            && let Err(error) = binding.commit_reservation(fd, reservation_id, slot)
+        {
+            *ipc = Some(Err(error));
+        }
+    }
+
+    pub(super) fn install_ipc_slot(&self, number: i32, slot: &FileSlot) {
+        let mut ipc = self.ipc.lock();
+        if let Some(Ok(binding)) = &mut *ipc
+            && let Err(error) = binding.install_slot(number, slot)
         {
             // Drop invalidates the whole shared namespace before the host
             // mutation becomes visible; a stale guest TableId forwards.
             *ipc = Some(Err(error));
+        }
+    }
+
+    pub(super) fn remove_ipc_slot(&self, number: i32) {
+        let mut ipc = self.ipc.lock();
+        if let Some(Ok(binding)) = &mut *ipc
+            && let Err(error) = binding.remove_slot(number)
+        {
+            *ipc = Some(Err(error));
+        }
+    }
+
+    pub(super) fn set_ipc_cloexec(&self, number: i32, cloexec: bool) {
+        let mut ipc = self.ipc.lock();
+        if let Some(Ok(binding)) = &mut *ipc
+            && let Err(error) = binding.set_cloexec(number, cloexec)
+        {
+            *ipc = Some(Err(error));
+        }
+    }
+
+    pub(super) fn ipc_flags_dirty(&self, slots: &FileSlotMap) -> bool {
+        let ipc = self.ipc.lock();
+        let Some(Ok(binding)) = &*ipc else {
+            return false;
+        };
+        binding.has_dirty_flags(slots)
+    }
+
+    pub(super) fn refresh_ipc_flags(&self, slots: &mut FileSlotMap) {
+        let ipc = self.ipc.lock();
+        if let Some(Ok(binding)) = &*ipc {
+            binding.refresh_flags(slots);
+        }
+    }
+
+    pub(super) fn reconcile_copy_from_ipc(
+        &self,
+        slots: &mut FileSlotMap,
+        stdio_cloexec: &mut [bool; 3],
+        closed_stdio: &mut [bool; 3],
+    ) {
+        let mut ipc = self.ipc.lock();
+        if let Some(Ok(binding)) = &mut *ipc {
+            binding.refresh_flags(slots);
+            binding.refresh_stdio();
+            *stdio_cloexec = binding.stdio_cloexec;
+            *closed_stdio = binding.closed_stdio;
         }
     }
 
@@ -242,12 +488,15 @@ impl Drop for FileTableStdioGuard<'_> {
         // explicit_stdio is updated under that guard and this same IPC mutex.
         let mut ipc = self.table.ipc.lock();
         if let Some(Ok(binding)) = &mut *ipc {
-            match self.field {
-                StdioField::Closed => binding.closed_stdio = *self.guard,
-                StdioField::Cloexec => binding.stdio_cloexec = *self.guard,
-            }
             for number in 0..3 {
-                if let Err(error) = binding.sync_stdio(number) {
+                if self.guard[number] == self.before[number] {
+                    continue;
+                }
+                let result = match self.field {
+                    StdioField::Closed => binding.set_stdio_closed(number, self.guard[number]),
+                    StdioField::Cloexec => binding.set_stdio_cloexec(number, self.guard[number]),
+                };
+                if let Err(error) = result {
                     *ipc = Some(Err(error));
                     break;
                 }
@@ -259,10 +508,17 @@ impl Drop for FileTableStdioGuard<'_> {
 impl FileTable {
     pub(super) fn stdio_guard(&self, field: StdioField) -> FileTableStdioGuard<'_> {
         let mutation = self.mutation_lease();
-        let guard = match field {
+        let mut guard = match field {
             StdioField::Closed => self.closed_stdio.lock(),
             StdioField::Cloexec => self.stdio_cloexec.lock(),
         };
+        if let Some(Ok(binding)) = &mut *self.ipc.lock() {
+            binding.refresh_stdio();
+            *guard = match field {
+                StdioField::Closed => binding.closed_stdio,
+                StdioField::Cloexec => binding.stdio_cloexec,
+            };
+        }
         let before = *guard;
         FileTableStdioGuard {
             guard,
@@ -292,7 +548,7 @@ mod tests {
     // No host fd, fork, environment mutation or global counter: VM-free
     // authority witnesses run in the parallel kernel partition.
     #[test]
-    fn red_until_step3_m1_one_table_writer() {
+    fn one_table_writer() {
         let ids = ObjectIdRegistry::new();
         let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
         let map = map();
@@ -309,20 +565,13 @@ mod tests {
         let peer_id = fd::TableId::from_raw(map.lookup(peer.id().raw()).unwrap());
         authority.setfd(shared, fd::Fd(3), true).unwrap();
         assert_eq!(authority.getfd(peer_id, fd::Fd(3)), Ok(false));
+        assert_eq!(peer.read_open_files().get(&3).unwrap().fd_flags, 0);
         let host_flag = parent.read_open_files().get(&3).unwrap().fd_flags != 0;
-        let result = if host_flag {
-            Ok(())
-        } else {
-            Err("host slot flags diverge from shared authority")
-        };
-        assert_eq!(
-            result.expect_err("flips at M1 cutover"),
-            "host slot flags diverge from shared authority"
-        );
+        assert!(host_flag, "host slot flags diverge from shared authority");
     }
 
     #[test]
-    fn red_until_step3_m1_no_host_slot_selection() {
+    fn no_host_slot_selection() {
         let ids = ObjectIdRegistry::new();
         let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
         let map = map();
@@ -339,16 +588,10 @@ mod tests {
             assert!(authority.get(shared, fd::Fd(number)).is_ok());
         }
         authority.close(shared, fd::Fd(0)).unwrap();
-        // The one authority's lowest free slot is now 0. Host selection still
-        // considers implicit stdio open and chooses 3, even with a live peer.
         let selected = parent.reserve_slot_at_or_above(0, 64).unwrap();
-        let result = if selected.fd() == 0 {
-            Ok(())
-        } else {
-            Err("host selector ignores shared fd zero hole")
-        };
         assert_eq!(
-            result.expect_err("flips at M1 cutover"),
+            selected.fd(),
+            0,
             "host selector ignores shared fd zero hole"
         );
     }
