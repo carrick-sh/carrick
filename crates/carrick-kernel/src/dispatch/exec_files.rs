@@ -56,7 +56,7 @@ pub struct ExecFilesystem {
 /// Caller-selected resources, retained independently of any host TaskRef.
 struct ExecFileContext {
     pub caller: ExecCaller,
-    pub visible_pid: Option<super::NsPid>,
+    pub proc_caller: Option<super::fs::pathres::RetainedProcCaller>,
     pub cwd: String,
     pub fsuid: NsUid,
     pub fsgid: NsGid,
@@ -102,36 +102,79 @@ impl ExecFiles {
         super::fs::check_path_length(path).map_err(ExecSourceError::Linux)?;
         let path = self.resolve_path(path);
         super::fs::check_path_length(&path).map_err(ExecSourceError::Linux)?;
-        // Redundant separators and interior `.` do not change these directory
-        // prefixes. Never collapse `..`, or a trailing directory requirement.
-        let magic_path = if path.ends_with('/') || path.ends_with("/.") {
-            path.clone()
-        } else {
-            format!(
-                "/{}",
-                path.split('/')
-                    .filter(|part| !part.is_empty() && *part != ".")
-                    .collect::<Vec<_>>()
-                    .join("/")
-            )
-        };
         let visible = self
             .context
-            .visible_pid
-            .and_then(|pid| u32::try_from(pid.raw()).ok());
-        if proc_self_magic_link(&magic_path, visible) == Some("exe") {
-            return self
-                .context
-                .executable
-                .clone()
-                .ok_or(ExecSourceError::Linux(carrick_abi::LINUX_ENOENT));
+            .proc_caller
+            .and_then(|caller| u32::try_from(caller.pid.raw()).ok());
+        // Proc aliases must use the captured caller, including while walking
+        // an interior `..`; the context-free ProcVfs cannot select this caller.
+        let mut normalized = format!(
+            "/{}",
+            path.split('/')
+                .filter(|part| !part.is_empty() && *part != ".")
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        normalized =
+            super::fs::proc_synthetic::rewrite_dev_fd_alias(&normalized).unwrap_or(normalized);
+        if let Some(visible) = visible {
+            for alias in ["self", "curproc", "this"] {
+                let prefix = format!("/proc/{alias}/");
+                if let Some(tail) = normalized.strip_prefix(&prefix) {
+                    normalized = format!("/proc/{visible}/{tail}");
+                    break;
+                }
+            }
         }
-        if let Some(fd) = proc_self_fd_number(&magic_path, visible) {
-            let fd = crate::kernel::FileSlotNumber::for_open_fd(fd)
-                .map_err(|_| ExecSourceError::Linux(carrick_abi::LINUX_ENOENT))?;
-            return self.context.descriptors.source(fd);
+        if let Some(caller) = self.context.proc_caller
+            && let Some(tail) = normalized.strip_prefix("/proc/thread-self/")
+        {
+            normalized = format!(
+                "/proc/{}/task/{}/{tail}",
+                caller.pid.raw(),
+                caller.tid.raw()
+            );
         }
-        self.filesystem.acquire(&path)
+        let directory_required = path.ends_with('/') || path.ends_with("/.");
+        self.filesystem.acquire(
+            &normalized,
+            directory_required,
+            self.context.proc_caller,
+            |candidate| {
+                // Only the captured thread's directory may select its retained
+                // executable or descriptors; another thread is not this caller.
+                let thread_path = self.context.proc_caller.and_then(|caller| {
+                    let prefix = format!("/proc/{}/task/{}/", caller.pid.raw(), caller.tid.raw());
+                    candidate
+                        .strip_prefix(&prefix)
+                        .map(|tail| format!("/proc/{}/{tail}", caller.pid.raw()))
+                });
+                let candidate = thread_path.as_deref().unwrap_or(candidate);
+                let source = if proc_self_magic_link(candidate, visible) == Some("exe") {
+                    Some(
+                        self.context
+                            .executable
+                            .clone()
+                            .ok_or(ExecSourceError::Linux(carrick_abi::LINUX_ENOENT)),
+                    )
+                } else {
+                    proc_self_fd_number(candidate, visible).map(|fd| {
+                        let fd = crate::kernel::FileSlotNumber::for_open_fd(fd)
+                            .map_err(|_| ExecSourceError::Linux(carrick_abi::LINUX_ENOENT))?;
+                        self.context.descriptors.source(fd)
+                    })
+                };
+                source.map(|source| {
+                    source.and_then(|source| {
+                        if directory_required {
+                            Err(ExecSourceError::Linux(carrick_abi::LINUX_ENOTDIR))
+                        } else {
+                            Ok(source)
+                        }
+                    })
+                })
+            },
+        )
     }
 
     pub fn check_source(&self, source: &ExecSource) -> Result<(), LinuxErrno> {
@@ -143,15 +186,15 @@ impl ExecFiles {
     }
 
     pub fn notify_exec(&self, path: &str) {
-        let Some(pid) = self.context.visible_pid else {
+        let Some(caller) = self.context.proc_caller else {
             return;
         };
         self.filesystem.fanotify.notify(
             path,
             carrick_abi::LinuxFanotifyEvents::OPEN | carrick_abi::LinuxFanotifyEvents::OPEN_EXEC,
             false,
-            pid.raw() as i32,
-            pid.raw() as i32,
+            caller.pid.raw() as i32,
+            caller.pid.raw() as i32,
         );
     }
 
@@ -165,40 +208,66 @@ impl ExecFiles {
 }
 
 impl ExecFilesystem {
-    fn acquire(&self, path: &str) -> Result<ExecSource, ExecSourceError> {
+    fn acquire(
+        &self,
+        path: &str,
+        directory_required: bool,
+        proc_caller: Option<super::fs::pathres::RetainedProcCaller>,
+        special: impl Fn(&str) -> Option<Result<ExecSource, ExecSourceError>>,
+    ) -> Result<ExecSource, ExecSourceError> {
+        // A retained magic source is authoritative even in bare-run mode.
+        if let Some(source) = special(path) {
+            return source;
+        }
         let acquire = || {
             super::fs::check_path_length(path).map_err(ExecSourceError::Linux)?;
             let observations = std::cell::RefCell::default();
             let paths = super::fs::pathres::LayeredPathView {
                 rootfs: &self.rootfs,
                 mounts: &self.mounts,
+                proc_caller,
                 resolve_observations: &observations,
             };
-            let walked = if path.split('/').any(|part| part == "..") {
-                paths
-                    .resolve_dotdot_symlink_aware("/", path)
-                    .map_err(ExecSourceError::Linux)?
-            } else {
-                path.to_owned()
-            };
-            let resolved = paths
-                .canonicalize_following(&walked)
+            if paths.symlink_follow_budget_exceeded(path) {
+                return Err(ExecSourceError::Linux(carrick_abi::LINUX_ELOOP));
+            }
+            let walked = paths
+                .resolve_dotdot_symlink_aware("/", path)
                 .map_err(ExecSourceError::Linux)?;
+            let (resolved, retained) = paths
+                .canonicalize_with_source(&walked, &special)
+                .map_err(ExecSourceError::Linux)?;
+            if let Some(source) = retained {
+                // A magic source was selected. Its refusal is authoritative,
+                // even if the original spelling was a non-proc symlink.
+                return Ok(source);
+            }
             if paths
                 .layered_lstat(&resolved)
                 .is_ok_and(|md| md.kind == carrick_vfs::rootfs::RootFsEntryKind::Directory)
             {
                 return Err(ExecSourceError::Linux(carrick_abi::LINUX_EACCES));
             }
-            self.acquire_at(&resolved).map_err(ExecSourceError::Host)
-        };
-        acquire().or_else(|error| {
-            if !self.host_fallback {
-                return Err(error);
+            if directory_required {
+                return Err(ExecSourceError::Linux(carrick_abi::LINUX_ENOTDIR));
             }
-            let file = std::fs::File::open(path).map_err(ExecSourceError::Host)?;
-            ExecSource::host(file, path.to_owned()).map_err(ExecSourceError::Host)
-        })
+            self.acquire_at(&resolved)
+                .map(Ok)
+                .map_err(ExecSourceError::Host)
+        };
+        match acquire() {
+            Ok(source) => source,
+            Err(error) => {
+                if !self.host_fallback || path.starts_with("/proc/") {
+                    return Err(error);
+                }
+                let file = std::fs::File::open(path).map_err(ExecSourceError::Host)?;
+                if directory_required && !file.metadata().map_err(ExecSourceError::Host)?.is_dir() {
+                    return Err(ExecSourceError::Linux(carrick_abi::LINUX_ENOTDIR));
+                }
+                ExecSource::host(file, path.to_owned()).map_err(ExecSourceError::Host)
+            }
+        }
     }
 }
 
@@ -243,8 +312,12 @@ impl SyscallDispatcher {
                     mm: context.shared().mm().id(),
                     execution: context.thread().execution_state().generation(),
                 },
-                visible_pid: super::fs::proc_synthetic::proc_visible_self(context)
-                    .map(|pid| super::NsPid(pid as i32)),
+                proc_caller: super::fs::proc_synthetic::proc_visible_self(context)
+                    .zip(crate::namespace::pid::ns_visible_guest_tid(context))
+                    .map(|(pid, tid)| super::fs::pathres::RetainedProcCaller {
+                        pid: super::NsPid(pid as i32),
+                        tid: super::NsPid(tid as i32),
+                    }),
                 cwd: context.resources().fs_context().cwd(),
                 fsuid: credentials.fsuid,
                 fsgid: credentials.fsgid,
