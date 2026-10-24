@@ -2956,6 +2956,10 @@ mod tests {
             arm_process_call_claimed(93, 0, || NativeThreadGroupOwner::ForkChild),
             "native thread exit"
         );
+        assert!(
+            arm_process_call_claimed(95, 0, || NativeThreadGroupOwner::ForkChild),
+            "native child waitid"
+        );
         assert!(!arm_process_call_claimed(62, 0, || panic!(
             "ordinary lseek queried registry"
         )));
