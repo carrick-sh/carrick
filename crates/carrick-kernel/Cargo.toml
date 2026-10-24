@@ -57,6 +57,7 @@ deferred-capture-test-control = ["test-support"]
 # backend selection stays above, in carrick-runtime.
 
 [dependencies]
+carrick-fd-core = { path = "../carrick-fd-core" }
 carrick-core = { path = "../carrick-core" }
 carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }

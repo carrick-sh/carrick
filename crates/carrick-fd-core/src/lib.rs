@@ -16,6 +16,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 #[cfg(all(test, feature = "loom"))]
 use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
+pub mod exec;
 pub mod handle;
 pub mod storage;
 
