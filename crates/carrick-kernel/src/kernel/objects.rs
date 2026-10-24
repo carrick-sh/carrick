@@ -1098,6 +1098,9 @@ struct DescriptionLifecycle {
 /// pin or HostIpc. A shared OFD can retain this owner after all host slots die.
 #[derive(Debug, Default)]
 struct DescriptionPhysicalLifetime {
+    /// Counts this description against its host inode's EL1 ownership record
+    /// (host regular files only; set once at construction).
+    el1_registration: std::sync::OnceLock<crate::el1_delegation::InodeOpenRegistration>,
     fd_refs: AtomicUsize,
     transition: Mutex<DescriptionLifecycle>,
 }
@@ -1186,9 +1189,6 @@ pub struct FileDescription {
     epoll_registrations: Mutex<BTreeMap<(FileDescriptionId, i32), Weak<FileDescription>>>,
     revision: ObjectRevision,
     delegation_handle: std::sync::atomic::AtomicU32,
-    /// Counts this description against its host inode's EL1 ownership record
-    /// (host regular files only; set once at construction).
-    el1_registration: std::sync::OnceLock<crate::el1_delegation::InodeOpenRegistration>,
 }
 
 impl FileDescription {
@@ -1281,7 +1281,6 @@ impl FileDescription {
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
             delegation_handle: std::sync::atomic::AtomicU32::new(0),
-            el1_registration: std::sync::OnceLock::new(),
         })
     }
 
@@ -1315,7 +1314,6 @@ impl FileDescription {
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
             delegation_handle: std::sync::atomic::AtomicU32::new(0),
-            el1_registration: std::sync::OnceLock::new(),
         })
     }
 
@@ -1343,7 +1341,6 @@ impl FileDescription {
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
             delegation_handle: std::sync::atomic::AtomicU32::new(0),
-            el1_registration: std::sync::OnceLock::new(),
         }
     }
 
@@ -1355,7 +1352,6 @@ impl FileDescription {
             epoll_registrations: Mutex::new(BTreeMap::new()),
             revision: ObjectRevision::new(),
             delegation_handle: std::sync::atomic::AtomicU32::new(0),
-            el1_registration: std::sync::OnceLock::new(),
         }
     }
 
@@ -1402,12 +1398,16 @@ impl FileDescription {
         &self,
         registration: crate::el1_delegation::InodeOpenRegistration,
     ) {
-        let _ = self.el1_registration.set(registration);
+        let _ = self.common.physical.el1_registration.set(registration);
     }
 
     /// The host inode identity this description is registered under, if any.
     pub(crate) fn el1_identity(&self) -> Option<carrick_vfs::InodeIdentity> {
-        self.el1_registration.get().map(|r| r.identity())
+        self.common
+            .physical
+            .el1_registration
+            .get()
+            .map(|r| r.identity())
     }
 
     pub(crate) fn has_active_mappings(&self) -> bool {
