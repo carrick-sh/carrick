@@ -33746,35 +33746,35 @@
       "operation": "lock_closed_stdio",
       "owner": "carrick_kernel::dispatch::fs::close_dup::FsView<'a>::close",
       "lane": "shared",
-      "ceiling": 1
+      "ceiling": 0
     },
     {
       "family": "k1_inspect_misc",
       "operation": "lock_closed_stdio",
       "owner": "carrick_kernel::dispatch::fs::fd_helpers::FsView<'a>::install_fd_at_or_above",
       "lane": "shared",
-      "ceiling": 2
+      "ceiling": 0
     },
     {
       "family": "k1_inspect_misc",
       "operation": "lock_closed_stdio",
       "owner": "carrick_kernel::dispatch::fs::fd_helpers::FsView<'a>::install_fd_pair_at_or_above",
       "lane": "shared",
-      "ceiling": 2
+      "ceiling": 0
     },
     {
       "family": "k1_inspect_misc",
       "operation": "lock_next_fd",
       "owner": "carrick_kernel::dispatch::fs::fd_helpers::FsView<'a>::install_fd_at_or_above",
       "lane": "shared",
-      "ceiling": 1
+      "ceiling": 0
     },
     {
       "family": "k1_inspect_misc",
       "operation": "lock_next_fd",
       "owner": "carrick_kernel::dispatch::fs::fd_helpers::FsView<'a>::install_fd_pair_at_or_above",
       "lane": "shared",
-      "ceiling": 1
+      "ceiling": 0
     },
     {
       "family": "k1_inspect_misc",
@@ -33970,14 +33970,14 @@
       "operation": "write_open_files",
       "owner": "carrick_kernel::dispatch::fs::fd_helpers::FsView<'a>::install_fd_at_or_above",
       "lane": "shared",
-      "ceiling": 1
+      "ceiling": 0
     },
     {
       "family": "k1_inspect_misc",
       "operation": "write_open_files",
       "owner": "carrick_kernel::dispatch::fs::fd_helpers::FsView<'a>::install_fd_pair_at_or_above",
       "lane": "shared",
-      "ceiling": 1
+      "ceiling": 0
     },
     {
       "family": "k1_inspect_misc",
