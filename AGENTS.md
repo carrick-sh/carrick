@@ -537,6 +537,13 @@ acceptance.
 GitHub is the system of record for plans, status, decisions and evidence.
 Chat, worker mailboxes, scratch notes and agent memory are not.
 
+- **Write for people, not only agents.** Every comment, review, PR body
+  and issue is read by humans too (owner direction 2026-10-24, #231). Lead
+  with what happened and what it means for the reader. Use plain sentences,
+  and explain or link terms of art and issue numbers. Put raw data (JSON
+  contracts, logs, long tables) below that summary or in a collapsed
+  `<details>` block. Agent-generated text follows the same rule:
+  dispatch outcome comments and review bodies are written to be read.
 - **Issue first, then work.** Every unit of work starts as an issue with the
   plan, acceptance criterion and links. Worker briefs cite the issue number,
   and the PR closes it (`Closes #N`).
