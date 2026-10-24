@@ -675,6 +675,9 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         172 => Family::Lifecycle(LifecycleCall::GetPid),
         220 => Family::Lifecycle(LifecycleCall::Clone),
         nr if nr == carrick_syscall_abi::nr::WAIT4.raw() => Family::Lifecycle(LifecycleCall::Wait4),
+        nr if nr == carrick_syscall_abi::nr::WAITID.raw() => {
+            Family::Lifecycle(LifecycleCall::WaitId)
+        }
         nr if nr == carrick_syscall_abi::nr::EXIT_GROUP.raw() => {
             Family::Lifecycle(LifecycleCall::ExitGroup)
         }
@@ -1093,7 +1096,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         && matches!(
             family,
             Family::Signal(crate::signal::SignalCall::RtSigreturn)
-                | Family::Lifecycle(LifecycleCall::Wait4)
+                | Family::Lifecycle(LifecycleCall::Wait4 | LifecycleCall::WaitId)
         );
     if pending.host_work()
         && !pending.resumes_operation()
