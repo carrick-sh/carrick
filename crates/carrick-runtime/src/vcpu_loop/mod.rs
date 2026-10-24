@@ -522,6 +522,7 @@ pub(crate) struct KernelState {
     fatal_signal: FatalSignalAuthority,
     control_exec: Mutex<Option<carrick_kernel::kernel::control::ExecRuntime>>,
     external_exec: Mutex<Option<carrick_kernel::kernel::control::ExecWork>>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     _native_exec_capability: Option<crate::runtime::exec::NativeExecCapabilityLease>,
 }
 
@@ -546,6 +547,7 @@ impl KernelState {
                 hvpatch_rt.set_work_scope(scope);
             }
         }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let native_exec_capability = hvpatch_process.as_ref().map(|_| {
             crate::runtime::exec::retain_native_exec_capability(&dispatcher).unwrap_or_else(
                 |errno| {
@@ -575,6 +577,7 @@ impl KernelState {
             fatal_signal: FatalSignalAuthority::default(),
             control_exec: Mutex::new(None),
             external_exec: Mutex::new(None),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             _native_exec_capability: native_exec_capability,
         }
     }
