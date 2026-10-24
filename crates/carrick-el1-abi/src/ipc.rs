@@ -1079,7 +1079,7 @@ impl<'a> IpcRegion<'a> {
     /// installation. A consumed (zero-capacity) extent owns nothing.
     pub fn reclaim_descriptors(
         &self,
-        extent: Extent,
+        extent: &mut Extent,
         wait: &impl LockWait,
     ) -> Result<(), fd::storage::StorageError> {
         if extent.capacity == 0 {
@@ -1097,7 +1097,9 @@ impl<'a> IpcRegion<'a> {
             .checked_next_power_of_two()
             .ok_or(fd::storage::StorageError::Invalid)?;
         self.descriptor_storage()
-            .release(fd::storage::Allocation { offset, bytes }, wait)
+            .release(&mut fd::storage::Allocation { offset, bytes }, wait)?;
+        *extent = Extent::default();
+        Ok(())
     }
 
     pub fn descriptor_allocations(&self) -> u32 {
