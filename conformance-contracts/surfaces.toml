@@ -1968,6 +1968,10 @@ path = "crates/carrick-fd-core/src/exec.rs"
 contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable"]
 
 [[surfaces]]
+path = "crates/carrick-el1-linux/src/file_table/exec.rs"
+contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable", "process.exec.files"]
+
+[[surfaces]]
 path = "crates/carrick-kernel/src/kernel/fd_exec.rs"
 contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable"]
 
