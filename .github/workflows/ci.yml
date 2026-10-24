@@ -182,10 +182,6 @@ jobs:
       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just,cargo-deny
-      - name: Fetch and validate probe coverage base commit
-        env:
-          CI_EVENT: ${{ github.event_name }}
-        run: just ci-probe-coverage-base
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - name: Configure persisted compiler cache
@@ -202,10 +198,6 @@ jobs:
           tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
-      - name: Install Semgrep
-        if: ${{ !cancelled() }}
-        timeout-minutes: 12
-        run: just ci-install-semgrep
       - name: Exact Linux and macOS unit shard coverage
         if: ${{ !cancelled() }}
         run: just check-test-shards
@@ -235,10 +227,50 @@ jobs:
         env:
           CI_BASE: ${{ github.event.pull_request.base.sha }}
         run: just check-contract-change "$CI_BASE" "$GITHUB_SHA"
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
+
+  lint-domains:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Fetch and validate probe coverage base commit
+        env:
+          CI_EVENT: ${{ github.event_name }}
+        run: just ci-probe-coverage-base
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+      - name: Install per-user compiler cache
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
+      - name: Install Semgrep
+        if: ${{ !cancelled() }}
+        timeout-minutes: 12
+        run: just ci-install-semgrep
       - name: Host-independent typed-domain checks and contract registry
         if: ${{ !cancelled() }}
         run: just lint-domains-source
-
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
@@ -947,6 +979,7 @@ jobs:
       - linked-issue
       - commit-trailers
       - lint
+      - lint-domains
       - portable
       - loom
       - linux-doc

@@ -2466,7 +2466,7 @@ print(json.dumps({"rows": [{"source": {"file": "crates/carrick-kernel/src/lib.rs
 fn review_macos_census_checkout_fetches_the_event_base() {
     let source = std::fs::read_to_string(tools_root().join(".github/workflows/ci.yml")).unwrap();
     let workflow = yaml_rust2::YamlLoader::load_from_str(&source).unwrap();
-    for job in ["lint", "macos-clippy"] {
+    for job in ["lint-domains", "macos-clippy"] {
         let steps = workflow[0]["jobs"][job]["steps"].as_vec().unwrap();
         let checkout = steps
             .iter()
