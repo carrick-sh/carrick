@@ -86,7 +86,7 @@ fn finalize_hvf_exec_base(
 
 pub(crate) fn load_execve_image(
     dispatcher: &SyscallDispatcher,
-    context: &carrick_kernel::kernel::KernelContext,
+    files: &carrick_kernel::dispatch::exec_files::ExecFiles,
     path: &str,
     // argv/env are opaque BYTE strings (Linux ABI), not UTF-8. `path` is a
     // String (resolved against the String/Path fs layer); argv[0] / shebang
@@ -112,32 +112,14 @@ pub(crate) fn load_execve_image(
     // interpreter (execve03/execve02). Then resolve any `#!` shebang script to
     // its interpreter (shared with the initial entrypoint load via
     // `resolve_shebang`).
-    let abs_path = dispatcher.resolve_exec_path(path);
-    let host_fallback = dispatcher.exec_host_fs_fallback();
-    let acquire_source = |path: &str| {
-        dispatcher
-            .acquire_exec_source(context, path)
-            .or_else(|error| {
-                if !host_fallback {
-                    return Err(error);
-                }
-                let file = std::fs::File::open(path).map_err(
-                    carrick_kernel::dispatch::executable_authority::ExecSourceError::Host,
-                )?;
-                carrick_kernel::dispatch::executable_authority::ExecSource::host(
-                    file,
-                    path.to_owned(),
-                )
-                .map_err(carrick_kernel::dispatch::executable_authority::ExecSourceError::Host)
-            })
-    };
-    let named_source = acquire_source(&abs_path).map_err(exec_source_errno)?;
-    dispatcher.check_exec_source(&abs_path, &named_source)?;
+    let abs_path = files.resolve_path(path);
+    let named_source = files.acquire(&abs_path).map_err(exec_source_errno)?;
+    files.check_source(&named_source)?;
     // fanotify FAN_OPEN_EXEC, emitted after validation so a failed execve
     // generates nothing — the event means "this image is being executed", and
     // an ENOENT/EACCES target never is. Placed before shebang resolution so
     // `abs_path` is still the file the guest actually named.
-    dispatcher.fanotify_notify_exec(&abs_path);
+    files.notify_exec(&abs_path);
     let named_target = abs_path.clone();
     let mut path = abs_path;
     let mut argv = argv;
@@ -164,8 +146,8 @@ pub(crate) fn load_execve_image(
         next_argv.extend(argv.into_iter().skip(1));
         path = interpreter;
         argv = next_argv;
-        source = acquire_source(&path).map_err(exec_source_errno)?;
-        dispatcher.check_exec_source(&path, &source)?;
+        source = files.acquire(&path).map_err(exec_source_errno)?;
+        files.check_source(&source)?;
         final_source_inspected = false;
     }
     // A fourth shebang replacement exhausts the loop after acquiring its
@@ -180,24 +162,17 @@ pub(crate) fn load_execve_image(
     // Linux reports that as a second FAN_OPEN_EXEC. Skip it for a plain binary,
     // where `resolve_shebang` hands back the same path it was given.
     if path != named_target {
-        dispatcher.fanotify_notify_exec(&path);
+        files.notify_exec(&path);
     }
 
     // Read the main binary AND resolve its interpreter OVERLAY-FIRST via
-    // `read_exec_file`, so execve works for guest-created/overlay binaries
+    // the retained file capabilities, so execve works for guest-created/overlay binaries
     // (downloaded/extracted ELF, /tmp/p, dpkg-unpacked binary) and needs no
     // in-memory rootfs layer (which `--fs host` drops after seeding). The
     // host-fs fallback (reading the literal absolute path straight off the
     // host) is ON only for a bare RunElf boot; a container run keeps it OFF so
     // an execve target absent from the container fs ENOENTs instead of escaping
-    // to the matching HOST binary. See `SyscallDispatcher::exec_host_fs_fallback`.
-    let host_read = |p: &str| -> Option<Vec<u8>> {
-        if host_fallback {
-            ::std::fs::read(p).ok()
-        } else {
-            None
-        }
-    };
+    // to the matching HOST binary. The filesystem capability retains that fallback policy.
     let vdso_enabled = vdso_enabled_for_debug();
     let requires_syscall_traps = requires_syscall_traps || dispatcher.requires_syscall_traps();
     // The cache is deliberately limited to direct little-endian AArch64 ELFs.
@@ -214,12 +189,10 @@ pub(crate) fn load_execve_image(
         })
         .flatten();
     let (base, argv) = if cache_key.is_some() {
-        let base = dispatcher.with_hvpatch_exec_cache(cache_key, || {
+        let base = files.with_cache(cache_key, || {
             let raw_bytes = source.read_all().map_err(host_io_errno)?;
             let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|interpreter| {
-                dispatcher
-                    .read_exec_file(interpreter)
-                    .or_else(|| host_read(interpreter))
+                files.read_interpreter(interpreter)
             })
             .map_err(carrick_kernel::exec_helpers::exec_image_errno)?
             .with_main_file_path(path.clone());
@@ -241,9 +214,7 @@ pub(crate) fn load_execve_image(
             Some(Err(errno)) => return Err(errno),
         };
         let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|interpreter| {
-            dispatcher
-                .read_exec_file(interpreter)
-                .or_else(|| host_read(interpreter))
+            files.read_interpreter(interpreter)
         })
         .map_err(carrick_kernel::exec_helpers::exec_image_errno)?
         .with_main_file_path(path.clone());
@@ -478,5 +449,33 @@ mod tests {
                 "production exec leaf at {va:#x} escaped its ASID"
             );
         }
+    }
+    #[test]
+    fn retained_exec_files_preserve_numeric_preparation_errnos() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image");
+        std::fs::write(&path, b"not an executable image").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let files = dispatcher.capture_exec_files(&context);
+        drop(context);
+        let load_errno = || match load_execve_image(
+            &dispatcher,
+            &files,
+            path.to_str().unwrap(),
+            vec![],
+            vec![],
+            false,
+        ) {
+            Ok(_) => panic!("invalid image was accepted"),
+            Err(errno) => errno.get(),
+        };
+        assert_eq!(load_errno(), 13, "EACCES before image parsing");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(load_errno(), 8, "ENOEXEC for executable non-ELF");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(load_errno(), 2, "ENOENT after unlink");
     }
 }

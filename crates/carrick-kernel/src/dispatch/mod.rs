@@ -683,6 +683,7 @@ pub use mem::boot_private_file_backings;
 pub(crate) mod net;
 #[macro_use]
 mod perf;
+pub mod exec_files;
 pub mod executable_authority;
 pub(crate) mod proc;
 #[cfg(any(test, feature = "test-support"))]
@@ -2002,53 +2003,7 @@ impl SyscallDispatcher {
         key: Option<String>,
         build: impl FnOnce() -> Result<crate::memory::AddressSpace, E>,
     ) -> Result<crate::memory::AddressSpace, E> {
-        let Some(key) = key else {
-            return build();
-        };
-        let slot = {
-            let mut cache = self.fs.hvpatch_exec_cache.lock();
-            std::sync::Arc::clone(
-                cache
-                    .entry(key.clone())
-                    .or_insert_with(|| std::sync::Arc::new(parking_lot::Mutex::new(None))),
-            )
-        };
-        let mut prepared = slot.lock();
-        if let Some(image) = prepared.as_ref() {
-            return Ok(image.clone());
-        }
-        let image = match build() {
-            Ok(image) => image,
-            Err(error) => {
-                // A failed load is not cacheable. Remove its pending slot while
-                // it is still locked so a later lookup creates a fresh build.
-                let mut cache = self.fs.hvpatch_exec_cache.lock();
-                if cache
-                    .get(&key)
-                    .is_some_and(|current| std::sync::Arc::ptr_eq(current, &slot))
-                {
-                    cache.remove(&key);
-                }
-                return Err(error);
-            }
-        };
-        *prepared = Some(image.clone());
-        drop(prepared);
-
-        const MAX_PREPARED_EXEC_IMAGES: usize = 16;
-        let mut cache = self.fs.hvpatch_exec_cache.lock();
-        while cache.len() > MAX_PREPARED_EXEC_IMAGES {
-            // Do not evict an in-flight builder: its key must remain available
-            // to concurrent callers. The transient excess is at most the
-            // number of simultaneous distinct builds and drains as they end.
-            let evicted = cache.iter().find_map(|(candidate, slot)| {
-                (candidate != &key && slot.try_lock().is_some_and(|ready| ready.is_some()))
-                    .then(|| candidate.clone())
-            });
-            let Some(evicted) = evicted else { break };
-            cache.remove(&evicted);
-        }
-        Ok(image)
+        self.exec_filesystem().with_cache(key, build)
     }
 
     /// Bounded head of [`SyscallDispatcher::read_exec_file`]: at most `max`
@@ -2396,12 +2351,7 @@ impl SyscallDispatcher {
     /// left untouched by the caller (Linux preserves whatever the caller
     /// passed); only the path used to LOAD the image is absolutized.
     pub fn resolve_exec_path(&self, path: &str) -> String {
-        if path.starts_with('/') {
-            normalize_abs_path(path)
-        } else {
-            let cwd = self.cwd();
-            normalize_abs_path(&format!("{}/{}", cwd.trim_end_matches('/'), path))
-        }
+        exec_files::resolve_exec_path(path, &self.cwd())
     }
 
     /// Set the guest's initial working directory (docker `-w` / image

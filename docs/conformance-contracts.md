@@ -1851,3 +1851,14 @@ The old requester resumes its untagged Control write before its failed CAS,
 overwriting the replacement's Service handback despite returning Stale.
 This is RED on the under-custody repair at focused bound 3; publishing tagged
 intent and applying payload only under exact owner custody preserves Service.
+
+### Retained executable file services
+
+`process.exec.files` covers executable source selection with retained caller
+filesystem, credential, executable and descriptor-source capabilities. Two
+independent callers retain those resources after their dispatchers are dropped;
+ENOENT (2) and EACCES (13) remain ordinary pre-commit failures. Filesystem
+syscalls and exec share the layered path resolver, and host exec consumes the
+same capability API intended for ring service requests. The fixture verifies
+resource lifetime and isolation, not two executing native processes. Native
+transaction publication and signed replacement witnesses remain #785 work.

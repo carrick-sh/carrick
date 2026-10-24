@@ -1817,3 +1817,19 @@ contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable"]
 [[surfaces]]
 path = "crates/carrick-fd-core/src/reservation.rs"
 contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/exec_files.rs"
+contracts = ["process.exec.files"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/executable_authority.rs"
+contracts = ["process.exec.files"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/pathres.rs"
+contracts = ["process.exec.files"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/runtime/exec.rs"
+contracts = ["process.exec.files"]

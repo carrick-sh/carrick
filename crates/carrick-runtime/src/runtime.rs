@@ -1263,16 +1263,15 @@ where
                 let cmdline = proc_argv.join(" ");
                 carrick_kernel::dispatch::set_host_process_name(cmdline.as_bytes());
                 let proc_env = env.clone();
-                let loaded = dispatcher.with_kernel_credentials(&kernel_context, || {
-                    load_execve_image(
+                let files = dispatcher.capture_exec_files(&kernel_context);
+                let loaded = load_execve_image(
                         &dispatcher,
-                        &kernel_context,
+                        &files,
                         &path,
                         argv,
                         env,
                         dispatcher.requires_syscall_traps(),
-                    )
-                });
+                    );
                 match loaded {
                     Ok(crate::runtime::exec::LoadedExecImage {
                         image: new_image,
