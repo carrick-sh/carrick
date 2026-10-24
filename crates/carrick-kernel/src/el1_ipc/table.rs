@@ -199,6 +199,13 @@ mod tests {
     #[test]
     fn serial_host_el1_ipc_owned_tables_reclaim_extent_and_identity_capacity() {
         let owner = Arc::new(HostIpc::new(1 << 16).unwrap());
+        for capacity in [0, i32::MAX as usize + 1] {
+            assert!(matches!(
+                owner.create_table(64, capacity),
+                Err(AdmissionError::NoMemory)
+            ));
+            assert_eq!(owner.region().descriptor_allocations(), 0);
+        }
         for _ in 0..carrick_el1_abi::ipc::IPC_FD_TABLES + 1 {
             let mut parent = HostTable::create(Arc::clone(&owner), 64, 4).unwrap();
             let child = parent.fork().unwrap();
