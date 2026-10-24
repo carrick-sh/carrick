@@ -80,6 +80,12 @@ pub use epoll::SYS_EPOLL_PWAIT;
 /// (a missing descriptor is then EBADF, not a host descriptor).
 pub trait IpcTables {
     fn table_of(&self, task: &CurrentTask) -> Option<RawTableId>;
+    fn owned_table_of(&self, _task: &CurrentTask) -> Option<RawTableId> {
+        None
+    }
+    fn is_owned_table(&self, task: &CurrentTask) -> bool {
+        self.owned_table_of(task).is_some()
+    }
 }
 
 /// The shared IPC authority as this venue maps it.
@@ -178,6 +184,47 @@ fn release_native_description<C: carrick_el1_abi::EntryContext>(
     Ok(())
 }
 
+pub(crate) fn is_zone_releasable_backing(
+    description: carrick_el1_abi::ipc::fd::Description,
+) -> bool {
+    !matches!(
+        IpcBacking::decode(description.backing),
+        Some(IpcBacking::Host(_))
+    )
+}
+
+pub(crate) fn settle_native_release<C: carrick_el1_abi::EntryContext>(
+    region: &IpcRegion<'_>,
+    release: carrick_el1_abi::ipc::fd::DeferredRelease,
+    zone: Option<(&carrick_sched_core::ZoneTables<C>, carrick_el1_abi::SlotId)>,
+    task: &CurrentTask,
+) -> Result<(), carrick_el1_abi::ipc::IpcError> {
+    use carrick_el1_abi::ipc::fd::DeferredRelease;
+    match release {
+        DeferredRelease::None => Ok(()),
+        DeferredRelease::Deferred => {
+            task.linux.mark_pending_host_work();
+            Ok(())
+        }
+        DeferredRelease::Now(description) => {
+            if let Some((zone, slot)) = zone {
+                release_native_description(region, description, zone, slot, task)
+            } else {
+                match region.release_backing(description.backing, &Finish)? {
+                    IpcReleased::Object { wake, .. } => {
+                        if wake.host_owed {
+                            task.linux.mark_pending_host_work();
+                        }
+                        Ok(())
+                    }
+                    IpcReleased::Epoll => Ok(()),
+                    IpcReleased::Host(_) => Err(carrick_el1_abi::ipc::IpcError::Corrupt),
+                }
+            }
+        }
+    }
+}
+
 /// Tables resolved through the host-published [`IpcTableMap`], keyed by the
 /// running task's host file table (which an EL1 switch-in updates): a table
 /// with no entry is not served.
@@ -186,6 +233,10 @@ pub struct MapTables<'a>(pub &'a IpcTableMap);
 impl IpcTables for MapTables<'_> {
     fn table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
         self.0.lookup(task.linux.file_table.load(Ordering::Acquire))
+    }
+    fn owned_table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
+        self.0
+            .lookup_owned(task.linux.file_table.load(Ordering::Acquire))
     }
 }
 
@@ -223,6 +274,9 @@ struct GuestTables;
 impl IpcTables for GuestTables {
     fn table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
         MapTables(carrick_el1_abi::ipc_table_map_guest()).table_of(task)
+    }
+    fn owned_table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
+        MapTables(carrick_el1_abi::ipc_table_map_guest()).owned_table_of(task)
     }
 }
 
@@ -263,46 +317,79 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
     venue: &IpcVenue<'_>,
     user: &mut M,
 ) -> IpcServed {
+    serve_ipc_with_sigpipe(sched, frame, venue, user, false).0
+}
+
+/// Serve IPC transfers in EL1, returning `(served, sigpipe_owed)` so tasks
+/// whose signal authority lives in the ring can raise `SIGPIPE` without
+/// forwarding or handing back to a host task.
+pub fn serve_ipc_with_sigpipe<C: ThreadCpu, U: UserWord, M: UserCopy>(
+    sched: &mut Sched<'_, C, U>,
+    frame: &mut TrapFrame,
+    venue: &IpcVenue<'_>,
+    user: &mut M,
+    native_sigpipe: bool,
+) -> (IpcServed, bool) {
     let nr = frame.x[8] as usize;
     if nr != SYS_READ && nr != SYS_WRITE && nr != SYS_EPOLL_PWAIT {
-        return IpcServed::Forward;
+        return (IpcServed::Forward, false);
     }
     let (token, op, resumed) = match sched.take_object_operation() {
         // The slot's record is not this task's: the host settles it.
         Err(_) => {
-            return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward);
+            return (
+                leave(sched, IpcLeave::StaleOperation, IpcServed::Forward),
+                false,
+            );
         }
         Ok(Some(t)) => {
             let Some(token) = from_sched_token(t) else {
-                return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward);
+                return (
+                    leave(sched, IpcLeave::StaleOperation, IpcServed::Forward),
+                    false,
+                );
             };
             let Ok(op) = venue.region.operation(&token) else {
-                return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward);
+                return (
+                    leave(sched, IpcLeave::StaleOperation, IpcServed::Forward),
+                    false,
+                );
             };
             if op.task != task_key(sched.task) || op.mm != mm_key(sched.task) {
                 let served = handback(frame, token, op, IpcHandback::Continue, 0, venue);
-                return leave(sched, IpcLeave::ForeignOperation, served);
+                return (leave(sched, IpcLeave::ForeignOperation, served), false);
             }
             if op.kind == IpcOpKind::EpollWait {
-                return epoll::resume(sched, frame, venue, user, token, op);
+                return (epoll::resume(sched, frame, venue, user, token, op), false);
             }
             (token, op, true)
         }
-        Ok(None) if nr == SYS_EPOLL_PWAIT => return epoll::serve(sched, frame, venue, user),
+        Ok(None) if nr == SYS_EPOLL_PWAIT => {
+            return (epoll::serve(sched, frame, venue, user), false);
+        }
         Ok(None) => match admit(sched, frame, venue, user) {
             Admission::Admitted(token, op) => (token, op, false),
             Admission::Immediate(result) => {
                 frame.x[0] = result as u64;
-                return IpcServed::Returned { switched: false };
+                return (IpcServed::Returned { switched: false }, false);
             }
-            Admission::Forward => return IpcServed::Forward,
+            Admission::Forward => return (IpcServed::Forward, false),
             Admission::Restart(token, op) => {
                 let served = handback(frame, token, op, IpcHandback::Restart, 0, venue);
-                return leave(sched, IpcLeave::Restart, served);
+                return (leave(sched, IpcLeave::Restart, served), false);
             }
         },
     };
-    run(sched, frame, venue, user, token, op, resumed)
+    run(
+        sched,
+        frame,
+        venue,
+        user,
+        token,
+        op,
+        resumed,
+        native_sigpipe,
+    )
 }
 
 fn task_key(task: &CurrentTask) -> IpcTaskKey {
@@ -488,7 +575,8 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
     mut token: IpcOpToken,
     mut op: IpcOperation,
     resumed: bool,
-) -> IpcServed {
+    native_sigpipe: bool,
+) -> (IpcServed, bool) {
     let region = &venue.region;
     let object = IpcObjectHandle::from_raw(op.object);
     let mut copy = PrefixCopy::new(user);
@@ -500,14 +588,17 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             match flags {
                 Ok(nonblock) => nonblock,
                 Err(_) => {
-                    return bail(
-                        sched,
-                        frame,
-                        token,
-                        op,
-                        resumed,
-                        venue,
-                        IpcLeave::FlagsRefused,
+                    return (
+                        bail(
+                            sched,
+                            frame,
+                            token,
+                            op,
+                            resumed,
+                            venue,
+                            IpcLeave::FlagsRefused,
+                        ),
+                        false,
                     );
                 }
             }
@@ -526,21 +617,24 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     Some(IpcLockHolder::El1 { .. }) => IpcLeave::ObjectBusyEl1,
                     None => IpcLeave::ObjectBusy,
                 };
-                return bail(sched, frame, token, op, resumed, venue, why);
+                return (bail(sched, frame, token, op, resumed, venue, why), false);
             }
         };
         let (status, wake) = match transfer(&mut guard, &mut op, &mut copy) {
             Ok(step) => step,
             Err(_) => {
                 drop(guard);
-                return bail(
-                    sched,
-                    frame,
-                    token,
-                    op,
-                    resumed,
-                    venue,
-                    IpcLeave::TransferRefused,
+                return (
+                    bail(
+                        sched,
+                        frame,
+                        token,
+                        op,
+                        resumed,
+                        venue,
+                        IpcLeave::TransferRefused,
+                    ),
+                    false,
                 );
             }
         };
@@ -579,31 +673,50 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
             }
             StepStatus::Blocked(lane) => {
                 let Some((_, Some(snap))) = parking else {
-                    return bail(
-                        sched,
-                        frame,
-                        token,
-                        op,
-                        resumed,
-                        venue,
-                        IpcLeave::ParkRefused,
+                    return (
+                        bail(
+                            sched,
+                            frame,
+                            token,
+                            op,
+                            resumed,
+                            venue,
+                            IpcLeave::ParkRefused,
+                        ),
+                        false,
                     );
                 };
                 match park(sched, frame, region, token, op, object, lane, snap, None) {
-                    Parked::Done(served) => return served,
+                    Parked::Done(served) => return (served, false),
                     Parked::Retry(t) => {
                         token = t;
                         continue;
                     }
                     Parked::Refused(t) => {
-                        return bail(sched, frame, t, op, resumed, venue, IpcLeave::ParkRefused);
+                        return (
+                            bail(sched, frame, t, op, resumed, venue, IpcLeave::ParkRefused),
+                            false,
+                        );
                     }
                 }
+            }
+            StepStatus::Broken if native_sigpipe => {
+                let result = if written > 0 {
+                    written as i64
+                } else {
+                    linux::EPIPE
+                };
+                finish(sched, token, region);
+                frame.x[0] = result as u64;
+                return (IpcServed::Returned { switched: false }, true);
             }
             StepStatus::Broken if written == 0 && !resumed => {
                 // No effect yet: the host re-runs the call (EPIPE + SIGPIPE).
                 finish(sched, token, region);
-                return leave(sched, IpcLeave::BrokenFirst, IpcServed::Forward);
+                return (
+                    leave(sched, IpcLeave::BrokenFirst, IpcServed::Forward),
+                    false,
+                );
             }
             StepStatus::Broken => {
                 let result = if written > 0 {
@@ -612,32 +725,38 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
                     linux::EPIPE
                 };
                 let served = handback(frame, token, op, IpcHandback::Sigpipe, result, venue);
-                return leave(sched, IpcLeave::SigpipeHandback, served);
+                return (leave(sched, IpcLeave::SigpipeHandback, served), false);
             }
             StepStatus::Fault if written == 0 && !resumed => {
                 // The host resolves the fault (first touch or EFAULT).
                 finish(sched, token, region);
-                return leave(sched, IpcLeave::FaultFirst, IpcServed::Forward);
+                return (
+                    leave(sched, IpcLeave::FaultFirst, IpcServed::Forward),
+                    false,
+                );
             }
             // Only a delivered prefix can complete short. A resumed read
             // with no progress still owns its byte and description; a copy
             // refusal must be resolved by that continuation, never as EOF.
             StepStatus::Fault if op.kind == IpcOpKind::PipeRead && written > 0 => written as i64,
             StepStatus::Fault => {
-                return bail(
-                    sched,
-                    frame,
-                    token,
-                    op,
-                    resumed,
-                    venue,
-                    IpcLeave::FaultFirst,
+                return (
+                    bail(
+                        sched,
+                        frame,
+                        token,
+                        op,
+                        resumed,
+                        venue,
+                        IpcLeave::FaultFirst,
+                    ),
+                    false,
                 );
             }
         };
         finish(sched, token, region);
         frame.x[0] = result as u64;
-        return IpcServed::Returned { switched: false };
+        return (IpcServed::Returned { switched: false }, false);
     }
 }
 

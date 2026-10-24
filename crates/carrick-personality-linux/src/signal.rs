@@ -372,6 +372,8 @@ pub trait ProcessSignals {
         blocked: carrick_signal_core::policy::SigBlockMask,
     ) -> Result<(), carrick_syscall_abi::LinuxErrno>;
 
+    fn raise_sigpipe(&mut self) {}
+
     fn rt_sigaction(
         &mut self,
         signum: carrick_signal_core::policy::Signal,

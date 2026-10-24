@@ -7526,6 +7526,27 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ),
         )
     }
+    #[inline(never)]
+    fn raise_sigpipe(&mut self) {
+        let Some(signal) =
+            carrick_signal_core::policy::Signal::from_number(carrick_syscall_abi::LINUX_SIGPIPE)
+        else {
+            return;
+        };
+        let graph = self.runtime.graph.lock();
+        let Ok(row) = graph.owner.task(self.key) else {
+            return;
+        };
+        let _ = row
+            .native()
+            .resources()
+            .signals()
+            .enqueue_thread_unless_ignored(
+                self.record,
+                signal,
+                Some(carrick_syscall_abi::LinuxSiginfo::kernel(signal.number())),
+            );
+    }
     fn rt_sigaction(
         &mut self,
         signal: carrick_signal_core::policy::Signal,

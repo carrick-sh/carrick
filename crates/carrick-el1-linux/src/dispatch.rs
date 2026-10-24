@@ -1298,11 +1298,41 @@ impl<
     fn may_serve_poll(&self) -> bool {
         self.frame.may_serve_poll()
     }
+    fn native_descriptor_owner(&self) -> bool {
+        self.ipc
+            .zip(self.task())
+            .is_some_and(|(venue, task)| venue.tables.is_owned_table(task))
+    }
     fn may_serve_descriptor(&self) -> bool {
-        if self.frame.may_serve_descriptor() {
-            return true;
-        }
         let ordinal = self.frame.canonical_ordinal().raw();
+        if self.native_descriptor_owner() {
+            if [
+                carrick_personality_linux::crossing::nr::DUP,
+                carrick_personality_linux::crossing::nr::DUP3,
+                carrick_personality_linux::crossing::nr::CLOSE,
+            ]
+            .iter()
+            .any(|nr| nr.raw() == ordinal)
+                || ordinal == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2
+            {
+                return true;
+            }
+            if ordinal == carrick_personality_linux::crossing::nr::FCNTL.raw() {
+                return matches!(
+                    self.frame.argument(1).unwrap_or(u64::MAX),
+                    carrick_abi::LINUX_F_DUPFD
+                        | carrick_abi::LINUX_F_GETFD
+                        | carrick_abi::LINUX_F_SETFD
+                        | carrick_abi::LINUX_F_GETFL
+                        | carrick_abi::LINUX_F_SETFL
+                        | carrick_abi::LINUX_F_DUPFD_CLOEXEC
+                );
+            }
+            return false;
+        }
+        if self.frame.may_serve_descriptor() {
+            return ordinal != carrick_personality_linux::crossing::nr::FCNTL.raw();
+        }
         if ![
             carrick_personality_linux::crossing::nr::DUP,
             carrick_personality_linux::crossing::nr::DUP3,
@@ -1576,6 +1606,9 @@ impl<
         }
     }
     fn descriptor(&mut self) -> FamilyCompletion {
+        if self.native_descriptor_owner() {
+            return self.serve_owned_ipc_descriptor();
+        }
         let Some(task) = self.task() else {
             return FamilyCompletion::Forward;
         };
@@ -2018,13 +2051,411 @@ pub(super) fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
     }
 }
 
+struct NativeFdWait;
+impl carrick_el1_abi::ipc::LockWait for NativeFdWait {
+    fn wait(&self, _attempt: u32) -> bool {
+        core::hint::spin_loop();
+        true
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NativeDupTarget {
+    Lowest(carrick_el1_abi::ipc::fd::Fd),
+    FcntlMin(carrick_el1_abi::ipc::fd::Fd),
+    Exact(carrick_el1_abi::ipc::fd::Fd),
+}
+
+#[inline(never)]
+fn raise_native_sigpipe<'p, Context: DispatchContext>(
+    process: Option<&mut (dyn lifecycle::ProcessNative<Context> + 'p)>,
+) {
+    if let Some(signals) = process.and_then(|p| p.signal_venue()) {
+        signals.raise_sigpipe();
+    }
+}
+
+fn map_fd_error(error: carrick_el1_abi::ipc::fd::Error) -> FamilyCompletion {
+    use carrick_el1_abi::ipc::fd::Error;
+    let errno = match error {
+        Error::BadFd => carrick_syscall_abi::LINUX_EBADF,
+        Error::InvalidArgument => carrick_syscall_abi::LINUX_EINVAL,
+        Error::TooManyFiles => carrick_syscall_abi::LINUX_EMFILE,
+        Error::NoMemory | Error::NeedsBacking { .. } | Error::NeedsOfds => {
+            carrick_syscall_abi::LINUX_ENOMEM
+        }
+        Error::Busy => carrick_abi::LINUX_EBUSY,
+        Error::Contended
+        | Error::StaleTable
+        | Error::BadBacking
+        | Error::StalePin
+        | Error::PinRaced(_) => carrick_syscall_abi::LINUX_EIO,
+    };
+    FamilyCompletion::Complete(errno.guest_retval())
+}
+
+fn map_ipc_error(error: carrick_el1_abi::ipc::IpcError) -> FamilyCompletion {
+    match error {
+        carrick_el1_abi::ipc::IpcError::Fd(fd_err) => map_fd_error(fd_err),
+        _ => FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EIO.guest_retval()),
+    }
+}
+
+fn run_with_table_growth<T>(
+    region: &carrick_el1_abi::ipc::IpcRegion<'_>,
+    table: carrick_el1_abi::ipc::fd::TableId,
+    mut op: impl FnMut(
+        carrick_el1_abi::ipc::IpcFdAuthority<'_, NativeFdWait>,
+    ) -> Result<T, carrick_el1_abi::ipc::fd::Error>,
+) -> Result<T, FamilyCompletion> {
+    loop {
+        match op(region.fd(NativeFdWait)) {
+            Ok(val) => return Ok(val),
+            Err(carrick_el1_abi::ipc::fd::Error::NeedsBacking { descriptors }) => {
+                region
+                    .ensure_table_capacity(table, descriptors, &NativeFdWait)
+                    .map_err(map_ipc_error)?;
+            }
+            Err(err) => return Err(map_fd_error(err)),
+        }
+    }
+}
+
 impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context: DispatchContext>
     El1PendingFamilies<'_, F, C, U, G, Context>
 {
-    fn ipc_transfer(&mut self) -> FamilyCompletion {
-        let Some(venue) = &self.ipc else {
+    fn settle_delegated_release(
+        frame: &mut G,
+        open_table: &[DelegatedOpenFile],
+        task: &CurrentTask,
+        release: Option<super::file_table::ReleasedDescription>,
+    ) -> Result<(), FamilyCompletion> {
+        let Some(release) = release else {
+            return Ok(());
+        };
+        task.linux.mark_pending_host_work();
+        let binding = open_table
+            .get(release.handle.checked_sub(1).unwrap_or(u32::MAX) as usize)
+            .and_then(DelegatedOpenFile::host_object);
+        if binding.is_some_and(|b| b.stdio_fd().is_some())
+            && !binding
+                .is_some_and(|b| frame.release_host_object(b, release.handle, release.incarnation))
+        {
+            return Err(FamilyCompletion::Complete(
+                carrick_syscall_abi::LINUX_EIO.guest_retval(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn duplicate_owned_ipc(
+        &mut self,
+        venue: &ipc::IpcVenue<'_>,
+        task: &CurrentTask,
+        table: carrick_el1_abi::ipc::fd::TableId,
+        file_table: u64,
+        old: carrick_el1_abi::ipc::fd::Fd,
+        target: NativeDupTarget,
+        cloexec: bool,
+        zone: Option<(&ZoneTables, SlotId)>,
+    ) -> Result<carrick_el1_abi::ipc::fd::Fd, FamilyCompletion> {
+        use super::file_table::HostBindingDupError;
+        use carrick_el1_abi::ipc::fd::Error;
+
+        let authority = venue.region.fd(NativeFdWait);
+        let (pin, _) = authority.pin(table, old).map_err(map_fd_error)?;
+        let reservation = match run_with_table_growth(&venue.region, table, |auth| match target {
+            NativeDupTarget::Lowest(min) => auth.reserve_min(table, min),
+            NativeDupTarget::FcntlMin(min) => auth.reserve_dup_min(table, min),
+            NativeDupTarget::Exact(fd) => auth.reserve_exact(table, fd),
+        }) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let release = authority
+                    .unpin_filtered(pin, ipc::is_zone_releasable_backing)
+                    .map_err(map_fd_error)?;
+                ipc::settle_native_release(&venue.region, release, zone, task)
+                    .map_err(map_ipc_error)?;
+                return Err(error);
+            }
+        };
+        let new_fd = reservation.fd();
+        let mut reservation = Some(reservation);
+        let projected = super::file_table::with_host_binding_dup(
+            self.fd_map,
+            self.open_table,
+            file_table,
+            old.0,
+            new_fd.0,
+            cloexec,
+            || {
+                let claim = reservation.take().ok_or(Error::InvalidArgument)?;
+                match authority.commit_reservation_filtered(
+                    claim,
+                    &pin,
+                    cloexec,
+                    ipc::is_zone_releasable_backing,
+                ) {
+                    Ok(release) => Ok(release),
+                    Err(refused) => {
+                        let error = refused.error();
+                        reservation = Some(refused.into_reservation());
+                        Err(error)
+                    }
+                }
+            },
+        );
+
+        let projected = match projected {
+            Ok(projected) => Ok(projected),
+            Err(HostBindingDupError::Full) => Err(map_fd_error(Error::TooManyFiles)),
+            Err(HostBindingDupError::Invalid) => Err(map_fd_error(Error::BadBacking)),
+            Err(HostBindingDupError::Mutation(error)) => Err(map_fd_error(error)),
+        };
+        if let Some(claim) = reservation {
+            authority
+                .cancel_reservation(claim)
+                .map_err(|refused| map_fd_error(refused.error()))?;
+        }
+        let pin_release = authority
+            .unpin_filtered(pin, ipc::is_zone_releasable_backing)
+            .map_err(map_fd_error)?;
+        ipc::settle_native_release(&venue.region, pin_release, zone, task)
+            .map_err(map_ipc_error)?;
+
+        let (release, delegated_release) = projected?;
+        ipc::settle_native_release(&venue.region, release, zone, task).map_err(map_ipc_error)?;
+        Self::settle_delegated_release(self.frame, self.open_table, task, delegated_release)?;
+        Ok(new_fd)
+    }
+
+    #[inline(never)]
+    fn serve_owned_ipc_descriptor(&mut self) -> FamilyCompletion {
+        use carrick_el1_abi::ipc::fd::{AccessMode, Fd, TableId};
+        let Some(venue) = self.ipc else {
             return FamilyCompletion::Forward;
         };
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
+            return FamilyCompletion::Forward;
+        };
+        let Some(raw) = venue.tables.owned_table_of(task) else {
+            return FamilyCompletion::Forward;
+        };
+        let table = TableId::from_raw(raw);
+        let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
+        let ordinal = self.frame.canonical_ordinal().raw();
+        let old = Fd(self.frame.argument(0).unwrap_or(0) as i32);
+        let zone = self
+            .zone
+            .as_ref()
+            .zip(self.frame.slot())
+            .map(|(z, slot)| (z.tables, slot));
+
+        match ordinal {
+            nr if nr == carrick_personality_linux::crossing::nr::DUP.raw() => {
+                let new_fd = match self.duplicate_owned_ipc(
+                    venue,
+                    task,
+                    table,
+                    file_table,
+                    old,
+                    NativeDupTarget::Lowest(Fd(0)),
+                    false,
+                    zone,
+                ) {
+                    Ok(fd) => fd,
+                    Err(done) => return done,
+                };
+                FamilyCompletion::Complete(i64::from(new_fd.0))
+            }
+            nr if nr == carrick_personality_linux::crossing::nr::DUP3.raw() => {
+                let new = Fd(self.frame.argument(1).unwrap_or(0) as i32);
+                let flags = self.frame.argument(2).unwrap_or(0);
+                if flags & !carrick_syscall_abi::LINUX_O_CLOEXEC != 0 || old == new {
+                    return FamilyCompletion::Complete(
+                        carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+                    );
+                }
+                let cloexec = flags != 0;
+                let new_fd = match self.duplicate_owned_ipc(
+                    venue,
+                    task,
+                    table,
+                    file_table,
+                    old,
+                    NativeDupTarget::Exact(new),
+                    cloexec,
+                    zone,
+                ) {
+                    Ok(fd) => fd,
+                    Err(done) => return done,
+                };
+                FamilyCompletion::Complete(i64::from(new_fd.0))
+            }
+            nr if nr == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2 => {
+                let new = Fd(self.frame.argument(1).unwrap_or(0) as i32);
+                if old == new {
+                    return match venue.region.fd(NativeFdWait).get(table, old) {
+                        Ok(_) => FamilyCompletion::Complete(i64::from(new.0)),
+                        Err(error) => map_fd_error(error),
+                    };
+                }
+                match self.duplicate_owned_ipc(
+                    venue,
+                    task,
+                    table,
+                    file_table,
+                    old,
+                    NativeDupTarget::Exact(new),
+                    false,
+                    zone,
+                ) {
+                    Ok(fd) => FamilyCompletion::Complete(i64::from(fd.0)),
+                    Err(done) => done,
+                }
+            }
+            nr if nr == carrick_personality_linux::crossing::nr::CLOSE.raw() => {
+                let released = match venue.region.fd(NativeFdWait).close_filtered(
+                    table,
+                    old,
+                    ipc::is_zone_releasable_backing,
+                ) {
+                    Ok(rel) => rel,
+                    Err(err) => return map_fd_error(err),
+                };
+                if let Err(err) = ipc::settle_native_release(&venue.region, released, zone, task) {
+                    return map_ipc_error(err);
+                }
+                let change = super::file_table::close_host_binding(
+                    self.fd_map,
+                    self.open_table,
+                    file_table,
+                    old.0,
+                );
+                if let Err(err) = Self::settle_delegated_release(
+                    self.frame,
+                    self.open_table,
+                    task,
+                    change.and_then(|c| c.release),
+                ) {
+                    return err;
+                }
+                FamilyCompletion::Complete(0)
+            }
+            nr if nr == carrick_personality_linux::crossing::nr::FCNTL.raw() => {
+                let cmd = self.frame.argument(1).unwrap_or(u64::MAX);
+                let arg = self.frame.argument(2).unwrap_or(0);
+                match cmd {
+                    carrick_abi::LINUX_F_DUPFD | carrick_abi::LINUX_F_DUPFD_CLOEXEC => {
+                        let cloexec = cmd == carrick_abi::LINUX_F_DUPFD_CLOEXEC;
+                        let min = Fd(arg as i32);
+                        let new_fd = match self.duplicate_owned_ipc(
+                            venue,
+                            task,
+                            table,
+                            file_table,
+                            old,
+                            NativeDupTarget::FcntlMin(min),
+                            cloexec,
+                            zone,
+                        ) {
+                            Ok(fd) => fd,
+                            Err(done) => return done,
+                        };
+                        FamilyCompletion::Complete(i64::from(new_fd.0))
+                    }
+                    carrick_abi::LINUX_F_GETFD => {
+                        match venue.region.fd(NativeFdWait).getfd(table, old) {
+                            Ok(cloexec) => FamilyCompletion::Complete(
+                                i64::from(cloexec) * (carrick_abi::LINUX_FD_CLOEXEC as i64),
+                            ),
+                            Err(err) => map_fd_error(err),
+                        }
+                    }
+                    carrick_abi::LINUX_F_SETFD => {
+                        let cloexec = arg & carrick_abi::LINUX_FD_CLOEXEC != 0;
+                        if let Err(err) = venue.region.fd(NativeFdWait).setfd(table, old, cloexec) {
+                            return map_fd_error(err);
+                        }
+                        if let Some((_, index)) = fd_map_lookup(self.fd_map, file_table, old.0) {
+                            if cloexec {
+                                self.fd_map[index].fd_flags.fetch_or(
+                                    super::file_table::GUEST_FD_CLOEXEC,
+                                    Ordering::Release,
+                                );
+                            } else {
+                                self.fd_map[index].fd_flags.fetch_and(
+                                    !super::file_table::GUEST_FD_CLOEXEC,
+                                    Ordering::Release,
+                                );
+                            }
+                        }
+                        FamilyCompletion::Complete(0)
+                    }
+                    carrick_abi::LINUX_F_GETFL => {
+                        match venue.region.fd(NativeFdWait).getfl(table, old) {
+                            Ok((access, flags)) => {
+                                let acc = match access {
+                                    AccessMode::ReadOnly => carrick_abi::LINUX_O_RDONLY,
+                                    AccessMode::WriteOnly => carrick_abi::LINUX_O_WRONLY,
+                                    AccessMode::ReadWrite => carrick_abi::LINUX_O_RDWR,
+                                    AccessMode::Path => carrick_abi::LINUX_O_PATH,
+                                };
+                                let out = acc
+                                    | (u64::from(flags.append) * carrick_abi::LINUX_O_APPEND)
+                                    | (u64::from(flags.nonblock) * carrick_abi::LINUX_O_NONBLOCK)
+                                    | (u64::from(flags.asynchronous) * carrick_abi::LINUX_O_ASYNC)
+                                    | flags.immutable;
+                                FamilyCompletion::Complete(out as i64)
+                            }
+                            Err(err) => map_fd_error(err),
+                        }
+                    }
+                    carrick_abi::LINUX_F_SETFL => {
+                        let (_, mut flags) = match venue.region.fd(NativeFdWait).getfl(table, old) {
+                            Ok(pair) => pair,
+                            Err(err) => return map_fd_error(err),
+                        };
+                        flags.append = arg & carrick_abi::LINUX_O_APPEND != 0;
+                        flags.nonblock = arg & carrick_abi::LINUX_O_NONBLOCK != 0;
+                        flags.asynchronous = arg & carrick_abi::LINUX_O_ASYNC != 0;
+                        if let Err(err) = venue.region.fd(NativeFdWait).setfl(table, old, flags) {
+                            return map_fd_error(err);
+                        }
+                        if let Some((handle, index)) = fd_map_lookup(self.fd_map, file_table, old.0)
+                            && handle > 0
+                            && handle & carrick_el1_abi::FD_HANDLE_INOTIFY_TAG == 0
+                            && self.fd_map[index].fd_flags.load(Ordering::Acquire)
+                                & FdMapSlot::HOST_VIEW
+                                == 0
+                            && let Some(open) = self.open_table.get((handle - 1) as usize)
+                        {
+                            if flags.append {
+                                open.flags.fetch_or(
+                                    carrick_el1_abi::DELEGATED_FLAG_APPEND,
+                                    Ordering::Release,
+                                );
+                            } else {
+                                open.flags.fetch_and(
+                                    !carrick_el1_abi::DELEGATED_FLAG_APPEND,
+                                    Ordering::Release,
+                                );
+                            }
+                        }
+                        FamilyCompletion::Complete(0)
+                    }
+                    _ => FamilyCompletion::Forward,
+                }
+            }
+            _ => FamilyCompletion::Forward,
+        }
+    }
+
+    fn ipc_transfer(&mut self) -> FamilyCompletion {
+        let Some(venue) = self.ipc else {
+            return FamilyCompletion::Forward;
+        };
+        let native_sigpipe = self.process.is_some();
         let Some(frame) = self.frame.arm_frame() else {
             self.frame.record_isa_unsupported_forward();
             return FamilyCompletion::Forward;
@@ -2043,11 +2474,16 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 task,
                 validator: &file::HardwareValidator,
             };
-            let disposition = ipc::serve_ipc(&mut sched, frame, venue, &mut user);
+            let (disposition, sigpipe_owed) =
+                ipc::serve_ipc_with_sigpipe(&mut sched, frame, venue, &mut user, native_sigpipe);
+            let result = frame.x[0] as i64;
+            if sigpipe_owed {
+                raise_native_sigpipe(self.process.as_deref_mut());
+            }
             return carrick_personality_linux::dispatch::transfer_effect(
                 &task.linux,
                 orig_x0,
-                frame.x[0] as i64,
+                result,
                 disposition,
             );
         }
