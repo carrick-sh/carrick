@@ -1380,16 +1380,15 @@ where
         let command_line = proc_argv.join(" ");
         let proc_env = env.clone();
         let requires_syscall_traps = kernel.dispatcher.requires_syscall_traps();
-        let loaded = match kernel.dispatcher.with_kernel_resources(kernel_context, || {
-            load_execve_image(
-                &kernel.dispatcher,
-                kernel_context,
-                &path,
-                argv,
-                env,
-                requires_syscall_traps,
-            )
-        }) {
+        let files = kernel.dispatcher.capture_exec_files(kernel_context);
+        let loaded = match load_execve_image(
+            &kernel.dispatcher,
+            &files,
+            &path,
+            argv,
+            env,
+            requires_syscall_traps,
+        ) {
             Ok(image) => image,
             Err(errno) => {
                 return self
