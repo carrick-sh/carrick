@@ -95,3 +95,118 @@ the larger of queue notification and wake delivery. Optional helpers may inline
 in one image feature closure and remain emitted in another; both forms are
 charged. Synthetic cumulative-overflow tests reject both FD paths even when
 every individual frame remains below its separate ceiling.
+
+## Headroom measurement for the #740 stack (2026-10-24)
+
+On ctb-w4, with the pinned Rust 1.96.0 toolchain and the slice 3b base,
+**both** the ordinary and `allocator-test-control` images measured 11,343
+checked bytes. The task brief's 12,175-byte observation did not reproduce
+on this host. Both builds used `env -u RUSTC_WRAPPER CARRICK_SCCACHE=0`.
+The 12,288-byte envelope ceiling and 3,072-byte individual ceiling are unchanged.
+
+These are the five largest baseline envelopes, identical in both images:
+
+| Envelope | Checked bytes |
+|---|---:|
+| signal terminal exit | 11343 |
+| native backing reply | 10975 |
+| native wait copy | 10879 |
+| native fork descriptors | 10573 |
+| signal delivery copy | 9951 |
+
+The table below expands **every nonzero frame** charged by those five
+compositions. Columns give the multiplicity (a dash means absent). `T` is
+terminal exit, `B` backing reply, `W` wait copy, `F` fork descriptors and `S`
+signal delivery copy. Sizes include the checker's worst-case alignment slack;
+LLVM hashes and generic parameters are omitted from symbol names. This is
+an expansion of `frame_budget.rs`'s conservative sums/maxima, including
+indirect calls and exclusive-branch maxima, rather than an observed backtrace.
+
+| Frame | Bytes | T | B | W | F | S |
+|---|---:|---:|---:|---:|---:|---:|
+| `vector record` | 288 | 1 | 1 | 1 | 1 | 1 |
+| `carrick_el1_syscall` | 112 | 1 | 1 | 1 | 1 | 1 |
+| `dispatch_entry` | 96 | 1 | 1 | 1 | 1 | 1 |
+| `dispatch_syscall` | 560 | 1 | — | — | 1 | 1 |
+| `with_process_entry` | 511 | 1 | — | — | 1 | 1 |
+| `deliver_on_user_return` | 608 | 1 | — | — | — | 1 |
+| `deliver_signal_on_syscall_return` | 608 | 2 | — | — | — | 2 |
+| `force_delivery_fault` | 208 | 1 | — | — | — | 1 |
+| `exit_with_status` | 1424 | 1 | — | — | — | — |
+| `publish_exit` | 1296 | 1 | — | — | — | — |
+| `finish_exit` | 1744 | 1 | — | — | — | — |
+| `publish_exit_receipt` | 704 | 1 | — | — | — | — |
+| `BTreeMap::insert_recursing` | 1440 | 1 | — | — | — | — |
+| `deallocate` | 144 | 1 | 1 | — | 1 | — |
+| `service_mailbox` | 160 | 1 | 1 | — | 1 | — |
+| `ObjectWaitGuard::drop` | 336 | 1 | 1 | 1 | 1 | 1 |
+| `place_in_guest` | 208 | 1 | 1 | 1 | 1 | 1 |
+| `find_idle_except` | 64 | 1 | 1 | 1 | 1 | 1 |
+| `accepts` | 64 | 1 | 1 | 1 | 1 | 1 |
+| `running_raw` | 16 | 1 | 1 | 1 | 1 | 1 |
+| `panic_bounds_check` | 64 | 1 | 1 | 1 | 1 | 1 |
+| `panic_fmt` | 64 | 1 | 1 | 1 | 1 | 1 |
+| `rust_begin_unwind` | 16 | 1 | 1 | 1 | 1 | 1 |
+| `interrupt` | 160 | — | 1 | 1 | — | — |
+| `preempt_record` | 128 | — | 1 | 1 | — | — |
+| `idle` | 256 | — | 1 | 1 | — | — |
+| `load` | 208 | — | 1 | 1 | — | — |
+| `resume_production` | 319 | — | 1 | 1 | — | — |
+| `resume_selected` | 192 | — | 1 | 1 | — | — |
+| `resume_checkpoint` | 512 | — | 1 | 1 | — | — |
+| `resume_pending_lifecycle` | 928 | — | 1 | 1 | — | — |
+| `park_owner_wait` | 384 | — | 1 | — | — | — |
+| `finish_owner_wait` | 560 | — | 1 | — | — | — |
+| `finish_service` | 528 | — | 1 | — | — | — |
+| `apply_fault_reply` | 864 | — | 1 | — | — | — |
+| `apply_grant` | 1312 | — | 1 | — | — | — |
+| `execute_descriptor_txn` | 592 | — | 1 | — | 1 | — |
+| `visit_live_table` | 144 | — | 4 | — | 4 | — |
+| `visit_entry` | 128 | — | 4 | — | 4 | — |
+| `descend` | 272 | — | 4 | — | 4 | — |
+| `store` | 128 | — | 1 | — | 1 | — |
+| `unlink` | 96 | — | 1 | — | 1 | — |
+| `wait_query` | 1520 | — | — | 1 | — | — |
+| `copy_with` | 96 | — | — | 1 | — | — |
+| `copy_signal_bytes` | 416 | — | — | 1 | — | 1 |
+| `write_user_bytes` | 2240 | — | — | 1 | — | 1 |
+| `authorize` | 688 | — | — | 1 | — | 1 |
+| `root_for` | 480 | — | — | 1 | — | 1 |
+| `root_any` | 576 | — | — | 1 | — | 1 |
+| `lock_using` | 352 | — | — | 1 | — | 1 |
+| `Reservations::drop_in_place` | 80 | — | — | 1 | — | 1 |
+| `SpaceNotificationLease::release_retiring_resource` | 80 | — | — | 1 | — | 1 |
+| `SpaceNotificationLease::release_resource` | 320 | — | — | 1 | — | 1 |
+| `fork_owned` | 703 | — | — | — | 1 | — |
+| `prepare_mm` | 2879 | — | — | — | 1 | — |
+| `prepare_fork` | 1296 | — | — | — | 1 | — |
+| `setup_arm_signal_frame` | 288 | — | — | — | — | 1 |
+
+`GuestReservedExit::begin` now keeps the pending topology, reservation and
+member/resource effects in one box through `finish_exit`. Its rollback owner
+and drop behavior are unchanged. `GuestPendingExit::publish` returns the
+published record in its existing box directly, eliminating the aggregate return
+buffer in `finish_exit`. There is one additional fixed-size allocation per
+pending exit; the published-result allocation already existed. No new unsafe
+code, Linux behavior, stack layout or chain accounting is introduced.
+
+| Measurement | Before (both images) | After (both images) |
+|---|---:|---:|
+| Maximum checked envelope | 11,343 | 10,975 |
+| Signal terminal exit | 11,343 | 10,959 |
+| `publish_exit` frame | 1,296 | 1,040 |
+| `finish_exit` frame | 1,744 | 1,616 |
+
+The deepest remaining standalone envelope is native backing reply. The macOS
+cross-check reports 10,975 in one image closure and 11,263 in its broader
+closures. Linux clippy feature closures produce different compiled frames and
+reach 11,311 bytes. These results are distinct from the two standalone
+measurements above and still pass 12,288.
+
+A tighter limit is mechanically possible by replacing `stack_size * 3 / 4`
+in `Frames::check` with a lower ceiling. An 11 KiB ceiling (11,264 bytes)
+leaves 289 bytes above the standalone maximum but would reject the Linux
+clippy feature closures; those need further headroom first. This is a proposal
+for the director, not a budget change. The ARM gate still does not prove CPL0
+chain depth or guard pages; shared ownership changes compile for CPL0 through
+`clippy-linux`.

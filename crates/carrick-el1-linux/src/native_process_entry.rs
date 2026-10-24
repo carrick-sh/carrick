@@ -254,9 +254,9 @@ pub fn publish_exit<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestPr
 
 #[inline(never)]
 fn finish_exit<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>(
-    pending: GuestPendingExit<'_, C, U, N, F>,
+    pending: Box<GuestPendingExit<'_, C, U, N, F>>,
 ) -> ExitPublicationResult<N> {
-    let mut published = Box::new(pending.publish()?);
+    let mut published = pending.publish()?;
     let resources = published.take_resources();
     Ok((resources, published))
 }
