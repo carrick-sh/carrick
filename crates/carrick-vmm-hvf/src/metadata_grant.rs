@@ -160,11 +160,11 @@ fn service_terminal_operation(
                 return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
             };
             let mut stock = custody.fork_stock.lock();
-            let mut ledger = custody.el1_frame_grants.lock();
+            let mut ledger = crate::fork_stock::fork_table_accounting(custody);
             return match reclaim_fork_stock(
                 custody,
                 &mut stock,
-                &mut *ledger,
+                &mut ledger,
                 region,
                 cpu,
                 execution,
@@ -1505,20 +1505,13 @@ pub(crate) fn service_native_fork_stock(
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
             let mut stock = custody.fork_stock.lock();
-            let mut ledger = custody.el1_frame_grants.lock();
+            let mut ledger = crate::fork_stock::fork_table_accounting(custody);
             let Some(active) = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())
             else {
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
-            if reclaim_fork_stock(
-                custody,
-                &mut stock,
-                &mut *ledger,
-                region,
-                cpu,
-                active.into(),
-            )
-            .is_err()
+            if reclaim_fork_stock(custody, &mut stock, &mut ledger, region, cpu, active.into())
+                .is_err()
             {
                 exchange.refuse(ForkStockRefusal::Inventory);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
@@ -1527,7 +1520,7 @@ pub(crate) fn service_native_fork_stock(
                 exchange.refuse(ForkStockRefusal::Capacity);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
-            let result = stock.loan(&mut *ledger, execution, exchange, |life| {
+            let result = stock.loan(&mut ledger, execution, exchange, |life| {
                 lifecycle_window(custody, life)
             });
             if let Err(refusal) = result {
@@ -1598,9 +1591,9 @@ pub(crate) fn service_native_fork_stock(
                 }
                 result.is_ok()
             } else {
-                let mut ledger = custody.el1_frame_grants.lock();
+                let mut ledger = crate::fork_stock::fork_table_accounting(custody);
                 match stock.owner.settle(
-                    &mut *ledger,
+                    &mut ledger,
                     execution,
                     settlement,
                     |pages| {
