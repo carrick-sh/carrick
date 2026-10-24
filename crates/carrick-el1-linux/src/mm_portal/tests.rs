@@ -315,7 +315,7 @@ fn owner_grant_rejects_recycled_range_after_host_reconciliation() {
     };
     let stale = ReservationFaultPlan {
         mm,
-        generation: window.generation,
+        mapping_incarnation: window.mapping_incarnation,
         range: window.range,
         protection: window.protection,
         fault_page: window.fault_page,
@@ -976,12 +976,12 @@ fn untouched_transfer_window(prefix: bool) {
     let slot = carrick_el1_abi::PortalGrantSlot::new();
     // Selection released its exclusion before host supply. Every changed
     // determinant must refuse without publishing even one descriptor.
-    let bad_generation =
-        carrick_el1_abi::ReservationGeneration::new(window.generation.raw() + 1).unwrap();
+    let bad_incarnation =
+        carrick_el1_abi::ReservationIncarnation::new(window.mapping_incarnation.raw() + 1).unwrap();
     let bad_source = carrick_el1_abi::HostBackingIdentity::new(nz(17), nz(3), 0);
     for stale in [
         carrick_el1_abi::PortalGrantWindow {
-            generation: bad_generation,
+            mapping_incarnation: bad_incarnation,
             ..window
         },
         carrick_el1_abi::PortalGrantWindow {
@@ -1367,7 +1367,7 @@ fn untouched_private_file_selects_only_owner_retained_source() {
         .unwrap();
     let plan = carrick_el1::memory::reservations::ReservationFaultPlan {
         mm,
-        generation: window.generation,
+        mapping_incarnation: window.mapping_incarnation,
         range: window.range,
         protection: window.protection,
         fault_page: window.fault_page,
@@ -4196,7 +4196,7 @@ fn grant_gate_closed_after_selection_preserves_exact_owner_wait() {
 }
 
 #[test]
-fn grant_resume_reselects_generation_range_protection_and_source_changed_while_parked() {
+fn grant_resume_reselects_mapping_range_protection_and_source_changed_while_parked() {
     use carrick_el1::memory::reservations::{Decision, Placement};
     for change in ["generation", "range", "protection", "source"] {
         let region = Region::new();
@@ -4309,7 +4309,10 @@ fn grant_resume_reselects_generation_range_protection_and_source_changed_while_p
             let Ok(TransferStep::Supply(fresh)) = current else {
                 panic!("{change}: {current:?}");
             };
-            assert_ne!(fresh.generation, window.generation, "{change}");
+            assert_ne!(
+                fresh.mapping_incarnation, window.mapping_incarnation,
+                "{change}"
+            );
             assert_eq!(fresh.operation.incarnation, window.operation.incarnation);
             assert_eq!(fresh.host_backing, (change == "source").then_some(source));
         }

@@ -602,6 +602,7 @@ mod tests {
             assert!(model.work < 64);
         }
         let mut guest = table.lock_identity_for_test(0, a).unwrap();
+        let old_generation = guest.generation();
         let old = guest
             .fault_plan(0x100000, 4096, ReservationProtection::READ_WRITE)
             .unwrap();
@@ -615,7 +616,7 @@ mod tests {
             panic!()
         };
         guest.refuse(request).unwrap();
-        assert_eq!(guest.generation(), old.generation);
+        assert_eq!(guest.generation(), old_generation);
         let decision = guest.mprotect(request.range, request.protection).unwrap();
         finish(&mut guest, decision);
         let committed_generation = guest.generation();
@@ -636,7 +637,7 @@ mod tests {
             second.mapping(0x100000).unwrap().protection,
             ReservationProtection::READ_WRITE
         );
-        assert_eq!(second.generation(), old.generation);
+        assert_eq!(second.generation(), old_generation);
     }
 
     #[test]

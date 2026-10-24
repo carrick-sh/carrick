@@ -189,7 +189,7 @@ fn authenticate_target<
     let authenticated = root.authenticate_fork_transfer_fault(
         ReservationFaultPlan {
             mm: window.operation.mm,
-            generation: window.generation,
+            mapping_incarnation: window.mapping_incarnation,
             range: window.range,
             protection: window.protection,
             fault_page: window.fault_page,

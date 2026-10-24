@@ -1,11 +1,11 @@
 //! Exact lazy-window selection record, independent of hardware transport.
-use crate::{PortalOperation, ReservationGeneration, ReservationProtection, ReservationRange};
+use crate::{PortalOperation, ReservationIncarnation, ReservationProtection, ReservationRange};
 use core::num::NonZeroU64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortalGrantWindow {
     pub operation: PortalOperation,
-    pub generation: ReservationGeneration,
+    pub mapping_incarnation: ReservationIncarnation,
     pub range: ReservationRange,
     pub protection: ReservationProtection,
     pub fault_page: u64,
@@ -28,7 +28,7 @@ impl PortalGrantWindow {
             self.operation.mm.raw(),
             self.operation.incarnation.get(),
             self.operation.sequence.get(),
-            self.generation.raw(),
+            self.mapping_incarnation.raw(),
             self.range.start(),
             self.range.end(),
             self.protection.bits(),
@@ -48,7 +48,7 @@ impl PortalGrantWindow {
                 incarnation: NonZeroU64::new(w[2])?,
                 sequence: NonZeroU64::new(w[3])?,
             },
-            generation: ReservationGeneration::new(w[4])?,
+            mapping_incarnation: ReservationIncarnation::new(w[4])?,
             range: ReservationRange::new(w[5], w[6])?,
             protection: ReservationProtection::from_bits(w[7])?,
             fault_page: w[8],

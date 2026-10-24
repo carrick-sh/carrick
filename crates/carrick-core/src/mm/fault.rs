@@ -1,4 +1,4 @@
-//! Shared lazy-supply generations and exact reservation fault admission.
+//! Shared lazy-supply identities and exact reservation fault admission.
 use carrick_core_abi::{
     EL1_FRAME_GRANT_TARGET_SIZE, FrameGrantMailbox, FrameGrantRequest, ReservationIncarnation,
     ReservationMm,
@@ -160,7 +160,7 @@ pub fn select_fault_window<
             incarnation: NonZeroU64::new(root.incarnation().raw()).ok_or(Refusal::Stale)?,
             sequence,
         },
-        generation: plan.generation,
+        mapping_incarnation: plan.mapping_incarnation,
         range: plan.range,
         protection: plan.protection,
         fault_page: plan.fault_page,
@@ -189,7 +189,7 @@ pub fn select_cow_supply_window<
     if root.fork_pending() && !root.fork_write_authorized(fork_sequence) {
         return Err(MmError::Busy);
     }
-    let mapping = root.mapping(va.raw()).ok_or(MmError::Fault)?;
+    let (mapping, mapping_incarnation) = root.node(va.raw()).ok_or(MmError::Fault)?;
     if !mapping
         .protection
         .permits(carrick_core_abi::ReservationProtection::READ_WRITE)
@@ -199,7 +199,7 @@ pub fn select_cow_supply_window<
     let page = va.raw() & !4095;
     Ok(carrick_core_abi::PortalGrantWindow {
         operation,
-        generation: mapping.generation,
+        mapping_incarnation,
         range: carrick_core_abi::ReservationRange::new(
             page,
             page.checked_add(4096).ok_or(MmError::Invalid)?,
