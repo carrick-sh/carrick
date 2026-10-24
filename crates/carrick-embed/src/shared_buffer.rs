@@ -836,38 +836,33 @@ mod tests {
         let wait_res = lease.futex_wait(0, 0, Some(Duration::from_secs(2)));
         assert!(wait_res.is_ok());
 
-        // Prove the other order with an owned enrollment in the same real
-        // shared table. The continuation subscription exposes admission
-        // directly, without guessing when a blocking waiter has parked.
-        use carrick_thread::thread::FutexGenerationEnrollment;
+        // Observe the enrollment made by the real blocking lease call.
+        // A subscription would create a separate waiter and miss a wrong
+        // table/key in futex_wait itself.
         let location = lease.shared_futex_location(0).unwrap();
         let key = carrick_thread::platform_futex::carrier_shared_futex_key(location);
         let table = lease.shared_futex.table();
-        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
-        let subscription = match table.subscribe_generation(
-            table.prepare_wait(key),
-            Arc::new(move |event| {
-                let _ = wake_tx.send(event);
-            }),
-        ) {
-            FutexGenerationEnrollment::Subscribed(subscription) => subscription,
-            FutexGenerationEnrollment::Ready(_) => panic!("waiter must enroll before wake"),
-        };
+        let (enrolled_tx, enrolled_rx) = std::sync::mpsc::channel();
+        table.observe_word_wait_enrollment_for_test(enrolled_tx);
         let lease_clone = lease.clone();
         let (completed_tx, completed_rx) = std::sync::mpsc::channel();
         let handle = thread::spawn(move || {
-            let _ = completed_tx.send(lease_clone.futex_wake(0, 1));
+            let result = lease_clone.futex_wait(0, 42, Some(Duration::from_secs(2)));
+            let _ = completed_tx.send(result);
         });
-        wake_rx
+        let enrolled_key = enrolled_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("enrolled shared-buffer waiter must receive the wake");
-        let woken = completed_rx
+            .expect("blocking shared-buffer futex_wait must enroll on its shared table");
+        assert_eq!(
+            enrolled_key, key,
+            "blocking wait must enroll on the wake key"
+        );
+        assert_eq!(lease.futex_wake(0, 1).expect("enrolled futex wake"), 1);
+        completed_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("enrolled futex wake must complete")
-            .expect("enrolled futex wake");
-        assert_eq!(woken, 1);
-        handle.join().expect("waker completed");
-        drop(subscription);
+            .expect("enrolled blocking futex_wait must complete after wake")
+            .expect("enrolled blocking futex_wait must be woken, not time out");
+        handle.join().expect("blocking waiter completed");
 
         // Timeout test: wait for value 42 (which it is) with small timeout
         let to_res = lease.futex_wait(0, 42, Some(Duration::from_millis(10)));
