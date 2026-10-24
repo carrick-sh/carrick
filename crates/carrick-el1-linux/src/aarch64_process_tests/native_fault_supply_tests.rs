@@ -522,14 +522,17 @@ fn composed_native_supply(competing_publication: bool) {
         .unwrap();
     let mut physical_grants =
         carrick_hal::physical_grants::NativePhysicalGrants::new(physical_owner);
-    for gpa in [0xa0000000, 0xa0004000] {
+    // Carrier allocation generations already advanced before the first child
+    // fault. They must not become the fresh inventory mapping's generation.
+    for (gpa, physical_generation) in [(0xa0000000, 5), (0xa0004000, 6)] {
+        let physical_generation = NonZeroU64::new(physical_generation).unwrap();
         let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
             std::sync::Arc::default(),
             physical.clone(),
             [FrameGpa::new(gpa)],
             0,
             16384,
-            NonZeroU64::MIN,
+            physical_generation,
             physical_owner,
             carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
         )
@@ -540,7 +543,7 @@ fn composed_native_supply(competing_publication: bool) {
             .unwrap()
             .lock()
             .unwrap()
-            .backing(&staged, 16384);
+            .backing(&staged, 16384, physical_generation);
         physical_grants
             .publish_cow(staged, retained, pool, exclusion.proof())
             .unwrap();
@@ -557,6 +560,7 @@ fn composed_native_supply(competing_publication: bool) {
             row.permissions.exec,
             "COW backing must permit later execution"
         );
+        assert_eq!(row.generation.raw(), 1, "fresh inventory publication");
     }
     let child_physical_root =
         RootGpa::page_aligned(FrameGpa::new(child_root & AARCH64_ROOT_ADDRESS_MASK)).unwrap();
@@ -794,13 +798,13 @@ fn composed_native_supply(competing_publication: bool) {
         [FrameGpa::new(0xa0020000)],
         0,
         16384,
-        NonZeroU64::MIN,
+        NonZeroU64::new(7).unwrap(),
         physical_owner,
     )
     .unwrap();
     let rows = {
         let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
-        let retained = stock.backing(&staged, 16384);
+        let retained = stock.backing(&staged, 16384, NonZeroU64::new(7).unwrap());
         stock
             .owner
             .child_physical_mut(handle.mm(), child_physical_root)
