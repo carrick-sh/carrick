@@ -946,6 +946,80 @@ impl UnpublishedExecAddressSpace {
     pub fn mm(&self) -> MmId {
         self.0.mm
     }
+
+    /// Import the prepared image's reservation facts into this closed MM.
+    /// The caller retains physical backing separately; this does not install
+    /// mappings or grant an execution lane permission to adopt the successor.
+    pub fn import_image(
+        self,
+        layout: carrick_personality_linux::mm::LinuxReservationLayout,
+        rows: impl IntoIterator<Item = carrick_core::mm::reservation::ImportedMapping>,
+    ) -> Result<PreparedExecAddressSpace, (carrick_el1::memory::reservations::Refusal, Self)> {
+        use carrick_el1::memory::reservations::{Refusal, RootReleaseVenue};
+        let import = || {
+            let backing = self.0.tables.backing.as_ref().ok_or(Refusal::Stale)?;
+            let region = backing.region().ok_or(Refusal::Stale)?;
+            let mm = carrick_el1_abi::ReservationMm::new(self.0.mm.raw()).ok_or(Refusal::Stale)?;
+            let seal = |model: &mut carrick_el1::memory::reservations::Reservations<'_>| {
+                if model.mm() != mm {
+                    return Err(Refusal::Stale);
+                }
+                model.import_image(layout, rows, |_| {
+                    Ok((layout.external_address_bytes, layout.external_data_bytes))
+                })?;
+                let incarnation =
+                    std::num::NonZeroU64::new(model.incarnation().raw()).ok_or(Refusal::Stale)?;
+                // SAFETY: this publication retains the exact closed root,
+                // successfully admitted by the shared import above.
+                Ok(unsafe {
+                    carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                        region.carrier,
+                        mm,
+                        incarnation,
+                    )
+                })
+            };
+            match &self.0.reservation_provider {
+                Some(provider) => {
+                    let view = provider.prepare()?;
+                    seal(&mut view.lock(mm)?)
+                }
+                None => {
+                    let venue = RootReleaseVenue::new(
+                        region.reservations,
+                        self.0.tables.release_venue().ok_or(Refusal::Stale)?,
+                    )?;
+                    seal(&mut venue.lock(
+                        self.0.index.index(),
+                        mm,
+                        &carrick_el1::memory::reservations::NoRootWait,
+                    )?)
+                }
+            }
+        };
+        match import() {
+            Ok(handle) => Ok(PreparedExecAddressSpace {
+                publication: self,
+                handle,
+            }),
+            Err(error) => Err((error, self)),
+        }
+    }
+}
+
+/// Imported reservation authority, still closed and unpublished to execution.
+/// Only a future consuming process-owner exec proof may open this successor.
+pub struct PreparedExecAddressSpace {
+    publication: UnpublishedExecAddressSpace,
+    handle: carrick_el1_abi::El1MmHandle,
+}
+impl PreparedExecAddressSpace {
+    pub fn handle(&self) -> carrick_el1_abi::El1MmHandle {
+        self.handle
+    }
+    pub fn mm(&self) -> MmId {
+        self.publication.mm()
+    }
 }
 
 /// A fork root exists for owner construction but is not installable by EL1.
