@@ -1,6 +1,8 @@
 //! Backing custody for a ring-owned request; no host task or process adoption.
 use super::*;
-use carrick_core_abi::service::{ServiceCell, ServiceError, ServiceRequest, ServiceTicket};
+use carrick_core_abi::service::{
+    ServiceCell, ServiceError, ServiceRequest, ServiceSelector, ServiceTicket,
+};
 use carrick_sched_core::object_wait::ObjectWaitKey;
 use core::ops::Deref;
 
@@ -465,6 +467,24 @@ fn stale() -> TrapError {
     TrapError::Hypervisor("native service custody mismatch".into())
 }
 
+/// Once the lane notice is consumed, absence is no longer a valid intake
+/// result: the ring member remains parked until this host owner completes it.
+struct ConsumedServiceNotice(ServiceSelector);
+impl ConsumedServiceNotice {
+    fn selector(&self) -> ServiceSelector {
+        self.0
+    }
+
+    fn miss<T>(&self, reason: &'static str) -> Result<T, TrapError> {
+        Err(TrapError::Hypervisor(format!(
+            "native service intake failed after consuming record {}:{} sequence {}: {reason}",
+            self.0.record.id.raw(),
+            self.0.record.incarnation,
+            self.0.sequence,
+        )))
+    }
+}
+
 pub(super) fn take(
     custody: &Arc<crate::trap::CarrierVmCustody>,
     cpu: carrick_guest_arch::CpuId,
@@ -474,107 +494,185 @@ pub(super) fn take(
     let Some(selector) = task.service_notice.take().map_err(|_| stale())? else {
         return Ok(None);
     };
-    let Some(key) = ObjectWaitKey::native_service(selector.record) else {
-        return Ok(None);
-    };
-    let Ok(queue) = zone.object_wait(key, &carrick_sched_core::ShortLockSpin) else {
-        return Ok(None);
-    };
-    let Some(identity) = queue.native_service_member(selector.record) else {
-        return Ok(None);
-    };
-    if identity.generation != selector.execution.raw() {
-        return Ok(None);
-    }
-    let Some(generation) = custody.live_generation() else {
-        return Err(stale());
-    };
-    let address = carrick_guest_arch::KernelVa::new(identity.control_slot);
-    let Some((_, base, len)) = retained_dynamic_metadata(
-        custody,
-        address,
-        core::mem::size_of::<carrick_el1_abi::ThreadControlSlot>(),
-    ) else {
-        return Ok(None);
-    };
-    let offset = identity.control_slot.checked_sub(base).ok_or_else(stale)? as usize;
-    if offset
-        .checked_add(core::mem::size_of::<carrick_el1_abi::ThreadControlSlot>())
-        .is_none_or(|end| end > len)
-    {
-        return Err(stale());
-    }
-    let pin = {
-        let aperture = metadata_aperture(custody).lock();
-        let index =
-            ((base - EL1_DYNAMIC_METADATA_BASE) / EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64) as usize;
-        let Some(mapping) = aperture.slots.get(index).and_then(Option::as_ref) else {
-            return Ok(None);
+    let consumed = ConsumedServiceNotice(selector);
+    let service = (|| {
+        let selector = consumed.selector();
+        let Some(key) = ObjectWaitKey::native_service(selector.record) else {
+            return consumed.miss("invalid native-service wait key");
         };
-        let extent = MetadataExtent::new(base, len as u64, mapping.token).ok_or_else(stale)?;
-        aperture
-            .pin_extent(extent, generation.0)
-            .map_err(|_| stale())?
-    };
-    // SAFETY: checked whole control range inside the pinned metadata extent.
-    let control = unsafe {
-        pin.host_base()
-            .as_ptr()
-            .add(offset)
-            .cast::<carrick_el1_abi::ThreadControlSlot>()
-    };
-    if !control
-        .addr()
-        .is_multiple_of(core::mem::align_of::<carrick_el1_abi::ThreadControlSlot>())
-    {
-        return Err(stale());
-    }
-    // SAFETY: initialized control belongs to the exact live native record;
-    // the service queue serializes cancellation/consumption with this intake.
-    let control = unsafe { &*control };
-    if control.zone_record() != Some(selector.record) || !control.native_signal_owner() {
-        return Ok(None);
-    }
-    let pin = ServicePin {
-        cell: core::ptr::NonNull::from(&control.service),
-        _mapping: pin,
-        _carrier: Arc::clone(custody),
-    };
-    // SAFETY: exact record/control and native birth authenticated above. The
-    // ring's active service claim retains its admitted MM through ticket ACK.
-    let ticket =
-        unsafe { ServiceCell::claim_notice(pin, selector, custody.transfer_carrier, identity) };
-    match ticket {
-        Ok(mut ticket) => {
-            let portal = region
-                .record_ptr::<carrick_el1_abi::MmPortalSlots>(
-                    carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize,
-                )
-                .ok_or_else(stale)?;
-            // SAFETY: initialized portal in the retained carrier ABI region.
-            let portal = unsafe { &*portal };
-            let cow = ticket
-                .take_fault_selection(portal.grant(cpu.raw() as usize).ok_or_else(stale)?)
-                .map_err(|_| stale())?;
-            let (reply, reply_pin) = if let Some(address) = ticket.reply_address() {
-                let (pointer, pin) = retain_reply(custody, region, address)?;
-                (Some(pointer), pin)
-            } else {
-                (None, None)
-            };
-            Ok(Some(NativeService {
-                reply,
-                _reply_pin: reply_pin,
-                ticket,
-                cow,
-                custody: Arc::clone(custody),
-                slot: carrick_sched_core::SlotId::from_index(cpu.raw() as usize)
-                    .ok_or_else(stale)?,
-            }))
+        let Ok(queue) = zone.object_wait(key, &carrick_sched_core::ShortLockSpin) else {
+            return consumed.miss("native-service wait queue unavailable");
+        };
+        let Some(identity) = queue.native_service_member(selector.record) else {
+            return consumed.miss("native-service member absent");
+        };
+        if identity.generation != selector.execution.raw() {
+            return consumed.miss("native-service execution generation changed");
         }
-        // A stale selector cannot acknowledge or complete a successor.
-        Err(ServiceError::Stale) => Ok(None),
-        Err(_) => Err(stale()),
+        let Some(generation) = custody.live_generation() else {
+            return Err(stale());
+        };
+        let address = carrick_guest_arch::KernelVa::new(identity.control_slot);
+        let Some((_, base, len)) = retained_dynamic_metadata(
+            custody,
+            address,
+            core::mem::size_of::<carrick_el1_abi::ThreadControlSlot>(),
+        ) else {
+            return consumed.miss("native-service control metadata absent");
+        };
+        let offset = identity.control_slot.checked_sub(base).ok_or_else(stale)? as usize;
+        if offset
+            .checked_add(core::mem::size_of::<carrick_el1_abi::ThreadControlSlot>())
+            .is_none_or(|end| end > len)
+        {
+            return Err(stale());
+        }
+        let pin = {
+            let aperture = metadata_aperture(custody).lock();
+            let index = ((base - EL1_DYNAMIC_METADATA_BASE)
+                / EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64) as usize;
+            let Some(mapping) = aperture.slots.get(index).and_then(Option::as_ref) else {
+                return consumed.miss("native-service metadata aperture absent");
+            };
+            let extent = MetadataExtent::new(base, len as u64, mapping.token).ok_or_else(stale)?;
+            aperture
+                .pin_extent(extent, generation.0)
+                .map_err(|_| stale())?
+        };
+        // SAFETY: checked whole control range inside the pinned metadata extent.
+        let control = unsafe {
+            pin.host_base()
+                .as_ptr()
+                .add(offset)
+                .cast::<carrick_el1_abi::ThreadControlSlot>()
+        };
+        if !control
+            .addr()
+            .is_multiple_of(core::mem::align_of::<carrick_el1_abi::ThreadControlSlot>())
+        {
+            return Err(stale());
+        }
+        // SAFETY: initialized control belongs to the exact live native record;
+        // the service queue serializes cancellation/consumption with this intake.
+        let control = unsafe { &*control };
+        if control.zone_record() != Some(selector.record) || !control.native_signal_owner() {
+            return consumed.miss("native-service control owner changed");
+        }
+        let pin = ServicePin {
+            cell: core::ptr::NonNull::from(&control.service),
+            _mapping: pin,
+            _carrier: Arc::clone(custody),
+        };
+        // SAFETY: exact record/control and native birth authenticated above. The
+        // ring's active service claim retains its admitted MM through ticket ACK.
+        let ticket =
+            unsafe { ServiceCell::claim_notice(pin, selector, custody.transfer_carrier, identity) };
+        match ticket {
+            Ok(mut ticket) => {
+                let portal = region
+                    .record_ptr::<carrick_el1_abi::MmPortalSlots>(
+                        carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize,
+                    )
+                    .ok_or_else(stale)?;
+                // SAFETY: initialized portal in the retained carrier ABI region.
+                let portal = unsafe { &*portal };
+                let cow = ticket
+                    .take_fault_selection(portal.grant(cpu.raw() as usize).ok_or_else(stale)?)
+                    .map_err(|_| stale())?;
+                let (reply, reply_pin) = if let Some(address) = ticket.reply_address() {
+                    let (pointer, pin) = retain_reply(custody, region, address)?;
+                    (Some(pointer), pin)
+                } else {
+                    (None, None)
+                };
+                Ok(NativeService {
+                    reply,
+                    _reply_pin: reply_pin,
+                    ticket,
+                    cow,
+                    custody: Arc::clone(custody),
+                    slot: carrick_sched_core::SlotId::from_index(cpu.raw() as usize)
+                        .ok_or_else(stale)?,
+                })
+            }
+            // A stale selector cannot acknowledge or complete a successor.
+            Err(ServiceError::Stale) => consumed.miss("native-service cell rejected selector"),
+            Err(_) => Err(stale()),
+        }
+    })()?;
+    Ok(Some(service))
+}
+
+#[cfg(test)]
+mod intake_tests {
+    use super::*;
+    use carrick_core_abi::{EntryThreadGeneration, SnapshotGeneration};
+    use carrick_guest_arch::NativeOrdinal;
+    use carrick_sched_core::{
+        RecordId, RecordRef,
+        process::{TaskId, TaskKey, TaskSerial},
+    };
+    use core::num::{NonZeroI32, NonZeroU64};
+
+    fn birth() -> carrick_core_abi::service::ServiceBirth {
+        let generation = NonZeroU64::MIN;
+        carrick_core_abi::service::ServiceBirth {
+            process: TaskKey {
+                id: TaskId::from_registry_allocation(NonZeroI32::new(1).unwrap()),
+                serial: TaskSerial::from_registry_allocation(generation),
+            },
+            thread: EntryThreadGeneration::from_raw(generation.get()),
+            record: RecordRef {
+                id: RecordId::from_raw(1).unwrap(),
+                incarnation: generation.get(),
+            },
+            // SAFETY: this protocol-only fixture never authorizes memory access.
+            mm: unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    NonZeroU64::MIN,
+                    carrick_el1_abi::ReservationMm::new(1).unwrap(),
+                    generation,
+                )
+            },
+        }
+    }
+
+    #[test]
+    fn consumed_notice_intake_miss_is_loud_with_sigkill_pending() {
+        let cell = ServiceCell::new();
+        let birth = birth();
+        cell.bind(birth).unwrap();
+        let request = cell
+            .publish(
+                birth,
+                SnapshotGeneration::INITIAL,
+                carrick_core_abi::service::ServiceOperation::Crossing {
+                    ordinal: NativeOrdinal::new(1),
+                },
+                None,
+            )
+            .unwrap();
+        let notice = carrick_core_abi::service::ServiceNotice::new();
+        notice.publish(request.identity.into()).unwrap();
+        let consumed = ConsumedServiceNotice(notice.take().unwrap().unwrap());
+
+        assert_eq!(
+            cell.cancel(request.identity),
+            Ok(false),
+            "SIGKILL cancellation waits for the physical intake owner"
+        );
+        let intake: Result<(), TrapError> = consumed.miss("missing host intake member");
+        assert!(
+            intake.is_err(),
+            "a consumed notice cannot silently leave the parked member REQUESTED"
+        );
+
+        let ticket = cell.claim(request).unwrap();
+        assert!(ticket.complete(false).is_ok());
+        assert_eq!(
+            cell.consume(request.identity),
+            Ok(carrick_core_abi::service::ServiceResult::Cancelled)
+        );
     }
 }
 
