@@ -69,6 +69,8 @@ runner_sha256=70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613
 sccache_version=0.18.0
 sccache_sha256=45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
 rustup_sha256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
+gh_version=2.102.0
+gh_sha256=bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
 curl -fSL --retry 2 "$image_url" -o "$image"
 printf '%s  %s\n' "$image_sha512" "$image" | sha512sum -c -
 curl -fSL "https://github.com/actions/runner/releases/download/v${runner_version}/actions-runner-linux-x64-${runner_version}.tar.gz" -o seed/runner.tar.gz
@@ -77,12 +79,15 @@ curl -fSL "https://github.com/mozilla/sccache/releases/download/v${sccache_versi
 printf '%s  %s\n' "$sccache_sha256" seed/sccache.tar.gz | sha256sum -c -
 curl -fSL https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init -o seed/rustup-init
 printf '%s  %s\n' "$rustup_sha256" seed/rustup-init | sha256sum -c -
+curl -fSL "https://github.com/cli/cli/releases/download/v${gh_version}/gh_${gh_version}_linux_amd64.tar.gz" -o seed/gh.tar.gz
+printf '%s  %s\n' "$gh_sha256" seed/gh.tar.gz | sha256sum -c -
 cp "$xtask" seed/carrick-xtask
 cp "$inputs/rust-toolchain.toml" "$inputs/Cargo.lock" seed/
 cp "$inputs/scripts/ci/runner-once.sh" seed/
 cp "$inputs/scripts/ci/admit-job.sh" seed/
 cp "$inputs/scripts/ci/inputs/codex-sdk-requirements.txt" seed/
 printf '%s\n' "$profile" > seed/profile
+printf '%s\n' "$gh_version" > seed/gh-version
 cat > seed/meta-data <<DATA
 instance-id: carrick-template-${template}
 local-hostname: carrick-template-${template}
@@ -117,7 +122,7 @@ disable_root: true
 ssh_deletekeys: true
 ssh_genkeytypes: [ed25519, rsa]
 package_update: true
-packages: [sudo, build-essential, clang, git, gh, curl, jq, just, python3-venv, util-linux, procps, qemu-guest-agent, openssh-server, nftables, libicu76, libssl3t64, libkrb5-3, zlib1g]
+packages: [sudo, build-essential, clang, git, curl, jq, just, python3-venv, util-linux, procps, qemu-guest-agent, openssh-server, nftables, libicu76, libssl3t64, libkrb5-3, zlib1g]
 runcmd:
   - [bash, -c, 'mkdir -p /mnt/carrick-seed; mount -o ro /dev/disk/by-label/cidata /mnt/carrick-seed; bash /mnt/carrick-seed/provision.sh']
 DATA
@@ -152,6 +157,9 @@ tar xf runner.tar.gz -C /home/runner/actions-runner
 mkdir -p /tmp/sccache-extract
 tar xf sccache.tar.gz -C /tmp/sccache-extract
 install -m 755 /tmp/sccache-extract/sccache-*/sccache /usr/local/bin/sccache
+mkdir -p /tmp/gh-extract
+tar xf gh.tar.gz -C /tmp/gh-extract
+install -m 755 /tmp/gh-extract/gh_*/bin/gh /usr/local/bin/gh
 install -m 755 rustup-init /tmp/rustup-init
 cp rust-toolchain.toml /home/runner/rust-toolchain.toml
 chown -R runner:runner /home/runner
@@ -202,11 +210,22 @@ chmod 755 /usr/local/bin/carrick-ci-ready
 install -m 755 admit-job.sh /usr/local/bin/carrick-ci-admit-job.sh
 systemctl daemon-reload
 runuser -u runner -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
+gh_version=$(cat gh-version)
+gh_first_line=$(gh --version </dev/null | head -n1)
+if ! [[ $gh_first_line =~ ^gh[[:space:]]+version[[:space:]]+([0-9.]+) && ${BASH_REMATCH[1]} == "$gh_version" ]]; then
+  echo "unexpected gh version: $gh_first_line (expected $gh_version)" >&2
+  exit 1
+fi
+if ! gh api --help </dev/null | grep -q -- '--slurp'; then
+  echo "gh api missing --slurp" >&2
+  exit 1
+fi
 mkdir -p /var/lib/carrick-ci
 jq -n --arg kernel "$(uname -r)" --arg rust "$(runuser -u runner -- /home/runner/.cargo/bin/rustc --version)" \
-  '{kernel:$kernel,rust:$rust,kvm_api:12,user:"runner",svm:true,runner_registered:false}' > /var/lib/carrick-ci/qualification.json
+  --arg gh "$gh_version" \
+  '{kernel:$kernel,rust:$rust,gh:$gh,kvm_api:12,user:"runner",svm:true,runner_registered:false}' > /var/lib/carrick-ci/qualification.json
 dpkg-query -W -f='${Package}=${Version}\n' > /var/lib/carrick-ci/packages.txt
-rm -rf /tmp/rustup-init /tmp/sccache-extract
+rm -rf /tmp/rustup-init /tmp/sccache-extract /tmp/gh-extract
 PROVISION
 genisoimage -quiet -output /var/lib/vz/template/iso/carrick-template-${template}-seed.iso -volid cidata -joliet -rock seed
 # Root qm operations below apply ONLY to the approved template build.
@@ -297,7 +316,7 @@ if [[ $nameserver != none ]]; then qm set "$template" --nameserver "$nameserver"
 qm template "$template"
 jq -n --arg commit "$commit" --arg script_hash "$(sha256sum "$inputs/scripts/ci/build-template-debian.sh" | cut -d' ' -f1)" \
   --arg image_url "$image_url" --arg image_sha512 "$image_sha512" --arg runner_version "$runner_version" --arg runner_sha256 "$runner_sha256" \
-  --arg sccache_sha256 "$sccache_sha256" --arg rustup_sha256 "$rustup_sha256" --arg toolchain_hash "$(sha256sum seed/rust-toolchain.toml | cut -d' ' -f1)" \
+  --arg sccache_sha256 "$sccache_sha256" --arg rustup_sha256 "$rustup_sha256" --arg gh_sha256 "$gh_sha256" --arg toolchain_hash "$(sha256sum seed/rust-toolchain.toml | cut -d' ' -f1)" \
   --arg lock_hash "$(sha256sum seed/Cargo.lock | cut -d' ' -f1)" --arg xtask_hash "$(sha256sum seed/carrick-xtask | cut -d' ' -f1)" \
   --arg packages_hash "$(sha256sum packages.txt | cut -d' ' -f1)" --slurpfile qualification qualification.json \
   --arg pool "$template_pool" --argjson vmid "$template" --arg profile "$profile" --arg node "$node" --arg storage "$storage" --arg bridge "$bridge" \
@@ -305,7 +324,7 @@ jq -n --arg commit "$commit" --arg script_hash "$(sha256sum "$inputs/scripts/ci/
   --arg bootstrap_hash "$(sha256sum seed/runner-once.sh | cut -d' ' -f1)" --arg hook_hash "$(sha256sum seed/admit-job.sh | cut -d' ' -f1)" \
   '{vmid:$vmid,profile:$profile,node:$node,pool:$pool,cpu:"host",vcpus:$cores,memory_mib:$memory_mib,disk_gib:$disk_gib,storage:$storage,bridge:$bridge,script_commit:$commit,
     script_sha256:$script_hash,image_url:$image_url,image_sha512:$image_sha512,runner_version:$runner_version,runner_sha256:$runner_sha256,
-    sccache_sha256:$sccache_sha256,rustup_sha256:$rustup_sha256,toolchain_sha256:$toolchain_hash,cargo_lock_sha256:$lock_hash,
+    sccache_sha256:$sccache_sha256,rustup_sha256:$rustup_sha256,gh_sha256:$gh_sha256,toolchain_sha256:$toolchain_hash,cargo_lock_sha256:$lock_hash,
     xtask_sha256:$xtask_hash,bootstrap_sha256:$bootstrap_hash,hook_sha256:$hook_hash,packages_sha256:$packages_hash,qualification:$qualification[0]}' > manifest.json
 qm config "$template"
 cat manifest.json

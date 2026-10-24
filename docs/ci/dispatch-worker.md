@@ -241,6 +241,14 @@ file for the template's Python (3.13, x86_64) and rebuild template 9000.
 The test `agent_template_prebuilds_the_hash_locked_codex_sdk_the_driver_uses`
 ties the builder, the lock file and the driver together.
 
+### Pinned GitHub CLI
+
+The template pins official GitHub CLI release 2.102.0 (SHA-256 verified) at
+`/usr/local/bin/gh` rather than installing Debian's apt package, so `gh api
+--slurp` is available for dispatch review continuation and comment pagination
+(#838). Template qualification verifies `gh --version` reports 2.102.0 and
+`gh api --help` lists `--slurp`.
+
 ## Rollout and live acceptance
 
 Portable tests cover trigger trust, capacity refusal without charges, branch
