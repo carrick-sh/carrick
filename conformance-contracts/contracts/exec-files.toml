@@ -9,7 +9,7 @@ structural_budgets = []
 rationale = "The loader consumes retained filesystem and source capabilities rather than recapturing a host task. Path resolution and prepared-image caching share their production implementations with filesystem dispatch. Capability construction retains a fixed number of authorities, not a scan of the descriptor table; descriptor access remains with the FD authority. This contract does not claim ring transaction publication or a runtime ratio."
 
 [bindings]
-vm_free = "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_keep_two_callers_without_host_task_bindings; retained_host_source_rechecks_execute_mode_on_exact_object; proc_exe_fd_keeps_original_source_after_process_exec_identity_changes; carrick-runtime::runtime::exec::tests"
+vm_free = "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_keep_two_callers_without_host_task_bindings; exec_capabilities_reject_foreign_context; exec_capabilities_reject_predecessor_context_after_exec; exec_capabilities_legacy_file_survives_last_descriptor_close; exec_capabilities_memory_permission_follows_unlinked_inode; exec_capabilities_resolve_dotdot_after_symlink; exec_capabilities_validate_raw_path_before_normalization; exec_capabilities_proc_fd_retains_open_inode_after_name_replacement; exec_capabilities_proc_fd_keeps_memory_file_contents; retained_host_source_rechecks_execute_mode_on_exact_object; proc_exe_fd_keeps_original_source_after_process_exec_identity_changes; carrick-runtime::runtime::exec::tests"
 
 [bindings.unresolved]
 embed_structural = "Signed native child exec and new-MM publication remain #785 cuts 2-4; this binding verifies retained file services only."

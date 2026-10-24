@@ -1263,19 +1263,20 @@ where
                 let cmdline = proc_argv.join(" ");
                 carrick_kernel::dispatch::set_host_process_name(cmdline.as_bytes());
                 let proc_env = env.clone();
-                let files = dispatcher.capture_exec_files(&kernel_context);
-                let loaded = load_execve_image(
-                        &dispatcher,
+                let loader = exec::ExecLoaderCapabilities::capture(&dispatcher);
+                let loaded = dispatcher.capture_exec_files(&kernel_context).and_then(|files| load_execve_image(
+                        &loader,
                         &files,
                         &path,
                         argv,
                         env,
                         dispatcher.requires_syscall_traps(),
-                    );
+                    ));
                 match loaded {
                     Ok(crate::runtime::exec::LoadedExecImage {
                         image: new_image,
                         source: executable_source,
+                        binfmt_argv,
                     }) => {
                         crate::probes::execve_loaded(
                             &path,
@@ -1291,6 +1292,9 @@ where
                             proc_env,
                             executable_source,
                         );
+                        if let Some(argv) = binfmt_argv {
+                            dispatcher.enter_binfmt(&argv);
+                        }
                         dispatcher.reset_signal_handlers_on_execve(&kernel_context);
                         // Reset and refresh memory proc state as one VMA generation.
                         let prepared_dispatch_mm_exec = apply_exec_image_proc_state(

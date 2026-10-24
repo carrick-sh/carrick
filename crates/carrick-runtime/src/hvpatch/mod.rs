@@ -1412,11 +1412,7 @@ fn prepare_image(mut image: AddressSpace) -> Result<PreparedImage, PrepareError>
 /// Patch an `execve` replacement image before the runtime adds its own
 /// executable trampoline/vector pages.
 #[cfg(any(test, feature = "platform-macos"))]
-pub(crate) fn prepare_exec_image_for_dispatcher(
-    image: AddressSpace,
-    dispatcher: &SyscallDispatcher,
-) -> Result<AddressSpace, PrepareError> {
-    let _ = dispatcher;
+pub(crate) fn prepare_exec_image(image: AddressSpace) -> Result<AddressSpace, PrepareError> {
     Ok(prepare_image(image)?.image)
 }
 
@@ -3900,9 +3896,7 @@ mod tests {
                 .unwrap()
         };
 
-        let hvpatch_dispatcher = SyscallDispatcher::new();
-        let hvpatch_image = prepare_exec_image_for_dispatcher(make_image(), &hvpatch_dispatcher)
-            .expect("HvPatch exec image");
+        let hvpatch_image = prepare_exec_image(make_image()).expect("HvPatch exec image");
         assert_ne!(
             u32::from_le_bytes(hvpatch_image.regions()[0].bytes()[0..4].try_into().unwrap()),
             SVC_ZERO,
