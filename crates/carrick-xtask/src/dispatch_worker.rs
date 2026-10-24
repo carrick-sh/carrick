@@ -807,23 +807,30 @@ fn loop_transcript() -> Result<(), ScalerError> {
     )?;
     Ok(())
 }
-fn record_worker_failure(error: &ScalerError) -> Result<(), ScalerError> {
+fn record_worker_failure(error: &ScalerError, dispatch: &Dispatch) -> Result<(), ScalerError> {
     let state = crate::agent_runner::state()?;
     let package =
         PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?)
             .join("dispatch-output");
     std::fs::create_dir_all(&package)?;
-    // A previous receipt must never authorize publication after failed harvest.
-    match std::fs::remove_file(state.join("receipt.json")) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
+    // Failed candidates never replace the last successfully harvested pair.
+    // Remove only orphaned/invalid state, so later workers can start afresh.
+    if worker_checkpoint(&state, dispatch).is_err() {
+        if state.join("work").is_dir() {
+            std::fs::remove_dir_all(state.join("work"))?;
+        }
+        if state.join("receipt.json").exists() {
+            std::fs::remove_file(state.join("receipt.json"))?;
+        }
     }
     let contract = Contract {
         status: ContractStatus::Failed,
         summary: format!("Worker production/harvest failed: {error}"),
         tests: vec![],
-        risks: vec!["Harvest incomplete; publication refused".into()],
+        risks: vec![
+            "Harvest incomplete; candidate discarded, last good checkpoint retained if available"
+                .into(),
+        ],
     };
     std::fs::write(
         package.join("contract.json"),
@@ -1258,6 +1265,65 @@ struct Receipt {
     refused_workflow: bool,
 }
 
+/// One predicate for continuation and publication: a scoped receipt and tree.
+fn worker_checkpoint(state: &Path, dispatch: &Dispatch) -> Result<Option<Receipt>, ScalerError> {
+    let work = state.join("work");
+    let receipt_path = state.join("receipt.json");
+    if !work.exists() && !receipt_path.exists() {
+        return Ok(None);
+    }
+    if !work.is_dir() || !receipt_path.is_file() {
+        return Err(ScalerError::Guard(
+            "incomplete worker checkpoint: tree and receipt required",
+        ));
+    }
+    let receipt: Receipt = regular_text(&receipt_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .ok_or(ScalerError::Guard("invalid worker checkpoint receipt"))?;
+    if receipt.base != dispatch.base
+        || receipt.branch != dispatch.branch
+        || (!receipt.expected_tip.is_empty() && !sha(&receipt.expected_tip))
+    {
+        return Err(ScalerError::Guard("worker checkpoint scope refused"));
+    }
+    Ok(Some(receipt))
+}
+
+/// Publish a fully validated candidate, rolling back the tree if receipt commit
+/// fails. The last good pair remains untouched during harvesting and rendering.
+fn install_worker_checkpoint(
+    state: &Path,
+    candidate: &Path,
+    receipt: &Receipt,
+) -> Result<(), ScalerError> {
+    use std::io::Write;
+    let mut next_receipt = tempfile::NamedTempFile::new_in(state)?;
+    next_receipt.write_all(&serde_json::to_vec(receipt)?)?;
+    let backup = candidate.with_file_name("previous");
+    let work = state.join("work");
+    let had_work = work.exists();
+    if had_work {
+        std::fs::rename(&work, &backup)?;
+    }
+    let commit = (|| -> Result<(), ScalerError> {
+        std::fs::rename(candidate, &work)?;
+        next_receipt
+            .persist(state.join("receipt.json"))
+            .map_err(|error| error.error)?;
+        Ok(())
+    })();
+    if commit.is_err() {
+        if work.exists() {
+            std::fs::remove_dir_all(&work)?;
+        }
+        if had_work {
+            std::fs::rename(&backup, &work)?;
+        }
+    }
+    commit
+}
+
 fn admitted_base(resolved_main: bool) -> Result<String, ScalerError> {
     select_base(
         resolved_main,
@@ -1640,7 +1706,61 @@ fn harvest_worker(
     Ok((contract, refused_workflow, diffstat, code))
 }
 
-fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerError> {
+trait WorkerHost {
+    fn initialize(&mut self) -> Result<(), ScalerError>;
+    fn prepare(&mut self, state: &Path, actor: &Path, backend: &str) -> Result<(), ScalerError>;
+    // A host may shorten the foreground deadline, never extend admission.
+    fn agent_deadline(&self, allotted: std::time::Instant) -> std::time::Instant {
+        allotted
+    }
+    fn agent(&mut self, root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError>;
+    fn retire(&mut self) -> Result<(), ScalerError>;
+    fn hand_back(&mut self, actor: &Path) -> Result<(), ScalerError>;
+}
+struct NativeWorkerHost;
+impl WorkerHost for NativeWorkerHost {
+    fn initialize(&mut self) -> Result<(), ScalerError> {
+        #[cfg(target_os = "linux")]
+        // SAFETY: adopt and reap detached children before scanning agent bytes.
+        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let identity = output(Command::new("/usr/bin/id").args(["-u", AGENT_USER]))?;
+        let uid = String::from_utf8_lossy(&identity)
+            .trim()
+            .parse::<libc::uid_t>()
+            .map_err(|_| ScalerError::Guard("invalid pre-created agent uid"))?;
+        // SAFETY: geteuid has no preconditions.
+        if uid == 0 || uid == unsafe { libc::geteuid() } {
+            return Err(ScalerError::Guard(
+                "agent uid must be separate and unprivileged",
+            ));
+        }
+        cleanup_agent_user()?;
+        Ok(())
+    }
+    fn prepare(&mut self, state: &Path, actor: &Path, backend: &str) -> Result<(), ScalerError> {
+        prepare_worker_actor(state, actor, backend)
+    }
+    fn agent(&mut self, root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
+        agent(root, dispatch)
+    }
+    fn retire(&mut self) -> Result<(), ScalerError> {
+        cleanup_agent_user()
+    }
+    fn hand_back(&mut self, actor: &Path) -> Result<(), ScalerError> {
+        let actor_path = actor.to_str().ok_or(ScalerError::Guard("agent state"))?;
+        sudo(&["/usr/bin/chgrp", "-hR", AGENT_USER, actor_path])?;
+        sudo(&["/usr/bin/chmod", "-R", "ug+rwX,o-rwx", actor_path])?;
+        Ok(())
+    }
+}
+fn produce(
+    root: &Path,
+    dispatch: &Dispatch,
+    setup: &str,
+    host: &mut dyn WorkerHost,
+) -> Result<(), ScalerError> {
     let base = dispatch.base.clone();
     if !sha(&base)
         || (setup == "success/success" && git(root, &["rev-parse", "HEAD"])?.trim() != base)
@@ -1664,15 +1784,12 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         risks: vec![],
     };
     let mut code = 1;
-    let mut expected_tip = if work.is_dir() && state.join("receipt.json").exists() {
-        let previous: Receipt = serde_json::from_str(&regular_text(&state.join("receipt.json"))?)?;
-        if previous.base != base || previous.branch != dispatch.branch {
-            return Err(ScalerError::Guard("previous worker scope changed"));
-        }
-        previous.expected_tip
-    } else {
-        String::new()
-    };
+    let previous = worker_checkpoint(&state, dispatch)?;
+    let mut expected_tip = previous
+        .as_ref()
+        .map(|receipt| receipt.expected_tip.clone())
+        .unwrap_or_default();
+    let mut candidate = None;
     let mut raw = if package.join("raw.log").is_file() {
         regular_text(&package.join("raw.log"))?
     } else {
@@ -1681,24 +1798,8 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
     let mut diffstat = String::new();
     let mut refused_workflow = setup != "success/success";
     if setup == "success/success" {
-        let commands = dispatch.loop_deadline.map(CommandWindow::until);
-        #[cfg(target_os = "linux")]
-        // SAFETY: adopt and reap detached children before scanning agent bytes.
-        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let identity = output(Command::new("/usr/bin/id").args(["-u", AGENT_USER]))?;
-        let uid = String::from_utf8_lossy(&identity)
-            .trim()
-            .parse::<libc::uid_t>()
-            .map_err(|_| ScalerError::Guard("invalid pre-created agent uid"))?;
-        // SAFETY: geteuid has no preconditions.
-        if uid == 0 || uid == unsafe { libc::geteuid() } {
-            return Err(ScalerError::Guard(
-                "agent uid must be separate and unprivileged",
-            ));
-        }
-        cleanup_agent_user()?;
+        let preparation_commands = dispatch.loop_deadline.map(CommandWindow::until);
+        host.initialize()?;
         let outer = tempfile::Builder::new()
             .prefix("carrick-dispatch-")
             .tempdir_in("/var/tmp")?;
@@ -1707,16 +1808,9 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         std::fs::create_dir(&actor)?;
         std::fs::set_permissions(&actor, std::fs::Permissions::from_mode(0o700))?;
         timed_phase("worker.prepare", || {
-            prepare_worker_actor(&state, &actor, &dispatch.worker.backend)
+            host.prepare(&state, &actor, &dispatch.worker.backend)
         })?;
         let actor_work = actor.join("work");
-        let previous: Option<Receipt> = if work.is_dir() {
-            Some(serde_json::from_str(&regular_text(
-                &state.join("receipt.json"),
-            )?)?)
-        } else {
-            None
-        };
         expected_tip = timed_phase("worker.checkout", || {
             worker_checkout(root, &work, &actor_work, dispatch, previous.as_ref())
         })?;
@@ -1729,18 +1823,20 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
                 "41898282+github-actions[bot]@users.noreply.github.com",
             ],
         )?;
-        let result = timed_phase("worker.agent", || agent(&actor_work, dispatch));
+        drop(preparation_commands);
+        let mut agent_dispatch = dispatch.clone();
+        agent_dispatch.loop_deadline = dispatch
+            .loop_deadline
+            .map(|allotted| host.agent_deadline(allotted).min(allotted));
+        let commands = agent_dispatch.loop_deadline.map(CommandWindow::until);
+        let result = timed_phase("worker.agent", || host.agent(&actor_work, &agent_dispatch));
         drop(commands);
-        let _harvest = dispatch.harvest_deadline.map(CommandWindow::until);
+        // Dropping the agent window restores NativeLauncher's harvest window.
         // This is mandatory even on launcher failure, before scanning or hand-back.
-        timed_phase("worker.retirement", cleanup_agent_user)?;
+        timed_phase("worker.retirement", || host.retire())?;
         // Read agent files only as data after verified uid retirement. The
         // pre-created private group lets runner read without becoming root.
-        let actor_path = actor.to_str().ok_or(ScalerError::Guard("agent state"))?;
-        timed_phase("worker.hand_back", || {
-            sudo(&["/usr/bin/chgrp", "-hR", AGENT_USER, actor_path])?;
-            sudo(&["/usr/bin/chmod", "-R", "ug+rwX,o-rwx", actor_path])
-        })?;
+        timed_phase("worker.hand_back", || host.hand_back(&actor))?;
         let (_, evidence) = read_result(&actor.join("result.json"));
         let previous = std::mem::take(&mut raw);
         raw.push_str(&evidence);
@@ -1766,9 +1862,13 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
             TRANSCRIPT_BYTES,
         );
         std::fs::write(package.join("raw.log"), &raw)?;
+        let staging = tempfile::Builder::new()
+            .prefix("harvest-")
+            .tempdir_in(&state)?;
         (contract, refused_workflow, diffstat, code) = timed_phase("worker.harvest", || {
-            harvest_worker(&actor, &work, dispatch, result)
+            harvest_worker(&actor, &staging.path().join("candidate"), dispatch, result)
         })?;
+        candidate = Some(staging);
     }
     std::fs::write(package.join("raw.log"), &raw)?;
     let transcript = format!(
@@ -1796,17 +1896,20 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         serde_json::to_vec_pretty(&contract)?,
     )?;
     std::fs::write(package.join("diffstat.txt"), diffstat)?;
-    // This receipt stays on the disposable runner; it is not transferred or uploaded.
-    std::fs::write(
-        state.join("receipt.json"),
-        serde_json::to_vec(&Receipt {
-            base,
-            branch: dispatch.branch.clone(),
-            exit_code: code,
-            expected_tip,
-            refused_workflow,
-        })?,
-    )?;
+    // This receipt stays on the disposable runner; it is not uploaded.
+    if let Some(candidate) = candidate {
+        install_worker_checkpoint(
+            &state,
+            &candidate.path().join("candidate"),
+            &Receipt {
+                base,
+                branch: dispatch.branch.clone(),
+                exit_code: code,
+                expected_tip,
+                refused_workflow,
+            },
+        )?;
+    }
     Ok(())
 }
 

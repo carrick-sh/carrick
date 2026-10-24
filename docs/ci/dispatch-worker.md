@@ -129,7 +129,10 @@ worker minutes. Each worker allocation includes `[loop].harvest_seconds`
 worker deadline. Retirement, permission hand-back, snapshot, checkpoint and
 result collection use the reserved window. A timed-out worker retains partial
 work and logs with a failed timeout contract. Harvest failures name the original
-error and refuse publication; production is never rerun as a setup failure.
+error and discard the failed candidate. The last successfully harvested tree
+and its receipt stay available for continuation and publication; without that
+pair, publication is refused with a named reason. Production is never rerun as
+a setup failure.
 The reserve is deducted from worker and wall time, rather than added after
 either budget. The 42-minute default leaves five minutes within the 47-minute
 loop step for retirement and reporting. The workflow stamps
