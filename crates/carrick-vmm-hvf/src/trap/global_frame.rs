@@ -137,33 +137,13 @@ impl GlobalFrameIpaAllocator {
     }
 }
 
-#[derive(::core::fmt::Debug)]
-pub(crate) struct El1FrameGrantLedger {
-    active: std::collections::BTreeSet<(u64, u64)>,
-    returned: std::collections::BTreeSet<(u64, u64)>,
-    stats: El1FrameGrantStats,
-    by_mm: std::collections::BTreeMap<El1FrameGrantMm, El1FrameGrantStats>,
-}
-
-impl Default for El1FrameGrantLedger {
-    fn default() -> Self {
-        Self {
-            active: Default::default(),
-            returned: Default::default(),
-            by_mm: Default::default(),
-            stats: El1FrameGrantStats {
-                scope: Some(El1FrameGrantScope(std::sync::Arc::new(()))),
-                complete: true,
-                ..Default::default()
-            },
-        }
-    }
-}
+mod grant_ledger;
+pub(crate) use grant_ledger::El1FrameGrantLedger;
 
 /// A snapshot handle owns accounting only, never physical backing or a VM.
 #[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct El1FrameGrantObserver {
-    ledger: std::sync::Arc<parking_lot::Mutex<El1FrameGrantLedger>>,
+    ledger: std::sync::Arc<El1FrameGrantLedger>,
 }
 impl El1FrameGrantObserver {
     pub(crate) fn new(custody: &CarrierVmCustody) -> Self {
@@ -172,100 +152,13 @@ impl El1FrameGrantObserver {
         }
     }
     pub fn snapshot(&self) -> El1FrameGrantStats {
-        self.ledger.lock().stats.clone()
+        self.ledger.snapshot()
     }
     pub fn snapshot_mm(&self, mm: El1FrameGrantMm) -> Option<El1FrameGrantStats> {
-        self.ledger.lock().by_mm.get(&mm).cloned()
+        self.ledger.snapshot_mm(mm)
     }
     pub fn snapshots_by_mm(&self) -> Vec<El1FrameGrantStats> {
-        self.ledger.lock().by_mm.values().cloned().collect()
-    }
-}
-
-fn add_grant_counter(counter: &mut u64, complete: &mut bool, amount: u64) {
-    match counter.checked_add(amount) {
-        Some(value) => *counter = value,
-        None => {
-            *complete = false;
-            *counter = u64::MAX;
-        }
-    }
-}
-
-impl El1FrameGrantLedger {
-    pub(crate) fn mark_grant(
-        &mut self,
-        base: u64,
-        length: u64,
-        mm: El1FrameGrantMm,
-    ) -> Result<(), TrapError> {
-        if length == 0
-            || !base.is_multiple_of(4096)
-            || !length.is_multiple_of(4096)
-            || base.checked_add(length).is_none()
-        {
-            return Err(TrapError::Hypervisor(format!(
-                "EL1 frame grant has an invalid physical extent: base=0x{base:x} length=0x{length:x}"
-            )));
-        }
-        let key = (base, length);
-        if self.active.contains(&key) {
-            return Err(TrapError::Hypervisor(format!(
-                "EL1 frame regrant precedes exact return: base=0x{base:x} length=0x{length:x}"
-            )));
-        }
-        self.active.insert(key);
-        let reused = self.returned.contains(&key);
-        self.update(mm, |stats| {
-            add_grant_counter(&mut stats.grants_succeeded, &mut stats.complete, 1);
-            add_grant_counter(&mut stats.bytes_granted, &mut stats.complete, length);
-            if reused {
-                add_grant_counter(&mut stats.reused_grants, &mut stats.complete, 1);
-            }
-        });
-        Ok(())
-    }
-
-    fn update(&mut self, mm: El1FrameGrantMm, mut update: impl FnMut(&mut El1FrameGrantStats)) {
-        let scoped = self.by_mm.entry(mm).or_insert_with(|| El1FrameGrantStats {
-            scope: self.stats.scope.clone(),
-            mm: Some(mm),
-            complete: true,
-            ..Default::default()
-        });
-        update(scoped);
-        update(&mut self.stats);
-    }
-
-    pub(crate) fn mark_return(
-        &mut self,
-        base: u64,
-        length: u64,
-        mm: El1FrameGrantMm,
-        release_ipa: bool,
-    ) {
-        if self.active.remove(&(base, length)) {
-            self.returned.insert((base, length));
-            self.update(mm, |stats| {
-                add_grant_counter(&mut stats.returns_completed, &mut stats.complete, 1);
-                add_grant_counter(&mut stats.bytes_returned, &mut stats.complete, length);
-                if release_ipa {
-                    add_grant_counter(&mut stats.ipa_bytes_returned, &mut stats.complete, length);
-                }
-            });
-        } else {
-            self.update(mm, |stats| stats.complete = false);
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn snapshot(&self) -> El1FrameGrantStats {
-        self.stats.clone()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn snapshot_mm(&self, mm: El1FrameGrantMm) -> Option<El1FrameGrantStats> {
-        self.by_mm.get(&mm).cloned()
+        self.ledger.snapshots_by_mm()
     }
 }
 
@@ -354,11 +247,6 @@ mod allocator_stats_tests {
             assert_eq!(observer.snapshot().bytes_granted, scale * length);
             assert_eq!(observer.snapshot().retained_backing_bytes(), Some(0));
         }
-        let mut ledger = El1FrameGrantLedger::default();
-        ledger.stats.bytes_granted = u64::MAX;
-        ledger.mark_grant(0x8000_0000, 0x4000, test_mm()).unwrap();
-        assert!(!ledger.stats.complete);
-        assert_eq!(ledger.stats.retained_backing_bytes(), None);
     }
 
     fn grant_owned(
@@ -625,14 +513,14 @@ mod allocator_stats_tests {
     fn el1_lifecycle_regrant_requires_a_return_receipt_at_three_scales() {
         let mut observations = Vec::new();
         for scale in [1, 8, 64] {
-            let mut ledger = El1FrameGrantLedger::default();
+            let ledger = El1FrameGrantLedger::default();
             let length = CowArmedRanges::COMPOUND_SIZE;
             for index in 0..scale {
                 let base = 0x8000_0000 + index * length;
                 ledger.mark_grant(base, length, test_mm()).unwrap();
-                let before = ledger.stats.clone();
+                let before = ledger.snapshot();
                 let rejected = ledger.mark_grant(base, length, test_mm()).is_err();
-                observations.push((scale, rejected && ledger.stats == before));
+                observations.push((scale, rejected && ledger.snapshot() == before));
             }
         }
         assert!(
@@ -696,21 +584,21 @@ mod allocator_stats_tests {
     #[test]
     fn el1_grant_stats_count_owned_and_pooled_return_and_reuse() {
         let mut allocator = GlobalFrameIpaAllocator::new();
-        let mut ledger = El1FrameGrantLedger::default();
+        let ledger = El1FrameGrantLedger::default();
         let length = CowArmedRanges::COMPOUND_SIZE;
         let first = allocator.allocate(length, length).expect("first extent");
         ledger
             .mark_grant(first, length, test_mm())
             .expect("tag first grant");
         assert_eq!(
-            ledger.stats,
+            ledger.snapshot(),
             El1FrameGrantStats {
                 grants_succeeded: 1,
                 returns_completed: 0,
                 reused_grants: 0,
                 bytes_granted: length,
                 bytes_returned: 0,
-                ..ledger.stats.clone()
+                ..ledger.snapshot()
             }
         );
         allocator
@@ -738,14 +626,14 @@ mod allocator_stats_tests {
             .expect("reuse pooled grant");
         ledger.mark_return(pooled, length, test_mm(), true);
         assert_eq!(
-            ledger.stats,
+            ledger.snapshot(),
             El1FrameGrantStats {
                 grants_succeeded: 4,
                 returns_completed: 4,
                 reused_grants: 2,
                 bytes_granted: length * 4,
                 bytes_returned: length * 4,
-                ..ledger.stats.clone()
+                ..ledger.snapshot()
             }
         );
     }
@@ -790,10 +678,7 @@ pub(crate) fn mark_el1_frame_grant_in(
             "EL1 owner already has a grant receipt".to_owned(),
         ));
     }
-    custody
-        .el1_frame_grants
-        .lock()
-        .mark_grant(base, length, mm)?;
+    custody.el1_frame_grants.mark_grant(base, length, mm)?;
     *receipt = Some(El1FrameGrantReceipt {
         base,
         length,
@@ -815,22 +700,13 @@ struct El1FrameGrantReceipt {
     mm: El1FrameGrantMm,
     returned: bool,
     pooled: bool,
-    ledger: std::sync::Arc<parking_lot::Mutex<El1FrameGrantLedger>>,
+    ledger: std::sync::Arc<El1FrameGrantLedger>,
 }
 
 impl Drop for El1FrameGrantReceipt {
     fn drop(&mut self) {
-        self.ledger.lock().update(self.mm, |stats| {
-            if !self.returned {
-                stats.complete = false;
-            }
-            let counter = if self.pooled {
-                &mut stats.pooled_reusable_bytes
-            } else {
-                &mut stats.host_backing_released_bytes
-            };
-            add_grant_counter(counter, &mut stats.complete, self.length);
-        });
+        self.ledger
+            .backing_released(self.mm, self.length, self.returned, self.pooled);
     }
 }
 
@@ -2468,16 +2344,12 @@ pub(crate) fn finalize_global_frame_owner_record_using(
 ) -> Result<(), TrapError> {
     let mut receipt = owner.mapping.el1_grant.lock();
     if let Some(receipt) = receipt.as_mut() {
-        let mut ledger = receipt.ledger.lock();
-        let release_ipa = owner
-            .snapshot()
-            .is_some_and(|snapshot| snapshot.release_ipa);
-        // Publish the receipt before another grant can reuse the returned IPA.
-        finalize_terminal_stage2_record_using(custody, owner.record_identity, release_ipa_fn)?;
-        if !receipt.returned {
-            ledger.mark_return(receipt.base, receipt.length, receipt.mm, release_ipa);
-            receipt.returned = true;
-        }
+        std::sync::Arc::clone(&receipt.ledger).finalize_return(
+            custody,
+            owner,
+            receipt,
+            release_ipa_fn,
+        )?;
     } else {
         finalize_terminal_stage2_record_using(custody, owner.record_identity, release_ipa_fn)?;
     }
