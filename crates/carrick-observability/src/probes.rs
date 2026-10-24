@@ -6197,6 +6197,8 @@ mod real {
 
         /// Failed backend load: exact thread, generation, executor and error.
         fn hvpatch__executor__load__failure(_: u64, _: u64, _: u32, _: &str) {}
+        /// Owner-thread lifecycle failure, including unbound native service.
+        fn hvpatch__executor__failure(_: u32, _: &str) {}
         /// One scheduler wake edge against a kernel thread. Args: ThreadSerial,
         /// wake kind (`HvpatchSchedulerWakeKind`), the execution state the
         /// wake found (`HvpatchThreadExecutionStateKind`), that state's
@@ -7034,6 +7036,12 @@ mod real {
             executor,
             error
         ));
+    }
+
+    /// Preserve failures outside backend load, including idle service work
+    /// that has no host task binding or logical terminal result of its own.
+    pub fn hvpatch_executor_failure(executor: u32, error: &str) {
+        carrick_usdt::hvpatch__executor__failure!(|| (executor, error));
     }
 
     /// Exact scheduler wake edge, recorded after the thread state machine
@@ -9726,6 +9734,7 @@ mod stub {
         executor: u32,
         error: &str
     ));
+    stub!(hvpatch_executor_failure(executor: u32, error: &str));
     stub!(hvpatch_scheduler_wake(
         thread_serial: u64,
         kind: super::HvpatchSchedulerWakeKind,
