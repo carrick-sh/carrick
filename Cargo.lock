@@ -756,6 +756,7 @@ dependencies = [
  "carrick-el1-abi",
  "carrick-el1-linux",
  "carrick-fatal",
+ "carrick-fd-core",
  "carrick-guest-arch",
  "carrick-guest-mem",
  "carrick-hal",
