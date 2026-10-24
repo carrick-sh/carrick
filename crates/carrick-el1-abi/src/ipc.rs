@@ -1106,6 +1106,39 @@ impl<'a> IpcRegion<'a> {
         self.descriptor_storage().live_allocations()
     }
 
+    /// One fork/storage transaction for host and ring venues. The binding
+    /// publisher runs under the parent descriptor lock; refusal returns both
+    /// the unpublished child identity and its extent without a final release.
+    pub fn fork_descriptors<W: LockWait>(
+        &self,
+        parent: fd::TableId,
+        wait: &W,
+        publish: impl FnOnce(fd::TableId) -> Result<(), fd::Error>,
+    ) -> Result<fd::TableId, IpcError> {
+        struct BorrowedWait<'a, W>(&'a W);
+        impl<W: LockWait> LockWait for BorrowedWait<'_, W> {
+            fn wait(&self, attempt: u32) -> bool {
+                self.0.wait(attempt)
+            }
+        }
+        let authority = self.fd(BorrowedWait(wait));
+        let capacity = authority.backing_capacity(parent).map_err(IpcError::Fd)?;
+        let mut extent =
+            self.provision_descriptors(capacity, wait)
+                .map_err(|error| match error {
+                    fd::storage::StorageError::Contended => IpcError::Contended,
+                    _ => IpcError::Fd(fd::Error::NoMemory),
+                })?;
+        match authority.fork_published(parent, &mut extent, publish) {
+            Ok(child) => Ok(child),
+            Err(error) => {
+                self.reclaim_descriptors(&mut extent, &carrick_sched_core::ShortLockSpin)
+                    .map_err(|_| IpcError::Corrupt)?;
+                Err(IpcError::Fd(error))
+            }
+        }
+    }
+
     /// Pool bytes `[offset, offset+len)`, authenticated against the pool.
     fn pool_range(
         &self,
