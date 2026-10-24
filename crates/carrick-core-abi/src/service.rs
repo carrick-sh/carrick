@@ -985,7 +985,7 @@ mod tests {
                 incarnation: owner.mm.incarnation(),
                 sequence: NonZeroU64::MIN,
             },
-            generation: crate::ReservationGeneration::new(1).unwrap(),
+            mapping_incarnation: crate::ReservationIncarnation::new(1).unwrap(),
             range: crate::ReservationRange::new(page, page + 4096).unwrap(),
             protection: crate::ReservationProtection::from_bits(3).unwrap(),
             fault_page: page,

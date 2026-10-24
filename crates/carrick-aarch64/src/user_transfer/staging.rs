@@ -174,14 +174,13 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
                 incarnation: target.handle.incarnation(),
                 sequence: nz(frame.x[8]),
             },
-            generation: carrick_el1_abi::ReservationGeneration::new(frame.x[9]).unwrap_or_else(
-                || {
+            mapping_incarnation: carrick_el1_abi::ReservationIncarnation::new(frame.x[9])
+                .unwrap_or_else(|| {
                     carrick_fatal::carrick_fatal!(
                         "aarch64::prepared_copy",
-                        "invalid supply generation"
+                        "invalid supply mapping incarnation"
                     )
-                },
-            ),
+                }),
             range: carrick_el1_abi::ReservationRange::new(frame.x[10], frame.x[11]).unwrap_or_else(
                 || carrick_fatal::carrick_fatal!("aarch64::prepared_copy", "invalid supply range"),
             ),

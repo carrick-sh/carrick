@@ -1013,10 +1013,10 @@ mod tests {
         assert_eq!(unchanged.generation(), initial.generation());
         assert!(unchanged.maps()[0].write);
         assert_eq!(
-            unchanged.generation(),
             peer.fault_plan(va, 4096, ReservationProtection::READ_WRITE)
                 .unwrap()
-                .generation
+                .mapping_incarnation,
+            peer.node(va).unwrap().1
         );
 
         let mut conflicting = mem.semantic_vmas.clone().into_vec();

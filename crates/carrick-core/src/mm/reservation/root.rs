@@ -137,7 +137,7 @@ pub struct ReturnSlot {
 )]
 pub struct ReservationFaultPlan {
     pub mm: ReservationMm,
-    pub generation: ReservationGeneration,
+    pub mapping_incarnation: ReservationIncarnation,
     pub range: ReservationRange,
     pub protection: ReservationProtection,
     pub fault_page: u64,
@@ -1670,7 +1670,7 @@ impl<
         if self.pending().is_some_and(|p| p.range.contains(page)) {
             return Err(Refusal::Busy);
         }
-        let mapping = self.mapping(page).ok_or(Refusal::Hole)?;
+        let (mapping, mapping_incarnation) = self.node(page).ok_or(Refusal::Hole)?;
         if !(mapping.anonymous || allow_backing && mapping.host_backing.is_some()) {
             return Err(Refusal::ForeignMapping);
         }
@@ -1686,7 +1686,7 @@ impl<
             .ok_or(Refusal::Invalid)?;
         Ok(ReservationFaultPlan {
             mm: self.mm,
-            generation: mapping.generation,
+            mapping_incarnation,
             range,
             protection: mapping.protection,
             fault_page: page,
@@ -1710,20 +1710,23 @@ impl<
     ) -> bool {
         (!self.state().fork_pending || self.fork_write_authorized(sequence))
             && plan.mm == self.mm
-            && plan.generation == self.generation()
             && self.pending().is_none_or(|p| {
                 p.range.end() <= plan.range.start() || p.range.start() >= plan.range.end()
             })
-            && self.mapping(plan.fault_page).is_some_and(|m| {
-                (if let Some(backing) = backing {
-                    plan.range
-                        .start()
-                        .checked_sub(m.range.start())
-                        .and_then(|offset| m.host_backing.and_then(|source| source.advance(offset)))
-                        == Some(backing)
-                } else {
-                    m.anonymous && m.host_backing.is_none()
-                }) && m.protection == plan.protection
+            && self.node(plan.fault_page).is_some_and(|(m, incarnation)| {
+                incarnation == plan.mapping_incarnation
+                    && (if let Some(backing) = backing {
+                        plan.range
+                            .start()
+                            .checked_sub(m.range.start())
+                            .and_then(|offset| {
+                                m.host_backing.and_then(|source| source.advance(offset))
+                            })
+                            == Some(backing)
+                    } else {
+                        m.anonymous && m.host_backing.is_none()
+                    })
+                    && m.protection == plan.protection
                     && m.range.start() <= plan.range.start()
                     && m.range.end() >= plan.range.end()
             })
@@ -3493,7 +3496,6 @@ mod tests {
             carrick_sched_core::object_wait::OBJECT_WAIT_LAYOUT_HASH
         );
     }
-
     #[test]
     fn reservation_observer_walk_is_linear_and_generation_exact_for_two_mms() {
         let table = table();
@@ -3888,6 +3890,35 @@ mod tests {
             Err(Refusal::Limit)
         );
     }
+
+    #[test]
+    fn unrelated_mapping_revision_keeps_exact_fault_plan_authentic() {
+        let table = table();
+        let mm = ReservationMm::new(32).unwrap();
+        table.publish(32, mm, layout()).unwrap();
+        let mut root = table.lock(32, mm).unwrap();
+        root.finish_import().unwrap();
+        let rw = ReservationProtection::READ_WRITE;
+        let decision = root.mmap(Placement::Fixed(0x100000), 0x10_000, rw).unwrap();
+        complete(&mut root, decision);
+        let plan = root
+            .fault_plan(0x101000, 0x10_000, rw)
+            .expect("bulk first touch is selected");
+
+        let decision = root
+            .mmap(
+                Placement::Fixed(0x200000),
+                4096,
+                ReservationProtection::NONE,
+            )
+            .unwrap();
+        complete(&mut root, decision);
+        assert!(
+            root.authenticate_fault(plan),
+            "an unrelated root revision cannot stale the unchanged exact mapping"
+        );
+    }
+
     #[test]
     fn reservation_holes_limits_byte_break_and_prepared_protection() {
         let table = table();

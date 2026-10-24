@@ -1398,8 +1398,10 @@ fn grant_fixture<B: carrick_mmu_core::owner_mmu::OwnerGrantMmu>(
     let wire = PortalGrantSlot::new();
     for stale in [
         carrick_core_abi::PortalGrantWindow {
-            generation: carrick_core_abi::ReservationGeneration::new(window.generation.raw() + 1)
-                .unwrap(),
+            mapping_incarnation: carrick_core_abi::ReservationIncarnation::new(
+                window.mapping_incarnation.raw() + 1,
+            )
+            .unwrap(),
             ..window
         },
         carrick_core_abi::PortalGrantWindow {

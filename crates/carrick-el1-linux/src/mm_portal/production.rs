@@ -341,7 +341,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
                     unreachable!()
                 };
                 frame.x[8] = window.operation.sequence.get();
-                frame.x[9] = window.generation.raw();
+                frame.x[9] = window.mapping_incarnation.raw();
                 frame.x[10] = window.range.start();
                 frame.x[11] = window.range.end();
                 frame.x[12] = window.protection.bits();

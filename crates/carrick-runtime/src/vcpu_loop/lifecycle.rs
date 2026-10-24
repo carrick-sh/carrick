@@ -2170,7 +2170,7 @@ pub(crate) mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn fork_child_tid_bootstrap_preserves_cow_supply_before_copyout() {
         use carrick_el1_abi::{
-            PortalGrantWindow, PortalOperation, ReservationGeneration, ReservationMm,
+            PortalGrantWindow, PortalOperation, ReservationIncarnation, ReservationMm,
             ReservationProtection, ReservationRange,
         };
         use carrick_guest_mem::{
@@ -2219,7 +2219,7 @@ pub(crate) mod tests {
                             incarnation: NonZeroU64::new(1).unwrap(),
                             sequence: NonZeroU64::new(124).unwrap(),
                         },
-                        generation: ReservationGeneration::new(2).unwrap(),
+                        mapping_incarnation: ReservationIncarnation::new(2).unwrap(),
                         range: ReservationRange::new(0x6000000000, 0x6000001000).unwrap(),
                         protection: ReservationProtection::READ_WRITE,
                         fault_page: 0x6000000000,

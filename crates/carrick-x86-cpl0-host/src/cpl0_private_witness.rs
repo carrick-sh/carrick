@@ -147,7 +147,7 @@ impl PrivateAnonymousWitness {
                 mm.get(),
                 grant.context.root.address().raw(),
                 grant.context.generation.raw().get(),
-                grant.window.generation.raw(),
+                grant.window.mapping_incarnation.raw(),
             ),
             grant.window.operation.sequence.get(),
             &leaves,

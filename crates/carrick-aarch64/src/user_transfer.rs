@@ -20,7 +20,7 @@ pub enum SupplyProgress {
 }
 
 /// Fulfil one exact owner-issued physical request before retrying the same
-/// transfer. The request carries the MM incarnation and grant generation;
+/// transfer. The request carries the MM and exact mapping incarnations;
 /// the guest validates both again while applying the descriptor transaction.
 pub fn supply<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
     engine: &Aarch64EngineCore<V>,
@@ -142,7 +142,7 @@ fn trace_grant_refusal(window: carrick_el1_abi::PortalGrantWindow, reason: u32) 
         window.operation.carrier.get(),
         window.operation.mm.raw(),
         window.operation.incarnation.get(),
-        window.generation.raw(),
+        window.mapping_incarnation.raw(),
     );
     el1_grant_refusal(
         reason * 10 + 2,
@@ -777,7 +777,7 @@ mod grant_wait_tests {
         };
         let window = PortalGrantWindow {
             operation,
-            generation: carrick_el1_abi::ReservationGeneration::new(5).unwrap(),
+            mapping_incarnation: carrick_el1_abi::ReservationIncarnation::new(5).unwrap(),
             range: carrick_el1_abi::ReservationRange::new(0x6000, 0x7000).unwrap(),
             protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
             fault_page: 0x6000,

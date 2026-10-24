@@ -182,7 +182,7 @@ fn native_fault_reply_stale_owner_window_retries_instruction() {
             incarnation: NonZeroU64::MIN,
             sequence: NonZeroU64::MIN,
         },
-        generation: carrick_el1_abi::ReservationGeneration::INITIAL,
+        mapping_incarnation: carrick_el1_abi::ReservationIncarnation::new(1).unwrap(),
         range: carrick_el1_abi::ReservationRange::new(VA, VA + 4096).unwrap(),
         protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
         fault_page: VA,
@@ -913,7 +913,9 @@ fn composed_native_supply(
     frame.esr = 0x15 << 26;
     frame.x[8] = 222;
     let map_base = if replace_cow { VA + 4096 } else { VA + 0x10000 };
-    frame.x[..6].copy_from_slice(&[map_base, 8192, 3, 0x32, u64::MAX, 0]);
+    let replacement_len = if replace_cow { 65536 } else { 8192 };
+    let backing_len = if replace_cow { replacement_len } else { 16384 };
+    frame.x[..6].copy_from_slice(&[map_base, replacement_len, 3, 0x32, u64::MAX, 0]);
     let transfer_pin = replace_cow.then(|| {
         let page = residency
             .lookup(identity.mm, map_base)
@@ -941,7 +943,7 @@ fn composed_native_supply(
             "refusal preserves the original residency"
         );
         drop(pin);
-        frame.x[..6].copy_from_slice(&[map_base, 8192, 3, 0x32, u64::MAX, 0]);
+        frame.x[..6].copy_from_slice(&[map_base, replacement_len, 3, 0x32, u64::MAX, 0]);
         assert_eq!(
             carrick_el1::memory::serve_delegated_anonymous(
                 &mut frame,
@@ -1042,13 +1044,13 @@ fn composed_native_supply(
         physical.clone(),
         [FrameGpa::new(0xa0020000)],
         0,
-        16384,
+        backing_len,
         physical_owner,
     )
     .unwrap();
     let rows = {
         let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
-        let retained = stock.backing(&staged, 16384, NonZeroU64::new(7).unwrap());
+        let retained = stock.backing(&staged, backing_len, NonZeroU64::new(7).unwrap());
         stock
             .owner
             .child_physical_mut(handle.mm(), child_physical_root)
@@ -1072,7 +1074,11 @@ fn composed_native_supply(
             publication: carrick_mmu_core::aarch64::GuestLeafPublication {
                 va: window.range.start(),
                 ipa: rows[0].gpa.raw(),
-                len: 4096,
+                len: if replace_cow {
+                    window.range.len()
+                } else {
+                    4096
+                },
                 writable: true,
                 executable: false,
             },
@@ -1082,7 +1088,7 @@ fn composed_native_supply(
         tables: TableGrants::new(&[]).unwrap(),
     };
     assert_eq!(window.range.start(), fresh);
-    assert!(window.range.len() >= 8192);
+    assert_eq!(window.range.len(), replacement_len);
     // SAFETY: the native pending request owns this aligned reply through ACK.
     assert!(
         unsafe { &*(reply.raw() as *const carrick_el1_abi::PortalGrantSlot) }.submit(window, &txn)
@@ -1157,11 +1163,13 @@ fn composed_native_supply(
         leaf(words, child_root, fresh) & AARCH64_ROOT_ADDRESS_MASK,
         rows[0].gpa.raw()
     );
-    assert_eq!(
-        leaf(words, child_root, fresh + 4096),
-        0,
-        "unreadable suffix must remain absent"
-    );
+    if !replace_cow {
+        assert_eq!(
+            leaf(words, child_root, fresh + 4096),
+            0,
+            "unreadable suffix must remain absent"
+        );
+    }
     if replace_cow {
         assert_eq!(fresh % 16384, 4096, "exercise a sub-compound boundary");
         assert_eq!(
@@ -1172,7 +1180,13 @@ fn composed_native_supply(
         // The fixture's physical memory model gives fresh anonymous backing
         // zero bytes, just as the real physical allocator does.
         let replacement = rows[0].gpa.raw();
-        memory.pages.borrow_mut().insert(replacement, vec![0; 4096]);
+        for offset in (0..replacement_len).step_by(4096) {
+            memory
+                .pages
+                .borrow_mut()
+                .insert(replacement + offset, vec![0; 4096]);
+        }
+
         let child_output = leaf(words, child_root, fresh) & AARCH64_ROOT_ADDRESS_MASK;
         assert!(
             memory.pages.borrow()[&child_output]

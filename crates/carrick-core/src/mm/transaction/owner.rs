@@ -659,7 +659,7 @@ impl<
                     incarnation: continuation.handle.incarnation(),
                     sequence: continuation.sequence(),
                 },
-                generation: plan.generation,
+                mapping_incarnation: plan.mapping_incarnation,
                 range: plan.range,
                 protection: plan.protection,
                 fault_page: plan.fault_page,
@@ -731,7 +731,7 @@ impl<
             Err(MmError::Fault) => return Ok(None),
             result => result?,
         };
-        // SAFETY: exact-MM editor, reservation generation and live output
+        // SAFETY: exact-MM editor, mapping incarnation and live output
         // were authenticated above; core publishes the sole bounded fence.
         unsafe {
             crate::mm::transaction::validate_selection(

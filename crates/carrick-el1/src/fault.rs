@@ -2801,7 +2801,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(window.operation.incarnation.get(), root.incarnation().raw());
-        assert_eq!(window.generation, root.mapping(VA).unwrap().generation);
+        assert_eq!(window.mapping_incarnation, root.node(VA).unwrap().1);
         drop(root);
         assert_eq!(window.range.start(), VA);
         assert_eq!(window.range.len(), 4096);
