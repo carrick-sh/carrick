@@ -25,7 +25,7 @@ pub use storage::ResolvedReservationNodes;
 
 /// One prepared image mapping. The caller retains every referenced backing
 /// until the unpublished MM is adopted or its physical rollback settles.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub struct ImportedMapping {
     pub range: ReservationRange,
     pub protection: ReservationProtection,
