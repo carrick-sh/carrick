@@ -117,15 +117,15 @@ or host-backed path.
 - Produces: literal Linux wait4 status for normal and signal death, including
   the core bit, plus pid/-1/0/-pgid, WNOHANG, and ECHILD witnesses.
 
-- [ ] **Step 1: Add a two-process red witness that sends a default core signal through production signal delivery and checks `WIFSIGNALED`, `WTERMSIG`, and the raw core bit via wait4.**
+- [x] **Step 1: Add a two-process red witness that sends a default core signal through production signal delivery and checks `WIFSIGNALED`, `WTERMSIG`, and the raw core bit via wait4.**
 
-- [ ] **Step 2: Run the focused witness and retain the RED showing that native termination currently drops bit 7.**
+- [x] **Step 2: Run the focused witness and retain the RED showing that native termination currently drops bit 7.**
 
-- [ ] **Step 3: Pass the typed terminating signal into the terminal owner and derive the core flag once from `carrick-signal-core`; update all callers without adding an ARM-only status encoder.**
+- [x] **Step 3: Pass the typed terminating signal into the terminal owner and derive the core flag once from `carrick-signal-core`; update all callers without adding an ARM-only status encoder.**
 
-- [ ] **Step 4: Add or tighten one shared-owner selection matrix for pid, -1, 0, and -pgid, including WNOHANG while a matching child lives and numeric ECHILD (10) after its only zombie is consumed.**
+- [x] **Step 4: Add or tighten one shared-owner selection matrix for pid, -1, 0, and -pgid, including WNOHANG while a matching child lives and numeric ECHILD (10) after its only zombie is consumed.**
 
-- [ ] **Step 5: Run the focused ARM/native wait tests and commit.**
+- [x] **Step 5: Run the focused ARM/native wait tests and commit.**
 
 ### Task 5: Bind SIGCHLD, Blocking wait4, and Pipeline SIGPIPE
 
