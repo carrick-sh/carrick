@@ -2661,6 +2661,12 @@ impl FileTable {
             .functional_gate
             .acquire_mutation()
             .ok_or(crate::linux_abi::LINUX_EBADF)?;
+        // Global FileTable lock order: open_files -> next_fd -> reserved_slots ->
+        // stdio_cloexec -> closed_stdio -> ipc. Acquire open_files first even on
+        // the IPC selector path so commit_reserved_slot (open_files.write ->
+        // reserved_slots) and publish_ipc (open_files.read -> reserved_slots)
+        // never invert or race with admission.
+        let open_files = self.read_open_files();
         let mut next_fd = self.lock_next_fd();
         let mut reserved = self.lock_reserved_slots();
         let reservation_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2672,6 +2678,7 @@ impl FileTable {
             }
             drop(reserved);
             drop(next_fd);
+            drop(open_files);
             return Ok(FileSlotReservation {
                 table: Arc::clone(self),
                 fd,
@@ -2680,7 +2687,6 @@ impl FileTable {
             });
         }
 
-        let open_files = self.read_open_files();
         let closed_stdio = self.lock_closed_stdio();
 
         let mut fd = None;
@@ -5068,6 +5074,64 @@ mod tests {
         );
         assert!(join_res.is_ok());
         assert!(!table.is_slot_reserved(3));
+    }
+
+    #[test]
+    fn reserve_slot_at_or_above_does_not_hold_reservation_locks_while_awaiting_open_files() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+
+        // Simulate commit_reserved_slot / close holding open_files.write() before
+        // acquiring next_fd or reserved_slots.
+        let open_files_guard = table.open_files.write();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn({
+            let table = Arc::clone(&table);
+            move || {
+                tx.send(()).unwrap();
+                table.reserve_slot_at_or_above(0, 64)
+            }
+        });
+
+        rx.recv().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut entered = false;
+        while std::time::Instant::now() < deadline {
+            if table.functional_gate.state.lock().active_mutations >= 1 {
+                entered = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Canonical FileTable lock order is open_files -> next_fd -> reserved_slots.
+        // While blocked on open_files.read(), reserve_slot_at_or_above must hold
+        // neither next_fd nor reserved_slots.
+        let next_fd_free = entered
+            && table
+                .next_fd
+                .try_lock_for(std::time::Duration::from_millis(50))
+                .is_some();
+        let reserved_free = entered
+            && table
+                .reserved_slots
+                .try_lock_for(std::time::Duration::from_millis(50))
+                .is_some();
+
+        drop(open_files_guard);
+        let reserved_slot = t.join().expect("worker join").expect("reserve slot");
+        drop(reserved_slot);
+
+        assert!(
+            entered,
+            "reserve_slot_at_or_above should enter mutation admission within timeout"
+        );
+        assert!(
+            next_fd_free && reserved_free,
+            "reserve_slot_at_or_above must acquire open_files before next_fd and reserved_slots (next_fd_free={next_fd_free}, reserved_free={reserved_free})"
+        );
     }
 }
 
