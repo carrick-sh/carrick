@@ -235,7 +235,7 @@ pub(crate) mod lookup;
 mod mount;
 pub(crate) mod notify;
 mod open;
-mod pathres;
+pub(in crate::dispatch) mod pathres;
 pub(crate) mod pipe;
 pub(crate) mod proc_synthetic;
 pub(crate) use proc_synthetic::*;

@@ -559,7 +559,9 @@ impl CurrentExecutable {
     }
 }
 
-fn materialize_shared(contents: carrick_vfs::fs_backend::SharedFileContents) -> Arc<[u8]> {
+pub(super) fn materialize_shared(
+    contents: carrick_vfs::fs_backend::SharedFileContents,
+) -> Arc<[u8]> {
     if contents.dirty.is_empty() && contents.len == contents.base.len() {
         return contents.base;
     }
@@ -695,109 +697,9 @@ impl SyscallDispatcher {
         context: &crate::kernel::KernelContext,
         path: &str,
     ) -> Result<ExecSource, ExecSourceError> {
-        let visible_self = crate::dispatch::fs::proc_synthetic::proc_visible_self(context);
-        if crate::dispatch::fs::proc_synthetic::proc_self_magic_link(path, visible_self)
-            == Some("exe")
-        {
-            return self
-                .current_executable()
-                .map(|current| current.source().clone())
-                .ok_or(ExecSourceError::Linux(crate::linux_abi::LINUX_ENOENT));
-        }
-        if let Some(fd) =
-            crate::dispatch::fs::proc_synthetic::proc_self_fd_number(path, visible_self)
-        {
-            let source = self
-                .open_file(fd)
-                .and_then(|file| file.description.retained_exec_source());
-            if let Some(source) = source {
-                return Ok(source);
-            }
-        }
-        crate::dispatch::fs::check_path_length(path).map_err(ExecSourceError::Linux)?;
-        let resolved = self
-            .canonicalize_following(path)
-            .map_err(ExecSourceError::Linux)?;
-        if self
-            .layered_lstat(&resolved)
-            .is_ok_and(|metadata| metadata.kind == carrick_vfs::rootfs::RootFsEntryKind::Directory)
-        {
-            return Err(ExecSourceError::Linux(crate::linux_abi::LINUX_EACCES));
-        }
-        self.acquire_exec_source_at(&resolved)
-            .map_err(ExecSourceError::Host)
-    }
-
-    fn acquire_exec_source_at(&self, path: &str) -> io::Result<ExecSource> {
-        use carrick_vfs::fs_backend::OverlayEntryKind;
-
-        match self.fs.rootfs_vfs.overlay.lookup_kind(path) {
-            Some(OverlayEntryKind::File) => {
-                if let Some(file) = self.fs.rootfs_vfs.overlay.open_file_readonly(path) {
-                    return ExecSource::host(file, path.to_owned());
-                }
-                let entry = self
-                    .fs
-                    .rootfs_vfs
-                    .overlay
-                    .shared_file_entry(path, false)
-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-                if let Some(object) = entry.object {
-                    return Ok(ExecSource::shared_object(object, path.to_owned()));
-                }
-                return Ok(ExecSource::shared(
-                    materialize_shared(entry.contents.clone()),
-                    entry.contents.object_id,
-                    path.to_owned(),
-                    entry.metadata.mode,
-                    carrick_abi::NsUid::ROOT,
-                    carrick_abi::NsGid::ROOT,
-                ));
-            }
-            Some(OverlayEntryKind::Dir) => {
-                return Err(io::Error::from_raw_os_error(libc::EACCES));
-            }
-            Some(OverlayEntryKind::Deleted) => {
-                return Err(io::Error::from_raw_os_error(libc::ENOENT));
-            }
-            None => {}
-        }
-
-        if let Some(rootfs) = self.fs.rootfs_vfs.rootfs.as_ref() {
-            if let Some(file) = rootfs.open_file_readonly(path) {
-                return ExecSource::host(file, path.to_owned());
-            }
-            if let Ok(bytes) = rootfs.read_shared(path) {
-                let metadata = rootfs
-                    .metadata(path)
-                    .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
-                return Ok(ExecSource::shared(
-                    bytes,
-                    carrick_vfs::fs_backend::fresh_file_object_id(),
-                    path.to_owned(),
-                    metadata.mode,
-                    carrick_abi::NsUid::ROOT,
-                    carrick_abi::NsGid::ROOT,
-                ));
-            }
-        }
-
-        if let Some((bytes, metadata)) = self.fs.vfs_mounts.resolve(path).and_then(|mount| {
-            let metadata = mount.vfs.lookup(path).ok()?;
-            let bytes = mount.vfs.read_file(path).ok()?;
-            Some((bytes, metadata))
-        }) {
-            return Ok(ExecSource::shared(
-                bytes.into(),
-                carrick_vfs::fs_backend::fresh_file_object_id(),
-                path.to_owned(),
-                metadata.mode,
-                carrick_abi::NsUid::new(metadata.uid),
-                carrick_abi::NsGid::new(metadata.gid),
-            ));
-        }
-
-        Err(io::Error::from_raw_os_error(libc::ENOENT))
+        self.capture_exec_files(context)
+            .without_host_fallback()
+            .acquire(path)
     }
 }
 
@@ -1208,5 +1110,66 @@ mod tests {
             .acquire_exec_source(&context, &format!("/proc/self/fd/{fd}"))
             .unwrap();
         assert_eq!(retained.read_all().unwrap(), b"program-a");
+    }
+    #[test]
+    fn exec_capabilities_keep_two_callers_without_host_task_bindings() {
+        let first = SyscallDispatcher::new();
+        let second = SyscallDispatcher::new();
+        for (dispatcher, bytes) in [
+            (&first, b"first".as_slice()),
+            (&second, b"second".as_slice()),
+        ] {
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .set_file_contents("/image", bytes.to_vec())
+                .unwrap();
+            dispatcher
+                .fs
+                .rootfs_vfs
+                .overlay
+                .set_mode("/image", 0o755)
+                .unwrap();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let source = dispatcher.acquire_exec_source(&context, "/image").unwrap();
+            dispatcher.set_executable_identity_with_source("/image", vec![], vec![], source);
+        }
+        let first_context = first.capture_one_task_context().unwrap();
+        let second_context = second.capture_one_task_context().unwrap();
+        let first_task = Arc::downgrade(first_context.task());
+        let second_task = Arc::downgrade(second_context.task());
+        let a = first.capture_exec_files(&first_context);
+        let b = second.capture_exec_files(&second_context);
+        assert_ne!(a.caller(), b.caller());
+        drop(first_context);
+        drop(second_context);
+        let old = a.acquire("/image").unwrap();
+        first
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_mode("/image", 0o644)
+            .unwrap();
+        assert_eq!(a.check_source(&old).unwrap_err().get(), 13);
+        assert!(b.check_source(&b.acquire("/image").unwrap()).is_ok());
+
+        drop(first);
+        drop(second);
+        assert!(first_task.upgrade().is_none());
+        assert!(second_task.upgrade().is_none());
+        assert_eq!(
+            a.acquire("/proc/self/exe").unwrap().read_all().unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            b.acquire("/proc/self/exe").unwrap().read_all().unwrap(),
+            b"second"
+        );
+        assert_eq!(a.acquire("image").unwrap().read_all().unwrap(), b"first");
+        assert!(
+            matches!(a.acquire("/absent"), Err(ExecSourceError::Host(error)) if error.raw_os_error() == Some(2))
+                || matches!(a.acquire("/absent"), Err(ExecSourceError::Linux(errno)) if errno.get() == 2)
+        );
     }
 }

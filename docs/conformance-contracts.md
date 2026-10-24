@@ -2123,3 +2123,13 @@ The committed native ARM64 oracle and its source fingerprint are preserved.
 Fresh signed HVF execution, live sibling-editor contention, handled-signal
 delivery, final runtime ratios and exact-artifact promotion remain
 director-owned. VM-free evidence does not close those integration gates.
+### Retained executable file services
+
+`process.exec.files` covers executable source selection with retained caller
+filesystem, credential, executable and descriptor-source capabilities. Two
+independent callers retain those resources after their dispatchers are dropped;
+ENOENT (2) and EACCES (13) remain ordinary pre-commit failures. Filesystem
+syscalls and exec share the layered path resolver, and host exec consumes the
+same capability API intended for ring service requests. The fixture verifies
+resource lifetime and isolation, not two executing native processes. Native
+transaction publication and signed replacement witnesses remain #785 work.
