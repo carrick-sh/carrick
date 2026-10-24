@@ -153,6 +153,50 @@ impl CowResolver for FaultResolver<'_> {
 fn native_child_empty_supply_resumes_cow_without_changing_parent() {
     composed_native_supply(false, None, false);
 }
+
+#[test]
+fn native_fault_reply_stale_owner_window_retries_instruction() {
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, TableGrants,
+    };
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let slot = carrick_el1_abi::PortalGrantSlot::new();
+    let window = carrick_el1_abi::PortalGrantWindow {
+        operation: carrick_el1_abi::PortalOperation {
+            carrier: NonZeroU64::new(2).unwrap(),
+            mm: ReservationMm::new(1).unwrap(),
+            incarnation: NonZeroU64::MIN,
+            sequence: NonZeroU64::MIN,
+        },
+        generation: carrick_el1_abi::ReservationGeneration::INITIAL,
+        range: carrick_el1_abi::ReservationRange::new(VA, VA + 4096).unwrap(),
+        protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
+        fault_page: VA,
+        host_backing: None,
+        fork_sequence: None,
+    };
+    let txn = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: NonZeroU64::MIN,
+            generation: NonZeroU64::MIN,
+        },
+        root: carrick_mmu_core::aarch64::SubstrateGpa(0x10000),
+        op: DescriptorOp::Retire(PageSpan::new(VA, 4096)),
+        tables: TableGrants::NONE,
+    };
+    assert!(slot.submit(window, &txn));
+
+    // A supplied reply authenticates its old operation, not the current
+    // instruction. A replaced owner must retry the fault under the current
+    // mapping instead of turning the stale reply into SIGSEGV.
+    assert_eq!(
+        NativeProcessService::apply_fault_reply(&mut service, &slot),
+        Ok(())
+    );
+}
+
 #[test]
 fn native_backing_reply_observes_a_competing_valid_publication() {
     composed_native_supply(true, None, false);
