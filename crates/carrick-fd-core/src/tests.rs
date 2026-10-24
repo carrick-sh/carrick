@@ -2600,3 +2600,73 @@ fn revoked_namespace_releases_outside_the_descriptor_lock() {
         .unwrap();
     c.destroy_table(peer, |_| {}).unwrap();
 }
+
+#[test]
+fn filtered_live_close_and_dup_replace_defer_host_release_once() {
+    let c = authority::<3, 8>();
+    let parent = c.create_table(16, &mut storage(8)).unwrap();
+    let pipe_fd = c.open(parent, Fd(0), description(10), false).unwrap();
+    let host_a = c.open(parent, Fd(1), description(101), false).unwrap();
+    let host_b = c.open(parent, Fd(2), description(102), false).unwrap();
+    let peer = c.fork(parent, &mut storage(8)).unwrap();
+
+    // Token < 100 is ring-releasable; >= 100 must defer to the host retired-OFD list.
+    let can_release = |d: Description| d.backing.0 < 100;
+
+    // Closing host_a in parent while peer still holds it yields None.
+    assert_eq!(
+        c.close_filtered(parent, host_a, can_release),
+        Ok(DeferredRelease::None)
+    );
+    assert_eq!(c.take_retired_ofd(), Ok(None));
+    // Final live close of host_a in peer defers release to retired_ofds.
+    assert_eq!(
+        c.close_filtered(peer, host_a, can_release),
+        Ok(DeferredRelease::Deferred)
+    );
+    assert_eq!(
+        c.take_retired_ofd().unwrap().unwrap().backing,
+        BackingToken(101)
+    );
+    assert_eq!(c.take_retired_ofd(), Ok(None));
+
+    // Replacing host_b via dup2_filtered in parent while peer holds it yields None,
+    // then replacing host_b via dup3_filtered in peer defers host_b (102) once.
+    assert_eq!(
+        c.dup2_filtered(parent, pipe_fd, host_b, can_release),
+        Ok(DeferredRelease::None)
+    );
+    assert_eq!(c.take_retired_ofd(), Ok(None));
+    assert_eq!(
+        c.dup3_filtered(peer, pipe_fd, host_b, true, can_release),
+        Ok(DeferredRelease::Deferred)
+    );
+    assert_eq!(
+        c.take_retired_ofd().unwrap().unwrap().backing,
+        BackingToken(102)
+    );
+    assert_eq!(c.take_retired_ofd(), Ok(None));
+
+    // Closing all ring-releasable pipe_fd aliases returns Now(Description(10)) on the last one.
+    assert_eq!(
+        c.close_filtered(parent, pipe_fd, can_release),
+        Ok(DeferredRelease::None)
+    );
+    assert_eq!(
+        c.close_filtered(parent, host_b, can_release),
+        Ok(DeferredRelease::None)
+    );
+    assert_eq!(
+        c.close_filtered(peer, pipe_fd, can_release),
+        Ok(DeferredRelease::None)
+    );
+    assert_eq!(
+        c.close_filtered(peer, host_b, can_release),
+        Ok(DeferredRelease::Now(description(10)))
+    );
+
+    c.destroy_table(parent, |_| panic!("all descriptions already released"))
+        .unwrap();
+    c.destroy_table(peer, |_| panic!("all descriptions already released"))
+        .unwrap();
+}
