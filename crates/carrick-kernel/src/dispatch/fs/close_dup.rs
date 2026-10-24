@@ -221,7 +221,7 @@ impl<'a> FsView<'a> {
             let old_fd: Fd = fd;
             // dup(2) returns the LOWEST-numbered unused descriptor, with no
             // floor — including 0/1/2 when the caller has closed them. min_fd=0
-            // (not 3) lets first_free_fd hand back a CLOSED stdio number while
+            // (not 3) lets the table reservation reuse a CLOSED stdio number while
             // still skipping an OPEN one. Flooring at 3 made `close(0); dup(fd)`
             // return a freed fd >= 3 instead of 0, so libuv's
             // uv_pipe_open(loop, 0) wrapped a dead fd 0 and uv_run crashed
@@ -278,11 +278,6 @@ impl<'a> FsView<'a> {
             let fd: Fd = fd;
             if !(0..this.nofile_limit()).contains(&fd.0) {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
-            // Closing a stdio number (0/1/2) frees it for reuse by the
-            // lowest-free-descriptor allocator (a later open()/dup can land there).
-            if fd.0 >= 0 && fd.0 < 3 {
-                this.captured_file_table().lock_closed_stdio()[fd.0 as usize] = true;
             }
             let files = this.captured_file_table();
             let (open_file, epoll_reservation) = {

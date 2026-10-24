@@ -380,6 +380,8 @@ fn approved_table_guard(owner: &str, method: &syn::ImplItemFn) -> bool {
 // Closed implementation owners, not source paths. Calls made inside these
 // authority primitives are definitions rather than legacy caller debt.
 const DEFINITION_OWNERS: &[&str] = &[
+    // Guarded removal owns implicit stdio closure, including rollback paths.
+    "carrick_kernel::kernel::objects::FileTableWriteGuard<'_>::remove",
     "carrick_kernel::kernel::objects::FileTable::commit_exact_replacement",
     "carrick_kernel::kernel::objects::FileTable::commit_reserved_slot",
     "carrick_kernel::kernel::objects::FileTable::epoll_wake_handle",
