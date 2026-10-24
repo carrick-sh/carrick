@@ -621,7 +621,7 @@ contracts = ["kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/stage2_backend.rs"
-contracts = ["kernel.el1.gic"]
+contracts = ["kernel.el1.gic", "process.exec.backing"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/lib.rs"
@@ -745,7 +745,7 @@ contracts = ["kernel.time.coarse-clock-vdso"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/execve_rebuild.rs"
-contracts = ["kernel.mm.exec-heap-window", "kernel.exec.stage1-image", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation"]
+contracts = ["kernel.mm.exec-heap-window", "kernel.exec.stage1-image", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "process.exec.backing"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/exec.rs"
@@ -1990,3 +1990,7 @@ contracts = ["process.exec.files"]
 [[surfaces]]
 path = "crates/carrick-runtime/src/runtime/exec.rs"
 contracts = ["process.exec.files"]
+
+[[surfaces]]
+path = "crates/carrick-host/src/host_mapping.rs"
+contracts = ["process.exec.backing"]

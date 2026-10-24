@@ -38,6 +38,15 @@ fn host_page_size() -> usize {
     usize::try_from(page).unwrap_or(4096)
 }
 
+/// Physical contents for an exclusively owned, not-yet-published image extent.
+/// File artifacts must cover the complete extent and remain immutable while a
+/// mapping uses them; the caller retains that artifact authority.
+pub enum HostImageSource<'a> {
+    Private { bytes: &'a [u8], offset: usize },
+    Shared { bytes: &'a [u8], offset: usize },
+    PrivateFile(&'a std::fs::File),
+}
+
 /// RAII owner for host virtual memory that backs a guest HVF mapping.
 ///
 /// The trap engine still performs `hv_vm_map`/`hv_vm_unmap` explicitly; this
@@ -50,6 +59,38 @@ pub struct OwnedHostMapping {
 }
 
 impl OwnedHostMapping {
+    /// Prepare host backing without installing any guest mapping. Anonymous
+    /// extents copy only the occupied payload; the tail stays demand-zero.
+    pub fn prepare_image(len: usize, source: HostImageSource<'_>) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        if len == 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let (kind, bytes, offset) = match source {
+            HostImageSource::PrivateFile(file) => {
+                return Self::map_private_file(file.as_raw_fd(), 0, len);
+            }
+            HostImageSource::Private { bytes, offset } => {
+                (HostMappingKind::PrivateAnon, bytes, offset)
+            }
+            HostImageSource::Shared { bytes, offset } => {
+                (HostMappingKind::SharedAnon, bytes, offset)
+            }
+        };
+        if offset.checked_add(bytes.len()).is_none_or(|end| end > len) {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let mapping = Self::map_shared_anon(len, kind)?;
+        if !bytes.is_empty() {
+            // SAFETY: the fresh mapping owns the checked extent exclusively;
+            // the borrowed source cannot alias a newly allocated mapping.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapping.ptr.add(offset), bytes.len());
+            }
+        }
+        Ok(mapping)
+    }
+
     pub fn map_shared_anon(len: usize, kind: HostMappingKind) -> Result<Self, std::io::Error> {
         let share = anonymous_mapping_share_flag(kind);
         #[allow(deprecated)] // MAP_NORESERVE: removed in FreeBSD 11, harmless no-op elsewhere
@@ -268,6 +309,120 @@ mod tests {
     /// Serialize the mmap tests so none maps during another's freed-address check.
     /// Poison-recovering so a panic in one test doesn't cascade-fail the others.
     static MMAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn exec_image_private_artifact_has_two_independent_retained_views() {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+        let _serialize = MMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let len = 16 * 1024;
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![0xa5; len]).unwrap();
+        let first =
+            OwnedHostMapping::prepare_image(len, HostImageSource::PrivateFile(&file)).unwrap();
+        let second =
+            OwnedHostMapping::prepare_image(len, HostImageSource::PrivateFile(&file)).unwrap();
+        // SAFETY: both private mappings are exclusively owned by this test.
+        unsafe { first.as_ptr().write(0x51) };
+        assert_eq!(unsafe { second.as_ptr().read() }, 0xa5);
+        let mut source = [0];
+        file.read_exact_at(&mut source, 0).unwrap();
+        assert_eq!(source, [0xa5]);
+        drop(file);
+        assert_eq!(unsafe { first.as_ptr().read() }, 0x51);
+        assert_eq!(unsafe { second.as_ptr().read() }, 0xa5);
+    }
+
+    #[test]
+    fn exec_image_sparse_payload_preserves_offsets_and_zero_tail() {
+        let _serialize = MMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let extent = 2 * 1024 * 1024;
+        let offset = 16 * 1024;
+        let image = OwnedHostMapping::prepare_image(
+            extent,
+            HostImageSource::Private {
+                bytes: b"occupied",
+                offset,
+            },
+        )
+        .unwrap();
+        // SAFETY: the image exclusively owns this complete initialized extent.
+        let bytes = unsafe { std::slice::from_raw_parts(image.as_ptr(), image.len()) };
+        assert_eq!(&bytes[offset..offset + 8], b"occupied");
+        assert_eq!(bytes[offset - 1], 0);
+        assert_eq!(bytes[offset + 8], 0);
+        assert_eq!(bytes[extent - 1], 0);
+    }
+
+    #[test]
+    fn exec_image_invalid_extent_preserves_an_independent_preparation() {
+        let _serialize = MMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let peer = OwnedHostMapping::prepare_image(
+            16 * 1024,
+            HostImageSource::Private {
+                bytes: b"peer",
+                offset: 0,
+            },
+        )
+        .unwrap();
+        for (len, offset) in [(0, 0), (16 * 1024, 16 * 1024), (16 * 1024, usize::MAX)] {
+            let error = OwnedHostMapping::prepare_image(
+                len,
+                HostImageSource::Private {
+                    bytes: b"x",
+                    offset,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(22), "EINVAL=22");
+        }
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(peer.as_ptr(), 4) },
+            b"peer"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exec_image_drop_releases_only_its_own_file_view() {
+        use std::io::Write;
+        let _serialize = MMAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&vec![0x35; 16 * 1024]).unwrap();
+        let path = file.path().to_str().unwrap();
+        let count = || {
+            std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .filter(|line| line.ends_with(path))
+                .count()
+        };
+        assert_eq!(count(), 0);
+        let peer = OwnedHostMapping::prepare_image(
+            16 * 1024,
+            HostImageSource::PrivateFile(file.as_file()),
+        )
+        .unwrap();
+        let abandoned = OwnedHostMapping::prepare_image(
+            16 * 1024,
+            HostImageSource::PrivateFile(file.as_file()),
+        )
+        .unwrap();
+        assert_eq!(count(), 2);
+        drop(abandoned);
+        assert_eq!(count(), 1);
+        assert_eq!(unsafe { peer.as_ptr().read() }, 0x35);
+        drop(peer);
+        assert_eq!(count(), 0);
+    }
 
     #[test]
     fn private_anon_uses_host_shared_backing_for_hvf_coherence() {

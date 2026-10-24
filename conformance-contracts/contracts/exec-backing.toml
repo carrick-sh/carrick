@@ -1,0 +1,16 @@
+schema_version = 1
+id = "process.exec.backing"
+title = "Uninstalled exec backing retains isolated physical image extents"
+guest_surfaces = ["syscall:execve", "syscall:execveat"]
+semantic_authority = ["execve(2): failure before replacement preserves the old image; mmap(2): MAP_PRIVATE writes do not modify the source file"]
+fixture = "Two real private host mappings, source descriptor release, sparse payload bounds and abandoned preparation"
+scale_points = [1, 2]
+structural_budgets = []
+rationale = "The existing exec mapper consumes one physical backing constructor. Anonymous preparation copies only occupied payload bytes; private executable artifacts retain demand-backed file mappings. The VM-free leaf witnesses prove host backing isolation and cleanup, not native MM publication, IPA/root-slot recovery or process replacement."
+
+[bindings]
+vm_free = "carrick-host::host_mapping::tests::exec_image_private_artifact_has_two_independent_retained_views; exec_image_sparse_payload_preserves_offsets_and_zero_tail; exec_image_invalid_extent_preserves_an_independent_preparation; exec_image_drop_releases_only_its_own_file_view"
+
+[bindings.unresolved]
+embed_structural = "Native service ticket binding, unpublished successor-MM publication and aggregate IPA/root-slot rollback remain #785 work; physical backing tests do not prove those boundaries."
+docker = "Signed exec replacement and Linux differential errno witnesses remain required for slice acceptance; no Docker or HVF is available on ctb-w1."
