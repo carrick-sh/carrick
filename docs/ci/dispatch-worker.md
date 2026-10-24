@@ -12,7 +12,7 @@ The owner (`tjfontaine`, account type `User`) can start a run by:
 - Applying `dispatch` or any `dispatch:*` label to an owner-authored issue.
   The suffix is free-text context for the model, never a model selector.
 - Creating an unedited `/agent [free text]` comment on an owner-authored
-  issue or an owned dispatch PR, including a merge-conflicted PR.
+  open issue or an owned dispatch PR, including a merge-conflicted PR.
 - Submitting a `changes_requested` review on an owned dispatch PR.
 
 The sender and triggering actor must both be the owner; the comment or review
@@ -28,7 +28,10 @@ select another linked `work/dispatch-*` branch before invoking workers. A
 candidate must have an open owned dispatch draft PR closing this issue, or an
 authenticated earlier run's handoff recording its publication. The server
 verifies the original run, workflow, owner identities and issue-scoped artifact
-name, then reads the live remote tip. A suggestive branch name alone grants no
+name, then reads the live remote tip. Without an open PR, the tip must equal
+the latest authenticated handoff publication for that branch. A branch with
+any closed or merged PR is refused. Reviews stay on the reviewed branch and
+cannot call `select_branch`. A suggestive branch name alone grants no
 authority. Other issues' branches, non-dispatch names and unlinked branches are
 refused. The explicit `select_branch` tool is the sole request schema with a
 branch field; no schema has issue, PR, repository or scope fields. PR triggers
@@ -77,8 +80,9 @@ accepts only the loop uid through Linux `SO_PEERCRED`, refusing the worker uid.
 `AGENT_DIRECTOR_TOKEN` is used only to bootstrap the pinned launcher from
 private `carrick-sh/agy-director`. The workflow provisions every available
 worker credential: `CODEX_AUTH_JSON` and `AGY_OAUTH_TOKEN`. Worker-private homes
-hold both; the separate loop home holds only agy auth. Codex can be absent; agy
-is required for the loop. These repository secrets are referenced only by
+contain only the selected backend’s credential subtree. The runner-private
+capacity-query home retains both; the separate loop home holds only agy auth.
+Codex can be absent; agy is required for the loop. These repository secrets are referenced only by
 `dispatch-worker.yml`, enforced by workflow tests. The owner's Mac refreshes
 them every 15 minutes; the director token is a read-only one-hour App token.
 The App private key never leaves the Mac.
@@ -110,16 +114,17 @@ There are no tool arguments for issue, PR, repository or scope. Only `select_bra
 | --- | --- |
 | `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, commits, issue/PR comments, earlier verified runs with URLs, conclusions, artifact names and outcome contracts. Includes their outcome comments and available branch candidates; board status is explicitly unavailable with this token. Includes the label/comment/review trigger verbatim and provenance. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
 | `select_branch {branch}` | Before workers begin, selects the new run branch or an authenticated issue-linked branch. Reads and retains its remote tip for the publication lease. |
-| `read_artifact {run, name}` | Reads one fixed text filename (`contract.json`, `handoff.json`, `raw.log`, `transcript.md`, `diffstat.txt`) from a completed earlier run. Verifies workflow/run/owner identity and the issue-derived upload bundle name. Rejects another issue, workflow, current run, expired/oversized bundle or unknown filename. Download is runner-private and the final read refuses symlinks and exceeds neither 64 KiB nor the event wall budget. |
-| `read_capacity {}` | Runs pinned `agy_worker.py capacity --json` as the worker account. Reads the real `backends` map from `capacity_report`, with `installed`, `free_slots`, `quota_free`, `score` and agy `quota.groups`/`group_scores`. Augments it with exact current IDs from the launcher's live `models --backend` roster, excluding superseded IDs. Returns numeric capacity and model IDs only, never credentials or raw diagnostics. Each query/output is bounded (120 s, 64 KiB) inside the event wall budget. |
-| `invoke_worker {notes, backend, model}` | Notes at most 8 KiB, with the model choice and reason. Refreshes capacity, refuses missing/uninstalled/full/exhausted backends and missing/exhausted models before charging either call or worker budget. Agy quota is checked for the selected model's group. Runs workers sequentially on the selected branch; each later worker sees earlier commits and a server-built handoff of contract summaries, tests and risks. All workers share 35 total minutes; owner trigger and inline review text are supplied verbatim, with coordinator notes separately labelled. |
+| `read_artifact {run, name}` | Reads one fixed text filename (`contract.json`, `handoff.json`, `raw.log`, `transcript.md`, `diffstat.txt`) from a completed earlier run. Verifies workflow/run/owner identity, a completed `carrick-agent` worker with successful upload, and the issue-derived upload bundle name. Review runs must have the same workflow blob as main. The returned contract, handoff or worker-transcript text is tagged with its dispatch provenance and marked untrusted. Rejects another issue, workflow, current run, expired/oversized bundle or unknown filename. Download is runner-private and the final read refuses symlinks and exceeds neither 64 KiB nor the event wall budget. |
+| `read_capacity {}` | Runs pinned `agy_worker.py capacity --json` as the worker account. Reads the real `backends` map from `capacity_report`, with `installed`, `free_slots`, `quota_free`, `score` and agy `quota.groups`/`group_scores`. Augments it with exact current IDs from the launcher's live `models --backend` roster, excluding superseded IDs. Returns numeric capacity and model IDs only, never credentials or raw diagnostics. The capacity snapshot is queried once per loop invocation and reused, including on refused choices. Each subprocess/output is bounded (120 s, 64 KiB) inside the event wall budget. |
+| `invoke_worker {notes, backend, model}` | Notes at most 8 KiB, with the model choice and reason. Checks remaining worker, tool-call and time budgets before consulting the cached capacity snapshot; refuses missing/uninstalled/full/exhausted backends and missing/exhausted models before charging either call or worker budget. Agy quota is checked for the selected model's group. Three refused worker requests exhaust their separate refusal budget without charging workers. Runs workers sequentially on the selected branch; each later worker sees earlier commits and a server-built handoff of contract summaries, tests and risks. All workers share 35 total minutes; owner trigger and inline review text are supplied verbatim, with coordinator notes separately labelled. |
 | `publish {}` | Shared receipt/ownership checks; refuses `.github/workflows/*`; only the admitted branch, fixed refspec and expected-tip lease. Creates a draft with the first commit's title, PR template, `Closes #N` and run URL, or retains the owned PR. |
 | `comment {body}` | At most 8 KiB; posts only on this issue or its continued PR, with token masking, credential redaction and a verified run footer. |
 | `finish {status, summary}` | `done`, `blocked` or `failed`; posts an outcome with a bounded contract preview (full claims remain in artifacts), worker contract excerpt, selected backend/model and reasoning, budgets and run URL. One attempt, exempt from call budget; failed posting stops the loop and triggers one server fallback. |
 
 The only ceilings are `[loop]` in `.github/dispatch-tiers.toml`: 12 tool calls,
-two state reads, three workers, one publication, two optional comments, 64 KiB
-state, 45 wall minutes including at most 35 total worker minutes. There
+two state reads, three workers, three refused worker requests, one publication,
+two optional comments, 64 KiB state, 45 wall minutes including at most 35 total
+worker minutes. There
 are no dispatch tier tables or tier-selected credentials. The loop chooses
 from live capacity and explains its choice in the outcome. No retries or
 budget increases occur on refusals. If the loop exits or times out without
@@ -128,10 +133,19 @@ cancellation or GitHub failure can prevent that network report.
 
 Provenance is information, never authority. `owner` requires the owner User;
 `dispatch-agent(run N)` requires a bot post with a verified last run footer,
-repository, workflow and owner actors. Issue and comment runs use main;
-reviews use this issue's dispatch branch. Available issue/PR mappings must
-match. Write collaborators are tagged `collaborator(login)`; all others are
-`unverified`, with bodies withheld. Lookups are cached. No provenance tag can
+repository, workflow, owner actors and successful artifact upload on an agent
+runner. Issue and comment runs use main; review runs require their workflow
+blob to equal main. Available issue/PR mappings and the artifact bundle must
+match. Commit authors never grant owner or collaborator provenance: commits
+are tagged `commit(author-claimed)`, and their messages are withheld unless
+their SHAs belong to an authenticated handoff’s published-tip parent chain.
+Deleted or invalid linked runs are skipped. History discovery inspects at
+most 32 prior run candidates, combining linked branches and comment footers
+with completed issue/comment runs of this workflow after issue creation; it
+never scans the repository-wide artifact inventory. Contracts from verified
+artifacts take precedence over comment previews, and the server’s outcome
+block precedes all model text. Write collaborators are tagged
+`collaborator(login)`; all others are `unverified`, with bodies withheld. Lookups are cached. No provenance tag can
 widen tool permissions. Admission is bound to the webhook digest in private
 runner state; auth and the loop consume it without reinterpreting labels.
 

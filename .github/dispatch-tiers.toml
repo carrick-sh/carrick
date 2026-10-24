@@ -5,6 +5,7 @@ model = "high"
 calls = 12
 reads = 2
 workers = 3
+refused_workers = 3
 publishes = 1
 comments = 2
 response_bytes = 65536
