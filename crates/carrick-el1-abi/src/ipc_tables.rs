@@ -8,7 +8,7 @@
 //! entry is not served (EL1 forwards): publication is the host's admission
 //! of a complete descriptor namespace, withdrawal its revocation.
 //!
-//! Concurrency: one host writer at a time (`writer` lock word), lock-free
+//! Concurrency: one host or ring writer at a time (`writer` lock word), lock-free
 //! EL1 readers. Each entry is a sequence lock: the writer makes `seq` odd,
 //! writes the fields, then makes it even (Release); a reader that sees an
 //! odd or changed `seq` treats the entry as absent (fail closed: forward).
@@ -34,7 +34,20 @@ pub struct IpcTableMapEntry {
     authority: AtomicU64,
     index: AtomicU64,
     generation: AtomicU64,
+    retirement: AtomicU32,
 }
+
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq)]
+enum RetirementOwner {
+    /// The published table is borrowed from a retained external binding.
+    Binding = 0,
+    /// The directory retains the table until its lifecycle owner takes it.
+    Directory = 1,
+}
+
+pub const RETIREMENT_OWNER_OFFSET: u64 = core::mem::offset_of!(IpcTableMapEntry, retirement) as u64;
+pub const RETIREMENT_PROTOCOL_VERSION: u64 = 1;
 
 #[repr(C, align(64))]
 #[derive(Debug)]
@@ -56,6 +69,8 @@ pub enum IpcTableMapError {
     /// No free entry within the probe bound: the table stays unpublished
     /// (its calls forward), never misrouted.
     Full,
+    /// A live binding already retains this identity; replacement would lose custody.
+    Occupied,
 }
 
 fn home(file_table: u64) -> usize {
@@ -89,19 +104,39 @@ impl IpcTableMap {
         WriterGuard(&self.writer)
     }
 
-    fn store(entry: &IpcTableMapEntry, file_table: u64, table: RawTableId) {
+    fn store(entry: &IpcTableMapEntry, file_table: u64, table: RawTableId, owner: RetirementOwner) {
         let seq = entry.seq.load(Ordering::Relaxed);
         entry.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
         core::sync::atomic::fence(Ordering::Release);
         entry.authority.store(table.authority, Ordering::Relaxed);
         entry.index.store(table.index, Ordering::Relaxed);
         entry.generation.store(table.generation, Ordering::Relaxed);
+        entry.retirement.store(owner as u32, Ordering::Relaxed);
         entry.file_table.store(file_table, Ordering::Relaxed);
         entry.seq.store(seq.wrapping_add(2), Ordering::Release);
     }
 
     /// Host: publish (or replace) `file_table`'s shared table.
     pub fn publish(&self, file_table: u64, table: RawTableId) -> Result<(), IpcTableMapError> {
+        self.publish_with_owner(file_table, table, RetirementOwner::Binding)
+    }
+
+    /// Transfer an unpublished table to the directory's lifecycle custody.
+    /// Refusal leaves ownership with the caller and cannot replace a binding.
+    pub fn publish_owned(
+        &self,
+        file_table: u64,
+        table: RawTableId,
+    ) -> Result<(), IpcTableMapError> {
+        self.publish_with_owner(file_table, table, RetirementOwner::Directory)
+    }
+
+    fn publish_with_owner(
+        &self,
+        file_table: u64,
+        table: RawTableId,
+        owner: RetirementOwner,
+    ) -> Result<(), IpcTableMapError> {
         if file_table == EMPTY || file_table == TOMBSTONE {
             return Err(IpcTableMapError::InvalidKey);
         }
@@ -110,7 +145,12 @@ impl IpcTableMap {
         for i in Self::probe(file_table) {
             let key = self.entries[i].file_table.load(Ordering::Relaxed);
             if key == file_table {
-                Self::store(&self.entries[i], file_table, table);
+                if owner == RetirementOwner::Directory
+                    || self.entries[i].retirement.load(Ordering::Relaxed) != owner as u32
+                {
+                    return Err(IpcTableMapError::Occupied);
+                }
+                Self::store(&self.entries[i], file_table, table, owner);
                 return Ok(());
             }
             if free.is_none() && (key == EMPTY || key == TOMBSTONE) {
@@ -121,24 +161,53 @@ impl IpcTableMap {
             }
         }
         let i = free.ok_or(IpcTableMapError::Full)?;
-        Self::store(&self.entries[i], file_table, table);
+        Self::store(&self.entries[i], file_table, table, owner);
         Ok(())
     }
 
     /// Host: withdraw `file_table` (its calls forward from now on).
     pub fn withdraw(&self, file_table: u64) {
+        let _ = self.withdraw_table(file_table);
+    }
+
+    /// Withdraw and transfer the exact table identity under the writer lock.
+    /// Lifecycle callers must not use a lookup followed by withdrawal: a
+    /// seqlock lookup may report transient absence during another publication.
+    pub fn withdraw_table(&self, file_table: u64) -> Option<RawTableId> {
+        self.withdraw_with_owner(file_table, RetirementOwner::Binding)
+    }
+
+    /// Consume only directory-owned custody. Borrowed host bindings keep
+    /// their own retirement owner (including a native runtime's root).
+    pub fn take_owned(&self, file_table: u64) -> Option<RawTableId> {
+        self.withdraw_with_owner(file_table, RetirementOwner::Directory)
+    }
+
+    fn withdraw_with_owner(&self, file_table: u64, owner: RetirementOwner) -> Option<RawTableId> {
+        if file_table == EMPTY || file_table == TOMBSTONE {
+            return None;
+        }
         let _writer = self.lock();
         for i in Self::probe(file_table) {
             let entry = &self.entries[i];
             let key = entry.file_table.load(Ordering::Relaxed);
             if key == file_table {
-                Self::store(entry, TOMBSTONE, RawTableId::default());
-                return;
+                if entry.retirement.load(Ordering::Relaxed) != owner as u32 {
+                    return None;
+                }
+                let table = RawTableId {
+                    authority: entry.authority.load(Ordering::Relaxed),
+                    index: entry.index.load(Ordering::Relaxed),
+                    generation: entry.generation.load(Ordering::Relaxed),
+                };
+                Self::store(entry, TOMBSTONE, RawTableId::default(), owner);
+                return Some(table);
             }
             if key == EMPTY {
-                return;
+                return None;
             }
         }
+        None
     }
 
     /// EL1 or host: the table published for `file_table`, if any. At most
@@ -208,11 +277,33 @@ mod tests {
         assert_eq!(m.lookup(5), Some(raw(1)));
         m.publish(5, raw(3)).unwrap();
         assert_eq!(m.lookup(5), Some(raw(3)), "fork/unshare republishes");
-        m.withdraw(5);
+        assert_eq!(m.withdraw_table(5), Some(raw(3)));
+        assert_eq!(m.withdraw_table(5), None, "custody transfers once");
         assert_eq!(m.lookup(5), None);
         assert_eq!(m.lookup(6), Some(raw(2)), "tombstones keep probing");
         assert_eq!(m.publish(0, raw(1)), Err(IpcTableMapError::InvalidKey));
         assert_eq!(m.lookup(0), None);
+        assert_eq!(m.withdraw_table(0), None);
+        assert_eq!(m.withdraw_table(u64::MAX), None);
+    }
+
+    #[test]
+    fn directory_custody_cannot_replace_or_retire_a_borrowed_binding() {
+        let m = map();
+        m.publish(5, raw(1)).unwrap();
+        assert_eq!(m.publish_owned(5, raw(2)), Err(IpcTableMapError::Occupied));
+        assert_eq!(m.take_owned(5), None);
+        assert_eq!(m.lookup(5), Some(raw(1)));
+        m.publish_owned(6, raw(2)).unwrap();
+        assert_eq!(m.publish(6, raw(3)), Err(IpcTableMapError::Occupied));
+        assert_eq!(m.publish_owned(6, raw(3)), Err(IpcTableMapError::Occupied));
+        m.withdraw(6);
+        assert_eq!(m.lookup(6), Some(raw(2)));
+        assert_eq!(m.take_owned(6), Some(raw(2)));
+        assert_eq!(m.take_owned(6), None);
+        assert_eq!(m.withdraw_table(5), Some(raw(1)));
+        assert_eq!(m.take_owned(0), None);
+        assert_eq!(m.take_owned(u64::MAX), None);
     }
 
     #[test]
