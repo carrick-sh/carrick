@@ -1079,7 +1079,15 @@ contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/process.rs"
-contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.exec.custody"]
+
+[[surfaces]]
+path = "crates/carrick-sched-core/src/process/exec.rs"
+contracts = ["process.exec.custody"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/exec.rs"
+contracts = ["process.exec.custody"]
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/process/identity_allocator.rs"
