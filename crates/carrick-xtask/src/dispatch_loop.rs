@@ -1004,7 +1004,16 @@ trait WorkerLauncher {
     fn produce(&mut self, root: &Path, dispatch: &Dispatch, setup: &str)
     -> Result<(), ScalerError>;
 }
-struct NativeLauncher;
+struct NativeLauncher {
+    host: Box<dyn WorkerHost>,
+}
+impl Default for NativeLauncher {
+    fn default() -> Self {
+        Self {
+            host: Box::new(NativeWorkerHost),
+        }
+    }
+}
 impl WorkerLauncher for NativeLauncher {
     fn capacity(&mut self, deadline: Instant) -> Result<Value, ScalerError> {
         read_capacity(deadline)
@@ -1015,9 +1024,10 @@ impl WorkerLauncher for NativeLauncher {
         dispatch: &Dispatch,
         setup: &str,
     ) -> Result<(), ScalerError> {
-        if let Err(error) = produce(root, dispatch, setup) {
-            let retirement = cleanup_agent_user();
-            record_worker_failure(&error)?;
+        let _harvest = dispatch.harvest_deadline.map(CommandWindow::until);
+        if let Err(error) = produce(root, dispatch, setup, self.host.as_mut()) {
+            let retirement = self.host.retire();
+            record_worker_failure(&error, dispatch)?;
             retirement?;
         }
         Ok(())
@@ -1625,8 +1635,9 @@ impl Server<'_> {
                 }
                 cleanup_agent_user()?;
                 let state = crate::agent_runner::state()?;
-                let receipt: Receipt =
-                    serde_json::from_str(&regular_text(&state.join("receipt.json"))?)?;
+                let receipt = worker_checkpoint(&state, &self.dispatch)?.ok_or(
+                    ScalerError::Guard("no successfully harvested worker checkpoint to publish"),
+                )?;
                 if receipt.branch != self.dispatch.branch
                     || receipt.base != self.dispatch.base
                     || receipt.refused_workflow
@@ -1844,6 +1855,9 @@ fn post_loop_capture(
 ) -> Result<(), ScalerError> {
     let _capture =
         CommandWindow::until((Instant::now() + Duration::from_secs(90)).min(final_deadline));
+    // finish may have sealed an earlier population. Revoke readiness before
+    // any capture/retirement work can fail or append diagnostics.
+    artifacts_ready(false)?;
     retire()?;
     hand_back()?;
     capture_loop_foreground(actor)?;
@@ -1926,7 +1940,7 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
             .ok_or(ScalerError::Guard("missing job token"))?,
         finished: false,
         setup,
-        launcher: Box::new(NativeLauncher),
+        launcher: Box::new(NativeLauncher::default()),
         capacity: None,
     };
     let result = (|| -> Result<(), ScalerError> {
@@ -2032,9 +2046,6 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
             },
             final_deadline,
         )?;
-        if server.finished {
-            artifacts_ready(false)?;
-        }
         loop_transcript()?;
         if server.finished {
             mask_artifacts(
@@ -2111,7 +2122,7 @@ mod tests {
             token: "fixture-token".into(),
             finished: false,
             setup: "success/success",
-            launcher: Box::new(NativeLauncher),
+            launcher: Box::new(NativeLauncher::default()),
             capacity: None,
         }
     }
@@ -2272,33 +2283,65 @@ mod tests {
             model: "gpt-6.1-sol".into(),
         })
     }
-    struct TimeoutLauncher;
-    impl WorkerLauncher for TimeoutLauncher {
-        fn capacity(&mut self, _: Instant) -> Result<Value, ScalerError> {
-            Ok(live_capacity())
+    #[derive(Clone, Copy)]
+    enum FixtureTurn {
+        Good,
+        CorruptSnapshot,
+        Continue,
+        Timeout,
+        HandBackFailure,
+    }
+    struct NativeFixtureHost {
+        turns: std::collections::VecDeque<FixtureTurn>,
+        active: FixtureTurn,
+        retired: bool,
+        calls: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+    impl WorkerHost for NativeFixtureHost {
+        fn initialize(&mut self) -> Result<(), ScalerError> {
+            Ok(())
         }
-        fn produce(
-            &mut self,
-            root: &Path,
-            dispatch: &Dispatch,
-            _: &str,
-        ) -> Result<(), ScalerError> {
-            let actor = tempfile::tempdir()?;
-            let target = actor.path().join("work");
+        fn prepare(&mut self, _: &Path, _: &Path, _: &str) -> Result<(), ScalerError> {
+            Ok(())
+        }
+        fn agent_deadline(&self, allotted: Instant) -> Instant {
+            if matches!(self.turns.front(), Some(FixtureTurn::Timeout)) {
+                // Start the timeout stimulus at launch; checkout speed must not
+                // decide whether this fixture ever exercises a foreground child.
+                allotted.min(Instant::now() + Duration::from_secs(2))
+            } else {
+                allotted
+            }
+        }
+        fn agent(&mut self, root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
+            self.active = self
+                .turns
+                .pop_front()
+                .expect("unexpected extra worker launch");
+            self.calls.set(self.calls.get() + 1);
+            self.retired = false;
             let state = crate::agent_runner::state()?;
-            std::fs::create_dir_all(&state)?;
-            worker_checkout(root, &state.join("work"), &target, dispatch, None)?;
-            // The foreground fixture writes partial work and logs, then exceeds
-            // the actual agent deadline. The normal command runner kills it.
+            let actor = root.parent().unwrap();
+            let script = match self.active {
+                FixtureTurn::Good => "printf good > first-good",
+                FixtureTurn::CorruptSnapshot => "test -f first-good; mkdir .git/objects/not-hex",
+                FixtureTurn::Continue => "test -f first-good; test ! -d .git/objects/not-hex",
+                FixtureTurn::Timeout => "printf partial > unfinished; sleep 30",
+                FixtureTurn::HandBackFailure => "printf lost > incomplete",
+            };
+            // This is the real foreground process: it writes its own contract,
+            // stdout evidence and work before the deadline runner can kill it.
+            let source = format!(
+                "printf 'fixture agent started\n' > \"$1\"; printf '%s' \"$3\" > \"$2\"; {script}"
+            );
+            let contract = json!({"structured_output":{"status":"done","summary":"fixture worker progress","tests":[],"risks":[]}}).to_string();
             let mut command = Command::new("/bin/sh");
             command
-                .arg("-c")
-                .arg("printf partial > unfinished; printf 'worker started\n' > \"$1\"; sleep 10")
-                .arg("fixture")
+                .args(["-c", &source, "fixture"])
                 .arg(state.join("agent.out"))
-                .current_dir(&target)
-                .stdout(std::fs::File::create(state.join("agent.out"))?)
-                .stderr(std::fs::File::create(state.join("agent.err"))?);
+                .arg(actor.join("result.json"))
+                .arg(contract)
+                .current_dir(root);
             let result = crate::ci_scaler::execute(
                 &mut command,
                 &[],
@@ -2307,61 +2350,180 @@ mod tests {
                     .unwrap()
                     .saturating_duration_since(Instant::now()),
             );
-            assert!(result.is_err(), "fixture agent did not time out");
-            let work = state.join("work");
-            let (contract, _, diffstat, _) =
-                harvest_worker(actor.path(), &work, dispatch, Ok(124))?;
-            let package = root.parent().unwrap().join("dispatch-output");
-            std::fs::create_dir_all(&package)?;
-            std::fs::write(
-                package.join("raw.log"),
-                regular_text(&state.join("agent.out"))?,
-            )?;
-            for name in ["transcript.md", "diffstat.txt"] {
-                std::fs::write(package.join(name), "")?;
+            std::fs::write(state.join("agent.err"), "")?;
+            if matches!(self.active, FixtureTurn::Timeout) {
+                assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(|e| e.to_string().contains("timed out")),
+                    "foreground fixture did not exceed its real deadline: {result:?}"
+                );
+                Ok(124)
+            } else {
+                result?;
+                if matches!(self.active, FixtureTurn::Good) {
+                    git(root, &["add", "--", "first-good"])?;
+                    git(root, &["commit", "-m", "fix(ci): first good worker"])?;
+                }
+                Ok(0)
             }
-            std::fs::write(package.join("diffstat.txt"), diffstat)?;
-            std::fs::write(
-                package.join("contract.json"),
-                serde_json::to_vec(&contract)?,
-            )?;
+        }
+        fn retire(&mut self) -> Result<(), ScalerError> {
+            output(&mut Command::new("/usr/bin/true"))?;
+            self.retired = true;
+            Ok(())
+        }
+        fn hand_back(&mut self, _: &Path) -> Result<(), ScalerError> {
+            assert!(self.retired, "candidate read before retirement");
+            output(&mut Command::new("/usr/bin/true"))?;
+            if matches!(self.active, FixtureTurn::HandBackFailure) {
+                return Err(ScalerError::Guard("fixture harvest hand-back failed"));
+            }
             Ok(())
         }
     }
+    fn native_fixture(
+        turns: Vec<FixtureTurn>,
+    ) -> (NativeLauncher, std::rc::Rc<std::cell::Cell<u32>>) {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        (
+            NativeLauncher {
+                host: Box::new(NativeFixtureHost {
+                    turns: turns.into(),
+                    active: FixtureTurn::Continue,
+                    retired: true,
+                    calls: calls.clone(),
+                }),
+            },
+            calls,
+        )
+    }
+    fn native_dispatch(root: &Path) -> Dispatch {
+        std::fs::create_dir(root).unwrap();
+        git(root, &["init", "-b", "main"]).unwrap();
+        git(root, &["commit", "--allow-empty", "-m", "base"]).unwrap();
+        let mut dispatch = server(root).dispatch;
+        dispatch.resume = false;
+        dispatch.review = false;
+        dispatch.base = git(root, &["rev-parse", "HEAD"]).unwrap().trim().into();
+        dispatch.loop_deadline = Some(Instant::now() + Duration::from_secs(60));
+        dispatch.harvest_deadline = Some(Instant::now() + Duration::from_secs(60));
+        dispatch
+    }
     #[test]
-    fn timed_out_worker_retains_checkpoint_logs_and_failed_contract() {
-        shared_fixture(|temporary| {
-            let root = temporary.join("base");
-            std::fs::create_dir(&root).unwrap();
-            git(&root, &["init", "-b", "main"]).unwrap();
-            git(&root, &["commit", "--allow-empty", "-m", "base"]).unwrap();
-            let mut server = server(&root);
-            server.dispatch.base = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().into();
-            server.dispatch.resume = false;
-            server.dispatch.review = false;
-            server.policy.worker_minutes = 1;
-            server.policy.harvest_seconds = 30;
-            server.used.worker_millis = 28_000;
-            server.launcher = Box::new(TimeoutLauncher);
-            server
-                .execute(worker_request())
-                .expect("timeout lost mandatory harvest");
-            let work = crate::agent_runner::state().unwrap().join("work");
+    fn review_native_timeout_keeps_checkpoint_and_contract() {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let (mut native, calls) = native_fixture(vec![FixtureTurn::Timeout]);
+            native.produce(&base, &dispatch, "success/success").unwrap();
+            let state = crate::agent_runner::state().unwrap();
+            assert_eq!(calls.get(), 1);
             assert!(
-                git(&work, &["log", "-1", "--format=%s"])
-                    .unwrap()
+                git(&state.join("work"), &["log", "-1", "--format=%s"])
+                    .expect("native timeout lost checkpoint")
                     .contains("checkpoint")
             );
-            let package = temporary.join("dispatch-output");
-            assert!(!regular_text(&package.join("raw.log")).unwrap().is_empty());
+            let package = root.join("dispatch-output");
             let contract: Contract =
                 serde_json::from_str(&regular_text(&package.join("contract.json")).unwrap())
                     .unwrap();
             assert_eq!(contract.status, ContractStatus::Failed);
             assert!(
-                contract.summary.contains("timed out"),
-                "{}",
+                contract.summary.contains("fixture worker progress")
+                    && contract.summary.contains("timed out"),
+                "native timeout lost worker contract: {}",
                 contract.summary
+            );
+            assert!(
+                regular_text(&package.join("raw.log"))
+                    .unwrap()
+                    .contains("fixture agent started")
+            );
+        });
+    }
+    #[test]
+    fn review_native_harvest_error_never_reruns_setup() {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let (mut native, calls) = native_fixture(vec![FixtureTurn::HandBackFailure]);
+            native.produce(&base, &dispatch, "success/success").unwrap();
+            let contract: Contract = serde_json::from_str(
+                &regular_text(&root.join("dispatch-output/contract.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(calls.get(), 1);
+            assert!(
+                contract
+                    .summary
+                    .contains("fixture harvest hand-back failed")
+                    && !contract.summary.contains("setup did not complete"),
+                "native launcher reran setup: {}",
+                contract.summary
+            );
+        });
+    }
+    #[test]
+    fn review_native_failed_harvest_preserves_previous_publication_and_continuation() {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let mut dispatch = native_dispatch(&base);
+            dispatch.loop_deadline = Some(Instant::now() + Duration::from_secs(60));
+            let (mut native, calls) = native_fixture(vec![
+                FixtureTurn::Good,
+                FixtureTurn::CorruptSnapshot,
+                FixtureTurn::Continue,
+            ]);
+            native.produce(&base, &dispatch, "success/success").unwrap();
+            let state = crate::agent_runner::state().unwrap();
+            let good = git(&state.join("work"), &["rev-parse", "HEAD"]).unwrap();
+            native.produce(&base, &dispatch, "success/success").unwrap();
+            let receipt: Receipt = serde_json::from_str(
+                &regular_text(&state.join("receipt.json"))
+                    .expect("failed harvest erased previous publication receipt"),
+            )
+            .unwrap();
+            assert!(!receipt.refused_workflow);
+            assert_eq!(
+                git(&state.join("work"), &["rev-parse", "HEAD"]).unwrap(),
+                good,
+                "failed harvest replaced last good tree"
+            );
+            native.produce(&base, &dispatch, "success/success").unwrap();
+            assert_eq!(
+                calls.get(),
+                3,
+                "harvest failure poisoned every later worker"
+            );
+            std::fs::write(root.join("remote-tip"), &good).unwrap();
+            let contract: Contract = serde_json::from_str(
+                &regular_text(&root.join("dispatch-output/contract.json")).unwrap(),
+            )
+            .unwrap();
+            let report = state.join("publication.md");
+            std::fs::write(&report, "").unwrap();
+            assert_eq!(
+                publish(
+                    &base,
+                    &dispatch,
+                    &receipt,
+                    &contract,
+                    &report,
+                    "fixture-token",
+                    &mut RunCache::default()
+                )
+                .unwrap(),
+                Some(800),
+                "last good worker was no longer publishable"
+            );
+            assert_eq!(
+                regular_text(&state.join("published-tip")).unwrap(),
+                good.trim()
+            );
+            assert_eq!(
+                regular_text(&state.join("work/first-good")).unwrap(),
+                "good"
             );
         });
     }
@@ -3034,6 +3196,30 @@ esac
         });
     }
     #[test]
+    fn review_failed_final_capture_revokes_upload_readiness() {
+        shared_fixture(|root| {
+            server(root)
+                .outcome(ContractStatus::Done, "finished")
+                .unwrap();
+            let error = post_loop_capture(
+                root,
+                || Ok(()),
+                || Err(ScalerError::Guard("fixture hand-back failed")),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("hand-back failed"));
+            let output = regular_text(&root.join("outputs")).unwrap();
+            assert_eq!(
+                output
+                    .lines()
+                    .rfind(|line| line.starts_with("artifacts_ready=")),
+                Some("artifacts_ready=false"),
+                "failed final capture left unscanned upload enabled"
+            );
+        });
+    }
+    #[test]
     fn review_transcript_frames_and_reserves_every_stream() {
         shared_fixture(|root| {
             let state = crate::agent_runner::state().unwrap();
@@ -3166,7 +3352,7 @@ esac
             )
             .unwrap();
             let error = ScalerError::Guard("snapshot refused candidate symlink");
-            record_worker_failure(&error).unwrap();
+            record_worker_failure(&error, &server(root).dispatch).unwrap();
             let package = root.join("dispatch-output");
             mask_artifacts(&package, "fixture-token").unwrap();
             let contract: Contract =
