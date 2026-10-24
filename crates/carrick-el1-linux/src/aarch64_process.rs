@@ -636,6 +636,26 @@ impl core::fmt::Debug for Born {
 }
 
 pub trait ForkStockCrossing {
+    /// The carrier's complete shared descriptor namespace, if admitted.
+    fn ipc_binding(
+        &self,
+    ) -> Option<(
+        carrick_el1_abi::ipc::IpcRegion<'_>,
+        &carrick_el1_abi::ipc_tables::IpcTableMap,
+    )> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            let map = carrick_el1_abi::ipc_table_map_guest();
+            if !map.window_published() {
+                return None;
+            }
+            Some((carrick_el1_abi::ipc_window_guest()?.attach().ok()?, map))
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            None
+        }
+    }
     /// The carrier's shared descriptor metadata, owned by the guest kernel.
     fn open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -681,6 +701,14 @@ pub trait ForkStockCrossing {
 }
 
 impl<T: ForkStockCrossing> ForkStockCrossing for &T {
+    fn ipc_binding(
+        &self,
+    ) -> Option<(
+        carrick_el1_abi::ipc::IpcRegion<'_>,
+        &carrick_el1_abi::ipc_tables::IpcTableMap,
+    )> {
+        T::ipc_binding(self)
+    }
     fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError> {
         (**self).cross_child_reclaim(mm, cpu)
     }

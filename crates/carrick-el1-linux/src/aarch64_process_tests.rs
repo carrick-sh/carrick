@@ -153,6 +153,11 @@ enum CommitFault {
 
 struct TestStockCrossing {
     #[cfg(test)]
+    ipc: Option<(
+        std::sync::Arc<carrick_kernel::el1_ipc::HostIpc>,
+        &'static carrick_el1_abi::ipc_tables::IpcTableMap,
+    )>,
+    #[cfg(test)]
     physical: Option<std::sync::Mutex<native_retirement_tests::PhysicalStock>>,
     fd_map: Vec<carrick_el1_abi::FdMapSlot>,
     open_table: Vec<carrick_el1_abi::DelegatedOpenFile>,
@@ -191,6 +196,8 @@ impl TestStockCrossing {
 
     fn new(stock_pages: &[u64]) -> Self {
         Self {
+            #[cfg(test)]
+            ipc: None,
             open_table: (0..16)
                 .map(|_| carrick_el1_abi::DelegatedOpenFile::new())
                 .collect(),
@@ -228,6 +235,16 @@ impl TestStockCrossing {
 }
 
 impl ForkStockCrossing for TestStockCrossing {
+    #[cfg(test)]
+    fn ipc_binding(
+        &self,
+    ) -> Option<(
+        carrick_el1_abi::ipc::IpcRegion<'_>,
+        &carrick_el1_abi::ipc_tables::IpcTableMap,
+    )> {
+        self.ipc.as_ref().map(|(owner, map)| (owner.region(), *map))
+    }
+
     fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError> {
         let zone = self.zone.lock().unwrap().unwrap();
         let (binding, _) = self.child.lock().unwrap().unwrap();
@@ -7063,4 +7080,116 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
         None
     );
     assert_eq!((later.elr, later.x[0]), (0x600004, 99));
+}
+
+#[test]
+fn native_fork_two_children_inherit_the_complete_ipc_namespace() {
+    use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
+    use carrick_kernel::el1_ipc::{HostIpc, HostTable};
+    use carrick_sched_core::ShortLockSpin;
+    use std::sync::Arc;
+
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+    let table = HostTable::create(Arc::clone(&owner), 64, 64).unwrap();
+    let object = owner.create_pipe(65536).unwrap();
+    let reader = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Reader,
+            }
+            .encode(),
+            fd::AccessMode::ReadOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    let writer = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Writer,
+            }
+            .encode(),
+            fd::AccessMode::WriteOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    reader.install(table.id(), fd::Fd(3), false).unwrap();
+    writer.install(table.id(), fd::Fd(4), true).unwrap();
+    // Aligned, zero-initialized ABI storage; no process-global fixture pointer.
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    map.publish(5, table.id().to_raw()).unwrap();
+    let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = TestStockCrossing::new(&pages);
+    crossing.ipc = Some((Arc::clone(&owner), map));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let parent = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let children: [_; 2] = core::array::from_fn(|_| {
+        let mut entry = runtime
+            .enter(source, &fixture.task, parked, &mut service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("native fork must return");
+        };
+        assert!(result.raw() > 0, "fork errno number: {}", -result.raw());
+        let child = runtime
+            .namespace_child_key(parent, result.raw() as u32)
+            .unwrap();
+        let binding = runtime.task_binding(child).unwrap();
+        fixture.zone.record(binding.record.id).identity().file_table
+    });
+    assert_ne!(children[0], children[1]);
+    let ipc = owner.region();
+    let authority = ipc.fd(ShortLockSpin);
+    for child in children {
+        let raw = map
+            .lookup(child)
+            .expect("native child has no IPC namespace");
+        let child_table = fd::TableId::from_raw(raw);
+        assert_ne!(child_table, table.id());
+        assert_eq!(
+            authority.get(child_table, fd::Fd(3)).unwrap().backing,
+            IpcBacking::Pipe {
+                object,
+                end: End::Reader
+            }
+            .encode()
+        );
+        assert_eq!(authority.getfd(child_table, fd::Fd(4)), Ok(true));
+    }
 }
