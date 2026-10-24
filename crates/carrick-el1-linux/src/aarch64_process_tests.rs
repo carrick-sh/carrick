@@ -7312,6 +7312,15 @@ fn native_fork_two_children_inherit_the_complete_ipc_namespace() {
         0,
         "EOF is due only after both child writer descriptions close"
     );
+    assert_eq!(
+        ipc.lock(object, &ShortLockSpin)
+            .unwrap()
+            .pipe()
+            .unwrap()
+            .read_with(1, |_| panic!("EOF copies no bytes"))
+            .result,
+        Ok(0)
+    );
     table.close(fd::Fd(3)).unwrap();
     drop(reader);
     assert!(
@@ -7324,4 +7333,17 @@ fn native_fork_two_children_inherit_the_complete_ipc_namespace() {
         1,
         "only the live parent retains table backing"
     );
+    // Root exit crosses to the host owner. The native hook must not also
+    // retire that owner's table; HostTable's eventual Drop closes it once.
+    let parent_table = table.id();
+    service.retire_fd_table(5);
+    if let Err(error) = authority.backing_capacity(parent_table) {
+        // Preserve the assertion on the red implementation instead of a
+        // second-retirement fatal abort from fixture destruction.
+        core::mem::forget(table);
+        panic!("native retirement stole the host-owned root table: {error:?}");
+    }
+    assert_eq!(map.lookup(5), Some(parent_table.to_raw()));
+    drop(table);
+    assert_eq!(ipc.descriptor_allocations(), 0);
 }
