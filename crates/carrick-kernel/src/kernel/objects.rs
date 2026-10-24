@@ -2825,7 +2825,9 @@ impl FileTable {
             .ok_or(crate::linux_abi::LINUX_EBADF)?;
         let mut open_files = self.write_open_files();
         let mut reserved = self.lock_reserved_slots();
-        let ipc_bound = matches!(*self.ipc.lock(), Some(Ok(_)));
+        let ipc = self.ipc.lock();
+        let ipc_bound = matches!(*ipc, Some(Ok(_)));
+        drop(ipc);
 
         // All authentication and occupancy checks precede publication. The
         // cursor was advanced at admission; cancellation, not commit, rewinds it.
