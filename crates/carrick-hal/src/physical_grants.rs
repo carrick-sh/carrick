@@ -315,14 +315,16 @@ impl<R> NativePhysicalGrants<R> {
         );
         Ok(grants)
     }
-    /// Settle exact USED receipts while the MM editor is excluded. Live
-    /// descriptor output is supplied by the ISA adapter; inventory identities,
-    /// bounded page work and once-only pool completion belong to this owner.
+    /// Settle exact USED receipts while the MM editor is excluded.
+    ///
+    /// USED authenticates a completed ring-owned publication, not the current
+    /// descriptor: a later MAP_FIXED or unmap may already have replaced it.
+    /// This owner authenticates retained physical custody and completes the
+    /// pool record exactly once; no backend descriptor verdict is accepted.
     pub fn settle(
         &mut self,
         pool: &carrick_el1_abi::CowGrantPool,
         excluded: &carrick_sched_core::ExcludedEditor<'_>,
-        mut output: impl FnMut(u64) -> Option<u64>,
     ) -> Result<usize, TrapError> {
         let fail = || TrapError::Hypervisor("native USED physical receipt mismatch".into());
         if excluded.key() != self.owner.native_mm.raw().get() || pool.claimed_by(excluded) {
@@ -344,9 +346,6 @@ impl<R> NativePhysicalGrants<R> {
                     carrick_guest_mem::Gpa::new(grant.physical_ipa),
                     entry.custody.length,
                 )
-                || (0..completion.span_len).step_by(4096).any(|offset| {
-                    output(completion.span_va + offset) != Some(completion.new_ipa + offset)
-                })
                 || !pool.finish(excluded, &grant)
             {
                 return Err(fail());

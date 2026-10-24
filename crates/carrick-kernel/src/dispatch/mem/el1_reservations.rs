@@ -1197,4 +1197,3 @@ pub use provider::{HostReservationProvider, PreparedHostReservations, PreparedRe
 #[path = "el1_reservations/returns.rs"]
 mod returns;
 pub use returns::El1ReturnError;
-pub(crate) use returns::settle_final_root;

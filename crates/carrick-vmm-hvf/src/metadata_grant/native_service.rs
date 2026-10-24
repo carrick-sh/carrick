@@ -184,9 +184,7 @@ impl NativeService {
         if grants.owner() != owner || physical.rollback.failed() {
             return Err(stale());
         }
-        grants.settle(pool, exclusion.proof(), |va| {
-            native_output(&custody, root, va)
-        })?;
+        grants.settle(pool, exclusion.proof())?;
         if pool.ready(handle.mm().raw()).next().is_none() {
             for _ in 0..carrick_hal::physical_grants::NativePhysicalGrants::<
                 crate::fork_stock::NativeFrameBacking,
@@ -580,35 +578,6 @@ pub(super) fn take(
     }
 }
 
-// The stock lock retains the table arenas; exclusion prevents descriptor edits.
-fn native_output(
-    custody: &crate::trap::CarrierVmCustody,
-    root: carrick_guest_arch::RootGpa,
-    va: u64,
-) -> Option<u64> {
-    let mut table = root.address().raw();
-    for (level, index) in carrick_mmu_core::aarch64::indices(va)
-        .into_iter()
-        .enumerate()
-    {
-        let pointer = crate::fork_stock::ForkStockHostCustody::physical_ptr::<AtomicU64>(
-            custody,
-            carrick_guest_arch::FrameGpa::new(table + index as u64 * 8),
-        )
-        .ok()?;
-        // SAFETY: retained stock tables and exact owner exclusion, atomic word.
-        let word = unsafe { &*pointer }.load(Ordering::Acquire);
-        if level == 3 {
-            return (word != 0).then_some(word & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK);
-        }
-        if word & 3 != 3 {
-            return None;
-        }
-        table = word & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
-    }
-    None
-}
-
 pub(crate) fn settle_native_cow(
     custody: &crate::trap::CarrierVmCustody,
     pool: &carrick_el1_abi::CowGrantPool,
@@ -627,9 +596,7 @@ pub(crate) fn settle_native_cow(
             Ok(Some(0))
         };
     };
-    grants
-        .settle(pool, excluded, |va| native_output(custody, root, va))
-        .map(Some)
+    grants.settle(pool, excluded).map(Some)
 }
 
 fn retain_reply(

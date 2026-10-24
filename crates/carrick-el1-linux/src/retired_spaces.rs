@@ -143,7 +143,9 @@ pub fn space_has_resident_slot<C: Copy + Send + Sync + zerocopy::FromZeros>(
 }
 
 /// Retire a closed child's reservation root (tree nodes, notifications) and
-/// free its exact space entry so both indices can be reused.
+/// free its exact space entry so both indices can be reused. The carrier
+/// quarantines physical stock before this call and releases the whole MM's
+/// inventory only after entry removal; deferred returns retire with that MM.
 pub fn retire_closed_space<
     P: PinnedMetadataExtent,
     Policy: ReservationPolicy,
@@ -164,7 +166,7 @@ pub fn retire_closed_space<
     owner
         .root_any(mm, worker)
         .map_err(|_| NativeProcessError::Stale)?
-        .retire()
+        .retire_final()
         .map_err(|_| NativeProcessError::Busy)?;
     owner.spaces.free(index);
     Ok(())

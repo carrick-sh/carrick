@@ -559,6 +559,19 @@ settlement and neutral physical retirement. The former was red when carrier
 generation 5 was submitted as the fresh mapping's generation. The existing
 two-grant refill and bounded page-copy assertions remain unchanged.
 
+Native USED receipts authenticate completed ring publications, not descriptors
+that must remain installed until host settlement. MAP_FIXED and unmap may
+replace those descriptors while the physical grant remains retained. The
+shared physical owner settles exact grant epoch, MM and live inventory identity
+without a backend page-table verdict. The two-live-process witness
+`native_child_fixed_over_cow_preserves_parent_bytes_and_retires` replaces a
+COW-shared page at a sub-16K offset, checks both processes' bytes and returns
+stock through terminal retirement; a foreign MM cannot settle the receipt.
+Final-MM root retirement consumes its deferred-return journal together with
+its tree, under retained whole-MM physical custody. Host and native exits
+use that same neutral operation; ordinary retirement still refuses owed
+returns. Refusal must leave the journal intact.
+
 Native backing selection must exclude live or prepared inherited neighbors,
 even when the child's lazy-grant residency table has no row for them.
 `native_child_backing_selection_excludes_inherited_live_neighbor` forks an

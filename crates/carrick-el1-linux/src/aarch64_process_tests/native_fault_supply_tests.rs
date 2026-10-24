@@ -50,8 +50,8 @@ fn leaf(words: &impl LiveDescriptorWords, root: u64, va: u64) -> u64 {
     }
     unreachable!()
 }
-struct UntouchedMapping<'a>(&'a dyn LiveDescriptorWords);
-impl carrick_el1::memory::AnonymousBackingProbe for UntouchedMapping<'_> {
+struct FixtureMapping<'a>(&'a dyn LiveDescriptorWords);
+impl carrick_el1::memory::AnonymousBackingProbe for FixtureMapping<'_> {
     fn backing(
         &mut self,
         root: carrick_guest_arch::AddressSpaceRegister,
@@ -69,7 +69,7 @@ impl carrick_el1::memory::AnonymousBackingProbe for UntouchedMapping<'_> {
         None
     }
 }
-impl carrick_el1::memory::AnonymousPermissionEditor for UntouchedMapping<'_> {
+impl carrick_el1::memory::AnonymousPermissionEditor for FixtureMapping<'_> {
     fn protect_and_invalidate(
         &mut self,
         _: carrick_guest_arch::AddressSpaceRegister,
@@ -78,7 +78,7 @@ impl carrick_el1::memory::AnonymousPermissionEditor for UntouchedMapping<'_> {
         panic!("new mapping has no resident permission work")
     }
 }
-impl carrick_el1::memory::AnonymousRetirementEditor for UntouchedMapping<'_> {
+impl carrick_el1::memory::AnonymousRetirementEditor for FixtureMapping<'_> {
     fn retire_and_invalidate(
         &mut self,
         root: carrick_guest_arch::AddressSpaceRegister,
@@ -865,7 +865,7 @@ fn composed_native_supply(
             &fixture.task,
             access,
             fixture.region.table(),
-            &mut UntouchedMapping(words),
+            &mut FixtureMapping(words),
         ),
         carrick_el1::memory::DelegatedAnonymous::Served
     );
@@ -873,7 +873,7 @@ fn composed_native_supply(
     if replace_cow {
         // serve_delegated_anonymous updates the installed global residency
         // table on target_os=none; this fixture owns that table explicitly.
-        residency.retire_overlapping(identity.mm, fresh, 8192);
+        assert!(residency.retire_overlapping(identity.mm, fresh, 8192));
     }
     assert!(fresh == map_base, "native mmap: {fresh:#x}");
     frame.esr = 0x92000046;
@@ -1110,8 +1110,11 @@ fn composed_native_supply(
         );
     }
     assert_eq!(page.claimed_count(), 0);
+    // Another live MM cannot settle this child's physical receipts.
+    let parent_mm = fixture.leader.mm;
+    assert_ne!(parent_mm, identity.mm);
     let exclusion = access
-        .try_exclude_editor(access.find(identity.mm).unwrap(), identity.mm)
+        .try_exclude_editor(access.find(parent_mm).unwrap(), parent_mm)
         .unwrap();
     let mut stock = crossing.physical.as_ref().unwrap().lock().unwrap();
     let physical_grants = stock
@@ -1121,19 +1124,16 @@ fn composed_native_supply(
         .supplied
         .as_mut()
         .unwrap();
-    assert!(
-        physical_grants
-            .settle(pool, exclusion.proof(), |_| None)
-            .is_err()
-    );
+    assert!(physical_grants.settle(pool, exclusion.proof()).is_err());
     assert!(
         pool.has_completions_for(identity.mm),
         "failed authentication retains USED"
     );
     drop(stock);
     drop(exclusion);
-    // Leave USED for the actual terminal adapter: it must settle while the
-    // child root exists, then return stock without any later fork loan.
+    // Leave USED for the actual terminal adapter: it must authenticate the
+    // retained publication even after MAP_FIXED, then return stock without
+    // any later fork loan.
     let context =
         unsafe { observed_entry_address(source, &fixture.task, child_root, child) }.unwrap();
     *crossing.child.lock().unwrap() = Some((
