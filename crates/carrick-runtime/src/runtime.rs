@@ -3234,6 +3234,12 @@ mod tests {
             // and reaps that child; committed retirement creates no host
             // process in production.
             ("hvpatch/stage1_mm.rs", [0, 0, 1]),
+            // `carrier::tests::isolated_fixture_process` self-spawns the exact
+            // carrier unit test in its own process, because the VM lifecycle
+            // window and preemption driver are process-global host state
+            // (#504). It bounds and reaps that child; it is test isolation,
+            // not production host-process-per-guest architecture.
+            ("carrier.rs", [0, 0, 1]),
             // This unit test self-spawns to isolate a process-global abort
             // boundary while proving pending exec error preservation. It is
             // not production host-process-per-guest architecture.
