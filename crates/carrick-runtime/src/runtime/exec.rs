@@ -112,12 +112,6 @@ pub(crate) fn load_execve_image(
     requires_syscall_traps: bool,
 ) -> Result<LoadedExecImage, LinuxErrno> {
     use crate::linux_abi::LINUX_ENOENT;
-    let argv = if argv.is_empty() {
-        vec![path.as_bytes().to_vec()]
-    } else {
-        argv
-    };
-
     // Absolutize a RELATIVE execve target against the guest cwd before any
     // layer lookup (Linux resolves `execve("b/foo")` against the caller's cwd;
     // carrick's layers key on absolute guest paths). See `resolve_exec_path`.
@@ -129,6 +123,11 @@ pub(crate) fn load_execve_image(
     // its interpreter (shared with the initial entrypoint load via
     // `resolve_shebang`).
     let abs_path = files.resolve_path(path);
+    let argv = if argv.is_empty() {
+        vec![abs_path.as_bytes().to_vec()]
+    } else {
+        argv
+    };
     let host_open = |path: &str| std::fs::File::open(path);
     let acquire_source = |path: &str| files.acquire_with_host_file_service(path, &host_open);
     let named_source = acquire_source(path).map_err(exec_source_errno)?;
@@ -270,6 +269,123 @@ pub(crate) use carrick_kernel::exec_helpers::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_aarch64_exec() -> Vec<u8> {
+        const ET_EXEC: u16 = 2;
+        const EM_AARCH64: u16 = 183;
+        const PT_LOAD: u32 = 1;
+        let mut elf = vec![0_u8; 0x1004];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        elf[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x400000_u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        let ph = 64;
+        elf[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[ph + 4..ph + 8].copy_from_slice(&5_u32.to_le_bytes());
+        elf[ph + 8..ph + 16].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf[ph + 16..ph + 24].copy_from_slice(&0x400000_u64.to_le_bytes());
+        elf[ph + 32..ph + 40].copy_from_slice(&4_u64.to_le_bytes());
+        elf[ph + 40..ph + 48].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf[ph + 48..ph + 56].copy_from_slice(&0x1000_u64.to_le_bytes());
+        elf[0x1000..0x1004].copy_from_slice(&0xd503_201f_u32.to_le_bytes());
+        elf
+    }
+
+    fn read_image_u64(image: &AddressSpace, address: u64) -> u64 {
+        u64::from_le_bytes(
+            image
+                .read_bytes(address, 8)
+                .expect("stack word")
+                .try_into()
+                .expect("u64 stack word"),
+        )
+    }
+
+    fn read_image_c_string(image: &AddressSpace, address: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut cursor = address;
+        loop {
+            let byte = image.read_bytes(cursor, 1).expect("stack string byte")[0];
+            if byte == 0 {
+                return bytes;
+            }
+            bytes.push(byte);
+            cursor += 1;
+        }
+    }
+
+    fn execfn(image: &AddressSpace) -> Vec<u8> {
+        const AT_EXECFN: u64 = 31;
+        let mut cursor = image.initial_stack_pointer().expect("initial stack") + 32;
+        loop {
+            let tag = read_image_u64(image, cursor);
+            let value = read_image_u64(image, cursor + 8);
+            if tag == AT_EXECFN {
+                return read_image_c_string(image, value);
+            }
+            assert_ne!(tag, 0, "AT_EXECFN missing from initial stack");
+            cursor += 16;
+        }
+    }
+
+    #[test]
+    fn exec_normalizes_dot_slashes_and_dotdot_in_guest_visible_names() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("image");
+        std::fs::write(&executable, synthetic_aarch64_exec()).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(directory.path().join("sub")).unwrap();
+        let expected = executable.to_string_lossy().into_owned();
+        let spellings = [
+            directory
+                .path()
+                .join("./image")
+                .to_string_lossy()
+                .into_owned(),
+            format!("{}//image", directory.path().display()),
+            directory
+                .path()
+                .join("sub/../image")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let files = dispatcher.capture_exec_files(&context).unwrap();
+        let loader = ExecLoaderCapabilities::capture(&dispatcher);
+
+        for spelling in spellings {
+            let loaded = load_execve_image(&loader, &files, &spelling, vec![], vec![], false)
+                .expect("load spelled executable");
+            let sp = loaded.image.initial_stack_pointer().expect("initial stack");
+            let argv0 = read_image_u64(&loaded.image, sp + 8);
+            assert_eq!(
+                read_image_c_string(&loaded.image, argv0),
+                expected.as_bytes()
+            );
+            assert_eq!(execfn(&loaded.image), expected.as_bytes());
+            let mappings: Vec<_> = loaded
+                .image
+                .file_mappings()
+                .iter()
+                .filter(|mapping| mapping.start == 0x400000)
+                .collect();
+            assert!(
+                !mappings.is_empty() && mappings.iter().all(|mapping| mapping.path == expected),
+                "main mappings did not use normalized name for {spelling}"
+            );
+        }
+    }
 
     #[cfg(feature = "syscall-shim")]
     struct ContinueInterceptor;
