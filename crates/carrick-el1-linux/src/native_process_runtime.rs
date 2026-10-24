@@ -28,7 +28,8 @@ use carrick_personality_linux::{
         MsgrcvResult, ProcessIpcVenue,
     },
     lifecycle::{
-        LifecycleOutcome, LinuxWaitOptions, ProcessForkChildTid, ProcessNative, ProcessWaitPid,
+        LifecycleOutcome, LinuxWaitOptions, ProcessForkChildTid, ProcessNative, ProcessWaitId,
+        ProcessWaitPid,
     },
 };
 #[cfg(test)]
@@ -720,8 +721,14 @@ struct PendingWait {
     caller: TaskKey,
     query: WaitQuery,
     status: UserVa,
+    output: PendingWaitOutput,
     precheck: WaitPrecheck,
     channel: Arc<WaitChannel>,
+}
+#[derive(Clone, Copy)]
+enum PendingWaitOutput {
+    Wait4,
+    WaitId { nowait: bool },
 }
 struct ExitWakeCustody {
     channel: Arc<WaitChannel>,
@@ -3591,7 +3598,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn fail(&self, error: NativeProcessError) -> LifecycleOutcome {
         returned(error.errno())
     }
-    fn query(
+    fn wait4_query(
         &self,
         pid: ProcessWaitPid,
         options: LinuxWaitOptions,
@@ -3631,11 +3638,64 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             job_control: WaitJobControl::NONE,
         })
     }
+    fn waitid_query(
+        &self,
+        id: ProcessWaitId,
+        options: LinuxWaitOptions,
+    ) -> Result<WaitQuery, NativeProcessError> {
+        if !LinuxWaitOptions::WAITID_SUPPORTED.contains(options)
+            || !options.intersects(LinuxWaitOptions::WAITID_STATE_MASK)
+        {
+            return Err(NativeProcessError::Invalid);
+        }
+        // Native process stop/continue custody is a separate owner seam. Do
+        // not answer it from the carrier or silently consume an exit receipt.
+        if !options.contains(LinuxWaitOptions::WEXITED) {
+            return Err(NativeProcessError::Unsupported);
+        }
+        let graph = self.runtime.graph.lock();
+        let row = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?;
+        let target = match id {
+            ProcessWaitId::All => WaitTarget::Any,
+            ProcessWaitId::Pid(pid) if pid != 0 => WaitTarget::Exact(
+                graph
+                    .owner
+                    .namespace_child_key(self.key, pid)
+                    .map_err(|_| NativeProcessError::Stale)?
+                    .ok_or(NativeProcessError::NoChild)?,
+            ),
+            ProcessWaitId::ProcessGroup(0) => {
+                WaitTarget::ProcessGroup(row.identity().process_group)
+            }
+            ProcessWaitId::ProcessGroup(group) => WaitTarget::ProcessGroup(
+                graph
+                    .owner
+                    .namespace_child_group(self.key, group)
+                    .map_err(|_| NativeProcessError::Stale)?
+                    .ok_or(NativeProcessError::NoChild)?,
+            ),
+            ProcessWaitId::Pid(_) => return Err(NativeProcessError::NoChild),
+            ProcessWaitId::PidFd(_) => return Err(NativeProcessError::Unsupported),
+            ProcessWaitId::Invalid => return Err(NativeProcessError::Invalid),
+        };
+        Ok(WaitQuery {
+            target,
+            class: carrick_personality_linux::lifecycle::wait_child_class(options),
+            job_control: WaitJobControl {
+                stopped: options.contains(LinuxWaitOptions::WSTOPPED),
+                continued: options.contains(LinuxWaitOptions::WCONTINUED),
+            },
+        })
+    }
     fn wait_query(
         &mut self,
         query: WaitQuery,
         status: UserVa,
         nohang: bool,
+        output: PendingWaitOutput,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
         let mut rescan = None;
         loop {
@@ -3666,9 +3726,37 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         if status.raw() == 0 {
                             Ok(())
                         } else {
-                            self.service.copy_status(&mm, status, zombie.status)
+                            match output {
+                                PendingWaitOutput::Wait4 => {
+                                    self.service.copy_status(&mm, status, zombie.status)
+                                }
+                                PendingWaitOutput::WaitId { .. } => {
+                                    let wait = zombie.status.raw();
+                                    let (code, child_status) = if zombie.status.is_signaled() {
+                                        let code = if wait & 0x80 != 0 {
+                                            carrick_syscall_abi::LINUX_CLD_DUMPED
+                                        } else {
+                                            carrick_syscall_abi::LINUX_CLD_KILLED
+                                        };
+                                        (code, wait & 0x7f)
+                                    } else {
+                                        (carrick_syscall_abi::LINUX_CLD_EXITED, (wait >> 8) & 0xff)
+                                    };
+                                    let info = carrick_syscall_abi::LinuxSiginfo::child_exit(
+                                        carrick_signal_core::policy::Signal::CHLD.number(),
+                                        zombie.namespace_pid as i32,
+                                        zombie.ruid.raw(),
+                                        code,
+                                        child_status,
+                                    );
+                                    self.service.copy_siginfo(&mm, status, &info)
+                                }
+                            }
                         }
                     })?;
+                    if matches!(output, PendingWaitOutput::WaitId { nowait: true }) {
+                        return Ok(returned(0));
+                    }
                     let consumed = {
                         let mut graph = self.runtime.graph.lock();
                         copied
@@ -3682,8 +3770,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             continue;
                         }
                     };
-                    let result = match &consumed.selection {
-                        WaitSelection::Exited(zombie) => i64::from(zombie.namespace_pid),
+                    let result = match (&consumed.selection, output) {
+                        (WaitSelection::Exited(_), PendingWaitOutput::WaitId { .. }) => 0,
+                        (WaitSelection::Exited(zombie), PendingWaitOutput::Wait4) => {
+                            i64::from(zombie.namespace_pid)
+                        }
                         _ => return Err(NativeProcessError::NoChild),
                     };
                     drop(consumed);
@@ -3695,6 +3786,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 WaitWork::Other(WaitSelection::StillRunning(precheck)) => {
                     if nohang {
+                        if matches!(output, PendingWaitOutput::WaitId { .. }) && status.raw() != 0 {
+                            self.service.copy_siginfo(
+                                &mm,
+                                status,
+                                &carrick_syscall_abi::LinuxSiginfo::empty(),
+                            )?;
+                        }
                         return Ok(returned(0));
                     }
                     let ch = channel.clone();
@@ -3705,6 +3803,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             caller: self.key,
                             query,
                             status,
+                            output,
                             precheck,
                             channel,
                         }),
@@ -3917,7 +4016,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     return Some(self.fail(NativeProcessError::Stale));
                 }
                 Some(
-                    match self.wait_query(pending.query, pending.status, false) {
+                    match self.wait_query(pending.query, pending.status, false, pending.output) {
                         Ok(outcome) => outcome,
                         Err(error) => self.fail(error),
                     },
@@ -5980,11 +6079,38 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         if _rusage.raw() != 0 {
             return self.fail(NativeProcessError::Unsupported);
         }
-        let query = match self.query(_pid, _options) {
+        let query = match self.wait4_query(_pid, _options) {
             Ok(query) => query,
             Err(error) => return self.fail(error),
         };
-        match self.wait_query(query, _status, _options.contains(LinuxWaitOptions::WNOHANG)) {
+        match self.wait_query(
+            query,
+            _status,
+            _options.contains(LinuxWaitOptions::WNOHANG),
+            PendingWaitOutput::Wait4,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => self.fail(error),
+        }
+    }
+    fn waitid(
+        &mut self,
+        id: ProcessWaitId,
+        info: UserVa,
+        options: LinuxWaitOptions,
+    ) -> LifecycleOutcome {
+        let query = match self.waitid_query(id, options) {
+            Ok(query) => query,
+            Err(error) => return self.fail(error),
+        };
+        match self.wait_query(
+            query,
+            info,
+            options.contains(LinuxWaitOptions::WNOHANG),
+            PendingWaitOutput::WaitId {
+                nowait: options.contains(LinuxWaitOptions::WNOWAIT),
+            },
+        ) {
             Ok(outcome) => outcome,
             Err(error) => self.fail(error),
         }

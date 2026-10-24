@@ -113,6 +113,7 @@ pub mod nr {
     pub const SHMAT: CanonicalNr = CanonicalNr(196);
     pub const SHMDT: CanonicalNr = CanonicalNr(197);
     pub const WAIT4: CanonicalNr = CanonicalNr(260);
+    pub const WAITID: CanonicalNr = CanonicalNr(95);
     pub const PPOLL: CanonicalNr = CanonicalNr(73);
     pub const PRLIMIT64: CanonicalNr = CanonicalNr(261);
 }

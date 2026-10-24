@@ -126,6 +126,31 @@ impl ProcessWaitPid {
         self.0
     }
 }
+
+/// Typed `waitid(2)` selector. Invalid raw id types remain explicit so the
+/// process owner, rather than an ISA adapter or host wait API, lowers EINVAL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessWaitId {
+    All,
+    Pid(u32),
+    ProcessGroup(u32),
+    PidFd(u32),
+    Invalid,
+}
+impl ProcessWaitId {
+    pub const fn from_syscall_arguments(id_type: u64, id: u64) -> Self {
+        match id_type {
+            0 => Self::All,
+            1 if id <= u32::MAX as u64 => Self::Pid(id as u32),
+            2 if id <= u32::MAX as u64 => Self::ProcessGroup(id as u32),
+            3 if id <= u32::MAX as u64 => Self::PidFd(id as u32),
+            _ => Self::Invalid,
+        }
+    }
+    pub const fn pid(pid: u32) -> Self {
+        Self::Pid(pid)
+    }
+}
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -143,6 +168,7 @@ pub enum LifecycleCall {
     Clone,
     Fork,
     Wait4,
+    WaitId,
     ExitGroup,
 }
 
@@ -227,6 +253,17 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
         options: LinuxWaitOptions,
         rusage: UserVa,
     ) -> LifecycleOutcome;
+    fn waitid(
+        &mut self,
+        _id: ProcessWaitId,
+        _info: UserVa,
+        _options: LinuxWaitOptions,
+    ) -> LifecycleOutcome {
+        LifecycleOutcome::Returned {
+            result: SyscallResult::new(carrick_syscall_abi::LINUX_ENOSYS.guest_retval()),
+            work: false,
+        }
+    }
     fn exit_group(&mut self, status: u8) -> LifecycleOutcome;
     fn as_identity_venue(&mut self) -> Option<&mut dyn crate::identity::ProcessIdentityVenue> {
         None
@@ -398,6 +435,14 @@ pub trait LifecycleNative<'a>: UserCopy {
         _status: UserVa,
         _options: LinuxWaitOptions,
         _rusage: UserVa,
+    ) -> Option<LifecycleOutcome> {
+        None
+    }
+    fn process_waitid(
+        &mut self,
+        _id: ProcessWaitId,
+        _info: UserVa,
+        _options: LinuxWaitOptions,
     ) -> Option<LifecycleOutcome> {
         None
     }
@@ -583,6 +628,13 @@ pub fn invoke<'a>(
                 UserVa::new(args[1]),
                 LinuxWaitOptions::from_bits_retain(args[2]),
                 UserVa::new(args[3]),
+            );
+        }
+        LifecycleCall::WaitId => {
+            return native.process_waitid(
+                ProcessWaitId::from_syscall_arguments(args[0], args[1]),
+                UserVa::new(args[2]),
+                LinuxWaitOptions::from_bits_retain(args[3]),
             );
         }
         LifecycleCall::ExitGroup => return native.process_exit_group(args[0] as u8),

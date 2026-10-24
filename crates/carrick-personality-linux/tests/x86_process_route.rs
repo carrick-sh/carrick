@@ -12,7 +12,11 @@ use carrick_syscall_abi::syscall_x86_64::{SyscallRemap, lookup_x86_64};
 
 #[test]
 fn x86_process_calls_route_to_neutral_lifecycle_hooks() {
-    for (native, expected) in [(61, LifecycleCall::Wait4), (231, LifecycleCall::ExitGroup)] {
+    for (native, expected) in [
+        (61, LifecycleCall::Wait4),
+        (247, LifecycleCall::WaitId),
+        (231, LifecycleCall::ExitGroup),
+    ] {
         let entry = lookup_x86_64(native).expect("process syscall has a table entry");
         let canonical = match entry.remap {
             SyscallRemap::Direct(canonical) => canonical.raw(),
@@ -109,12 +113,20 @@ fn pidfds_remain_unported_until_the_native_owner_exists() {
 fn arm_signal_routes_match_preapproved_native_owner() {
     for ordinal in (129..=139).chain(core::iter::once(240)) {
         let expected = match ordinal {
+            129 => Family::Signal(carrick_personality_linux::signal::SignalCall::Kill),
+            130 => Family::Signal(carrick_personality_linux::signal::SignalCall::Tkill),
+            131 => Family::Signal(carrick_personality_linux::signal::SignalCall::Tgkill),
             132 => Family::Lifecycle(LifecycleCall::SigAltStack),
+            133 => Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigsuspend),
             // #323 pre-approved ARM rt_sigaction for the native signal owner.
             134 => Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigaction),
             135 => Family::Lifecycle(LifecycleCall::SigProcMask),
+            136 => Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigpending),
+            137 => Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigtimedwait),
+            138 => Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigqueueinfo),
             139 => Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigreturn),
-            _ => Family::Unported,
+            240 => Family::Signal(carrick_personality_linux::signal::SignalCall::RtTgsigqueueinfo),
+            _ => unreachable!(),
         };
         assert_eq!(
             route_aarch64(ordinal, u64::MAX),

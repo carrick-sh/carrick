@@ -31,7 +31,9 @@ use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_mmu_core::owner_mmu::Aarch64Mmu;
 use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessForkChildTid, ProcessNative};
 #[cfg(test)]
-use carrick_personality_linux::lifecycle::{LinuxWaitOptions, LinuxWaitStatus, ProcessWaitPid};
+use carrick_personality_linux::lifecycle::{
+    LinuxWaitOptions, LinuxWaitStatus, ProcessWaitId, ProcessWaitPid,
+};
 #[cfg(test)]
 use carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
 use carrick_sched_core::process::{TaskKey, TaskSerial};
@@ -1229,6 +1231,17 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
             panic!("WNOHANG must return without parking")
         };
         assert_eq!(result.raw(), 0, "a live native child is not waitable");
+        let mut child_info = carrick_syscall_abi::LinuxSiginfo::kill(17, 1, 1, 1);
+        let LifecycleOutcome::Returned { result, .. } = parent_entry.waitid(
+            ProcessWaitId::pid(child_pid),
+            UserVa::new(&raw mut child_info as u64),
+            LinuxWaitOptions::WEXITED | LinuxWaitOptions::WNOHANG,
+        ) else {
+            panic!("waitid WNOHANG must return without parking")
+        };
+        assert_eq!(result.raw(), 0);
+        let si_signo = child_info.si_signo;
+        assert_eq!(si_signo, 0, "waitid WNOHANG clears the empty result");
     }
 
     // Parent yields slot to child
@@ -1287,6 +1300,26 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
     let mut parent_entry = runtime
         .enter(source, &fixture.task, parked, &mut service)
         .unwrap();
+
+    let mut child_info = carrick_syscall_abi::LinuxSiginfo::empty();
+    let waitid_outcome = parent_entry.waitid(
+        ProcessWaitId::pid(child_pid),
+        UserVa::new(&raw mut child_info as u64),
+        LinuxWaitOptions::WEXITED | LinuxWaitOptions::WNOWAIT,
+    );
+    assert!(matches!(
+        waitid_outcome,
+        LifecycleOutcome::Returned { result, .. } if result.raw() == 0
+    ));
+    let si_signo = child_info.si_signo;
+    let si_code = child_info.si_code;
+    assert_eq!(si_signo, 17);
+    assert_eq!(si_code, carrick_syscall_abi::LINUX_CLD_EXITED);
+    assert_eq!(child_info.si_addr as u32, child_pid);
+    assert_eq!(
+        i32::from_le_bytes(child_info._pad[0..4].try_into().unwrap()),
+        9
+    );
 
     let wait_outcome = parent_entry.wait4(
         ProcessWaitPid::from_syscall_argument(child_pid as u64),
