@@ -1630,13 +1630,15 @@ mod tests {
             .set_file_contents("/dir/image", b"correct".to_vec())
             .unwrap();
         let context = dispatcher.capture_one_task_context().unwrap();
-        assert_eq!(
-            dispatcher
-                .capture_exec_files(&context)
-                .unwrap()
-                .resolve_path("/link/../image"),
-            "/link/../image"
-        );
+        let files = dispatcher.capture_exec_files(&context).unwrap();
+        for (spelling, expected) in [
+            ("/dir/./image", "/dir/image"),
+            ("/dir//image", "/dir/image"),
+            ("/dir/nested/../image", "/dir/image"),
+            ("/link/../image", "/image"),
+        ] {
+            assert_eq!(files.resolve_path(spelling), expected);
+        }
         let source = dispatcher
             .acquire_exec_source(&context, "/link/../image")
             .unwrap();

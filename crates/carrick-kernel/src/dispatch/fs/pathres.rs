@@ -199,11 +199,47 @@ impl<'a> FsView<'a> {
     /// Targets without `..` keep the cheap lexical join, which is almost all of
     /// them.
     fn join_symlink_target(&self, parent: &str, target: &str) -> Result<String, LinuxErrno> {
-        self.path_view().join_symlink_target(parent, target)
+        if !target.split('/').any(|c| c == "..") {
+            return Ok(join_rootfs_path(parent, target));
+        }
+        match DotdotDepthGuard::enter() {
+            Some(_guard) => self.resolve_dotdot_symlink_aware(parent, target),
+            None => Err(crate::linux_abi::LINUX_ELOOP),
+        }
     }
 
     pub(crate) fn canonicalize_following(&self, path: &str) -> Result<String, LinuxErrno> {
-        self.path_view().canonicalize_following(path)
+        check_component_length(path)?;
+        let mut cur = path.to_string();
+        for _ in 0..40 {
+            check_component_length(&cur)?;
+            let md = self.layered_lstat(&cur)?;
+            if md.kind != RootFsEntryKind::Symlink {
+                return Ok(cur);
+            }
+            let target = self
+                .readlink_layered(&cur)
+                .ok_or(crate::linux_abi::LINUX_ENOENT)?;
+            let source = cur;
+            let next = if target.starts_with('/') {
+                join_rootfs_path("/", &target)
+            } else {
+                let parent = Path::new(&source)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/".to_string());
+                self.join_symlink_target(&parent, &target)?
+            };
+            if next == source
+                || next
+                    .strip_prefix(&source)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                return Err(crate::linux_abi::LINUX_ELOOP);
+            }
+            cur = next;
+        }
+        Err(crate::linux_abi::LINUX_ELOOP)
     }
 
     /// Like `canonicalize_following`, but a final component that resolves to a
@@ -657,7 +693,49 @@ impl<'a> FsView<'a> {
         anchor: &str,
         path: &str,
     ) -> Result<String, LinuxErrno> {
-        self.path_view().resolve_dotdot_symlink_aware(anchor, path)
+        let mut all: Vec<&str> = Vec::new();
+        if !Path::new(path).is_absolute() {
+            all.extend(anchor.split('/').filter(|c| !c.is_empty() && *c != "."));
+        }
+        all.extend(path.split('/').filter(|c| !c.is_empty() && *c != "."));
+
+        let mut base = String::new();
+        let last = all.len().saturating_sub(1);
+        for (i, comp) in all.iter().enumerate() {
+            if *comp == ".." {
+                match base.rfind('/') {
+                    Some(pos) => base.truncate(pos),
+                    None => base.clear(),
+                }
+                continue;
+            }
+            let mut candidate = base.clone();
+            candidate.push('/');
+            candidate.push_str(comp);
+            if i == last {
+                base = candidate;
+                break;
+            }
+            match self.layered_lstat(&candidate) {
+                Ok(md) if md.kind == RootFsEntryKind::Symlink => {
+                    match self.canonicalize_following(&candidate) {
+                        Ok(target) if self.path_is_directory(&target) => {
+                            base = target.trim_end_matches('/').to_owned();
+                        }
+                        Ok(_) => return Err(LINUX_ENOTDIR),
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(md) if md.kind == RootFsEntryKind::Directory => base = candidate,
+                Ok(_) => return Err(LINUX_ENOTDIR),
+                Err(errno) => return Err(errno),
+            }
+        }
+        Ok(if base.is_empty() {
+            "/".to_owned()
+        } else {
+            base
+        })
     }
 
     /// Rewrite `abs` so every intermediate (non-final) directory-symlink
