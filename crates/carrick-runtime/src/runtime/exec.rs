@@ -11,6 +11,24 @@ use carrick_kernel::exec_helpers::parse_shebang;
 pub(crate) struct LoadedExecImage {
     pub(crate) image: AddressSpace,
     pub(crate) source: carrick_kernel::dispatch::executable_authority::ExecSource,
+    pub(crate) binfmt_argv: Option<Vec<Vec<u8>>>,
+}
+
+/// Loader configuration retains physical services, never a task or dispatcher.
+pub(crate) struct ExecLoaderCapabilities {
+    clock: Arc<carrick_kernel::kernel::container::ClockDomain>,
+    linux_page_size: u64,
+    requires_syscall_traps: bool,
+}
+
+impl ExecLoaderCapabilities {
+    pub(crate) fn capture(dispatcher: &SyscallDispatcher) -> Self {
+        Self {
+            clock: Arc::clone(dispatcher.container().clock()),
+            linux_page_size: dispatcher.linux_page_size(),
+            requires_syscall_traps: dispatcher.requires_syscall_traps(),
+        }
+    }
 }
 
 fn host_io_errno(error: std::io::Error) -> LinuxErrno {
@@ -52,7 +70,7 @@ fn inspect_exec_head(
 }
 
 fn finalize_hvf_exec_base(
-    dispatcher: &SyscallDispatcher,
+    loader: &ExecLoaderCapabilities,
     raw: AddressSpace,
     needs_at_base: bool,
     vdso_enabled: bool,
@@ -60,16 +78,14 @@ fn finalize_hvf_exec_base(
 ) -> Result<AddressSpace, LinuxErrno> {
     use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOEXEC};
 
-    let requires_syscall_traps = requires_syscall_traps || dispatcher.requires_syscall_traps();
+    let requires_syscall_traps = requires_syscall_traps || loader.requires_syscall_traps;
     let mut staged = raw.with_vdso_auxv(vdso_enabled);
     if needs_at_base {
         staged = staged.with_auxv_base(ROSETTA_AT_BASE_PLACEHOLDER);
     }
-    let staged = crate::hvpatch::prepare_exec_image_for_dispatcher(staged, dispatcher)
-        .map_err(|_| LINUX_ENOEXEC)?;
+    let staged = crate::hvpatch::prepare_exec_image(staged).map_err(|_| LINUX_ENOEXEC)?;
     use carrick_hal::GuestArch as _;
     type HvfArch = <crate::trap::HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch;
-    let container = dispatcher.container();
     staged
         .with_el0_trampoline_bytes(HvfArch::entry_trampoline_bytes())
         .and_then(|image| with_hvf_syscall_mailbox(image, requires_syscall_traps))
@@ -77,7 +93,7 @@ fn finalize_hvf_exec_base(
         .and_then(|image| {
             with_optional_vdso_for_clock_with_visibility::<HvfArch>(
                 image,
-                container.clock(),
+                &loader.clock,
                 requires_syscall_traps,
             )
         })
@@ -85,7 +101,7 @@ fn finalize_hvf_exec_base(
 }
 
 pub(crate) fn load_execve_image(
-    dispatcher: &SyscallDispatcher,
+    loader: &ExecLoaderCapabilities,
     files: &carrick_kernel::dispatch::exec_files::ExecFiles,
     path: &str,
     // argv/env are opaque BYTE strings (Linux ABI), not UTF-8. `path` is a
@@ -113,7 +129,7 @@ pub(crate) fn load_execve_image(
     // its interpreter (shared with the initial entrypoint load via
     // `resolve_shebang`).
     let abs_path = files.resolve_path(path);
-    let named_source = files.acquire(&abs_path).map_err(exec_source_errno)?;
+    let named_source = files.acquire(path).map_err(exec_source_errno)?;
     files.check_source(&named_source)?;
     // fanotify FAN_OPEN_EXEC, emitted after validation so a failed execve
     // generates nothing — the event means "this image is being executed", and
@@ -174,20 +190,21 @@ pub(crate) fn load_execve_image(
     // an execve target absent from the container fs ENOENTs instead of escaping
     // to the matching HOST binary. The filesystem capability retains that fallback policy.
     let vdso_enabled = vdso_enabled_for_debug();
-    let requires_syscall_traps = requires_syscall_traps || dispatcher.requires_syscall_traps();
+    let requires_syscall_traps = requires_syscall_traps || loader.requires_syscall_traps;
     // The cache is deliberately limited to direct little-endian AArch64 ELFs.
     // Rosetta redirects rewrite argv and carry target-specific AT_BASE state;
     // mutable/foreign images stay on the uncached path below.
     let cache_key = direct_aarch64
         .then(|| {
             source.hvpatch_cache_key(
-                dispatcher.linux_page_size(),
+                loader.linux_page_size,
                 vdso_enabled,
                 requires_syscall_traps,
                 false,
             )
         })
         .flatten();
+    let mut binfmt_argv = None;
     let (base, argv) = if cache_key.is_some() {
         let base = files.with_cache(cache_key, || {
             let raw_bytes = source.read_all().map_err(host_io_errno)?;
@@ -196,7 +213,7 @@ pub(crate) fn load_execve_image(
             })
             .map_err(carrick_kernel::exec_helpers::exec_image_errno)?
             .with_main_file_path(path.clone());
-            finalize_hvf_exec_base(dispatcher, raw, false, vdso_enabled, requires_syscall_traps)
+            finalize_hvf_exec_base(loader, raw, false, vdso_enabled, requires_syscall_traps)
         })?;
         (base, argv)
     } else {
@@ -208,7 +225,7 @@ pub(crate) fn load_execve_image(
             None => (raw_bytes, argv),
             Some(Ok(redirect)) => {
                 needs_at_base = redirect.target_is_dynamic;
-                dispatcher.enter_binfmt(&redirect.argv);
+                binfmt_argv = Some(redirect.argv.clone());
                 (redirect.interpreter_bytes, redirect.argv)
             }
             Some(Err(errno)) => return Err(errno),
@@ -220,7 +237,7 @@ pub(crate) fn load_execve_image(
         .with_main_file_path(path.clone());
         (
             finalize_hvf_exec_base(
-                dispatcher,
+                loader,
                 raw,
                 needs_at_base,
                 vdso_enabled,
@@ -229,11 +246,15 @@ pub(crate) fn load_execve_image(
             argv,
         )
     };
-    let linux_page_size = dispatcher.linux_page_size();
+    let linux_page_size = loader.linux_page_size;
     let image = base
         .with_linux_initial_stack_execfn_page_size(argv, env, path.as_bytes(), linux_page_size)
         .map_err(|_| LINUX_ENOENT)?;
-    Ok(LoadedExecImage { image, source })
+    Ok(LoadedExecImage {
+        image,
+        source,
+        binfmt_argv,
+    })
 }
 
 // Shebang resolution and the signal-death / stop helpers live in the
@@ -297,9 +318,14 @@ mod tests {
         let mut dispatcher = SyscallDispatcher::new();
         dispatcher.install_interceptor(std::sync::Arc::new(ContinueInterceptor));
 
-        let mut image =
-            finalize_hvf_exec_base(&dispatcher, synthetic_exec_image(), false, true, false)
-                .expect("interceptor-bearing exec image");
+        let mut image = finalize_hvf_exec_base(
+            &ExecLoaderCapabilities::capture(&dispatcher),
+            synthetic_exec_image(),
+            false,
+            true,
+            false,
+        )
+        .expect("interceptor-bearing exec image");
         let context = dispatcher
             .capture_one_task_context()
             .expect("exec task context");
@@ -326,7 +352,7 @@ mod tests {
 
         type HvfArch = <crate::trap::HvfTrapEngine as carrick_hal::ThreadedEngine>::Arch;
         let image = finalize_hvf_exec_base(
-            &SyscallDispatcher::new(),
+            &ExecLoaderCapabilities::capture(&SyscallDispatcher::new()),
             synthetic_exec_image(),
             false,
             true,
@@ -419,8 +445,14 @@ mod tests {
             )],
         )
         .expect("synthetic exec image");
-        let image = finalize_hvf_exec_base(&SyscallDispatcher::new(), raw, false, false, false)
-            .expect("production HVPatch exec builder");
+        let image = finalize_hvf_exec_base(
+            &ExecLoaderCapabilities::capture(&SyscallDispatcher::new()),
+            raw,
+            false,
+            false,
+            false,
+        )
+        .expect("production HVPatch exec builder");
         let tables = image
             .regions()
             .iter()
@@ -459,10 +491,12 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().unwrap();
-        let files = dispatcher.capture_exec_files(&context);
+        let files = dispatcher.capture_exec_files(&context).unwrap();
+        let loader = ExecLoaderCapabilities::capture(&dispatcher);
         drop(context);
+        drop(dispatcher);
         let load_errno = || match load_execve_image(
-            &dispatcher,
+            &loader,
             &files,
             path.to_str().unwrap(),
             vec![],

@@ -337,6 +337,10 @@ impl SharedFileObject {
         }
     }
 
+    pub fn set_mode(&self, mode: u32) {
+        self.state.write().mode = mode & 0o7777;
+    }
+
     pub fn mode(&self) -> u32 {
         self.state.read().mode
     }
