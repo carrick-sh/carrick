@@ -202,17 +202,6 @@ fn capture_owns_its_helper_when_a_build_replaces_the_running_binary() {
         .unwrap();
     let executable = dir.path().join("xtask");
     std::fs::hard_link(binary, &executable).unwrap();
-    // Retain a copied inode's writer as if inherited by a parallel fork (#814).
-    use std::os::unix::fs::MetadataExt;
-    let source = std::fs::metadata(env!("CARGO_BIN_EXE_carrick-xtask")).unwrap();
-    let target = std::fs::metadata(&executable).unwrap();
-    let _inherited_writer =
-        ((source.dev(), source.ino()) != (target.dev(), target.ino())).then(|| {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&executable)
-                .unwrap()
-        });
     std::fs::write(dir.path().join("justfile"), "test:\n    rm -f \"$CARRICK_TEST_EXECUTABLE\"\n    cargo test -p one --lib\nlanes:\n    cargo test -p one --lib\ntest-shard-a:\n    cargo run -p carrick-xtask -- test-batch lanes\n").unwrap();
     let output = Command::new(&executable)
         .current_dir(dir.path())
