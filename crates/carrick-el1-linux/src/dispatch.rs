@@ -488,7 +488,7 @@ pub(super) fn arm_process_call_claimed(
 ) -> bool {
     nr == 435
         || (nr == 220 && flags & 0x0001_0000 == 0)
-        || (matches!(nr, 260 | 93 | 94 | 95 | 58 | 139) && registered())
+        || (matches!(nr, 221 | 260 | 93 | 94 | 95 | 58 | 139) && registered())
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
