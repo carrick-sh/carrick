@@ -43,6 +43,13 @@ pub struct GuestDescriptorChange {
     pub release: Option<ReleasedDescription>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum HostBindingDupError<E> {
+    Full,
+    Invalid,
+    Mutation(E),
+}
+
 pub const GUEST_FD_CLOEXEC: u32 = 1;
 pub const GUEST_FD_LIMIT: i32 = 1024;
 
@@ -244,6 +251,134 @@ pub fn dup2_host_binding(
         fd: new_fd,
         release,
     })
+}
+
+/// Prepare the legacy host-binding projection before committing the shared
+/// descriptor authority. The target is claimed and the source reference is
+/// retained while `operation` publishes the fd-core mutation. Refusal restores
+/// the exact prior projection; success cannot fail after authority publication.
+pub fn with_host_binding_dup<T, E>(
+    fd_map: &[FdMapSlot],
+    open_table: &[DelegatedOpenFile],
+    file_table: u64,
+    old_fd: i32,
+    new_fd: i32,
+    cloexec: bool,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<(T, Option<ReleasedDescription>), HostBindingDupError<E>> {
+    if !(0..GUEST_FD_LIMIT).contains(&new_fd) {
+        return Err(HostBindingDupError::Invalid);
+    }
+    let _guard = lock_fd_map(fd_map).ok_or(HostBindingDupError::Invalid)?;
+
+    let source =
+        fd_map_lookup(fd_map, file_table, old_fd).map(|(handle, index)| ReleasedDescription {
+            handle,
+            incarnation: fd_map[index].incarnation.load(Ordering::Acquire),
+        });
+    if let Some(source) = source
+        && !retain_reference(open_table, source)
+    {
+        return Err(HostBindingDupError::Invalid);
+    }
+
+    let live_target = fd_map_lookup(fd_map, file_table, new_fd);
+    if live_target.is_some_and(|(_, index)| {
+        fd_map[index].fd_flags.load(Ordering::Acquire) & FdMapSlot::HOST_VIEW != 0
+    }) {
+        if let Some(source) = source {
+            release_reference(open_table, source, file_table);
+        }
+        return Err(HostBindingDupError::Invalid);
+    }
+    let tombstone = tombstone_index(fd_map, file_table, new_fd);
+    let target = if let Some((handle, index)) = live_target {
+        Some((
+            index,
+            handle,
+            fd_map[index].incarnation.load(Ordering::Acquire),
+            fd_map[index].fd_flags.load(Ordering::Acquire),
+        ))
+    } else if let Some(index) = tombstone {
+        Some((index, 0, 1, fd_map[index].fd_flags.load(Ordering::Acquire)))
+    } else if source.is_some() {
+        fd_map
+            .iter()
+            .take(FD_MAP_CAPACITY)
+            .position(|slot| slot.incarnation.load(Ordering::Acquire) == 0)
+            .map(|index| (index, 0, 0, 0))
+    } else {
+        None
+    };
+    if let Some(source) = source
+        && target.is_none()
+    {
+        release_reference(open_table, source, file_table);
+        return Err(HostBindingDupError::Full);
+    }
+    if let Some((index, _, incarnation, _)) = target {
+        let claimed = if incarnation == 0 {
+            fd_map[index].try_claim()
+        } else {
+            fd_map[index].try_claim_live(incarnation)
+        };
+        if !claimed {
+            if let Some(source) = source {
+                release_reference(open_table, source, file_table);
+            }
+            return Err(HostBindingDupError::Invalid);
+        }
+    }
+
+    let value = match operation() {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some((index, handle, incarnation, flags)) = target {
+                if incarnation == 0 {
+                    fd_map[index].clear();
+                } else {
+                    fd_map[index].set_with_flags(
+                        file_table,
+                        new_fd as u32,
+                        handle,
+                        incarnation,
+                        flags,
+                    );
+                }
+            }
+            if let Some(source) = source {
+                release_reference(open_table, source, file_table);
+            }
+            return Err(HostBindingDupError::Mutation(error));
+        }
+    };
+
+    let release = target.and_then(|(index, handle, incarnation, _)| {
+        if let Some(source) = source {
+            fd_map[index].set_with_flags(
+                file_table,
+                new_fd as u32,
+                source.handle,
+                source.incarnation,
+                u32::from(cloexec) * GUEST_FD_CLOEXEC,
+            );
+        } else {
+            fd_map[index].clear();
+        }
+        (handle != 0)
+            .then(|| {
+                release_reference(
+                    open_table,
+                    ReleasedDescription {
+                        handle,
+                        incarnation,
+                    },
+                    file_table,
+                )
+            })
+            .flatten()
+    });
+    Ok((value, release))
 }
 
 /// Choose the first unused descriptor at or above `min_fd`, sharing the same
@@ -946,6 +1081,37 @@ mod tests {
                     handle: original,
                     incarnation: 1,
                 }),
+            })
+        );
+    }
+
+    #[test]
+    fn prepared_host_projection_rolls_back_refusal_before_authority_publication() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_stdio(&fd_map, &open_table, &object_table, 10, [true, true, true]);
+        let source = fd_map_lookup(&fd_map, 10, 1).unwrap();
+        let target = fd_map_lookup(&fd_map, 10, 2).unwrap();
+
+        let refused =
+            with_host_binding_dup(&fd_map, &open_table, 10, 1, 2, false, || Err::<(), _>(17u8));
+        assert_eq!(refused, Err(HostBindingDupError::Mutation(17)));
+        assert_eq!(fd_map_lookup(&fd_map, 10, 1), Some(source));
+        assert_eq!(fd_map_lookup(&fd_map, 10, 2), Some(target));
+
+        let (published, release) =
+            with_host_binding_dup(&fd_map, &open_table, 10, 1, 2, true, || Ok::<_, u8>(23))
+                .unwrap();
+        assert_eq!(published, 23);
+        assert_eq!(fd_map_lookup(&fd_map, 10, 2).unwrap().0, source.0);
+        assert_eq!(
+            fd_map[target.1].fd_flags.load(Ordering::Acquire),
+            GUEST_FD_CLOEXEC
+        );
+        assert_eq!(
+            release,
+            Some(ReleasedDescription {
+                handle: target.0,
+                incarnation: 1,
             })
         );
     }

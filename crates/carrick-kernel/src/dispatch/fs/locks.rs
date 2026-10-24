@@ -1637,7 +1637,14 @@ impl<'a> FsView<'a> {
                     // F_SETFD FD_CLOEXEC must be reflected back. Read the
                     // remembered per-stdio-fd bit.
                     if is_stdio_fd(fd.0) {
-                        let bit = if this.captured_file_table().lock_stdio_cloexec()[fd.0 as usize] {
+                        let table = this.captured_file_table();
+                        if let Some(res) = table.ipc_fd_flags(fd.0) {
+                            return Ok(match res {
+                                Ok(bits) => DispatchOutcome::returned_u64_or_errno(bits),
+                                Err(errno) => DispatchOutcome::errno(errno),
+                            });
+                        }
+                        let bit = if table.lock_stdio_cloexec()[fd.0 as usize] {
                             LINUX_FD_CLOEXEC as i64
                         } else {
                             0

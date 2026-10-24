@@ -8,6 +8,7 @@ description = "Linux personality client of the neutral carrick-el1 runtime, and 
 
 [dependencies]
 carrick-el1 = { path = "../carrick-el1" }
+carrick-abi = { path = "../carrick-abi" }
 carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-syscall-abi = { path = "../carrick-syscall-abi" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
@@ -33,7 +34,6 @@ path = "src/entry.rs"
 path = "src/lib.rs"
 
 [dev-dependencies]
-carrick-abi = { path = "../carrick-abi" }
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
 carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
 carrick-guest-mem = { path = "../carrick-guest-mem" }

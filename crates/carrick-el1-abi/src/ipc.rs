@@ -1139,6 +1139,52 @@ impl<'a> IpcRegion<'a> {
         }
     }
 
+    /// Grow `table`'s descriptor backing to at least `descriptors` (rounded up
+    /// to a power of two within `MAX_DESCRIPTORS`) and reclaim the retired
+    /// extent in the same synchronized pool.
+    pub fn ensure_table_capacity<W: LockWait>(
+        &self,
+        table: fd::TableId,
+        descriptors: usize,
+        wait: &W,
+    ) -> Result<(), IpcError> {
+        struct BorrowedWait<'a, W>(&'a W);
+        impl<W: LockWait> LockWait for BorrowedWait<'_, W> {
+            fn wait(&self, attempt: u32) -> bool {
+                self.0.wait(attempt)
+            }
+        }
+        let capacity = descriptors
+            .max(1)
+            .checked_next_power_of_two()
+            .ok_or(IpcError::Fd(fd::Error::NoMemory))?
+            .min(i32::MAX as usize);
+        if capacity < descriptors {
+            return Err(IpcError::Fd(fd::Error::NoMemory));
+        }
+        let mut extent =
+            self.provision_descriptors(capacity, wait)
+                .map_err(|error| match error {
+                    fd::storage::StorageError::Contended => IpcError::Contended,
+                    _ => IpcError::Fd(fd::Error::NoMemory),
+                })?;
+        let authority = self.fd(BorrowedWait(wait));
+        let result = authority.grow_table(table, &mut extent);
+        let result = match result {
+            Err(fd::Error::InvalidArgument)
+                if authority
+                    .backing_capacity(table)
+                    .is_ok_and(|seen| seen >= descriptors) =>
+            {
+                Ok(())
+            }
+            result => result,
+        };
+        self.reclaim_descriptors(&mut extent, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| IpcError::Corrupt)?;
+        result.map_err(IpcError::Fd)
+    }
+
     /// Pool bytes `[offset, offset+len)`, authenticated against the pool.
     fn pool_range(
         &self,

@@ -2337,6 +2337,17 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         self.drop_hold(pin.key.index, PIN)
     }
 
+    /// Release an operation pin while deferring selected final physical
+    /// releases to the host retirement queue.
+    pub fn unpin_filtered(
+        &self,
+        pin: OfdPin,
+        release_here: impl FnOnce(Description) -> bool,
+    ) -> Result<DeferredRelease, Error> {
+        self.check_pin(&pin)?;
+        self.drop_hold_filtered(pin.key.index, PIN, release_here)
+    }
+
     /// Descriptor references and pins of a pinned description.
     pub fn holds(&self, pin: &OfdPin) -> Result<(usize, usize), Error> {
         self.check_pin(pin)?;
