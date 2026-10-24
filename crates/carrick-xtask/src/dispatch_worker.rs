@@ -1576,7 +1576,13 @@ fn publish(
     contract: &Contract,
     report_path: &Path,
     token: &str,
+    runs: &mut agent_loop::RunCache,
 ) -> Result<Option<u64>, ScalerError> {
+    if dispatch.resume {
+        agent_loop::verified_branch_cached(root, dispatch.issue, &dispatch.branch, runs)?;
+    } else {
+        branch_prs(root, &dispatch.branch, "all")?;
+    }
     let state = crate::agent_runner::state()?;
     let work = state.join("work");
     let id = branch_run(dispatch.issue, &dispatch.branch)?;
@@ -1584,11 +1590,6 @@ fn publish(
         && work.is_dir()
         && git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base
     {
-        if dispatch.resume {
-            agent_loop::verified_branch(root, dispatch.issue, &dispatch.branch)?;
-        } else {
-            branch_prs(root, &dispatch.branch, "all")?;
-        }
         git(
             &work,
             &["merge-base", "--is-ancestor", &receipt.base, "HEAD"],
@@ -1837,7 +1838,8 @@ fi
                 &receipt,
                 &contract,
                 &report,
-                "fixture-token"
+                "fixture-token",
+                &mut agent_loop::RunCache::default(),
             )
             .unwrap(),
             Some(800)
@@ -1884,7 +1886,8 @@ fi
                 &receipt,
                 &contract,
                 &report,
-                "fixture-token"
+                "fixture-token",
+                &mut agent_loop::RunCache::default(),
             )
             .unwrap(),
             Some(800)
