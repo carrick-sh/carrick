@@ -280,59 +280,79 @@ impl ExecSource {
         description: Arc<crate::kernel::FileDescription>,
     ) -> io::Result<Self> {
         use super::fd_table::OpenDescription;
-        use std::os::fd::BorrowedFd;
-        // Retain backing before acquiring its I/O guard. Final close takes
-        // lifecycle custody before the backing lock, so reverse order deadlocks.
-        let is_memory_file = description
-            .read_for_io()
-            .is_some_and(|open| matches!(&*open, OpenDescription::File { .. }));
-        let retained = if is_memory_file {
-            Some(
-                description
-                    .retain_mapping()
-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?,
-            )
-        } else {
-            None
-        };
-        let open = description
-            .read_for_io()
+        use std::os::fd::AsFd;
+        enum Opened {
+            Host(super::fd_table::HostFdRef, String),
+            Memory { path: String, mode: u32 },
+        }
+        if !description
+            .inspect_kind(|open| {
+                matches!(
+                    open,
+                    OpenDescription::HostFile { .. } | OpenDescription::File { .. }
+                )
+            })
+            .unwrap_or(false)
+        {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+        // Retain backing before inspection: final close takes lifecycle
+        // custody before the backing lock. This also recalls a delegated file
+        // before duplicating its descriptor. No host I/O runs under inspection.
+        let retained = description
+            .retain_mapping()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
-        match &*open {
-            OpenDescription::HostFile {
-                host_fd, metadata, ..
-            } => {
-                // SAFETY: the description guard owns the fd throughout duplication.
-                let fd = unsafe { BorrowedFd::borrow_raw(host_fd.raw()) }.try_clone_to_owned()?;
-                Self::host(fd.into(), metadata.path.to_string_lossy().into_owned())
-            }
-            OpenDescription::File { path, metadata, .. } => Ok(Self {
-                backing: Arc::new(ExecutableBacking::OpenFile(
-                    retained.ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?,
+        let opened = description
+            .inspect_kind(|open| match open {
+                OpenDescription::HostFile {
+                    host_fd, metadata, ..
+                } => Ok(Opened::Host(
+                    host_fd.clone(),
+                    metadata.path.to_string_lossy().into_owned(),
                 )),
+                OpenDescription::File { path, metadata, .. } => Ok(Opened::Memory {
+                    path: path.clone(),
+                    mode: metadata.mode,
+                }),
+                _ => Err(io::Error::from_raw_os_error(libc::EACCES)),
+            })
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))??;
+        match opened {
+            Opened::Host(file, path) => {
+                // An initial delegation may have passed its mapping-count
+                // check before retain_mapping acquired custody. Inspection
+                // waits for that publisher's backing guard; recall again
+                // after it releases the guard, before fstat or file reads.
+                // The retained mapping rejects every later delegation.
+                crate::el1_delegation::recall_if_delegated(&description);
+                Self::host(file.as_fd().try_clone_to_owned()?.into(), path)
+            }
+            Opened::Memory { path, mode } => Ok(Self {
+                backing: Arc::new(
+                    crate::dispatch::executable_authority::ExecutableBacking::OpenFile(retained),
+                ),
                 object_id: ExecutableObjectId::Description(description.id()),
-                resolved_path: path.clone(),
-                mode: metadata.mode,
+                resolved_path: path,
+                mode,
                 uid: carrick_abi::NsUid::ROOT,
                 gid: carrick_abi::NsGid::ROOT,
             }),
-            _ => Err(io::Error::from_raw_os_error(libc::EACCES)),
         }
     }
 
     fn opened_contents(
         description: &crate::kernel::FileDescription,
     ) -> io::Result<(super::fd_table::FileContents, u32)> {
-        let open = description
-            .read_for_io()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
-        let super::fd_table::OpenDescription::File {
-            contents, metadata, ..
-        } = &*open
-        else {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        };
-        Ok((contents.clone(), metadata.mode))
+        description
+            .inspect_kind(|open| match open {
+                // File is never delegated. Inspect only this variant; no
+                // host descriptor I/O or mutable HostFile state is observed.
+                super::fd_table::OpenDescription::File {
+                    contents, metadata, ..
+                } => Ok((contents.clone(), metadata.mode)),
+                _ => Err(io::Error::from_raw_os_error(libc::EACCES)),
+            })
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?
     }
 
     pub(crate) fn shared(
