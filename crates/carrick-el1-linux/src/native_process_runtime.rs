@@ -1913,7 +1913,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 ))
             }
             carrick_el1_abi::ExternalSignalSource::Terminal
-            | carrick_el1_abi::ExternalSignalSource::HostFault => None,
+            | carrick_el1_abi::ExternalSignalSource::HostFault
+            | carrick_el1_abi::ExternalSignalSource::InZoneIpc => None,
         };
         let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
             carrick_signal_core::SignalSet::from_bits(member.control.blocked().0),

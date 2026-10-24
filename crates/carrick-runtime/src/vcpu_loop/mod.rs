@@ -1636,6 +1636,7 @@ where
                 engine,
                 self.zone_mm,
                 &mut request,
+                &mut self.external_signals,
             )? {
                 zone::IpcHandbackRoute::Complete(outcome) => ipc_prepared = Some(outcome),
                 zone::IpcHandbackRoute::OwnerMemory { pending, outcome } => {
@@ -4758,8 +4759,15 @@ pub(crate) mod tests {
                             6
                         );
                         let zone::IpcHandbackRoute::OwnerMemory { pending, outcome } =
-                            zone::ipc_route(&kernel.dispatcher, &root, this_tid, outcome, None)
-                                .unwrap()
+                            zone::ipc_route(
+                                &kernel.dispatcher,
+                                &root,
+                                this_tid,
+                                outcome,
+                                None,
+                                &mut state.external_signals,
+                            )
+                            .unwrap()
                         else {
                             panic!("read must retain its exact operation on refusal");
                         };
