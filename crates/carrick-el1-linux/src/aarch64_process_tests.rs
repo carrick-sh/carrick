@@ -1165,6 +1165,7 @@ fn activate(
 enum Wait4TerminalCase {
     Exited,
     CoreSignal,
+    PipeSignal,
 }
 
 /// Red-first Test 3: wait4 consumes an exited zombie exactly once with exact status copied.
@@ -1182,6 +1183,12 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
 #[test]
 fn arm_wait4_reports_default_core_signal_from_production_delivery() {
     wait4_consumes_zombie_once_with_exact_status(Wait4TerminalCase::CoreSignal);
+}
+
+#[cfg(test)]
+#[test]
+fn arm_wait4_reports_sigpipe_from_native_signal_owner() {
+    wait4_consumes_zombie_once_with_exact_status(Wait4TerminalCase::PipeSignal);
 }
 
 #[cfg(test)]
@@ -1271,11 +1278,19 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
             panic!("matching child process group must not park");
         };
         assert_eq!(result.raw(), 0, "-pgid selects the regrouped live child");
-        if matches!(terminal, Wait4TerminalCase::CoreSignal) {
+        if matches!(
+            terminal,
+            Wait4TerminalCase::CoreSignal | Wait4TerminalCase::PipeSignal
+        ) {
+            let signal = match terminal {
+                Wait4TerminalCase::CoreSignal => 11,
+                Wait4TerminalCase::PipeSignal => 13,
+                Wait4TerminalCase::Exited => unreachable!(),
+            };
             parent_entry
                 .kill(
                     SignalProcessSelector::from_abi(u64::from(child_pid)),
-                    SignalRequest::from_abi(11).unwrap(),
+                    SignalRequest::from_abi(signal).unwrap(),
                     SignalInfo::Generated(None),
                 )
                 .unwrap();
@@ -1364,7 +1379,7 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
                     }
                 ));
             }
-            Wait4TerminalCase::CoreSignal => {
+            Wait4TerminalCase::CoreSignal | Wait4TerminalCase::PipeSignal => {
                 assert!(child_entry.signal_checkpoint_needed());
                 let mut frame = carrick_el1_abi::TrapFrame::default();
                 let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
@@ -1423,6 +1438,7 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
     let expected_code = match terminal {
         Wait4TerminalCase::Exited => carrick_syscall_abi::LINUX_CLD_EXITED,
         Wait4TerminalCase::CoreSignal => carrick_syscall_abi::LINUX_CLD_DUMPED,
+        Wait4TerminalCase::PipeSignal => carrick_syscall_abi::LINUX_CLD_KILLED,
     };
     assert_eq!(si_code, expected_code);
     assert_eq!(child_info.si_addr as u32, child_pid);
@@ -1431,6 +1447,7 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
         match terminal {
             Wait4TerminalCase::Exited => 9,
             Wait4TerminalCase::CoreSignal => 11,
+            Wait4TerminalCase::PipeSignal => 13,
         }
     );
 
@@ -1448,6 +1465,7 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
     let expected_status = match terminal {
         Wait4TerminalCase::Exited => 9 << 8,
         Wait4TerminalCase::CoreSignal => 11 | 0x80,
+        Wait4TerminalCase::PipeSignal => 13,
     };
     assert_eq!(status_storage, expected_status);
     if matches!(terminal, Wait4TerminalCase::CoreSignal) {

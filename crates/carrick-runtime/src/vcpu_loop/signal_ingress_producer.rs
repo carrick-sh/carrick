@@ -52,6 +52,22 @@ impl HostIngressTarget {
             process_birth: carrick_core_abi::BirthSerial::of_task(context.task().key().serial),
         })
     }
+
+    fn thread_event(
+        self,
+        generation: carrick_el1_abi::SignalEventGeneration,
+        signal: Signal,
+        source: ExternalSignalSource,
+    ) -> ExternalSignalRecord {
+        ExternalSignalRecord::new(
+            EntryEventIdentity::from_binding(self.binding),
+            self.binding,
+            self.record,
+            generation,
+            signal,
+            source,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +81,7 @@ pub(crate) enum HostIngressStep {
 pub(crate) enum HostIngressError {
     EventGenerationExhausted,
     InvalidBridgeSignal(i32),
+    DeferredInZoneSignalPending,
 }
 
 /// The exact event survives queue fullness in this executor. Each boundary
@@ -73,15 +90,44 @@ pub(crate) enum HostIngressError {
 #[derive(Default)]
 pub(crate) struct HostSignalIngressProducer {
     pending: Option<SignalIngressAdmission>,
+    deferred_in_zone: Option<SignalIngressAdmission>,
 }
 
 impl HostSignalIngressProducer {
     pub(crate) const fn new() -> Self {
-        Self { pending: None }
+        Self {
+            pending: None,
+            deferred_in_zone: None,
+        }
     }
 
     pub(crate) fn pending_event(&self) -> Option<ExternalSignalRecord> {
-        self.pending.as_ref().map(SignalIngressAdmission::event)
+        self.deferred_in_zone
+            .as_ref()
+            .or(self.pending.as_ref())
+            .map(SignalIngressAdmission::event)
+    }
+
+    pub(crate) fn publish_deferred_in_zone<const N: usize>(
+        &mut self,
+        queue: &SignalIngressQueue<N>,
+        target: HostIngressTarget,
+        signal: Signal,
+    ) -> Result<HostIngressStep, HostIngressError> {
+        if self.deferred_in_zone.is_some() {
+            return Err(HostIngressError::DeferredInZoneSignalPending);
+        }
+        let generation = queue
+            .issue_event_generation()
+            .ok_or(HostIngressError::EventGenerationExhausted)?;
+        let event = target.thread_event(generation, signal, ExternalSignalSource::InZoneIpc);
+        match queue.admit(event) {
+            Ok(()) => Ok(HostIngressStep::Published),
+            Err(pending) => {
+                self.deferred_in_zone = Some(pending);
+                Ok(HostIngressStep::Parked)
+            }
+        }
     }
 
     pub(crate) fn publish<const N: usize>(
@@ -90,6 +136,17 @@ impl HostSignalIngressProducer {
         target: Option<HostIngressTarget>,
         take_bridge_signal: impl FnOnce(i32) -> Option<carrick_hal::PendingSignalEvent>,
     ) -> Result<HostIngressStep, HostIngressError> {
+        if let Some(pending) = self.deferred_in_zone.take() {
+            if queue.drain_generation() == pending.observed_drain() {
+                self.deferred_in_zone = Some(pending);
+                return Ok(HostIngressStep::Parked);
+            }
+            if let Err(pending) = pending.retry(queue) {
+                self.deferred_in_zone = Some(pending);
+                return Ok(HostIngressStep::Parked);
+            }
+            return Ok(HostIngressStep::Published);
+        }
         if let Some(pending) = self.pending.take() {
             if queue.drain_generation() == pending.observed_drain() {
                 self.pending = Some(pending);
@@ -209,6 +266,71 @@ mod tests {
             BirthSerial::of_task(context.task().key().serial)
         );
         assert_ne!(target.binding.generation.raw(), target.process_birth.raw());
+    }
+
+    #[test]
+    fn deferred_in_zone_sigpipe_keeps_exact_thread_event_across_full_ingress() {
+        use carrick_kernel::kernel::continuation::test_support::publish;
+
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
+            109,
+            carrick_hal::ThreadId::synthetic_for_tests(227),
+            "in-zone-sigpipe".to_owned(),
+        )
+        .unwrap();
+        let (_kernel, context) = carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        assert_eq!(publish(&context, 0x709).raw(), 1);
+        let control = context.thread().control_slot();
+        let record = RecordRef {
+            id: RecordId::from_raw(4).unwrap(),
+            incarnation: 9,
+        };
+        control.bind_zone_record(record);
+        let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+        custody.commit_registration();
+        custody.commit_native_signal_owner();
+        let target = HostIngressTarget::from_context(&context).unwrap();
+        let queue = SignalIngressQueue::<2>::new();
+        let mut producer = HostSignalIngressProducer::new();
+
+        assert_eq!(
+            producer
+                .publish_deferred_in_zone(&queue, target, Signal::PIPE)
+                .unwrap(),
+            HostIngressStep::Published
+        );
+        assert_eq!(
+            producer
+                .publish_deferred_in_zone(&queue, target, Signal::PIPE)
+                .unwrap(),
+            HostIngressStep::Published
+        );
+        assert_eq!(
+            producer
+                .publish_deferred_in_zone(&queue, target, Signal::PIPE)
+                .unwrap(),
+            HostIngressStep::Parked
+        );
+        let retained = producer.pending_event().unwrap();
+        assert_eq!(retained.signal(), Signal::PIPE);
+        assert_eq!(retained.source(), ExternalSignalSource::InZoneIpc);
+        assert_eq!(
+            retained.scope(),
+            carrick_el1_abi::ExternalSignalScope::Thread
+        );
+        assert_eq!(retained.record(), record);
+
+        for _ in 0..2 {
+            let queued = queue.take().unwrap();
+            assert_eq!(queued.signal(), Signal::PIPE);
+        }
+        assert_eq!(
+            producer.publish(&queue, None, |_| None).unwrap(),
+            HostIngressStep::Published
+        );
+        assert!(producer.pending_event().is_none());
+        let retried = queue.take().unwrap();
+        assert_eq!(retried, retained);
     }
 
     #[test]

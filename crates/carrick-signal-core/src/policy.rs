@@ -26,6 +26,7 @@ impl Signal {
     pub const KILL: Self = Self(9);
     pub const BUS: Self = Self(7);
     pub const SEGV: Self = Self(11);
+    pub const PIPE: Self = Self(13);
     pub const ALRM: Self = Self(14);
     pub const CHLD: Self = Self(17);
     pub const CONT: Self = Self(18);

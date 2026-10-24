@@ -1261,10 +1261,43 @@ fn ipc_complete(
     if sigpipe && !dispatcher.signal_is_ignored(context, carrick_abi::LINUX_SIGPIPE) {
         dispatcher.mark_signal_pending(context, tid, carrick_abi::LINUX_SIGPIPE);
     }
+    ipc_result(result)
+}
+
+fn ipc_result(result: i64) -> DispatchOutcome {
     match LinuxErrno::from_guest_retval(result) {
         Some(errno) => DispatchOutcome::Errno { errno },
         None => DispatchOutcome::Returned { value: result },
     }
+}
+
+fn ipc_complete_for_owner(
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+    context: &carrick_kernel::kernel::KernelContext,
+    tid: ThreadId,
+    result: i64,
+    sigpipe: bool,
+    producer: &mut super::signal_ingress_producer::HostSignalIngressProducer,
+) -> Result<DispatchOutcome, RuntimeError> {
+    if sigpipe
+        && let Some(target) =
+            super::signal_ingress_producer::HostIngressTarget::from_context(context)
+    {
+        let queue = carrick_el1_abi::signal_ingress_host().ok_or_else(|| {
+            RuntimeError::Configuration("native SIGPIPE ingress has no shared reservation".into())
+        })?;
+        producer
+            .publish_deferred_in_zone(
+                queue,
+                target,
+                carrick_personality_linux::signal::policy::Signal::PIPE,
+            )
+            .map_err(|error| {
+                RuntimeError::Configuration(format!("native SIGPIPE ingress: {error:?}"))
+            })?;
+        return Ok(ipc_result(result));
+    }
+    Ok(ipc_complete(dispatcher, context, tid, result, sigpipe))
 }
 
 /// Decode an [`carrick_el1_abi::ipc::IPC_HANDBACK_NR`] frame: restore the
@@ -1279,6 +1312,7 @@ pub(super) fn ipc_handback_route<E: ThreadedEngine>(
     engine: &mut E,
     zone_mm: Option<u64>,
     request: &mut SyscallRequest,
+    producer: &mut super::signal_ingress_producer::HostSignalIngressProducer,
 ) -> Result<IpcHandbackRoute, RuntimeError> {
     let region = host_ipc::host_region().ok_or_else(|| {
         RuntimeError::Configuration("IPC handback without a published IPC window".to_owned())
@@ -1309,7 +1343,14 @@ pub(super) fn ipc_handback_route<E: ThreadedEngine>(
     )
     .map_err(|error| ipc_error("handback completion", error))?;
     restart_with_remaining(engine, Some(request), &outcome)?;
-    ipc_route(&kernel.dispatcher, context, tid, outcome, snapshots)
+    ipc_route(
+        &kernel.dispatcher,
+        context,
+        tid,
+        outcome,
+        snapshots,
+        producer,
+    )
 }
 
 /// A timed epoll wait re-runs with what is left of its deadline: rewrite
@@ -1344,11 +1385,12 @@ pub(super) fn ipc_route(
     tid: ThreadId,
     outcome: host_ipc::IpcHostOutcome,
     snapshots: Option<[Option<ObjectWaitSnapshot>; 2]>,
+    producer: &mut super::signal_ingress_producer::HostSignalIngressProducer,
 ) -> Result<IpcHandbackRoute, RuntimeError> {
     Ok(match outcome {
-        host_ipc::IpcHostOutcome::Complete { result, sigpipe } => {
-            IpcHandbackRoute::Complete(ipc_complete(dispatcher, context, tid, result, sigpipe))
-        }
+        host_ipc::IpcHostOutcome::Complete { result, sigpipe } => IpcHandbackRoute::Complete(
+            ipc_complete_for_owner(dispatcher, context, tid, result, sigpipe, producer)?,
+        ),
         host_ipc::IpcHostOutcome::Restart { .. } => IpcHandbackRoute::Restart,
         host_ipc::IpcHostOutcome::OwnerMemory { token, outcome } => IpcHandbackRoute::OwnerMemory {
             pending: host_ipc::RetainedIpcOperation::new(context.kernel(), token)
@@ -1400,6 +1442,7 @@ impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E> {
             self.this_tid,
             outcome,
             snapshots,
+            &mut self.external_signals,
         )? {
             IpcHandbackRoute::Complete(outcome) => Ok(outcome),
             IpcHandbackRoute::Park(park) => {
@@ -1568,6 +1611,7 @@ where
             self.state.this_tid,
             outcome,
             snapshots,
+            &mut self.state.external_signals,
         )?)
     }
 
@@ -1724,6 +1768,7 @@ where
                     self.state.this_tid,
                     outcome,
                     None,
+                    &mut self.state.external_signals,
                 )?
             }
             None => {
@@ -1953,7 +1998,16 @@ mod ipc_tests {
         let snapshots = host_ipc::lane_snapshots(&zone, object);
         assert!(snapshots.iter().all(Option::is_some));
         let token = region.begin_operation(IpcOperation::EMPTY).unwrap();
-        let route = ipc_route(&dispatcher, &context, tid, blocked(token), Some(snapshots)).unwrap();
+        let mut producer = super::signal_ingress_producer::HostSignalIngressProducer::new();
+        let route = ipc_route(
+            &dispatcher,
+            &context,
+            tid,
+            blocked(token),
+            Some(snapshots),
+            &mut producer,
+        )
+        .unwrap();
         let IpcHandbackRoute::Park(park) = route else {
             panic!("a blocked operation parks");
         };
@@ -1994,7 +2048,17 @@ mod ipc_tests {
         drop(guard);
         // Without a wait queue, a blocked operation fails closed.
         let token = region.begin_operation(IpcOperation::EMPTY).unwrap();
-        assert!(ipc_route(&dispatcher, &context, tid, blocked(token), None).is_err());
+        assert!(
+            ipc_route(
+                &dispatcher,
+                &context,
+                tid,
+                blocked(token),
+                None,
+                &mut producer,
+            )
+            .is_err()
+        );
     }
 
     fn syscall_state(nr: u64, x0: u64) -> GuestCpuState {
