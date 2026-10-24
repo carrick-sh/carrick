@@ -5,7 +5,7 @@ guest_surfaces = ["kernel:filetable", "syscall:close", "syscall:dup2", "syscall:
 semantic_authority = ["man 2 fork", "man 2 clone", "man 2 dup", "man 2 execve"]
 fixture = "kernel:two live FileTables with shared IPC publication and bare stdio"
 scale_points = [65, 4096, 65536]
-rationale = "Shared authority mutations must be visible to every observer. Host custody must not select numeric descriptors. Flips at M1 cutover: red_until_step3_m1_one_table_writer and red_until_step3_m1_no_host_slot_selection. Each gate asserts the exact current failure using expect_err; unexpected green fails. Invert both to positive assertions in the same commit deleting the old writer. No production cutover is authorized by these tests."
+rationale = "Shared authority mutations must be visible to every observer. Host custody must not select numeric descriptors. Enforced by one_table_writer and no_host_slot_selection."
 
 # These bindings enforce typed fixture assertions directly (slot reads, bitmap
 # levels and incarnation identity), not fabricated WorkMetric observations.
@@ -13,7 +13,7 @@ rationale = "Shared authority mutations must be visible to every observer. Host 
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-kernel::kernel::objects::ipc::tests::{red_until_step3_m1_one_table_writer,red_until_step3_m1_no_host_slot_selection}"
+vm_free = "carrick-kernel::kernel::objects::ipc::tests::{one_table_writer,no_host_slot_selection}"
 
 [bindings.unresolved]
 embed_structural = "Signed EL0 ownership witness is required after Phase B and step-2 memory land. VM-free publication tests do not prove guest execution or carrier isolation."
