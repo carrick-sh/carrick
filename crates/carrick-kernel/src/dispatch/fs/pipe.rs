@@ -1020,7 +1020,7 @@ mod tests {
     use crate::dispatch::{InternalWaitKind, WaitFdAuthority};
 
     #[test]
-    fn native_children_final_writer_close_publishes_eof() {
+    fn forked_tables_final_writer_close_publishes_eof() {
         use carrick_el1_abi::ipc::fd;
         let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
         let parent = crate::el1_ipc::HostTable::create(Arc::clone(&owner), 64, 64).unwrap();
@@ -1039,8 +1039,9 @@ mod tests {
                 owner.release(description.backing).unwrap();
             }
         };
-        // Both children are live. Parent relinquishes every endpoint, including
-        // its host-side functional references; only inherited slots remain.
+        // Both forked tables are live. The parent relinquishes every endpoint,
+        // including its host-side functional references; only inherited slots
+        // remain. Native process birth is covered in aarch64_process_tests.
         close(parent.id(), fd::Fd(0));
         close(parent.id(), fd::Fd(1));
         pipe.release_endpoint(core_pipe::End::Reader);
