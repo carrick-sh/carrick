@@ -16,6 +16,11 @@ mod common;
 #[path = "../../../fixtures/embed-el1-sched/src/sample_buffer.rs"]
 mod sample_buffer;
 
+#[path = "common/host_read_enrollment.rs"]
+mod host_read_enrollment;
+#[path = "../../../fixtures/embed-el1-sched/src/host_read_gate.rs"]
+mod host_read_gate;
+
 use std::time::Duration;
 
 use carrick_abi::{NsGid, NsUid};
@@ -26,6 +31,69 @@ use carrick_embed::{
 };
 
 const FIXTURE: &str = "/opt/carrick/el1-sched";
+
+#[derive(Default)]
+struct HostReadTask(std::sync::Mutex<Option<carrick_kernel::kernel::objects::TaskRef>>);
+
+impl carrick_kernel::observe::SyscallObserver for HostReadTask {
+    fn on_syscall(
+        &self,
+        process: &carrick_kernel::observe::ProcessInfo<'_>,
+        _call: &carrick_kernel::observe::SyscallInfo<'_>,
+    ) -> carrick_kernel::observe::SyscallAction {
+        self.0
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| process.context().task().clone());
+        carrick_kernel::observe::SyscallAction::Allow
+    }
+}
+
+/// The host only acknowledges a live producer registration on the exact
+/// reader. A forwarded syscall counter, a prepared wait, or a different
+/// thread's nanosleep cannot release the guest's socket write.
+fn observe_host_read(
+    task: &HostReadTask,
+    lease: &carrick_embed::SharedBufferLease,
+    stop: &std::sync::atomic::AtomicBool,
+    timeout: Duration,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let tid = lease
+        .atomic_u32(std::mem::offset_of!(
+            host_read_gate::HostReadGate,
+            reader_tid
+        ))
+        .unwrap();
+    let enrolled = lease
+        .atomic_u32(std::mem::offset_of!(host_read_gate::HostReadGate, enrolled))
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !stop.load(Ordering::Acquire) && started.elapsed() < timeout {
+        let Ok(tid) = tid.load(Ordering::Acquire) else {
+            return false;
+        };
+        let owner = task.0.lock().unwrap().clone();
+        if tid != 0
+            && let Some(owner) = owner
+            && let Some(reader) = owner.threads().into_iter().find(|thread| {
+                carrick_kernel::namespace::pid::ns_visible_thread_tid(thread) == Some(tid)
+            })
+            && matches!(
+                reader.execution_state(),
+                carrick_kernel::kernel::objects::ThreadExecutionState::Blocked { .. }
+            )
+            && host_read_enrollment::enrolled_read(reader.continuation_diagnostic().as_ref())
+        {
+            enrolled.store(1, Ordering::Release).unwrap();
+            return true;
+        }
+        // Diagnostic sampling cadence only: elapsed time never permits a
+        // write, and the timeout is failure-only. No runtime path is polled.
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    false
+}
 
 /// Failure-only live capture for this witness. The signed embed carrier is
 /// this process, so there is no CLI parent to discover or attach by mistake.
@@ -366,7 +434,42 @@ fn run_fixture_in_image(
         ));
         captured = Some(bytes);
     }
-    let mut result = common::run_or_fail(builder.run_blocking());
+    let mut result = if args.first() == Some(&"host-compute") {
+        let buffer = carrick_embed::SharedBuffer::new(4096).unwrap();
+        let task = std::sync::Arc::new(HostReadTask::default());
+        let prepared = {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime
+                .block_on(
+                    builder
+                        .shared_buffer("host-read-gate", &buffer)
+                        .observer(task.clone())
+                        .prepare(),
+                )
+                .unwrap()
+        };
+        let lease = prepared.shared_buffer_lease("host-read-gate").unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let observer = scope.spawn(|| observe_host_read(&task, &lease, &stop, timeout));
+            let result = prepared.execute();
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            let observed = observer.join().unwrap();
+            let result = common::run_or_fail(result);
+            assert!(
+                observed,
+                "socket read never enrolled: exit={} stderr={:?}",
+                result.exit_code,
+                result.stderr_utf8()
+            );
+            result
+        })
+    } else {
+        common::run_or_fail(builder.run_blocking())
+    };
     if let Some(bytes) = captured {
         result.stdout = std::mem::take(&mut *bytes.lock().unwrap());
     }
@@ -1837,7 +1940,8 @@ fn el1_sched_two_processes_share_vcpus() {
     }
 }
 
-/// A host-served socket read completes before its thread exchanges 16
+/// A host-served socket read is observed enrolled before the writer releases
+/// it, then its thread exchanges 16
 /// syscall-free compute turns with a CPU-0 sibling. Completion plus actual
 /// in-guest preemptions proves shared-CPU progress independent of host wall
 /// time. The virtual slice deadline is checked with the VM-free fake clock
@@ -1847,8 +1951,13 @@ fn el1_sched_host_woken_thread_preempts_a_compute_loop() {
     let _guard = common::guest_lock();
     reset_el1_counters();
     let carrier = carrier_or_fail();
-    for _ in 0..3 {
-        let measured = run_fixture(&carrier, &["host-compute", "16"], Duration::from_secs(60));
+    for delayed in [false, false, false, true] {
+        let args = if delayed {
+            vec!["host-compute", "16", "delayed-reader"]
+        } else {
+            vec!["host-compute", "16"]
+        };
+        let measured = run_fixture(&carrier, &args, Duration::from_secs(60));
         let stdout = measured.result.stdout_utf8();
         println!(
             "el1-sched host-compute exits={} zone={:?} {}",
@@ -1859,6 +1968,12 @@ fn el1_sched_host_woken_thread_preempts_a_compute_loop() {
         assert!(measured.result.success(), "{}", describe(&measured));
         assert_eq!(field(&stdout, "a_count"), 16.0, "{stdout:?}");
         assert_eq!(field(&stdout, "b_count"), 16.0, "{stdout:?}");
+        assert_eq!(field(&stdout, "enrolled"), 1.0, "{stdout:?}");
+        assert_eq!(
+            field(&stdout, "delayed_reader"),
+            f64::from(delayed),
+            "{stdout:?}"
+        );
         assert!(
             measured.zone.preemptions >= 2,
             "host-completed thread must share the compute CPU: {:?}",

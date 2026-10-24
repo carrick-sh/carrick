@@ -49,8 +49,11 @@
 //!   the pingpong threads are doing. The main thread pins to CPU 0 and waits
 //!   on a host-served read until the actor runs; it prints `stepper ok`.
 //! - `host-compute <rounds>` (EL1 plan 1d): two threads pinned to one guest CPU;
-//!   one completes the other's host-served socket `read`, then both exchange
-//!   counted atomic turns without further syscalls.
+//!   the signed harness acknowledges the sibling's enrolled host socket read
+//!   through `/dev/carrick/shm/host-read-gate` before the main thread writes.
+//!   Both then exchange counted atomic turns without further syscalls. The
+//!   optional `delayed-reader` keeps the sibling before read until nanosleep
+//!   has returned, proving that elapsed sleep is not enrollment evidence.
 //! - `two-process <iters>` (EL1 plan 1d): `fork`, then each process runs a
 //!   `pingpong` pair pinned to guest CPUs 0 and 1, so threads of the two
 //!   address spaces share those vCPUs; prints each process's round trips.
@@ -112,6 +115,7 @@ use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize,
 use std::time::{Duration, Instant};
 
 mod delegated_root;
+mod host_read_gate;
 mod ipc;
 mod sample_buffer;
 mod threads;
@@ -1190,11 +1194,36 @@ fn epoll_pingpong(iters: usize) -> i32 {
 
 /// Host-served socket completion followed by counted syscall-free turns on
 /// one vCPU. Pipes are in-zone and cannot exercise host completion here.
-fn host_compute(rounds: u32) -> i32 {
+fn host_compute(rounds: u32, delayed_reader: bool) -> i32 {
     assert!(rounds >= 2);
+    let gate_fd = unsafe { libc::open(c"/dev/carrick/shm/host-read-gate".as_ptr(), libc::O_RDWR) };
+    assert!(gate_fd >= 0, "host read enrollment gate");
+    let gate_ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            gate_fd,
+            0,
+        )
+    };
+    assert_ne!(gate_ptr, libc::MAP_FAILED, "map host read enrollment gate");
+    // The page-aligned mapping stays live through the sibling join. Both
+    // sides access only the protocol's aligned atomic words.
+    let gate = unsafe { &*gate_ptr.cast::<host_read_gate::HostReadGate>() };
+    unsafe { libc::close(gate_fd) };
     let (read_fd, write_fd) = socket_pair();
     let b = std::thread::spawn(move || {
         assert_eq!(pin(0), 0, "host-compute sibling affinity");
+        if delayed_reader {
+            while gate.sleep_done.load(Ordering::Acquire) == 0 {
+                std::hint::spin_loop();
+            }
+        }
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        assert!(tid > 0, "host-compute reader identity");
+        gate.reader_tid.store(tid as u32, Ordering::Release);
         assert_eq!(read_byte(read_fd), 1, "host-compute read");
         compute_sibling(rounds);
     });
@@ -1202,14 +1231,23 @@ fn host_compute(rounds: u32) -> i32 {
     // This exercises the same nanosleep input as the original reproducer;
     // neither the turn count nor the preemption assertion uses its duration.
     sleep_ms(30);
+    gate.sleep_done.store(1, Ordering::Release);
+    // This is observation of a production enrollment, not a duration-based
+    // assumption that the sibling has reached read. The embed watchdog bounds
+    // a missing enrollment; there is no timeout-to-success path.
+    while gate.enrolled.load(Ordering::Acquire) != 1 {
+        std::hint::spin_loop();
+    }
     assert_eq!(write_byte(write_fd), 1, "host-compute write");
     compute_main(rounds);
     b.join().expect("host-compute sibling exits");
     println!(
-        "host-compute rounds={rounds} a_count={} b_count={}",
+        "host-compute rounds={rounds} a_count={} b_count={} enrolled=1 delayed_reader={}",
         CP_A.load(Ordering::Acquire),
-        CP_B.load(Ordering::Acquire)
+        CP_B.load(Ordering::Acquire),
+        u32::from(delayed_reader)
     );
+    assert_eq!(unsafe { libc::munmap(gate_ptr, 4096) }, 0);
     0
 }
 
@@ -3509,7 +3547,10 @@ fn main() {
         "sock-pingpong-stepper" => {
             sock_pingpong_stepper(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(2_000))
         }
-        "host-compute" => host_compute(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(16)),
+        "host-compute" => host_compute(
+            args.get(2).and_then(|n| n.parse().ok()).unwrap_or(16),
+            args.get(3).is_some_and(|arg| arg == "delayed-reader"),
+        ),
         "two-process" => two_process(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20_000)),
         "mm-occupancy" => mm_occupancy(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200)),
         "first-touch" => match args.get(2) {
