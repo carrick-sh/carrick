@@ -1901,6 +1901,19 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         Ok(())
     }
     fn retire_fd_table(&mut self, table: u64) {
+        if let Some((region, map)) = self.crossing.ipc_binding()
+            && let Some(raw) = map.lookup(table)
+        {
+            map.withdraw(table);
+            super::ipc::retire_namespace(
+                &region,
+                carrick_el1_abi::ipc::fd::TableId::from_raw(raw),
+                self.zone,
+                self.slot,
+                self.task,
+            )
+            .unwrap_or_else(|_| fatal());
+        }
         super::file_table::retire_fd_map(self.crossing.fd_map(), self.crossing.open_table(), table);
         self.task.linux.mark_pending_host_work();
     }

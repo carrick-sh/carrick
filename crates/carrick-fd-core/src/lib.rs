@@ -225,6 +225,42 @@ const fn decode_entry(word: u64) -> Option<Entry> {
     }
 }
 
+/// Owns queued physical table retirement. The table is no longer a guest
+/// namespace; its unclosed slots retain physical releases until completion.
+#[must_use]
+pub struct RetiredTable<'view, 'core, B: SlotBacking, W: LockWait, const T: usize> {
+    authority: &'view Authority<'core, B, W, T>,
+    id: TableId,
+    capacity: usize,
+    finished: bool,
+}
+impl<B: SlotBacking, W: LockWait, const T: usize> RetiredTable<'_, '_, B, W, T> {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    pub fn finish(&mut self, release: impl FnMut(Description)) -> Result<Extent, Error> {
+        if self.finished {
+            return Err(Error::StaleTable);
+        }
+        let extent = self
+            .authority
+            .destroy_table_in_states(self.id, release, &[TABLE_RETIRED])?;
+        self.finished = true;
+        Ok(extent)
+    }
+}
+impl<B: SlotBacking, W: LockWait, const T: usize> Drop for RetiredTable<'_, '_, B, W, T> {
+    fn drop(&mut self) {
+        if !self.finished {
+            push(
+                &self.authority.core.retired_tables,
+                self.id.index,
+                &self.authority.core.tables[self.id.index].retired,
+            );
+        }
+    }
+}
+
 /// One descriptor slot in venue-provided (possibly shared) memory:
 /// 0 = empty, otherwise OFD index + 1 with bit 63 = FD_CLOEXEC. Accessed only
 /// under the owning table's lock.
@@ -462,6 +498,7 @@ impl Table<'_> {
 pub(crate) const TABLE_FREE: u32 = 0;
 pub(crate) const TABLE_LIVE: u32 = 1;
 pub(crate) const TABLE_LIVE_HANDLES: u32 = 2;
+const TABLE_RETIRED: u32 = 3;
 pub(crate) const TABLE_BOUND_TASK: u32 = 4;
 pub(crate) const FREE_INDEX: u64 = u32::MAX as u64;
 const REF: u64 = 1 << 32;
@@ -633,7 +670,8 @@ pub struct Core<const T: usize> {
     /// Personality object records published by the venue
     /// ([`Authority::publish_objects`]): indices below it resolve; it only grows.
     pub(crate) object_count: AtomicU64,
-    _reserved: [u64; 2],
+    retired_tables: AtomicU64,
+    _reserved: [u64; 1],
     pub(crate) tables: [TableRecord; T],
 }
 
@@ -654,7 +692,12 @@ const fn str_eq(a: &str, b: &str) -> bool {
 }
 
 /// Named layout facts a shared-memory venue folds into its ABI layout hash.
-pub const NAMED_LAYOUT_FACTS: [(&str, u64); 56] = [
+pub const NAMED_LAYOUT_FACTS: [(&str, u64); 58] = [
+    ("TABLE_RETIRED", TABLE_RETIRED as u64),
+    (
+        "Core.retired_tables",
+        core::mem::offset_of!(Core<1>, retired_tables) as u64,
+    ),
     (
         "TableRecord.size",
         core::mem::size_of::<TableRecord>() as u64,
@@ -949,7 +992,8 @@ impl<const T: usize> Core<T> {
             ofd_count: AtomicU64::new(0),
             free_objects: AtomicU64::new(0),
             object_count: AtomicU64::new(0),
-            _reserved: [0; 2],
+            retired_tables: AtomicU64::new(0),
+            _reserved: [0; 1],
             tables: core::array::from_fn(|_| TableRecord::default()),
         };
         let identity = NEXT_AUTHORITY
@@ -1847,9 +1891,71 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     pub fn destroy_table(
         &self,
         table: TableId,
-        mut release: impl FnMut(Description),
+        release: impl FnMut(Description),
     ) -> Result<Extent, Error> {
+        self.destroy_table_in_states(table, release, &[TABLE_LIVE])
+    }
+
+    /// Revoke a namespace now, retaining deferred physical releases in its
+    /// own storage. Selected descriptions close in this venue; the remaining
+    /// slots and extent move to the authority's retirement queue. The queue
+    /// needs no allocation: each table owns its link until physical completion.
+    pub fn retire_table(
+        &self,
+        table: TableId,
+        release_here: impl Fn(Description) -> bool,
+        mut release: impl FnMut(Description),
+    ) -> Result<(), Error> {
         let (guard, t) = self.lock(table)?;
+        for fd in 0..t.storage.capacity() {
+            if let Some(entry) = t.storage.get(fd)
+                && release_here(self.snapshot(entry.ofd)?)
+                && let Some(description) = self.close_locked(&t, Fd(fd as i32))?
+            {
+                release(description);
+            }
+        }
+        guard.record.begin_write();
+        guard.record.state.store(TABLE_RETIRED, Ordering::Release);
+        guard.record.end_write();
+        drop(guard);
+        push(
+            &self.core.retired_tables,
+            table.index,
+            &self.core.tables[table.index].retired,
+        );
+        Ok(())
+    }
+
+    /// Take owned custody of one revoked table. Dropping the receipt without
+    /// finishing returns it to the queue, including on lock refusal.
+    pub fn take_retired_table(&self) -> Option<RetiredTable<'_, 'a, B, W, T>> {
+        let index = pop(&self.core.retired_tables, |i| {
+            self.core
+                .tables
+                .get(i)
+                .map(|table| table.retired.load(Ordering::Relaxed))
+        })?;
+        let record = &self.core.tables[index];
+        Some(RetiredTable {
+            authority: self,
+            id: TableId {
+                authority: self.core.identity.load(Ordering::Acquire),
+                index,
+                generation: record.generation.load(Ordering::Acquire),
+            },
+            capacity: record.extent_capacity.load(Ordering::Relaxed) as usize,
+            finished: false,
+        })
+    }
+
+    fn destroy_table_in_states(
+        &self,
+        table: TableId,
+        mut release: impl FnMut(Description),
+        states: &[u32],
+    ) -> Result<Extent, Error> {
+        let (guard, t) = self.lock_in_states(table, states)?;
         for fd in 0..t.storage.capacity() {
             if t.storage.get(fd).is_some()
                 && let Some(d) = self.close_locked(&t, Fd(fd as i32))?

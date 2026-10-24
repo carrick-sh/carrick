@@ -557,3 +557,96 @@ fn task_cross_bucket_recycle_authenticates_original_bucket_sequence() {
         assert_eq!(host.table_id(anchor), Ok(anchor_table));
     });
 }
+
+#[test]
+fn two_retiring_tables_transfer_final_release_once() {
+    struct Tables {
+        slots: [DescriptorSlot; 2],
+        bitmap: [AtomicU64; 2],
+        ofd: OfdRecord,
+    }
+    impl SlotBacking for Tables {
+        fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
+            let index = usize::try_from(extent.token).ok()?;
+            Some((
+                self.slots.get(index..index + 1)?,
+                self.bitmap.get(index..index + 1)?,
+            ))
+        }
+        fn ofd(&self, index: usize) -> Option<&OfdRecord> {
+            (index == 0).then_some(&self.ofd)
+        }
+    }
+    model(|| {
+        let core = Arc::new(Core::<2>::new().unwrap());
+        let backing = Arc::new(Tables {
+            slots: core::array::from_fn(|_| DescriptorSlot::default()),
+            bitmap: core::array::from_fn(|_| AtomicU64::new(0)),
+            ofd: OfdRecord::default(),
+        });
+        let authority = core.bind(&*backing, NoWait);
+        authority.publish_ofds(1).unwrap();
+        let parent = authority
+            .create_table(
+                1,
+                &mut Extent {
+                    token: 0,
+                    capacity: 1,
+                },
+            )
+            .unwrap();
+        authority
+            .open(
+                parent,
+                Fd(0),
+                Description::new(
+                    BackingToken(7),
+                    AccessMode::ReadWrite,
+                    StatusFlags::default(),
+                ),
+                false,
+            )
+            .unwrap();
+        let peer = authority
+            .fork(
+                parent,
+                &mut Extent {
+                    token: 1,
+                    capacity: 1,
+                },
+            )
+            .unwrap();
+        let releases = Arc::new(AtomicU32::new(0));
+        let actors = [parent, peer].map(|table| {
+            let core = core.clone();
+            let backing = backing.clone();
+            let releases = releases.clone();
+            thread::spawn(move || {
+                let authority = core.bind(&*backing, NoWait);
+                authority
+                    .retire_table(table, |_| false, |_| panic!("retained for drain"))
+                    .unwrap();
+                if let Some(mut receipt) = authority.take_retired_table() {
+                    receipt
+                        .finish(|description| {
+                            assert_eq!(description.backing, BackingToken(7));
+                            releases.fetch_add(1, Ordering::Relaxed);
+                        })
+                        .unwrap();
+                }
+            })
+        });
+        for actor in actors {
+            actor.join().unwrap();
+        }
+        while let Some(mut receipt) = authority.take_retired_table() {
+            receipt
+                .finish(|_| {
+                    releases.fetch_add(1, Ordering::Relaxed);
+                })
+                .unwrap();
+        }
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+        assert_eq!(backing.ofd.holds.load(Ordering::Acquire), 0);
+    });
+}

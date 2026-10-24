@@ -6,6 +6,17 @@ use super::{AdmissionError, HostDescriptionFlags, HostDescriptionState, HostIpc}
 use crate::el1_zone::HostLockWait;
 use carrick_el1_abi::ipc::{IPC_MAX_OFDS, fd};
 
+fn invalid_retirement() -> ! {
+    carrick_fatal::carrick_fatal!("ipc::table", "invalid owned table retirement")
+}
+
+impl HostIpc {
+    pub(crate) fn service_retired_tables(&self) {
+        self.drain_retired_tables()
+            .unwrap_or_else(|_| invalid_retirement());
+    }
+}
+
 #[derive(Debug)]
 pub struct HostTable {
     owner: Arc<HostIpc>,
@@ -129,9 +140,7 @@ impl Drop for HostTable {
             .destroy_table(self.id, |d| retired.push(d))
             .map_err(AdmissionError::from)
             .and_then(|extent| self.owner.reclaim_descriptors(extent))
-            .unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::table", "invalid owned table retirement")
-            });
+            .unwrap_or_else(|_| invalid_retirement());
         for description in retired {
             self.release(description);
         }
