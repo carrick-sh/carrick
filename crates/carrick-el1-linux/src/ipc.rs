@@ -104,7 +104,6 @@ pub fn retire_namespace<C: carrick_el1_abi::EntryContext>(
     use carrick_el1_abi::ipc::IpcError;
     let authority = region.fd(carrick_sched_core::ShortLockSpin);
     let mut released = Ok(());
-    task.linux.mark_pending_host_work();
     authority
         .retire_table(
             table,
@@ -125,6 +124,9 @@ pub fn retire_namespace<C: carrick_el1_abi::EntryContext>(
             },
         )
         .map_err(IpcError::Fd)?;
+    // Publish boundary work after the retirement link is visible. A peer
+    // boundary may drain concurrently with this venue's final endpoint close.
+    task.linux.mark_pending_host_work();
     released
 }
 

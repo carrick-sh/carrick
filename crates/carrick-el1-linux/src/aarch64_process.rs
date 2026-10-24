@@ -1840,7 +1840,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                             carrick_el1_abi::ipc::fd::TableId::from_raw(parent),
                             &carrick_sched_core::ShortLockSpin,
                             |child| {
-                                map.publish(child_table, child.to_raw())
+                                map.publish_owned(child_table, child.to_raw())
                                     .map_err(|_| carrick_el1_abi::ipc::fd::Error::NoMemory)
                             },
                         )
@@ -1859,9 +1859,8 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     }
     fn retire_fd_table(&mut self, table: u64) {
         if let Some((region, map)) = self.crossing.ipc_binding()
-            && let Some(raw) = map.lookup(table)
+            && let Some(raw) = map.take_owned(table)
         {
-            map.withdraw(table);
             super::ipc::retire_namespace(
                 &region,
                 carrick_el1_abi::ipc::fd::TableId::from_raw(raw),

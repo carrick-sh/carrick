@@ -774,6 +774,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_IPC_TABLE_MAP_OFFSET,
         ipc::IPC_LAYOUT_HASH,
         core::mem::size_of::<ipc_tables::IpcTableMap>() as u64,
+        ipc_tables::RETIREMENT_OWNER_OFFSET,
+        ipc_tables::RETIREMENT_PROTOCOL_VERSION,
         MAX_DELEGATED_FILES as u64,
         MAX_ZONE_OPEN_FILES as u64,
         MAX_DELEGATED_INOTIFY as u64,
@@ -3971,7 +3973,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x4315d7ff461f3bb9);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x96efe18697108790);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
