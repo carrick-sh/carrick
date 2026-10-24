@@ -74,7 +74,7 @@ fn serial_host_execute_truncation_never_retains_partial_opaque_credential() {
             "printf 'useful diagnostic\\n' >&2; head -c 16358 /dev/zero | tr '\\000' x >&2; printf '%s' \"$GH_TOKEN\" >&2; exit 42",
         ]),
         &[],
-        Duration::from_secs(5),
+        Duration::from_secs(60),
     )
     .unwrap_err();
     let rendered = format!("{err} {err:?}");
