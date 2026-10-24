@@ -3041,6 +3041,54 @@ fn delegated_committed_alias_install_replaces_the_range_with_its_host_row() {
     assert_eq!((row.start, row.end), (owned, owned + 2 * PAGE));
 }
 
+#[test]
+fn delegated_alias_install_preclaims_residency_before_backend_replacement() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    let heap = dispatcher.mem().lock().layout.heap_base;
+    let owned = heap + 96 * PAGE;
+    root.guest_mmap(Placement::Fixed(owned), 2 * PAGE, READ)
+        .unwrap();
+
+    let residency = Box::leak(Box::new(carrick_el1_abi::FrameGrantResidencyTable::new()));
+    let identity = carrick_el1_abi::FrameGrantResidencyIdentity {
+        mm_key: dispatcher.mm_authority().mm_id.raw(),
+        semantic_base: owned,
+        physical_ipa: 0x1234_0000,
+        len: 2 * PAGE,
+        mapping_id: 1,
+        frame_id: 1,
+        owner_generation: 1,
+        inventory_revision: 1,
+    };
+    assert!(residency.publish(identity).is_some());
+    let page = residency.lookup(identity.mm_key, owned + PAGE).unwrap();
+    let transfer = residency.pin_transfer(page).unwrap();
+
+    let refused = alias_mmap(&mut dispatcher, &mut memory, owned)
+        .with_claim_and_residency_for_test(residency, |_| {
+            panic!("backend install started while replacement residency was pinned")
+        });
+    assert!(refused.is_none());
+    assert!(root.lock().mapping(owned).unwrap().anonymous);
+    assert_eq!(residency.lookup(identity.mm_key, owned + PAGE), Some(page));
+    drop(transfer);
+
+    let committed = alias_mmap(&mut dispatcher, &mut memory, owned)
+        .with_claim_and_residency_for_test(residency, |install| {
+            assert!(
+                residency.pin_transfer(page).is_none(),
+                "install claim must close transfer admission before backend mutation"
+            );
+            dispatcher.commit_host_alias_install(install)
+        })
+        .expect("claim after transfer settles");
+    committed.expect("commit");
+    assert!(residency.lookup(identity.mm_key, owned + PAGE).is_none());
+    assert!(!root.lock().mapping(owned).unwrap().anonymous);
+}
+
 // ---------------------------------------------------------------------------
 // S2 fencing: root node exhaustion is a typed, recoverable outcome. A host
 // syscall that may need root metadata after its backend work secures it

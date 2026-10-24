@@ -54,8 +54,16 @@ impl Serialize for HostAliasTransaction {
 
 impl HostAliasTransaction {
     pub fn claim<'permit>(
+        self,
+        permit: &'permit mm_mutation::HostAliasPermit<'_>,
+    ) -> Option<HostAliasInstallGuard<'permit>> {
+        self.claim_with_residency(permit, carrick_el1_abi::frame_grant_residency_host())
+    }
+
+    fn claim_with_residency<'permit>(
         mut self,
         permit: &'permit mm_mutation::HostAliasPermit<'_>,
+        residency: Option<&'static carrick_el1_abi::FrameGrantResidencyTable>,
     ) -> Option<HostAliasInstallGuard<'permit>> {
         if !permit.authorizes(&self.authority.mutation_coordinator, self.authority.mm_id) {
             return None;
@@ -74,6 +82,29 @@ impl HostAliasTransaction {
         if *id != self.id {
             return None;
         }
+        // A live grant may acquire transfer custody independently of the
+        // descriptor editor. Close that admission before the runtime changes
+        // stage-1, then carry the exact retirement through backend success or
+        // guard rollback. Retiring after `map_host_alias` is too late: a
+        // transfer admitted in that interval can leave the replaced grant
+        // authoritative over the new leaves.
+        let residency_retirement = match (
+            residency,
+            commit.as_ref().and_then(|commit| commit.mmap.as_ref()),
+        ) {
+            (Some(residency), Some(mmap)) => {
+                let Some(retirement) = residency.begin_retire_overlapping(
+                    self.authority.mm_id.raw(),
+                    mmap.start,
+                    mmap.len,
+                ) else {
+                    drop(phase);
+                    return None;
+                };
+                Some(retirement)
+            }
+            _ => None,
+        };
         let installing = commit.take();
         *phase = HostAliasPhase::Installing {
             id: self.id,
@@ -84,6 +115,7 @@ impl HostAliasTransaction {
             authority: Arc::clone(&self.authority),
             transactions: Arc::clone(&self.transactions),
             _structural: structural,
+            residency_retirement,
             id: self.id,
             armed: true,
         })
@@ -97,6 +129,19 @@ impl HostAliasTransaction {
         let coordinator = Arc::clone(&self.authority.mutation_coordinator);
         mm_mutation::test_support::with_permit(coordinator, |permit| {
             self.claim(permit).map(use_install)
+        })
+    }
+
+    #[cfg(test)]
+    pub fn with_claim_and_residency_for_test<T>(
+        self,
+        residency: &'static carrick_el1_abi::FrameGrantResidencyTable,
+        use_install: impl FnOnce(HostAliasInstallGuard<'_>) -> T,
+    ) -> Option<T> {
+        let coordinator = Arc::clone(&self.authority.mutation_coordinator);
+        mm_mutation::test_support::with_permit(coordinator, |permit| {
+            self.claim_with_residency(permit, Some(residency))
+                .map(use_install)
         })
     }
 }
@@ -132,6 +177,7 @@ pub struct HostAliasInstallGuard<'permit> {
     pub(crate) authority: Arc<DispatchMmAuthority>,
     pub(crate) transactions: Arc<HostAliasTransactions>,
     pub(crate) _structural: mm_mutation::HostAliasCoordinatorGuard<'permit>,
+    residency_retirement: Option<carrick_el1_abi::FrameGrantResidencyRetirement<'static>>,
     pub(crate) id: HostAliasTransactionId,
     pub(crate) armed: bool,
 }
@@ -518,6 +564,17 @@ impl SyscallDispatcher {
         if let Some(mmap) = commit.mmap {
             let start = mmap.start;
             let len = mmap.len;
+            if install
+                .residency_retirement
+                .take()
+                .is_some_and(|retirement| !retirement.commit())
+            {
+                // Backend mutation has already committed, so the runtime's
+                // existing DispatcherCommit refusal must fail the carrier
+                // closed. Do not publish Linux VMA metadata over an
+                // indeterminate residency generation.
+                return Err(LINUX_ENOMEM);
+            }
             if let Some(proposal) = commit.root_proposal {
                 proposal.commit_host_owned();
             }
