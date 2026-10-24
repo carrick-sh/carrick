@@ -383,6 +383,10 @@ path = "crates/carrick-vmm-hvf/src/trap/global_frame.rs"
 contracts = ["kernel.mm.native-code-content"]
 
 [[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/global_frame/grant_ledger.rs"
+contracts = ["kernel.mm.native-code-content", "process.native.terminal-child"]
+
+[[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/foreign_mm.rs"
 contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain", "kernel.mm.current-read-reuse", "kernel.fork.stage1-image"]
 
