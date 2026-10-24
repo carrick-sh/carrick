@@ -1907,24 +1907,32 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         mut release: impl FnMut(Description),
     ) -> Result<(), Error> {
         let (guard, t) = self.lock(table)?;
-        for fd in 0..t.storage.capacity() {
-            if let Some(entry) = t.storage.get(fd)
-                && release_here(self.snapshot(entry.ofd)?)
-                && let Some(description) = self.close_locked(&t, Fd(fd as i32))?
-            {
-                release(description);
-            }
-        }
         guard.record.begin_write();
         guard.record.state.store(TABLE_RETIRED, Ordering::Release);
         guard.record.end_write();
         drop(guard);
+        // Revocation transfers exclusive slot/storage custody to this call:
+        // ordinary mutators and lock-free lookups now reject the table. It is
+        // not queued until this pass finishes, so a drainer cannot race it.
+        // Release callbacks may take object locks or allocate, never under a
+        // descriptor lock and without an O(capacity) temporary release vector.
+        let result = (|| {
+            for fd in 0..t.storage.capacity() {
+                if let Some(entry) = t.storage.get(fd)
+                    && release_here(self.snapshot(entry.ofd)?)
+                    && let Some(description) = self.close_locked(&t, Fd(fd as i32))?
+                {
+                    release(description);
+                }
+            }
+            Ok(())
+        })();
         push(
             &self.core.retired_tables,
             table.index,
             &self.core.tables[table.index].retired,
         );
-        Ok(())
+        result
     }
 
     /// Take owned custody of one revoked table. Dropping the receipt without

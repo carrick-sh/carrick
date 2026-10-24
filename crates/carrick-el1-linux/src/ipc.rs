@@ -35,8 +35,6 @@
 //!   other argument register is untouched, and the record says what to do
 //!   ([`IpcHandback`]) and carries the original `x0` and syscall number.
 
-extern crate alloc;
-
 use super::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1::substrate::file::UserCopy;
 use carrick_el1::substrate::ipc::{
@@ -105,8 +103,8 @@ pub fn retire_namespace<C: carrick_el1_abi::EntryContext>(
 ) -> Result<(), carrick_el1_abi::ipc::IpcError> {
     use carrick_el1_abi::ipc::IpcError;
     let authority = region.fd(carrick_sched_core::ShortLockSpin);
-    let capacity = authority.backing_capacity(table).map_err(IpcError::Fd)?;
-    let mut releases = alloc::vec::Vec::with_capacity(capacity.min(region.ofd_count()));
+    let mut released = Ok(());
+    task.linux.mark_pending_host_work();
     authority
         .retire_table(
             table,
@@ -116,14 +114,18 @@ pub fn retire_namespace<C: carrick_el1_abi::EntryContext>(
                     Some(IpcBacking::Host(_))
                 )
             },
-            |description| releases.push(description),
+            |description| {
+                released = released.and(release_native_description(
+                    region,
+                    description,
+                    zone,
+                    slot,
+                    task,
+                ));
+            },
         )
         .map_err(IpcError::Fd)?;
-    task.linux.mark_pending_host_work();
-    for description in releases {
-        release_native_description(region, description, zone, slot, task)?;
-    }
-    Ok(())
+    released
 }
 
 fn release_native_description<C: carrick_el1_abi::EntryContext>(
