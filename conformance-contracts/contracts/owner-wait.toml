@@ -14,3 +14,6 @@ vm_free = "carrick-core::cancellation::loom_models; carrick-el1-linux::native_pr
 [bindings.unresolved]
 routing = "The upper #802 layer integrates effect custody with secured output and unifies typed wait routing."
 signed = "Signed HVF acceptance is director-owned; unavailable on Linux ctb-w1."
+embed_structural = "Signed HVF unavailable on ctb-w1; exact-artifact signed acceptance remains director-owned and is recorded on the upper #802 layer."
+docker = "Docker unavailable and forbidden on ctb-w1; this internal owner-refusal schedule has no external Linux producer."
+holder_audit = "The model's editor releases without guest work. A complete typed holder audit across all owner authorities is not established by this model."
