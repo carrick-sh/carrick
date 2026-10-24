@@ -888,45 +888,28 @@ pub(crate) fn map_exclusive_region(
     mapping: &GuestMapping,
     size: usize,
 ) -> Result<(*mut u8, usize, crate::host_mapping::OwnedHostMapping), TrapError> {
-    if let Some(backing) = &mapping.private_file_backing {
-        let host_mapping = crate::host_mapping::OwnedHostMapping::map_private_file(
-            backing.file.as_raw_fd(),
-            0,
-            size,
-        )
-        .map_err(|error| {
-            TrapError::Hypervisor(format!(
-                "mmap private executable artifact (size={size}) failed: {error}"
-            ))
-        })?;
-        return Ok((host_mapping.as_ptr(), host_mapping.len(), host_mapping));
-    }
-    let kind = if mapping.shared {
-        crate::host_mapping::HostMappingKind::SharedAnon
+    use crate::host_mapping::{HostImageSource, OwnedHostMapping};
+    let source = if let Some(backing) = &mapping.private_file_backing {
+        HostImageSource::PrivateFile(&backing.file)
     } else {
-        crate::host_mapping::HostMappingKind::PrivateAnon
-    };
-    let host_mapping =
-        crate::host_mapping::OwnedHostMapping::map_shared_anon(size, kind).map_err(|error| {
-            TrapError::Hypervisor(format!("mmap guest region (size={size}) failed: {error}"))
-        })?;
-    let host = host_mapping.as_ptr();
-    let size = host_mapping.len();
-    // Copy the payload prefix into the freshly-zeroed region; the rest stays
-    // zero (lazy). offset_in_mapping + image.len() <= mapped_size is guaranteed
-    // by GuestMappingPlan::from_address_space.
-    if !mapping.image.is_empty() {
-        let off = usize::try_from(mapping.offset_in_mapping)
+        let offset = usize::try_from(mapping.offset_in_mapping)
             .map_err(|_| TrapError::MappingTooLarge(mapping.offset_in_mapping))?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                mapping.image.as_ptr(),
-                host.add(off),
-                mapping.image.len(),
-            );
+        if mapping.shared {
+            HostImageSource::Shared {
+                bytes: &mapping.image,
+                offset,
+            }
+        } else {
+            HostImageSource::Private {
+                bytes: &mapping.image,
+                offset,
+            }
         }
-    }
-    Ok((host, size, host_mapping))
+    };
+    let host_mapping = OwnedHostMapping::prepare_image(size, source).map_err(|error| {
+        TrapError::Hypervisor(format!("mmap guest image (size={size}) failed: {error}"))
+    })?;
+    Ok((host_mapping.as_ptr(), host_mapping.len(), host_mapping))
 }
 
 fn publish_el1_region_host_ptr(mapping: &GuestMapping, host: *mut u8) {
