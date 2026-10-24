@@ -1,7 +1,7 @@
 //! Kernel-owned storage for the shared host/EL1 IPC authority.
 
 mod table;
-pub use table::HostTable;
+pub use table::{HostSlotReservation, HostTable};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::NonNull;
