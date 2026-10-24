@@ -361,6 +361,36 @@ struct ExecBackingInstallError {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct ExecBackingPublishError {
+    error: TrapError,
+    _installed: Box<InstalledExecBacking>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum TerminalExecBackingFailure {
+    Install(ExecBackingInstallError),
+    Publish(ExecBackingPublishError),
+    Rollback(TrapError),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl core::fmt::Display for TerminalExecBackingFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Install(failure) => write!(
+                f,
+                "exec successor map rollback retained unresolved custody: {}",
+                failure.error
+            ),
+            Self::Publish(failure) => {
+                write!(f, "publish installed exec backing: {}", failure.error)
+            }
+            Self::Rollback(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl core::fmt::Debug for ExecBackingInstallError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ExecBackingInstallError")
@@ -632,7 +662,10 @@ fn rollback_after_install_failure(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl InstalledExecBacking {
-    fn publish(mut self, successor_root_slot: (u64, u64)) -> PublishedExecBacking {
+    fn publish(
+        mut self,
+        successor_root_slot: (u64, u64),
+    ) -> Result<PublishedExecBacking, ExecBackingPublishError> {
         for index in 0..self.regions.len() {
             let Some(identity) = self.regions[index].record else {
                 continue;
@@ -664,22 +697,22 @@ impl InstalledExecBacking {
                     "pooled exec root has no structural epoch".to_owned(),
                 )),
             };
-            result.unwrap_or_else(|error| {
-                carrick_fatal!(
-                    "hvpatch::exec_commit",
-                    "publish installed exec backing: {error}"
-                )
-            });
+            if let Err(error) = result {
+                return Err(ExecBackingPublishError {
+                    error,
+                    _installed: Box::new(self),
+                });
+            }
             self.regions[index].record = None;
         }
-        PublishedExecBacking {
+        Ok(PublishedExecBacking {
             plan: self.plan,
             regions: self
                 .regions
                 .into_iter()
                 .map(|installed| installed.region)
                 .collect(),
-        }
+        })
     }
 
     fn rollback_using(
@@ -1593,29 +1626,28 @@ impl HvfVmState {
                     }
                 },
             );
-            match installed {
-                Ok(installed) => {
-                    let published = installed.publish(replacement_mm_root_slot);
-                    published_exec_plan = Some(published.plan);
-                    published_exec_regions = published.regions;
+            let published = match installed {
+                Ok(installed) => installed
+                    .publish(replacement_mm_root_slot)
+                    .map_err(TerminalExecBackingFailure::Publish),
+                Err(failure) if failure.retained.is_some() => {
+                    Err(TerminalExecBackingFailure::Install(failure))
                 }
                 Err(failure) => {
-                    if failure.retained.is_some() {
-                        carrick_fatal!(
-                            "hvpatch::exec_commit",
-                            "exec successor map rollback retained unresolved custody: {}",
-                            failure.error
-                        );
-                    }
                     let authority_after = self.exec_authority_fingerprint();
-                    if let Err(rollback_error) =
-                        verify_exec_authority_rollback(&authority_before, &authority_after)
-                    {
-                        carrick_fatal!("hvpatch::exec_commit", "{rollback_error}");
+                    match verify_exec_authority_rollback(&authority_before, &authority_after) {
+                        Ok(()) => return Err(failure.error),
+                        Err(rollback_error) => {
+                            Err(TerminalExecBackingFailure::Rollback(rollback_error))
+                        }
                     }
-                    return Err(failure.error);
                 }
             }
+            .unwrap_or_else(|failure| {
+                carrick_fatal!("hvpatch::exec_commit", "{failure}");
+            });
+            published_exec_plan = Some(published.plan);
+            published_exec_regions = published.regions;
             if let Some((Some(retired), _)) = inventory_reservations.as_mut() {
                 let authority = self.cow_authority.as_ref().cloned().ok_or_else(|| {
                     TrapError::Hypervisor(
