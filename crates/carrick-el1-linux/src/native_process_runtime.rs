@@ -11992,6 +11992,15 @@ mod tests {
             service.copies,
             [LinuxWaitStatus::exited(9), LinuxWaitStatus::exited(7)]
         );
+        let graph = runtime.graph.lock();
+        assert_eq!(graph.owner.tasks().len(), 1, "only init remains live");
+        assert!(graph.owner.task(root).is_ok());
+        assert!(graph.owner.task(parent).is_err());
+        assert!(graph.owner.task(child).is_err());
+        assert!(
+            graph.owner.zombies().is_empty(),
+            "the adopter consumed both terminal receipts exactly once"
+        );
     }
     #[test]
     fn child_exit_group_waits_for_parent_bucket_and_delivers_status() {
