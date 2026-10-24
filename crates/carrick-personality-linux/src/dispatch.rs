@@ -637,7 +637,6 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
         134 => Family::Signal(crate::signal::SignalCall::RtSigaction),
         139 => Family::Signal(crate::signal::SignalCall::RtSigreturn),
-        129..=131 | 133 | 136..=138 | 240 => Family::Unported,
         _ => route_shared(ordinal, allocator_control),
     }
 }
