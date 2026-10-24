@@ -55,8 +55,58 @@ jobs:
           path: ${{ runner.temp }}/request/
           if-no-files-found: error
 
-  gate:
+  # Build the exact-SHA fixture bundle on a hosted, ephemeral ARM Linux runner
+  # with no secrets (the same pattern as kernel-runtime's signed-fixtures job).
+  # A static bundle path on each Mac goes stale whenever fixture inputs change.
+  fixtures:
     needs: authorize
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      bundle-name: ${{ steps.bundle.outputs.name }}
+      bundle-sha256: ${{ steps.bundle.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+          persist-credentials: false
+      - name: Verify native ARM Linux publisher
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = aarch64
+      - name: Install pinned Rust toolchain and guest targets
+        run: rustup show active-toolchain
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just,sccache@0.18.0
+      - name: Publish exact-SHA fixture bundle
+        env:
+          SHA: ${{ needs.authorize.outputs.sha }}
+        run: just fixtures-publish "$SHA"
+      # The archive basename is the manifest digest, not the archive digest.
+      - name: Record fixture archive transport identity
+        id: bundle
+        env:
+          SHA: ${{ needs.authorize.outputs.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundles=(target/fixtures/published/"$SHA"/*.tar.gz)
+          test "${#bundles[@]}" -eq 1
+          digest=$(sha256sum "${bundles[0]}")
+          test "$(wc -c < "${bundles[0]}")" -gt 0
+          printf 'name=%s\nsha256=%s\n' "${bundles[0]##*/}" "${digest%% *}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-fixtures-${{ needs.authorize.outputs.sha }}-${{ github.run_attempt }}
+          path: target/fixtures/published/${{ needs.authorize.outputs.sha }}/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
+  gate:
+    needs: [authorize, fixtures]
     runs-on: [self-hosted, macOS, ARM64, carrick-signed-gate]
     timeout-minutes: 240
     # GitHub has not assigned runner.name when it evaluates concurrency.
@@ -78,13 +128,24 @@ jobs:
         with:
           name: signed-request-${{ github.run_attempt }}
           path: ${{ runner.temp }}/request
+      - name: Download the exact-SHA fixture bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-fixtures-${{ needs.authorize.outputs.sha }}-${{ github.run_attempt }}
+          path: target/fixtures/incoming
+      - name: Verify fixture archive transport digest
+        env:
+          BUNDLE_NAME: ${{ needs.fixtures.outputs.bundle-name }}
+          BUNDLE_SHA256: ${{ needs.fixtures.outputs.bundle-sha256 }}
+        run: scripts/ci/download-fixture-bundle.sh verify
       - name: Execute approved SHA in a fresh detached worktree
         env:
           CARRICK_RUN_ID: signed-gate-${{ github.run_id }}-${{ github.run_attempt }}
-          # Local immutable bundle path, configured separately on each Mac.
-          # No API credential is passed to candidate code.
-          CARRICK_SIGNED_FIXTURE_BUNDLE: ${{ vars.CARRICK_SIGNED_FIXTURE_BUNDLE }}
+          # This run's exact-SHA bundle; restore re-verifies its input identity
+          # against the candidate tree. No API credential reaches candidate code.
+          BUNDLE_NAME: ${{ needs.fixtures.outputs.bundle-name }}
         run: >-
+          CARRICK_SIGNED_FIXTURE_BUNDLE="$PWD/target/fixtures/incoming/$BUNDLE_NAME"
           cargo run --locked -p carrick-xtask -- signed-gate execute
           --request "$RUNNER_TEMP/request/request.json" --output "$RUNNER_TEMP/signed-result"
       - name: Upload receipt, artifact identity and step logs
