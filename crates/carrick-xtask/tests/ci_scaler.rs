@@ -1183,8 +1183,8 @@ fn template_installs_every_program_the_dispatch_driver_spawns() {
         .unwrap()
         .split(", ")
         .collect();
-    // python3 ships in the cloud image (cloud-init); provision.sh installs rustup.
-    let provided_otherwise = ["python3", "rustup"];
+    // python3 ships in the cloud image (cloud-init); provision.sh installs rustup and official gh.
+    let provided_otherwise = ["python3", "rustup", "gh"];
     let mut spawned = Vec::new();
     for driver in [
         include_str!("../src/agent_runner.rs"),
@@ -1223,6 +1223,36 @@ fn template_installs_every_program_the_dispatch_driver_spawns() {
             "agent template does not install {program}"
         );
     }
+    assert!(
+        !packages.contains(&"gh"),
+        "gh must not be installed via apt (Debian package lacks --slurp, #838)"
+    );
+    assert!(
+        source.contains("gh_version=2.102.0"),
+        "missing pinned gh_version"
+    );
+    assert!(
+        source
+            .contains("gh_sha256=bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386"),
+        "missing pinned gh_sha256"
+    );
+    assert!(
+        source.contains("install -m 755 /tmp/gh-extract/gh_*/bin/gh /usr/local/bin/gh"),
+        "missing gh installation to /usr/local/bin/gh"
+    );
+    assert!(
+        source.contains("gh api --help") && source.contains("--slurp"),
+        "missing qualification check for gh --slurp"
+    );
+    assert!(
+        source.contains("--arg gh \"$gh_version\"") && source.contains("gh:$gh"),
+        "qualification.json must record gh version"
+    );
+    assert!(
+        source.contains("--arg gh_sha256 \"$gh_sha256\"")
+            && source.contains("gh_sha256:$gh_sha256"),
+        "manifest.json must record gh_sha256"
+    );
 }
 
 #[test]

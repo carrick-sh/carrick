@@ -156,7 +156,8 @@ the first-rollout selector bootstrap requirement.
    `post-up iptables -t raw -I PREROUTING -i fwbr+ -j CT --zone 1` (and the
    matching `post-down ... -D ...`).
 4. `scripts/ci/build-template-debian.sh INPUT_DIR FULL_COMMIT XTASK` builds
-   and qualifies template 300 from the site row (`carrick-xtask ci-scaler site`).
+   and qualifies template 300 from the site row (`carrick-xtask ci-scaler site`),
+   pinning the runner, sccache, rustup and official `gh` 2.102.0 (SHA-256 verified).
 5. Run the controller as a systemd unit, so it survives reboots and session
    exits:
 
