@@ -530,7 +530,7 @@ impl OwnerState {
 }
 
 /// Keeps one open description counted against its inode's owner record.
-/// Stored on the `FileDescription`; dropped with it.
+/// Retained by the shared physical lifetime, including inherited IPC OFDs.
 #[derive(::core::fmt::Debug)]
 pub(crate) struct InodeOpenRegistration {
     identity: InodeIdentity,
@@ -611,6 +611,15 @@ pub(crate) fn register_open(identity: InodeIdentity) -> InodeOpenRegistration {
             join_pending,
         };
     }
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn registered_opens(identity: InodeIdentity) -> usize {
+    OWNERS
+        .lock()
+        .as_ref()
+        .and_then(|owners| owners.get(&identity))
+        .map_or(0, |owner| owner.open_count)
 }
 
 /// True when no object is delegated anywhere in the carrier.
