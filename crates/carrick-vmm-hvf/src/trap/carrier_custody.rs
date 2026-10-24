@@ -408,7 +408,7 @@ impl CarrierVmCustodyState {
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub struct CarrierVmCustody {
     pub(crate) transfer_carrier: core::num::NonZeroU64,
-    pub(crate) el1_frame_grants: std::sync::Arc<parking_lot::Mutex<El1FrameGrantLedger>>,
+    pub(crate) el1_frame_grants: std::sync::Arc<El1FrameGrantLedger>,
     /// Host COW accounting for every MM admitted to this carrier.
     pub(crate) host_cow_ledger: crate::hvf_aarch64_engine::HostCowLedger,
     pub(crate) metadata_completion:
@@ -629,9 +629,7 @@ impl CarrierVmCustody {
         let asids = carrick_hal::asid::AsidAllocator::new();
         Self {
             transfer_carrier,
-            el1_frame_grants: std::sync::Arc::new(parking_lot::Mutex::new(
-                El1FrameGrantLedger::default(),
-            )),
+            el1_frame_grants: std::sync::Arc::new(El1FrameGrantLedger::default()),
             host_cow_ledger: crate::hvf_aarch64_engine::HostCowLedger::default(),
             metadata_completion: parking_lot::Mutex::new(None),
             native_wait_channel_wake: parking_lot::Mutex::new(None),
@@ -4552,10 +4550,10 @@ mod carrier_vm_custody_tests {
                 let mut exchange = ForkStockExchange::new(req).expect("exchange");
                 let loan = {
                     let mut stock = custody.fork_stock.lock();
-                    let mut ledger = custody.el1_frame_grants.lock();
+                    let mut ledger = crate::fork_stock::fork_table_accounting(custody);
                     stock
                         .owner
-                        .loan(&mut *ledger, exec, &mut exchange, |_| true)
+                        .loan(&mut ledger, exec, &mut exchange, |_| true)
                         .expect("grant loan")
                 };
                 let selected = PortalForkCustody::Frame {
@@ -4614,10 +4612,10 @@ mod carrier_vm_custody_tests {
                         .expect("reserve custody");
                     let mut commit =
                         ForkStockSettlement::commit_reserved(loan, completion).expect("commit");
-                    let mut ledger = custody.el1_frame_grants.lock();
+                    let mut ledger = crate::fork_stock::fork_table_accounting(custody);
                     stock
                         .owner
-                        .commit_admitted(&mut *ledger, exec, &mut commit)
+                        .commit_admitted(&mut ledger, exec, &mut commit)
                         .expect("commit admitted child");
                     assert_eq!(stock.owner.live_children(), 1);
                 }

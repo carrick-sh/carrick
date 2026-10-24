@@ -592,6 +592,15 @@ Commit refusal, failed crossing, or missing acknowledgment; these are invariant
 faults after publication, not successful forks. These host witnesses do not
 replace signed guest or KVM acceptance.
 
+Physical-custody destruction must not retain the grant-accounting lock (#569).
+`child_reclaim_and_terminal_finalization_do_not_invert_accounting_lock` drives
+that same neutral stock owner against a second executor finalizing a directory
+entry. The bounded witness rejects the ledger-to-directory edge captured on
+hardware. The HVF accounting authority exposes only completed accounting
+operations to fork callers, never a guard or a callback under the guard.
+Exact terminal receipt publication remains serialized with IPA reuse inside
+the accounting implementation; it does not admit or reclaim fork custody.
+
 Custody arrays may be allocated in either the fixed EL1 bootstrap/heap region
 or a retained dynamic metadata grant. The dynamic path shares the lifecycle
 record venue, rather than imposing a fixed-region-only allocation limit.

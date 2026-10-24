@@ -7,7 +7,7 @@ use carrick_hal::asid::{AsidAllocator, AsidGeneration};
 pub use carrick_hal::fork_stock::{ForkStockServiceError, GrantExecution, take_fork_table_stock};
 use core::num::NonZeroU64;
 pub type PendingForkLoan = carrick_hal::fork_stock::PendingForkLoan<AsidGeneration>;
-use crate::trap::{CarrierVmCustody, El1FrameGrantLedger, El1FrameGrantMm};
+use crate::trap::CarrierVmCustody;
 use carrick_hal::fork_stock::{ForkStock, ForkTableLedger};
 
 #[derive(Default)]
@@ -358,32 +358,10 @@ impl ForkStockHostCustody {
         })
     }
 }
-impl ForkTableLedger for El1FrameGrantLedger {
-    fn grant(&mut self, page: RootGpa, mm: carrick_el1_abi::ReservationMm) -> bool {
-        El1FrameGrantMm::new(mm.raw())
-            .is_some_and(|mm| self.mark_grant(page.address().raw(), 4096, mm).is_ok())
-    }
-    fn give_back(&mut self, page: RootGpa, mm: carrick_el1_abi::ReservationMm) {
-        if let Some(mm) = El1FrameGrantMm::new(mm.raw()) {
-            self.mark_return(page.address().raw(), 4096, mm, false);
-        }
-    }
-}
-
-/// Accounting venue used by every native fork-stock crossing.
+/// Accounting venue used by every native fork-stock crossing. Its opaque
+/// return type has no lock, Deref, or callback API: only leaf accounting.
 pub(crate) fn fork_table_accounting(custody: &CarrierVmCustody) -> impl ForkTableLedger + '_ {
-    ForkGrantAccounting(custody.el1_frame_grants.lock())
-}
-
-struct ForkGrantAccounting<'a>(parking_lot::MutexGuard<'a, El1FrameGrantLedger>);
-
-impl ForkTableLedger for ForkGrantAccounting<'_> {
-    fn grant(&mut self, page: RootGpa, mm: carrick_el1_abi::ReservationMm) -> bool {
-        self.0.grant(page, mm)
-    }
-    fn give_back(&mut self, page: RootGpa, mm: carrick_el1_abi::ReservationMm) {
-        self.0.give_back(page, mm);
-    }
+    &*custody.el1_frame_grants
 }
 #[cfg(test)]
 mod tests {
