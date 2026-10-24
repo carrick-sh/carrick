@@ -608,6 +608,8 @@ pub enum GuestRetirementError {
     TableOutsidePrimary,
     MissingTable,
     NotPrivateAnonymous,
+    /// A live grant-window transfer still holds residency publication.
+    ResidencyBusy,
     /// A failed retirement could not restore its pre-image: editor
     /// exclusion was violated and the MM's table graph is indeterminate.
     RollbackFailed,

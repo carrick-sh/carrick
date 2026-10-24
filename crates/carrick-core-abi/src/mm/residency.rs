@@ -13,6 +13,7 @@ const GRANT_STATE_MASK: u64 = 3;
 pub const GRANT_PAGE_SIZE: u64 = 4096;
 const GRANT_PROBES: usize = 64;
 pub const TRANSFER_PIN_RETIRED: u64 = 1 << 63;
+const TRANSFER_PIN_RETIRING: u64 = TRANSFER_PIN_RETIRED | 1;
 
 /// Exact frame ownership carried beside the residency bits. A slot cannot
 /// authorize a reused mapping or frame with the same VA and IPA but a new
@@ -157,6 +158,37 @@ pub struct FrameGrantTransferPin<'a> {
 impl Drop for FrameGrantTransferPin<'_> {
     fn drop(&mut self) {
         self.record.transfer_pins.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Exact-MM reservation of every residency row overlapping one descriptor
+/// retirement. The caller either commits after the descriptor transaction or
+/// drops this token to reopen transfer admission without changing residency.
+pub struct FrameGrantResidencyRetirement<'a> {
+    table: &'a FrameGrantResidencyTable,
+    mm_key: u64,
+    start: u64,
+    end: u64,
+    active: bool,
+}
+impl FrameGrantResidencyRetirement<'_> {
+    /// Retire the preclaimed rows after their stage-1 leaves are unreachable.
+    /// Exact-MM exclusion makes a failed commit an invariant violation.
+    #[must_use]
+    pub fn commit(mut self) -> bool {
+        let committed = self
+            .table
+            .commit_retirement(self.mm_key, self.start, self.end);
+        self.active = false;
+        committed
+    }
+}
+impl Drop for FrameGrantResidencyRetirement<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.table
+                .cancel_retirement(self.mm_key, self.start, self.end);
+        }
     }
 }
 
@@ -520,6 +552,100 @@ impl FrameGrantResidencyTable {
         }
         true
     }
+
+    /// Close transfer admission for every live row the descriptor retirement
+    /// will replace. No row or committed bit changes until [`commit`](FrameGrantResidencyRetirement::commit),
+    /// and dropping the token restores the exact preclaim state.
+    pub fn begin_retire_overlapping(
+        &self,
+        mm_key: u64,
+        start: u64,
+        len: u64,
+    ) -> Option<FrameGrantResidencyRetirement<'_>> {
+        let end = start.checked_add(len)?;
+        if mm_key == 0 || start >= end {
+            return None;
+        }
+        for record in &self.slots {
+            let state = record.state.load(Ordering::Acquire);
+            if state & GRANT_STATE_MASK != GRANT_LIVE {
+                continue;
+            }
+            let identity = record.identity();
+            if identity.mm_key != mm_key
+                || identity.semantic_base >= end
+                || start >= identity.semantic_base.saturating_add(identity.len)
+                || record.state.load(Ordering::Acquire) != state
+            {
+                continue;
+            }
+            if record
+                .transfer_pins
+                .compare_exchange(
+                    0,
+                    TRANSFER_PIN_RETIRING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                self.cancel_retirement(mm_key, start, end);
+                return None;
+            }
+            if record.state.load(Ordering::Acquire) != state || record.identity() != identity {
+                record.transfer_pins.store(0, Ordering::Release);
+                self.cancel_retirement(mm_key, start, end);
+                return None;
+            }
+        }
+        Some(FrameGrantResidencyRetirement {
+            table: self,
+            mm_key,
+            start,
+            end,
+            active: true,
+        })
+    }
+
+    fn cancel_retirement(&self, mm_key: u64, start: u64, end: u64) {
+        for record in &self.slots {
+            let state = record.state.load(Ordering::Acquire);
+            if state & GRANT_STATE_MASK != GRANT_LIVE {
+                continue;
+            }
+            let identity = record.identity();
+            if identity.mm_key == mm_key
+                && identity.semantic_base < end
+                && start < identity.semantic_base.saturating_add(identity.len)
+                && record.state.load(Ordering::Acquire) == state
+            {
+                let _ = record.transfer_pins.compare_exchange(
+                    TRANSFER_PIN_RETIRING,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+        }
+    }
+
+    fn commit_retirement(&self, mm_key: u64, start: u64, end: u64) -> bool {
+        for (slot, record) in self.slots.iter().enumerate() {
+            let state = record.state.load(Ordering::Acquire);
+            if state & GRANT_STATE_MASK != GRANT_LIVE {
+                continue;
+            }
+            let identity = record.identity();
+            if identity.mm_key == mm_key
+                && identity.semantic_base < end
+                && start < identity.semantic_base.saturating_add(identity.len)
+                && !self.retire_claimed_fragment(slot, identity, start, end)
+            {
+                return false;
+            }
+        }
+        true
+    }
     /// Revoke a small page-aligned span using bounded grant lookups instead
     /// of scanning the carrier's index. Intended for one COW compound.
     /// The exact-MM editor excludes concurrent leaf/publication changes.
@@ -556,9 +682,54 @@ impl FrameGrantResidencyTable {
         if !self.retire(slot, identity) {
             return false;
         }
+        self.publish_retirement_fragments(identity, bits, start, end);
+        true
+    }
+
+    fn retire_claimed_fragment(
+        &self,
+        slot: usize,
+        identity: FrameGrantResidencyIdentity,
+        start: u64,
+        end: u64,
+    ) -> bool {
+        let Some(record) = self.slots.get(slot) else {
+            return false;
+        };
+        let state = record.state.load(Ordering::Acquire);
+        if state & GRANT_STATE_MASK != GRANT_LIVE
+            || record.identity() != identity
+            || record.transfer_pins.load(Ordering::Acquire) != TRANSFER_PIN_RETIRING
+        {
+            return false;
+        }
+        let bits = core::array::from_fn(|index| record.committed[index].load(Ordering::Acquire));
+        if record
+            .state
+            .compare_exchange(
+                state,
+                (state & !GRANT_STATE_MASK) | GRANT_RETIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.dirty[slot / 64].fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+        self.publish_retirement_fragments(identity, bits, start, end);
+        true
+    }
+
+    fn publish_retirement_fragments(
+        &self,
+        identity: FrameGrantResidencyIdentity,
+        bits: [u64; 8],
+        start: u64,
+        end: u64,
+    ) {
         let base = identity.semantic_base;
         let grant_end = base + identity.len;
-        // A byte-level overlap revokes its entire Linux page.
         let cut_start = start & !(GRANT_PAGE_SIZE - 1);
         let cut_end = end.saturating_add(GRANT_PAGE_SIZE - 1) & !(GRANT_PAGE_SIZE - 1);
         for (fragment_start, fragment_end) in [
@@ -588,7 +759,6 @@ impl FrameGrantResidencyTable {
                 }
             }
         }
-        true
     }
 }
 
@@ -603,6 +773,103 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    fn table() -> std::boxed::Box<FrameGrantResidencyTable> {
+        let layout = std::alloc::Layout::new::<FrameGrantResidencyTable>();
+        // SAFETY: allocation uses the table layout and is initialized before
+        // the owning Box is constructed.
+        unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<FrameGrantResidencyTable>();
+            assert!(!ptr.is_null());
+            FrameGrantResidencyTable::init_in_place(ptr);
+            std::boxed::Box::from_raw(ptr)
+        }
+    }
+
+    fn identity() -> FrameGrantResidencyIdentity {
+        FrameGrantResidencyIdentity {
+            mm_key: 7,
+            semantic_base: 0x10_0000,
+            physical_ipa: 0x20_0000,
+            len: 16 * GRANT_PAGE_SIZE,
+            mapping_id: 11,
+            frame_id: 12,
+            owner_generation: 13,
+            inventory_revision: 14,
+        }
+    }
+
+    #[test]
+    fn retirement_preclaim_refuses_pins_and_rolls_back_or_commits_whole() {
+        let table = table();
+        let identity = identity();
+        assert!(table.publish(identity).is_some());
+        let page = table
+            .lookup(
+                identity.mm_key,
+                identity.semantic_base + 2 * GRANT_PAGE_SIZE,
+            )
+            .unwrap();
+        let pin = table.pin_transfer(page).unwrap();
+        assert!(
+            table
+                .begin_retire_overlapping(
+                    identity.mm_key,
+                    identity.semantic_base + GRANT_PAGE_SIZE,
+                    2 * GRANT_PAGE_SIZE,
+                )
+                .is_none(),
+            "a live transfer must refuse before descriptor retirement"
+        );
+        drop(pin);
+
+        let retirement = table
+            .begin_retire_overlapping(
+                identity.mm_key,
+                identity.semantic_base + GRANT_PAGE_SIZE,
+                2 * GRANT_PAGE_SIZE,
+            )
+            .unwrap();
+        assert!(
+            table.pin_transfer(page).is_none(),
+            "preclaim closes admission"
+        );
+        drop(retirement);
+        assert!(
+            table.pin_transfer(page).is_some(),
+            "dropping an uncommitted claim restores the row"
+        );
+
+        let retirement = table
+            .begin_retire_overlapping(
+                identity.mm_key,
+                identity.semantic_base + GRANT_PAGE_SIZE,
+                2 * GRANT_PAGE_SIZE,
+            )
+            .unwrap();
+        assert!(retirement.commit());
+        assert!(
+            table
+                .lookup(identity.mm_key, identity.semantic_base)
+                .is_some(),
+            "prefix survives"
+        );
+        assert!(
+            table
+                .lookup(identity.mm_key, identity.semantic_base + GRANT_PAGE_SIZE)
+                .is_none(),
+            "replaced pages are revoked"
+        );
+        assert!(
+            table
+                .lookup(
+                    identity.mm_key,
+                    identity.semantic_base + 3 * GRANT_PAGE_SIZE
+                )
+                .is_some(),
+            "suffix survives"
+        );
+    }
 
     #[test]
     fn constructors_have_identical_wire_bytes_and_frozen_arm_layout() {
