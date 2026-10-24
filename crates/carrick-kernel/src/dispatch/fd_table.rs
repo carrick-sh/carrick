@@ -2020,18 +2020,28 @@ pub(crate) fn kernel_file_description(
 pub struct NativeFileWitness {
     backing: OpenDescriptionRef,
     parent: Option<Arc<crate::kernel::FileDescription>>,
+    raw_fd: HostFd,
+    inode: carrick_vfs::InodeIdentity,
 }
 
 #[cfg(feature = "test-support")]
 impl NativeFileWitness {
-    pub fn new(table: &crate::el1_ipc::HostTable, fd: i32) -> std::io::Result<Self> {
+    pub fn new(
+        table: &crate::el1_ipc::HostTable,
+        fd: carrick_el1_abi::ipc::fd::Fd,
+    ) -> std::io::Result<Self> {
         use std::io::Write;
         use std::os::fd::IntoRawFd;
         let mut file = tempfile::tempfile()?;
         file.write_all(b"child")?;
+        let host_fd = HostFdRef::new(file.into_raw_fd());
+        let raw_fd = host_fd.view();
+        let inode = host_fd
+            .inode_identity()
+            .ok_or_else(|| std::io::Error::other("missing host inode"))?;
         let backing = Arc::new(RwLock::new(OpenDescription::HostFile {
             base: OpenDescriptionBase::new(0),
-            host_fd: HostFdRef::new(file.into_raw_fd()),
+            host_fd,
             metadata: RootFsMetadata {
                 path: "/native-file-witness".into(),
                 kind: carrick_vfs::rootfs::RootFsEntryKind::File,
@@ -2041,16 +2051,18 @@ impl NativeFileWitness {
             writable: true,
         }));
         let description = kernel_file_description(Arc::clone(&backing), 0);
+        // Exercise registration lifetime without enabling a VM or changing
+        // process-wide EL1 configuration. Duplicate registration is dropped.
+        description.set_el1_registration(crate::el1_delegation::register_open(inode));
         description.retain_fd_ref();
         let witness = Self {
             backing,
             parent: Some(Arc::clone(&description)),
+            raw_fd,
+            inode,
         };
         table
-            .replace_slot(
-                carrick_el1_abi::ipc::fd::Fd(fd),
-                &crate::kernel::FileSlot::new(description, 0),
-            )
+            .replace_slot(fd, &crate::kernel::FileSlot::new(description, 0))
             .map_err(|error| {
                 std::io::Error::from_raw_os_error(
                     crate::el1_ipc::CreateError::from_admission(error)
@@ -2082,6 +2094,19 @@ impl NativeFileWitness {
 
     pub fn mapping(&self) -> Option<Arc<crate::kernel::objects::MappedFileReference>> {
         self.parent.as_ref()?.retain_mapping()
+    }
+
+    pub fn registered_opens(&self) -> usize {
+        crate::el1_delegation::registered_opens(self.inode)
+    }
+
+    /// The serial fixture opens no other file between final close and this
+    /// probe, so the retired numeric fd cannot be reused by another test.
+    pub fn physical_fd_errno(&self) -> Option<i32> {
+        // SAFETY: F_GETFD accepts any numeric fd, including a closed one.
+        (unsafe { libc::fcntl(self.raw_fd.0, libc::F_GETFD) } < 0)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten()
     }
 
     pub fn read(&self, bytes: &mut [u8]) -> std::io::Result<usize> {

@@ -7205,7 +7205,8 @@ fn native_child_resources(mapping_last: Option<bool>) {
         .unwrap();
     reader.install(table.id(), fd::Fd(3), false).unwrap();
     writer.install(table.id(), fd::Fd(4), true).unwrap();
-    let mut host_file = carrick_kernel::dispatch::NativeFileWitness::new(&table, 5).unwrap();
+    let mut host_file =
+        carrick_kernel::dispatch::NativeFileWitness::new(&table, fd::Fd(5)).unwrap();
     let mut mapping = mapping_last.map(|_| host_file.mapping().unwrap());
     if mapping_last.is_some() {
         host_file.restore_parent_view().unwrap();
@@ -7269,7 +7270,7 @@ fn native_child_resources(mapping_last: Option<bool>) {
         }
     }
     assert_eq!(
-        carrick_kernel::dispatch::NativeFileWitness::new(&table, 6)
+        carrick_kernel::dispatch::NativeFileWitness::new(&table, fd::Fd(6))
             .err()
             .unwrap()
             .raw_os_error(),
@@ -7346,6 +7347,11 @@ fn native_child_resources(mapping_last: Option<bool>) {
     table.close(fd::Fd(5)).unwrap();
     host_file.close_parent();
     assert_eq!(owner.retained_host_resources(), 1);
+    assert_eq!(
+        host_file.registered_opens(),
+        1,
+        "native OFD retains inode admission accounting after the wrapper closes"
+    );
     let mut bytes = [0; 5];
     assert_eq!(
         host_file.read(&mut bytes).map_err(|e| e.raw_os_error()),
@@ -7402,9 +7408,12 @@ fn native_child_resources(mapping_last: Option<bool>) {
     assert_eq!(owner.drain_retired_tables().unwrap(), 1);
     assert_eq!(owner.retained_host_resources(), 0);
     if mapping_last == Some(true) {
+        assert_eq!(host_file.registered_opens(), 1);
         assert_eq!(host_file.read(&mut bytes).unwrap(), 5);
         drop(mapping.take());
     }
+    assert_eq!(host_file.physical_fd_errno(), Some(9));
+    assert_eq!(host_file.registered_opens(), 0);
     assert_eq!(
         host_file.read(&mut bytes).unwrap_err().raw_os_error(),
         Some(9)
