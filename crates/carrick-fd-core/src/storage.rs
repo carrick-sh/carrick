@@ -19,6 +19,7 @@ pub enum StorageError {
 
 /// Owned allocation receipt. The venue transfers its ownership into the
 /// descriptor table's extent and reconstructs it only from a retired extent.
+#[must_use = "storage remains owned until released or transferred into a table extent"]
 #[derive(Debug)]
 pub struct Allocation {
     pub offset: u64,
@@ -128,7 +129,7 @@ impl<const N: usize> Storage<N> {
     /// extent: it carries allocation custody, not an independently usable ID.
     pub fn release(
         &self,
-        allocation: Allocation,
+        allocation: &mut Allocation,
         wait: &impl LockWait,
     ) -> Result<(), StorageError> {
         let _guard = self.acquire(wait)?;
@@ -174,6 +175,8 @@ impl<const N: usize> Storage<N> {
             self.nodes[index].store(value, Ordering::Relaxed);
         }
         self.live.fetch_sub(1, Ordering::Relaxed);
+        allocation.offset = 0;
+        allocation.bytes = 0;
         Ok(())
     }
 
@@ -206,7 +209,12 @@ mod loom_models {
                 let storage = Arc::clone(&storage);
                 let active = Arc::clone(&active);
                 thread::spawn(move || {
-                    if let Ok(allocation) = storage.allocate(4096, &BoundedSpin(0)) {
+                    let allocation = match storage.allocate(4096, &BoundedSpin(0)) {
+                        Ok(allocation) => allocation,
+                        Err(StorageError::Contended) => return,
+                        Err(error) => panic!("two allocations fit in this pool: {error:?}"),
+                    };
+                    {
                         let bit = 1 << (allocation.offset / 4096);
                         assert_eq!(active.fetch_or(bit, Ordering::AcqRel) & bit, 0);
                         thread::yield_now();
@@ -218,7 +226,7 @@ mod loom_models {
                                 true
                             }
                         }
-                        storage.release(allocation, &Wait).unwrap();
+                        storage.release(&mut { allocation }, &Wait).unwrap();
                     }
                 })
             });
@@ -229,7 +237,7 @@ mod loom_models {
             assert_eq!(storage.live_allocations(), 0);
             let entire = storage.allocate(4 * 4096, &BoundedSpin(0)).unwrap();
             assert_eq!(entire.bytes, 4 * 4096);
-            storage.release(entire, &BoundedSpin(0)).unwrap();
+            storage.release(&mut { entire }, &BoundedSpin(0)).unwrap();
         });
     }
 }
@@ -264,11 +272,11 @@ mod tests {
             Err(StorageError::Exhausted)
         ));
         for allocation in live.into_iter().rev() {
-            storage.release(allocation, &wait).unwrap();
+            storage.release(&mut { allocation }, &wait).unwrap();
         }
         let entire = storage.allocate(64 * 4096, &wait).unwrap();
         assert_eq!((entire.offset, entire.bytes), (0, 64 * 4096));
-        storage.release(entire, &wait).unwrap();
+        storage.release(&mut { entire }, &wait).unwrap();
         assert_eq!(storage.live_allocations(), 0);
     }
 
@@ -295,7 +303,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                storage.release(allocation, &wait),
+                storage.release(&mut { allocation }, &wait),
                 Err(StorageError::Invalid)
             );
             assert_eq!(storage.live_allocations(), 2);
@@ -304,12 +312,35 @@ mod tests {
             offset: first.offset,
             bytes: first.bytes,
         };
-        storage.release(first, &wait).unwrap();
+        storage.release(&mut { first }, &wait).unwrap();
         assert_eq!(
-            storage.release(duplicate, &wait),
+            storage.release(&mut { duplicate }, &wait),
             Err(StorageError::Invalid)
         );
-        storage.release(peer, &wait).unwrap();
+        storage.release(&mut { peer }, &wait).unwrap();
+        assert_eq!(storage.live_allocations(), 0);
+    }
+
+    #[test]
+    fn contended_release_retains_the_owned_receipt() {
+        // SAFETY: this record contains only zero-initializable atomics.
+        let storage = unsafe { Box::<Storage<16>>::new_zeroed().assume_init() };
+        let wait = BoundedSpin(0);
+        storage.initialize(8 * 4096).unwrap();
+        let mut allocation = storage.allocate(8192, &wait).unwrap();
+        let peer = storage.allocate(8192, &wait).unwrap();
+        let before = (allocation.offset, allocation.bytes);
+        let guard = storage.acquire(&wait).unwrap();
+        assert_eq!(
+            storage.release(&mut allocation, &wait),
+            Err(StorageError::Contended)
+        );
+        assert_eq!((allocation.offset, allocation.bytes), before);
+        assert_eq!(storage.live_allocations(), 2);
+        drop(guard);
+        storage.release(&mut allocation, &wait).unwrap();
+        assert_eq!((allocation.offset, allocation.bytes), (0, 0));
+        storage.release(&mut { peer }, &wait).unwrap();
         assert_eq!(storage.live_allocations(), 0);
     }
 }
