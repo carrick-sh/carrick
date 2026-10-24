@@ -240,6 +240,45 @@ impl IpcTableMap {
         None
     }
 
+    /// EL1 or host: the active directory-owned namespace for `file_table`.
+    /// Unlike the ordinary fail-forward lookup, an in-progress directory
+    /// update is retried: a native child must not escape its sole authority
+    /// merely because its publication sequence was transiently odd.
+    pub fn lookup_owned(&self, file_table: u64) -> Option<RawTableId> {
+        if file_table == EMPTY || file_table == TOMBSTONE {
+            return None;
+        }
+        loop {
+            let mut retry = false;
+            for i in Self::probe(file_table) {
+                let entry = &self.entries[i];
+                let seq = entry.seq.load(Ordering::Acquire);
+                let key = entry.file_table.load(Ordering::Relaxed);
+                let table = RawTableId {
+                    authority: entry.authority.load(Ordering::Relaxed),
+                    index: entry.index.load(Ordering::Relaxed),
+                    generation: entry.generation.load(Ordering::Relaxed),
+                };
+                let retirement = entry.retirement.load(Ordering::Relaxed);
+                core::sync::atomic::fence(Ordering::Acquire);
+                if seq & 1 != 0 || entry.seq.load(Ordering::Relaxed) != seq {
+                    retry = true;
+                    break;
+                }
+                if key == file_table {
+                    return (retirement == RetirementOwner::Directory as u32).then_some(table);
+                }
+                if key == EMPTY {
+                    return None;
+                }
+            }
+            if !retry {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     /// EL1 or host: authoritative lookup serialized against concurrent table
     /// publication/withdrawal so probe-chain updates cannot cause a transient
     /// miss during fork.
