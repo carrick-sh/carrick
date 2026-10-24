@@ -1020,6 +1020,44 @@ mod tests {
     use crate::dispatch::{InternalWaitKind, WaitFdAuthority};
 
     #[test]
+    fn native_children_final_writer_close_publishes_eof() {
+        use carrick_el1_abi::ipc::fd;
+        let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 20).unwrap());
+        let parent = crate::el1_ipc::HostTable::create(Arc::clone(&owner), 64, 64).unwrap();
+        let pipe = PipeInner::create(Arc::clone(&owner), 1, PIPE_BUF).unwrap();
+        pipe.retain_endpoint(core_pipe::End::Reader);
+        pipe.retain_endpoint(core_pipe::End::Writer);
+        pipe.install_endpoint_for_test(core_pipe::End::Reader, parent.id(), fd::Fd(0))
+            .unwrap();
+        pipe.install_endpoint_for_test(core_pipe::End::Writer, parent.id(), fd::Fd(1))
+            .unwrap();
+        let region = owner.region();
+        let authority = region.fd(HostLockWait);
+        let children = core::array::from_fn::<_, 2, _>(|_| parent.fork().unwrap());
+        let close = |table, fd| {
+            if let Some(description) = authority.close(table, fd).unwrap() {
+                owner.release(description.backing).unwrap();
+            }
+        };
+        // Both children are live. Parent relinquishes every endpoint, including
+        // its host-side functional references; only inherited slots remain.
+        close(parent.id(), fd::Fd(0));
+        close(parent.id(), fd::Fd(1));
+        pipe.release_endpoint(core_pipe::End::Reader);
+        pipe.release_endpoint(core_pipe::End::Writer);
+        close(children[0].id(), fd::Fd(1));
+        assert_eq!(pipe.snapshot().writers, 1);
+        close(children[1].id(), fd::Fd(1));
+        assert_eq!(pipe.snapshot().writers, 0, "last inherited writer owns EOF");
+        assert_eq!(pipe.read_with(1, |_| panic!("EOF copies nothing")), Ok(0));
+        for child in &children {
+            close(child.id(), fd::Fd(0));
+        }
+        assert!(pipe.is_retired());
+        drop((parent, children));
+    }
+
+    #[test]
     fn red_until_step3_m2_shared_close_still_needs_host_endpoint_release() {
         use carrick_el1_abi::ipc::fd;
         for pairs in [1, 8, 64] {
