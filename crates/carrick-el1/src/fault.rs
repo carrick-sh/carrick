@@ -290,6 +290,19 @@ impl<'a, W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> X86Prepa
     pub unsafe fn under_editor(mm_key: NonZeroU64, words: &'a W) -> Self {
         Self { mm_key, words }
     }
+
+    fn admitted_root(
+        &self,
+        root_pa: u64,
+    ) -> Result<carrick_guest_arch::RootGpa, GuestPreparedCommitError> {
+        let root =
+            carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(root_pa))
+                .ok_or(GuestPreparedCommitError::BadAddress)?;
+        if crate::isa::x86::hardware_live_root() != Ok(root) {
+            return Err(GuestPreparedCommitError::BadAddress);
+        }
+        Ok(root)
+    }
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
@@ -305,9 +318,8 @@ impl<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> PreparedPage
         carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
     > {
         use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
-        if crate::isa::x86::hardware_live_root().map(|live| live.address().raw()) != Ok(root) {
-            return Err(DescriptorRefusal::StaleRoot);
-        }
+        self.admitted_root(root)
+            .map_err(|_| DescriptorRefusal::StaleRoot)?;
         carrick_core::mm::frames::select_backing_window::<carrick_mmu_core::x86::owner_mmu::X86Mmu, _>(
             self.words, root, window,
         )
@@ -320,18 +332,14 @@ impl<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> PreparedPage
         access: LeafAccess,
     ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
         use carrick_guest_arch::{
-            EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, RootGpa, UserRange, UserVa,
+            EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, UserRange, UserVa,
         };
         use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
         use carrick_mmu_core::x86::descriptor_txn::{
             Access, DescriptorOutcome, DescriptorTxn, InlineJournal, execute_descriptor_txn,
             translate_leaf,
         };
-        let root = RootGpa::page_aligned(FrameGpa::new(root_pa))
-            .ok_or(GuestPreparedCommitError::BadAddress)?;
-        if crate::isa::x86::hardware_live_root() != Ok(root) {
-            return Err(GuestPreparedCommitError::BadAddress);
-        }
+        let root = self.admitted_root(root_pa)?;
         let range = UserRange::checked(UserVa::new(va), GuestLen::new(4096))
             .ok_or(GuestPreparedCommitError::BadAddress)?;
         let expected = FrameGpa::new(expected_pa);
