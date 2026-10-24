@@ -13,6 +13,7 @@ use thiserror::Error;
 
 mod assignment;
 mod github;
+pub(crate) use github::dispatch_workflow_unchanged;
 mod live;
 mod mac;
 mod site;

@@ -233,10 +233,6 @@ impl ProvenanceCache {
                     .or_insert_with(|| {
                         let run = lookup(&format!("repos/{REPOSITORY}/actions/runs/{id}"))?;
                         let run = authenticate_artifact_run(run, issue, &mut lookup).ok()?;
-                        let artifacts = lookup(&format!(
-                            "repos/{REPOSITORY}/actions/runs/{id}/artifacts?per_page=100"
-                        ))?;
-                        artifact_scope(&run.0, artifacts["artifacts"].as_array()?, issue).ok()?;
                         Some(run)
                     })
                     .clone()
@@ -531,57 +527,54 @@ const ARTIFACT_FILES: [&str; 5] = [
 /// Publication and text provenance require more evidence than PR ownership.
 /// In particular a review's workflow is loaded from the PR merge ref.
 #[derive(Clone)]
-struct ArtifactRun(Value);
+struct ArtifactRun(Value, bool);
 fn authenticate_artifact_run(
     run: Value,
     issue: u64,
     mut lookup: impl FnMut(&str) -> Option<Value>,
 ) -> Result<ArtifactRun, ScalerError> {
-    let refused = || ScalerError::Guard("prior run lacks trusted main workflow and agent upload");
+    let refused = || ScalerError::Guard("prior run lacks trusted main workflow and agent worker");
     if !dispatch_run_identity(&run, Some(issue)) || run["status"] != "completed" {
         return Err(refused());
     }
-    if run["event"] == "pull_request_review" {
-        let mut blob = |reference: &str| {
-            lookup(&format!(
-                "repos/{REPOSITORY}/contents/.github/workflows/dispatch-worker.yml?ref={reference}"
-            ))
-            .and_then(|v| v["sha"].as_str().filter(|s| sha(s)).map(str::to_owned))
-        };
-        let main = blob("main").ok_or_else(refused)?;
-        if blob(run["head_sha"].as_str().ok_or_else(refused)?).as_ref() != Some(&main) {
-            return Err(refused());
-        }
+    if run["event"] == "pull_request_review"
+        && !crate::ci_scaler::dispatch_workflow_unchanged(
+            run["head_sha"].as_str().ok_or_else(refused)?,
+            |endpoint| lookup(endpoint).ok_or_else(refused),
+        )?
+    {
+        return Err(refused());
     }
     let id = run["id"].as_u64().ok_or_else(refused)?;
     let jobs = lookup(&format!(
         "repos/{REPOSITORY}/actions/runs/{id}/jobs?filter=latest&per_page=100"
     ))
     .ok_or_else(refused)?;
-    if !jobs["jobs"].as_array().is_some_and(|jobs| {
-        jobs.iter().any(|job| {
-            let runner = job["runner_name"].as_str().unwrap_or_default();
-            job["name"] == "worker"
-                && job["status"] == "completed"
-                && (runner == "carrick-agent"
-                    || runner.starts_with("carrick-agent-")
-                    || job["labels"]
-                        .as_array()
-                        .is_some_and(|labels| labels.iter().any(|l| l == "carrick-agent")))
-                && job["steps"].as_array().is_some_and(|steps| {
-                    steps.iter().any(|step| {
-                        matches!(
-                            step["name"].as_str(),
-                            Some("Run actions/upload-artifact@v4" | "actions/upload-artifact@v4")
-                        ) && step["status"] == "completed"
-                            && step["conclusion"] == "success"
-                    })
-                })
+    let job = jobs["jobs"]
+        .as_array()
+        .and_then(|jobs| {
+            jobs.iter().find(|job| {
+                let runner = job["runner_name"].as_str().unwrap_or_default();
+                job["name"] == "worker"
+                    && job["status"] == "completed"
+                    && (runner == "carrick-agent"
+                        || runner.starts_with("carrick-agent-")
+                        || job["labels"]
+                            .as_array()
+                            .is_some_and(|labels| labels.iter().any(|l| l == "carrick-agent")))
+            })
         })
-    }) {
-        return Err(refused());
-    }
-    Ok(ArtifactRun(run))
+        .ok_or_else(refused)?;
+    let uploaded = job["steps"].as_array().is_some_and(|steps| {
+        steps.iter().any(|step| {
+            matches!(
+                step["name"].as_str(),
+                Some("Run actions/upload-artifact@v4" | "actions/upload-artifact@v4")
+            ) && step["status"] == "completed"
+                && step["conclusion"] == "success"
+        })
+    });
+    Ok(ArtifactRun(run, uploaded))
 }
 fn artifact_scope(run: &Value, artifacts: &[Value], issue: u64) -> Result<Value, ScalerError> {
     let id = run["id"]
@@ -627,6 +620,9 @@ fn run_artifacts(
         return Err(ScalerError::Guard("prior run identity mismatch"));
     }
     let run = authenticate_artifact_run(run, issue, |endpoint| api(root, endpoint).ok())?;
+    if !run.1 {
+        return Err(ScalerError::Guard("prior run upload did not succeed"));
+    }
     let data = api(
         root,
         &format!("repos/{REPOSITORY}/actions/runs/{id_number}/artifacts?per_page=100"),
@@ -2105,8 +2101,9 @@ case "$endpoint" in
  */actions/artifacts*) test ! -f "$RUNNER_TEMP/no-repo-scan" || { echo 'repository-wide artifact scan' >&2; exit 92; }; cat "$RUNNER_TEMP/repo-artifacts.json" ;;
  */workflows/dispatch-worker.yml/runs*) cat "$RUNNER_TEMP/workflow-runs.json" ;;
  */actions/runs/*/jobs*) cat "$RUNNER_TEMP/jobs.json" ;;
+ */compare/main...*) printf '{"files":[],"merge_base_commit":{"sha":"%040d"}}' 1 ;;
  */contents/.github/workflows/dispatch-worker.yml*)
-   case "$endpoint" in *ref=main) printf '{"sha":"%040d"}' 0 ;; *) cat "$RUNNER_TEMP/workflow.json" ;; esac ;;
+   case "$endpoint" in *ref=main) printf '{"type":"file","sha":"%040d"}' 0 ;; *ref=0000000000000000000000000000000000000001) if test -f "$RUNNER_TEMP/workflow-base.json"; then cat "$RUNNER_TEMP/workflow-base.json"; else printf '{"type":"file","sha":"%040d"}' 0; fi ;; *) cat "$RUNNER_TEMP/workflow.json" ;; esac ;;
  */actions/runs/42/artifacts*) cat "$RUNNER_TEMP/artifacts.json" ;;
  */actions/runs/43/artifacts*) if test -f "$RUNNER_TEMP/artifacts-43.json"; then cat "$RUNNER_TEMP/artifacts-43.json"; else echo '{"artifacts":[]}'; fi ;;
  */actions/runs/44/artifacts*) echo '{"artifacts":[{"id":9,"name":"dispatch-587-44-1","expired":false,"size_in_bytes":100}]}' ;;
@@ -2194,7 +2191,7 @@ esac
         std::fs::write(root.join("jobs.json"), json!({"jobs":[{"name":"worker","status":"completed","conclusion":"success","runner_name":"carrick-agent-123","labels":["carrick-agent"],"steps":[{"name":"Run actions/upload-artifact@v4","status":"completed","conclusion":"success"}]}]}).to_string()).unwrap();
         std::fs::write(
             root.join("workflow.json"),
-            json!({"sha":"0".repeat(40)}).to_string(),
+            json!({"type":"file","sha":"0".repeat(40)}).to_string(),
         )
         .unwrap();
         test(&root);
@@ -2333,6 +2330,87 @@ esac
         });
     }
     #[test]
+    fn review_trust_uses_the_heads_merge_base() {
+        shared_fixture(|root| {
+            let mut run: Value =
+                serde_json::from_str(&regular_text(&root.join("run.json")).unwrap()).unwrap();
+            run["event"] = "pull_request_review".into();
+            run["head_branch"] = "work/dispatch-799-42".into();
+            std::fs::write(root.join("run.json"), run.to_string()).unwrap();
+            let old = json!({"type":"file","sha":"b".repeat(40)}).to_string();
+            std::fs::write(root.join("workflow.json"), &old).unwrap();
+            std::fs::write(root.join("workflow-base.json"), &old).unwrap();
+            assert!(
+                prior_artifact(root, 799, RunId(42), "handoff.json").is_ok(),
+                "later workflow change on main revoked an unchanged review run"
+            );
+            std::fs::remove_file(root.join("workflow-base.json")).unwrap();
+            assert!(
+                prior_artifact(root, 799, RunId(42), "handoff.json").is_err(),
+                "review head changed the workflow relative to its merge base"
+            );
+        });
+    }
+    #[test]
+    fn review_workflow_change_matching_current_main_is_refused() {
+        shared_fixture(|root| {
+            let mut run: Value =
+                serde_json::from_str(&regular_text(&root.join("run.json")).unwrap()).unwrap();
+            run["event"] = "pull_request_review".into();
+            run["head_branch"] = "work/dispatch-799-42".into();
+            std::fs::write(root.join("run.json"), run.to_string()).unwrap();
+            std::fs::write(
+                root.join("workflow-base.json"),
+                json!({"type":"file","sha":"b".repeat(40)}).to_string(),
+            )
+            .unwrap();
+            assert!(
+                prior_artifact(root, 799, RunId(42), "handoff.json").is_err(),
+                "review workflow change matching current main was admitted"
+            );
+        });
+    }
+    #[test]
+    fn expired_artifact_does_not_revoke_outcome_provenance() {
+        shared_fixture(|root| {
+            std::fs::write(root.join("artifacts.json"), "{\"artifacts\":[]}").unwrap();
+            let state = server(root).read_state().unwrap();
+            assert!(
+                state["state"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["kind"] == "issue_comment"
+                        && item["provenance"] == "dispatch-agent(run 42)"),
+                "expired artifact revoked authenticated outcome provenance: {state}"
+            );
+            assert!(prior_artifact(root, 799, RunId(42), "handoff.json").is_err());
+        });
+    }
+    #[test]
+    fn failed_upload_does_not_revoke_open_pr_continuation() {
+        shared_fixture(|root| {
+            let jobs = regular_text(&root.join("jobs.json")).unwrap();
+            std::fs::write(
+                root.join("jobs.json"),
+                jobs.replace("\"success\"", "\"failure\""),
+            )
+            .unwrap();
+            assert!(
+                verified_branch(root, 799, "work/dispatch-799-42").is_ok(),
+                "origin upload failure revoked open owned PR continuation"
+            );
+            let state = server(root).read_state().unwrap();
+            assert!(state.to_string().contains("prior result"));
+            assert!(
+                prior_artifact(root, 799, RunId(42), "handoff.json").is_err(),
+                "failed upload granted artifact authority"
+            );
+            std::fs::write(root.join("prs.json"), "[]").unwrap();
+            assert!(verified_branch(root, 799, "work/dispatch-799-42").is_err());
+        });
+    }
+    #[test]
     fn review_sources_require_main_workflow_and_agent_upload() {
         shared_fixture(|root| {
             let mut bad = Vec::new();
@@ -2350,7 +2428,7 @@ esac
                 match scenario {
                     "changed workflow" => std::fs::write(
                         root.join("workflow.json"),
-                        json!({"sha":"b".repeat(40)}).to_string(),
+                        json!({"type":"file","sha":"b".repeat(40)}).to_string(),
                     )
                     .unwrap(),
                     "missing agent job" => std::fs::write(
@@ -2367,19 +2445,21 @@ esac
                 if prior_artifact(root, 799, RunId(42), "handoff.json").is_ok() {
                     bad.push(scenario);
                 }
-                assert!(
+                assert_eq!(
                     verified_branch(root, 799, "work/dispatch-799-42").is_err(),
+                    scenario != "upload not successful",
                     "untrusted run granted branch authority: {scenario}"
                 );
                 let state = server(root).read_state().unwrap();
                 assert!(
-                    !state.to_string().contains("prior result"),
+                    state.to_string().contains("prior result")
+                        == (scenario == "upload not successful"),
                     "untrusted earlier run supplied text: {scenario}"
                 );
                 std::fs::write(root.join("jobs.json"), jobs).unwrap();
                 std::fs::write(
                     root.join("workflow.json"),
-                    json!({"sha":"0".repeat(40)}).to_string(),
+                    json!({"type":"file","sha":"0".repeat(40)}).to_string(),
                 )
                 .unwrap();
             }
@@ -2781,7 +2861,7 @@ esac
             provenance_with(
                 &item,
                 799,
-                |id| (id == "42").then(|| ArtifactRun(run.clone())),
+                |id| (id == "42").then(|| ArtifactRun(run.clone(), true)),
                 false
             ),
             "dispatch-agent(run 42)"
@@ -3026,8 +3106,12 @@ esac
         ] {
             let mut other = run.clone();
             other[field] = value;
-            if provenance_with(&item, 799, |_| Some(ArtifactRun(other.clone())), false)
-                != "unverified"
+            if provenance_with(
+                &item,
+                799,
+                |_| Some(ArtifactRun(other.clone(), true)),
+                false,
+            ) != "unverified"
             {
                 bad.push(field);
             }
@@ -3039,7 +3123,7 @@ esac
         let item = json!({"user":{"login":"github-actions[bot]","type":"Bot"},"body":format!("receipt\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
         let run = json!({"id":42,"repository":{"full_name":REPOSITORY},"path":".github/workflows/dispatch-worker.yml","actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"},"head_repository":{"full_name":REPOSITORY},"head_sha":"a".repeat(40),"event":"issues","head_branch":"main"});
         assert_eq!(
-            provenance_with(&item, 799, |_| Some(ArtifactRun(run.clone())), false),
+            provenance_with(&item, 799, |_| Some(ArtifactRun(run.clone(), true)), false),
             "dispatch-agent(run 42)"
         );
         for (pointer, value) in [
@@ -3052,7 +3136,7 @@ esac
             let mut bad = run.clone();
             *bad.pointer_mut(pointer).unwrap() = value.into();
             assert_eq!(
-                provenance_with(&item, 799, |_| Some(ArtifactRun(bad.clone())), false),
+                provenance_with(&item, 799, |_| Some(ArtifactRun(bad.clone(), true)), false),
                 "unverified",
                 "{pointer}"
             );
@@ -3061,12 +3145,22 @@ esac
         review["event"] = "pull_request_review".into();
         review["head_branch"] = "work/dispatch-799-42".into();
         assert_eq!(
-            provenance_with(&item, 799, |_| Some(ArtifactRun(review.clone())), false),
+            provenance_with(
+                &item,
+                799,
+                |_| Some(ArtifactRun(review.clone(), true)),
+                false
+            ),
             "dispatch-agent(run 42)"
         );
         review["head_branch"] = "work/dispatch-1-42".into();
         assert_eq!(
-            provenance_with(&item, 799, |_| Some(ArtifactRun(review.clone())), false),
+            provenance_with(
+                &item,
+                799,
+                |_| Some(ArtifactRun(review.clone(), true)),
+                false
+            ),
             "unverified"
         );
         assert_eq!(provenance_with(&item, 799, |_| None, false), "unverified");

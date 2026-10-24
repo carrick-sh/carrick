@@ -46,6 +46,44 @@ fn admission_refused(run: &Value, reason: &str) {
     }
 }
 
+/// Check the PR's own workflow changes against its merge base with main.
+/// Today's main can have advanced since an earlier review ran.
+pub(crate) fn dispatch_workflow_unchanged(
+    head: &str,
+    mut lookup: impl FnMut(&str) -> Result<Value, ScalerError>,
+) -> Result<bool, ScalerError> {
+    if !full_sha(head) {
+        return Ok(false);
+    }
+    let comparison = lookup(&format!("repos/{REPOSITORY}/compare/main...{head}"))?;
+    let files = comparison["files"]
+        .as_array()
+        .ok_or(ScalerError::External("comparison files"))?;
+    if files
+        .iter()
+        .any(|f| f["filename"] == DISPATCH_WORKFLOW || f["previous_filename"] == DISPATCH_WORKFLOW)
+    {
+        return Ok(false);
+    }
+    // GitHub caps comparison files at 300. Blob equality with the merge base
+    // proves the head kept main's workflow even when the file list is capped.
+    let base = comparison["merge_base_commit"]["sha"]
+        .as_str()
+        .filter(|s| full_sha(s))
+        .ok_or(ScalerError::External("comparison merge base"))?;
+    let mut blobs = Vec::new();
+    for reference in [head, base] {
+        let blob = lookup(&format!(
+            "repos/{REPOSITORY}/contents/{DISPATCH_WORKFLOW}?ref={reference}"
+        ))?;
+        if blob["type"] != "file" || !blob["sha"].as_str().is_some_and(full_sha) {
+            return Ok(false);
+        }
+        blobs.push(blob["sha"].clone());
+    }
+    Ok(blobs[0] == blobs[1])
+}
+
 pub(super) struct Github;
 impl Github {
     pub(super) fn request(
@@ -540,44 +578,7 @@ impl Github {
             let head = run["head_sha"]
                 .as_str()
                 .ok_or(ScalerError::Guard("review SHA missing"))?;
-            let comparison = request(
-                "GET",
-                &format!("repos/{REPOSITORY}/compare/main...{head}"),
-                None,
-                false,
-            )?;
-            let files = comparison["files"]
-                .as_array()
-                .ok_or(ScalerError::External("comparison files"))?;
-            if files.iter().any(|f| {
-                f["filename"] == DISPATCH_WORKFLOW || f["previous_filename"] == DISPATCH_WORKFLOW
-            }) {
-                return Ok(false);
-            }
-            // GitHub caps comparison files at 300; absence in a capped list
-            // is not evidence. Compare head with the merge base in that case.
-            // https://docs.github.com/en/rest/commits/commits#compare-two-commits
-            if files.len() < 300 {
-                return Ok(true);
-            }
-            let base = comparison["merge_base_commit"]["sha"]
-                .as_str()
-                .filter(|s| full_sha(s))
-                .ok_or(ScalerError::External("comparison merge base"))?;
-            let mut blobs = Vec::new();
-            for reference in [head, base] {
-                let blob = request(
-                    "GET",
-                    &format!("repos/{REPOSITORY}/contents/{DISPATCH_WORKFLOW}?ref={reference}"),
-                    None,
-                    false,
-                )?;
-                if blob["type"] != "file" || !blob["sha"].as_str().is_some_and(full_sha) {
-                    return Ok(false);
-                }
-                blobs.push(blob["sha"].clone());
-            }
-            Ok(blobs[0] == blobs[1])
+            dispatch_workflow_unchanged(head, |endpoint| request("GET", endpoint, None, false))
         })();
         match checked {
             Ok(true) => Ok(true),
