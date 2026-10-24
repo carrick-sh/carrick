@@ -617,7 +617,7 @@ mod tests {
                         perms: 3,
                         logical_owner: Some(crate::trap::CarrierLogicalOwner { id, generation: 1 }),
                     },
-                    || 0,
+                    |_| 0,
                 )
                 .unwrap();
         }
@@ -808,7 +808,7 @@ mod tests {
                         perms: 3,
                         logical_owner: Some(crate::trap::CarrierLogicalOwner { id, generation: 1 }),
                     },
-                    || 0,
+                    |_| 0,
                 )
                 .unwrap();
         }

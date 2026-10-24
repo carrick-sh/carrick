@@ -1507,7 +1507,7 @@ pub(crate) fn install_ipc_window_using(
             perms: READ_WRITE,
             logical_owner: Some(owner),
         };
-        match custody.publish_stage2_record_using(spec, || map(host, ipa, len, READ_WRITE)) {
+        match custody.publish_stage2_record_using(spec, |_| map(host, ipa, len, READ_WRITE)) {
             Ok(identity) => records.push(identity),
             Err(error) => {
                 for identity in records {
