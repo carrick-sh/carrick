@@ -1723,6 +1723,48 @@ impl ForkTableLedger for RecordingLedger {
     }
 }
 
+#[test]
+fn native_descriptor_tables_are_preclaimed_from_child_stock_until_retirement() {
+    use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
+
+    let mut stock = stock(UntaggedRoots, 10, 1);
+    let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    let child = child_of(granted, 44);
+    let owner = stock.child_owner(granted.request.child_mm).unwrap();
+    let before = stock.table_stock().to_vec();
+
+    let reservation = stock
+        .reserve_native_descriptor_tables(
+            &mut NoTableLedger,
+            owner,
+            child.context.root,
+            MAX_TABLE_GRANTS,
+        )
+        .unwrap();
+    let descriptor_tables = reservation.descriptor_tables();
+    let reserved = reservation.pages().to_vec();
+    assert_eq!(descriptor_tables.len(), MAX_TABLE_GRANTS);
+    assert!(reserved.iter().all(|page| before.contains(page)));
+    stock.commit_native_descriptor_tables(reservation);
+    assert!(
+        reserved
+            .iter()
+            .all(|page| !stock.table_stock().contains(page)),
+        "a submitted transaction's grants stay charged to the child"
+    );
+
+    retire(&mut stock, child).unwrap();
+    let cleared = RefCell::new(Vec::new());
+    assert_eq!(reclaim(&mut stock, |_| true, &cleared), 1);
+    assert!(reserved.iter().all(|page| cleared.borrow().contains(page)));
+    assert!(
+        reserved
+            .iter()
+            .all(|page| stock.table_stock().contains(page))
+    );
+}
+
 #[derive(Debug)]
 struct TestTableReservation(Vec<RootGpa>);
 

@@ -231,7 +231,7 @@ impl NativeService {
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         use carrick_mmu_core::aarch64::descriptor_txn::{
-            DescriptorOp, DescriptorTxn, DescriptorTxnId, MAX_TABLE_GRANTS, PageSpan, TableGrants,
+            DescriptorOp, DescriptorTxn, DescriptorTxnId, MAX_TABLE_GRANTS, PageSpan,
         };
         use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
         let Some(reply) = self.reply else {
@@ -307,7 +307,6 @@ impl NativeService {
         if grants.owner() != owner || physical.rollback.failed() {
             return Err(stale());
         }
-        let prefix = MAX_TABLE_GRANTS as u64 * 4096;
         let data_len = publication_len.next_multiple_of(carrick_el1_abi::COW_GRANT_SIZE);
         let executable = window
             .protection
@@ -316,7 +315,7 @@ impl NativeService {
         // and later executable-publication capacity. The exact MM's inventory
         // and stage-1 publication below retain the selected access policy.
         let perms = crate::trap::hvf_mem_perms(carrick_hal::physical_grants::COW_GRANT_PERMISSIONS);
-        let length = prefix + data_len;
+        let length = data_len;
         let (host, ipa, generation) = crate::trap::allocate_grant_extent(&custody, perms, length)?;
         let retained = Arc::new(crate::fork_stock::NativeFrameBacking {
             carrier: Arc::downgrade(&custody),
@@ -331,28 +330,17 @@ impl NativeService {
         if let Some(bytes) = bytes {
             // SAFETY: retained writable allocation contains this bounded data span.
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    host.add(prefix as usize),
-                    bytes.len(),
-                );
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), host, bytes.len());
             }
         }
         if executable {
-            // SAFETY: initialized retained backing; publication has not exposed it.
-            unsafe {
-                crate::trap::invalidate_instruction_cache(host.add(prefix as usize), data_len);
-            }
+            crate::trap::invalidate_instruction_cache(host, data_len);
         }
         let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage_with_permissions(
             Arc::clone(&physical.rollback),
             inventory,
-            (0..MAX_TABLE_GRANTS)
-                .map(|index| carrick_guest_arch::FrameGpa::new(ipa + index as u64 * 4096))
-                .chain(core::iter::once(carrick_guest_arch::FrameGpa::new(
-                    ipa + prefix,
-                ))),
-            MAX_TABLE_GRANTS,
+            [carrick_guest_arch::FrameGpa::new(ipa)],
+            0,
             data_len,
             owner,
             carrick_hal::MemPerms {
@@ -364,7 +352,20 @@ impl NativeService {
             },
         )?;
         let rows = grants.retain_backing(staged, retained)?;
-        let data = rows.last().ok_or_else(stale)?;
+        let data = rows.first().ok_or_else(stale)?;
+        let table_reservation = stock
+            .owner
+            .reserve_native_descriptor_tables(
+                &mut crate::fork_stock::fork_table_accounting(&custody),
+                handle,
+                root,
+                MAX_TABLE_GRANTS,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!(
+                    "native backing descriptor table reservation: {error:?}"
+                ))
+            })?;
         let txn = DescriptorTxn {
             id: DescriptorTxnId {
                 mm_key: core::num::NonZeroU64::new(handle.mm().raw()).ok_or_else(stale)?,
@@ -384,17 +385,21 @@ impl NativeService {
                 resident: PageSpan::new(window.fault_page, 4096),
                 backing: data.identity,
             },
-            tables: TableGrants::new(
-                &rows[..MAX_TABLE_GRANTS]
-                    .iter()
-                    .map(|grant| SubstrateGpa(grant.gpa.raw()))
-                    .collect::<Vec<_>>(),
-            )
-            .ok_or_else(stale)?,
+            tables: table_reservation.descriptor_tables(),
         };
         // SAFETY: intake pinned and authenticated the request-owned reply. The
         // ring retains it through ACK, then revalidates and executes this slot.
         let submitted = unsafe { reply.as_ref() }.submit(window, &txn);
+        if submitted {
+            stock
+                .owner
+                .commit_native_descriptor_tables(table_reservation);
+        } else {
+            stock.owner.cancel_native_descriptor_tables(
+                &mut crate::fork_stock::fork_table_accounting(&custody),
+                table_reservation,
+            );
+        }
         drop(stock);
         self.complete(submitted)
     }
@@ -603,79 +608,6 @@ pub(super) fn take(
     Ok(Some(service))
 }
 
-#[cfg(test)]
-mod intake_tests {
-    use super::*;
-    use carrick_core_abi::{EntryThreadGeneration, SnapshotGeneration};
-    use carrick_guest_arch::NativeOrdinal;
-    use carrick_sched_core::{
-        RecordId, RecordRef,
-        process::{TaskId, TaskKey, TaskSerial},
-    };
-    use core::num::{NonZeroI32, NonZeroU64};
-
-    fn birth() -> carrick_core_abi::service::ServiceBirth {
-        let generation = NonZeroU64::MIN;
-        carrick_core_abi::service::ServiceBirth {
-            process: TaskKey {
-                id: TaskId::from_registry_allocation(NonZeroI32::new(1).unwrap()),
-                serial: TaskSerial::from_registry_allocation(generation),
-            },
-            thread: EntryThreadGeneration::from_raw(generation.get()),
-            record: RecordRef {
-                id: RecordId::from_raw(1).unwrap(),
-                incarnation: generation.get(),
-            },
-            // SAFETY: this protocol-only fixture never authorizes memory access.
-            mm: unsafe {
-                carrick_el1_abi::El1MmHandle::from_admitted_owner(
-                    NonZeroU64::MIN,
-                    carrick_el1_abi::ReservationMm::new(1).unwrap(),
-                    generation,
-                )
-            },
-        }
-    }
-
-    #[test]
-    fn consumed_notice_intake_miss_is_loud_with_sigkill_pending() {
-        let cell = ServiceCell::new();
-        let birth = birth();
-        cell.bind(birth).unwrap();
-        let request = cell
-            .publish(
-                birth,
-                SnapshotGeneration::INITIAL,
-                carrick_core_abi::service::ServiceOperation::Crossing {
-                    ordinal: NativeOrdinal::new(1),
-                },
-                None,
-            )
-            .unwrap();
-        let notice = carrick_core_abi::service::ServiceNotice::new();
-        notice.publish(request.identity.into()).unwrap();
-        let consumed = ConsumedServiceNotice(notice.take().unwrap().unwrap());
-
-        assert_eq!(
-            cell.cancel(request.identity),
-            Ok(false),
-            "SIGKILL cancellation waits for the physical intake owner"
-        );
-        let intake: Result<(), TrapError> = consumed.miss("missing host intake member");
-        assert!(
-            intake.is_err(),
-            "a consumed notice cannot silently leave the parked member REQUESTED"
-        );
-
-        let ticket = cell.claim(request).unwrap();
-        assert!(ticket.complete(false).is_ok());
-        assert_eq!(
-            cell.consume(request.identity),
-            Ok(carrick_core_abi::service::ServiceResult::Cancelled)
-        );
-    }
-}
-
 pub(crate) fn settle_native_cow(
     custody: &crate::trap::CarrierVmCustody,
     pool: &carrick_el1_abi::CowGrantPool,
@@ -756,4 +688,77 @@ fn retain_reply(
         core::ptr::NonNull::new(pointer.cast()).ok_or_else(stale)?,
         Some(pin),
     ))
+}
+
+#[cfg(test)]
+mod intake_tests {
+    use super::*;
+    use carrick_core_abi::{EntryThreadGeneration, SnapshotGeneration};
+    use carrick_guest_arch::NativeOrdinal;
+    use carrick_sched_core::{
+        RecordId, RecordRef,
+        process::{TaskId, TaskKey, TaskSerial},
+    };
+    use core::num::{NonZeroI32, NonZeroU64};
+
+    fn birth() -> carrick_core_abi::service::ServiceBirth {
+        let generation = NonZeroU64::MIN;
+        carrick_core_abi::service::ServiceBirth {
+            process: TaskKey {
+                id: TaskId::from_registry_allocation(NonZeroI32::new(1).unwrap()),
+                serial: TaskSerial::from_registry_allocation(generation),
+            },
+            thread: EntryThreadGeneration::from_raw(generation.get()),
+            record: RecordRef {
+                id: RecordId::from_raw(1).unwrap(),
+                incarnation: generation.get(),
+            },
+            // SAFETY: this protocol-only fixture never authorizes memory access.
+            mm: unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    NonZeroU64::MIN,
+                    carrick_el1_abi::ReservationMm::new(1).unwrap(),
+                    generation,
+                )
+            },
+        }
+    }
+
+    #[test]
+    fn consumed_notice_intake_miss_is_loud_with_sigkill_pending() {
+        let cell = ServiceCell::new();
+        let birth = birth();
+        cell.bind(birth).unwrap();
+        let request = cell
+            .publish(
+                birth,
+                SnapshotGeneration::INITIAL,
+                carrick_core_abi::service::ServiceOperation::Crossing {
+                    ordinal: NativeOrdinal::new(1),
+                },
+                None,
+            )
+            .unwrap();
+        let notice = carrick_core_abi::service::ServiceNotice::new();
+        notice.publish(request.identity.into()).unwrap();
+        let consumed = ConsumedServiceNotice(notice.take().unwrap().unwrap());
+
+        assert_eq!(
+            cell.cancel(request.identity),
+            Ok(false),
+            "SIGKILL cancellation waits for the physical intake owner"
+        );
+        let intake: Result<(), TrapError> = consumed.miss("missing host intake member");
+        assert!(
+            intake.is_err(),
+            "a consumed notice cannot silently leave the parked member REQUESTED"
+        );
+
+        let ticket = cell.claim(request).unwrap();
+        assert!(ticket.complete(false).is_ok());
+        assert_eq!(
+            cell.consume(request.identity),
+            Ok(carrick_core_abi::service::ServiceResult::Cancelled)
+        );
+    }
 }
