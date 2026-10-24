@@ -7,6 +7,20 @@ use core::num::{NonZeroU32, NonZeroU64};
 use core::ops::Deref;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Opaque retained host file/loader capability. The ring may inherit this
+/// value, but only the carrier that minted it can resolve the capability.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct ExecCapabilityId(NonZeroU64);
+impl ExecCapabilityId {
+    pub const fn new(raw: NonZeroU64) -> Self {
+        Self(raw)
+    }
+    pub const fn raw(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServiceBirth {
     pub process: TaskKey,
@@ -596,8 +610,7 @@ impl ServiceCell {
                     Ordering::Release,
                 );
                 Ok(ServiceTicket {
-                    reply: NonZeroU64::new(cell.wait_revision.load(Ordering::Relaxed))
-                        .map(|address| carrick_guest_arch::KernelVa::new(address.get())),
+                    reply: NonZeroU64::new(cell.wait_revision.load(Ordering::Relaxed)),
                     cell: core::mem::ManuallyDrop::new(pin),
                     request,
                     selection_taken: false,
@@ -671,8 +684,7 @@ impl ServiceCell {
             Ordering::Release,
         );
         Ok(ServiceTicket {
-            reply: NonZeroU64::new(cell.wait_revision.load(Ordering::Relaxed))
-                .map(|address| carrick_guest_arch::KernelVa::new(address.get())),
+            reply: NonZeroU64::new(cell.wait_revision.load(Ordering::Relaxed)),
             cell: core::mem::ManuallyDrop::new(pin),
             request,
             selection_taken: false,
@@ -826,7 +838,9 @@ pub struct ServiceTicket<P: Deref<Target = ServiceCell>> {
     cell: core::mem::ManuallyDrop<P>,
     request: ServiceRequest,
     selection_taken: bool,
-    reply: Option<carrick_guest_arch::KernelVa>,
+    // Preserve NonZeroU64's niche instead of expanding an optional domain
+    // wrapper inside every retained service ticket.
+    reply: Option<NonZeroU64>,
 }
 // Failed acknowledgement returns the unique ticket so the caller cannot lose
 // service custody. Boxing that error would add allocation to the EL1 crossing.
@@ -834,6 +848,7 @@ pub struct ServiceTicket<P: Deref<Target = ServiceCell>> {
 impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
     pub fn reply_address(&self) -> Option<carrick_guest_arch::KernelVa> {
         self.reply
+            .map(|address| carrick_guest_arch::KernelVa::new(address.get()))
     }
 
     pub fn request(&self) -> ServiceRequest {

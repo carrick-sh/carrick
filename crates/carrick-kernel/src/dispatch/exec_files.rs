@@ -20,6 +20,10 @@ pub enum ExecCaller {
         mm: crate::kernel::MmId,
         execution: Option<crate::kernel::objects::ExecutionGeneration>,
     },
+    Native {
+        birth: carrick_core_abi::service::ServiceBirth,
+        execution: carrick_core_abi::SnapshotGeneration,
+    },
 }
 
 /// Read-only lookup into the FD authority. Exec does not interpret descriptor
@@ -52,6 +56,7 @@ pub struct ExecFilesystem {
 }
 
 /// Caller-selected resources, retained independently of any host TaskRef.
+#[derive(Clone)]
 struct ExecFileContext {
     pub caller: ExecCaller,
     pub proc_caller: Option<super::fs::pathres::RetainedProcCaller>,
@@ -62,6 +67,7 @@ struct ExecFileContext {
     pub descriptors: Arc<dyn ExecFdSources>,
 }
 
+#[derive(Clone)]
 pub struct ExecFiles {
     filesystem: ExecFilesystem,
     context: ExecFileContext,
@@ -83,6 +89,24 @@ impl ExecFiles {
 
     pub fn caller(&self) -> ExecCaller {
         self.context.caller
+    }
+
+    /// Rebind inherited physical capabilities to an exact ring-owned caller.
+    /// Cwd, executable identity and descriptor-source custody remain retained
+    /// from the forked capability; credentials come from the live ring task.
+    pub fn for_native_caller(
+        &self,
+        birth: carrick_core_abi::service::ServiceBirth,
+        execution: carrick_core_abi::SnapshotGeneration,
+        fsuid: NsUid,
+        fsgid: NsGid,
+    ) -> Self {
+        let mut inherited = self.clone();
+        inherited.context.caller = ExecCaller::Native { birth, execution };
+        inherited.context.proc_caller = None;
+        inherited.context.fsuid = fsuid;
+        inherited.context.fsgid = fsgid;
+        inherited
     }
 
     pub fn resolve_path(&self, path: &str) -> String {

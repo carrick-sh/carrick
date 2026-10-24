@@ -53,6 +53,9 @@ pub enum HostBindingDupError<E> {
 pub const GUEST_FD_CLOEXEC: u32 = 1;
 pub const GUEST_FD_LIMIT: i32 = 1024;
 
+mod exec;
+pub use exec::*;
+
 #[cfg(any(test, feature = "host-test"))]
 pub static RETAINED_HOOK: SpinLock<Option<alloc::boxed::Box<dyn FnOnce() + Send>>> =
     SpinLock::new(None);
@@ -1156,6 +1159,59 @@ mod tests {
             None
         );
         assert_eq!(fd_map[child_index].fd_flags.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn native_exec_custody_applies_cloexec_only_at_commit() {
+        use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial};
+        use core::num::{NonZeroI32, NonZeroU64};
+
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_stdio(
+            &fd_map,
+            &open_table,
+            &object_table,
+            10,
+            [false, true, false],
+        );
+        assert_eq!(
+            dup2_host_binding(&fd_map, &open_table, 10, 1, 5, true)
+                .unwrap()
+                .fd,
+            5
+        );
+        assert!(fork_fd_map(&fd_map, &open_table, 10, 11));
+        let child = TaskKey {
+            id: TaskId::from_registry_allocation(NonZeroI32::new(11).unwrap()),
+            serial: TaskSerial::from_registry_allocation(NonZeroU64::new(101).unwrap()),
+        };
+
+        let prepared = match carrick_fd_core::exec::prepare_close_on_exec(
+            child,
+            NativeTableCustody::capture(child, 11, &fd_map, &open_table).unwrap(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(_) => panic!("native descriptor preparation failed"),
+        };
+        assert!(fd_map_lookup(&fd_map, 11, 5).is_some());
+        assert!(fd_map_lookup(&fd_map, 10, 5).is_some());
+        drop(prepared);
+        assert!(fd_map_lookup(&fd_map, 11, 5).is_some());
+
+        let prepared = match carrick_fd_core::exec::prepare_close_on_exec(
+            child,
+            NativeTableCustody::capture(child, 11, &fd_map, &open_table).unwrap(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(_) => panic!("native descriptor preparation failed"),
+        };
+        let (survivor, releases) = carrick_fd_core::exec::commit(prepared);
+        assert_eq!(survivor.file_table(), 11);
+        assert!(fd_map_lookup(&fd_map, 11, 1).is_some());
+        assert!(fd_map_lookup(&fd_map, 11, 5).is_none());
+        assert!(fd_map_lookup(&fd_map, 10, 5).is_some());
+        drop(releases);
+        assert_eq!(open_table[0].lifetime.ring_references(1), Some(3));
     }
 
     #[test]
