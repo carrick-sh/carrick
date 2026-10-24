@@ -1887,14 +1887,36 @@ impl FileSlotReservation {
         &self.table
     }
 
+    /// Acquire the installed functional reference only after admission checks.
+    /// Refusal leaves the supplied description's lifetime unchanged.
     pub fn commit(mut self, slot: FileSlot) -> Result<(), crate::linux_abi::LinuxErrno> {
         let res = self
             .table
-            .commit_reserved_slot(self.fd, self.reservation_id, slot);
+            .commit_reserved_slot([(self.fd, self.reservation_id, slot)]);
         if res.is_ok() {
             self.committed = true;
         }
         res
+    }
+
+    /// Publish both admitted descriptors under one namespace lock. Refusal
+    /// cancels both claims without exposing a half-installed pipe/socket pair.
+    pub(crate) fn commit_pair(
+        mut self,
+        mut second: Self,
+        slots: [FileSlot; 2],
+    ) -> Result<(), crate::linux_abi::LinuxErrno> {
+        if !Arc::ptr_eq(&self.table, &second.table) {
+            return Err(crate::linux_abi::LINUX_EBADF);
+        }
+        let [first_slot, second_slot] = slots;
+        self.table.commit_reserved_slot([
+            (self.fd, self.reservation_id, first_slot),
+            (second.fd, second.reservation_id, second_slot),
+        ])?;
+        self.committed = true;
+        second.committed = true;
+        Ok(())
     }
 }
 
@@ -2760,54 +2782,37 @@ impl FileTable {
         }
     }
 
-    pub(crate) fn commit_reserved_slot(
+    fn commit_reserved_slot<const N: usize>(
         &self,
-        fd: i32,
-        reservation_id: u64,
-        slot: FileSlot,
+        claims: [(i32, u64, FileSlot); N],
     ) -> Result<(), crate::linux_abi::LinuxErrno> {
         let _mutation = self
             .functional_gate
             .acquire_mutation()
             .ok_or(crate::linux_abi::LINUX_EBADF)?;
         let mut open_files = self.write_open_files();
-        let mut next_fd = self.lock_next_fd();
         let mut reserved = self.lock_reserved_slots();
 
-        if reserved.get(&fd).copied() != Some(reservation_id) {
-            return Err(crate::linux_abi::LINUX_EBADF);
-        }
-
-        if open_files.contains_key(&fd) {
-            return Err(crate::linux_abi::LINUX_EBUSY);
-        }
-
-        reserved.remove(&fd);
-        open_files.insert(fd, slot);
-
-        if (0..3).contains(&fd) {
-            self.lock_closed_stdio()[fd as usize] = false;
-        }
-
-        if fd >= 3 && fd == *next_fd {
-            let mut candidate = fd.saturating_add(1);
-            let closed = self.lock_closed_stdio();
-            loop {
-                let reserved_stdio = (0..3).contains(&candidate) && !closed[candidate as usize];
-                if !open_files.contains_key(&candidate)
-                    && !reserved.contains_key(&candidate)
-                    && !reserved_stdio
-                {
-                    break;
-                }
-                let Some(next) = candidate.checked_add(1) else {
-                    break;
-                };
-                candidate = next;
+        // All authentication and occupancy checks precede publication. The
+        // cursor was advanced at admission; cancellation, not commit, rewinds it.
+        for (index, (fd, reservation_id, _)) in claims.iter().enumerate() {
+            if reserved.get(fd) != Some(reservation_id)
+                || claims[..index].iter().any(|(other, _, _)| other == fd)
+            {
+                return Err(crate::linux_abi::LINUX_EBADF);
             }
-            *next_fd = candidate;
+            if open_files.contains_key(fd) {
+                return Err(crate::linux_abi::LINUX_EBUSY);
+            }
         }
-
+        for (fd, _, slot) in claims {
+            slot.description.retain_fd_ref();
+            reserved.remove(&fd);
+            open_files.insert(fd, slot);
+            if (0..3).contains(&fd) {
+                self.lock_closed_stdio()[fd as usize] = false;
+            }
+        }
         Ok(())
     }
 
@@ -3401,6 +3406,12 @@ impl FileTableWriteGuard<'_> {
     pub(crate) fn remove(&mut self, number: &i32) -> Option<FileSlot> {
         #[cfg(test)]
         crate::dispatch::budget_meter::record_table_lookup();
+        // Removing a standard descriptor also removes its implicit stream.
+        // Do this under the namespace guard so rollback cannot resurrect bare
+        // stdin/stdout/stderr between removal and projection publication.
+        if (0..3).contains(number) {
+            self.owner.lock_closed_stdio()[*number as usize] = true;
+        }
         let removed = self.guard.remove(number);
         if removed.is_some() {
             self.mark_replaced(*number);
@@ -4758,6 +4769,46 @@ mod tests {
     }
 
     #[test]
+    fn reserved_pair_refusal_publishes_neither_slot_or_functional_reference() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().unwrap()));
+        let first = table.reserve_slot_at_or_above(0, 64).unwrap();
+        let second = table.reserve_slot_at_or_above(0, 64).unwrap();
+        let slots = [dummy_file_slot(), dummy_file_slot()];
+        let descriptions = slots.each_ref().map(|slot| Arc::clone(&slot.description));
+        // Invalidate the second admission before publication. The first is
+        // still valid, so a sequential pair commit would expose half the pair.
+        assert!(table.cancel_reservation(second.fd(), second.reservation_id()));
+        assert_eq!(first.commit_pair(second, slots).unwrap_err().get(), 9);
+        assert_eq!(table.slot_count(), 0);
+        assert!(
+            descriptions
+                .iter()
+                .all(|description| description.fd_ref_count() == 0)
+        );
+        assert!(!table.is_slot_reserved(3));
+        assert!(!table.is_slot_reserved(4));
+        let first = table.reserve_slot_at_or_above(0, 64).unwrap();
+        let second = table.reserve_slot_at_or_above(0, 64).unwrap();
+        assert_eq!((first.fd(), second.fd()), (3, 4));
+        let slots = descriptions
+            .each_ref()
+            .map(|description| FileSlot::new(Arc::clone(description), 0));
+        first.commit_pair(second, slots).unwrap();
+        assert!(
+            descriptions
+                .iter()
+                .all(|description| description.fd_ref_count() == 1)
+        );
+        drop(table);
+        assert!(
+            descriptions
+                .iter()
+                .all(|description| description.fd_ref_count() == 0)
+        );
+    }
+
+    #[test]
     fn authenticated_commit_rejects_mismatched_reservation_id() {
         let ids = ObjectIdRegistry::new();
         let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
@@ -4766,7 +4817,7 @@ mod tests {
 
         // Attempting to commit directly with a wrong reservation_id must fail EBADF
         let err = table
-            .commit_reserved_slot(fd, res.reservation_id() + 999, dummy_file_slot())
+            .commit_reserved_slot([(fd, res.reservation_id() + 999, dummy_file_slot())])
             .unwrap_err();
         assert_eq!(err, crate::linux_abi::LINUX_EBADF);
 

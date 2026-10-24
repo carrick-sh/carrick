@@ -990,7 +990,7 @@ impl<'a> FsView<'a> {
                 LINUX_O_WRONLY | nonblock,
                 fd_flags,
             );
-            let Ok((read_fd, write_fd)) = this.install_fd_pair_at_or_above(3, read_open, write_open)
+            let Ok((read_fd, write_fd)) = this.install_fd_pair_at_or_above(0, read_open, write_open)
             else {
                 return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
             };
