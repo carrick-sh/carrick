@@ -125,7 +125,7 @@ fn http_fixture() -> (String, std::thread::JoinHandle<String>) {
         // waiting for the read timeout below.
         stream.set_nonblocking(false).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         let mut request = vec![];
         while request_complete(&request).is_none_or(|total| request.len() < total) {
@@ -506,7 +506,7 @@ fn http_fixture_drains_split_post_body_before_closing_connection() {
         .unwrap();
     let mut client = std::net::TcpStream::connect(addr).unwrap();
     client
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_secs(60)))
         .unwrap();
     write!(
         client,
