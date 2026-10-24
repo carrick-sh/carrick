@@ -224,34 +224,27 @@ fn admit_bind(
     // Every owned row becomes a root node, so it is never charged here.
     let host = HostCharges::at_admission(mem);
     root.with_root_for_import(|model| {
-        let result = (|| {
-            let mut import =
-                carrick_personality_linux::mm::LinuxReservationLayout::from(model.layout());
-            import.heap = heap;
-            import.arena = arena;
-            import.brk = brk;
-            import.address_limit = address_limit;
-            import.data_limit = data_limit;
-            import.external_address_bytes = 0;
-            import.external_data_bytes = 0;
-            model.configure_import(import)?;
-            for (range, prot, flags, backing) in rows {
-                match backing {
-                    Some(backing) => model.import_with_backing(range, prot, flags, backing)?,
-                    None => model.import_with(range, prot, flags)?,
+        let mut import =
+            carrick_personality_linux::mm::LinuxReservationLayout::from(model.layout());
+        import.heap = heap;
+        import.arena = arena;
+        import.brk = brk;
+        import.address_limit = address_limit;
+        import.data_limit = data_limit;
+        import.external_address_bytes = 0;
+        import.external_data_bytes = 0;
+        model.import_image(
+            import,
+            rows.into_iter().map(|(range, protection, flags, backing)| {
+                carrick_core::mm::reservation::ImportedMapping {
+                    range,
+                    protection,
+                    flags,
+                    backing,
                 }
-            }
-            // Sealed with the exact charges of everything it does not hold:
-            // the guest venue decides against them from its first proposal.
-            let (address, data) = host.beyond(model)?;
-            model.set_external_charges(address, data);
-            model.finish_import()
-        })();
-        if result.is_err() && !model.is_admitted() {
-            // A failed import exposes no partial authority.
-            model.abort_import()?;
-        }
-        result
+            }),
+            |model| host.beyond(model),
+        )
     })?;
     mem.seal_delegated(root, &owned);
     mem.host_backing_leases

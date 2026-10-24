@@ -2207,3 +2207,11 @@ physical installation, ring exec adoption, or two running native processes.
 The HVF two-carrier COW-pool witness additionally checks exact mapping selection,
 retired-generation refusal and weak registration lifetime; Linux can compile
 that macOS-only fixture but cannot run it.
+
+The successor reservation-import witness rejects overlapping prepared mappings,
+returns the still-owned closed successor for retry, and leaves a peer's admitted
+root intact. Successful import issues the exact carrier/MM/incarnation handle
+but keeps the execution gate closed. The host admission adapter calls the same
+`Reservations::import_image` operation; its node-exhaustion witness verifies
+rollback returns nodes rather than confusing allocator high-water with live use.
+This still does not prove installed physical backing or exec commit.

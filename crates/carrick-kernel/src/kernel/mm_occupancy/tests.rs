@@ -1188,3 +1188,65 @@ fn retained_host_publication_obeys_switching_policy() {
     );
     assert!(backing.region().unwrap().zone.spaces.find(43_001).is_none());
 }
+
+#[test]
+fn successor_image_import_failure_keeps_old_root_and_success_stays_closed() {
+    let backing = Arc::new(RetainedPublicationFixture {
+        bytes: carrick_test_support::TestEl1Region::zeroed(),
+        carrier: std::num::NonZeroU64::new(95).unwrap(),
+        released: Arc::default(),
+    });
+    let prepare = |id| {
+        publish_closed_address_space_in(
+            backing.clone(),
+            mm(id),
+            &fence(),
+            0x20_000,
+            0x20_000,
+            0,
+            0,
+            ReservationRootPublication {
+                limits: ReservationLimits {
+                    address: u64::MAX,
+                    data: u64::MAX,
+                },
+                provider: None,
+            },
+        )
+        .unwrap()
+    };
+    let old = prepare(43_002);
+    let next = prepare(43_003);
+    let region = backing.region().unwrap();
+    let layout = carrick_personality_linux::mm::LinuxReservationLayout {
+        heap: carrick_el1_abi::ReservationRange::new(0x1000, 0x100000).unwrap(),
+        arena: carrick_el1_abi::ReservationRange::new(0x100000, 0x1000000).unwrap(),
+        brk: 0x1000,
+        address_limit: u64::MAX,
+        data_limit: u64::MAX,
+        external_address_bytes: 0,
+        external_data_bytes: 0,
+    };
+    let row = carrick_core::mm::reservation::ImportedMapping {
+        range: carrick_el1_abi::ReservationRange::new(0x200000, 0x204000).unwrap(),
+        protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
+        flags: carrick_el1_abi::ReservationNodeFlags::ANONYMOUS_PRIVATE,
+        backing: None,
+    };
+    let old = old.import_image(layout, [row]).ok().unwrap();
+    let old_handle = old.handle();
+    let (_, next) = next
+        .import_image(layout, [row, row])
+        .err()
+        .expect("overlapping image must fail");
+    assert_eq!(old.handle(), old_handle);
+    assert!(region.zone.spaces.find(43_002).is_some());
+    let next = next.import_image(layout, [row]).ok().unwrap();
+    assert_ne!(old_handle, next.handle());
+    assert_eq!(next.handle().carrier(), backing.carrier);
+    assert!(!region.zone.spaces.is_open(43_003));
+    drop(next);
+    assert!(region.zone.spaces.find(43_003).is_none());
+    assert!(region.zone.spaces.find(43_002).is_some());
+    drop(old);
+}
