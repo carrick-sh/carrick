@@ -885,8 +885,9 @@ impl HostIpc {
         self.region()
             .provision_descriptors(capacity, &HostLockWait)
             .map_err(|error| match error {
-                fd::storage::StorageError::Exhausted => AdmissionError::NoMemory,
-                fd::storage::StorageError::Invalid => AdmissionError::Shared(IpcError::BadStorage),
+                fd::storage::StorageError::Exhausted | fd::storage::StorageError::Invalid => {
+                    AdmissionError::NoMemory
+                }
                 fd::storage::StorageError::Contended => AdmissionError::Shared(IpcError::Contended),
             })
     }
