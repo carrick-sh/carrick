@@ -1797,3 +1797,11 @@ contracts = ["kernel.x86.file-region", "kernel.el1.fork-cow", "kernel.el1.mm-exc
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_retirement_tests.rs"
 contracts = ["process.native.terminal-child"]
+
+[[surfaces]]
+path = "crates/carrick-fd-core/src/exec.rs"
+contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/fd_exec.rs"
+contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable"]

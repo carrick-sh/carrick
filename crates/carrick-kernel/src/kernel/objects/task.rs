@@ -102,20 +102,6 @@ impl ThreadResources {
         ))
     }
 
-    pub(in crate::kernel) fn for_exec(
-        caller: &Self,
-        ids: &ObjectIdRegistry,
-    ) -> Result<Self, ObjectIdError> {
-        Ok(Self::new(
-            Arc::new(crate::kernel::FileTable::for_exec(
-                ids.file_table_id()?,
-                &caller.files,
-            )),
-            Arc::clone(&caller.fs_context),
-            Arc::clone(&caller.credentials),
-        ))
-    }
-
     pub fn files(&self) -> Arc<FileTable> {
         Arc::clone(&self.files)
     }
@@ -2167,6 +2153,13 @@ impl Task {
             .map(|(_, thread)| thread.runner_gate())
             .collect();
         ExecDrain::new(gates)
+    }
+
+    pub(in crate::kernel) fn owns_file_table(&self, files: &Arc<FileTable>) -> bool {
+        self.threads
+            .lock()
+            .values()
+            .any(|(_, thread)| Arc::ptr_eq(thread.resources().files_ref(), files))
     }
 
     pub(in crate::kernel) fn thread_keys(&self) -> Vec<ThreadKey> {
