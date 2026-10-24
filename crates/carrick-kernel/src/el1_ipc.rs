@@ -945,9 +945,9 @@ impl HostIpc {
         result.map_err(Into::into)
     }
     /// Reclaim only an extent returned by this region's destroy/grow operation.
-    pub(crate) fn reclaim_descriptors(&self, extent: fd::Extent) {
+    pub(crate) fn reclaim_descriptors(&self, mut extent: fd::Extent) {
         self.region()
-            .reclaim_descriptors(extent, &HostLockWait)
+            .reclaim_descriptors(&mut extent, &HostLockWait)
             .unwrap_or_else(|_| {
                 carrick_fatal::carrick_fatal!("ipc::table", "invalid descriptor extent return")
             });
