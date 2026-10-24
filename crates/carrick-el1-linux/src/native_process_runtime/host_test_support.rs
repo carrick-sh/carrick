@@ -1125,9 +1125,12 @@ impl NativeServiceCapacityFixture {
         ));
         assert!(matches!(
             entry
-                .begin_service(ServiceOperation::CarrierWork {
-                    entry: carrick_sched_core::object_wait::OwnerEntry::Syscall,
-                })
+                .begin_service(
+                    ServiceOperation::CarrierWork {
+                        entry: carrick_sched_core::object_wait::OwnerEntry::Syscall,
+                    },
+                    None
+                )
                 .unwrap(),
             NativeResume::Left(None)
         ));

@@ -79,3 +79,8 @@ The native service continuation envelope includes both fresh capture and
 resumption, the exact owner-entry borrow, park/completion, and notification
 allocation tails. The completed-work variant preserves the saved result;
 its carrier acknowledgment cannot replay an already completed syscall.
+
+Native owner waits include the direct service admission frame and both
+parking paths. Native backing replies additionally charge the retained
+service continuation, grant authentication and the descriptor executor,
+including its four table levels and allocation/notification tails.

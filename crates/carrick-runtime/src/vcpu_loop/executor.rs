@@ -197,6 +197,9 @@ where
             Some("executor post-create lifecycle panicked; exact lease failed closed".to_owned())
         }
     };
+    if let Some(error) = &failure {
+        crate::probes::hvpatch_executor_failure(executor_id.raw_for_probe(), error);
+    }
     if !startup_sent {
         let message = failure
             .clone()
@@ -1647,7 +1650,7 @@ fn next_runnable<F: PersistentExecutor>(
                 GuestIdleExit::Idle => return Ok(None),
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 GuestIdleExit::Service(service) => {
-                    backend::finish_native_service(service, scheduler.kernel())
+                    backend::finish_native_service(*service, scheduler.kernel())
                         .map_err(|error| NextError::Fatal(error.to_string()))?;
                     return Ok(None);
                 }
@@ -1758,7 +1761,7 @@ fn next_runnable<F: PersistentExecutor>(
         GuestIdleExit::Idle => Ok(None),
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         GuestIdleExit::Service(service) => {
-            backend::finish_native_service(service, scheduler.kernel())
+            backend::finish_native_service(*service, scheduler.kernel())
                 .map_err(|error| NextError::Fatal(error.to_string()))?;
             Ok(None)
         }

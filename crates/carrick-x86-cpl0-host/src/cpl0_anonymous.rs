@@ -10,6 +10,7 @@ use carrick_hal::guest_arch_binding::{
     GuestArchBinding,
     core_arch::{ExecutionGeneration, TaskIdentity, TaskSerial},
 };
+use carrick_hal::{FrameEventCapacity, FrameInventoryEvent};
 use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorOp as WireOp, DescriptorTxn as WireTxn, TableGrants,
 };
@@ -1428,11 +1429,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 .ok_or_else(|| fail("owner COW GPA exhausted"))?,
         );
         let (mut inventory, _) = InitialInventory::stage(
+            Arc::clone(&self.initial_rollback_fault),
             Arc::clone(&self.frame_inventory),
             [gpa],
             0,
             size,
-            NonZeroU64::MIN,
             execution.context.into(),
         )?;
         let backing = inventory
@@ -1726,13 +1727,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 .ok_or_else(|| fail("owner grant GPA exhausted"))?,
         );
         let (mut inventory, grants) = InitialInventory::stage(
+            Arc::clone(&self.initial_rollback_fault),
             Arc::clone(&self.frame_inventory),
             [gpa],
             0,
             len,
-            // A newly allocated physical mapping starts at generation one;
-            // the guest operation sequence belongs to the descriptor txn.
-            NonZeroU64::MIN,
             execution.context.into(),
         )?;
         let identity = inventory

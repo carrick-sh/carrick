@@ -34143,7 +34143,7 @@
     {
       "family": "k1_mapping_ring",
       "operation": "read_for_io",
-      "owner": "carrick_kernel::dispatch::mem::backing::MemView<'a>::snapshot_private_mmap_description",
+      "owner": "carrick_kernel::dispatch::mem::backing::snapshot_private_mmap_description",
       "lane": "shared",
       "ceiling": 1
     },

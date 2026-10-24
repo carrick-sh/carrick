@@ -642,7 +642,11 @@ pub fn dispatch_irq(frame: &mut TrapFrame, counters: &Counters) -> Action {
 }
 
 /// Unified entry dispatch (interrupts, lower-EL data aborts, and syscalls).
-pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
+pub fn dispatch_entry(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
+) -> Action {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     if matches!(frame.esr, 0xfffc..=0xfffe) {
         return arm_signal_user_return(frame);
@@ -650,7 +654,7 @@ pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
     let action = if frame.esr == 0 {
         dispatch_irq(frame, counters)
     } else if matches!((frame.esr >> 26) & 0x3f, 0x20 | 0x24) {
-        dispatch_fault(frame, counters)
+        dispatch_fault(frame, counters, owner_wait)
     } else {
         dispatch_syscall(frame, counters)
     };
@@ -665,9 +669,13 @@ pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
 
 /// Capture only after the final descriptor drain has selected its boundary.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-pub fn capture_native_service_exit(frame: &mut TrapFrame, action: Action) -> Action {
+pub fn capture_native_service_exit(
+    frame: &mut TrapFrame,
+    action: Action,
+    wait: Option<carrick_core_abi::PortalOwnerWait>,
+) -> Action {
     if matches!(action, Action::Forward | Action::ServedWithWork)
-        && let Some(owned) = arm_native_service_exit(frame, action)
+        && let Some(owned) = arm_native_service_exit(frame, action, wait)
     {
         return owned;
     }
@@ -737,7 +745,11 @@ pub(super) fn native_service_operation(
 /// The host receives a selector only after this continuation has parked.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
-fn arm_native_service_exit(frame: &mut TrapFrame, action: Action) -> Option<Action> {
+fn arm_native_service_exit(
+    frame: &mut TrapFrame,
+    action: Action,
+    wait: Option<carrick_core_abi::PortalOwnerWait>,
+) -> Option<Action> {
     use super::native_process_runtime::NativeResume;
     use carrick_personality_linux::lifecycle::ProcessNative;
     let task = carrick_el1_abi::current_task_guest(frame.slot as usize)?;
@@ -749,6 +761,20 @@ fn arm_native_service_exit(frame: &mut TrapFrame, action: Action) -> Option<Acti
     }
     let (page, control) = task.lifecycle_refs()?;
     let operation = native_service_operation(frame, &task.linux, action)?;
+    // This CPU still exclusively owns its portal slot. Bind its selection
+    // before park, so even a delayed first intake cannot steal a successor.
+    let fault_sequence =
+        if let carrick_core_abi::service::ServiceOperation::Fault(fault) = operation {
+            // SAFETY: fixed initialized ABI region of this carrier.
+            let portal = unsafe {
+                &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
+            };
+            portal
+                .grant(frame.slot as usize)?
+                .native_fault_sequence(task.mm.key.load(Ordering::Acquire), fault.address.raw())
+        } else {
+            None
+        };
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
     sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
@@ -762,7 +788,11 @@ fn arm_native_service_exit(frame: &mut TrapFrame, action: Action) -> Option<Acti
         control,
         &mut service,
         |process| {
-            let result = process.begin_service(operation)?;
+            let result = if let Some(wait) = wait {
+                process.begin_owner_service_wait(operation, wait)?
+            } else {
+                process.begin_service(operation, fault_sequence)?
+            };
             if matches!(result, NativeResume::Left(_)) && process.take_handoff_receipt().is_none() {
                 return Err(super::native_process_runtime::NativeProcessError::Quarantined);
             }
@@ -2821,7 +2851,7 @@ mod tests {
             ..TrapFrame::default()
         };
 
-        let action = dispatch_entry(&mut frame, &counters);
+        let action = dispatch_entry(&mut frame, &counters, &mut None);
         assert_eq!(action, Action::Forward);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
         // Arbitrary x8 is not treated as a syscall
@@ -2837,7 +2867,10 @@ mod tests {
             far: 0x6000_1000,
             ..TrapFrame::default()
         };
-        assert_eq!(dispatch_entry(&mut frame, &counters), Action::Forward);
+        assert_eq!(
+            dispatch_entry(&mut frame, &counters, &mut None),
+            Action::Forward
+        );
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
     }
 
@@ -2849,7 +2882,7 @@ mod tests {
             ..TrapFrame::default()
         };
 
-        let action = dispatch_entry(&mut frame, &counters);
+        let action = dispatch_entry(&mut frame, &counters, &mut None);
         assert_eq!(action, Action::Forward);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
     }
@@ -2868,7 +2901,7 @@ mod tests {
             ..TrapFrame::default()
         };
 
-        let action = dispatch_entry(&mut frame, &counters);
+        let action = dispatch_entry(&mut frame, &counters, &mut None);
         assert_eq!(action, Action::Served);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
         assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 0);

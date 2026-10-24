@@ -5,7 +5,9 @@ use carrick_core_abi::service::{ServiceError, ServiceOperation, ServiceRequest, 
 use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
 
 pub(super) struct PendingService<'a> {
+    reply: Option<Box<carrick_el1_abi::PortalGrantSlot>>,
     request: ServiceRequest,
+    pub(super) wait: Option<carrick_core_abi::PortalOwnerWait>,
     claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
     control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
 }
@@ -46,11 +48,54 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .service
             .cancel(request.identity)
             .map_err(service_error)?;
+        let wait = self
+            .graph
+            .lock()
+            .service_wait(&record)
+            .and_then(|pending| pending.wait);
         let mut effects = WakeEffects::default();
-        guard
-            .notify_object(slot, &mut effects)
-            .map_err(|_| NativeProcessError::Quarantined)?;
-        drop(guard);
+        if let Some(wait) = wait {
+            drop(guard);
+            let enrollment = carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
+                self.zone,
+                request.identity.birth.mm,
+                wait,
+            )
+            .map_err(|_| NativeProcessError::Stale)?;
+            let completion =
+                |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>| {
+                    crate::sched::object_wait::deliver_completion(self.zone, slot, owned);
+                };
+            let queue = self
+                .zone
+                .object_wait_with_completion(
+                    enrollment.key(),
+                    &carrick_sched_core::ShortLockSpin,
+                    &completion,
+                )
+                .map_err(|_| NativeProcessError::Stale)?;
+            // Recheck after queue admission: a completed wait may already have
+            // moved to its successor. Cancellation remains sticky in the cell.
+            if self
+                .graph
+                .lock()
+                .service_wait(&record)
+                .is_some_and(|pending| pending.request == request && pending.wait == Some(wait))
+            {
+                let operation = OperationToken::new(
+                    u64::from(record.id.raw()),
+                    request.identity.sequence.get(),
+                )
+                .ok_or(NativeProcessError::Stale)?;
+                queue.wake_owner_operation(record, &operation, slot, &mut effects);
+            }
+            drop(queue);
+        } else {
+            guard
+                .notify_object(slot, &mut effects)
+                .map_err(|_| NativeProcessError::Quarantined)?;
+            drop(guard);
+        }
         service.wake_effects(effects);
         Ok(())
     }
@@ -89,6 +134,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn begin_service(
         &mut self,
         operation: ServiceOperation,
+        fault_sequence: Option<core::num::NonZeroU64>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        self.begin_service_inner(operation, fault_sequence, None)
+    }
+    /// Park the exact ring operation on the producer observed before its
+    /// failed admission. No physical service notice is published.
+    pub fn begin_owner_service_wait(
+        &mut self,
+        operation: ServiceOperation,
+        wait: carrick_core_abi::PortalOwnerWait,
+    ) -> Result<NativeResume, NativeProcessError> {
+        self.begin_service_inner(operation, None, Some(wait))
+    }
+    #[inline(never)]
+    fn begin_service_inner(
+        &mut self,
+        operation: ServiceOperation,
+        fault_sequence: Option<core::num::NonZeroU64>,
+        owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
     ) -> Result<NativeResume, NativeProcessError> {
         let (page, control) = {
             let graph = self.runtime.graph.lock();
@@ -115,22 +179,55 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .service
             .bound_birth(self.key, self.binding.thread_generation, self.record)
             .map_err(service_error)?;
+        let reply = if matches!(operation, ServiceOperation::Fault(fault) if !fault.present)
+            && fault_sequence.is_some()
+        {
+            Some(FallibleBox::<carrick_el1_abi::PortalGrantSlot>::try_reserve()?.zeroed())
+        } else {
+            None
+        };
+        let owner_queue = owner_wait
+            .map(|_| {
+                let key =
+                    ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
+                self.source
+                    .zone
+                    .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                    .map_err(|_| NativeProcessError::Stale)
+            })
+            .transpose()?;
         let claim = carrick_core::terminal::NativeServiceClaim::acquire(page)
             .map_err(|_| NativeProcessError::Busy)?;
         let published = {
             let graph = self.runtime.graph.lock();
             if !claim.admitted() || graph.has_member_wait(&self.record) {
                 Err(NativeProcessError::Busy)
+            } else if let Some(wait) = owner_wait {
+                self.control
+                    .service
+                    .begin_owner_wait(birth, self.binding.generation, operation, wait)
+                    .map_err(service_error)
             } else {
                 self.control
                     .service
-                    .publish(birth, self.binding.generation, operation)
+                    .publish_with_reply(
+                        birth,
+                        self.binding.generation,
+                        operation,
+                        fault_sequence,
+                        reply.as_ref().map(|slot| {
+                            carrick_guest_arch::KernelVa::new(
+                                core::ptr::from_ref(&**slot).addr() as u64
+                            )
+                        }),
+                    )
                     .map_err(service_error)
             }
         };
         let request = match published {
             Ok(request) => request,
             Err(error) => {
+                drop(owner_queue);
                 self.release_service_claim(claim)?;
                 return Err(error);
             }
@@ -138,11 +235,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.runtime.graph.lock().insert_member_wait(
             self.record,
             MemberWait::Service(PendingService {
+                reply,
                 request,
+                wait: owner_wait,
                 claim,
                 control,
             }),
         );
+        drop(owner_queue);
+        if let Some(wait) = owner_wait {
+            return self.park_owner_wait(request, wait);
+        }
         if let Err(error) = self
             .current
             .service_notice
@@ -203,6 +306,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             ServiceOperation::CarrierWork { entry } => entry,
         };
         let mut completion = None;
+        let mut completed_pending = None;
         let mut failure = None;
         let parked = carrick_core::wait::park_object_record(
             zone,
@@ -219,6 +323,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 match self.control.service.consume(request.identity) {
                     Ok(result) => {
+                        if let ServiceResult::Wait(wait) = result {
+                            let mut graph = self.runtime.graph.lock();
+                            let Some(pending) = graph.service_wait_mut(&self.record) else {
+                                failure = Some(NativeProcessError::Stale);
+                                return Err(ObjectWaitError::Stale);
+                            };
+                            pending.wait = Some(wait);
+                        } else {
+                            completed_pending =
+                                self.runtime.graph.lock().remove_service_wait(&self.record);
+                        }
                         completion = Some(result);
                         return Err(ObjectWaitError::Changed);
                     }
@@ -239,7 +354,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Err(error);
         }
         if let Some(result) = completion {
-            return self.finish_service(request, result);
+            return match result {
+                ServiceResult::Wait(wait) => self.park_owner_wait(request, wait),
+                _ => self.finish_service(
+                    request,
+                    result,
+                    completed_pending.ok_or(NativeProcessError::Stale)?,
+                ),
+            };
         }
         let mut parked = parked.map_err(|_| NativeProcessError::Quarantined)?;
         self.handoff = parked.take_receipt();
@@ -264,21 +386,116 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     && token.generation() == request.identity.sequence.get() => {}
             _ => return Some(Err(NativeProcessError::Stale)),
         }
-        Some(self.park_service(request))
+        let wait = self
+            .runtime
+            .graph
+            .lock()
+            .service_wait(&self.record)
+            .and_then(|pending| pending.wait);
+        Some(if wait.is_some() {
+            self.finish_owner_wait(request)
+        } else {
+            self.park_service(request)
+        })
     }
 
     #[inline(never)]
-    fn finish_service(
+    fn park_owner_wait(
         &mut self,
         request: ServiceRequest,
-        result: ServiceResult,
+        wait: carrick_core_abi::PortalOwnerWait,
     ) -> Result<NativeResume, NativeProcessError> {
+        use carrick_sched_core::object_wait::ObjectWaitError;
+        let zone = self.source.zone;
+        let enrollment = carrick_core_abi::wait::PortalWaitEnrollment::for_owner(
+            zone,
+            request.identity.birth.mm,
+            wait,
+        )
+        .map_err(|_| NativeProcessError::Stale)?;
+        let operation = OperationToken::new(
+            u64::from(self.record.id.raw()),
+            request.identity.sequence.get(),
+        )
+        .ok_or(NativeProcessError::Stale)?;
+        let parked = carrick_core::wait::park_object_record(
+            zone,
+            self.source.slot,
+            enrollment.owner_request(operation),
+            &|owned| {
+                crate::sched::object_wait::deliver_completion(zone, self.source.slot, owned);
+            },
+            || {
+                // MM queue -> service queue is the only nested queue order.
+                let key =
+                    ObjectWaitKey::native_service(self.record).ok_or(ObjectWaitError::Stale)?;
+                let _queue = zone.object_wait(key, &carrick_sched_core::ShortLockSpin)?;
+                if self.signal_interrupts_current()
+                    || self.runtime.graph.lock().pending.has_exit(&self.key)
+                {
+                    self.control
+                        .service
+                        .cancel(request.identity)
+                        .map_err(|_| ObjectWaitError::Stale)?;
+                }
+                if !enrollment.is_live()
+                    || self
+                        .control
+                        .service
+                        .owner_wait_cancelled(request.identity)
+                        .map_err(|_| ObjectWaitError::Stale)?
+                {
+                    return Err(ObjectWaitError::Changed);
+                }
+                // SAFETY: this slot owns the admitted native record and saved context.
+                unsafe {
+                    *zone.record(self.record.id).ctx_mut() = *self.words;
+                }
+                Ok((self.record.id, false))
+            },
+        );
+        match parked {
+            Ok(mut parked) => {
+                self.handoff = parked.take_receipt();
+                Ok(NativeResume::Left(None))
+            }
+            Err((ObjectWaitError::Changed, _)) => self.finish_owner_wait(request),
+            Err(_) => Err(NativeProcessError::Quarantined),
+        }
+    }
+    fn finish_owner_wait(
+        &mut self,
+        request: ServiceRequest,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let key = ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
+        let queue = self
+            .source
+            .zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| NativeProcessError::Stale)?;
+        let result = self
+            .control
+            .service
+            .finish_owner_wait(request.identity)
+            .map_err(service_error)?;
+        // Remove the phase under the service queue before cancellation observes IDLE.
         let pending = self
             .runtime
             .graph
             .lock()
             .remove_service_wait(&self.record)
             .ok_or(NativeProcessError::Stale)?;
+        drop(queue);
+        self.finish_service(request, result, pending)
+    }
+
+    #[inline(never)]
+    fn finish_service(
+        &mut self,
+        request: ServiceRequest,
+        mut result: ServiceResult,
+        mut pending: PendingService<'a>,
+    ) -> Result<NativeResume, NativeProcessError> {
         if pending.request != request {
             return Err(NativeProcessError::Quarantined);
         }
@@ -298,6 +515,41 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.release_service_claim(pending.claim)?;
             return Ok(NativeResume::NoPending);
         }
+        if result == ServiceResult::Supplied
+            && let Some(reply) = &pending.reply
+        {
+            match self.service.apply_fault_reply(reply) {
+                Ok(()) => {}
+                Err(carrick_core::mm::transaction::MmError::Wait(wait)) => {
+                    let key = ObjectWaitKey::native_service(self.record)
+                        .ok_or(NativeProcessError::Stale)?;
+                    let queue = self
+                        .source
+                        .zone
+                        .object_wait(key, &carrick_sched_core::ShortLockSpin)
+                        .map_err(|_| NativeProcessError::Stale)?;
+                    let next = self
+                        .control
+                        .service
+                        .begin_owner_wait(
+                            request.identity.birth,
+                            self.binding.generation,
+                            request.operation,
+                            wait,
+                        )
+                        .map_err(service_error)?;
+                    pending.request = next;
+                    pending.wait = Some(wait);
+                    self.runtime
+                        .graph
+                        .lock()
+                        .insert_member_wait(self.record, MemberWait::Service(pending));
+                    drop(queue);
+                    return self.park_owner_wait(next, wait);
+                }
+                Err(_) => result = ServiceResult::Refused,
+            }
+        }
         // SAFETY: completion belongs to this exact selected record.
         unsafe {
             self.source
@@ -306,6 +558,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .consume_owner_continuation();
         }
         let completed = (|| match (request.operation, result) {
+            (_, ServiceResult::Wait(_)) => Err(NativeProcessError::Quarantined),
             (
                 ServiceOperation::CarrierWork { .. },
                 ServiceResult::Supplied | ServiceResult::Cancelled,
@@ -328,6 +581,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 )))
             }
             (ServiceOperation::Fault(_), ServiceResult::Cancelled) => Ok(NativeResume::NoPending),
+            (ServiceOperation::Fault(fault), ServiceResult::BackingFault) => {
+                self.force_fault_info(
+                    carrick_signal_core::policy::Signal::BUS,
+                    carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                        carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+                    ),
+                    carrick_syscall_abi::LinuxSiginfo {
+                        si_code: carrick_syscall_abi::LINUX_BUS_ADRERR,
+                        si_addr: fault.address.raw(),
+                        ..carrick_syscall_abi::LinuxSiginfo::empty()
+                    },
+                )
+                .map_err(|_| NativeProcessError::Fault)?;
+                Ok(NativeResume::NoPending)
+            }
+            (_, ServiceResult::BackingFault) => Err(NativeProcessError::Quarantined),
             (ServiceOperation::Fault(fault), ServiceResult::Refused) => {
                 self.force_sigsegv_info(
                     carrick_signal_core::policy::SigBlockMask::blocking_all_of(

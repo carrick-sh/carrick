@@ -38,13 +38,32 @@
  * - carrick*:::hvpatch-executor-load-failure args: thread serial u64,
  *   execution generation u64, executor u32, error C string. Source-qualified;
  *   a capture must see this row before attributing a backend load refusal.
+ * - carrick*:::hvpatch-executor-failure args: executor u32, error C string.
+ *   Source-qualified; covers the whole worker lifecycle, including native
+ *   service on idle executors without a host task binding.
+ *   Live-qualified on cloudmac 2026-10-23: executor 4 reports a fresh
+ *   inventory mapping with generation 5 where the owner requires 1, after
+ *   reason-6 settlement of the root's zone continuation (detail 14).
+ * - carrick*:::trace-witness-exit args: external launcher's raw wait status.
+ *   Ends captures of scripts/test-signed.sh after its scoped cleanup.
+ * - carrick*:::hvpatch-native-crossing-refused args: MM, MM incarnation,
+ *   record id, service sequence, native ordinal. Source-qualified; distinguishes
+ *   a ring-owned refusal from a failing host executor.
+ * - carrick*:::hvpatch-native-fault-supply args: MM, sequence, phase, fault
+ *   page, selected length. Phases: 0 COW, 1 backing, 2 supplied, 3 refused,
+ *   4 owner wait, 5 backing fault, 6 no selected supply window. Completion
+ *   rows have zero page/length; unselected requests have zero length.
  *
  * PERTURBATION: LOW — only the selected syscalls and lifecycle edges print;
  * the sched_yield storm the reproducer generates is not instrumented.
+ * Native refusals print only their first eight rows per MM/ordinal and
+ * aggregate the full count; refusal-loop captures are not timing evidence.
  * A reason-6 settlement also captures its host stack, so an unexpected
  * executor-failure retirement can be attributed to its actual caller.
- * Zero lifecycle events makes the capture fail closed (exit 1). A target
- * still alive at 120 seconds makes the capture fail closed (exit 2).
+ * Zero lifecycle events makes the capture fail closed (exit 1). Bound guest
+ * execution at 120 seconds from first lifecycle event, with a separate 300s
+ * startup bound for the signed launcher's build and signing. This does not
+ * change the signed test's own deadline. Provider errors fail the capture.
  */
 
 #pragma D option quiet
@@ -54,12 +73,15 @@ dtrace:::BEGIN
 {
     started = timestamp;
     lifecycle = 0;
+    guest_started = 0;
+    errors = 0;
 }
 
 carrick*:::hvpatch-guest-lifecycle
 /pid == $target || progenyof($target)/
 {
     lifecycle++;
+    guest_started = guest_started == 0 ? timestamp : guest_started;
     printf("%12d host_tid=%d lifecycle phase=%d pid=%d ppid=%d tid=%d asid=%d\n",
         timestamp - started, tid, arg0, arg1, arg2, arg3, arg4);
 }
@@ -92,6 +114,44 @@ carrick*:::hvpatch-exec-runtime-stage
         timestamp - started, tid, arg0, arg1, arg2, arg3);
 }
 
+carrick*:::hvpatch-executor-failure
+/pid == $target || progenyof($target)/
+{
+    printf("%12d host_tid=%d executor-failure executor=%d error=%s\n",
+        timestamp - started, tid, arg0, copyinstr(arg1));
+    ustack(32);
+}
+
+carrick*:::hvpatch-native-crossing-refused
+/pid == $target || progenyof($target)/
+{
+    @refusals[arg0, arg4] = count();
+    refusal_rows[arg0, arg4]++;
+}
+
+carrick*:::hvpatch-native-crossing-refused
+/(pid == $target || progenyof($target)) && refusal_rows[arg0, arg4] <= 8/
+{
+    printf("%12d host_tid=%d native-crossing-refused mm=%d incarnation=%d record=%d sequence=%d ordinal=%d\n",
+        timestamp - started, tid, arg0, arg1, arg2, arg3, arg4);
+}
+
+dtrace:::ERROR { errors++; }
+
+carrick*:::hvpatch-native-fault-supply
+/pid == $target || progenyof($target)/
+{
+    @faults[arg0, arg2, arg3] = count();
+    fault_rows[arg0, arg2]++;
+}
+
+carrick*:::hvpatch-native-fault-supply
+/(pid == $target || progenyof($target)) && fault_rows[arg0, arg2] <= 8/
+{
+    printf("%12d host_tid=%d native-fault mm=%d sequence=%d phase=%d page=0x%x length=%d\n",
+        timestamp - started, tid, arg0, arg1, arg2, arg3, arg4);
+}
+
 carrick*:::hvpatch-syscall-service-begin
 /(pid == $target || progenyof($target)) && (arg3 == 221 || arg3 == 93 || arg3 == 94)/
 {
@@ -110,12 +170,27 @@ proc:::exit
 /pid == $target/
 {
     printf("%12d target-exit\n", timestamp - started);
-    exit(lifecycle == 0 ? 1 : 0);
+    exit(lifecycle == 0 || errors != 0 ? 1 : 0);
+}
+
+carrick*:::trace-witness-exit
+/pid == $target/
+{
+    printf("%12d witness-exit wait_status=%d\n", timestamp - started, arg0);
+    exit(lifecycle == 0 || errors != 0 ? 1 : 0);
 }
 
 tick-1s
-/timestamp - started >= 120 * 1000000000/
+/(guest_started != 0 && timestamp - guest_started >= 120ULL * 1000000000ULL) ||
+ (guest_started == 0 && timestamp - started >= 300ULL * 1000000000ULL)/
 {
     printf("terminal-trace timeout\n");
     exit(2);
+}
+
+END
+{
+    printa("native-crossing-refused-total mm=%d ordinal=%d count=%@d\n", @refusals);
+    printa("native-fault-total mm=%d phase=%d page=0x%x count=%@d\n", @faults);
+    printf("terminal-trace end lifecycle=%d errors=%d\n", lifecycle, errors);
 }

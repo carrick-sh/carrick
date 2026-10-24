@@ -20,6 +20,13 @@ pub struct ServiceIdentity {
     pub execution: SnapshotGeneration,
     pub sequence: NonZeroU64,
 }
+/// Physical demand selected by the ring; mapping policy stays with the owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceFaultSupply {
+    Cow(crate::PortalGrantWindow),
+    Backing(crate::PortalGrantWindow),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceOperation {
     Fault(FaultInfo),
@@ -35,12 +42,16 @@ pub enum ServiceOperation {
 pub struct ServiceRequest {
     pub identity: ServiceIdentity,
     pub operation: ServiceOperation,
+    /// Exact ring-selected portal operation, captured before releasing the lane.
+    pub fault_sequence: Option<NonZeroU64>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceResult {
+    BackingFault,
     Supplied,
     Refused,
     Cancelled,
+    Wait(crate::PortalOwnerWait),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceError {
@@ -49,7 +60,7 @@ pub enum ServiceError {
     Exhausted,
 }
 
-pub const NATIVE_SERVICE_PROTOCOL: u64 = 1;
+pub const NATIVE_SERVICE_PROTOCOL: u64 = 4;
 
 /// Transport selector only: authority remains in the member's retained cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,6 +153,8 @@ const CANCEL_REQUESTED: u64 = 5;
 const COMPLETED: u64 = 6;
 const CANCELLED: u64 = 7;
 const CANCEL_QUEUED: u64 = 8;
+const OWNED_WAIT: u64 = 9;
+const WAIT_CANCELLED: u64 = 10;
 
 /// A member owns this cell, not the execution slot. Its enclosing allocation
 /// and semantic MM claim must remain retained through acknowledgment. All
@@ -153,6 +166,7 @@ pub struct ServiceCell {
     sequence: AtomicU64,
     words: [AtomicU64; 12],
     result: AtomicU64,
+    wait_revision: AtomicU64,
 }
 impl ServiceCell {
     pub const fn new() -> Self {
@@ -161,6 +175,7 @@ impl ServiceCell {
             sequence: AtomicU64::new(0),
             words: [const { AtomicU64::new(0) }; 12],
             result: AtomicU64::new(0),
+            wait_revision: AtomicU64::new(0),
         }
     }
     // Binding/publication must use authenticated lifecycle and admitted-MM
@@ -237,6 +252,27 @@ impl ServiceCell {
         birth
     }
 
+    /// Recover the birth MM for a currently executing, exact member. This
+    /// does not probe the reservation root whose contention is being handled.
+    pub fn bound_mm(
+        &self,
+        record: RecordRef,
+        thread: EntryThreadGeneration,
+    ) -> Result<El1MmHandle, ServiceError> {
+        let id = i32::try_from(self.words[1].load(Ordering::Acquire))
+            .ok()
+            .and_then(core::num::NonZeroI32::new)
+            .ok_or(ServiceError::Stale)?;
+        let serial =
+            NonZeroU64::new(self.words[2].load(Ordering::Acquire)).ok_or(ServiceError::Stale)?;
+        let process = TaskKey {
+            id: carrick_sched_core::process::TaskId::from_registry_allocation(id),
+            serial: carrick_sched_core::process::TaskSerial::from_registry_allocation(serial),
+        };
+        self.bound_birth(process, thread, record)
+            .map(|birth| birth.mm)
+    }
+
     /// Caller holds the member reset reservation. An outstanding request
     /// refuses reset even if a physical metadata pin keeps its bytes mapped.
     pub fn reset_unpublished(&self) -> Result<(), ServiceError> {
@@ -254,11 +290,31 @@ impl ServiceCell {
         birth: ServiceBirth,
         execution: SnapshotGeneration,
         operation: ServiceOperation,
+        fault_sequence: Option<NonZeroU64>,
+    ) -> Result<ServiceRequest, ServiceError> {
+        self.publish_with_reply(birth, execution, operation, fault_sequence, None)
+    }
+    /// Reply storage belongs to the ring continuation through service ACK.
+    /// The transport authenticates its retained allocation before accessing it.
+    pub fn publish_with_reply(
+        &self,
+        birth: ServiceBirth,
+        execution: SnapshotGeneration,
+        operation: ServiceOperation,
+        fault_sequence: Option<NonZeroU64>,
+        reply: Option<carrick_guest_arch::KernelVa>,
     ) -> Result<ServiceRequest, ServiceError> {
         self.state
             .compare_exchange(IDLE, WRITING, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| ServiceError::Busy)?;
-        if !execution.issued() || !self.same_birth(birth) {
+        if !execution.issued()
+            || !self.same_birth(birth)
+            || (fault_sequence.is_some() && !matches!(operation, ServiceOperation::Fault(_)))
+            || (reply.is_some()
+                && (fault_sequence.is_none()
+                    || !matches!(operation, ServiceOperation::Fault(fault) if !fault.present)))
+            || reply.is_some_and(|address| address.raw() == 0)
+        {
             self.state.store(IDLE, Ordering::Release);
             return Err(ServiceError::Stale);
         }
@@ -281,6 +337,12 @@ impl ServiceCell {
         for (index, value) in [(8, execution.raw()), (9, kind), (10, first), (11, second)] {
             self.words[index].store(value, Ordering::Relaxed);
         }
+        // The request stamp and completion result occupy disjoint protocol
+        // phases. Claim copies the stamp before acknowledgment writes a result.
+        self.result
+            .store(fault_sequence.map_or(0, NonZeroU64::get), Ordering::Relaxed);
+        self.wait_revision
+            .store(reply.map_or(0, |address| address.raw()), Ordering::Relaxed);
         self.sequence.store(next.get(), Ordering::Relaxed);
         self.state.store(REQUESTED, Ordering::Release);
         Ok(ServiceRequest {
@@ -290,6 +352,7 @@ impl ServiceCell {
                 sequence: next,
             },
             operation,
+            fault_sequence,
         })
     }
     #[inline(never)]
@@ -394,9 +457,14 @@ impl ServiceCell {
                 }
                 _ => return Err(ServiceError::Stale),
             };
+            let fault_sequence = NonZeroU64::new(cell.result.load(Ordering::Relaxed));
+            if fault_sequence.is_some() && !matches!(operation, ServiceOperation::Fault(_)) {
+                return Err(ServiceError::Stale);
+            }
             Ok(ServiceRequest {
                 identity,
                 operation,
+                fault_sequence,
             })
         })();
         match decoded {
@@ -410,8 +478,11 @@ impl ServiceCell {
                     Ordering::Release,
                 );
                 Ok(ServiceTicket {
+                    reply: NonZeroU64::new(cell.wait_revision.load(Ordering::Relaxed))
+                        .map(|address| carrick_guest_arch::KernelVa::new(address.get())),
                     cell: core::mem::ManuallyDrop::new(pin),
                     request,
+                    selection_taken: false,
                 })
             }
             Err(error) => {
@@ -456,7 +527,10 @@ impl ServiceCell {
                     && cell.words[11].load(Ordering::Relaxed) == 0
             }
         };
-        if !operation_matches {
+        if !operation_matches
+            || cell.result.load(Ordering::Relaxed)
+                != request.fault_sequence.map_or(0, NonZeroU64::get)
+        {
             cell.state.store(state, Ordering::Release);
             return Err(ServiceError::Stale);
         }
@@ -469,8 +543,11 @@ impl ServiceCell {
             Ordering::Release,
         );
         Ok(ServiceTicket {
+            reply: NonZeroU64::new(cell.wait_revision.load(Ordering::Relaxed))
+                .map(|address| carrick_guest_arch::KernelVa::new(address.get())),
             cell: core::mem::ManuallyDrop::new(pin),
             request,
+            selection_taken: false,
         })
     }
     /// Return true only when no host operation remains. Cancellation of an
@@ -484,6 +561,11 @@ impl ServiceCell {
                 // that acknowledged sequence between those steps.
                 self.lock_exact(IDLE, identity)?;
                 self.state.store(IDLE, Ordering::Release);
+                Ok(true)
+            }
+            OWNED_WAIT | WAIT_CANCELLED => {
+                self.lock_exact(state, identity)?;
+                self.state.store(WAIT_CANCELLED, Ordering::Release);
                 Ok(true)
             }
             REQUESTED | CANCEL_QUEUED | SERVICING | CANCEL_REQUESTED | COMPLETED | CANCELLED => {
@@ -529,13 +611,82 @@ impl ServiceCell {
         self.lock_exact(state, identity)?;
         let result = if state == CANCELLED {
             ServiceResult::Cancelled
+        } else if self.result.load(Ordering::Relaxed) == 16 {
+            ServiceResult::BackingFault
         } else if self.result.load(Ordering::Relaxed) == 1 {
             ServiceResult::Supplied
+        } else if let Some(cause) =
+            crate::PortalWaitCause::decode(self.result.load(Ordering::Relaxed).saturating_sub(2))
+        {
+            // SAFETY: complete_wait checked the retained exact MM identity;
+            // the service ticket supplies its pre-probe resource revision.
+            ServiceResult::Wait(unsafe {
+                crate::PortalOwnerWait::from_owner(
+                    identity.birth.mm,
+                    cause,
+                    self.wait_revision.load(Ordering::Relaxed),
+                )
+            })
         } else {
             ServiceResult::Refused
         };
-        self.state.store(IDLE, Ordering::Release);
+        self.state.store(
+            if matches!(result, ServiceResult::Wait(_)) {
+                OWNED_WAIT
+            } else {
+                IDLE
+            },
+            Ordering::Release,
+        );
         Ok(result)
+    }
+    /// Reserve a ring-owned resource wait without publishing external work.
+    /// Caller holds the member service queue across request/phase publication.
+    pub fn begin_owner_wait(
+        &self,
+        birth: ServiceBirth,
+        execution: SnapshotGeneration,
+        operation: ServiceOperation,
+        wait: crate::PortalOwnerWait,
+    ) -> Result<ServiceRequest, ServiceError> {
+        if wait.handle() != birth.mm {
+            return Err(ServiceError::Stale);
+        }
+        let request = self.publish(birth, execution, operation, None)?;
+        self.lock_exact(REQUESTED, request.identity)?;
+        self.result
+            .store(2 + wait.cause().encode(), Ordering::Relaxed);
+        self.wait_revision.store(wait.revision(), Ordering::Relaxed);
+        self.state.store(OWNED_WAIT, Ordering::Release);
+        Ok(request)
+    }
+    /// Inspect sticky cancellation under the stable member service queue.
+    pub fn owner_wait_cancelled(&self, identity: ServiceIdentity) -> Result<bool, ServiceError> {
+        let state = self.state.load(Ordering::Acquire);
+        if !matches!(state, OWNED_WAIT | WAIT_CANCELLED) {
+            return Err(ServiceError::Busy);
+        }
+        self.lock_exact(state, identity)?;
+        self.state.store(state, Ordering::Release);
+        Ok(state == WAIT_CANCELLED)
+    }
+    /// Consume the one owner wait after its producer edge or cancellation.
+    /// No external ticket or second acknowledgment exists for this phase.
+    pub fn finish_owner_wait(
+        &self,
+        identity: ServiceIdentity,
+    ) -> Result<ServiceResult, ServiceError> {
+        let state = self.state.load(Ordering::Acquire);
+        if !matches!(state, OWNED_WAIT | WAIT_CANCELLED) {
+            return Err(ServiceError::Busy);
+        }
+        self.lock_exact(state, identity)?;
+        self.state.store(IDLE, Ordering::Release);
+        Ok(if state == WAIT_CANCELLED {
+            ServiceResult::Cancelled
+        } else {
+            ServiceResult::Supplied
+        })
     }
 }
 /// Dropping a transport handle is not completion: it leaves the operation and
@@ -544,12 +695,47 @@ impl ServiceCell {
 pub struct ServiceTicket<P: Deref<Target = ServiceCell>> {
     cell: core::mem::ManuallyDrop<P>,
     request: ServiceRequest,
+    selection_taken: bool,
+    reply: Option<carrick_guest_arch::KernelVa>,
 }
 impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
+    pub fn reply_address(&self) -> Option<carrick_guest_arch::KernelVa> {
+        self.reply
+    }
+
     pub fn request(&self) -> ServiceRequest {
         self.request
     }
-    pub fn complete(mut self, supplied: bool) -> Result<(), (ServiceError, Self)> {
+    /// Claim at most one lane selection before the transport releases that
+    /// execution lane. The ticket cannot later consume a successor's window.
+    pub fn take_fault_selection(
+        &mut self,
+        slot: &crate::PortalGrantSlot,
+    ) -> Result<Option<ServiceFaultSupply>, ServiceError> {
+        if self.selection_taken {
+            return Err(ServiceError::Stale);
+        }
+        self.selection_taken = true;
+        slot.take_native_fault_selection(self)
+    }
+    pub fn complete_backing_fault(self) -> Result<(), (ServiceError, Self)> {
+        if !matches!(self.request().operation, ServiceOperation::Fault(fault) if !fault.present) {
+            return Err((ServiceError::Stale, self));
+        }
+        self.acknowledge(16, 0)
+    }
+    pub fn complete(self, supplied: bool) -> Result<(), (ServiceError, Self)> {
+        self.acknowledge(u64::from(supplied), 0)
+    }
+    /// Acknowledge physical service and transfer the same continuation to an
+    /// exact-MM producer. No physical resource guard survives this call.
+    pub fn complete_wait(self, wait: crate::PortalOwnerWait) -> Result<(), (ServiceError, Self)> {
+        if wait.handle() != self.request.identity.birth.mm {
+            return Err((ServiceError::Stale, self));
+        }
+        self.acknowledge(2 + wait.cause().encode(), wait.revision())
+    }
+    fn acknowledge(mut self, result: u64, revision: u64) -> Result<(), (ServiceError, Self)> {
         let cell = &**self.cell;
         let state = cell.state.load(Ordering::Acquire);
         if !matches!(state, SERVICING | CANCEL_REQUESTED) {
@@ -565,7 +751,8 @@ impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
         if let Err(error) = cell.lock_exact(state, self.request.identity) {
             return Err((error, self));
         }
-        cell.result.store(u64::from(supplied), Ordering::Relaxed);
+        cell.result.store(result, Ordering::Relaxed);
+        cell.wait_revision.store(revision, Ordering::Relaxed);
         cell.state.store(
             if state == CANCEL_REQUESTED {
                 CANCELLED
@@ -641,10 +828,10 @@ mod tests {
         first.bind(first_birth).unwrap();
         second.bind(second_birth).unwrap();
         let a = first
-            .publish(first_birth, SnapshotGeneration::INITIAL, fault())
+            .publish(first_birth, SnapshotGeneration::INITIAL, fault(), None)
             .unwrap();
         let b = second
-            .publish(second_birth, SnapshotGeneration::INITIAL, fault())
+            .publish(second_birth, SnapshotGeneration::INITIAL, fault(), None)
             .unwrap();
         let a_ticket = first.claim(a).unwrap();
         let b_ticket = second.claim(b).unwrap();
@@ -666,13 +853,13 @@ mod tests {
         let owner = birth(1, 1);
         cell.bind(owner).unwrap();
         let first = cell
-            .publish(owner, SnapshotGeneration::INITIAL, fault())
+            .publish(owner, SnapshotGeneration::INITIAL, fault(), None)
             .unwrap();
         assert!(cell.claim(first).unwrap().complete(true).is_ok());
         assert_eq!(cell.consume(first.identity), Ok(ServiceResult::Supplied));
         assert_eq!(cell.cancel(first.identity), Ok(true));
         let next = cell
-            .publish(owner, SnapshotGeneration::INITIAL, fault())
+            .publish(owner, SnapshotGeneration::INITIAL, fault(), None)
             .unwrap();
         assert_eq!(cell.cancel(first.identity), Err(ServiceError::Stale));
         assert!(cell.claim(next).unwrap().complete(true).is_ok());
@@ -686,7 +873,7 @@ mod tests {
         let owner = birth(1, 1);
         cell.bind(owner).unwrap();
         let request = cell
-            .publish(owner, SnapshotGeneration::INITIAL, fault())
+            .publish(owner, SnapshotGeneration::INITIAL, fault(), None)
             .unwrap();
         let ticket = ServiceCell::claim_owned(cell.clone(), request).unwrap();
         assert_eq!(Arc::strong_count(&cell), 2);
@@ -703,7 +890,7 @@ mod tests {
         let old_birth = birth(1, 1);
         cell.bind(old_birth).unwrap();
         let old = cell
-            .publish(old_birth, SnapshotGeneration::INITIAL, fault())
+            .publish(old_birth, SnapshotGeneration::INITIAL, fault(), None)
             .unwrap();
         assert!(!cell.cancel(old.identity).unwrap());
         assert_eq!(cell.consume(old.identity), Err(ServiceError::Busy));
@@ -729,7 +916,7 @@ mod tests {
             Ok(new_birth)
         );
         let new = cell
-            .publish(new_birth, SnapshotGeneration::INITIAL, fault())
+            .publish(new_birth, SnapshotGeneration::INITIAL, fault(), None)
             .unwrap();
         assert!(new.identity.sequence > old.identity.sequence);
         assert!(matches!(cell.claim(old), Err(ServiceError::Stale)));
@@ -745,5 +932,218 @@ mod tests {
         assert!(ticket.complete(false).is_ok());
         assert_eq!(cell.consume(old.identity), Err(ServiceError::Stale));
         assert_eq!(cell.consume(new.identity), Ok(ServiceResult::Refused));
+    }
+    #[test]
+    fn backing_reply_is_bound_to_the_claimed_request_phase() {
+        let cell = ServiceCell::new();
+        let birth = birth(1, 1);
+        cell.bind(birth).unwrap();
+        let operation = ServiceOperation::Fault(FaultInfo {
+            address: UserVa::new(0x4000),
+            access: Access::Read,
+            present: false,
+        });
+        let address = carrick_guest_arch::KernelVa::new(0x10000);
+        let request = cell
+            .publish_with_reply(
+                birth,
+                SnapshotGeneration::INITIAL,
+                operation,
+                Some(NonZeroU64::MIN),
+                Some(address),
+            )
+            .unwrap();
+        let ticket = cell.claim(request).unwrap();
+        assert_eq!(ticket.reply_address(), Some(address));
+        assert!(ticket.complete_backing_fault().is_ok());
+        assert_eq!(
+            cell.consume(request.identity),
+            Ok(ServiceResult::BackingFault)
+        );
+        let request = cell
+            .publish(birth, SnapshotGeneration::INITIAL, operation, None)
+            .unwrap();
+        let ticket = cell.claim(request).unwrap();
+        assert_eq!(
+            ticket.reply_address(),
+            None,
+            "successor cannot inherit the previous buffer"
+        );
+        assert!(ticket.complete(false).is_ok());
+        assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Refused));
+    }
+
+    fn supply_window(owner: ServiceBirth) -> crate::PortalGrantWindow {
+        let page = match fault() {
+            ServiceOperation::Fault(fault) => fault.address.raw() & !4095,
+            _ => unreachable!(),
+        };
+        crate::PortalGrantWindow {
+            operation: crate::PortalOperation {
+                carrier: owner.mm.carrier(),
+                mm: owner.mm.mm(),
+                incarnation: owner.mm.incarnation(),
+                sequence: NonZeroU64::MIN,
+            },
+            generation: crate::ReservationGeneration::new(1).unwrap(),
+            range: crate::ReservationRange::new(page, page + 4096).unwrap(),
+            protection: crate::ReservationProtection::from_bits(3).unwrap(),
+            fault_page: page,
+            host_backing: None,
+            fork_sequence: None,
+        }
+    }
+
+    #[test]
+    fn fault_supply_transfer_survives_lane_reuse_and_cancellation() {
+        let slot = crate::PortalGrantSlot::new();
+        let first = ServiceCell::new();
+        let second = ServiceCell::new();
+        let a = birth(1, 1);
+        let b = birth(2, 1);
+        first.bind(a).unwrap();
+        second.bind(b).unwrap();
+        let a_request = first
+            .publish(
+                a,
+                SnapshotGeneration::INITIAL,
+                fault(),
+                Some(NonZeroU64::MIN),
+            )
+            .unwrap();
+        let b_request = second
+            .publish(b, SnapshotGeneration::INITIAL, fault(), NonZeroU64::new(2))
+            .unwrap();
+        let mut a_ticket = first.claim(a_request).unwrap();
+        let mut b_ticket = second.claim(b_request).unwrap();
+        let a_window = supply_window(a);
+        let mut b_window = supply_window(b);
+        b_window.operation.sequence = NonZeroU64::new(2).unwrap();
+        assert!(slot.publish_cow_fault_selection(1, a_window));
+        assert_eq!(
+            a_ticket.take_fault_selection(&slot),
+            Ok(Some(ServiceFaultSupply::Cow(a_window)))
+        );
+        assert!(!slot.has_outstanding_for(a.mm.mm().raw()));
+        assert!(!first.cancel(a_request.identity).unwrap());
+        assert_eq!(first.consume(a_request.identity), Err(ServiceError::Busy));
+        assert!(slot.publish_fault_selection(2, b_window));
+        assert_eq!(
+            a_ticket.take_fault_selection(&slot),
+            Err(ServiceError::Stale)
+        );
+        assert_eq!(
+            slot.pending_fault_selection(b.mm.mm().raw(), b_window.fault_page),
+            Some((2, b_window))
+        );
+        assert_eq!(
+            b_ticket.take_fault_selection(&slot),
+            Ok(Some(ServiceFaultSupply::Backing(b_window)))
+        );
+        assert!(b_ticket.complete(false).is_ok());
+        assert_eq!(
+            second.consume(b_request.identity),
+            Ok(ServiceResult::Refused)
+        );
+        assert!(a_ticket.complete(true).is_ok());
+        assert_eq!(
+            first.consume(a_request.identity),
+            Ok(ServiceResult::Cancelled)
+        );
+    }
+
+    #[test]
+    fn fault_supply_transfer_rejects_recycled_mm_incarnation() {
+        let slot = crate::PortalGrantSlot::new();
+        let cell = ServiceCell::new();
+        let owner = birth(1, 1);
+        cell.bind(owner).unwrap();
+        let request = cell
+            .publish(
+                owner,
+                SnapshotGeneration::INITIAL,
+                fault(),
+                Some(NonZeroU64::MIN),
+            )
+            .unwrap();
+        let mut ticket = cell.claim(request).unwrap();
+        let window = supply_window(birth(1, 2));
+        assert!(slot.publish_cow_fault_selection(1, window));
+        assert_eq!(ticket.take_fault_selection(&slot), Err(ServiceError::Stale));
+        assert_eq!(
+            slot.pending_cow_fault_selection(owner.mm.mm().raw(), window.fault_page),
+            Some((1, window))
+        );
+        assert!(ticket.complete(false).is_ok());
+        assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Refused));
+    }
+
+    #[test]
+    fn delayed_first_fault_take_cannot_steal_same_mm_page_successor() {
+        let slot = crate::PortalGrantSlot::new();
+        let first = ServiceCell::new();
+        let second = ServiceCell::new();
+        let a = birth(1, 1);
+        let mut b = birth(2, 1);
+        b.mm = a.mm;
+        first.bind(a).unwrap();
+        second.bind(b).unwrap();
+        let a_request = first
+            .publish(
+                a,
+                SnapshotGeneration::INITIAL,
+                fault(),
+                Some(NonZeroU64::MIN),
+            )
+            .unwrap();
+        let b_request = second
+            .publish(b, SnapshotGeneration::INITIAL, fault(), NonZeroU64::new(2))
+            .unwrap();
+        let mut old_ticket = first.claim(a_request).unwrap();
+        let mut next_ticket = second.claim(b_request).unwrap();
+        let mut successor = supply_window(b);
+        successor.operation.sequence = NonZeroU64::new(2).unwrap();
+        assert!(slot.publish_cow_fault_selection(2, successor));
+        assert_eq!(
+            old_ticket.take_fault_selection(&slot),
+            Err(ServiceError::Stale)
+        );
+        assert_eq!(
+            slot.pending_cow_fault_selection(a.mm.mm().raw(), successor.fault_page),
+            Some((2, successor))
+        );
+        assert_eq!(
+            next_ticket.take_fault_selection(&slot),
+            Ok(Some(ServiceFaultSupply::Cow(successor)))
+        );
+        assert!(next_ticket.complete(false).is_ok());
+        assert!(old_ticket.complete(false).is_ok());
+        assert_eq!(
+            first.consume(a_request.identity),
+            Ok(ServiceResult::Refused)
+        );
+        assert_eq!(
+            second.consume(b_request.identity),
+            Ok(ServiceResult::Refused)
+        );
+    }
+    #[test]
+    fn mm_busy_ack_preserves_the_native_claim_until_its_owner_wakes() {
+        let cell = ServiceCell::new();
+        let owner = birth(1, 1);
+        cell.bind(owner).unwrap();
+        let request = cell
+            .publish(owner, SnapshotGeneration::INITIAL, fault(), None)
+            .unwrap();
+        // SAFETY: fixture names its exact admitted source before the busy probe.
+        let wait = unsafe {
+            crate::PortalOwnerWait::from_owner(owner.mm, crate::PortalWaitCause::Editor, 7)
+        };
+        assert!(cell.claim(request).unwrap().complete_wait(wait).is_ok());
+        assert_eq!(
+            cell.consume(request.identity),
+            Ok(ServiceResult::Wait(wait))
+        );
+        assert_eq!(cell.reset_unpublished(), Err(ServiceError::Busy));
     }
 }

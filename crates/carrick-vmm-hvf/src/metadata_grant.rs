@@ -5,6 +5,8 @@ mod native_service;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use native_service::NativeService;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use native_service::settle_native_cow;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn take_native_service(
     custody: &Arc<crate::trap::CarrierVmCustody>,
     cpu: carrick_guest_arch::CpuId,
@@ -72,17 +74,25 @@ impl<'a> RetainedAbiRegion<'a> {
 /// Runtime-owned handback venue for an already enrolled parent wait.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub trait NativeWaitChannelWake: std::fmt::Debug + Send + Sync {
+    fn complete_mm_wake(
+        &self,
+        zone: &carrick_sched_core::ZoneTables<carrick_el1_abi::Aarch64ParkedContext>,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
+    );
     fn wake(&self, mm: carrick_el1_abi::EntryMmKey, address: core::num::NonZeroU64) -> Option<u32>;
 }
 
 /// Authenticate the exact released task, independently of its former record.
 /// The CPU is synchronously stopped; a new slot entry invalidates this custody.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn terminal_child_execution(
+fn terminal_child_binding(
     custody: &crate::trap::CarrierVmCustody,
     cpu: carrick_guest_arch::CpuId,
     phase: carrick_sched_core::TerminalPhase,
-) -> Option<crate::fork_stock::GrantExecution> {
+) -> Option<carrick_el1_abi::ExecutionBinding> {
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
     let region = retained_abi_region(custody)?;
     let (task, zone) = stopped_records(region, cpu)?;
@@ -91,19 +101,7 @@ fn terminal_child_execution(
     if !carrick_core::entry::terminal_matches(binding, source, phase) {
         return None;
     }
-    let stock = custody.fork_stock.lock();
-    let mm = carrick_el1_abi::ReservationMm::new(binding.mm.raw())?;
-    if stock.owner.is_quarantined(mm) != (phase == carrick_sched_core::TerminalPhase::Retired) {
-        return None;
-    }
-    let context = carrick_guest_arch::AddressContext {
-        root: stock.owner.child_root(mm)?,
-        mm: carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(mm.raw())?),
-        generation: task.root_generation()?,
-    };
-    Some(crate::fork_stock::GrantExecution::new(
-        cpu, binding, context,
-    ))
+    Some(binding)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -121,7 +119,7 @@ fn service_terminal_operation(
     if !request_has_live_vm(custody, generation) || expected_cpu != u64::from(cpu.raw()) {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     }
-    let Some(execution) = terminal_child_execution(
+    let Some(binding) = terminal_child_binding(
         custody,
         cpu,
         if retired {
@@ -143,6 +141,38 @@ fn service_terminal_operation(
         {
             return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
         }
+        if op == carrick_el1_abi::GRANT_OP_CHILD_RECLAIM {
+            if args[0] != binding.mm.raw() {
+                return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+            }
+            let root = |raw| {
+                carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                    raw & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
+                ))
+            };
+            let execution = root(ttbr0).zip(root(idle)).and_then(|(live, idle)| {
+                carrick_hal::fork_stock::ReclaimExecution::maintenance_root(live, idle)
+            });
+            let Some(execution) = execution else {
+                return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+            };
+            let Some(region) = retained_abi_region(custody) else {
+                return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+            };
+            let mut stock = custody.fork_stock.lock();
+            let mut ledger = crate::fork_stock::fork_table_accounting(custody);
+            return match reclaim_fork_stock(
+                custody,
+                &mut stock,
+                &mut ledger,
+                region,
+                cpu,
+                execution,
+            ) {
+                Ok(count) => [METADATA_GRANT_SUCCESS, count as u64, 0, 0],
+                Err(_) => [METADATA_GRANT_ERR_DENIED, 0, 0, 0],
+            };
+        }
         let Some(address) = core::num::NonZeroU64::new(args[1]) else {
             return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
         };
@@ -154,6 +184,31 @@ fn service_terminal_operation(
             None => [METADATA_GRANT_ERR_DENIED, 0, 0, 0],
         };
     }
+    // Pending retirement still needs the live child-root capability. Terminal
+    // wakes use only the slot's exact execution receipt, which survives reclaim.
+    let Some(region) = retained_abi_region(custody) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    let Some((task, _)) = stopped_records(region, cpu) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    let Some(execution) = (|| {
+        let mm = carrick_el1_abi::ReservationMm::new(binding.mm.raw())?;
+        let stock = custody.fork_stock.lock();
+        if stock.owner.is_quarantined(mm) {
+            return None;
+        }
+        let context = carrick_guest_arch::AddressContext {
+            root: stock.owner.child_root(mm)?,
+            mm: carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(mm.raw())?),
+            generation: task.root_generation()?,
+        };
+        Some(crate::fork_stock::GrantExecution::new(
+            cpu, binding, context,
+        ))
+    })() else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
     if execution.context.root.address().raw()
         != ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
     {
@@ -164,6 +219,42 @@ fn service_terminal_operation(
     }) else {
         return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
     };
+    // Settle USED while the exact root still exists, then release unused pool
+    // records. Physical bytes remain with ForkStock until neutral reclamation.
+    let Some((_, zone)) = stopped_records(region, cpu) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    let Some(wake) = custody.native_wait_channel_wake.lock().clone() else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    let deliver = |zone: &carrick_sched_core::ZoneTables<carrick_el1_abi::Aarch64ParkedContext>,
+                   _: carrick_sched_core::Waker,
+                   effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+        '_,
+        carrick_el1_abi::Aarch64ParkedContext,
+    >| wake.complete_mm_wake(zone, effects);
+    let access = carrick_sched_core::spaces::notification::SpaceAccess::notified(
+        carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+            zone,
+            waker: carrick_sched_core::Waker::Host,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Captured(
+                &deliver,
+            ),
+        },
+    );
+    let Some(index) = zone.spaces.find(binding.mm.raw()) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    let Ok(exclusion) = access.try_exclude_editor(index, binding.mm.raw()) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    if let Some(pool) = carrick_el1_abi::cow_grant_pool_host() {
+        if settle_native_cow(custody, pool, exclusion.proof()).is_err() {
+            return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        }
+        pool.release_mm(exclusion.proof());
+    }
+    drop(exclusion);
     // SAFETY: the synchronous crossing retains the caller's aligned wire record.
     let retire = unsafe { &mut *pointer };
     if custody
@@ -1325,6 +1416,54 @@ fn retain_fork_custody_rows(
     Ok(retained)
 }
 
+/// Apply the neutral stock owner's verdicts in either a live loan venue or
+/// an authenticated terminal maintenance-root venue. This supplies mechanics;
+/// release-once, hygiene, tag retirement and pin disposal stay with ForkStock.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn reclaim_fork_stock(
+    custody: &crate::trap::CarrierVmCustody,
+    stock: &mut crate::fork_stock::ForkStockHostCustody,
+    ledger: &mut impl carrick_hal::fork_stock::ForkTableLedger,
+    region: RetainedAbiRegion<'_>,
+    cpu: carrick_guest_arch::CpuId,
+    execution: carrick_hal::fork_stock::ReclaimExecution,
+) -> Result<usize, carrick_hal::fork_stock::ForkStockServiceError> {
+    use carrick_hal::fork_stock::{ForkStockServiceError, SlotAbsence};
+    if !stock.owner.has_quarantine() {
+        return Ok(0);
+    }
+    let inventory = stock
+        .inventory()
+        .ok_or(ForkStockServiceError::OccupancyUnavailable)?;
+    let (_, zone) = stopped_records(region, cpu).ok_or(ForkStockServiceError::StaleExecution)?;
+    let pointer = region
+        .record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
+            carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
+        )
+        .ok_or(ForkStockServiceError::InvalidRecord)?;
+    // SAFETY: initialized atomic ABI record in the retained carrier mapping.
+    let residency = unsafe { &*pointer };
+    stock.owner.reclaim(
+        ledger,
+        execution,
+        |mm| {
+            // The shared guest owner frees this entry only after root retirement.
+            if zone.spaces.find(mm.raw()).is_some() {
+                return None;
+            }
+            SlotAbsence::scan(
+                mm,
+                (0..carrick_sched_core::ZONE_SLOTS)
+                    .filter_map(carrick_guest_arch::SlotId::from_index)
+                    .map(|slot| zone.installed_space(slot)),
+            )
+        },
+        |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
+        |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
+        |absence| carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence.mm()),
+    )
+}
+
 /// Native stock crossings retain an ABI stack, not a physical inventory row.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
@@ -1366,64 +1505,22 @@ pub(crate) fn service_native_fork_stock(
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
             let mut stock = custody.fork_stock.lock();
-            let mut ledger = custody.el1_frame_grants.lock();
-            if stock.owner.has_quarantine() {
-                let Some(inventory) = stock.inventory() else {
-                    exchange.refuse(ForkStockRefusal::Inventory);
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                };
-                let Some((_, zone)) = stopped_records(region, cpu) else {
-                    exchange.refuse(ForkStockRefusal::Stale);
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                };
-                let Some(pointer) = region.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
-                    carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
-                ) else {
-                    return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
-                };
-                // SAFETY: initialized fixed atomic ABI record in the retained region.
-                let residency = unsafe { &*pointer };
-                let Some(active) = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())
-                else {
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                };
-                let reclaimed = stock.owner.reclaim(
-                    &mut *ledger,
-                    active,
-                    |mm| {
-                        // The neutral guest MM owner retires the reservation root
-                        // before freeing its space entry. An absent slot alone is
-                        // insufficient to reuse still-published table storage.
-                        if zone.spaces.find(mm.raw()).is_some() {
-                            return None;
-                        }
-                        carrick_hal::fork_stock::SlotAbsence::scan(
-                            mm,
-                            (0..carrick_sched_core::ZONE_SLOTS)
-                                .filter_map(carrick_guest_arch::SlotId::from_index)
-                                .map(|slot| zone.installed_space(slot)),
-                        )
-                    },
-                    |pages| ForkStockHostCustody::clear_tables(custody, pages),
-                    |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
-                    |absence| {
-                        carrick_hal::fork_stock::release_child_mm(
-                            &*inventory,
-                            residency,
-                            absence.mm(),
-                        )
-                    },
-                );
-                if reclaimed.is_err() {
-                    exchange.refuse(ForkStockRefusal::Inventory);
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                }
+            let mut ledger = crate::fork_stock::fork_table_accounting(custody);
+            let Some(active) = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())
+            else {
+                return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+            };
+            if reclaim_fork_stock(custody, &mut stock, &mut ledger, region, cpu, active.into())
+                .is_err()
+            {
+                exchange.refuse(ForkStockRefusal::Inventory);
+                return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
             if stock.ensure_control_capacity(custody).is_err() {
                 exchange.refuse(ForkStockRefusal::Capacity);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
-            let result = stock.loan(&mut *ledger, execution, exchange, |life| {
+            let result = stock.loan(&mut ledger, execution, exchange, |life| {
                 lifecycle_window(custody, life)
             });
             if let Err(refusal) = result {
@@ -1457,7 +1554,7 @@ pub(crate) fn service_native_fork_stock(
                         .owner
                         .child_custody(pending.loan.request.operation, execution.context.root)
                 {
-                    for row in rows {
+                    for row in &rows.inherited {
                         if let Some(source) = row.retained_host_backing() {
                             inherited.inherit(source);
                         }
@@ -1486,6 +1583,7 @@ pub(crate) fn service_native_fork_stock(
                             count,
                             inherited,
                         )
+                        .map(crate::fork_stock::NativeChildPhysical::new)
                     },
                 );
                 if let Err(refusal) = &result {
@@ -1493,9 +1591,9 @@ pub(crate) fn service_native_fork_stock(
                 }
                 result.is_ok()
             } else {
-                let mut ledger = custody.el1_frame_grants.lock();
+                let mut ledger = crate::fork_stock::fork_table_accounting(custody);
                 match stock.owner.settle(
-                    &mut *ledger,
+                    &mut ledger,
                     execution,
                     settlement,
                     |pages| {
@@ -1732,7 +1830,9 @@ pub(crate) fn handle_metadata_grant_trap(
         )
     } else if matches!(
         op,
-        carrick_el1_abi::GRANT_OP_CHILD_RETIRE | carrick_el1_abi::GRANT_OP_WAIT_CHANNEL_WAKE
+        carrick_el1_abi::GRANT_OP_CHILD_RETIRE
+            | carrick_el1_abi::GRANT_OP_WAIT_CHANNEL_WAKE
+            | carrick_el1_abi::GRANT_OP_CHILD_RECLAIM
     ) {
         let ttbr0 = vcpu
             .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)

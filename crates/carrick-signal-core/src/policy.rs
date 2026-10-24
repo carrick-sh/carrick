@@ -22,6 +22,7 @@ pub struct Signal(u8);
 
 impl Signal {
     pub const KILL: Self = Self(9);
+    pub const BUS: Self = Self(7);
     pub const SEGV: Self = Self(11);
     pub const ALRM: Self = Self(14);
     pub const CHLD: Self = Self(17);

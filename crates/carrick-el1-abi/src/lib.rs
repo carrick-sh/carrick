@@ -353,6 +353,8 @@ pub const GRANT_OP_WAIT_CHANNEL_WAKE: u64 = 7;
 pub const GRANT_OP_FORK_REFUSAL: u64 = 8;
 /// Kick an excluded, host-owned execution residency on an issued CPU slot.
 pub const GRANT_OP_RESIDENCY_KICK: u64 = 9;
+/// Drain physical child stock after switching off its retired root.
+pub const GRANT_OP_CHILD_RECLAIM: u64 = 10;
 
 /// Bounded debug rendering of a typed refusal, retained on the stopped EL1 stack.
 #[repr(C, align(64))]
@@ -3969,7 +3971,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0xf7e02418d04b8b44);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x08858905afeb1fd9);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

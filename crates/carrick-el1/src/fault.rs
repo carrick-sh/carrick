@@ -204,6 +204,31 @@ impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopy
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl PreparedPageResolver for HardwarePreparedResolver {
+    fn select_backing_window(
+        &mut self,
+        root: u64,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<
+        carrick_el1_abi::PortalGrantWindow,
+        carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    > {
+        use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorRefusal, PrimaryTableWords};
+        let table = hardware_target_table_window(root).ok_or(DescriptorRefusal::BadRange)?;
+        // SAFETY: the shared fault owner retains the target MM editor; the
+        // current primary alias and admitted pool remain mapped throughout.
+        let words = unsafe {
+            PrimaryTableWords::new(
+                table.words,
+                table.physical_base,
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
+                &ServiceCopyMaintenance,
+            )
+            .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
+        }?;
+        carrick_core::mm::frames::select_backing_window::<carrick_mmu_core::owner_mmu::Aarch64Mmu, _>(
+            &words, root, window,
+        )
+    }
     fn commit_prepared(
         &mut self,
         ttbr0: u64,
@@ -265,12 +290,40 @@ impl<'a, W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> X86Prepa
     pub unsafe fn under_editor(mm_key: NonZeroU64, words: &'a W) -> Self {
         Self { mm_key, words }
     }
+
+    fn admitted_root(
+        &self,
+        root_pa: u64,
+    ) -> Result<carrick_guest_arch::RootGpa, GuestPreparedCommitError> {
+        let root =
+            carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(root_pa))
+                .ok_or(GuestPreparedCommitError::BadAddress)?;
+        if crate::isa::x86::hardware_live_root() != Ok(root) {
+            return Err(GuestPreparedCommitError::BadAddress);
+        }
+        Ok(root)
+    }
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> PreparedPageResolver
     for X86PreparedResolver<'_, W>
 {
+    fn select_backing_window(
+        &mut self,
+        root: u64,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<
+        carrick_el1_abi::PortalGrantWindow,
+        carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    > {
+        use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+        self.admitted_root(root)
+            .map_err(|_| DescriptorRefusal::StaleRoot)?;
+        carrick_core::mm::frames::select_backing_window::<carrick_mmu_core::x86::owner_mmu::X86Mmu, _>(
+            self.words, root, window,
+        )
+    }
     fn commit_prepared(
         &mut self,
         root_pa: u64,
@@ -279,18 +332,14 @@ impl<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> PreparedPage
         access: LeafAccess,
     ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
         use carrick_guest_arch::{
-            EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, RootGpa, UserRange, UserVa,
+            EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, UserRange, UserVa,
         };
         use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
         use carrick_mmu_core::x86::descriptor_txn::{
             Access, DescriptorOutcome, DescriptorTxn, InlineJournal, execute_descriptor_txn,
             translate_leaf,
         };
-        let root = RootGpa::page_aligned(FrameGpa::new(root_pa))
-            .ok_or(GuestPreparedCommitError::BadAddress)?;
-        if crate::isa::x86::hardware_live_root() != Ok(root) {
-            return Err(GuestPreparedCommitError::BadAddress);
-        }
+        let root = self.admitted_root(root_pa)?;
         let range = UserRange::checked(UserVa::new(va), GuestLen::new(4096))
             .ok_or(GuestPreparedCommitError::BadAddress)?;
         let expected = FrameGpa::new(expected_pa);
@@ -557,13 +606,13 @@ pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
 /// [`dispatch_fault_with_prepared`] after serving host descriptor
 /// transactions for the faulting MM.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_fault_with_descriptor_txns<P, C, X>(
+pub fn dispatch_fault_with_descriptor_txns<'supply, P, C, X>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
     spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     mut txns: Option<DescriptorTxnPath<'_, X>>,
-    mailboxes: GrantMailboxes<'_>,
+    supply: impl Into<FaultSupply<'supply>>,
     prepared: Option<PreparedFaultPath<'_, P>>,
     cow_resolver: &mut C,
 ) -> Action
@@ -584,7 +633,7 @@ where
         counters,
         current_tasks,
         spaces,
-        mailboxes,
+        supply,
         prepared,
         cow_resolver,
     )
@@ -967,6 +1016,7 @@ impl<'a> GrantMailboxes<'a> {
 /// A CPL0 fault can request physical supply without delegating leaf publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnerFaultSupplyOutcome {
+    Wait(carrick_el1_abi::PortalOwnerWait),
     Unavailable,
     PolicyDeclined,
     Selected,
@@ -974,15 +1024,21 @@ pub enum OwnerFaultSupplyOutcome {
 }
 
 pub struct OwnerFaultSupply<'a> {
+    handle: Option<carrick_el1_abi::El1MmHandle>,
     pub slots: &'a carrick_el1_abi::MmPortalSlots,
     outcome: core::cell::Cell<OwnerFaultSupplyOutcome>,
 }
 impl<'a> OwnerFaultSupply<'a> {
     pub fn new(slots: &'a carrick_el1_abi::MmPortalSlots) -> Self {
         Self {
+            handle: None,
             slots,
             outcome: core::cell::Cell::new(OwnerFaultSupplyOutcome::Unavailable),
         }
+    }
+    pub fn with_handle(mut self, handle: carrick_el1_abi::El1MmHandle) -> Self {
+        self.handle = Some(handle);
+        self
     }
     pub fn outcome(&self) -> OwnerFaultSupplyOutcome {
         self.outcome.get()
@@ -999,6 +1055,73 @@ impl<'a> From<GrantMailboxes<'a>> for FaultSupply<'a> {
     }
 }
 impl FaultSupply<'_> {
+    fn observe<C: Copy + Send + Sync + zerocopy::FromZeros>(
+        self,
+        spaces: SpaceAccess<'_, C>,
+        mm: u64,
+        cause: carrick_sched_core::spaces::notification::SpaceWaitCause,
+    ) -> Option<carrick_el1_abi::PortalOwnerWait> {
+        use carrick_sched_core::spaces::notification::SpaceWaitCause;
+        let Self::Owner(owner) = self else {
+            return None;
+        };
+        let handle = owner.handle.filter(|handle| handle.mm().raw() == mm)?;
+        let source = spaces
+            .venue()?
+            .zone
+            .space_entry(NonZeroU64::new(mm)?)?
+            .notifications(handle.incarnation())
+            .ok()?;
+        let revision = source.observe(cause).revision();
+        let cause = match cause {
+            SpaceWaitCause::Reservations => carrick_el1_abi::PortalWaitCause::Reservations,
+            SpaceWaitCause::Editor => carrick_el1_abi::PortalWaitCause::Editor,
+            SpaceWaitCause::Gate => carrick_el1_abi::PortalWaitCause::Gate,
+            _ => return None,
+        };
+        // SAFETY: exact birth MM source authenticated and sampled before probe.
+        Some(unsafe { carrick_el1_abi::PortalOwnerWait::from_owner(handle, cause, revision) })
+    }
+    fn wait(self, wait: Option<carrick_el1_abi::PortalOwnerWait>) {
+        if let (Self::Owner(owner), Some(wait)) = (self, wait) {
+            owner.outcome.set(OwnerFaultSupplyOutcome::Wait(wait));
+        }
+    }
+    fn editor<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
+        self,
+        spaces: SpaceAccess<'a, C>,
+        index: carrick_sched_core::SpaceIndex,
+        mm: u64,
+        owner: NonZeroU64,
+    ) -> Option<carrick_sched_core::spaces::SpaceEditor<'a, C>> {
+        use carrick_sched_core::spaces::{EditAdmissionRefusal, notification::SpaceWaitCause};
+        if matches!(self, Self::Mailbox(_)) {
+            return spaces.try_begin_edit_bounded(
+                index,
+                mm,
+                owner,
+                carrick_el1_abi::EL1_GUEST_LOCK_SPINS,
+            );
+        }
+        let editor = self.observe(spaces, mm, SpaceWaitCause::Editor);
+        let gate = self.observe(spaces, mm, SpaceWaitCause::Gate);
+        match spaces
+            .table()
+            .try_begin_edit_cause(index, mm, owner, spaces.venue())
+        {
+            Ok(editor) => Some(editor),
+            Err(EditAdmissionRefusal::Editor) => {
+                self.wait(editor);
+                None
+            }
+            Err(EditAdmissionRefusal::Gate) => {
+                self.wait(gate);
+                None
+            }
+            Err(EditAdmissionRefusal::Stale) => None,
+        }
+    }
+
     fn decline(self) {
         if let Self::Owner(owner) = self {
             owner.outcome.set(OwnerFaultSupplyOutcome::PolicyDeclined);
@@ -1085,12 +1208,12 @@ fn consume_served_refusals(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64,
     }
 }
 
-pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
+pub fn dispatch_fault_with_prepared<'supply, P: PreparedPageResolver, C: CowResolver>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
     spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
-    mailboxes: GrantMailboxes<'_>,
+    supply: impl Into<FaultSupply<'supply>>,
     prepared: Option<PreparedFaultPath<'_, P>>,
     cow_resolver: &mut C,
 ) -> Action {
@@ -1101,7 +1224,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         counters,
         current_tasks.get(frame.slot as usize),
         spaces,
-        mailboxes.into(),
+        supply.into(),
         prepared,
         cow_resolver,
     )
@@ -1173,6 +1296,11 @@ fn dispatch_classified_fault<
             return Action::Forward;
         };
         if let FaultSupply::Owner(_) = supply {
+            let observed = supply.observe(
+                spaces,
+                mm_key,
+                carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations,
+            );
             match root_fault_admission(
                 prepared.as_ref().and_then(|path| path.roots),
                 spaces,
@@ -1182,6 +1310,10 @@ fn dispatch_classified_fault<
                 LeafAccess::Write,
             ) {
                 RootFaultAdmission::Allowed => {}
+                RootFaultAdmission::Busy => {
+                    supply.wait(observed);
+                    return Action::Forward;
+                }
                 RootFaultAdmission::Declined => {
                     supply.decline();
                     return Action::Forward;
@@ -1193,20 +1325,11 @@ fn dispatch_classified_fault<
         // the host resolves this fault.
         // Sibling threads fault on the same forked MM together; each COW
         // holds the editor only for one compound copy and repoint.
-        let Some((grant, _editor)) = spaces.grant(index, mm_key).and_then(|grant| {
-            Some((
-                grant,
-                spaces.try_begin_edit_bounded(
-                    index,
-                    mm_key,
-                    owner,
-                    carrick_el1_abi::EL1_GUEST_LOCK_SPINS,
-                )?,
-            ))
-        }) else {
+        let Some(_editor) = supply.editor(spaces, index, mm_key, owner) else {
             cow_resolver.editor_busy();
             return Action::Forward;
         };
+        let grant = _editor.grant();
         match cow_resolver.resolve_cow_outcome(grant.ttbr0, mm_key, far) {
             CowResolution::Resolved => return Action::Served,
             CowResolution::Refused => return Action::Forward,
@@ -1215,8 +1338,19 @@ fn dispatch_classified_fault<
                     let selected = (|| {
                         let roots = prepared.as_ref()?.roots?;
                         let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
-                        let mut root =
-                            roots.lock_in(spaces, index.index(), mm, slot as u32).ok()?;
+                        let observed = supply.observe(
+                            spaces,
+                            mm_key,
+                            carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations,
+                        );
+                        let mut root = roots
+                            .lock_in(spaces, index.index(), mm, slot as u32)
+                            .map_err(|error| {
+                                if error == crate::memory::reservations::Refusal::Busy {
+                                    supply.wait(observed);
+                                }
+                            })
+                            .ok()?;
                         let operation = carrick_el1_abi::PortalOperation {
                             carrier: owner.slots.carrier()?,
                             mm,
@@ -1249,16 +1383,25 @@ fn dispatch_classified_fault<
     if let FaultClass::Protection(access) = fault {
         if let FaultSupply::Owner(_) = supply
             && let Some(task) = current_task
-            && root_fault_admission(
+        {
+            let mm = task.mm.key.load(Ordering::Acquire);
+            let observed = supply.observe(
+                spaces,
+                mm,
+                carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations,
+            );
+            match root_fault_admission(
                 prepared.as_ref().and_then(|path| path.roots),
                 spaces,
                 slot as u32,
-                task.mm.key.load(Ordering::Acquire),
+                mm,
                 far & !4095,
                 access,
-            ) == RootFaultAdmission::Declined
-        {
-            supply.decline();
+            ) {
+                RootFaultAdmission::Declined => supply.decline(),
+                RootFaultAdmission::Busy => supply.wait(observed),
+                _ => {}
+            }
         }
         return Action::Forward;
     }
@@ -1284,6 +1427,11 @@ fn dispatch_classified_fault<
         // First-touch stock over a root hole is backing, not a mapping: the
         // host answers a touch the root does not map (SIGSEGV), and asks
         // for no grant.
+        let observed = supply.observe(
+            spaces,
+            mm_key,
+            carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations,
+        );
         match root_fault_admission(
             prepared.as_ref().and_then(|path| path.roots),
             spaces,
@@ -1296,21 +1444,23 @@ fn dispatch_classified_fault<
                 supply.decline();
                 return Action::Forward;
             }
+            RootFaultAdmission::Busy => {
+                supply.wait(observed);
+                return Action::Forward;
+            }
             RootFaultAdmission::Unavailable => return Action::Forward,
             _ => {}
         }
         let Some(index) = spaces.find(mm_key) else {
             return Action::Forward;
         };
-        let Some(grant) = spaces.grant(index, mm_key) else {
-            return Action::Forward;
-        };
         let Some(owner) = NonZeroU64::new(slot + 1) else {
             return Action::Forward;
         };
-        let Some(_editor) = spaces.try_begin_edit(index, mm_key, owner) else {
+        let Some(_editor) = supply.editor(spaces, index, mm_key, owner) else {
             return Action::Forward;
         };
+        let grant = _editor.grant();
         let path = prepared.as_mut().expect("prepared grant path");
         match path.resolver.commit_prepared(
             grant.ttbr0,
@@ -1340,12 +1490,26 @@ fn dispatch_classified_fault<
     }
 
     if let FaultSupply::Owner(owner) = supply {
+        let mut retry = false;
         let selected = (|| {
             let roots = prepared.as_ref()?.roots?;
             let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
             let index = spaces.find(mm_key)?;
-            let mut root = roots.lock_in(spaces, index.index(), mm, slot as u32).ok()?;
-            let mut window = match carrick_core::mm::fault::select_fault_window(
+            let editor = supply.editor(spaces, index, mm_key, NonZeroU64::new(slot + 1)?)?;
+            let observed = supply.observe(
+                spaces,
+                mm_key,
+                carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations,
+            );
+            let mut root = roots
+                .lock_in(spaces, index.index(), mm, slot as u32)
+                .map_err(|error| {
+                    if error == crate::memory::reservations::Refusal::Busy {
+                        supply.wait(observed);
+                    }
+                })
+                .ok()?;
+            let window = match carrick_core::mm::fault::select_fault_window(
                 &mut root,
                 owner.slots.carrier()?,
                 carrick_guest_arch::UserVa::new(far),
@@ -1362,30 +1526,28 @@ fn dispatch_classified_fault<
                 }
                 Err(_) => return None,
             };
-            // Coalescing adjacent reservations does not erase existing PRIVATE
-            // or prepared custody. A bulk Prepare must never cover those pages.
-            // The retained residency owner includes prepared neighbors, too.
-            let residency = prepared.as_ref()?.residency;
-            if (window.range.start()..window.range.end())
-                .step_by(4096)
-                .any(|page| residency.lookup(mm_key, page).is_some())
+            let window = match prepared
+                .as_mut()?
+                .resolver
+                .select_backing_window(editor.grant().ttbr0, window)
             {
-                window = carrick_core::mm::fault::select_fault_window(
-                    &mut root,
-                    owner.slots.carrier()?,
-                    carrick_guest_arch::UserVa::new(far),
-                    carrick_guest_arch::GuestLen::new(4096),
-                    carrick_el1_abi::ReservationProtection::from_bits(access)?,
-                )
-                .ok()?;
-            }
-            if window.host_backing.is_some() {
-                return None;
-            }
+                Ok(window) => window,
+                Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::Occupied) => {
+                    // Same verdict as an occupied reply at application: a
+                    // concurrent publication invalidates the observed fault,
+                    // not the instruction. Re-enter without physical supply.
+                    retry = true;
+                    return None;
+                }
+                Err(_) => return None,
+            };
             let slot = owner.slots.grant(slot as usize)?;
             slot.publish_fault_selection(window.operation.sequence.get(), window)
                 .then_some(())
         })();
+        if retry {
+            return Action::Served;
+        }
         if selected.is_some() {
             owner.outcome.set(OwnerFaultSupplyOutcome::Selected);
         }

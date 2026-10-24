@@ -10,6 +10,11 @@
       "from": "carrick_vmm_hvf::host_signal::ForkResetWaiterRegistry::hold_for_fork",
       "to": "carrick_signal_linux::fork_reset::PreparedForkBacking<T>::hold",
       "issue": 488
+    },
+    {
+      "from": "carrick_kernel::dispatch::mem::backing::MemView<'a>::snapshot_private_mmap_description",
+      "to": "carrick_kernel::dispatch::mem::backing::snapshot_private_mmap_description",
+      "issue": 783
     }
   ],
   "terminal_custody": []

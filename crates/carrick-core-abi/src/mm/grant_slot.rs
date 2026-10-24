@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::PortalGrantWindow;
 #[repr(C, align(64))]
+#[derive(zerocopy::FromZeros)]
 pub struct PortalGrantSlot {
     state: AtomicU64,
     window: [AtomicU64; 13],
@@ -91,6 +92,63 @@ impl PortalGrantSlot {
         }))?;
         (window.operation.mm.raw() == mm_key && window.fault_page == fault_va & !4095)
             .then_some((generation, window))
+    }
+    /// Read the exact selected operation while the ring still owns this lane.
+    pub fn native_fault_sequence(&self, mm: u64, address: u64) -> Option<core::num::NonZeroU64> {
+        let (generation, window) = self
+            .pending_cow_fault_selection(mm, address)
+            .or_else(|| self.pending_fault_selection(mm, address))?;
+        (generation == window.operation.sequence.get()).then_some(window.operation.sequence)
+    }
+    /// Transfer only the selection stamped into the retained native request.
+    pub(crate) fn take_native_fault_selection<
+        P: core::ops::Deref<Target = crate::service::ServiceCell>,
+    >(
+        &self,
+        ticket: &crate::service::ServiceTicket<P>,
+    ) -> Result<Option<crate::service::ServiceFaultSupply>, crate::service::ServiceError> {
+        use crate::service::{ServiceError, ServiceFaultSupply, ServiceOperation};
+        let request = ticket.request();
+        let ServiceOperation::Fault(fault) = request.operation else {
+            return Ok(None);
+        };
+        let state = self.state.load(Ordering::Acquire);
+        let Some(sequence) = request.fault_sequence else {
+            return if state == 0 {
+                Ok(None)
+            } else {
+                Err(ServiceError::Stale)
+            };
+        };
+        if !matches!(state, 3 | 4) {
+            return Err(ServiceError::Stale);
+        }
+        self.state
+            .compare_exchange(state, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| ServiceError::Stale)?;
+        // Reservation excludes publication and reclamation while the stamp and
+        // payload are checked, including ABA through a same-MM/page successor.
+        let selected = PortalGrantWindow::decode(core::array::from_fn(|i| {
+            self.window[i].load(Ordering::Relaxed)
+        }))
+        .filter(|window| {
+            window.operation.sequence == sequence
+                && self.fault_generation.load(Ordering::Relaxed) == sequence.get()
+                && window.operation.mm == request.identity.birth.mm.mm()
+                && window.operation.carrier == request.identity.birth.mm.carrier()
+                && window.operation.incarnation == request.identity.birth.mm.incarnation()
+                && window.fault_page == fault.address.raw() & !4095
+        });
+        let Some(window) = selected else {
+            self.state.store(state, Ordering::Release);
+            return Err(ServiceError::Stale);
+        };
+        self.state.store(0, Ordering::Release);
+        Ok(Some(if state == 4 {
+            ServiceFaultSupply::Cow(window)
+        } else {
+            ServiceFaultSupply::Backing(window)
+        }))
     }
     /// Consume the exact demand only after its replacement loan is published.
     /// The caller retains exact-MM exclusion across inspection and consumption.

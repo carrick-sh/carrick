@@ -72,7 +72,7 @@ pub(crate) fn provision_guest_cow_grants(
             "guest COW grants serve only a guest-owned MM".to_owned(),
         ));
     }
-    let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
+    let stage2_perms = super::hvf_mem_perms(carrick_hal::physical_grants::COW_GRANT_PERMISSIONS);
     let mut published = 0;
     while published < count {
         let (new_host_ptr, new_physical_ipa, owner_generation) =
@@ -92,11 +92,7 @@ pub(crate) fn provision_guest_cow_grants(
             InventoryMappingStage {
                 gpa: new_physical_ipa,
                 length: CowArmedRanges::COMPOUND_SIZE,
-                permissions: carrick_hal::MemPerms {
-                    read: true,
-                    write: true,
-                    exec: true,
-                },
+                permissions: carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
                 backing: HvfVmState::private_backing_identity(),
                 inherited_frame: None,
                 stage2_lease: Some((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE)),
@@ -235,13 +231,27 @@ pub(crate) fn require_guest_cow_settled(mm: u64, site: &'static str) {
 
 /// One replacement compound, stage-2 mapped and registered as a live global
 /// frame owner: its host pointer, IPA and owner generation.
-fn allocate_grant_compound(
+pub(crate) fn allocate_grant_compound(
     custody: &std::sync::Arc<CarrierVmCustody>,
     stage2_perms: applevisor::memory::MemPerms,
 ) -> Result<(*mut u8, u64, u64), TrapError> {
-    if let Some(handle) = custody
-        .frame_pool()
-        .and_then(|pool| pool.allocate_compound())
+    allocate_grant_extent(custody, stage2_perms, CowArmedRanges::COMPOUND_SIZE)
+}
+pub(crate) fn allocate_grant_extent(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    stage2_perms: applevisor::memory::MemPerms,
+    length: u64,
+) -> Result<(*mut u8, u64, u64), TrapError> {
+    if length == 0
+        || !length.is_multiple_of(CowArmedRanges::COMPOUND_SIZE)
+        || length > carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE + 32768
+    {
+        return Err(TrapError::Hypervisor("native grant extent bound".into()));
+    }
+    if length == CowArmedRanges::COMPOUND_SIZE
+        && let Some(handle) = custody
+            .frame_pool()
+            .and_then(|pool| pool.allocate_compound())
     {
         let host_ptr = handle.as_mut_ptr();
         let physical_ipa = handle.ipa();
@@ -250,16 +260,13 @@ fn allocate_grant_compound(
         return Ok((host_ptr, physical_ipa, generation));
     }
     let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-        CowArmedRanges::COMPOUND_SIZE as usize,
+        length as usize,
         crate::host_mapping::HostMappingKind::FrameCow,
     )
     .map_err(|error| TrapError::Hypervisor(format!("allocate guest COW grant: {error}")))?;
     let host_ptr = new_host.as_ptr();
     #[allow(unused_mut)]
-    let mut lease = GlobalFrameStage2Lease::reserve(
-        CowArmedRanges::COMPOUND_SIZE,
-        CowArmedRanges::COMPOUND_SIZE,
-    )?;
+    let mut lease = GlobalFrameStage2Lease::reserve(length, CowArmedRanges::COMPOUND_SIZE)?;
     let physical_ipa = lease.base;
     #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
     {
@@ -269,7 +276,7 @@ fn allocate_grant_compound(
             inventory_hv_vm_map(
                 host_ptr.cast(),
                 physical_ipa,
-                CowArmedRanges::COMPOUND_SIZE as usize,
+                length as usize,
                 u64::from(stage2_perms),
             )
         };
@@ -654,19 +661,27 @@ impl CowGrantSettlement for CarrierGuestCowSettlement {
         let Some(custody) = self.custody.upgrade() else {
             return;
         };
-        match custody.guest_cow_state(excluded.key()) {
-            Ok(Some(state)) => {
-                settle_guest_cow_completions(&state, &custody, pool, excluded);
-            }
-            // The MM retired: its inventory retires the grants EL1 used
-            // with every other mapping, and its publication's retirement
-            // releases the records.
-            Ok(None) => {}
-            Err(()) => carrick_fatal!(
-                "hvpatch::guest_cow",
-                "EL1 COW completions for MM {} whose COW runtime was never bound",
-                excluded.key()
-            ),
+        let result = crate::metadata_grant::settle_native_cow(&custody, pool, excluded).and_then(
+            |settled| {
+                if settled.is_some() {
+                    return Ok(());
+                }
+                let state = custody.guest_cow_state(excluded.key()).map_err(|()| {
+                    TrapError::Hypervisor(format!(
+                        "EL1 COW completions for MM {} whose COW runtime was never bound",
+                        excluded.key()
+                    ))
+                })?;
+                if let Some(state) = state {
+                    settle_guest_cow_completions(&state, &custody, pool, excluded);
+                }
+                // A retired MM settles its inventory and releases its records
+                // through publication retirement, without another live state.
+                Ok(())
+            },
+        );
+        if let Err(error) = result {
+            carrick_fatal!("hvpatch::guest_cow", "COW completion settlement: {error}");
         }
     }
 

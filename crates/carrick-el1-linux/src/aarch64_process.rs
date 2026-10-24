@@ -668,6 +668,7 @@ pub trait ForkStockCrossing {
     fn cross_fork_stock(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_root_exit(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
+    fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_wait_channel_wake(
         &self,
         channel: super::native_process_runtime::ProcessWaitChannel,
@@ -680,6 +681,9 @@ pub trait ForkStockCrossing {
 }
 
 impl<T: ForkStockCrossing> ForkStockCrossing for &T {
+    fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError> {
+        (**self).cross_child_reclaim(mm, cpu)
+    }
     fn cross_cow_supply(&self, address: UserVa, cpu: u64) -> Result<(), NativeProcessError> {
         (**self).cross_cow_supply(address, cpu)
     }
@@ -714,6 +718,18 @@ impl<T: ForkStockCrossing> ForkStockCrossing for &T {
 pub struct HvcForkStockCrossing;
 
 impl ForkStockCrossing for HvcForkStockCrossing {
+    fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            carrick_el1::isa::aarch64::cross_hvc_child_reclaim(mm.raw(), cpu)
+                .map_err(|_| NativeProcessError::Fault)
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (mm, cpu);
+            Err(NativeProcessError::Unsupported)
+        }
+    }
     fn cross_cow_supply(&self, address: UserVa, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
@@ -896,6 +912,7 @@ pub struct Aarch64NativeProcessService<'a, X = HvcForkStockCrossing> {
     pub carrier: NonZeroU64,
     pub crossing: X,
     pub words: Option<&'a (dyn LiveDescriptorWords + 'a)>,
+    residency: Option<&'a carrick_el1_abi::FrameGrantResidencyTable>,
 }
 
 /// ARM mechanics for the shared exact-MM native user-write continuation.
@@ -982,6 +999,7 @@ impl<'a> Aarch64NativeProcessService<'a, HvcForkStockCrossing> {
             carrier,
             crossing: HvcForkStockCrossing,
             words: None,
+            residency: None,
         })
     }
 }
@@ -1003,11 +1021,20 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
             carrier,
             crossing,
             words: None,
+            residency: None,
         }
     }
 
     pub fn with_words(mut self, words: &'a (dyn LiveDescriptorWords + 'a)) -> Self {
         self.words = Some(words);
+        self
+    }
+
+    pub fn with_fault_residency(
+        mut self,
+        residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
+    ) -> Self {
+        self.residency = Some(residency);
         self
     }
 
@@ -1032,6 +1059,77 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     // paths; by value each move held another copy on the EL1 stack (#705).
     type PreparedMm = Box<Prepared<'a>>;
     type Born = Born;
+    #[inline(never)]
+    fn apply_fault_reply(
+        &mut self,
+        slot: &carrick_el1_abi::PortalGrantSlot,
+    ) -> Result<(), carrick_core::mm::transaction::MmError> {
+        use carrick_core::mm::transaction::MmError;
+        let owner = self.portal().map_err(|_| MmError::Stale)?;
+        let window = slot.window().ok_or(MmError::Stale)?;
+        let target = carrick_core::mm::frames::grant_target(&owner, window, self.worker())?;
+        let root = target.grant().ttbr0;
+        let live = if let Some(words) = self.words {
+            PreparedWords::Borrowed(words)
+        } else {
+            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+            {
+                PreparedWords::Owned(Box::new(
+                    super::mm_portal::production::current_mm_words(
+                        carrick_el1::isa::aarch64::hardware_live_ttbr(),
+                        root,
+                        &CURRENT_MM_MAINTENANCE,
+                    )
+                    .map_err(|_| MmError::Stale)?,
+                ))
+            }
+            #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+            {
+                return Err(MmError::Core);
+            }
+        };
+        let residency = if let Some(residency) = self.residency {
+            residency
+        } else {
+            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+            {
+                carrick_el1::isa::frame_grant_residency_guest()
+            }
+            #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+            {
+                return Err(MmError::Core);
+            }
+        };
+        let receipt = carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
+            slot,
+            &*live,
+            residency,
+            target,
+            || {
+                #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+                crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, root);
+                #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+                let _ = root;
+            },
+        )
+        .ok_or(MmError::Stale)?;
+        if matches!(
+            receipt.outcome,
+            carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
+                | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied
+                        | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot
+                )
+        ) {
+            // A competing publication or changed reservation invalidates this
+            // reply, not the instruction. Retry under the current mapping;
+            // the ordinary fault policy decides whether access is still valid.
+            Ok(())
+        } else {
+            Err(MmError::Stale)
+        }
+    }
+
     fn service_mm_handle(
         &self,
         mm: &Mm,
@@ -1559,6 +1657,29 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             roots: core::ptr::from_ref(self.roots).addr(),
             mm: ReservationMm::new(binding.mm.raw()).unwrap_or_else(|| fatal()),
         });
+        // The final child may be the run's last fork. Once its translation
+        // has been released, let the shared MM owner retire the closed root
+        // now; a still-borrowed root remains in the existing retirement queue.
+        {
+            let owner = self.portal().unwrap_or_else(|_| fatal());
+            let _retained_for_later_drain = RETIRED_SPACES.drain_portal(
+                &owner,
+                self.zone,
+                carrick_sched_core::ZONE_SLOTS,
+                self.worker(),
+            );
+        }
+        // The portal borrow ends before physical table/lifecycle clearing.
+        if self
+            .crossing
+            .cross_child_reclaim(
+                ReservationMm::new(binding.mm.raw()).unwrap_or_else(|| fatal()),
+                u64::from(self.worker()),
+            )
+            .is_err()
+        {
+            fatal();
+        }
     }
     fn wake_unplaceable_wait(
         &mut self,

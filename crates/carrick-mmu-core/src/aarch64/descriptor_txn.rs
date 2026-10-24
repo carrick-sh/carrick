@@ -1184,7 +1184,7 @@ const OUTCOME_INDETERMINATE: u64 = 4;
 /// [`Self::pending_covering`] lets either venue recognize a fault inside the
 /// operation span as an in-flight edit rather than a missing mapping.
 #[repr(C, align(64))]
-#[derive(Debug)]
+#[derive(Debug, zerocopy::FromZeros)]
 pub struct DescriptorTxnSlot {
     state: AtomicU32,
     mm_key: AtomicU64,

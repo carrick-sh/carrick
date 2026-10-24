@@ -23,10 +23,9 @@ use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, RootGp
 use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
 use carrick_hal::TrapError;
 use carrick_hal::{FrameCowAuthority, PhysicalFrameInventory};
-use carrick_hal::{
-    FrameEventCapacity, FrameId, FrameInventoryEvent, FrameLength, MappingGeneration, MappingId,
-    MemPerms,
-};
+#[cfg(test)]
+use carrick_hal::{FrameEventCapacity, FrameInventoryEvent, MemPerms};
+use carrick_hal::{FrameId, FrameLength, MappingGeneration, MappingId};
 #[cfg(test)]
 use carrick_kernel::kernel::{FrameInventoryAuthority, MmId, ObjectIdRegistry};
 use carrick_mmu_core::x86::descriptor_txn::{
@@ -38,7 +37,7 @@ use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg};
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 pub const RAM_SIZE: usize = 16 * 1024 * 1024;
@@ -524,14 +523,11 @@ pub struct InitialInventory {
     expected: usize,
     committed: usize,
     guest_exposed: bool,
-    rollback_fault: Arc<AtomicBool>,
+    rollback_fault: Arc<carrick_hal::physical_grants::PhysicalGrantRollback>,
 }
 impl InitialInventory {
     pub fn frames(&self) -> &[(FrameGpa, BackingIdentity)] {
         &self.frames
-    }
-    pub fn rollback_fault(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.rollback_fault)
     }
     pub fn expect_publications(&mut self, count: usize) {
         self.expected = count;
@@ -541,99 +537,38 @@ impl InitialInventory {
     }
 
     pub fn stage(
+        rollback_fault: Arc<carrick_hal::physical_grants::PhysicalGrantRollback>,
         source: Arc<dyn PhysicalFrameInventory>,
         gpas: impl IntoIterator<Item = FrameGpa>,
         table_grants: usize,
         frame_len: u64,
-        owner_generation: NonZeroU64,
         owner: carrick_hal::GuestFrameOwner,
     ) -> Result<(Self, Vec<X86InitialBootGrant>), TrapError> {
         let mm = owner.native_mm;
-        let authority = source.bind(owner);
-        let gpas: Vec<_> = gpas.into_iter().collect();
-        if table_grants >= gpas.len() {
-            return Err(fail("initial inventory grant partition"));
-        }
-        let capacity = FrameEventCapacity::for_event_count(
-            gpas.len()
-                .checked_mul(2)
-                .ok_or_else(|| fail("initial inventory capacity"))?,
-        )
-        .map_err(|error| fail(format!("initial inventory capacity: {error}")))?;
-        let mut reservation = authority
-            .reserve(gpas.len(), gpas.len(), capacity.get())
-            .map_err(|error| fail(format!("initial inventory reserve: {error}")))?;
-        let transaction = reservation.transaction();
-        let generation = MappingGeneration::from_backend_counter(owner_generation);
-        let length = FrameLength::from_mapping_extent(
-            NonZeroU64::new(frame_len).ok_or_else(|| fail("initial frame length"))?,
-        );
-        let mut rows = Vec::with_capacity(gpas.len());
-        for (index, gpa) in gpas.into_iter().enumerate() {
-            let frame = reservation
-                .claim_frame()
-                .map_err(|error| fail(format!("initial frame candidate: {error}")))?;
-            let mapping = reservation
-                .claim_mapping()
-                .map_err(|error| fail(format!("initial mapping candidate: {error}")))?;
-            if index >= table_grants {
-                reservation
-                    .push(FrameInventoryEvent::PrepareMapping {
-                        transaction,
-                        frame,
-                        mapping,
-                        generation,
-                        gpa: carrick_guest_mem::Gpa::new(gpa.raw()),
-                        length,
-                        permissions: MemPerms {
-                            read: true,
-                            write: true,
-                            exec: false,
-                        },
-                    })
-                    .map_err(|error| fail(format!("initial inventory prepare: {error}")))?;
-                reservation
-                    .push(FrameInventoryEvent::PublishMapping {
-                        transaction,
-                        mapping,
-                        generation,
-                    })
-                    .map_err(|error| fail(format!("initial inventory publish: {error}")))?;
-            }
-            rows.push((gpa, frame, mapping, index >= table_grants));
-        }
-        let receipt = carrick_hal::UnpublishedFrameInventoryApply::apply(
-            Arc::clone(&authority),
-            reservation.commit(()),
-        )
-        .map_err(|error| fail(format!("initial inventory apply: {error}")))?;
-        let mut frames = Vec::with_capacity(rows.len() - table_grants);
-        let mut grants = Vec::with_capacity(rows.len());
-        for (gpa, frame, mapping, is_data) in rows {
-            if is_data && !receipt.authorizes(mapping, frame) {
-                return Err(fail("initial inventory missing mapping"));
-            }
-            let identity = BackingIdentity {
-                frame_id: NonZeroU64::new(frame.raw())
-                    .ok_or_else(|| fail("initial frame identity"))?,
-                mapping_id: NonZeroU64::new(mapping.raw())
-                    .ok_or_else(|| fail("initial mapping identity"))?,
-                owner_generation,
-                inventory_revision: NonZeroU64::new(receipt.revision())
-                    .ok_or_else(|| fail("initial inventory revision"))?,
-            };
-            if is_data {
-                frames.push((gpa, identity));
-            }
-            grants.push(X86InitialBootGrant {
-                gpa: gpa.raw(),
-                frame_id: frame.raw(),
-                mapping_id: mapping.raw(),
-                owner_generation: generation.raw(),
-                inventory_revision: receipt.revision(),
-            });
-        }
-        frames.sort_unstable_by_key(|(gpa, _)| gpa.raw());
+        let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
+            Arc::clone(&rollback_fault),
+            Arc::clone(&source),
+            gpas,
+            table_grants,
+            frame_len,
+            owner,
+        )?
+        .handoff()?;
+        let grants = staged
+            .grants
+            .into_iter()
+            .map(|grant| X86InitialBootGrant {
+                gpa: grant.gpa.raw(),
+                frame_id: grant.identity.frame_id.get(),
+                mapping_id: grant.identity.mapping_id.get(),
+                owner_generation: grant.identity.owner_generation.get(),
+                inventory_revision: grant.identity.inventory_revision.get(),
+            })
+            .collect();
+        let authority = staged.authority;
+        let receipt = staged.receipt;
+        let frames = staged.frames;
+        let length = staged.length;
         Ok((
             Self {
                 mm,
@@ -645,7 +580,7 @@ impl InitialInventory {
                 expected: 0,
                 committed: 0,
                 guest_exposed: false,
-                rollback_fault: Arc::new(AtomicBool::new(false)),
+                rollback_fault,
             },
             grants,
         ))
@@ -722,8 +657,12 @@ impl InventoryTransaction for InitialInventory {
 }
 impl Drop for InitialInventory {
     fn drop(&mut self) {
-        if self.receipt.is_some() && !self.guest_exposed && self.rollback().is_err() {
-            self.rollback_fault.store(true, Ordering::Release);
+        if self.receipt.is_some()
+            && !self.guest_exposed
+            && self.rollback().is_err()
+            && let Some(receipt) = self.receipt.take()
+        {
+            self.rollback_fault.retain(receipt);
         }
     }
 }
@@ -2454,7 +2393,7 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     actual_run: Arc<[AtomicU32; 2]>,
     kernel_pod_storage: Vec<anonymous_owner::KernelPodStorage>,
     initial_inventory: Option<InitialInventory>,
-    initial_rollback_fault: Option<Arc<AtomicBool>>,
+    initial_rollback_fault: Arc<carrick_hal::physical_grants::PhysicalGrantRollback>,
     peer_entry: Option<carrick_guest_arch::KernelVa>,
     peer_admission: InitialPeerAdmission,
     initial_task: Option<InitialTaskBinding>,
@@ -2484,11 +2423,7 @@ impl<M: CarrierMemoryIo> Drop for Cpl0HostCustody<M> {
         // Unwind the inventory first. Its destructor only records a refused
         // retirement; this carrier observer chooses the existing fail-stop.
         drop(self.initial_inventory.take());
-        if self
-            .initial_rollback_fault
-            .as_ref()
-            .is_some_and(|fault| fault.load(Ordering::Acquire))
-        {
+        if self.initial_rollback_fault.failed() {
             carrick_el1_linux::dispatch::invalid_completion(
                 carrick_el1_linux::dispatch::NativeInvariant::PhysicalCustody(
                     "unexposed physical inventory rollback failed",
@@ -3043,15 +2978,57 @@ mod initial_reply_tests {
     use carrick_core_abi::{X86_INITIAL_BOOT_MAGIC, X86_INITIAL_BOOT_VERSION};
 
     #[test]
+    fn shared_physical_staging_rolls_back_before_exposure() {
+        let authority = Arc::new(FrameInventoryAuthority::new());
+        let ids = Arc::new(ObjectIdRegistry::new());
+        let staged = carrick_hal::physical_grants::StagedPhysicalGrants::stage(
+            Arc::default(),
+            authority.physical_projection(ids),
+            [FrameGpa::new(0x2_0000_0000)],
+            0,
+            4096,
+            carrick_hal::GuestFrameOwner {
+                native_mm: MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).unwrap()),
+                root_generation: ContextGeneration::new(NonZeroU64::MIN),
+            },
+        )
+        .unwrap();
+        let grant = staged.grants()[0];
+        let bound = Arc::clone(staged.authority());
+        let mapping = MappingId::from_kernel_allocation(grant.identity.mapping_id);
+        let frame = FrameId::from_kernel_allocation(grant.identity.frame_id);
+        let length = FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap());
+        let before = bound
+            .mapping_is_live(
+                mapping,
+                frame,
+                carrick_guest_mem::Gpa::new(grant.gpa.raw()),
+                length,
+            )
+            .unwrap();
+        assert!(before);
+        drop(staged);
+        let after = bound
+            .mapping_is_live(
+                mapping,
+                frame,
+                carrick_guest_mem::Gpa::new(grant.gpa.raw()),
+                length,
+            )
+            .unwrap();
+        assert!(!after);
+    }
+
+    #[test]
     fn unwind_rollback_refusal_returns_control_to_the_carrier_observer() {
         let authority = Arc::new(FrameInventoryAuthority::new());
         let ids = Arc::new(ObjectIdRegistry::new());
         let (inventory, _) = InitialInventory::stage(
+            Arc::default(),
             authority.physical_projection(Arc::clone(&ids)),
             [FrameGpa::new(0x2_0000_0000)],
             0,
             4096,
-            NonZeroU64::MIN,
             carrick_hal::GuestFrameOwner {
                 native_mm: MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).unwrap()),
                 root_generation: ContextGeneration::new(NonZeroU64::MIN),
@@ -3062,8 +3039,13 @@ mod initial_reply_tests {
             .rollback_unpublished_apply(inventory.receipt.as_ref().unwrap())
             .unwrap();
         let fault = Arc::clone(&inventory.rollback_fault);
+        let retained_authority = Arc::downgrade(&inventory.authority);
         drop(inventory);
-        assert!(fault.load(Ordering::Acquire));
+        assert!(fault.failed());
+        assert!(
+            retained_authority.upgrade().is_some(),
+            "refused rollback must retain its authority and receipt"
+        );
         // The carrier observer, rather than this destructor, chooses the
         // existing fail-stop transport after all owned custody is unwound.
     }
@@ -3073,11 +3055,11 @@ mod initial_reply_tests {
         let authority = Arc::new(FrameInventoryAuthority::new());
         let ids = Arc::new(ObjectIdRegistry::new());
         let (mut inventory, _) = InitialInventory::stage(
+            Arc::default(),
             authority.physical_projection(Arc::clone(&ids)),
             [FrameGpa::new(0x2_0000_0000)],
             0,
             4096,
-            NonZeroU64::MIN,
             carrick_hal::GuestFrameOwner {
                 native_mm: MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).unwrap()),
                 root_generation: ContextGeneration::new(NonZeroU64::MIN),
@@ -3108,11 +3090,11 @@ mod initial_reply_tests {
         for (index, owner) in owners.into_iter().enumerate() {
             let mm = MmId::from_raw_u64(owner).unwrap();
             let (mut inventory, _) = InitialInventory::stage(
+                Arc::default(),
                 authority.physical_projection(Arc::clone(&ids)),
                 [FrameGpa::new(0x2_0000_0000 + index as u64 * 4096)],
                 0,
                 4096,
-                NonZeroU64::MIN,
                 carrick_hal::GuestFrameOwner {
                     native_mm: MmGeneration::new(NonZeroU64::new(mm.raw()).unwrap()),
                     root_generation: ContextGeneration::new(NonZeroU64::MIN),
@@ -3142,11 +3124,11 @@ mod initial_reply_tests {
         let authority = Arc::new(FrameInventoryAuthority::new());
         let ids = Arc::new(ObjectIdRegistry::new());
         let (mut inventory, _) = InitialInventory::stage(
+            Arc::default(),
             authority.physical_projection(Arc::clone(&ids)),
             [FrameGpa::new(0x2_0000_0000)],
             0,
             4096,
-            NonZeroU64::MIN,
             carrick_hal::GuestFrameOwner {
                 native_mm: MmGeneration::new(
                     NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM"),
@@ -3204,12 +3186,12 @@ mod initial_reply_tests {
     #[test]
     fn initial_inventory_refuses_a_grant_with_a_different_gpa() {
         let (mut inventory, _) = InitialInventory::stage(
+            Arc::default(),
             Arc::new(FrameInventoryAuthority::new())
                 .physical_projection(Arc::new(ObjectIdRegistry::new())),
             [FrameGpa::new(0x2_0000_0000)],
             0,
             4096,
-            NonZeroU64::MIN,
             carrick_hal::GuestFrameOwner {
                 native_mm: MmGeneration::new(
                     NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM"),
@@ -3230,11 +3212,11 @@ mod initial_reply_tests {
         for exposed in [false, true] {
             let authority = Arc::new(FrameInventoryAuthority::new());
             let (mut inventory, _) = InitialInventory::stage(
+                Arc::default(),
                 authority.physical_projection(Arc::new(ObjectIdRegistry::new())),
                 [FrameGpa::new(0x2_0000_0000)],
                 0,
                 4096,
-                NonZeroU64::MIN,
                 carrick_hal::GuestFrameOwner {
                     native_mm: MmGeneration::new(
                         NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM"),
@@ -3260,11 +3242,11 @@ mod initial_reply_tests {
         let base = INITIAL_EXTENT_GPA + 0x20_000;
         let authority = Arc::new(FrameInventoryAuthority::new());
         let (inventory, grants) = InitialInventory::stage(
+            Arc::default(),
             authority.physical_projection(Arc::new(ObjectIdRegistry::new())),
             (0..4).map(|index| FrameGpa::new(base + index * 4096)),
             2,
             4096,
-            NonZeroU64::MIN,
             carrick_hal::GuestFrameOwner {
                 native_mm: MmGeneration::new(
                     NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM"),
@@ -3761,7 +3743,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             actual_run: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
             kernel_pod_storage,
             initial_inventory: None,
-            initial_rollback_fault: None,
+            initial_rollback_fault: Arc::default(),
             peer_entry: None,
             peer_admission: InitialPeerAdmission::Cold,
             initial_task: None,
@@ -3832,8 +3814,8 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
     pub fn retain_initial_inventory(&mut self, inventory: InitialInventory) {
         self.0.initial_inventory = Some(inventory);
     }
-    pub fn retain_rollback_fault(&mut self, fault: Arc<AtomicBool>) {
-        self.0.initial_rollback_fault = Some(fault);
+    pub fn rollback_fault(&self) -> Arc<carrick_hal::physical_grants::PhysicalGrantRollback> {
+        Arc::clone(&self.0.initial_rollback_fault)
     }
     pub fn initial_extent(&self) -> Option<(BackingHandle, usize)> {
         self.0.initial_extent

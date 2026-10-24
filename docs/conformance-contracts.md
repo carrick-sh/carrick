@@ -549,6 +549,27 @@ same-VA isolation. Lookup work follows the physical extent index and selected
 records, without scanning other MM populations. Signed fork acceptance remains
 required.
 
+Fresh physical-grant inventory mappings start at their own initial generation;
+the carrier allocation generation remains with physical backing custody.
+Shared `StagedPhysicalGrants` owns initialization and accepts no generation
+from a backend. `native_child_empty_supply_resumes_cow_without_changing_parent`
+and `native_backing_reply_observes_a_competing_valid_publication` compose
+carrier generations 5, 6 and 7 with fresh inventory publications, USED
+settlement and neutral physical retirement. The former was red when carrier
+generation 5 was submitted as the fresh mapping's generation. The existing
+two-grant refill and bounded page-copy assertions remain unchanged.
+
+Native backing selection must exclude live or prepared inherited neighbors,
+even when the child's lazy-grant residency table has no row for them.
+`native_child_backing_selection_excludes_inherited_live_neighbor` forks an
+actual child from a two-page reservation with one resident parent page and
+requires the first supply window to contain only the absent page. The neutral
+grant owner selects the contiguous available span under the exact MM editor,
+using the same predicate that authenticates publication. Work is bounded by
+the selected window (at most 512 pages, four descriptor loads per page), not
+the MM population. The adapter submits that exact window and never crops a
+decoded transaction or changes its receipt digest.
+
 The KVM vfork VM rebuild also publishes each selected shadow pointer to the
 host-side window descriptor under its write lock. The real-KVM binding
 `vfork_rebuild_host_reads_shadow_bytes` reads distinct child bytes through
@@ -570,6 +591,15 @@ inline-Commit path. ARM settlement keeps the child space closed on a typed
 Commit refusal, failed crossing, or missing acknowledgment; these are invariant
 faults after publication, not successful forks. These host witnesses do not
 replace signed guest or KVM acceptance.
+
+Physical-custody destruction must not retain the grant-accounting lock (#569).
+`child_reclaim_and_terminal_finalization_do_not_invert_accounting_lock` drives
+that same neutral stock owner against a second executor finalizing a directory
+entry. The bounded witness rejects the ledger-to-directory edge captured on
+hardware. The HVF accounting authority exposes only completed accounting
+operations to fork callers, never a guard or a callback under the guard.
+Exact terminal receipt publication remains serialized with IPA reuse inside
+the accounting implementation; it does not admit or reclaim fork custody.
 
 Custody arrays may be allocated in either the fixed EL1 bootstrap/heap region
 or a retained dynamic metadata grant. The dynamic path shares the lifecycle

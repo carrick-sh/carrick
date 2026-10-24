@@ -30,8 +30,36 @@ use crate::asid::{AsidAllocator, AsidError, AsidGeneration};
 
 /// Strong custody of an opaque byte source, independent of its original MM.
 /// The implementing source owner authenticates the handle and generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostBackingRead {
+    identity: carrick_el1_abi::HostBackingIdentity,
+    length: usize,
+}
+impl HostBackingRead {
+    pub fn new(identity: carrick_el1_abi::HostBackingIdentity, length: usize) -> Option<Self> {
+        (length != 0
+            && length as u64 <= carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
+            && identity.advance(length as u64).is_some())
+        .then_some(Self { identity, length })
+    }
+    pub fn identity(self) -> carrick_el1_abi::HostBackingIdentity {
+        self.identity
+    }
+    pub fn length(self) -> usize {
+        self.length
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostBackingReadError {
+    Inaccessible,
+    Stale,
+    Unavailable,
+}
+
 pub trait HostBackingRetention: Send + Sync {
     fn identity(&self) -> carrick_el1_abi::HostBackingIdentity;
+    /// Returns a bounded readable prefix; no bytes beyond a backing fault are supplied.
+    fn read(&self, request: HostBackingRead) -> Result<Vec<u8>, HostBackingReadError>;
 }
 
 /// Sources inherited from an exact, live committed child. Source identities
@@ -283,6 +311,26 @@ impl SlotAbsence {
 
     pub fn mm(&self) -> ReservationMm {
         self.mm
+    }
+}
+
+/// Execution venue for a quarantine drain. A maintenance venue has no active
+/// guest MM; it is admitted only after the live hardware root matches the
+/// carrier's retained maintenance root. All-slot absence is still required.
+#[derive(Clone, Copy, Debug)]
+pub struct ReclaimExecution {
+    active: Option<ReservationMm>,
+}
+impl From<ReservationMm> for ReclaimExecution {
+    fn from(active: ReservationMm) -> Self {
+        Self {
+            active: Some(active),
+        }
+    }
+}
+impl ReclaimExecution {
+    pub fn maintenance_root(live: RootGpa, maintenance: RootGpa) -> Option<Self> {
+        (maintenance.address().raw() != 0 && live == maintenance).then_some(Self { active: None })
     }
 }
 
@@ -853,6 +901,16 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             && child.root == root
             && !self.quarantine.contains_key(&key))
         .then_some(&child.physical)
+    }
+
+    /// Physical access requires the committed root; this grants no new
+    /// semantic admission. Terminal settlement may consume an existing receipt.
+    pub fn child_physical_mut(&mut self, mm: ReservationMm, root: RootGpa) -> Option<&mut C> {
+        let child = self.children.get_mut(&MmKey::of(mm)?)?;
+        (child.root == root).then_some(&mut child.physical)
+    }
+    pub fn child_owner(&self, mm: ReservationMm) -> Option<carrick_el1_abi::El1MmHandle> {
+        Some(self.children.get(&MmKey::of(mm)?)?.owner)
     }
 
     pub fn child_lifecycle(&self, mm: ReservationMm) -> Option<ForkLifecycleLoan> {
@@ -1491,7 +1549,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     }
 
     /// Drain quarantine. A child MM is reclaimed only when it is not
-    /// `active` and `occupancy` proves no zone slot has it installed.
+    /// active in the authenticated execution venue and `occupancy` proves no zone slot has it installed.
     /// Its tables and lifecycle record are cleared and its tag retired
     /// before anything reenters the reusable stock. A child whose release,
     /// clear or tag retirement fails is deferred (counted, still
@@ -1501,13 +1559,13 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     pub fn reclaim(
         &mut self,
         ledger: &mut impl ForkTableLedger,
-        active: ReservationMm,
+        execution: impl Into<ReclaimExecution>,
         occupancy: impl Fn(ReservationMm) -> Option<SlotAbsence>,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
         mut clear_lifecycle: impl FnMut(ForkLifecycleLoan) -> bool,
         mut release: impl FnMut(&SlotAbsence) -> bool,
     ) -> Result<usize, ForkStockServiceError> {
-        let active = MmKey::of(active);
+        let active = execution.into().active.and_then(MmKey::of);
         let candidates: Vec<(MmKey, SlotAbsence)> = self
             .quarantine
             .iter_mut()
