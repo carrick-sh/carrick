@@ -968,6 +968,10 @@ impl HostIpc {
         resources.live.insert(token.get(), resource);
         Ok(token)
     }
+    #[cfg(feature = "test-support")]
+    pub fn retained_host_resources(&self) -> usize {
+        self.resources.lock().live.len()
+    }
     /// Final-description release, after leaving the descriptor table lock.
     /// Delivers guest and host wakes after leaving object locks.
     pub fn release(&self, backing: fd::BackingToken) -> Result<IpcReleased, IpcError> {
