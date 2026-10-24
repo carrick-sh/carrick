@@ -121,11 +121,7 @@ impl SyscallDispatcher {
 
 impl<'a> FsView<'a> {
     fn observe_bind(&self, vfs: &dyn carrick_vfs::Vfs) {
-        if let Some(coherence) = vfs.cache_coherence()
-            && let Some(observations) = self.resolve_observations.borrow_mut().last_mut()
-        {
-            merge_observations(observations, &[CoherenceStamp::observe(coherence)]);
-        }
+        self.path_view().observe_bind(vfs)
     }
     /// Layered "is this a directory?" probe used by mkdirat / openat
     /// (O_CREAT) parent-existence checks. The synthetic /proc and
@@ -133,26 +129,7 @@ impl<'a> FsView<'a> {
     /// `mkdir("/proc/.tmp-XYZ")` can be detected as EEXIST rather
     /// than the wrong errno.
     pub(super) fn path_is_directory(&self, path: &str) -> bool {
-        if path == "/" || path.is_empty() {
-            return true;
-        }
-        if let Some(m) = self.fs.vfs_mounts.resolve(path) {
-            self.observe_bind(m.vfs);
-            if let Ok(md) = m.vfs.lookup(&m.full_path) {
-                return md.kind == carrick_vfs::EntryKind::Directory;
-            }
-        }
-        match self.fs.rootfs_vfs.overlay.lookup(path) {
-            Some(OverlayEntry::Dir) => return true,
-            Some(OverlayEntry::Deleted) | Some(OverlayEntry::File(_)) => return false,
-            None => {}
-        }
-        if let Some(rootfs) = &self.fs.rootfs_vfs.rootfs
-            && let Ok(metadata) = rootfs.metadata(path)
-        {
-            return metadata.kind == RootFsEntryKind::Directory;
-        }
-        false
+        self.path_view().path_is_directory(path)
     }
 
     /// Layered metadata probe. Mirrors the rootfs-or-synthetic chain
@@ -183,21 +160,7 @@ impl<'a> FsView<'a> {
     /// first, then rootfs/mounts) — mirrors `readlinkat`. `None` if `path` isn't
     /// a symlink any backend can read.
     pub(super) fn readlink_layered(&self, path: &str) -> Option<String> {
-        if let Some(target) = self.fs.rootfs_vfs.overlay.read_link(path) {
-            return Some(target);
-        }
-        use carrick_vfs::Vfs as _;
-        if let Some(m) = self.fs.vfs_mounts.resolve(path) {
-            self.observe_bind(m.vfs);
-            if let Ok(target) = m.vfs.readlink(&m.full_path) {
-                return Some(target.to_string_lossy().into_owned());
-            }
-        }
-        self.fs
-            .rootfs_vfs
-            .readlink(path)
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
+        self.path_view().readlink_layered(path)
     }
 
     /// Resolve `path` following a trailing symlink chain THROUGH the full VFS
@@ -217,16 +180,7 @@ impl<'a> FsView<'a> {
     /// File.) Mounts answer for their subtree; otherwise the overlay-aware
     /// `lookup_nofollow` does.
     pub(crate) fn layered_lstat(&self, path: &str) -> Result<RootFsMetadata, LinuxErrno> {
-        if let Some(m) = self.fs.vfs_mounts.resolve(path) {
-            self.observe_bind(m.vfs);
-            if let Ok(md) = m.vfs.lookup_nofollow(&m.full_path) {
-                return Ok(vfs_md_to_rootfs_md(path, &md));
-            }
-        }
-        self.fs
-            .rootfs_vfs
-            .lookup_nofollow(path)
-            .map(|md| vfs_md_to_rootfs_md(path, &md))
+        self.path_view().layered_lstat(path)
     }
 
     /// Join a relative symlink TARGET onto the directory holding the link.
@@ -245,51 +199,11 @@ impl<'a> FsView<'a> {
     /// Targets without `..` keep the cheap lexical join, which is almost all of
     /// them.
     fn join_symlink_target(&self, parent: &str, target: &str) -> Result<String, LinuxErrno> {
-        if !target.split('/').any(|c| c == "..") {
-            return Ok(join_rootfs_path(parent, target));
-        }
-        match DotdotDepthGuard::enter() {
-            Some(_guard) => self.resolve_dotdot_symlink_aware(parent, target),
-            None => Err(crate::linux_abi::LINUX_ELOOP),
-        }
+        self.path_view().join_symlink_target(parent, target)
     }
 
     pub(crate) fn canonicalize_following(&self, path: &str) -> Result<String, LinuxErrno> {
-        check_component_length(path)?;
-        let mut cur = path.to_string();
-        for _ in 0..40 {
-            check_component_length(&cur)?;
-            let md = self.layered_lstat(&cur)?;
-            if md.kind != RootFsEntryKind::Symlink {
-                return Ok(cur);
-            }
-            let target = self
-                .readlink_layered(&cur)
-                .ok_or(crate::linux_abi::LINUX_ENOENT)?;
-            let source = cur;
-            let next = if target.starts_with('/') {
-                join_rootfs_path("/", &target)
-            } else {
-                let parent = Path::new(&source)
-                    .parent()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "/".to_string());
-                self.join_symlink_target(&parent, &target)?
-            };
-            // A final symlink can expand to itself or below itself
-            // (`link -> link/inside`). The next host lstat then sees the link as
-            // an intermediate component and may collapse the cycle to ENOENT.
-            // Reject the recursive prefix before crossing that host boundary.
-            if next == source
-                || next
-                    .strip_prefix(&source)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-            {
-                return Err(crate::linux_abi::LINUX_ELOOP);
-            }
-            cur = next;
-        }
-        Err(crate::linux_abi::LINUX_ELOOP)
+        self.path_view().canonicalize_following(path)
     }
 
     /// Like `canonicalize_following`, but a final component that resolves to a
@@ -805,61 +719,7 @@ impl<'a> FsView<'a> {
         anchor: &str,
         path: &str,
     ) -> Result<String, LinuxErrno> {
-        let mut all: Vec<&str> = Vec::new();
-        if !Path::new(path).is_absolute() {
-            all.extend(anchor.split('/').filter(|c| !c.is_empty() && *c != "."));
-        }
-        all.extend(path.split('/').filter(|c| !c.is_empty() && *c != "."));
-
-        // `base` is the resolved, symlink-free prefix so far (no trailing slash;
-        // empty string == root).
-        let mut base = String::new();
-        let last = all.len().saturating_sub(1);
-        for (i, comp) in all.iter().enumerate() {
-            if *comp == ".." {
-                // Climb one resolved component (never above root).
-                match base.rfind('/') {
-                    Some(pos) => base.truncate(pos),
-                    None => base.clear(),
-                }
-                continue;
-            }
-            let mut candidate = base.clone();
-            candidate.push('/');
-            candidate.push_str(comp);
-            if i == last {
-                // Final component: leave it unfollowed for the caller.
-                base = candidate;
-                break;
-            }
-            match self.layered_lstat(&candidate) {
-                Ok(md) if md.kind == RootFsEntryKind::Symlink => {
-                    match self.canonicalize_following(&candidate) {
-                        Ok(target) if self.path_is_directory(&target) => {
-                            base = target.trim_end_matches('/').to_owned();
-                        }
-                        // Symlink to a non-directory can't be traversed as an
-                        // intermediate; ELOOP/other errors propagate.
-                        Ok(_) => return Err(LINUX_ENOTDIR),
-                        Err(e) => return Err(e),
-                    }
-                }
-                // A real directory intermediate: descend.
-                Ok(md) if md.kind == RootFsEntryKind::Directory => base = candidate,
-                // An existing non-directory intermediate (regular file, device,
-                // FIFO) can't be traversed → ENOTDIR.
-                Ok(_) => return Err(LINUX_ENOTDIR),
-                // A missing or otherwise inaccessible intermediate stops path
-                // resolution immediately. In particular, `missing/..` is ENOENT
-                // on Linux; it must not collapse back to the parent.
-                Err(errno) => return Err(errno),
-            }
-        }
-        Ok(if base.is_empty() {
-            "/".to_owned()
-        } else {
-            base
-        })
+        self.path_view().resolve_dotdot_symlink_aware(anchor, path)
     }
 
     /// Rewrite `abs` so every intermediate (non-final) directory-symlink
@@ -952,5 +812,205 @@ impl<'a> FsView<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// Read-only layered path authority, independent of a host task binding.
+/// Filesystem syscalls and executable services use this same resolver.
+pub(in crate::dispatch) struct LayeredPathView<'a> {
+    pub rootfs: &'a carrick_vfs::RootFsVfs,
+    pub mounts: &'a carrick_vfs::VfsMounts,
+    pub resolve_observations: &'a std::cell::RefCell<Vec<Vec<CoherenceStamp>>>,
+}
+
+impl FsView<'_> {
+    fn path_view(&self) -> LayeredPathView<'_> {
+        LayeredPathView {
+            rootfs: &self.fs.rootfs_vfs,
+            mounts: &self.fs.vfs_mounts,
+            resolve_observations: &self.resolve_observations,
+        }
+    }
+}
+
+impl LayeredPathView<'_> {
+    pub(in crate::dispatch) fn observe_bind(&self, vfs: &dyn carrick_vfs::Vfs) {
+        if let Some(coherence) = vfs.cache_coherence()
+            && let Some(observations) = self.resolve_observations.borrow_mut().last_mut()
+        {
+            merge_observations(observations, &[CoherenceStamp::observe(coherence)]);
+        }
+    }
+
+    pub(in crate::dispatch) fn path_is_directory(&self, path: &str) -> bool {
+        if path == "/" || path.is_empty() {
+            return true;
+        }
+        if let Some(m) = self.mounts.resolve(path) {
+            self.observe_bind(m.vfs);
+            if let Ok(md) = m.vfs.lookup(&m.full_path) {
+                return md.kind == carrick_vfs::EntryKind::Directory;
+            }
+        }
+        match self.rootfs.overlay.lookup(path) {
+            Some(OverlayEntry::Dir) => return true,
+            Some(OverlayEntry::Deleted) | Some(OverlayEntry::File(_)) => return false,
+            None => {}
+        }
+        if let Some(rootfs) = &self.rootfs.rootfs
+            && let Ok(metadata) = rootfs.metadata(path)
+        {
+            return metadata.kind == RootFsEntryKind::Directory;
+        }
+        false
+    }
+
+    pub(in crate::dispatch) fn readlink_layered(&self, path: &str) -> Option<String> {
+        if let Some(target) = self.rootfs.overlay.read_link(path) {
+            return Some(target);
+        }
+        use carrick_vfs::Vfs as _;
+        if let Some(m) = self.mounts.resolve(path) {
+            self.observe_bind(m.vfs);
+            if let Ok(target) = m.vfs.readlink(&m.full_path) {
+                return Some(target.to_string_lossy().into_owned());
+            }
+        }
+        self.rootfs
+            .readlink(path)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+
+    pub(in crate::dispatch) fn layered_lstat(
+        &self,
+        path: &str,
+    ) -> Result<RootFsMetadata, LinuxErrno> {
+        if let Some(m) = self.mounts.resolve(path) {
+            self.observe_bind(m.vfs);
+            if let Ok(md) = m.vfs.lookup_nofollow(&m.full_path) {
+                return Ok(vfs_md_to_rootfs_md(path, &md));
+            }
+        }
+        self.rootfs
+            .lookup_nofollow(path)
+            .map(|md| vfs_md_to_rootfs_md(path, &md))
+    }
+
+    pub(in crate::dispatch) fn join_symlink_target(
+        &self,
+        parent: &str,
+        target: &str,
+    ) -> Result<String, LinuxErrno> {
+        if !target.split('/').any(|c| c == "..") {
+            return Ok(join_rootfs_path(parent, target));
+        }
+        match DotdotDepthGuard::enter() {
+            Some(_guard) => self.resolve_dotdot_symlink_aware(parent, target),
+            None => Err(crate::linux_abi::LINUX_ELOOP),
+        }
+    }
+
+    pub(in crate::dispatch) fn canonicalize_following(
+        &self,
+        path: &str,
+    ) -> Result<String, LinuxErrno> {
+        check_component_length(path)?;
+        let mut cur = path.to_string();
+        for _ in 0..40 {
+            check_component_length(&cur)?;
+            let md = self.layered_lstat(&cur)?;
+            if md.kind != RootFsEntryKind::Symlink {
+                return Ok(cur);
+            }
+            let target = self
+                .readlink_layered(&cur)
+                .ok_or(crate::linux_abi::LINUX_ENOENT)?;
+            let source = cur;
+            let next = if target.starts_with('/') {
+                join_rootfs_path("/", &target)
+            } else {
+                let parent = Path::new(&source)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/".to_string());
+                self.join_symlink_target(&parent, &target)?
+            };
+            // A final symlink can expand to itself or below itself
+            // (`link -> link/inside`). The next host lstat then sees the link as
+            // an intermediate component and may collapse the cycle to ENOENT.
+            // Reject the recursive prefix before crossing that host boundary.
+            if next == source
+                || next
+                    .strip_prefix(&source)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                return Err(crate::linux_abi::LINUX_ELOOP);
+            }
+            cur = next;
+        }
+        Err(crate::linux_abi::LINUX_ELOOP)
+    }
+
+    pub(in crate::dispatch) fn resolve_dotdot_symlink_aware(
+        &self,
+        anchor: &str,
+        path: &str,
+    ) -> Result<String, LinuxErrno> {
+        let mut all: Vec<&str> = Vec::new();
+        if !Path::new(path).is_absolute() {
+            all.extend(anchor.split('/').filter(|c| !c.is_empty() && *c != "."));
+        }
+        all.extend(path.split('/').filter(|c| !c.is_empty() && *c != "."));
+
+        // `base` is the resolved, symlink-free prefix so far (no trailing slash;
+        // empty string == root).
+        let mut base = String::new();
+        let last = all.len().saturating_sub(1);
+        for (i, comp) in all.iter().enumerate() {
+            if *comp == ".." {
+                // Climb one resolved component (never above root).
+                match base.rfind('/') {
+                    Some(pos) => base.truncate(pos),
+                    None => base.clear(),
+                }
+                continue;
+            }
+            let mut candidate = base.clone();
+            candidate.push('/');
+            candidate.push_str(comp);
+            if i == last {
+                // Final component: leave it unfollowed for the caller.
+                base = candidate;
+                break;
+            }
+            match self.layered_lstat(&candidate) {
+                Ok(md) if md.kind == RootFsEntryKind::Symlink => {
+                    match self.canonicalize_following(&candidate) {
+                        Ok(target) if self.path_is_directory(&target) => {
+                            base = target.trim_end_matches('/').to_owned();
+                        }
+                        // Symlink to a non-directory can't be traversed as an
+                        // intermediate; ELOOP/other errors propagate.
+                        Ok(_) => return Err(LINUX_ENOTDIR),
+                        Err(e) => return Err(e),
+                    }
+                }
+                // A real directory intermediate: descend.
+                Ok(md) if md.kind == RootFsEntryKind::Directory => base = candidate,
+                // An existing non-directory intermediate (regular file, device,
+                // FIFO) can't be traversed → ENOTDIR.
+                Ok(_) => return Err(LINUX_ENOTDIR),
+                // A missing or otherwise inaccessible intermediate stops path
+                // resolution immediately. In particular, `missing/..` is ENOENT
+                // on Linux; it must not collapse back to the parent.
+                Err(errno) => return Err(errno),
+            }
+        }
+        Ok(if base.is_empty() {
+            "/".to_owned()
+        } else {
+            base
+        })
     }
 }

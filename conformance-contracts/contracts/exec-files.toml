@@ -1,0 +1,16 @@
+schema_version = 1
+id = "process.exec.files"
+title = "Exec file preparation retains exact caller resources without a host task"
+guest_surfaces = ["syscall:execve", "syscall:execveat", "proc:exe", "proc:fd"]
+semantic_authority = ["execve(2): path lookup and execute permission apply to the calling process; selected executable objects survive pathname replacement"]
+fixture = "Two independent live caller resources, retained executable sources and filesystem services after dispatcher release"
+scale_points = [1, 2]
+structural_budgets = []
+rationale = "The loader consumes retained filesystem and source capabilities rather than recapturing a host task. Path resolution and prepared-image caching share their production implementations with filesystem dispatch. Capability construction retains a fixed number of authorities, not a scan of the descriptor table; descriptor access remains with the FD authority. This contract does not claim ring transaction publication or a runtime ratio."
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::executable_authority::tests::exec_capabilities_keep_two_callers_without_host_task_bindings; retained_host_source_rechecks_execute_mode_on_exact_object; proc_exe_fd_keeps_original_source_after_process_exec_identity_changes; carrick-runtime::runtime::exec::tests"
+
+[bindings.unresolved]
+embed_structural = "Signed native child exec and new-MM publication remain #785 cuts 2-4; this binding verifies retained file services only."
+docker = "Native arm64 differential exec errno, shebang and magic-link witnesses remain required for full slice acceptance; Docker is unavailable on ctb-w1."
