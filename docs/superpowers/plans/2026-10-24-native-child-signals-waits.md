@@ -143,13 +143,13 @@ or host-backed path.
   explicit SIG_IGN/SA_NOCLDWAIT auto-reap, EINTR/SA_RESTART, and SIGPIPE
   delivery to the exact native writer.
 
-- [ ] **Step 1: Add a composed parent/child witness covering default SIGCHLD zombie retention, one blocked wait4 wake, and one reap; keep existing action-policy unit tests as the explicit-ignore/SA_NOCLDWAIT proof.**
+- [x] **Step 1: Add a composed parent/child witness covering default SIGCHLD zombie retention, one blocked wait4 wake, and one reap; keep existing action-policy unit tests as the explicit-ignore/SA_NOCLDWAIT proof.**
 
-- [ ] **Step 2: Bind the existing production ARM EINTR/SA_RESTART tests and assert their literal EINTR value where missing.**
+- [x] **Step 2: Bind the existing production ARM EINTR/SA_RESTART tests and assert their literal EINTR value where missing.**
 
-- [ ] **Step 3: Connect or witness the IPC SIGPIPE handback at the native signal owner: default SIGPIPE terminates the writer with wait status 13, while ignored SIGPIPE leaves EPIPE (32) as the operation result. Do not alter slice 3's FD authority.**
+- [x] **Step 3: Connect or witness the IPC SIGPIPE handback at the native signal owner: default SIGPIPE terminates the writer with wait status 13, while ignored SIGPIPE leaves EPIPE (32) as the operation result. Do not alter slice 3's FD authority.**
 
-- [ ] **Step 4: Run focused signal, wait, and IPC continuation tests, then commit.**
+- [x] **Step 4: Run focused signal, wait, and IPC continuation tests, then commit.**
 
 ### Task 6: Close Reparenting and Concurrent Group Exit
 

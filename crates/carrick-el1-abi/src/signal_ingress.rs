@@ -13,7 +13,7 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Transport protocol for the shared ARM EL1 / x86 CPL0 ingress record.
-pub const SIGNAL_INGRESS_PROTOCOL: u64 = 7;
+pub const SIGNAL_INGRESS_PROTOCOL: u64 = 8;
 
 /// Shared queue capacity; event producers must retain ownership on fullness.
 pub const SIGNAL_INGRESS_CAPACITY: usize = 64;
@@ -66,7 +66,8 @@ impl SignalEventGeneration {
     }
 }
 
-/// The host facility that observed an external signal event.
+/// The facility that observed an external signal or completed deferred
+/// in-zone work on behalf of the ring owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ExternalSignalSource {
@@ -74,6 +75,7 @@ pub enum ExternalSignalSource {
     IntervalTimer = 2,
     HostFault = 3,
     PosixTimer = 4,
+    InZoneIpc = 5,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
