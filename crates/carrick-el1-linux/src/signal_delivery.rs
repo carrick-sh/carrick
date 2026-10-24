@@ -104,7 +104,7 @@ where
         }
         policy::Disposition::Default => {
             if let policy::Delivery::Terminate { .. } = policy::default_delivery(sig) {
-                Some(match process.exit_with_signal(sig.number() as u8) {
+                Some(match process.exit_with_signal(sig) {
                     Ok(_) => CompletionRoute::Suspended,
                     Err(NativeProcessError::GroupExitCustody) => machine.group_exit_custody(task),
                     Err(_) => CompletionRoute::InvalidCompletion,
@@ -240,13 +240,11 @@ where
     A: SignalMachine<C>,
 {
     if original == Signal::SEGV {
-        return Some(
-            match process.exit_with_signal(Signal::SEGV.number() as u8) {
-                Ok(_) => CompletionRoute::Suspended,
-                Err(NativeProcessError::GroupExitCustody) => machine.group_exit_custody(task),
-                Err(_) => CompletionRoute::InvalidCompletion,
-            },
-        );
+        return Some(match process.exit_with_signal(Signal::SEGV) {
+            Ok(_) => CompletionRoute::Suspended,
+            Err(NativeProcessError::GroupExitCustody) => machine.group_exit_custody(task),
+            Err(_) => CompletionRoute::InvalidCompletion,
+        });
     }
     let (_, slot) = task.lifecycle_refs()?;
     if process.force_sigsegv(blocked).is_err() {

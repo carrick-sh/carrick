@@ -4712,10 +4712,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     /// Host owner-wait cancellation is an irrevocable native fatal obligation,
     /// even if a sibling selected the process-directed SIGKILL first.
     pub fn cancel_owner_wait(&mut self) -> Result<LifecycleOutcome, NativeProcessError> {
-        self.exit_with_signal(carrick_signal_core::policy::Signal::KILL.number() as u8)
+        self.exit_with_signal(carrick_signal_core::policy::Signal::KILL)
     }
-    pub fn exit_with_signal(&mut self, sig: u8) -> Result<LifecycleOutcome, NativeProcessError> {
-        let wait_status = LinuxWaitStatus::signaled(sig, false);
+    pub fn exit_with_signal(
+        &mut self,
+        signal: carrick_signal_core::policy::Signal,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
+        let carrick_signal_core::policy::Delivery::Terminate { core_dump } =
+            carrick_signal_core::policy::default_delivery(signal)
+        else {
+            return Err(NativeProcessError::Invalid);
+        };
+        let wait_status = LinuxWaitStatus::signaled(signal.number() as u8, core_dump);
         self.exit_with_status(wait_status, OwnerEntry::Exception)
     }
     #[inline(never)]
@@ -10332,7 +10340,7 @@ mod tests {
             .enter(source, &task, words(address), &mut service)
             .unwrap();
         assert!(matches!(
-            entry.exit_with_signal(15),
+            entry.exit_with_signal(carrick_signal_core::policy::Signal::from_number(15).unwrap()),
             Ok(LifecycleOutcome::Transferred {
                 progress: carrick_core::Served::Idle,
                 ..
@@ -10625,7 +10633,9 @@ mod tests {
                 LinuxWaitStatus::from_wait_encoding(9 << 8)
             };
             let outcome = if signal_exit {
-                entry.exit_with_signal(15).unwrap()
+                entry
+                    .exit_with_signal(carrick_signal_core::policy::Signal::from_number(15).unwrap())
+                    .unwrap()
             } else {
                 entry.exit_group(9)
             };
@@ -11349,7 +11359,11 @@ mod tests {
                     .unwrap();
                 let claim = child_page.claim_any().unwrap();
                 assert!(matches!(
-                    child_entry.exit_with_signal(15).unwrap(),
+                    child_entry
+                        .exit_with_signal(
+                            carrick_signal_core::policy::Signal::from_number(15).unwrap(),
+                        )
+                        .unwrap(),
                     LifecycleOutcome::Transferred { .. }
                 ));
                 assert!(child_entry.take_handoff_receipt().is_some());
@@ -11375,7 +11389,12 @@ mod tests {
                     let result =
                         release_bucket_when_publisher_waits(parent_bucket, &waiting, || {
                             if let Some(signal) = status.term_signal() {
-                                child_entry.exit_with_signal(signal)
+                                child_entry.exit_with_signal(
+                                    carrick_signal_core::policy::Signal::from_number(i32::from(
+                                        signal,
+                                    ))
+                                    .unwrap(),
+                                )
                             } else {
                                 Ok(child_entry.exit_group(7))
                             }

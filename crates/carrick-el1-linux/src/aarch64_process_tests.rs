@@ -1280,9 +1280,36 @@ fn activate(
     task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
 }
 
-/// Red-first Test 3: wait4 consumes the zombie exactly once with exact status copied.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum Wait4TerminalCase {
+    Exited,
+    CoreSignal,
+}
+
+/// Red-first Test 3: wait4 consumes an exited zombie exactly once with exact status copied.
+#[cfg(test)]
 #[test]
 fn test_wait4_consumes_zombie_once_with_exact_status() {
+    wait4_consumes_zombie_once_with_exact_status(Wait4TerminalCase::Exited);
+}
+
+/// A default core signal selected by the production delivery owner must retain
+/// Linux's bit-7 core marker through child retirement and the shared wait4
+/// owner. This is a two-process witness: the parent publishes SIGSEGV, the
+/// child consumes it at the ARM return checkpoint, and the parent reaps it.
+#[cfg(test)]
+#[test]
+fn arm_wait4_reports_default_core_signal_from_production_delivery() {
+    wait4_consumes_zombie_once_with_exact_status(Wait4TerminalCase::CoreSignal);
+}
+
+#[cfg(test)]
+fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
+    use carrick_personality_linux::signal::{
+        ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
+    };
+
     let fixture = Fixture::new(0x10000, asid(1));
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -1328,6 +1355,51 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
             panic!("expected fork return");
         };
         child_pid = result.raw() as u32;
+        for selector in [u64::from(child_pid), u64::MAX, 0] {
+            let LifecycleOutcome::Returned { result, .. } = parent_entry.wait4(
+                ProcessWaitPid::from_syscall_argument(selector),
+                UserVa::new(0),
+                LinuxWaitOptions::WNOHANG,
+                UserVa::new(0),
+            ) else {
+                panic!("live-child selector must not park");
+            };
+            assert_eq!(result.raw(), 0, "matching live child returns WNOHANG zero");
+        }
+        carrick_personality_linux::identity::ProcessIdentityVenue::set_pgid(
+            &mut parent_entry,
+            child_pid as i32,
+            child_pid as i32,
+        )
+        .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = parent_entry.wait4(
+            ProcessWaitPid::from_syscall_argument(0),
+            UserVa::new(0),
+            LinuxWaitOptions::WNOHANG,
+            UserVa::new(0),
+        ) else {
+            panic!("empty caller process group must not park");
+        };
+        assert_eq!(result.raw(), -10, "no matching children returns ECHILD");
+        let child_group = (-(i64::from(child_pid))) as u64;
+        let LifecycleOutcome::Returned { result, .. } = parent_entry.wait4(
+            ProcessWaitPid::from_syscall_argument(child_group),
+            UserVa::new(0),
+            LinuxWaitOptions::WNOHANG,
+            UserVa::new(0),
+        ) else {
+            panic!("matching child process group must not park");
+        };
+        assert_eq!(result.raw(), 0, "-pgid selects the regrouped live child");
+        if matches!(terminal, Wait4TerminalCase::CoreSignal) {
+            parent_entry
+                .kill(
+                    SignalProcessSelector::from_abi(u64::from(child_pid)),
+                    SignalRequest::from_abi(11).unwrap(),
+                    SignalInfo::Generated(None),
+                )
+                .unwrap();
+        }
     }
 
     let parent_key = TaskKey {
@@ -1369,7 +1441,8 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
         .zone
         .requeue_preempted(fixture.slot, parent_binding.record.id);
 
-    // Now child exits with status 9
+    // Now the child either exits normally or consumes a default core signal
+    // through the same production return checkpoint used by native execution.
     let child_source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -1400,14 +1473,47 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
                 &mut child_service,
             )
             .unwrap();
-        let exit_outcome = child_entry.exit_group(9);
-        assert!(matches!(
-            exit_outcome,
-            LifecycleOutcome::Transferred {
-                progress: carrick_core::Served::Idle,
-                ..
+        match terminal {
+            Wait4TerminalCase::Exited => {
+                let exit_outcome = child_entry.exit_group(9);
+                assert!(matches!(
+                    exit_outcome,
+                    LifecycleOutcome::Transferred {
+                        progress: carrick_core::Served::Idle,
+                        ..
+                    }
+                ));
             }
-        ));
+            Wait4TerminalCase::CoreSignal => {
+                assert!(child_entry.signal_checkpoint_needed());
+                let mut frame = carrick_el1_abi::TrapFrame::default();
+                let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+                let child_control_address = fixture
+                    .zone
+                    .record(child_binding.record.id)
+                    .identity()
+                    .control_slot;
+                // SAFETY: `activate` authenticated this exact live record and
+                // published its retained lifecycle control immediately above.
+                let child_control = unsafe {
+                    &*(child_control_address as *const carrick_el1_abi::ThreadControlSlot)
+                };
+                assert_eq!(
+                    super::signal_delivery::deliver_signal_with_control(
+                        &child_task,
+                        child_control,
+                        &mut child_entry,
+                        &mut frame,
+                        zerocopy::IntoBytes::as_bytes(&fp),
+                        &mut ArmWaitSignalMachine {
+                            user_sp: UserVa::new(0),
+                            backend: ArmWaitSignalBackend,
+                        },
+                    ),
+                    Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended)
+                );
+            }
+        }
     }
 
     // Now parent calls wait4 to consume the zombie
@@ -1434,11 +1540,18 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
     let si_signo = child_info.si_signo;
     let si_code = child_info.si_code;
     assert_eq!(si_signo, 17);
-    assert_eq!(si_code, carrick_syscall_abi::LINUX_CLD_EXITED);
+    let expected_code = match terminal {
+        Wait4TerminalCase::Exited => carrick_syscall_abi::LINUX_CLD_EXITED,
+        Wait4TerminalCase::CoreSignal => carrick_syscall_abi::LINUX_CLD_DUMPED,
+    };
+    assert_eq!(si_code, expected_code);
     assert_eq!(child_info.si_addr as u32, child_pid);
     assert_eq!(
         i32::from_le_bytes(child_info._pad[0..4].try_into().unwrap()),
-        9
+        match terminal {
+            Wait4TerminalCase::Exited => 9,
+            Wait4TerminalCase::CoreSignal => 11,
+        }
     );
 
     let wait_outcome = parent_entry.wait4(
@@ -1452,10 +1565,17 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
         wait_outcome,
         LifecycleOutcome::Returned { result, .. } if result.raw() == child_pid as i64
     ));
-    assert_eq!(
-        status_storage,
-        LinuxWaitStatus::from_wait_encoding(9 << 8).raw()
-    );
+    let expected_status = match terminal {
+        Wait4TerminalCase::Exited => 9 << 8,
+        Wait4TerminalCase::CoreSignal => 11 | 0x80,
+    };
+    assert_eq!(status_storage, expected_status);
+    if matches!(terminal, Wait4TerminalCase::CoreSignal) {
+        assert_ne!(status_storage & 0x7f, 0, "WIFSIGNALED");
+        assert_ne!(status_storage & 0x7f, 0x7f, "WIFSIGNALED");
+        assert_eq!(status_storage & 0x7f, 11, "WTERMSIG");
+        assert_eq!(status_storage & 0x80, 0x80, "core flag");
+    }
 
     // Second wait on the consumed child must fail with ECHILD (error code -10)
     let re_wait = parent_entry.wait4(
@@ -1467,6 +1587,16 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
     assert!(matches!(
         re_wait,
         LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::NoChild.errno()
+    ));
+    let no_children = parent_entry.wait4(
+        ProcessWaitPid::from_syscall_argument(u64::MAX),
+        status_va,
+        LinuxWaitOptions::WNOHANG,
+        UserVa::new(0),
+    );
+    assert!(matches!(
+        no_children,
+        LifecycleOutcome::Returned { result, .. } if result.raw() == -10
     ));
 }
 
