@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 18;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 19;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
@@ -191,6 +191,55 @@ pub struct BlockedMask(pub u64);
 )]
 #[repr(transparent)]
 pub struct PendingSignals(pub u64);
+
+/// A realtime signal cannot use the coalescing in-zone standard-signal seam.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct RealtimeInZoneSignal;
+
+/// Exact-thread standard signals completed by an in-zone host service.
+///
+/// Publication is admission: the fixed bitset cannot fill, and Linux standard
+/// signals merge by signum.  The native checkpoint moves the bits into its
+/// shared pending owner before the syscall return can reach EL0.
+#[repr(transparent)]
+#[derive(::core::fmt::Debug)]
+struct InZoneStandardPending(AtomicU32);
+
+impl InZoneStandardPending {
+    const fn new() -> Self {
+        Self(AtomicU32::new(0))
+    }
+
+    fn post(
+        &self,
+        signal: carrick_signal_core::policy::Signal,
+    ) -> Result<(), RealtimeInZoneSignal> {
+        if signal.is_realtime() {
+            return Err(RealtimeInZoneSignal);
+        }
+        self.0
+            .fetch_or(1_u32 << (signal.number() - 1), Ordering::Release);
+        Ok(())
+    }
+
+    fn take(&self) -> carrick_signal_core::SignalSet {
+        carrick_signal_core::SignalSet::from_bits(u64::from(self.0.swap(0, Ordering::AcqRel)))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 0
+    }
+
+    fn reset(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+}
 
 /// A pool entry: state word plus payload.
 #[repr(C, align(16))]
@@ -500,6 +549,7 @@ pub struct ThreadControlSlot {
     non_interrupting: AtomicU64,
     native_pending: PendingSummary,
     native_pending_writer: AtomicU32,
+    in_zone_standard_pending: InZoneStandardPending,
     /// The exact thread's sole affinity authority, shared by ring and host.
     affinity: carrick_core::affinity::AffinityAuthority,
     // Allocation aliases survive reset; the carrier pins both mappings before
@@ -611,6 +661,7 @@ impl ThreadControlSlot {
             non_interrupting: AtomicU64::new(0),
             native_pending: PendingSummary::new(),
             native_pending_writer: AtomicU32::new(0),
+            in_zone_standard_pending: InZoneStandardPending::new(),
             service: carrick_core_abi::service::ServiceCell::new(),
         }
     }
@@ -687,6 +738,24 @@ impl ThreadControlSlot {
         &self.pending
     }
 
+    /// Admit one standard signal owed by an in-zone host completion.
+    pub fn post_in_zone_standard_signal(
+        &self,
+        signal: carrick_signal_core::policy::Signal,
+    ) -> Result<(), RealtimeInZoneSignal> {
+        self.in_zone_standard_pending.post(signal)
+    }
+
+    /// Whether the native return checkpoint must import an in-zone signal.
+    pub fn has_in_zone_standard_signal(&self) -> bool {
+        !self.in_zone_standard_pending.is_empty()
+    }
+
+    /// Move all admitted standard signals to the native pending owner.
+    pub fn take_in_zone_standard_signals(&self) -> carrick_signal_core::SignalSet {
+        self.in_zone_standard_pending.take()
+    }
+
     fn reset(
         &self,
         blocked: BlockedMask,
@@ -713,6 +782,7 @@ impl ThreadControlSlot {
         self.birth_task.store(0, Ordering::Relaxed);
         self.birth_serial.clear(Ordering::Relaxed);
         self.non_interrupting.store(0, Ordering::Relaxed);
+        self.in_zone_standard_pending.reset();
         self.forwarded_saved_mask.store(0, Ordering::Relaxed);
         self.forwarded_mask_armed.store(0, Ordering::Relaxed);
         // Keep the sequence even: a stale odd value would wedge readers.
@@ -2029,7 +2099,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 46] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 47] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::offset_of!(PoolEntry, birth) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, terminal) as u64,
@@ -2054,6 +2124,7 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 46] = [
     ::core::mem::offset_of!(ThreadControlSlot, pending) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, native_pending) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, native_pending_writer) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, in_zone_standard_pending) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, zone_seq) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, zone_incarnation) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, zone_id) as u64,
@@ -2380,6 +2451,29 @@ mod tests {
         .unwrap();
         assert_eq!(control.pending().load(), PendingSignals(0));
         drop(next_birth);
+    }
+
+    #[test]
+    fn in_zone_standard_signals_merge_and_reset_with_exact_thread_control() {
+        use carrick_signal_core::policy::Signal;
+
+        let control = ThreadControlSlot::new();
+        control.post_in_zone_standard_signal(Signal::PIPE).unwrap();
+        control.post_in_zone_standard_signal(Signal::PIPE).unwrap();
+        assert!(control.has_in_zone_standard_signal());
+        assert_eq!(
+            control.take_in_zone_standard_signals(),
+            carrick_signal_core::SignalSet::EMPTY.with(Signal::PIPE)
+        );
+        assert!(!control.has_in_zone_standard_signal());
+        assert_eq!(
+            control.post_in_zone_standard_signal(Signal::RTMIN),
+            Err(RealtimeInZoneSignal)
+        );
+
+        control.post_in_zone_standard_signal(Signal::PIPE).unwrap();
+        control.reset_for_host_birth(BlockedMask(0)).unwrap();
+        assert!(!control.has_in_zone_standard_signal());
     }
 
     #[test]
@@ -3059,6 +3153,7 @@ mod layout_manifest {
                      non_interrupting: _,
                      native_pending: _,
                      native_pending_writer: _,
+                     in_zone_standard_pending: _,
                      affinity: _,
                      affinity_host_alias: _,
                      affinity_guest_alias: _,
@@ -3115,6 +3210,14 @@ mod layout_manifest {
             native_pending_writer,
             AtomicU32,
             184,
+            4,
+            4
+        );
+        field!(
+            ThreadControlSlot,
+            in_zone_standard_pending,
+            InZoneStandardPending,
+            188,
             4,
             4
         );

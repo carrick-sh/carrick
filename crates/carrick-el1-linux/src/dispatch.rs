@@ -895,6 +895,7 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     if frame.esr != 0xfffc
         && !(frame.esr == 0xfffe
             && frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64)
+        && !control.has_in_zone_standard_signal()
         && carrick_el1::isa::signal_ingress_guest().is_empty()
         && control.zone_record().is_some_and(|record| {
             !super::aarch64_process::registry().signal_checkpoint_needed(zone, record)

@@ -53,6 +53,7 @@ impl HostIngressTarget {
         })
     }
 
+    #[cfg(test)]
     fn thread_event(
         self,
         generation: carrick_el1_abi::SignalEventGeneration,
@@ -81,7 +82,8 @@ pub(crate) enum HostIngressStep {
 pub(crate) enum HostIngressError {
     EventGenerationExhausted,
     InvalidBridgeSignal(i32),
-    DeferredInZoneSignalPending,
+    InZoneTargetUnavailable,
+    RealtimeInZoneSignal,
 }
 
 /// The exact event survives queue fullness in this executor. Each boundary
@@ -90,44 +92,33 @@ pub(crate) enum HostIngressError {
 #[derive(Default)]
 pub(crate) struct HostSignalIngressProducer {
     pending: Option<SignalIngressAdmission>,
-    deferred_in_zone: Option<SignalIngressAdmission>,
 }
 
 impl HostSignalIngressProducer {
     pub(crate) const fn new() -> Self {
-        Self {
-            pending: None,
-            deferred_in_zone: None,
-        }
+        Self { pending: None }
     }
 
     pub(crate) fn pending_event(&self) -> Option<ExternalSignalRecord> {
-        self.deferred_in_zone
-            .as_ref()
-            .or(self.pending.as_ref())
-            .map(SignalIngressAdmission::event)
+        self.pending.as_ref().map(SignalIngressAdmission::event)
     }
 
-    pub(crate) fn publish_deferred_in_zone<const N: usize>(
-        &mut self,
-        queue: &SignalIngressQueue<N>,
-        target: HostIngressTarget,
+    /// Admit an exact-thread standard signal without consuming payload-ring
+    /// capacity. The retained control bit is the admission receipt: duplicate
+    /// standard signals merge there before the syscall result is published.
+    pub(crate) fn publish_in_zone_standard(
+        &self,
+        context: &carrick_kernel::kernel::KernelContext,
         signal: Signal,
     ) -> Result<HostIngressStep, HostIngressError> {
-        if self.deferred_in_zone.is_some() {
-            return Err(HostIngressError::DeferredInZoneSignalPending);
-        }
-        let generation = queue
-            .issue_event_generation()
-            .ok_or(HostIngressError::EventGenerationExhausted)?;
-        let event = target.thread_event(generation, signal, ExternalSignalSource::InZoneIpc);
-        match queue.admit(event) {
-            Ok(()) => Ok(HostIngressStep::Published),
-            Err(pending) => {
-                self.deferred_in_zone = Some(pending);
-                Ok(HostIngressStep::Parked)
-            }
-        }
+        HostIngressTarget::from_context(context)
+            .ok_or(HostIngressError::InZoneTargetUnavailable)?;
+        context
+            .thread()
+            .control_slot()
+            .post_in_zone_standard_signal(signal)
+            .map_err(|_| HostIngressError::RealtimeInZoneSignal)?;
+        Ok(HostIngressStep::Published)
     }
 
     pub(crate) fn publish<const N: usize>(
@@ -136,17 +127,6 @@ impl HostSignalIngressProducer {
         target: Option<HostIngressTarget>,
         take_bridge_signal: impl FnOnce(i32) -> Option<carrick_hal::PendingSignalEvent>,
     ) -> Result<HostIngressStep, HostIngressError> {
-        if let Some(pending) = self.deferred_in_zone.take() {
-            if queue.drain_generation() == pending.observed_drain() {
-                self.deferred_in_zone = Some(pending);
-                return Ok(HostIngressStep::Parked);
-            }
-            if let Err(pending) = pending.retry(queue) {
-                self.deferred_in_zone = Some(pending);
-                return Ok(HostIngressStep::Parked);
-            }
-            return Ok(HostIngressStep::Published);
-        }
         if let Some(pending) = self.pending.take() {
             if queue.drain_generation() == pending.observed_drain() {
                 self.pending = Some(pending);
@@ -269,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_in_zone_sigpipe_keeps_exact_thread_event_across_full_ingress() {
+    fn full_ingress_merges_two_exact_thread_sigpipes_without_aborting() {
         use carrick_kernel::kernel::continuation::test_support::publish;
 
         let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
@@ -291,46 +271,44 @@ mod tests {
         custody.commit_native_signal_owner();
         let target = HostIngressTarget::from_context(&context).unwrap();
         let queue = SignalIngressQueue::<2>::new();
-        let mut producer = HostSignalIngressProducer::new();
+        let producer = HostSignalIngressProducer::new();
 
-        assert_eq!(
-            producer
-                .publish_deferred_in_zone(&queue, target, Signal::PIPE)
-                .unwrap(),
-            HostIngressStep::Published
-        );
-        assert_eq!(
-            producer
-                .publish_deferred_in_zone(&queue, target, Signal::PIPE)
-                .unwrap(),
-            HostIngressStep::Published
-        );
-        assert_eq!(
-            producer
-                .publish_deferred_in_zone(&queue, target, Signal::PIPE)
-                .unwrap(),
-            HostIngressStep::Parked
-        );
-        let retained = producer.pending_event().unwrap();
-        assert_eq!(retained.signal(), Signal::PIPE);
-        assert_eq!(retained.source(), ExternalSignalSource::InZoneIpc);
-        assert_eq!(
-            retained.scope(),
-            carrick_el1_abi::ExternalSignalScope::Thread
-        );
-        assert_eq!(retained.record(), record);
-
-        for _ in 0..2 {
-            let queued = queue.take().unwrap();
-            assert_eq!(queued.signal(), Signal::PIPE);
+        for signal in [Signal::ALRM, Signal::CHLD] {
+            let generation = queue.issue_event_generation().unwrap();
+            queue
+                .admit(target.thread_event(generation, signal, ExternalSignalSource::Terminal))
+                .unwrap();
         }
+        assert!(
+            queue
+                .admit(target.thread_event(
+                    queue.issue_event_generation().unwrap(),
+                    Signal::PIPE,
+                    ExternalSignalSource::Terminal,
+                ))
+                .is_err()
+        );
+
         assert_eq!(
-            producer.publish(&queue, None, |_| None).unwrap(),
+            producer
+                .publish_in_zone_standard(&context, Signal::PIPE)
+                .unwrap(),
+            HostIngressStep::Published
+        );
+        assert_eq!(
+            producer
+                .publish_in_zone_standard(&context, Signal::PIPE)
+                .unwrap(),
             HostIngressStep::Published
         );
         assert!(producer.pending_event().is_none());
-        let retried = queue.take().unwrap();
-        assert_eq!(retried, retained);
+        let pending = control.take_in_zone_standard_signals();
+        assert!(pending.contains(Signal::PIPE));
+        assert_eq!(pending.lowest(), Some(Signal::PIPE.number()));
+        assert!(pending.without(Signal::PIPE).is_empty());
+        assert_eq!(queue.take().unwrap().signal(), Signal::ALRM);
+        assert_eq!(queue.take().unwrap().signal(), Signal::CHLD);
+        assert!(queue.take().is_none());
     }
 
     #[test]

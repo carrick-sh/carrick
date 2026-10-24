@@ -157,6 +157,9 @@ pub(super) fn resume_selected<'a, X: ForkStockCrossing>(
             .enter_registered(owner_registry, source, task, address, &words, service)
             .unwrap_or_else(|_| fatal())
     };
+    entry
+        .import_in_zone_standard_signals()
+        .unwrap_or_else(|_| fatal());
     entry.resume_checkpoint().unwrap_or_else(|reason| {
         super::native_run_failure::complete_native_run_failure(
             common_entry::execution_binding(task),
@@ -440,6 +443,7 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
             drain_native_signal_ingress(registry(), source, service);
             runtime.enter_registered(registry(), source, task, address, &words, service)?
         };
+        process.import_in_zone_standard_signals()?;
         let result = dispatch(&mut process);
         (result, process.take_root_exit())
     };
