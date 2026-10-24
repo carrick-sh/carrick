@@ -178,6 +178,8 @@ struct TestStockCrossing {
     handbacks: AtomicUsize,
     root_exits: AtomicUsize,
     root_exit_status: AtomicU64,
+    publish_child_affinity_aliases: bool,
+    metadata_in_el1_window: bool,
     #[cfg(all(test, target_os = "linux"))]
     require_stack_commit: bool,
 }
@@ -228,6 +230,8 @@ impl TestStockCrossing {
             handbacks: AtomicUsize::new(0),
             root_exits: AtomicUsize::new(0),
             root_exit_status: AtomicU64::new(u64::MAX),
+            publish_child_affinity_aliases: true,
+            metadata_in_el1_window: false,
             #[cfg(all(test, target_os = "linux"))]
             require_stack_commit: false,
         }
@@ -414,21 +418,60 @@ impl ForkStockCrossing for TestStockCrossing {
                     *self.pending_loan.lock().unwrap() = Some(loan);
                     return Ok(());
                 }
-                let layout = std::alloc::Layout::from_size_align(
-                    core::mem::size_of::<ThreadLifecyclePage>(),
-                    16384,
-                )
-                .unwrap();
-                let page_ptr = unsafe {
-                    let ptr = std::alloc::alloc_zeroed(layout).cast::<ThreadLifecyclePage>();
-                    (*ptr) = ThreadLifecyclePage::new();
-                    ptr
-                };
-                let controls = Box::leak(Box::new(core::array::from_fn::<
-                    _,
-                    { carrick_el1_abi::THREAD_POOL_ENTRIES + 1 },
-                    _,
-                >(|_| ThreadControlSlot::new())));
+                type ControlsArray = [ThreadControlSlot; carrick_el1_abi::THREAD_POOL_ENTRIES + 1];
+                let (page_ptr, controls): (*mut ThreadLifecyclePage, &'static mut ControlsArray) =
+                    if self.metadata_in_el1_window {
+                        static NEXT_OFFSET: AtomicU64 = AtomicU64::new(0x100_0000);
+                        let page_bytes =
+                            core::mem::size_of::<ThreadLifecyclePage>().next_multiple_of(16384);
+                        let chunk_bytes = (page_bytes + core::mem::size_of::<ControlsArray>())
+                            .next_multiple_of(16384);
+                        let offset = NEXT_OFFSET.fetch_add(chunk_bytes as u64, Ordering::Relaxed);
+                        let hint = carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + offset;
+                        let mapped = unsafe {
+                            libc::mmap(
+                                hint as *mut libc::c_void,
+                                chunk_bytes,
+                                libc::PROT_READ | libc::PROT_WRITE,
+                                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                                -1,
+                                0,
+                            )
+                        };
+                        assert_ne!(mapped, libc::MAP_FAILED, "metadata mmap failed");
+                        let base = mapped as u64;
+                        assert!(
+                            base.is_multiple_of(16384)
+                                && base >= carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                                && base + chunk_bytes as u64
+                                    <= carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+                                        + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE,
+                            "metadata mmap landed outside EL1_DYNAMIC_METADATA_BASE window: {base:#x}"
+                        );
+                        unsafe {
+                            let page_ptr = mapped.cast::<ThreadLifecyclePage>();
+                            page_ptr.write(ThreadLifecyclePage::new());
+                            let controls_ptr =
+                                mapped.cast::<u8>().add(page_bytes).cast::<ControlsArray>();
+                            controls_ptr.write(core::array::from_fn(|_| ThreadControlSlot::new()));
+                            (page_ptr, &mut *controls_ptr)
+                        }
+                    } else {
+                        let layout = std::alloc::Layout::from_size_align(
+                            core::mem::size_of::<ThreadLifecyclePage>(),
+                            16384,
+                        )
+                        .unwrap();
+                        let page_ptr = unsafe {
+                            let ptr =
+                                std::alloc::alloc_zeroed(layout).cast::<ThreadLifecyclePage>();
+                            (*ptr) = ThreadLifecyclePage::new();
+                            ptr
+                        };
+                        let controls =
+                            Box::leak(Box::new(core::array::from_fn(|_| ThreadControlSlot::new())));
+                        (page_ptr, controls)
+                    };
                 let lifecycle = carrick_el1_abi::ForkLifecycleLoan::new(
                     KernelVa::new(page_ptr as u64),
                     KernelVa::new(controls as *mut _ as u64),
@@ -449,12 +492,14 @@ impl ForkStockCrossing for TestStockCrossing {
                 ) {
                     return Err(NativeProcessError::Invalid);
                 }
-                for control in controls.iter() {
-                    // SAFETY: these leaked fixture controls share one host/guest alias.
-                    unsafe {
-                        control.publish_affinity_aliases(carrick_guest_arch::GuestVa::new(
-                            core::ptr::from_ref(control).expose_provenance() as u64,
-                        ));
+                if self.publish_child_affinity_aliases {
+                    for control in controls.iter() {
+                        // SAFETY: these leaked fixture controls share one host/guest alias.
+                        unsafe {
+                            control.publish_affinity_aliases(carrick_guest_arch::GuestVa::new(
+                                core::ptr::from_ref(control).expose_provenance() as u64,
+                            ));
+                        }
                     }
                 }
                 *self.pending_loan.lock().unwrap() = req.admit_loan(
@@ -7617,4 +7662,846 @@ fn serial_host_native_fork_unpublished_parent_ipc_table_succeeds_without_einval(
         "fork after host IPC withdrawal must not fail with EINVAL (22); got errno {}",
         -result.raw()
     );
+}
+
+#[cfg(test)]
+struct LowVaBuffer {
+    ptr: *mut u8,
+    map_len: usize,
+    len: usize,
+}
+
+#[cfg(test)]
+impl LowVaBuffer {
+    fn zeroed(len: usize) -> Self {
+        static NEXT_HINT: AtomicU64 = AtomicU64::new(0x2000_0000);
+        let map_len = len.max(1).next_multiple_of(4096);
+        let stride = map_len.next_multiple_of(0x1_0000) as u64;
+        let hint = NEXT_HINT.fetch_add(stride, Ordering::Relaxed);
+        let ptr = unsafe {
+            libc::mmap(
+                hint as *mut libc::c_void,
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "low-VA test mmap failed");
+        let ptr = ptr.cast::<u8>();
+        assert!(
+            carrick_guest_arch::lower_half_range(ptr as u64, map_len as u64),
+            "test buffer VA {ptr:p} must stay in 48-bit lower half"
+        );
+        Self { ptr, map_len, len }
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let mut buf = Self::zeroed(bytes.len());
+        buf.as_mut_slice().copy_from_slice(bytes);
+        buf
+    }
+
+    fn va(&self) -> u64 {
+        self.ptr as u64
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+#[cfg(test)]
+impl Drop for LowVaBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::munmap(self.ptr.cast::<libc::c_void>(), self.map_len);
+        }
+    }
+}
+
+#[cfg(test)]
+fn activate_target(
+    source: BornInZoneSource<'_, Aarch64ParkedContext>,
+    task: &CurrentTask,
+    binding: &super::native_process_runtime::NativeRecordBinding<
+        AddressContext<RootGpa>,
+        Aarch64ParkedContext,
+    >,
+) {
+    let zone = source.zone;
+    for _ in 0..8 {
+        let switched = zone.switch_in_full(source.slot).unwrap();
+        if switched.record == binding.record.id {
+            zone.install_space(source.slot, binding.address.mm.raw().get())
+                .unwrap();
+            let identity = zone.record(binding.record.id).identity();
+            task.set(
+                El1TaskId::from_linux_tid(binding.key.id.raw()),
+                carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+                identity.file_table,
+            );
+            task.mm
+                .key
+                .store(binding.address.mm.raw().get(), Ordering::Release);
+            task.mm
+                .thread_generation
+                .store(identity.serial, Ordering::Release);
+            task.publish_visible_pid(binding.visible_pid);
+            task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+            return;
+        }
+        zone.requeue_preempted(source.slot, switched.record);
+    }
+    panic!("target record {:?} not runnable in slot", binding.record.id);
+}
+
+#[test]
+fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof() {
+    use carrick_abi::{
+        LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_SETFD,
+        LINUX_F_SETFL, LINUX_O_NONBLOCK, LINUX_O_WRONLY,
+    };
+    use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
+    use carrick_kernel::el1_ipc::{HostIpc, HostTable, IpcLimits};
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use std::sync::Arc;
+
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let task = CurrentTask::new();
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let owner = Arc::new(
+        HostIpc::with_limits(
+            1 << 20,
+            IpcLimits {
+                descriptions: carrick_el1_abi::ipc::IPC_OFD_SEGMENT,
+                ..IpcLimits::ZONE
+            },
+        )
+        .unwrap(),
+    );
+    // Initial extent capacity 8 with soft limit 64 forces in-ring table growth
+    // when native children dup3/F_DUPFD above descriptor 7.
+    let table = HostTable::create(Arc::clone(&owner), 64, 8).unwrap();
+    let object = owner.create_pipe(65536).unwrap();
+    let reader = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Reader,
+            }
+            .encode(),
+            fd::AccessMode::ReadOnly,
+            fd::StatusFlags {
+                nonblock: true,
+                ..fd::StatusFlags::default()
+            },
+        ))
+        .unwrap();
+    let writer = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Writer,
+            }
+            .encode(),
+            fd::AccessMode::WriteOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    // Pre-open fd 1 as an alias of reader with FD_CLOEXEC so child 0's dup2(4, 1)
+    // replaces a live open target and clears FD_CLOEXEC.
+    reader.install(table.id(), fd::Fd(1), true).unwrap();
+    reader.install(table.id(), fd::Fd(3), false).unwrap();
+    writer.install(table.id(), fd::Fd(4), true).unwrap();
+    let mut host_file =
+        carrick_kernel::dispatch::NativeFileWitness::new(&table, fd::Fd(5)).unwrap();
+
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    map.publish(5, table.id().to_raw()).unwrap();
+    let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = TestStockCrossing::new(&pages);
+    crossing.metadata_in_el1_window = true;
+    crossing.ipc = Some((Arc::clone(&owner), map));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let parent = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let child_bindings: [_; 2] = core::array::from_fn(|_| {
+        let mut entry = runtime
+            .enter(source, &fixture.task, parked, &mut service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("native fork must return");
+        };
+        assert!(result.raw() > 0, "fork errno number: {}", -result.raw());
+        let child = runtime
+            .namespace_child_key(parent, result.raw() as u32)
+            .unwrap();
+        runtime.task_binding(child).unwrap()
+    });
+    let children = child_bindings
+        .each_ref()
+        .map(|binding| fixture.zone.record(binding.record.id).identity().file_table);
+    assert_ne!(children[0], children[1]);
+
+    // Close parent's writer (fd 4), fd 1, and host file (fd 5); only the two live
+    // native children hold them now.
+    drop(writer);
+    table.close(fd::Fd(1)).unwrap();
+    table.close(fd::Fd(4)).unwrap();
+    table.close(fd::Fd(5)).unwrap();
+    host_file.close_parent();
+    assert_eq!(owner.retained_host_resources(), 1);
+
+    let parent_binding = runtime.task_binding(parent).unwrap();
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, parent_binding.record.id);
+
+    let tables = crate::ipc::MapTables(map);
+    let venue = crate::ipc::IpcVenue {
+        region: owner.region(),
+        tables: &tables,
+    };
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let names = Box::new(carrick_el1_abi::InotifyNameCache::new());
+
+    let run_in_child = |idx: usize, nr: u64, args: [u64; 3]| -> (CompletionRoute, i64) {
+        let mut cpu = crate::sched::FakeCpu::default();
+        let mut svc = Aarch64NativeProcessService::with_crossing(
+            &task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            &crossing,
+        )
+        .with_words(&words);
+        let child_ctx =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, child_bindings[idx].address);
+        let mut entry = runtime.enter(source, &task, child_ctx, &mut svc).unwrap();
+        let mut frame = carrick_el1_abi::TrapFrame {
+            slot: fixture.slot.index() as u64,
+            elr: 0x4004,
+            ..Default::default()
+        };
+        frame.x[8] = nr;
+        frame.x[0] = args[0];
+        frame.x[1] = args[1];
+        frame.x[2] = args[2];
+        let route = super::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&task),
+            crossing.fd_map(),
+            &[],
+            crossing.open_table(),
+            &[],
+            &names,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            Some(&venue),
+            Some(&fixture),
+            Some(&mut entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        (route, frame.x[0] as i64)
+    };
+
+    let sys_dup = carrick_personality_linux::crossing::nr::DUP.raw();
+    let sys_dup3 = carrick_personality_linux::crossing::nr::DUP3.raw();
+    let sys_fcntl = carrick_personality_linux::crossing::nr::FCNTL.raw();
+    let sys_close = carrick_personality_linux::crossing::nr::CLOSE.raw();
+    let sys_read = carrick_personality_linux::crossing::nr::READ.raw();
+    let sys_write = carrick_personality_linux::crossing::nr::WRITE.raw();
+    activate_target(source, &task, &child_bindings[0]);
+    for binding in &child_bindings {
+        assert!(runtime.task_binding(binding.key).is_some());
+    }
+
+    // 1. dup(4) allocates lowest free slot 0 and clears FD_CLOEXEC.
+    let (route, ret) = run_in_child(0, sys_dup, [4, 0, 0]);
+    assert!(
+        matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+        "native dup must complete in ring, got {route:?}"
+    );
+    assert_eq!(ret, 0, "dup(4) must pick fd 0; errno {}", -ret);
+    assert_eq!(run_in_child(0, sys_fcntl, [0, LINUX_F_GETFD, 0]).1, 0);
+    assert_eq!(run_in_child(0, sys_fcntl, [4, LINUX_F_GETFD, 0]).1, 1);
+
+    // 2. dup2(4, 1) replaces open fd 1 and clears FD_CLOEXEC.
+    assert_eq!(
+        run_in_child(0, carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2, [4, 1, 0]).1,
+        1
+    );
+    assert_eq!(run_in_child(0, sys_fcntl, [1, LINUX_F_GETFD, 0]).1, 0);
+
+    // 3. dup3 validation (EINVAL = -22) and growth past initial capacity 8 -> fd 20.
+    assert_eq!(
+        run_in_child(0, sys_dup3, [4, 4, carrick_syscall_abi::LINUX_O_CLOEXEC]).1,
+        -22,
+        "same-fd dup3 must fail with EINVAL (-22)"
+    );
+    assert_eq!(
+        run_in_child(0, sys_dup3, [4, 2, 0x9999]).1,
+        -22,
+        "dup3 unknown flags must fail with EINVAL (-22)"
+    );
+    assert_eq!(
+        run_in_child(0, sys_dup3, [4, 20, carrick_syscall_abi::LINUX_O_CLOEXEC]).1,
+        20
+    );
+    assert_eq!(run_in_child(0, sys_fcntl, [20, LINUX_F_GETFD, 0]).1, 1);
+
+    // 4. fcntl F_DUPFD, F_DUPFD_CLOEXEC, F_SETFD, EBADF (-9) vs EINVAL (-22), EMFILE (-24).
+    assert_eq!(run_in_child(0, sys_fcntl, [4, LINUX_F_DUPFD, 10]).1, 10);
+    assert_eq!(run_in_child(0, sys_fcntl, [10, LINUX_F_GETFD, 0]).1, 0);
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [4, LINUX_F_DUPFD_CLOEXEC, 10]).1,
+        11
+    );
+    assert_eq!(run_in_child(0, sys_fcntl, [11, LINUX_F_GETFD, 0]).1, 1);
+    assert_eq!(run_in_child(0, sys_fcntl, [10, LINUX_F_SETFD, 1]).1, 0);
+    assert_eq!(run_in_child(0, sys_fcntl, [10, LINUX_F_GETFD, 0]).1, 1);
+    assert_eq!(run_in_child(0, sys_fcntl, [10, LINUX_F_SETFD, 0]).1, 0);
+    assert_eq!(run_in_child(0, sys_fcntl, [10, LINUX_F_GETFD, 0]).1, 0);
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [4, LINUX_F_DUPFD, 64]).1,
+        -22,
+        "F_DUPFD at RLIMIT_NOFILE (64) must fail with EINVAL (-22)"
+    );
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [4, LINUX_F_DUPFD, (-1i32) as u32 as u64]).1,
+        -22,
+        "F_DUPFD with negative 32-bit arg must fail with EINVAL (-22)"
+    );
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [99, LINUX_F_DUPFD, 64]).1,
+        -9,
+        "F_DUPFD checks bad oldfd EBADF (-9) before min arg EINVAL (-22)"
+    );
+
+    let mut fillers = Vec::new();
+    loop {
+        let fd_or_err = run_in_child(0, sys_dup, [4, 0, 0]).1;
+        if fd_or_err < 0 {
+            assert_eq!(
+                fd_or_err, -24,
+                "table full at RLIMIT_NOFILE must fail with EMFILE (-24)"
+            );
+            break;
+        }
+        fillers.push(fd_or_err as u64);
+    }
+    assert_eq!(run_in_child(0, sys_fcntl, [4, LINUX_F_DUPFD, 0]).1, -24);
+    for filler in fillers {
+        assert_eq!(run_in_child(0, sys_close, [filler, 0, 0]).1, 0);
+    }
+
+    // 5. F_GETFL / F_SETFL mutate the shared open file description visible to child 1.
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [4, LINUX_F_GETFL, 0]).1,
+        LINUX_O_WRONLY as i64
+    );
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [4, LINUX_F_SETFL, LINUX_O_NONBLOCK]).1,
+        0
+    );
+    assert_eq!(
+        run_in_child(0, sys_fcntl, [4, LINUX_F_GETFL, 0]).1,
+        (LINUX_O_WRONLY | LINUX_O_NONBLOCK) as i64
+    );
+
+    // 6. Duplicate a host-backed description through the same reservation
+    // transaction. Child 0's fd 2 keeps the physical object alive after both
+    // inherited fd 5 entries close.
+    assert_eq!(run_in_child(0, sys_dup, [5, 0, 0]).1, 2);
+    assert_eq!(run_in_child(0, sys_close, [5, 0, 0]).1, 0);
+    assert_eq!(
+        run_in_child(0, sys_close, [5, 0, 0]).1,
+        -9,
+        "second close must fail with EBADF (-9)"
+    );
+    let _ = owner.drain_retired_tables().unwrap();
+    assert_eq!(
+        owner.retained_host_resources(),
+        1,
+        "child 1 still holds host-backed fd 5"
+    );
+
+    // Close all writer aliases in child 0 EXCEPT fd 1 (created by dup2).
+    for writer_fd in [0, 4, 10, 11, 20] {
+        assert_eq!(run_in_child(0, sys_close, [writer_fd, 0, 0]).1, 0);
+    }
+
+    // Switch to live child 1.
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, child_bindings[0].record.id);
+    activate_target(source, &task, &child_bindings[1]);
+    assert_eq!(
+        run_in_child(1, sys_fcntl, [4, LINUX_F_GETFL, 0]).1,
+        (LINUX_O_WRONLY | LINUX_O_NONBLOCK) as i64,
+        "child 1 shares the writer OFD flags mutated by child 0"
+    );
+    assert_eq!(run_in_child(1, sys_close, [5, 0, 0]).1, 0);
+    let _ = owner.drain_retired_tables().unwrap();
+    assert_eq!(
+        owner.retained_host_resources(),
+        1,
+        "child 0's duplicate must retain the host resource"
+    );
+
+    // Child 1 closes its writer fd 4; child 0's dup2 alias (fd 1) is still open,
+    // so nonblocking read on fd 3 MUST return EAGAIN (-11), never premature EOF!
+    assert_eq!(run_in_child(1, sys_close, [4, 0, 0]).1, 0);
+    let read_buf = LowVaBuffer::zeroed(8);
+    assert_eq!(
+        run_in_child(1, sys_read, [3, read_buf.va(), 8]).1,
+        -11,
+        "reader must see EAGAIN (-11) while child 0 still holds dup2 writer alias fd 1"
+    );
+
+    // Switch back to child 0: write 2 bytes via fd 1 and close the final writer description.
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, child_bindings[1].record.id);
+    activate_target(source, &task, &child_bindings[0]);
+    assert_eq!(run_in_child(0, sys_close, [2, 0, 0]).1, 0);
+    assert!(
+        task.linux.has_pending_host_work(),
+        "final duplicated host close must schedule host drain"
+    );
+    let _ = owner.drain_retired_tables().unwrap();
+    task.linux
+        .take_host_work_doorbell()
+        .expect("doorbell must be armed")
+        .settled();
+    assert_eq!(owner.retained_host_resources(), 0);
+    assert_eq!(host_file.physical_fd_errno(), Some(9));
+    let payload = LowVaBuffer::from_bytes(b"ok");
+    assert_eq!(run_in_child(0, sys_write, [1, payload.va(), 2]).1, 2);
+    assert_eq!(run_in_child(0, sys_close, [1, 0, 0]).1, 0);
+
+    // Switch back to child 1: read drains "ok" (2 bytes), then returns EOF (0).
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, child_bindings[0].record.id);
+    activate_target(source, &task, &child_bindings[1]);
+    assert_eq!(run_in_child(1, sys_read, [3, read_buf.va(), 8]).1, 2);
+    assert_eq!(&read_buf.as_slice()[..2], b"ok");
+    assert_eq!(
+        run_in_child(1, sys_read, [3, read_buf.va(), 8]).1,
+        0,
+        "reader must observe EOF (0) once last writer across both children closed"
+    );
+
+    for binding in &child_bindings {
+        assert!(runtime.task_binding(binding.key).is_some());
+    }
+    service.retire_fd_table(children[0]);
+    service.retire_fd_table(children[1]);
+    assert_eq!(owner.drain_retired_tables().unwrap(), 2);
+    table.close(fd::Fd(3)).unwrap();
+    drop(reader);
+}
+
+#[test]
+fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe() {
+    use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
+    use carrick_kernel::el1_ipc::{HostIpc, HostTable, IpcLimits};
+    use carrick_personality_linux::{dispatch::CompletionRoute, signal::ProcessSignals};
+    use carrick_signal_core::{
+        SignalSet,
+        policy::{Action as SigAction, Disposition, SigBlockMask, Signal},
+    };
+    use std::sync::Arc;
+
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let task = CurrentTask::new();
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let owner = Arc::new(
+        HostIpc::with_limits(
+            1 << 20,
+            IpcLimits {
+                descriptions: carrick_el1_abi::ipc::IPC_OFD_SEGMENT,
+                ..IpcLimits::ZONE
+            },
+        )
+        .unwrap(),
+    );
+    let table = HostTable::create(Arc::clone(&owner), 64, 64).unwrap();
+    let object = owner.create_pipe(65536).unwrap();
+    let nonblock_flags = fd::StatusFlags {
+        nonblock: true,
+        ..fd::StatusFlags::default()
+    };
+    let reader = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Reader,
+            }
+            .encode(),
+            fd::AccessMode::ReadOnly,
+            nonblock_flags,
+        ))
+        .unwrap();
+    let writer = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Writer,
+            }
+            .encode(),
+            fd::AccessMode::WriteOnly,
+            nonblock_flags,
+        ))
+        .unwrap();
+    reader.install(table.id(), fd::Fd(3), false).unwrap();
+    writer.install(table.id(), fd::Fd(4), false).unwrap();
+
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    map.publish(5, table.id().to_raw()).unwrap();
+    let pages: Vec<_> = (0..32).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = TestStockCrossing::new(&pages);
+    crossing.metadata_in_el1_window = true;
+    crossing.ipc = Some((Arc::clone(&owner), map));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let parent = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let child_bindings: [_; 2] = core::array::from_fn(|_| {
+        let mut entry = runtime
+            .enter(source, &fixture.task, parked, &mut service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("native fork must return");
+        };
+        assert!(result.raw() > 0, "fork errno number: {}", -result.raw());
+        let child = runtime
+            .namespace_child_key(parent, result.raw() as u32)
+            .unwrap();
+        runtime.task_binding(child).unwrap()
+    });
+    let children = child_bindings
+        .each_ref()
+        .map(|binding| fixture.zone.record(binding.record.id).identity().file_table);
+
+    // Drop parent's reader and writer so ONLY the two live native children hold endpoints.
+    drop(reader);
+    drop(writer);
+    table.close(fd::Fd(3)).unwrap();
+    table.close(fd::Fd(4)).unwrap();
+
+    let parent_binding = runtime.task_binding(parent).unwrap();
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, parent_binding.record.id);
+
+    let tables = crate::ipc::MapTables(map);
+    let venue = crate::ipc::IpcVenue {
+        region: owner.region(),
+        tables: &tables,
+    };
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let names = Box::new(carrick_el1_abi::InotifyNameCache::new());
+
+    let run_in_child = |idx: usize, nr: u64, args: [u64; 3]| -> (CompletionRoute, i64) {
+        let mut cpu = crate::sched::FakeCpu::default();
+        let mut svc = Aarch64NativeProcessService::with_crossing(
+            &task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            &crossing,
+        )
+        .with_words(&words);
+        let child_ctx =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, child_bindings[idx].address);
+        let mut entry = runtime.enter(source, &task, child_ctx, &mut svc).unwrap();
+        let mut frame = carrick_el1_abi::TrapFrame {
+            slot: fixture.slot.index() as u64,
+            elr: 0x4004,
+            ..Default::default()
+        };
+        frame.x[8] = nr;
+        frame.x[0] = args[0];
+        frame.x[1] = args[1];
+        frame.x[2] = args[2];
+        let route = super::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&task),
+            crossing.fd_map(),
+            &[],
+            crossing.open_table(),
+            &[],
+            &names,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            Some(&venue),
+            Some(&fixture),
+            Some(&mut entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        (route, frame.x[0] as i64)
+    };
+
+    let sys_close = carrick_personality_linux::crossing::nr::CLOSE.raw();
+    let sys_read = carrick_personality_linux::crossing::nr::READ.raw();
+    let sys_write = carrick_personality_linux::crossing::nr::WRITE.raw();
+    const PIPE_BUF: usize = 4096;
+
+    // Child 0 is sole writer (closes fd 3); Child 1 is sole reader (closes fd 4).
+    activate_target(source, &task, &child_bindings[0]);
+    assert_eq!(run_in_child(0, sys_close, [3, 0, 0]).1, 0);
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, child_bindings[0].record.id);
+    activate_target(source, &task, &child_bindings[1]);
+    assert_eq!(run_in_child(1, sys_close, [4, 0, 0]).1, 0);
+
+    // Switch to writer (child 0): fill 15 full pages + 2096 bytes (leaving 2000 < PIPE_BUF free).
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, child_bindings[1].record.id);
+    activate_target(source, &task, &child_bindings[0]);
+    let pattern_bytes: Vec<u8> = (0..(15 * PIPE_BUF + 2096))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let pattern = LowVaBuffer::from_bytes(&pattern_bytes);
+    assert_eq!(
+        run_in_child(0, sys_write, [4, pattern.va(), pattern_bytes.len() as u64]).1,
+        pattern_bytes.len() as i64
+    );
+
+    // 1. PIPE_BUF (4096) write with < PIPE_BUF space refuses atomically with EAGAIN (-11), 0 written.
+    let atomic_chunk = LowVaBuffer::from_bytes(&vec![0xA5u8; PIPE_BUF]);
+    assert_eq!(
+        run_in_child(0, sys_write, [4, atomic_chunk.va(), PIPE_BUF as u64]).1,
+        -11,
+        "O_NONBLOCK write <= PIPE_BUF (4096) without room must fail atomically with EAGAIN (-11)"
+    );
+
+    // Switch to reader (child 1): drain 1 full page (4096 bytes), freeing 1 page in the 16-page ring.
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, child_bindings[0].record.id);
+    activate_target(source, &task, &child_bindings[1]);
+    let mut drained = Vec::new();
+    let page_buf = LowVaBuffer::zeroed(PIPE_BUF);
+    assert_eq!(
+        run_in_child(1, sys_read, [3, page_buf.va(), PIPE_BUF as u64]).1,
+        PIPE_BUF as i64
+    );
+    drained.extend_from_slice(page_buf.as_slice());
+
+    // 2. Write > PIPE_BUF (8192 bytes) with 1 page free performs partial write of 4096 bytes.
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, child_bindings[1].record.id);
+    activate_target(source, &task, &child_bindings[0]);
+    let large_write_bytes: Vec<u8> = (0..(2 * PIPE_BUF)).map(|i| ((i + 7) % 251) as u8).collect();
+    let large_write = LowVaBuffer::from_bytes(&large_write_bytes);
+    assert_eq!(
+        run_in_child(
+            0,
+            sys_write,
+            [4, large_write.va(), large_write_bytes.len() as u64]
+        )
+        .1,
+        PIPE_BUF as i64,
+        "O_NONBLOCK write > PIPE_BUF must transfer available partial bytes (4096)"
+    );
+    assert_eq!(
+        run_in_child(0, sys_write, [4, atomic_chunk.va(), PIPE_BUF as u64]).1,
+        -11
+    );
+
+    // Switch to reader (child 1): drain all remaining bytes and verify stream integrity, then close fd 3!
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, child_bindings[0].record.id);
+    activate_target(source, &task, &child_bindings[1]);
+    let rest = LowVaBuffer::zeroed(65536);
+    let n = run_in_child(1, sys_read, [3, rest.va(), 65536]).1;
+    assert_eq!(n, (14 * PIPE_BUF + 2096 + PIPE_BUF) as i64);
+    drained.extend_from_slice(&rest.as_slice()[..n as usize]);
+    let mut expected = pattern_bytes;
+    expected.extend_from_slice(&large_write_bytes[..PIPE_BUF]);
+    assert_eq!(
+        drained, expected,
+        "partial write must preserve exact stream bytes"
+    );
+
+    // Close the LAST reader description across all live processes.
+    assert_eq!(run_in_child(1, sys_close, [3, 0, 0]).1, 0);
+
+    // 3. Switch to writer (child 0): write after last reader closed returns EPIPE (-32) IN RING
+    // and enqueues SIGPIPE (13, SI_KERNEL) unless SIG_IGN is installed.
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, child_bindings[1].record.id);
+    activate_target(source, &task, &child_bindings[0]);
+    let sigpipe = Signal::from_number(13).unwrap();
+    let byte = LowVaBuffer::from_bytes(b"z");
+    let (route, ret) = run_in_child(0, sys_write, [4, byte.va(), 1]);
+    assert!(
+        matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
+        "native child write on broken pipe must complete in ring, got {route:?}"
+    );
+    assert_eq!(
+        ret, -32,
+        "write after last reader closed must return EPIPE (-32)"
+    );
+    {
+        let mut svc = Aarch64NativeProcessService::with_crossing(
+            &task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            &crossing,
+        )
+        .with_words(&words);
+        let child_ctx =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, child_bindings[0].address);
+        let mut entry = runtime.enter(source, &task, child_ctx, &mut svc).unwrap();
+        let pipe_mask = SigBlockMask::blocking_all_of(SignalSet::from_bits(sigpipe.bit()));
+        assert_eq!(
+            entry.rt_sigpending(pipe_mask),
+            sigpipe.bit(),
+            "broken pipe write must enqueue SIGPIPE (13) on the calling native thread"
+        );
+        let (sig, info, _) = entry
+            .take_deliverable(SigBlockMask::NONE)
+            .expect("SIGPIPE must be deliverable");
+        assert_eq!(sig, sigpipe);
+        let info = info.expect("SIGPIPE must carry kernel siginfo");
+        let si_signo = info.si_signo;
+        let si_code = info.si_code;
+        assert_eq!(si_signo, 13);
+        assert_eq!(si_code, carrick_syscall_abi::LINUX_SI_KERNEL);
+
+        // Install SIG_IGN for SIGPIPE; subsequent broken-pipe write returns EPIPE (-32) without SIGPIPE.
+        entry
+            .rt_sigaction(
+                sigpipe,
+                Some(SigAction {
+                    disposition: Disposition::Ignore,
+                    ..SigAction::default()
+                }),
+            )
+            .unwrap();
+    }
+    let (route2, ret2) = run_in_child(0, sys_write, [4, byte.va(), 1]);
+    assert!(matches!(
+        route2,
+        CompletionRoute::Served | CompletionRoute::WithWork
+    ));
+    assert_eq!(ret2, -32);
+    {
+        let mut svc = Aarch64NativeProcessService::with_crossing(
+            &task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            &crossing,
+        )
+        .with_words(&words);
+        let child_ctx =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, child_bindings[0].address);
+        let entry = runtime.enter(source, &task, child_ctx, &mut svc).unwrap();
+        let pipe_mask = SigBlockMask::blocking_all_of(SignalSet::from_bits(sigpipe.bit()));
+        assert_eq!(
+            entry.rt_sigpending(pipe_mask),
+            0,
+            "SIG_IGN must suppress SIGPIPE while still returning EPIPE (-32)"
+        );
+    }
+
+    service.retire_fd_table(children[0]);
+    service.retire_fd_table(children[1]);
+    assert_eq!(owner.drain_retired_tables().unwrap(), 2);
 }

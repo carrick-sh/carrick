@@ -494,6 +494,22 @@ impl<'a, T> NativeProcessSignals<'a, T> {
         }
     }
 
+    pub fn enqueue_thread_unless_ignored(
+        &self,
+        tid: carrick_sched_core::RecordRef,
+        signal: Signal,
+        info: Option<T>,
+    ) -> Option<EnqueueOutcome> {
+        self.publish_fatal(signal);
+        let mut res = self.resources.lock();
+        if res.actions.action(signal).disposition == Disposition::Ignore {
+            return None;
+        }
+        let outcome = res.thread_pending_mut(tid).enqueue(signal, info);
+        self.resources
+            .refresh_summary(&res, ProjectionUpdate::Member(tid));
+        Some(outcome)
+    }
     pub fn pending_set(&self, tid: carrick_sched_core::RecordRef) -> SignalSet {
         let resources = self.resources.lock();
         let proc = resources.inbox.pending().present();

@@ -253,6 +253,9 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
     fn ipc_available(&self) -> bool {
         false
     }
+    fn native_descriptor_owner(&self) -> bool {
+        false
+    }
     fn lifecycle_available(&self) -> bool {
         false
     }
@@ -984,6 +987,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         crate::crossing::nr::DUP,
         crate::crossing::nr::DUP3,
         crate::crossing::nr::CLOSE,
+        crate::crossing::nr::FCNTL,
     ]
     .iter()
     .any(|nr| nr.raw() == ordinal);
@@ -1077,6 +1081,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         && matches!(ordinal, 99 | 132 | 135);
     let transfer = pending.ipc_available()
         && matches!(family, Family::Read | Family::Write | Family::EpollWait);
+    let owned_descriptor = family == Family::Descriptor && pending.native_descriptor_owner();
     // Identity/resource operations complete synchronously under their owner.
     // Serve them before handing back metadata work; an absent owner still
     // declines through Unported crossing policy, never host identity replay.
@@ -1095,6 +1100,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         && !pending.resumes_operation()
         && !transfer
         && !setup
+        && !owned_descriptor
         && !owned_identity
         && !owned_yield
         && !owned_continuation
