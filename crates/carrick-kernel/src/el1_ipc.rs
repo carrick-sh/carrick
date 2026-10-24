@@ -998,9 +998,26 @@ impl HostIpc {
         Ok(released)
     }
 
+    /// Release a bounded batch of host-backed OFDs finalized in the ring
+    /// (`close_filtered` / `dup2_filtered` / `dup3_filtered`).
+    pub fn drain_retired_ofds(&self) -> Result<usize, AdmissionError> {
+        let region = self.region();
+        let authority = region.fd(HostLockWait);
+        let mut count = 0;
+        for _ in 0..region.ofd_count().max(1) {
+            let Some(description) = authority.take_retired_ofd()? else {
+                break;
+            };
+            self.release(description.backing)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Finish a bounded batch of ring-revoked tables. Receipts retain the
     /// table on refusal; resource destruction runs after all core locks.
     pub fn drain_retired_tables(&self) -> Result<usize, AdmissionError> {
+        self.drain_retired_ofds()?;
         let region = self.region();
         let authority = region.fd(HostLockWait);
         let mut count = 0;

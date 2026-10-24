@@ -239,4 +239,8 @@ Fork copies entries, not claims; backing growth preserves both. Commit/cancel
 consume the receipt, and refusal returns it for the owned continuation. Like
 `OfdPin`, the raw core receipt requires explicit settlement; host
 `HostSlotReservation` provides cancellation on Drop, including table retirement.
-These primitives do not yet replace FileTable's host selectors or projection.
+Host `FileTable` published into IPC routes numeric reservations and mutations
+directly through this authority without projection replay, and live native
+`close`/`dup2`/`dup3` filter final releases so in-zone pipe/eventfd endpoints
+close in ring while host-backed descriptions queue onto `retired_ofds` for host
+finalization.
