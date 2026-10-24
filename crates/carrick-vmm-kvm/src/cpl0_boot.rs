@@ -922,7 +922,6 @@ impl Cpl0Carrier {
             (0..grant_count).map(|index| initial_grant_gpa(frame_offset, index)),
             table_grants,
             4096,
-            NonZeroU64::MIN,
             carrick_hal::GuestFrameOwner {
                 native_mm: MmGeneration::new(
                     NonZeroU64::new(self.initial_mm_key())

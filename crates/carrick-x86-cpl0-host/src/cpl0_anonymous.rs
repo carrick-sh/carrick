@@ -1434,7 +1434,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             [gpa],
             0,
             size,
-            NonZeroU64::MIN,
             execution.context.into(),
         )?;
         let backing = inventory
@@ -1733,9 +1732,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             [gpa],
             0,
             len,
-            // A newly allocated physical mapping starts at generation one;
-            // the guest operation sequence belongs to the descriptor txn.
-            NonZeroU64::MIN,
             execution.context.into(),
         )?;
         let identity = inventory
