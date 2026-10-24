@@ -14,6 +14,7 @@ carrick-syscall-abi = { path = "../carrick-syscall-abi" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-core = { path = "../carrick-core" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-fd-core = { path = "../carrick-fd-core" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-inotify-core = { path = "../carrick-inotify-core" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }

@@ -15,6 +15,7 @@ pub(crate) struct LoadedExecImage {
 }
 
 /// Loader configuration retains physical services, never a task or dispatcher.
+#[derive(Clone)]
 pub(crate) struct ExecLoaderCapabilities {
     clock: Arc<carrick_kernel::kernel::container::ClockDomain>,
     linux_page_size: u64,
@@ -29,6 +30,73 @@ impl ExecLoaderCapabilities {
             requires_syscall_traps: dispatcher.requires_syscall_traps(),
         }
     }
+}
+
+/// Carrier-retained physical capabilities for a ring-owned exec. The key is
+/// inherited by native fork; resolving it never consults a host task table.
+pub(crate) struct NativeExecCapability {
+    _files: carrick_kernel::dispatch::exec_files::ExecFiles,
+    _loader: ExecLoaderCapabilities,
+}
+
+type NativeExecCapabilityKey = (usize, carrick_core_abi::service::ExecCapabilityId);
+
+fn native_exec_capabilities() -> &'static parking_lot::Mutex<
+    std::collections::BTreeMap<NativeExecCapabilityKey, std::sync::Weak<NativeExecCapability>>,
+> {
+    static CAPABILITIES: std::sync::OnceLock<
+        parking_lot::Mutex<
+            std::collections::BTreeMap<
+                NativeExecCapabilityKey,
+                std::sync::Weak<NativeExecCapability>,
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    CAPABILITIES.get_or_init(Default::default)
+}
+
+pub(crate) struct NativeExecCapabilityLease {
+    key: NativeExecCapabilityKey,
+    capability: Arc<NativeExecCapability>,
+}
+
+impl Drop for NativeExecCapabilityLease {
+    fn drop(&mut self) {
+        let mut capabilities = native_exec_capabilities().lock();
+        if capabilities
+            .get(&self.key)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|current| Arc::ptr_eq(&current, &self.capability))
+        {
+            capabilities.remove(&self.key);
+        }
+    }
+}
+
+pub(crate) fn retain_native_exec_capability(
+    dispatcher: &SyscallDispatcher,
+) -> Result<NativeExecCapabilityLease, LinuxErrno> {
+    let context = dispatcher
+        .capture_one_task_context()
+        .map_err(|_| crate::linux_abi::LINUX_ESRCH)?;
+    let raw = context.resources().files().id().raw();
+    let id = carrick_core_abi::service::ExecCapabilityId::new(
+        core::num::NonZeroU64::new(raw).ok_or(crate::linux_abi::LINUX_ESRCH)?,
+    );
+    let key = (Arc::as_ptr(context.kernel()).addr(), id);
+    let mut capabilities = native_exec_capabilities().lock();
+    let capability =
+        if let Some(capability) = capabilities.get(&key).and_then(std::sync::Weak::upgrade) {
+            capability
+        } else {
+            let capability = Arc::new(NativeExecCapability {
+                _files: dispatcher.capture_exec_files(&context)?,
+                _loader: ExecLoaderCapabilities::capture(dispatcher),
+            });
+            capabilities.insert(key, Arc::downgrade(&capability));
+            capability
+        };
+    Ok(NativeExecCapabilityLease { key, capability })
 }
 
 fn host_io_errno(error: std::io::Error) -> LinuxErrno {
@@ -629,5 +697,31 @@ mod tests {
         assert_eq!(load_errno(), 8, "ENOEXEC for executable non-ELF");
         std::fs::remove_file(&path).unwrap();
         assert_eq!(load_errno(), 2, "ENOENT after unlink");
+    }
+
+    #[test]
+    fn native_exec_capability_outlives_context_without_host_task_lookup() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let kernel = Arc::clone(context.kernel());
+        let id = carrick_core_abi::service::ExecCapabilityId::new(
+            core::num::NonZeroU64::new(context.resources().files().id().raw()).unwrap(),
+        );
+        let lease = retain_native_exec_capability(&dispatcher).unwrap();
+        drop(context);
+
+        let key = (Arc::as_ptr(&kernel).addr(), id);
+        let retained = native_exec_capabilities()
+            .lock()
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+            .expect("retained capability");
+        assert!(matches!(
+            retained._files.caller(),
+            carrick_kernel::dispatch::exec_files::ExecCaller::Host { .. }
+        ));
+        drop(retained);
+        drop(lease);
+        assert!(!native_exec_capabilities().lock().contains_key(&key));
     }
 }
