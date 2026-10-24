@@ -34502,12 +34502,12 @@
       "operation": "file_table_internals",
       "owner": "carrick_kernel::kernel::objects::FileTable::for_exec",
       "lane": "shared",
-      "ceiling": 6
+      "ceiling": 0
     },
     {
       "family": "raw_lock",
       "operation": "file_table_internals",
-      "owner": "carrick_kernel::kernel::objects::FileTable::for_fork_copy",
+      "owner": "carrick_kernel::kernel::objects::FileTable::copy_private",
       "lane": "shared",
       "ceiling": 6
     },
