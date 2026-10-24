@@ -622,47 +622,98 @@ pub(crate) fn settle_one(
 /// to, by exact MM id, in the carrier's custody.
 pub struct CarrierGuestCowSettlement {
     custody: std::sync::Weak<CarrierVmCustody>,
+    pool: CarrierCowPool,
+}
+
+enum CarrierCowPool {
+    Retained {
+        carrier: std::sync::Weak<PersistentCarrierMappings>,
+        generation: Option<CarrierVmGeneration>,
+    },
     #[cfg(test)]
-    pool: Option<&'static CowGrantPool>,
+    Fixture(&'static CowGrantPool),
 }
 
 impl CarrierGuestCowSettlement {
-    pub(crate) fn new(custody: &std::sync::Arc<CarrierVmCustody>) -> Self {
+    pub(crate) fn new(carrier: std::sync::Arc<PersistentCarrierMappings>) -> Self {
         Self {
-            custody: std::sync::Arc::downgrade(custody),
-            #[cfg(test)]
-            pool: None,
+            custody: std::sync::Arc::downgrade(&carrier.custody),
+            pool: CarrierCowPool::Retained {
+                generation: carrier.custody.live_generation(),
+                carrier: std::sync::Arc::downgrade(&carrier),
+            },
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_pool(mut self, pool: &'static CowGrantPool) -> Self {
-        self.pool = Some(pool);
-        self
+    pub(crate) fn for_test(
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        pool: &'static CowGrantPool,
+    ) -> Self {
+        Self {
+            custody: std::sync::Arc::downgrade(custody),
+            pool: CarrierCowPool::Fixture(pool),
+        }
     }
 
-    fn pool(&self) -> Option<&'static CowGrantPool> {
-        #[cfg(test)]
-        if let Some(pool) = self.pool {
-            return Some(pool);
+    pub(super) fn with_pool<T>(&self, use_pool: impl FnOnce(&CowGrantPool) -> T) -> Option<T> {
+        match &self.pool {
+            CarrierCowPool::Retained {
+                carrier,
+                generation,
+            } => {
+                let carrier = carrier.upgrade()?;
+                if generation.is_none() || carrier.custody.live_generation() != *generation {
+                    return None;
+                }
+                let pointer = carrier.host_pointer(
+                    carrick_el1_abi::EL1_REGION_BASE + carrick_el1_abi::EL1_COW_GRANT_POOL_OFFSET,
+                    core::mem::size_of::<CowGrantPool>(),
+                )?;
+                if !pointer
+                    .as_ptr()
+                    .addr()
+                    .is_multiple_of(core::mem::align_of::<CowGrantPool>())
+                {
+                    return None;
+                }
+                // SAFETY: this exact carrier owns the initialized, aligned ABI
+                // record; its mapping remains retained through this borrow.
+                Some(use_pool(unsafe {
+                    &*pointer.as_ptr().cast::<CowGrantPool>()
+                }))
+            }
+            #[cfg(test)]
+            CarrierCowPool::Fixture(pool) => Some(use_pool(pool)),
         }
-        carrick_el1_abi::cow_grant_pool_host()
     }
 }
 
 impl CowGrantSettlement for CarrierGuestCowSettlement {
     fn settle(&self, excluded: &ExcludedEditor<'_>) {
-        let Some(pool) = self.pool() else {
-            return;
-        };
-        if !pool.any_completed() || pool.completions(excluded).next().is_none() {
-            return;
-        }
         let Some(custody) = self.custody.upgrade() else {
             return;
         };
-        let result = crate::metadata_grant::settle_native_cow(&custody, pool, excluded).and_then(
-            |settled| {
+        self.with_pool(|pool| self.settle_in(&custody, pool, excluded));
+    }
+
+    fn release(&self, excluded: &ExcludedEditor<'_>) {
+        self.with_pool(|pool| pool.release_mm(excluded));
+    }
+}
+
+impl CarrierGuestCowSettlement {
+    fn settle_in(
+        &self,
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        pool: &CowGrantPool,
+        excluded: &ExcludedEditor<'_>,
+    ) {
+        if !pool.any_completed() || pool.completions(excluded).next().is_none() {
+            return;
+        }
+        let result =
+            crate::metadata_grant::settle_native_cow(custody, pool, excluded).and_then(|settled| {
                 if settled.is_some() {
                     return Ok(());
                 }
@@ -673,21 +724,14 @@ impl CowGrantSettlement for CarrierGuestCowSettlement {
                     ))
                 })?;
                 if let Some(state) = state {
-                    settle_guest_cow_completions(&state, &custody, pool, excluded);
+                    settle_guest_cow_completions(&state, custody, pool, excluded);
                 }
                 // A retired MM settles its inventory and releases its records
                 // through publication retirement, without another live state.
                 Ok(())
-            },
-        );
+            });
         if let Err(error) = result {
             carrick_fatal!("hvpatch::guest_cow", "COW completion settlement: {error}");
-        }
-    }
-
-    fn release(&self, excluded: &ExcludedEditor<'_>) {
-        if let Some(pool) = self.pool() {
-            pool.release_mm(excluded);
         }
     }
 }

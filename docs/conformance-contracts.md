@@ -1891,3 +1891,19 @@ Cancellation after transfer leaves the recipient responsible for the resource.
 The two-request VM-free witness covers independent completion and stale MM or
 sequence refusal. This transport primitive does not authorize exec adoption or
 claim native loader/new-MM integration.
+
+### Retained unpublished MM publication
+
+`kernel.mm.address-space-occupancy` now also covers closed successor publication
+through a retained carrier venue. Two independent ABI regions reuse the same
+numeric MM key: dropping one successor releases only that carrier's reservation
+root and COW settlement, while the other remains closed and retained. The
+successor exposes neither initial binding nor an opening operation. A refusal
+witness checks the final retained reference is released; the host-provider
+witness runs both with normal policy and `CARRICK_EL1_MM_SWITCH=0`.
+
+These are publication-component witnesses. They do not prove image import,
+physical installation, ring exec adoption, or two running native processes.
+The HVF two-carrier COW-pool witness additionally checks exact mapping selection,
+retired-generation refusal and weak registration lifetime; Linux can compile
+that macOS-only fixture but cannot run it.

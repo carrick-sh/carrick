@@ -412,6 +412,16 @@ pub struct CarrierMetadataAccess {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierMetadataAccess {
+    pub fn carrier_identity(&self) -> core::num::NonZeroU64 {
+        self.carrier.custody.transfer_carrier
+    }
+
+    pub fn guest_cow_settlement(&self) -> Arc<dyn carrick_el1_abi::CowGrantSettlement> {
+        Arc::new(crate::trap::CarrierGuestCowSettlement::new(Arc::clone(
+            &self.carrier,
+        )))
+    }
+
     pub(crate) fn new(carrier: Arc<crate::trap::PersistentCarrierMappings>) -> Option<Self> {
         let generation = carrier.custody.live_generation()?;
         let access = Self {
