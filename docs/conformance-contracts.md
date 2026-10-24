@@ -2133,3 +2133,14 @@ syscalls and exec share the layered path resolver, and host exec consumes the
 same capability API intended for ring service requests. The fixture verifies
 resource lifetime and isolation, not two executing native processes. Native
 transaction publication and signed replacement witnesses remain #785 work.
+
+### Uninstalled executable backing
+
+`process.exec.backing` covers the physical preparation leaf shared by the
+existing host exec mapper and its extracted owned preparation. Two real private
+file views survive descriptor closure without sharing writes; dropping one
+releases only its mapping. Invalid anonymous extents return EINVAL (22) and leave
+an independent preparation intact. Sparse payloads retain their offsets and
+zero tails without a full-extent copy. The initial witness is API compile-red.
+These tests do not prove service admission, successor-MM publication, aggregate
+IPA/root-slot rollback, or two executing native processes; those remain #785.
