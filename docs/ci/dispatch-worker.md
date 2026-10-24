@@ -112,7 +112,7 @@ There are no tool arguments for issue, PR, repository or scope. Only `select_bra
 
 | Tool | Policy |
 | --- | --- |
-| `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, commits, issue/PR comments, earlier verified runs with URLs, conclusions, artifact names and outcome contracts. Includes their outcome comments and available branch candidates; board status is explicitly unavailable with this token. Includes the label/comment/review trigger verbatim and provenance. Optional sources degrade individually to `unavailable` with endpoint, HTTP status when available, and bounded redacted stderr; unverifiable authors remain `unverified`. Only trigger/issue reads are mandatory. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
+| `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, commits, issue/PR comments, earlier verified runs with URLs, conclusions, artifact names and outcome contracts. Includes their outcome comments and available branch candidates; board status is explicitly unavailable with this token. Includes the label/comment/review trigger verbatim and provenance. Optional sources degrade individually to `unavailable` with endpoint, HTTP status when available, and bounded redacted stderr; unverifiable authors remain `unverified`. Errors are request-scoped, deduplicated and tagged `github-api(error)` with `untrusted:true`. `sources` is a fixed response field retained when chronological context is clipped; `sources_omitted` reports overflow of its half-response budget. Only trigger/issue reads are mandatory. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
 | `select_branch {branch}` | Before workers begin, selects the new run branch or an authenticated issue-linked branch. Reads and retains its remote tip for the publication lease. |
 | `read_artifact {run, name}` | Reads one fixed text filename (`contract.json`, `handoff.json`, `raw.log`, `transcript.md`, `diffstat.txt`) from a completed earlier run. Verifies workflow/run/owner identity, a completed `carrick-agent` worker with successful upload, and the issue-derived upload bundle name. Review runs must keep the workflow blob from their head’s merge base with main. The returned contract, handoff or worker-transcript text is tagged with its dispatch provenance and marked untrusted. Rejects another issue, workflow, current run, expired/oversized bundle or unknown filename. Download is runner-private and the final read refuses symlinks and exceeds neither 64 KiB nor the event wall budget. |
 | `read_capacity {}` | Runs pinned `agy_worker.py capacity --json` as the worker account. Reads the real `backends` map from `capacity_report`, with `installed`, `free_slots`, `quota_free`, `score` and agy `quota.groups`/`group_scores`. Augments it with exact current IDs from the launcher's live `models --backend` roster, excluding superseded IDs. Returns numeric capacity and model IDs only, never credentials or raw diagnostics. Only successful capacity reports are cached. Each admitted worker consumes its snapshot, so the next worker requires a fresh report; refused choices can reuse the current successful report. Total probes are capped at `workers + refused_workers`. Each subprocess/output is bounded (120 s, 64 KiB) inside the event wall budget. |
@@ -132,7 +132,11 @@ work and logs with a failed timeout contract. Harvest failures name the original
 error and refuse publication; production is never rerun as a setup failure.
 The reserve is deducted from worker and wall time, rather than added after
 either budget. The 42-minute default leaves five minutes within the 47-minute
-loop step for retirement and reporting; the loop also stops by job minute 55
+loop step for retirement and reporting. The workflow stamps
+`CARRICK_DISPATCH_STEP_STARTED_AT` before acquiring the host lease; the working
+window is capped at step start + 47 minutes - the five-minute final reserve,
+so lease waits consume working time. Post-loop capture has its own 90-second
+window within that reserve. The loop also stops by job minute 55
 to leave five minutes of the 60-minute job for finalization and upload. There
 are no dispatch tier tables or tier-selected credentials. The loop chooses
 from live capacity and explains its choice in the outcome. No retries or
@@ -171,9 +175,11 @@ text lengths (never note or comment bodies), outcomes and durations, plus
 GitHub source, capacity, worker and harvest phase timings. It keeps opening
 context and recent records, marking dropped older diagnostics. The loop's
 foreground event log, stderr, stdout and available final launcher response are
-saved as `loop-transcript.log`,
-capped at 512 KiB like the worker transcript artifacts. Redaction precedes
-clipping and the token scan covers every uploaded file. The workflow uploads
+saved as JSON sections in `loop-transcript.log`, with an independent fixed
+serialized byte share for each stream. Model text cannot forge section framing
+or crowd stdout/stderr out. The full transcript is capped at 512 KiB. Redaction precedes
+clipping and the token scan covers every uploaded file, including diagnostics
+written by the final outcome post. The workflow uploads
 the whole `dispatch-output` directory, including these diagnostics. Worker contracts are claims for review; incomplete contracts
 fail the job. PR review and repository gates establish correctness.
 

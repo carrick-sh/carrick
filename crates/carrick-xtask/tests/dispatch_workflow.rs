@@ -522,6 +522,14 @@ fi
             .env("GITHUB_RUN_ID", "999")
             .env("GITHUB_RUN_ATTEMPT", "1")
             .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
+            .env(
+                "CARRICK_DISPATCH_STEP_STARTED_AT",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    .to_string(),
+            )
             .env("CARRICK_DISPATCH_BASE", base.trim())
             .env("GITHUB_SHA", "b".repeat(40))
             .env("GH_TOKEN", "fixture-job-token")
@@ -770,4 +778,24 @@ esac
             );
         }
     }
+}
+
+#[test]
+fn review_loop_step_clock_precedes_lease_wait() {
+    let docs = YamlLoader::load_from_str(include_str!(
+        "../../../.github/workflows/dispatch-worker.yml"
+    ))
+    .unwrap();
+    let steps = docs[0]["jobs"]["worker"]["steps"].as_vec().unwrap();
+    let step = steps
+        .iter()
+        .find(|s| s["id"].as_str() == Some("loop"))
+        .unwrap();
+    let script = step["run"].as_str().unwrap();
+    assert!(
+        script
+            .find("CARRICK_DISPATCH_STEP_STARTED_AT")
+            .is_some_and(|stamp| stamp < script.find("host-lease").unwrap()),
+        "step clock missing before lease acquisition"
+    );
 }

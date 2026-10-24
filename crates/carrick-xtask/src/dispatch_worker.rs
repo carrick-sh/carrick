@@ -749,9 +749,43 @@ fn capture_loop_foreground(actor: &Path) -> Result<(), ScalerError> {
     }
     Ok(())
 }
+fn bounded_transcript(mut value: Value) -> Result<String, ScalerError> {
+    let quota = (TRANSCRIPT_BYTES - 4096) / 5;
+    if let Some(sections) = value["sections"].as_object_mut() {
+        for section in sections.values_mut() {
+            let text = section["text"].as_str().unwrap_or_default();
+            let mut low = 0;
+            let mut high = text.len();
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                let mut end = mid;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if serde_json::to_vec(&text[..end])?.len() <= quota.saturating_sub(64) {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            while !text.is_char_boundary(low) {
+                low -= 1;
+            }
+            let clipped = low < text.len();
+            let retained = text[..low].to_owned();
+            section["text"] = retained.into();
+            section["truncated"] = (clipped || section["truncated"] == true).into();
+        }
+    }
+    let text = serde_json::to_string_pretty(&value)?;
+    if text.len() > TRANSCRIPT_BYTES {
+        return Err(ScalerError::Guard("loop transcript exceeds bound"));
+    }
+    Ok(text)
+}
 fn loop_transcript() -> Result<(), ScalerError> {
     let state = crate::agent_runner::state()?;
-    let mut text = String::new();
+    let mut sections = serde_json::Map::new();
     for name in [
         "loop-result.json",
         "loop-events.log",
@@ -759,11 +793,9 @@ fn loop_transcript() -> Result<(), ScalerError> {
         "loop.out",
         "loop.err",
     ] {
-        text.push_str(&format!("=== {name} ===\n"));
-        match diagnostic_text(&state.join(name)) {
-            Ok(log) => text.push_str(&log),
-            Err(error) => text.push_str(&format!("unavailable: {error}\n")),
-        }
+        let text = diagnostic_text(&state.join(name))
+            .unwrap_or_else(|error| format!("unavailable: {error}\n"));
+        sections.insert(name.into(), json!({"untrusted":true,"text":text}));
     }
     let package =
         PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?)
@@ -771,7 +803,7 @@ fn loop_transcript() -> Result<(), ScalerError> {
     std::fs::create_dir_all(&package)?;
     std::fs::write(
         package.join("loop-transcript.log"),
-        clip_diagnostic(text, TRANSCRIPT_BYTES),
+        bounded_transcript(json!({"sections":sections}))?,
     )?;
     Ok(())
 }
@@ -1559,7 +1591,9 @@ fn harvest_worker(
     let code = match result {
         Ok(124) => {
             contract.status = ContractStatus::Failed;
-            contract.summary = "Worker timed out; partial work harvested for continuation".into();
+            contract
+                .summary
+                .push_str("\nWorker timed out; partial work harvested for continuation");
             124
         }
         Ok(code) => {
@@ -1810,6 +1844,10 @@ fn push_command(
     ))
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static LAST_SCANNED_ARTIFACTS: std::cell::RefCell<std::collections::BTreeMap<String, Vec<u8>>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
 /// Mask exact job-token bytes, then scan the complete upload population.
 fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
     if token.is_empty() {
@@ -1845,7 +1883,7 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
             contract.tests = contract.tests.iter().map(|s| mask(s)).collect();
             contract.risks = contract.risks.iter().map(|s| mask(s)).collect();
             serde_json::to_string_pretty(&contract)?
-        } else if name == "handoff.json" {
+        } else if name == "handoff.json" || name == "loop-transcript.log" {
             fn redact(value: &mut Value, mask: &impl Fn(&str) -> String) {
                 match value {
                     Value::String(s) => *s = mask(s),
@@ -1864,15 +1902,17 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
             }
             let mut value: Value = serde_json::from_str(&text)?;
             redact(&mut value, &mask);
-            serde_json::to_string_pretty(&value)?
+            if name == "loop-transcript.log" {
+                bounded_transcript(value)?
+            } else {
+                serde_json::to_string_pretty(&value)?
+            }
         } else {
             mask(&text)
         };
         let masked = match name {
             "loop.log" => clip_diagnostic(masked, LOOP_LOG_BYTES),
-            "raw.log" | "transcript.md" | "loop-transcript.log" => {
-                clip_diagnostic(masked, TRANSCRIPT_BYTES)
-            }
+            "raw.log" | "transcript.md" => clip_diagnostic(masked, TRANSCRIPT_BYTES),
             _ => masked,
         };
         std::fs::write(entry.path(), masked)?;
@@ -1884,11 +1924,19 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
     {
         return Err(ScalerError::Guard("incomplete dispatch artifacts"));
     }
-    for name in names {
+    for name in &names {
         if regular_text(&package.join(name))?.contains(token) {
             return Err(ScalerError::Guard("job token found in upload"));
         }
     }
+    #[cfg(test)]
+    LAST_SCANNED_ARTIFACTS.with(|scanned| {
+        *scanned.borrow_mut() = names
+            .iter()
+            .map(|name| Ok((name.clone(), std::fs::read(package.join(name))?)))
+            .collect::<Result<_, std::io::Error>>()?;
+        Ok::<_, std::io::Error>(())
+    })?;
     Ok(())
 }
 
