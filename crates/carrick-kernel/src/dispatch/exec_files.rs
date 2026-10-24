@@ -30,12 +30,7 @@ impl ExecFdSources for HostExecFdSources {
     fn source(&self, fd: crate::kernel::FileSlotNumber) -> Result<ExecSource, ExecSourceError> {
         let absent = || ExecSourceError::Linux(carrick_abi::LINUX_ENOENT);
         let _lease = self.0.acquire_functional_lease().ok_or_else(absent)?;
-        let file = self
-            .0
-            .read_open_files()
-            .get(&fd.raw())
-            .cloned()
-            .ok_or_else(absent)?;
+        let file = self.0.slot(fd).ok_or_else(absent)?;
         if let Some(source) = file.description.retained_exec_source() {
             return Ok(source);
         }
