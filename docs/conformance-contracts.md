@@ -172,6 +172,20 @@ HEAD, SHA-256, CDHash, LC_UUID, hypervisor entitlement, `__dof_carrick`, and
 run-ID-scoped cleanup. A focused contract proves only its named family; it does
 not close the frozen suite or ecosystem denominator.
 
+## Exec admission custody (`process.exec.custody`)
+
+The shared `carrick-sched-core::process::exec::ExecOperationGuard` retains
+admission until an already admitted sibling drain settles. Rollback resumes
+siblings before release; after the no-return cut, dropping the guard terminates
+siblings before release. The existing host Kernel exec transaction consumes this
+implementation. The VM-free callback fixture observes exact ordering and one
+disposition per drain, including two independently retained reservations.
+
+This is a behavior-preserving extraction for #785. There is no new semantic
+red-first claim: it does not bind ring exec, external image services, the FD
+authority, nonleader promotion, or old-MM completion rejection. Those require
+production native-owner witnesses and signed execution in the subsequent work.
+
 ## Filesystem cache cohort
 
 `kernel.fs.cache-cohort` covers cached path, directory topology, root-marker,
