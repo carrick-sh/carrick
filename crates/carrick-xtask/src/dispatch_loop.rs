@@ -2312,7 +2312,7 @@ case "$endpoint" in
    census_id=${endpoint#*/actions/runs/}; census_id=${census_id%%/*}
    if test -f "$RUNNER_TEMP/census-this-issue"; then
     printf '{"artifacts":[{"id":1,"name":"dispatch-799-%s-1","expired":false,"size_in_bytes":100}]}' "$census_id"
-   else echo '{"artifacts":[]}'; fi ;;
+   else printf '{"artifacts":[{"id":1,"name":"dispatch-587-%s-1","expired":false,"size_in_bytes":100}]}' "$census_id"; fi ;;
  */actions/runs/10??)
    census_id=${endpoint##*/}; sed "s/\"id\":42/\"id\":$census_id/" "$RUNNER_TEMP/run.json" ;;
  */actions/runs/42/artifacts*) cat "$RUNNER_TEMP/artifacts.json" ;;
@@ -2695,18 +2695,25 @@ esac
     #[test]
     fn expired_artifact_does_not_revoke_outcome_provenance() {
         shared_fixture(|root| {
-            std::fs::write(root.join("artifacts.json"), "{\"artifacts\":[]}").unwrap();
-            let state = server(root).read_state().unwrap();
-            assert!(
-                state["state"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|item| item["kind"] == "issue_comment"
-                        && item["provenance"] == "dispatch-agent(run 42)"),
-                "expired artifact revoked authenticated outcome provenance: {state}"
-            );
-            assert!(prior_artifact(root, 799, RunId(42), "handoff.json").is_err());
+            let mut expired: Value =
+                serde_json::from_str(&regular_text(&root.join("artifacts.json")).unwrap()).unwrap();
+            expired["artifacts"][0]["expired"] = true.into();
+            for artifacts in [expired, json!({"artifacts":[]})] {
+                std::fs::write(root.join("artifacts.json"), artifacts.to_string()).unwrap();
+                let state = server(root).read_state().unwrap();
+                for kind in ["issue_comment", "pr"] {
+                    assert!(
+                        state["state"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|item| item["kind"] == kind
+                                && item["provenance"] == "dispatch-agent(run 42)"),
+                        "expired artifact revoked authenticated {kind} provenance: {state}"
+                    );
+                }
+                assert!(prior_artifact(root, 799, RunId(42), "handoff.json").is_err());
+            }
         });
     }
     #[test]
