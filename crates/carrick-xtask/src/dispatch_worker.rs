@@ -178,7 +178,10 @@ pub fn validate_event(event: &Value, triggering_actor: &str) -> Result<Dispatch,
             ));
         }
     } else if comment {
-        if event["action"] != "created" || !agent_comment(&event["comment"]) {
+        if event["action"] != "created"
+            || event["issue"]["state"] != "open"
+            || !agent_comment(&event["comment"])
+        {
             return Err(ScalerError::Guard(
                 "comment requires an unedited owner /agent creation",
             ));
@@ -858,16 +861,37 @@ pub(crate) fn branch_run(issue: u64, branch: &str) -> Result<&str, ScalerError> 
 }
 
 fn open_prs(root: &Path, branch: &str) -> Result<Value, ScalerError> {
-    Ok(serde_json::from_str(&gh(
+    branch_prs(root, branch, "open")
+}
+fn branch_prs(root: &Path, branch: &str, state: &str) -> Result<Value, ScalerError> {
+    let filter = if state == "open" {
+        "&base=main"
+    } else {
+        "&per_page=100"
+    };
+    let prs: Value = serde_json::from_str(&gh(
         root,
         &[
             "api",
-            &format!("repos/{REPOSITORY}/pulls?state=open&base=main&head=carrick-sh:{branch}"),
+            &format!("repos/{REPOSITORY}/pulls?state={state}{filter}&head=carrick-sh:{branch}"),
         ],
-    )?)?)
+    )?)?;
+    if state == "all" && prs.as_array().is_some_and(|prs| prs.len() >= 100) {
+        return Err(ScalerError::Guard("branch PR history exceeds bound"));
+    }
+    if state == "all"
+        && prs.as_array().is_some_and(|prs| {
+            prs.iter()
+                .any(|pr| pr["state"] == "closed" || pr["merged_at"].as_str().is_some())
+        })
+    {
+        return Err(ScalerError::Guard("branch had a closed or merged PR"));
+    }
+    Ok(prs)
 }
 
-/// One run-identity predicate for controller admission and comment provenance.
+/// Run identity for controller admission and #799 PR ownership. Artifact and
+/// publication provenance additionally authenticate main workflow and jobs.
 /// The issue constraint is checked against every available issue/branch mapping.
 pub(crate) fn dispatch_run_identity(run: &Value, issue: Option<u64>) -> bool {
     let branch = run["head_branch"].as_str().unwrap_or_default();
@@ -1255,6 +1279,30 @@ fn worker_checkout(
     }
 }
 
+fn prepare_worker_actor(state: &Path, actor: &Path, backend: &str) -> Result<(), ScalerError> {
+    let credential = match backend {
+        "codex" => ".codex",
+        "agy" => ".gemini",
+        _ => return Err(ScalerError::Guard("worker credential backend refused")),
+    };
+    std::fs::create_dir(actor.join("home"))?;
+    std::fs::set_permissions(actor.join("home"), std::fs::Permissions::from_mode(0o700))?;
+    copy_tree(
+        &state.join("home").join(credential),
+        &actor.join("home").join(credential),
+        &mut 0,
+        TreeLinks::Preserve,
+    )?;
+    for name in ["bin", "director"] {
+        copy_tree(
+            &state.join(name),
+            &actor.join(name),
+            &mut 0,
+            TreeLinks::Preserve,
+        )?;
+    }
+    Ok(())
+}
 fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerError> {
     let base = dispatch.base.clone();
     if !sha(&base)
@@ -1320,14 +1368,7 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         let actor = outer.path().join("agent");
         std::fs::create_dir(&actor)?;
         std::fs::set_permissions(&actor, std::fs::Permissions::from_mode(0o700))?;
-        for name in ["home", "bin", "director"] {
-            copy_tree(
-                &state.join(name),
-                &actor.join(name),
-                &mut 0,
-                TreeLinks::Preserve,
-            )?;
-        }
+        prepare_worker_actor(&state, &actor, &dispatch.worker.backend)?;
         let actor_work = actor.join("work");
         let previous: Option<Receipt> = if work.is_dir() {
             Some(serde_json::from_str(&regular_text(
@@ -1545,6 +1586,8 @@ fn publish(
     {
         if dispatch.resume {
             agent_loop::verified_branch(root, dispatch.issue, &dispatch.branch)?;
+        } else {
+            branch_prs(root, &dispatch.branch, "all")?;
         }
         git(
             &work,
@@ -1717,6 +1760,7 @@ printf '%s\n' "$@" >> "$RUNNER_TEMP/gh.args"
 if test "$1" = api; then
  case "$2" in
  */actions/runs/42) cat "$RUNNER_TEMP/original.json" ;;
+ */actions/runs/42/jobs*) echo '{"jobs":[{"name":"worker","status":"completed","runner_name":"carrick-agent-123","steps":[{"name":"Run actions/upload-artifact@v4","status":"completed","conclusion":"success"}]}]}' ;;
  *'/pulls?'*) if test -f "$RUNNER_TEMP/created"; then cat "$RUNNER_TEMP/pr.json"; else echo '[]'; fi ;;
  *) exit 91 ;;
  esac
@@ -1767,7 +1811,8 @@ fi
         let subject = "fix(ci): implement the owner issue";
         git(&work, &["commit", "--allow-empty", "-m", subject]).unwrap();
         let pr = json!({"state":"open","number":800,"user":{"login":"github-actions[bot]","type":"Bot"},"head":{"ref":dispatch.branch,"repo":{"full_name":REPOSITORY}},"base":{"ref":"main"},"draft":true,"body":format!("Closes #634\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
-        let run = review_event()["dispatch_run"].clone();
+        let mut run = review_event()["dispatch_run"].clone();
+        run["status"] = "completed".into();
         std::fs::write(outer.join("original.json"), run.to_string()).unwrap();
         std::fs::write(outer.join("pr.json"), json!([pr.clone()]).to_string()).unwrap();
         let contract = Contract {
@@ -2261,6 +2306,41 @@ fi
         assert!(mask_artifacts(temp.path(), token).is_err());
     }
 
+    #[test]
+    fn worker_actor_receives_only_selected_backend_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        for name in [
+            "home/.codex",
+            "home/.gemini/antigravity-cli",
+            "bin",
+            "director",
+        ] {
+            std::fs::create_dir_all(state.join(name)).unwrap();
+        }
+        std::fs::write(state.join("home/.codex/auth.json"), "codex-secret").unwrap();
+        std::fs::write(
+            state.join("home/.gemini/antigravity-cli/antigravity-oauth-token"),
+            "agy-secret",
+        )
+        .unwrap();
+        let mut leaked = Vec::new();
+        for (backend, wanted, forbidden) in
+            [("agy", ".gemini", ".codex"), ("codex", ".codex", ".gemini")]
+        {
+            let actor = temp.path().join(backend);
+            std::fs::create_dir(&actor).unwrap();
+            prepare_worker_actor(&state, &actor, backend).unwrap();
+            assert!(actor.join("home").join(wanted).is_dir());
+            if actor.join("home").join(forbidden).exists() {
+                leaked.push(backend);
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "worker homes leaked other backend credentials: {leaked:?}"
+        );
+    }
     fn event() -> Value {
         json!({"repository":{"full_name":REPOSITORY},"action":"labeled",
             "sender":{"login":"tjfontaine","type":"User"},"label":{"name":"dispatch:sol-high"},
@@ -2294,6 +2374,7 @@ fi
         let mut value = event();
         value.as_object_mut().unwrap().remove("label");
         value["action"] = "created".into();
+        value["issue"]["state"] = "open".into();
         value["comment"] = json!({"user":{"login":"tjfontaine","type":"User"},"body":"/agent please continue","created_at":"2026-10-24T00:00:00Z","updated_at":"2026-10-24T00:00:00Z"});
         assert!(
             validate_event(&value, "tjfontaine").is_ok(),
@@ -2305,6 +2386,7 @@ fi
             ("/comment/updated_at", "2026-10-24T00:01:00Z"),
             ("/action", "edited"),
             ("/comment/body", "/agentish"),
+            ("/issue/state", "closed"),
         ] {
             let mut other = value.clone();
             *other.pointer_mut(pointer).unwrap() = bad.into();
