@@ -112,13 +112,28 @@ impl CowResolver for FaultResolver<'_> {
 
 #[test]
 fn native_child_empty_supply_resumes_cow_without_changing_parent() {
-    composed_native_supply(false);
+    composed_native_supply(CompetingPublication::None);
 }
 #[test]
 fn native_backing_reply_observes_a_competing_valid_publication() {
-    composed_native_supply(true);
+    composed_native_supply(CompetingPublication::Fault);
 }
-fn composed_native_supply(competing_publication: bool) {
+#[test]
+fn native_backing_reply_fills_fault_beside_a_competing_live_page() {
+    composed_native_supply(CompetingPublication::Neighbor);
+}
+#[test]
+fn native_backing_reply_offsets_supply_after_a_competing_live_page() {
+    composed_native_supply(CompetingPublication::Preceding);
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompetingPublication {
+    None,
+    Fault,
+    Neighbor,
+    Preceding,
+}
+fn composed_native_supply(competing_publication: CompetingPublication) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let window = carrick_el1_abi::EL1_COW_COPY_BASE;
@@ -711,7 +726,13 @@ fn composed_native_supply(competing_publication: bool) {
         "native mmap: {fresh:#x}"
     );
     frame.esr = 0x92000046;
-    frame.far = fresh + 7;
+    let fault_page = fresh
+        + if competing_publication == CompetingPublication::Preceding {
+            4096
+        } else {
+            0
+        };
+    frame.far = fault_page + 7;
     frame.elr = 0x401300;
     let backing_supply = OwnerFaultSupply::new(portal).with_handle(handle);
     assert_eq!(
@@ -824,7 +845,14 @@ fn composed_native_supply(competing_publication: bool) {
             publication: carrick_mmu_core::aarch64::GuestLeafPublication {
                 va: window.range.start(),
                 ipa: rows[0].gpa.raw(),
-                len: 4096,
+                len: if matches!(
+                    competing_publication,
+                    CompetingPublication::Neighbor | CompetingPublication::Preceding
+                ) {
+                    8192
+                } else {
+                    4096
+                },
                 writable: true,
                 executable: false,
             },
@@ -839,15 +867,62 @@ fn composed_native_supply(competing_publication: bool) {
     assert!(
         unsafe { &*(reply.raw() as *const carrick_el1_abi::PortalGrantSlot) }.submit(window, &txn)
     );
-    if competing_publication {
+    if competing_publication != CompetingPublication::None {
         let competing = carrick_el1_abi::PortalGrantSlot::new();
-        assert!(competing.submit(window, &txn));
+        let (competing_window, competing_txn) = if matches!(
+            competing_publication,
+            CompetingPublication::Neighbor | CompetingPublication::Preceding
+        ) {
+            let neighbor = if competing_publication == CompetingPublication::Preceding {
+                fresh
+            } else {
+                fresh + 4096
+            };
+            let index = access.find(identity.mm).unwrap();
+            let mut root = fixture
+                .region
+                .table()
+                .lock_in(access, index.index(), handle.mm(), 0)
+                .unwrap();
+            let selected = carrick_core::mm::fault::select_fault_window(
+                &mut root,
+                NonZeroU64::MIN,
+                carrick_guest_arch::UserVa::new(neighbor),
+                carrick_guest_arch::GuestLen::new(4096),
+                window.protection,
+            )
+            .unwrap();
+            assert_eq!(selected.range.start(), neighbor);
+            let competing_txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    generation: selected.operation.sequence,
+                    ..txn.id
+                },
+                root: txn.root,
+                op: DescriptorOp::Prepare {
+                    publication: carrick_mmu_core::aarch64::GuestLeafPublication {
+                        va: neighbor,
+                        ipa: rows[0].gpa.raw() + 8192,
+                        len: 4096,
+                        writable: true,
+                        executable: false,
+                    },
+                    resident: PageSpan::new(neighbor, 4096),
+                    backing: rows[0].identity,
+                },
+                tables: TableGrants::new(&[]).unwrap(),
+            };
+            (selected, competing_txn)
+        } else {
+            (window, txn)
+        };
+        assert!(competing.submit(competing_window, &competing_txn));
         let mm = crate::aarch64_process::Portal::for_zone(
             NonZeroU64::MIN,
             fixture.region.table(),
             fixture.zone,
         );
-        let target = carrick_core::mm::frames::grant_target(&mm, window, 0).unwrap();
+        let target = carrick_core::mm::frames::grant_target(&mm, competing_window, 0).unwrap();
         let receipt = carrick_core::mm::frames::apply_grant::<Aarch64Mmu, _>(
             &competing,
             words,
@@ -860,7 +935,11 @@ fn composed_native_supply(competing_publication: bool) {
             receipt.outcome,
             carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
         ));
-        assert!(competing.take_receipt(window, &txn).is_some());
+        assert!(
+            competing
+                .take_receipt(competing_window, &competing_txn)
+                .is_some()
+        );
     }
     {
         let queue = fixture
@@ -906,14 +985,31 @@ fn composed_native_supply(competing_publication: bool) {
         "a competing valid publication cannot manufacture SIGSEGV"
     );
     assert_eq!(
-        leaf(words, child_root, fresh) & AARCH64_ROOT_ADDRESS_MASK,
-        rows[0].gpa.raw()
+        leaf(words, child_root, fault_page) & AARCH64_ROOT_ADDRESS_MASK,
+        rows[0].gpa.raw() + fault_page - fresh,
+        "the faulting page must become resident even when a neighbor won publication"
     );
-    assert_eq!(
-        leaf(words, child_root, fresh + 4096),
-        0,
-        "unreadable suffix must remain absent"
-    );
+    if matches!(
+        competing_publication,
+        CompetingPublication::Neighbor | CompetingPublication::Preceding
+    ) {
+        let neighbor = if competing_publication == CompetingPublication::Preceding {
+            fresh
+        } else {
+            fresh + 4096
+        };
+        assert_eq!(
+            leaf(words, child_root, neighbor) & AARCH64_ROOT_ADDRESS_MASK,
+            rows[0].gpa.raw() + 8192,
+            "preserve the competing neighbor's output"
+        );
+    } else {
+        assert_eq!(
+            leaf(words, child_root, fresh + 4096),
+            0,
+            "unreadable suffix must remain absent"
+        );
+    }
     assert_eq!(
         leaf(words, 0x10000, fresh),
         0,
