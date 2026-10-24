@@ -4,6 +4,34 @@ use super::*;
 use carrick_core_abi::service::{ServiceError, ServiceOperation, ServiceRequest, ServiceResult};
 use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
 
+fn native_exception_signal(
+    kind: carrick_core_abi::service::NativeExceptionKind,
+) -> (carrick_signal_core::policy::Signal, i32) {
+    use carrick_core_abi::service::NativeExceptionKind;
+    match kind {
+        NativeExceptionKind::Breakpoint => (
+            carrick_signal_core::policy::Signal::TRAP,
+            carrick_syscall_abi::LINUX_TRAP_BRKPT,
+        ),
+        NativeExceptionKind::SingleStep => (
+            carrick_signal_core::policy::Signal::TRAP,
+            carrick_syscall_abi::LINUX_TRAP_TRACE,
+        ),
+        NativeExceptionKind::HardwareBreakpoint => (
+            carrick_signal_core::policy::Signal::TRAP,
+            carrick_syscall_abi::LINUX_TRAP_HWBKPT,
+        ),
+        NativeExceptionKind::UndefinedInstruction | NativeExceptionKind::FloatingPoint => (
+            carrick_signal_core::policy::Signal::ILL,
+            carrick_syscall_abi::LINUX_ILL_ILLOPC,
+        ),
+        NativeExceptionKind::Alignment => (
+            carrick_signal_core::policy::Signal::BUS,
+            carrick_syscall_abi::LINUX_BUS_ADRALN,
+        ),
+    }
+}
+
 pub(super) struct PendingService<'a> {
     reply: Option<Box<carrick_el1_abi::PortalGrantSlot>>,
     request: ServiceRequest,
@@ -301,7 +329,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         )
         .ok_or(NativeProcessError::Stale)?;
         let entry = match request.operation {
-            ServiceOperation::Fault(_) => OwnerEntry::Exception,
+            ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => OwnerEntry::Exception,
             ServiceOperation::Crossing { .. } => OwnerEntry::Syscall,
             ServiceOperation::CarrierWork { entry } => entry,
         };
@@ -507,7 +535,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .zone
                     .record(self.record.id)
                     .publish_owner_continuation(match request.operation {
-                        ServiceOperation::Fault(_) => OwnerEntry::Exception,
+                        ServiceOperation::Fault(_) | ServiceOperation::Exception(_) => {
+                            OwnerEntry::Exception
+                        }
                         ServiceOperation::Crossing { .. } => OwnerEntry::Syscall,
                         ServiceOperation::CarrierWork { entry } => entry,
                     });
@@ -580,7 +610,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     carrick_syscall_abi::LINUX_EINTR.guest_retval(),
                 )))
             }
-            (ServiceOperation::Fault(_), ServiceResult::Cancelled) => Ok(NativeResume::NoPending),
+            (
+                ServiceOperation::Fault(_) | ServiceOperation::Exception(_),
+                ServiceResult::Cancelled,
+            ) => Ok(NativeResume::NoPending),
             (ServiceOperation::Fault(fault), ServiceResult::BackingFault) => {
                 self.force_fault_info(
                     carrick_signal_core::policy::Signal::BUS,
@@ -615,6 +648,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| NativeProcessError::Fault)?;
                 Ok(NativeResume::NoPending)
             }
+            (ServiceOperation::Exception(exception), ServiceResult::Refused) => {
+                let (signal, si_code) = native_exception_signal(exception.kind);
+                self.force_fault_info(
+                    signal,
+                    carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                        carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+                    ),
+                    carrick_syscall_abi::LinuxSiginfo {
+                        si_code,
+                        si_addr: exception.address.raw(),
+                        ..carrick_syscall_abi::LinuxSiginfo::empty()
+                    },
+                )
+                .map_err(|_| NativeProcessError::Fault)?;
+                Ok(NativeResume::NoPending)
+            }
             (ServiceOperation::Fault(_), ServiceResult::Supplied) => {
                 // Supply changes physical availability only. Retry the exact
                 // faulting instruction; the ring fault resolver still decides
@@ -623,6 +672,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
             (ServiceOperation::Crossing { .. }, ServiceResult::Supplied) => {
                 // No generic host syscall dispatcher owns native semantics.
+                Err(NativeProcessError::Quarantined)
+            }
+            (ServiceOperation::Exception(_), ServiceResult::Supplied) => {
                 Err(NativeProcessError::Quarantined)
             }
         })();
@@ -637,5 +689,44 @@ fn service_error(error: ServiceError) -> NativeProcessError {
         ServiceError::Busy => NativeProcessError::Busy,
         ServiceError::Stale => NativeProcessError::Stale,
         ServiceError::Exhausted => NativeProcessError::Exhausted,
+    }
+}
+
+#[cfg(test)]
+mod exception_tests {
+    use super::native_exception_signal;
+    use carrick_core_abi::service::NativeExceptionKind;
+
+    #[test]
+    fn native_exception_signal_policy_is_exhaustive() {
+        use carrick_signal_core::policy::Signal;
+        for (kind, expected) in [
+            (
+                NativeExceptionKind::Breakpoint,
+                (Signal::TRAP, carrick_syscall_abi::LINUX_TRAP_BRKPT),
+            ),
+            (
+                NativeExceptionKind::SingleStep,
+                (Signal::TRAP, carrick_syscall_abi::LINUX_TRAP_TRACE),
+            ),
+            (
+                NativeExceptionKind::HardwareBreakpoint,
+                (Signal::TRAP, carrick_syscall_abi::LINUX_TRAP_HWBKPT),
+            ),
+            (
+                NativeExceptionKind::UndefinedInstruction,
+                (Signal::ILL, carrick_syscall_abi::LINUX_ILL_ILLOPC),
+            ),
+            (
+                NativeExceptionKind::Alignment,
+                (Signal::BUS, carrick_syscall_abi::LINUX_BUS_ADRALN),
+            ),
+            (
+                NativeExceptionKind::FloatingPoint,
+                (Signal::ILL, carrick_syscall_abi::LINUX_ILL_ILLOPC),
+            ),
+        ] {
+            assert_eq!(native_exception_signal(kind), expected);
+        }
     }
 }
