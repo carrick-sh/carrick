@@ -54,7 +54,7 @@ pub const GUEST_FD_CLOEXEC: u32 = 1;
 pub const GUEST_FD_LIMIT: i32 = 1024;
 
 mod exec;
-pub use exec::*;
+pub use exec::{NativeCloseOnExecStage, NativeExecFdError, NativeExecReleases, NativeTableCustody};
 
 #[cfg(any(test, feature = "host-test"))]
 pub static RETAINED_HOOK: SpinLock<Option<alloc::boxed::Box<dyn FnOnce() + Send>>> =
