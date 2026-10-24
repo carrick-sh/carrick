@@ -1309,4 +1309,9 @@ fn owner_comment_dispatch_run_is_admitted() {
         Admission::Agent.identifies_run(&run),
         "owner comment run refused"
     );
+    let mut context = standing_context("issue_comment", "refs/heads/main");
+    context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/heads/main");
+    assert!(Admission::Agent.authorize(&context).is_ok());
+    context.workflow_ref = format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/pull/42/merge");
+    assert!(Admission::Agent.authorize(&context).is_err());
 }

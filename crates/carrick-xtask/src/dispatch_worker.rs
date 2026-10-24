@@ -66,6 +66,7 @@ pub struct Dispatch {
     pub body: String,
     pub branch: String,
     pub resume: bool,
+    pub selected_tip: Option<String>,
     pub worker: Worker,
     pub base: String,
     pub review: bool,
@@ -142,11 +143,13 @@ pub(crate) fn agent_comment(comment: &Value) -> bool {
                 .is_some_and(|s| s.starts_with(char::is_whitespace)))
 }
 
-pub fn validate_event(
-    event: &Value,
-    _config: &str,
-    triggering_actor: &str,
-) -> Result<Dispatch, ScalerError> {
+pub(crate) fn comment_digest(comment: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let data = json!({"id":comment["id"],"body":comment["body"],"created_at":comment["created_at"],"updated_at":comment["updated_at"]});
+    format!("{:x}", Sha256::digest(data.to_string().as_bytes()))
+}
+
+pub fn validate_event(event: &Value, triggering_actor: &str) -> Result<Dispatch, ScalerError> {
     let review = event.get("review").is_some();
     let comment = event.get("comment").is_some();
     if event["repository"]["full_name"] != REPOSITORY
@@ -211,6 +214,9 @@ pub fn validate_event(
             .to_owned(),
         branch,
         resume,
+        selected_tip: event["pull_request"]["head"]["sha"]
+            .as_str()
+            .map(str::to_owned),
         worker: Worker::default(),
         base: String::new(),
         review,
@@ -245,7 +251,7 @@ fn schema() -> Value {
             "summary":{"type":"string"},"tests":{"type":"array","items":{"type":"string"}},
             "risks":{"type":"array","items":{"type":"string"}}}})
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Contract {
     pub status: ContractStatus,
@@ -470,17 +476,11 @@ fn account_command(command: &Command, user: &str, root: &Path) -> Command {
     isolated
 }
 
-fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
-    let state = root
-        .parent()
-        .ok_or(ScalerError::Guard("missing agent home"))?
-        .to_owned();
-    let home = state.join("home");
-    let schema_path = state.join("schema.json");
-    let prompt_file = state.join("prompt.md");
-    std::fs::write(&schema_path, serde_json::to_vec_pretty(&schema())?)?;
-    let prompt = format!(
+fn worker_prompt(dispatch: &Dispatch) -> String {
+    format!(
         "Work issue {REPOSITORY}#{} on branch {}. Read AGENTS.md in full.\n\
+        Rebase onto admitted main {} (refs/carrick/dispatch-main) before working.\n\
+        Resolve any conflicts in this isolated checkout; preserve earlier workers' commits.\n\
         Implement and verify this brief. Commit your work with a Why/What/Verified body and\n\
         Co-Authored-By: {}\nDo not push, open a PR, or post comments; the workflow publishes those.\n\
         Never use --no-verify, git stash or git add -A. Keep conformance-probes/target out of commits.\n\
@@ -490,10 +490,23 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         Return the requested JSON contract, stating unrun gates and blockers honestly.\n\n{}{}",
         dispatch.issue,
         dispatch.branch,
+        dispatch.base,
         dispatch.worker.coauthor,
         dispatch.body,
         dispatch.review_text
-    );
+    )
+}
+
+fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
+    let state = root
+        .parent()
+        .ok_or(ScalerError::Guard("missing agent home"))?
+        .to_owned();
+    let home = state.join("home");
+    let schema_path = state.join("schema.json");
+    let prompt_file = state.join("prompt.md");
+    std::fs::write(&schema_path, serde_json::to_vec_pretty(&schema())?)?;
+    let prompt = worker_prompt(dispatch);
     std::fs::write(&prompt_file, prompt)?;
     // Deduct checkout/build/bootstrap time rather than starting a fresh
     // 30-minute turn against a token snapshot taken at job admission.
@@ -957,19 +970,19 @@ struct Receipt {
     refused_workflow: bool,
 }
 
-fn admitted_base(review: bool) -> Result<String, ScalerError> {
+fn admitted_base(resolved_main: bool) -> Result<String, ScalerError> {
     select_base(
-        review,
+        resolved_main,
         std::env::var("CARRICK_DISPATCH_BASE").ok().as_deref(),
         std::env::var("GITHUB_SHA").ok().as_deref(),
     )
 }
 fn select_base(
-    review: bool,
+    resolved_main: bool,
     main: Option<&str>,
     github_sha: Option<&str>,
 ) -> Result<String, ScalerError> {
-    (if review { main } else { github_sha })
+    (if resolved_main { main } else { github_sha })
         .filter(|s| sha(s))
         .map(str::to_owned)
         .ok_or(ScalerError::Guard("missing admitted base SHA"))
@@ -1004,7 +1017,7 @@ pub(crate) fn load_event(root: &Path, path: &Path) -> Result<Value, ScalerError>
             .ok_or(ScalerError::Guard("missing comment id"))?;
         let live = api(root, &format!("repos/{REPOSITORY}/issues/comments/{id}"))?;
         if !agent_comment(&live)
-            || ["id", "body", "created_at", "updated_at", "user"]
+            || ["id", "body", "created_at", "updated_at"]
                 .iter()
                 .any(|k| live[k] != event["comment"][k])
         {
@@ -1123,25 +1136,14 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         } => return agent_loop::run(&root, &event, &setup_status),
         DispatchAction::Guard { event, admit, .. } => (event, admit),
     };
-    let mut event = load_event(&root, &event_path)?;
+    let event = load_event(&root, &event_path)?;
     let mut dispatch = validate_event(
         &event,
-        include_str!("../../../.github/dispatch-tiers.toml"),
         &std::env::var("GITHUB_TRIGGERING_ACTOR").unwrap_or_default(),
     )?;
-    dispatch.base = admitted_base(dispatch.review)?;
+    dispatch.base = admitted_base(dispatch.review || event.get("comment").is_some())?;
     if admit {
         cleanup_agent_user()?;
-        if !dispatch.resume {
-            let prs = linked_prs(&root, dispatch.issue, "open")?;
-            if let Some(pr) = select_owned_pr(dispatch.issue, &prs, |id| {
-                api(&root, &format!("repos/{REPOSITORY}/actions/runs/{id}"))
-            })? {
-                dispatch.branch = pr["head"]["ref"].as_str().unwrap_or_default().to_owned();
-                dispatch.resume = true;
-                event["pull_request"] = pr;
-            }
-        }
     }
     assigned_branch(&mut dispatch)?;
     branch_run(dispatch.issue, &dispatch.branch)?;
@@ -1155,11 +1157,13 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         use std::io::Write;
         writeln!(
             std::fs::OpenOptions::new().append(true).open(path)?,
-            "base={}\nhead={}",
+            "base={}\nhead={}\nissue={}\ncomment={}",
             dispatch.base,
             event["pull_request"]["head"]["sha"]
                 .as_str()
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            dispatch.issue,
+            comment_digest(&event["comment"])
         )?;
     }
     Ok(())
@@ -1186,6 +1190,71 @@ fn seal_runner(root: &Path) -> Result<(), ScalerError> {
     Ok(())
 }
 
+/// Clone only reconstructed data. A later worker starts at its predecessor's
+/// commits, preserving the first fetched remote tip as publication authority.
+fn worker_checkout(
+    root: &Path,
+    previous_work: &Path,
+    target: &Path,
+    dispatch: &Dispatch,
+    previous: Option<&Receipt>,
+) -> Result<String, ScalerError> {
+    let source = if previous.is_some() {
+        previous_work
+    } else {
+        root
+    };
+    let parent = target
+        .parent()
+        .ok_or(ScalerError::Guard("worker target parent"))?;
+    git(
+        parent,
+        &[
+            "clone",
+            "--no-local",
+            "--no-hardlinks",
+            "--no-checkout",
+            source.to_str().ok_or(ScalerError::Guard("worker source"))?,
+            "work",
+        ],
+    )?;
+    git(
+        target,
+        &[
+            "fetch",
+            "--no-tags",
+            root.to_str()
+                .ok_or(ScalerError::Guard("main checkout path"))?,
+            &format!("{}:refs/carrick/dispatch-main", dispatch.base),
+        ],
+    )?;
+    if previous.is_some() || dispatch.resume {
+        let reference = format!("origin/{}", dispatch.branch);
+        let tip = git(target, &["rev-parse", &reference])?.trim().to_owned();
+        if previous.is_none()
+            && dispatch
+                .selected_tip
+                .as_ref()
+                .is_some_and(|expected| *expected != tip)
+        {
+            return Err(ScalerError::Guard(
+                "selected branch moved before worker admission",
+            ));
+        }
+        git(target, &["checkout", "-B", &dispatch.branch, &reference])?;
+        if let Some(previous) = previous {
+            return Ok(previous.expected_tip.clone());
+        }
+        Ok(tip)
+    } else {
+        git(
+            target,
+            &["checkout", "-B", &dispatch.branch, &dispatch.base],
+        )?;
+        Ok(String::new())
+    }
+}
+
 fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerError> {
     let base = dispatch.base.clone();
     if !sha(&base)
@@ -1210,8 +1279,20 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         risks: vec![],
     };
     let mut code = 1;
-    let mut expected_tip = String::new();
-    let mut raw = String::new();
+    let mut expected_tip = if work.is_dir() && state.join("receipt.json").exists() {
+        let previous: Receipt = serde_json::from_str(&regular_text(&state.join("receipt.json"))?)?;
+        if previous.base != base || previous.branch != dispatch.branch {
+            return Err(ScalerError::Guard("previous worker scope changed"));
+        }
+        previous.expected_tip
+    } else {
+        String::new()
+    };
+    let mut raw = if package.join("raw.log").is_file() {
+        regular_text(&package.join("raw.log"))?
+    } else {
+        String::new()
+    };
     let mut diffstat = String::new();
     let mut refused_workflow = setup != "success/success";
     if setup == "success/success" {
@@ -1248,30 +1329,14 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
             )?;
         }
         let actor_work = actor.join("work");
-        git(
-            &actor,
-            &[
-                "clone",
-                "--no-local",
-                "--no-hardlinks",
-                "--no-checkout",
-                root.to_str().ok_or(ScalerError::Guard("checkout path"))?,
-                "work",
-            ],
-        )?;
-        if dispatch.resume {
-            let reference = format!("origin/{}", dispatch.branch);
-            expected_tip = git(&actor_work, &["rev-parse", &reference])?
-                .trim()
-                .to_owned();
-            git(
-                &actor_work,
-                &["checkout", "-b", &dispatch.branch, &reference],
-            )?;
-            git(&actor_work, &["rebase", &base])?;
+        let previous: Option<Receipt> = if work.is_dir() {
+            Some(serde_json::from_str(&regular_text(
+                &state.join("receipt.json"),
+            )?)?)
         } else {
-            git(&actor_work, &["checkout", "-b", &dispatch.branch, &base])?;
-        }
+            None
+        };
+        expected_tip = worker_checkout(root, &work, &actor_work, dispatch, previous.as_ref())?;
         git(&actor_work, &["config", "user.name", "github-actions[bot]"])?;
         git(
             &actor_work,
@@ -1290,6 +1355,9 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         sudo(&["/usr/bin/chgrp", "-hR", AGENT_USER, actor_path])?;
         sudo(&["/usr/bin/chmod", "-R", "ug+rwX,o-rwx", actor_path])?;
         code = result?;
+        if work.exists() {
+            std::fs::remove_dir_all(&work)?;
+        }
         snapshot(&actor_work, &work, &dispatch.branch)?;
         let evidence;
         (contract, evidence) = read_result(&actor.join("result.json"));
@@ -1399,7 +1467,15 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
         let name = name
             .to_str()
             .ok_or(ScalerError::Guard("invalid artifact name"))?;
-        if !["raw.log", "transcript.md", "contract.json", "diffstat.txt"].contains(&name) {
+        if ![
+            "raw.log",
+            "transcript.md",
+            "contract.json",
+            "diffstat.txt",
+            "handoff.json",
+        ]
+        .contains(&name)
+        {
             return Err(ScalerError::Guard("unexpected dispatch artifact"));
         }
         let text = regular_text(&entry.path())?;
@@ -1412,13 +1488,36 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
             contract.tests = contract.tests.iter().map(|s| mask(s)).collect();
             contract.risks = contract.risks.iter().map(|s| mask(s)).collect();
             serde_json::to_string_pretty(&contract)?
+        } else if name == "handoff.json" {
+            fn redact(value: &mut Value, mask: &impl Fn(&str) -> String) {
+                match value {
+                    Value::String(s) => *s = mask(s),
+                    Value::Array(a) => {
+                        for v in a {
+                            redact(v, mask);
+                        }
+                    }
+                    Value::Object(o) => {
+                        for v in o.values_mut() {
+                            redact(v, mask);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut value: Value = serde_json::from_str(&text)?;
+            redact(&mut value, &mask);
+            serde_json::to_string_pretty(&value)?
         } else {
             mask(&text)
         };
         std::fs::write(entry.path(), masked)?;
         names.insert(name.to_owned());
     }
-    if names.len() != 4 {
+    if !["raw.log", "transcript.md", "contract.json", "diffstat.txt"]
+        .iter()
+        .all(|name| names.contains(*name))
+    {
         return Err(ScalerError::Guard("incomplete dispatch artifacts"));
     }
     for name in names {
@@ -1445,8 +1544,15 @@ fn publish(
         && git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base
     {
         if dispatch.resume {
-            require_owned_pr(root, dispatch)?;
+            agent_loop::verified_branch(root, dispatch.issue, &dispatch.branch)?;
         }
+        git(
+            &work,
+            &["merge-base", "--is-ancestor", &receipt.base, "HEAD"],
+        )
+        .map_err(|_| {
+            ScalerError::Guard("worker must rebase onto admitted main before publication")
+        })?;
         let tip = git(
             &work,
             &[
@@ -1460,6 +1566,8 @@ fn publish(
         )?;
         let head = git(&work, &["rev-parse", "HEAD"])?;
         let existing = tip.split_whitespace().next();
+        let retained =
+            existing.is_some() && receipt.expected_tip.is_empty() && existing != Some(head.trim());
         if existing.is_some() && receipt.expected_tip.is_empty() && existing != Some(head.trim()) {
             let pr = require_owned_pr(root, dispatch)?;
             use std::io::Write;
@@ -1476,6 +1584,9 @@ fn publish(
                 id,
                 &receipt.expected_tip,
             )?)?;
+        }
+        if !retained {
+            std::fs::write(state.join("published-tip"), head.trim())?;
         }
         let prs = open_prs(root, &dispatch.branch)?;
         if prs.as_array().is_some_and(|prs| !prs.is_empty()) {
@@ -1530,6 +1641,56 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     #[test]
+    fn merge_conflicted_branch_reaches_the_isolated_worker_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("base");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-b", "main"]).unwrap();
+        std::fs::write(root.join("conflict"), "base\n").unwrap();
+        git(&root, &["add", "conflict"]).unwrap();
+        git(&root, &["commit", "-m", "base"]).unwrap();
+        git(&root, &["checkout", "-b", "work/dispatch-634-42"]).unwrap();
+        std::fs::write(root.join("conflict"), "worker branch\n").unwrap();
+        git(&root, &["commit", "-am", "branch change"]).unwrap();
+        let tip = git(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        git(&root, &["checkout", "main"]).unwrap();
+        std::fs::write(root.join("conflict"), "main change\n").unwrap();
+        git(&root, &["commit", "-am", "main change"]).unwrap();
+        let mut dispatch = validate_event(&event(), "tjfontaine").unwrap();
+        dispatch.base = git(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        dispatch.branch = "work/dispatch-634-42".into();
+        dispatch.resume = true;
+        dispatch.selected_tip = Some(tip.clone());
+        let actor = temp.path().join("actor");
+        std::fs::create_dir(&actor).unwrap();
+        let work = actor.join("work");
+        let result = worker_checkout(&root, &temp.path().join("unused"), &work, &dispatch, None);
+        assert!(
+            result.is_ok(),
+            "merge-conflicted dispatch branch refused before worker: {result:?}"
+        );
+        assert_eq!(git(&work, &["rev-parse", "HEAD"]).unwrap().trim(), tip);
+        assert_eq!(
+            regular_text(&work.join("conflict")).unwrap(),
+            "worker branch\n"
+        );
+        let prompt = worker_prompt(&dispatch);
+        assert!(prompt.contains(&dispatch.base) && prompt.contains("Resolve any conflicts"));
+        assert_eq!(
+            git(&work, &["rev-parse", "refs/carrick/dispatch-main"])
+                .unwrap()
+                .trim(),
+            dispatch.base
+        );
+        assert!(!work.join(".git/rebase-merge").exists());
+    }
+    #[test]
     fn label_publication_creates_draft_and_continues_the_owned_branch() {
         const CHILD: &str = "CARRICK_TEST_DISPATCH_PUBLICATION";
         if std::env::var_os(CHILD).is_none() {
@@ -1574,7 +1735,8 @@ fi
             }
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "dispatch_worker::tests::label_publication_creates_draft_and_continues_the_owned_branch", "--nocapture"])
-                .env(CHILD, "1").env("RUNNER_TEMP", temp.path())
+                .env(CHILD, "1")
+                .env("GH_TOKEN", "fixture-token").env("RUNNER_TEMP", temp.path())
                 .env("GITHUB_RUN_ID", "42").env("GITHUB_RUN_ATTEMPT", "1")
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
                 .output().unwrap();
@@ -1597,7 +1759,7 @@ fi
             .to_owned();
         let mut event = event();
         event["label"]["name"] = "dispatch".into();
-        let mut dispatch = validate_event(&event, TIERS, "tjfontaine").unwrap();
+        let mut dispatch = validate_event(&event, "tjfontaine").unwrap();
         dispatch.base = base.clone();
         assigned_branch(&mut dispatch).unwrap();
         assert_eq!(dispatch.branch, "work/dispatch-634-42");
@@ -1642,9 +1804,11 @@ fi
             "--draft\n--base\nmain\n--head\n{}\n--title\n{subject}",
             dispatch.branch
         )));
-        let selected = select_owned_pr(dispatch.issue, &[pr.clone()], |_| Ok(run.clone()))
-            .unwrap()
-            .unwrap();
+        let selected = select_owned_pr(dispatch.issue, std::slice::from_ref(&pr), |_| {
+            Ok(run.clone())
+        })
+        .unwrap()
+        .unwrap();
         assert_eq!(selected["head"]["ref"], dispatch.branch);
         let mut unowned = pr;
         unowned["user"]["login"] = "outsider".into();
@@ -1997,7 +2161,7 @@ fi
     fn push_is_only_the_admitted_run_ref_and_refuses_another_lane() {
         let temp = tempfile::tempdir().unwrap();
         fixture_repository(temp.path());
-        let mut dispatch = validate_event(&event(), TIERS, "tjfontaine").unwrap();
+        let mut dispatch = validate_event(&event(), "tjfontaine").unwrap();
         dispatch.branch = "work/dispatch-634-42".into();
         git(temp.path(), &["checkout", "-b", &dispatch.branch]).unwrap();
         let command = push_command(temp.path(), &dispatch, "42", "").unwrap();
@@ -2097,7 +2261,6 @@ fi
         assert!(mask_artifacts(temp.path(), token).is_err());
     }
 
-    const TIERS: &str = include_str!("../../../.github/dispatch-tiers.toml");
     fn event() -> Value {
         json!({"repository":{"full_name":REPOSITORY},"action":"labeled",
             "sender":{"login":"tjfontaine","type":"User"},"label":{"name":"dispatch:sol-high"},
@@ -2111,7 +2274,7 @@ fi
             "From the #548 independent review: `crates/carrick-xtask/src/ci_scaler/security_tests.rs` (around :47 and the new test near :428) still sets `set_read_timeout(2s)` on the fixture stream.\n\nFailure: if curl is descheduled for more than 2 s between connect and sending its request, `stream.read().unwrap()` panics and the test fails on speed rather than correctness. That is a load-dependent verdict.\n\nAcceptance: use the same 60 s hang bound as `execute`/`http_fixture`, or an event-driven bound; no wall-clock speed assertion."
         );
         assert!(
-            validate_event(&value, TIERS, "tjfontaine").is_ok(),
+            validate_event(&value, "tjfontaine").is_ok(),
             "#587 free-form body refused"
         );
     }
@@ -2121,7 +2284,7 @@ fi
         for label in ["dispatch", "dispatch:any owner context"] {
             value["label"]["name"] = label.into();
             assert!(
-                validate_event(&value, TIERS, "tjfontaine").is_ok(),
+                validate_event(&value, "tjfontaine").is_ok(),
                 "label {label} refused"
             );
         }
@@ -2133,9 +2296,10 @@ fi
         value["action"] = "created".into();
         value["comment"] = json!({"user":{"login":"tjfontaine","type":"User"},"body":"/agent please continue","created_at":"2026-10-24T00:00:00Z","updated_at":"2026-10-24T00:00:00Z"});
         assert!(
-            validate_event(&value, TIERS, "tjfontaine").is_ok(),
+            validate_event(&value, "tjfontaine").is_ok(),
             "owner /agent refused"
         );
+        let mut admitted = Vec::new();
         for (pointer, bad) in [
             ("/comment/user/login", "outsider"),
             ("/comment/updated_at", "2026-10-24T00:01:00Z"),
@@ -2144,11 +2308,14 @@ fi
         ] {
             let mut other = value.clone();
             *other.pointer_mut(pointer).unwrap() = bad.into();
-            assert!(
-                validate_event(&other, TIERS, "tjfontaine").is_err(),
-                "{pointer} admitted"
-            );
+            if validate_event(&other, "tjfontaine").is_ok() {
+                admitted.push(pointer);
+            }
         }
+        assert!(
+            admitted.is_empty(),
+            "unsafe comments admitted: {admitted:?}"
+        );
     }
     fn fixture_repository(root: &Path) {
         git(root, &["init", "-b", "work/dispatch-634-pending"]).unwrap();
@@ -2168,31 +2335,28 @@ fi
         ] {
             let mut bad = base.clone();
             *bad.pointer_mut(pointer).unwrap() = "untrusted".into();
-            assert!(
-                validate_event(&bad, TIERS, "tjfontaine").is_err(),
-                "{pointer}"
-            );
+            assert!(validate_event(&bad, "tjfontaine").is_err(), "{pointer}");
         }
         assert!(
-            validate_event(&base, TIERS, "someone-else").is_err(),
+            validate_event(&base, "someone-else").is_err(),
             "rerun actor"
         );
         let mut pr = base.clone();
         pr["issue"]["pull_request"] = json!({});
-        assert!(validate_event(&pr, TIERS, "tjfontaine").is_err());
+        assert!(validate_event(&pr, "tjfontaine").is_err());
         let mut bot = base;
         bot["sender"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
-        assert!(validate_event(&bot, TIERS, "carrick-workers[bot]").is_err());
+        assert!(validate_event(&bot, "carrick-workers[bot]").is_err());
         bot["sender"]["type"] = "User".into();
-        assert!(validate_event(&bot, TIERS, "carrick-workers[bot]").is_err());
+        assert!(validate_event(&bot, "carrick-workers[bot]").is_err());
     }
     #[test]
     fn owner_label_does_not_admit_an_issue_owned_by_another_author() {
         let mut value = event();
         value["issue"]["user"]["login"] = "someone-else".into();
-        assert!(validate_event(&value, TIERS, "tjfontaine").is_err());
+        assert!(validate_event(&value, "tjfontaine").is_err());
         value["issue"].as_object_mut().unwrap().remove("user");
-        assert!(validate_event(&value, TIERS, "tjfontaine").is_err());
+        assert!(validate_event(&value, "tjfontaine").is_err());
     }
     #[test]
     fn wip_checkpoint_preserves_trailer_and_excludes_target_symlink() {
@@ -2203,7 +2367,7 @@ fi
         std::fs::write(root.join("new file"), "work in progress").unwrap();
         std::fs::create_dir(root.join("conformance-probes")).unwrap();
         std::os::unix::fs::symlink("/tmp", root.join("conformance-probes/target")).unwrap();
-        let mut d = validate_event(&event(), TIERS, "tjfontaine").unwrap();
+        let mut d = validate_event(&event(), "tjfontaine").unwrap();
         d.worker.coauthor = "GPT-6.1 Sol <noreply@openai.com>".into();
         assert!(checkpoint(root, &d).unwrap());
         let message = git(root, &["log", "-1", "--format=%B"]).unwrap();
@@ -2230,14 +2394,14 @@ fi
     fn review_admission_requires_owner_owned_pr() {
         let event = review_event();
         let dispatch =
-            validate_event(&event, TIERS, "tjfontaine").expect("owner review must continue its PR");
+            validate_event(&event, "tjfontaine").expect("owner review must continue its PR");
         assert_eq!(dispatch.branch, "work/dispatch-634-42");
         assert!(dispatch.resume);
         let mut legacy = event.clone();
         legacy["issue"]["body"] =
             "## Brief\nBranch: work/dispatch-634-99\nBranch: work/elsewhere\nDo the review".into();
         assert_eq!(
-            validate_event(&legacy, TIERS, "tjfontaine").unwrap().branch,
+            validate_event(&legacy, "tjfontaine").unwrap().branch,
             dispatch.branch
         );
         let mut admitted = Vec::new();
@@ -2258,16 +2422,29 @@ fi
         ] {
             let mut bad = event.clone();
             *bad.pointer_mut(pointer).unwrap() = value;
-            if validate_event(&bad, TIERS, "tjfontaine").is_ok() {
+            if validate_event(&bad, "tjfontaine").is_ok() {
                 admitted.push(pointer);
             }
         }
-        if validate_event(&event, TIERS, "outsider").is_ok() {
+        if validate_event(&event, "outsider").is_ok() {
             admitted.push("triggering_actor");
         }
         assert!(admitted.is_empty(), "unsafe reviews admitted: {admitted:?}");
     }
 
+    #[test]
+    fn agent_comment_on_an_unowned_pr_is_refused() {
+        let mut event = review_event();
+        event.as_object_mut().unwrap().remove("review");
+        event["action"] = "created".into();
+        event["comment"] = json!({"user":{"login":"tjfontaine","type":"User"},"body":"/agent fix the conflict","created_at":"2026-10-24","updated_at":"2026-10-24"});
+        assert!(validate_event(&event, "tjfontaine").is_ok());
+        event["pull_request"]["user"]["login"] = "outsider".into();
+        assert!(
+            validate_event(&event, "tjfontaine").is_err(),
+            "unowned PR admitted"
+        );
+    }
     #[test]
     fn review_base_uses_admitted_main_and_never_the_merge_sha() {
         let main = "a".repeat(40);
