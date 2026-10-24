@@ -32,12 +32,14 @@ enum ExecutableBacking {
     },
     SharedObject(Arc<carrick_vfs::fs_backend::SharedFileObject>),
     SharedBytes(Arc<[u8]>),
+    OpenFile(Arc<crate::kernel::objects::MappedFileReference>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExecutableObjectId {
     Host { device: u64, inode: u64 },
     Memory(u64),
+    Description(crate::kernel::FileDescriptionId),
 }
 
 #[derive(Debug)]
@@ -272,6 +274,67 @@ impl ExecSource {
         })
     }
 
+    /// Retain the opened object, never its pathname. Host files duplicate the
+    /// owned descriptor; memory files keep their shared description and bytes.
+    pub(super) fn from_open_description(
+        description: Arc<crate::kernel::FileDescription>,
+    ) -> io::Result<Self> {
+        use super::fd_table::OpenDescription;
+        use std::os::fd::BorrowedFd;
+        // Retain backing before acquiring its I/O guard. Final close takes
+        // lifecycle custody before the backing lock, so reverse order deadlocks.
+        let is_memory_file = description
+            .read_for_io()
+            .is_some_and(|open| matches!(&*open, OpenDescription::File { .. }));
+        let retained = if is_memory_file {
+            Some(
+                description
+                    .retain_mapping()
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?,
+            )
+        } else {
+            None
+        };
+        let open = description
+            .read_for_io()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+        match &*open {
+            OpenDescription::HostFile {
+                host_fd, metadata, ..
+            } => {
+                // SAFETY: the description guard owns the fd throughout duplication.
+                let fd = unsafe { BorrowedFd::borrow_raw(host_fd.raw()) }.try_clone_to_owned()?;
+                Self::host(fd.into(), metadata.path.to_string_lossy().into_owned())
+            }
+            OpenDescription::File { path, metadata, .. } => Ok(Self {
+                backing: Arc::new(ExecutableBacking::OpenFile(
+                    retained.ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?,
+                )),
+                object_id: ExecutableObjectId::Description(description.id()),
+                resolved_path: path.clone(),
+                mode: metadata.mode,
+                uid: carrick_abi::NsUid::ROOT,
+                gid: carrick_abi::NsGid::ROOT,
+            }),
+            _ => Err(io::Error::from_raw_os_error(libc::EACCES)),
+        }
+    }
+
+    fn opened_contents(
+        description: &crate::kernel::FileDescription,
+    ) -> io::Result<(super::fd_table::FileContents, u32)> {
+        let open = description
+            .read_for_io()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+        let super::fd_table::OpenDescription::File {
+            contents, metadata, ..
+        } = &*open
+        else {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        };
+        Ok((contents.clone(), metadata.mode))
+    }
+
     pub(crate) fn shared(
         bytes: Arc<[u8]>,
         object_id: u64,
@@ -328,6 +391,11 @@ impl ExecSource {
             }
             ExecutableBacking::SharedObject(object) => (self.uid, self.gid, object.mode()),
             ExecutableBacking::SharedBytes(_) => (self.uid, self.gid, self.mode),
+            ExecutableBacking::OpenFile(description) => {
+                let (_, mode) = Self::opened_contents(description.description())
+                    .map_err(|_| carrick_abi::LINUX_EIO)?;
+                (self.uid, self.gid, mode)
+            }
         };
         crate::dispatch::dac_check(
             uid,
@@ -341,12 +409,20 @@ impl ExecSource {
         .map(|_| ())
     }
 
+    /// Update the retained in-memory inode when fchmod succeeds after unlink.
+    pub(super) fn set_memory_mode(&self, mode: u32) {
+        if let ExecutableBacking::SharedObject(object) = self.backing.as_ref() {
+            object.set_mode(mode);
+        }
+    }
+
     pub(crate) fn object_id(&self) -> ExecutableObjectId {
         self.object_id
     }
 
     pub fn read_head(&self, max: usize) -> io::Result<Vec<u8>> {
         match self.backing.as_ref() {
+            ExecutableBacking::OpenFile(_) => self.read_range(0, max),
             ExecutableBacking::SharedObject(object) => Ok(object.read_prefix(max)),
             ExecutableBacking::SharedBytes(bytes) => Ok(bytes[..bytes.len().min(max)].to_vec()),
             ExecutableBacking::HostFile { file, .. } => {
@@ -368,6 +444,15 @@ impl ExecSource {
 
     pub(crate) fn len(&self) -> io::Result<usize> {
         match self.backing.as_ref() {
+            ExecutableBacking::OpenFile(description) => usize::try_from(
+                Self::opened_contents(description.description())?
+                    .0
+                    .len()
+                    .map_err(|errno| {
+                        io::Error::other(format!("executable source errno {}", errno.get()))
+                    })?,
+            )
+            .map_err(io::Error::other),
             ExecutableBacking::SharedObject(object) => Ok(object.len()),
             ExecutableBacking::SharedBytes(bytes) => Ok(bytes.len()),
             ExecutableBacking::HostFile { file, .. } => usize::try_from(file.metadata()?.len())
@@ -392,6 +477,13 @@ impl ExecSource {
                         .map_err(|_| io::Error::from_raw_os_error(libc::EFBIG))?,
                 ))
             }
+            ExecutableBacking::OpenFile(description) => Ok((
+                crate::dispatch::inode_for_path(std::path::Path::new(&self.resolved_path)),
+                Self::opened_contents(description.description())?.1,
+                self.uid,
+                self.gid,
+                self.len()?,
+            )),
             ExecutableBacking::SharedObject(object) => Ok((
                 crate::dispatch::inode_for_path(std::path::Path::new(&self.resolved_path)),
                 object.mode(),
@@ -418,6 +510,21 @@ impl ExecSource {
 
     pub(crate) fn read_range(&self, offset: usize, max: usize) -> io::Result<Vec<u8>> {
         match self.backing.as_ref() {
+            ExecutableBacking::OpenFile(description) => {
+                let contents = Self::opened_contents(description.description())?.0;
+                let length = usize::try_from(contents.len().map_err(|errno| {
+                    io::Error::other(format!("executable source errno {}", errno.get()))
+                })?)
+                .map_err(io::Error::other)?;
+                let mut bytes = vec![0; length.saturating_sub(offset).min(max)];
+                let read = contents
+                    .read_at(offset as u64, &mut bytes)
+                    .map_err(|errno| {
+                        io::Error::other(format!("executable source errno {}", errno.get()))
+                    })?;
+                bytes.truncate(read);
+                Ok(bytes)
+            }
             ExecutableBacking::SharedObject(object) => Ok(object.read_range(offset, max)),
             ExecutableBacking::SharedBytes(bytes) => Ok(bytes
                 .get(offset..)
@@ -446,6 +553,7 @@ impl ExecSource {
 
     pub fn read_all(&self) -> io::Result<Vec<u8>> {
         match self.backing.as_ref() {
+            ExecutableBacking::OpenFile(_) => self.read_range(0, usize::MAX),
             ExecutableBacking::SharedObject(object) => Ok(object.read_all()),
             ExecutableBacking::SharedBytes(bytes) => Ok(bytes.as_ref().to_vec()),
             ExecutableBacking::HostFile { file, .. } => {
@@ -472,7 +580,9 @@ impl ExecSource {
     pub(crate) fn host_identity(&self) -> Option<(u64, u64)> {
         match self.backing.as_ref() {
             ExecutableBacking::HostFile { device, inode, .. } => Some((*device, *inode)),
-            ExecutableBacking::SharedObject(_) | ExecutableBacking::SharedBytes(_) => None,
+            ExecutableBacking::SharedObject(_)
+            | ExecutableBacking::SharedBytes(_)
+            | ExecutableBacking::OpenFile(_) => None,
         }
     }
 
@@ -698,6 +808,7 @@ impl SyscallDispatcher {
         path: &str,
     ) -> Result<ExecSource, ExecSourceError> {
         self.capture_exec_files(context)
+            .map_err(ExecSourceError::Linux)?
             .without_host_fallback()
             .acquire(path)
     }
@@ -1139,8 +1250,8 @@ mod tests {
         let second_context = second.capture_one_task_context().unwrap();
         let first_task = Arc::downgrade(first_context.task());
         let second_task = Arc::downgrade(second_context.task());
-        let a = first.capture_exec_files(&first_context);
-        let b = second.capture_exec_files(&second_context);
+        let a = first.capture_exec_files(&first_context).unwrap();
+        let b = second.capture_exec_files(&second_context).unwrap();
         assert_ne!(a.caller(), b.caller());
         drop(first_context);
         drop(second_context);
@@ -1162,6 +1273,9 @@ mod tests {
             a.acquire("/proc/self/exe").unwrap().read_all().unwrap(),
             b"first"
         );
+        for path in ["//proc/self/exe", "/proc/./self/exe"] {
+            assert_eq!(a.acquire(path).unwrap().read_head(5).unwrap(), b"first");
+        }
         assert_eq!(
             b.acquire("/proc/self/exe").unwrap().read_all().unwrap(),
             b"second"
@@ -1171,5 +1285,271 @@ mod tests {
             matches!(a.acquire("/absent"), Err(ExecSourceError::Host(error)) if error.raw_os_error() == Some(2))
                 || matches!(a.acquire("/absent"), Err(ExecSourceError::Linux(errno)) if errno.get() == 2)
         );
+    }
+    #[test]
+    fn exec_capabilities_reject_foreign_context() {
+        let first = SyscallDispatcher::new();
+        let second = SyscallDispatcher::new();
+        first
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/image", b"first".to_vec())
+            .unwrap();
+        let context = second.capture_one_task_context().unwrap();
+        assert!(matches!(first.acquire_exec_source(&context, "/image"),
+            Err(ExecSourceError::Linux(errno)) if errno.get() == 3));
+    }
+
+    #[test]
+    fn exec_capabilities_validate_raw_path_before_normalization() {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/image", b"image".to_vec())
+            .unwrap();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let path = format!("{}image", "/".repeat(4096));
+        assert!(matches!(dispatcher.acquire_exec_source(&context, &path),
+            Err(ExecSourceError::Linux(errno)) if errno.get() == 36));
+    }
+
+    #[test]
+    fn exec_capabilities_proc_fd_retains_open_inode_after_name_replacement() {
+        use super::super::fd_table::{HostFdRef, OpenDescription, OpenDescriptionBase};
+        use std::os::fd::IntoRawFd;
+        let dispatcher = SyscallDispatcher::new();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image");
+        std::fs::write(&path, b"original").unwrap();
+        let opened = std::fs::File::open(&path).unwrap();
+        let description = OpenDescription::HostFile {
+            base: OpenDescriptionBase::new(0),
+            host_fd: HostFdRef::new(opened.into_raw_fd()),
+            metadata: carrick_vfs::rootfs::RootFsMetadata {
+                path: path.clone(),
+                kind: carrick_vfs::rootfs::RootFsEntryKind::File,
+                mode: 0o755,
+                size: 8,
+            },
+            writable: false,
+        };
+        let super::super::DispatchOutcome::Returned { value: fd } =
+            dispatcher.install_fd(description, 0)
+        else {
+            panic!("install source");
+        };
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let source = dispatcher
+            .acquire_exec_source(&context, &format!("/proc/self/fd/{fd}"))
+            .unwrap();
+        assert_eq!(source.read_all().unwrap(), b"original");
+    }
+
+    #[test]
+    fn exec_capabilities_proc_fd_keeps_memory_file_contents() {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/image", b"original".to_vec())
+            .unwrap();
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_mode("/image", 0o755)
+            .unwrap();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let named = dispatcher.acquire_exec_source(&context, "/image").unwrap();
+        let outcome = dispatcher
+            .open_at_path_string(
+                &context,
+                None,
+                super::super::fs::OpenAtArgs {
+                    dirfd: carrick_abi::LINUX_AT_FDCWD,
+                    path: "/image",
+                    flags: 0,
+                    mode: 0,
+                },
+                &super::super::CompatReporter::default(),
+            )
+            .unwrap();
+        let super::super::DispatchOutcome::Returned { value: fd } = outcome else {
+            panic!("install source");
+        };
+        let source = dispatcher
+            .acquire_exec_source(&context, &format!("/proc/self/fd/{fd}"))
+            .unwrap();
+        assert_eq!(
+            source.object_id(),
+            named.object_id(),
+            "open must retain the VFS inode identity"
+        );
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_mode("/image", 0o644)
+            .unwrap();
+        assert_eq!(
+            source
+                .exec_access_errno(carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT)
+                .unwrap_err()
+                .get(),
+            13
+        );
+        drop(context);
+        drop(dispatcher);
+        assert_eq!(source.read_all().unwrap(), b"original");
+    }
+    #[test]
+    fn exec_capabilities_reject_predecessor_context_after_exec() {
+        let dispatcher = SyscallDispatcher::new();
+        let old = dispatcher.capture_one_task_context().unwrap();
+        let prepared = dispatcher.prepare_one_task_kernel_exec(&old).unwrap();
+        let successor = dispatcher.commit_one_task_kernel_exec(prepared).unwrap();
+        assert!(dispatcher.capture_exec_files(&successor).is_ok());
+        assert!(matches!(dispatcher.capture_exec_files(&old), Err(errno) if errno.get() == 3));
+    }
+
+    #[test]
+    fn exec_capabilities_legacy_file_survives_last_descriptor_close() {
+        use super::super::fd_table::{FileContents, OpenDescription, OpenDescriptionBase};
+        let dispatcher = SyscallDispatcher::new();
+        let outcome = dispatcher.install_fd(
+            OpenDescription::File {
+                base: OpenDescriptionBase::new(0),
+                path: "/anonymous".into(),
+                metadata: carrick_vfs::rootfs::RootFsMetadata {
+                    path: "/anonymous".into(),
+                    kind: carrick_vfs::rootfs::RootFsEntryKind::File,
+                    mode: 0o755,
+                    size: 8,
+                },
+                contents: FileContents::dense(b"original".to_vec()),
+                offset: 0,
+                writable: false,
+            },
+            0,
+        );
+        let super::super::DispatchOutcome::Returned { value: fd } = outcome else {
+            panic!("install source");
+        };
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let source = dispatcher
+            .acquire_exec_source(&context, &format!("/proc/self/fd/{fd}"))
+            .unwrap();
+        dispatcher.close_fd_for_internal_rollback(fd as i32);
+        assert_eq!(source.read_all().unwrap(), b"original");
+    }
+
+    #[test]
+    fn exec_capabilities_memory_permission_follows_unlinked_inode() {
+        use super::super::{
+            CompatReporter, DispatchOutcome, LinearMemory, SyscallArgs, SyscallRequest,
+        };
+        let mut dispatcher = SyscallDispatcher::new();
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/image", b"original".to_vec())
+            .unwrap();
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_mode("/image", 0o755)
+            .unwrap();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let outcome = dispatcher
+            .open_at_path_string(
+                &context,
+                None,
+                super::super::fs::OpenAtArgs {
+                    dirfd: carrick_abi::LINUX_AT_FDCWD,
+                    path: "/image",
+                    flags: 0,
+                    mode: 0,
+                },
+                &CompatReporter::default(),
+            )
+            .unwrap();
+        let DispatchOutcome::Returned { value: fd } = outcome else {
+            panic!("install source");
+        };
+        let source = dispatcher
+            .acquire_exec_source(&context, &format!("/proc/self/fd/{fd}"))
+            .unwrap();
+        assert!(dispatcher.fs.rootfs_vfs.overlay.remove_entry("/image"));
+        let mut memory = LinearMemory::new(0, vec![0; 64]);
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    &context,
+                    SyscallRequest::new(
+                        carrick_abi::syscall::nr::FCHMOD.0,
+                        SyscallArgs::from([fd as u64, 0o644, 0, 0, 0, 0])
+                    ),
+                    &mut memory,
+                    &CompatReporter::default()
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        assert_eq!(
+            source
+                .exec_access_errno(carrick_abi::NsUid::ROOT, carrick_abi::NsGid::ROOT)
+                .unwrap_err()
+                .get(),
+            13
+        );
+    }
+
+    #[test]
+    fn exec_capabilities_resolve_dotdot_after_symlink() {
+        use carrick_vfs::rootfs::{LayerSource, RootFs};
+        let mut archive = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut archive);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            builder
+                .append_link(&mut header, "link", "/dir/nested")
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let dispatcher = SyscallDispatcher::with_rootfs(
+            RootFs::from_layers([LayerSource::Tar(archive)]).unwrap(),
+        );
+        let overlay = &dispatcher.fs.rootfs_vfs.overlay;
+        overlay.make_dir("/dir").unwrap();
+        overlay.make_dir("/dir/nested").unwrap();
+        overlay
+            .set_file_contents("/image", b"wrong".to_vec())
+            .unwrap();
+        overlay
+            .set_file_contents("/dir/image", b"correct".to_vec())
+            .unwrap();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        assert_eq!(
+            dispatcher
+                .capture_exec_files(&context)
+                .unwrap()
+                .resolve_path("/link/../image"),
+            "/link/../image"
+        );
+        let source = dispatcher
+            .acquire_exec_source(&context, "/link/../image")
+            .unwrap();
+        assert_eq!(source.read_all().unwrap(), b"correct");
     }
 }
