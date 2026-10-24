@@ -797,6 +797,40 @@ impl GlobalFrameStage2Lease {
         self.backend_map_installed = false;
     }
 
+    /// Transfer this reservation into an exact carrier stage-2 record that
+    /// was admitted before the backend map. The record now owns unmap and IPA
+    /// release; the lease must not repeat either operation from `Drop`.
+    pub(crate) fn transfer_to_record(
+        mut self,
+        record: CarrierStage2RecordSnapshot,
+    ) -> Result<(), TrapError> {
+        let mismatch = !self.active
+            || record.ipa != self.base
+            || record.len as u64 != self.length
+            || !record.mapped
+            || record.backend_map_installed != self.backend_map_installed
+            || record.release_ipa != self.release_ipa;
+        // Once the record exists it is the sole retirement authority even if
+        // its snapshot exposes an internal mismatch. Disarm before reporting
+        // that invariant failure so unwinding cannot unmap/release twice.
+        self.active = false;
+        self.mapped = false;
+        self.backend_map_installed = false;
+        self.release_ipa = false;
+        #[cfg(any(test, feature = "foreign-cow-test-support"))]
+        {
+            self.drop_backing_audit = None;
+        }
+        if mismatch {
+            Err(TrapError::Hypervisor(format!(
+                "stage-2 lease/record transfer mismatch: lease={:?} record={record:?}",
+                self.key()
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     pub(crate) fn mark_test_mapped_without_backend(&mut self) {
         self.mapped = true;
@@ -1976,6 +2010,178 @@ pub(crate) fn publish_pooled_exec_root_owner_in(
     region.structural_owner = Some(owner);
     region.owner_generation = epoch.raw();
     Ok(epoch.raw())
+}
+
+/// Bind an already admitted exec stage-2 record to its reusable backing.
+/// Mapping admission and owner publication are separate phases of one exec
+/// transaction; this consumes no second lease and creates no second record.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn publish_installed_exec_region_owner_in(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    region: &mut HvfMappedRegion,
+    identity: CarrierStage2RecordIdentity,
+) -> Result<u64, TrapError> {
+    let snapshot = custody
+        .stage2_record_snapshot(identity.record_id)
+        .ok_or_else(|| {
+            TrapError::Hypervisor("installed exec region lost its stage-2 record".to_owned())
+        })?;
+    if snapshot.record_id != identity.record_id
+        || snapshot.vm_generation != identity.vm_generation
+        || snapshot.logical_owner != identity.logical_owner
+        || snapshot.ipa != region.physical_ipa
+        || snapshot.len != region.physical_size
+        || snapshot.host_addr != region.host_addr as usize
+        || snapshot.perms != u64::from(region.perms)
+        || !snapshot.mapped
+        || !snapshot.backend_map_installed
+        || !snapshot.release_ipa
+    {
+        return Err(TrapError::Hypervisor(format!(
+            "installed exec region/record mismatch: region=({:#x}, {}, {:p}) record={snapshot:?}",
+            region.physical_ipa, region.physical_size, region.host_addr
+        )));
+    }
+    let mapping = region
+        .host_mapping
+        .take()
+        .ok_or_else(|| TrapError::Hypervisor("installed exec region lost its backing".to_owned()))?
+        .into_exclusive()?;
+    let owner = std::sync::Arc::new(GlobalFrameHostOwner::from_record(
+        std::sync::Arc::new(GlobalFrameSharedMapping::new(mapping)),
+        std::sync::Arc::clone(custody),
+        identity,
+    ));
+    let key = (snapshot.ipa, snapshot.len as u64);
+    let mut owners = custody.global_frame_host_owners.lock();
+    if owners.contains_key(&key) {
+        drop(owners);
+        retain_pending_global_frame_owner(custody, owner);
+        return Err(TrapError::Hypervisor(format!(
+            "installed exec owner collision at IPA {:#x} size {}",
+            key.0, key.1
+        )));
+    }
+    owners.insert(key, GlobalFrameOwnerEntry::Live(owner));
+    let generation = identity.logical_owner.map_or(0, |owner| owner.generation);
+    region.owner_generation = generation;
+    Ok(generation)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn publish_installed_structural_owner(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    region: &mut HvfMappedRegion,
+    identity: CarrierStage2RecordIdentity,
+    epoch: StructuralEpoch,
+    backing: GlobalFrameSharedMapping,
+    backend_map_installed: bool,
+) -> Result<u64, TrapError> {
+    let snapshot = custody
+        .stage2_record_snapshot(identity.record_id)
+        .ok_or_else(|| {
+            TrapError::Hypervisor("installed exec structure lost its stage-2 record".to_owned())
+        })?;
+    if snapshot.record_id != identity.record_id
+        || snapshot.vm_generation != identity.vm_generation
+        || snapshot.ipa != region.physical_ipa
+        || snapshot.len != region.physical_size
+        || snapshot.host_addr != region.host_addr as usize
+        || snapshot.perms != u64::from(region.perms)
+        || snapshot.logical_owner
+            != Some(CarrierLogicalOwner {
+                id: epoch.raw(),
+                generation: epoch.raw(),
+            })
+        || !snapshot.mapped
+        || snapshot.backend_map_installed != backend_map_installed
+        || snapshot.release_ipa
+    {
+        return Err(TrapError::Hypervisor(format!(
+            "installed exec structure/record mismatch: region=({:#x}, {}, {:p}) record={snapshot:?}",
+            region.physical_ipa, region.physical_size, region.host_addr
+        )));
+    }
+    let retained = std::sync::Arc::new(StructuralBackingCustodyEntry {
+        mapping: std::sync::Arc::new(backing),
+        record_identity: parking_lot::Mutex::new(identity),
+        owner_retired: std::sync::atomic::AtomicBool::new(false),
+    });
+    if custody
+        .structural_backings
+        .lock()
+        .insert(identity.record_id, std::sync::Arc::clone(&retained))
+        .is_some()
+    {
+        carrick_fatal!(
+            "hvpatch::exec_commit",
+            "installed exec structural record published twice"
+        );
+    }
+    region.structural_owner = Some(std::sync::Arc::new(StructuralBackingOwner {
+        custody: std::sync::Arc::downgrade(custody),
+        retained,
+        epoch,
+        physical_ipa: snapshot.ipa,
+        physical_size: snapshot.len,
+    }));
+    region.owner_generation = epoch.raw();
+    Ok(epoch.raw())
+}
+
+/// Bind an admitted structural exec record to an owned mapping.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn publish_installed_exec_structure_in(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    region: &mut HvfMappedRegion,
+    identity: CarrierStage2RecordIdentity,
+    epoch: StructuralEpoch,
+    mm_root_slot: (u64, u64),
+) -> Result<u64, TrapError> {
+    let end = region
+        .physical_ipa
+        .checked_add(region.physical_size as u64)
+        .ok_or(TrapError::MappingTooLarge(region.physical_size as u64))?;
+    if region.physical_ipa < mm_root_slot.0 || end > mm_root_slot.0.saturating_add(mm_root_slot.1) {
+        return Err(TrapError::Hypervisor(format!(
+            "installed exec structure ({:#x}, {:#x}) escapes successor root slot ({:#x}, {:#x})",
+            region.physical_ipa, region.physical_size, mm_root_slot.0, mm_root_slot.1
+        )));
+    }
+    let mapping = region
+        .host_mapping
+        .take()
+        .ok_or_else(|| {
+            TrapError::Hypervisor("installed exec structure lost its backing".to_owned())
+        })?
+        .into_exclusive()?;
+    publish_installed_structural_owner(
+        custody,
+        region,
+        identity,
+        epoch,
+        GlobalFrameSharedMapping::new(mapping),
+        true,
+    )
+}
+
+/// Bind an admitted pre-mapped root-slot record to its checked-out handle.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn publish_installed_pooled_exec_root_in(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    region: &mut HvfMappedRegion,
+    identity: CarrierStage2RecordIdentity,
+    epoch: StructuralEpoch,
+    handle: crate::frame_pool::PooledRootSlotHandle,
+) -> Result<u64, TrapError> {
+    publish_installed_structural_owner(
+        custody,
+        region,
+        identity,
+        epoch,
+        GlobalFrameSharedMapping::from_pooled_root(handle),
+        false,
+    )
 }
 
 /// Cached `CARRICK_FORK_DEBUG_IPA` / `CARRICK_FORK_DEBUG_VA` (parsed once).

@@ -611,7 +611,7 @@ impl HostApertureState {
                 generation: token,
             }),
         };
-        let identity = match publish_metadata_mapping_using(custody, spec, || map(spec)) {
+        let identity = match publish_metadata_mapping_using(custody, spec, |_| map(spec)) {
             Ok(identity) => identity,
             Err(_) => {
                 self.unreserve_slots(slot, count);
@@ -842,7 +842,7 @@ fn allocate_metadata_backing(size: usize) -> Result<OwnedHostMapping, std::io::E
 fn publish_metadata_mapping_using(
     custody: &crate::trap::CarrierVmCustody,
     spec: crate::trap::CarrierStage2RecordSpec,
-    map: impl FnOnce() -> i32,
+    map: impl FnOnce(crate::trap::CarrierStage2RecordIdentity) -> i32,
 ) -> Result<crate::trap::CarrierStage2RecordIdentity, TrapError> {
     custody.publish_stage2_record_using(spec, map)
 }
@@ -1006,7 +1006,7 @@ pub(crate) fn service_metadata_operation(
             }),
         };
         let mut state = aperture.lock();
-        let publication = publish_metadata_mapping_using(custody, spec, || unsafe {
+        let publication = publish_metadata_mapping_using(custody, spec, |_| unsafe {
             crate::trap::inventory_hv_vm_map(backing.as_ptr().cast(), ipa, extent_size, permissions)
         });
         let identity = match publication {
@@ -2386,7 +2386,7 @@ mod tests {
                     generation: token,
                 }),
             },
-            || 0,
+            |_| 0,
         )
         .expect("publish fake backend record")
     }
@@ -2460,7 +2460,7 @@ mod tests {
         };
         let mut calls = 0;
         assert!(
-            publish_metadata_mapping_using(&custody, spec, || {
+            publish_metadata_mapping_using(&custody, spec, |_| {
                 calls += 1;
                 -1
             })
@@ -2474,11 +2474,11 @@ mod tests {
         let mut stale = spec;
         stale.vm_generation = crate::trap::CarrierVmGeneration(generation.0 + 1);
         assert!(
-            publish_metadata_mapping_using(&custody, stale, || panic!("stale VM must not map"))
+            publish_metadata_mapping_using(&custody, stale, |_| panic!("stale VM must not map"))
                 .is_err()
         );
         assert!(custody.stage2_record_identities().is_empty());
-        let identity = publish_metadata_mapping_using(&custody, spec, || 0).expect("map");
+        let identity = publish_metadata_mapping_using(&custody, spec, |_| 0).expect("map");
         let record = custody
             .stage2_record_snapshot(identity.record_id)
             .expect("record");
