@@ -129,7 +129,9 @@ pub(crate) fn load_execve_image(
     // its interpreter (shared with the initial entrypoint load via
     // `resolve_shebang`).
     let abs_path = files.resolve_path(path);
-    let named_source = files.acquire(path).map_err(exec_source_errno)?;
+    let host_open = |path: &str| std::fs::File::open(path);
+    let acquire_source = |path: &str| files.acquire_with_host_file_service(path, &host_open);
+    let named_source = acquire_source(path).map_err(exec_source_errno)?;
     files.check_source(&named_source)?;
     // fanotify FAN_OPEN_EXEC, emitted after validation so a failed execve
     // generates nothing — the event means "this image is being executed", and
@@ -162,7 +164,7 @@ pub(crate) fn load_execve_image(
         next_argv.extend(argv.into_iter().skip(1));
         path = interpreter;
         argv = next_argv;
-        source = files.acquire(&path).map_err(exec_source_errno)?;
+        source = acquire_source(&path).map_err(exec_source_errno)?;
         files.check_source(&source)?;
         final_source_inspected = false;
     }
@@ -209,7 +211,7 @@ pub(crate) fn load_execve_image(
         let base = files.with_cache(cache_key, || {
             let raw_bytes = source.read_all().map_err(host_io_errno)?;
             let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|interpreter| {
-                files.read_interpreter(interpreter)
+                acquire_source(interpreter).ok()?.read_all().ok()
             })
             .map_err(carrick_kernel::exec_helpers::exec_image_errno)?
             .with_main_file_path(path.clone());
@@ -231,7 +233,7 @@ pub(crate) fn load_execve_image(
             Some(Err(errno)) => return Err(errno),
         };
         let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|interpreter| {
-            files.read_interpreter(interpreter)
+            acquire_source(interpreter).ok()?.read_all().ok()
         })
         .map_err(carrick_kernel::exec_helpers::exec_image_errno)?
         .with_main_file_path(path.clone());

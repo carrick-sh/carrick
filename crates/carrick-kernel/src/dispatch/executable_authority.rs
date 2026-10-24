@@ -1708,7 +1708,30 @@ mod tests {
         }
         let context = dispatcher.capture_one_task_context().unwrap();
         let files = dispatcher.capture_exec_files(&context).unwrap();
-        assert!(matches!(files.acquire(host_path.to_str().unwrap()),
-            Err(ExecSourceError::Linux(errno)) if errno.get() == 2));
+        let calls = std::cell::Cell::new(0);
+        let host_open = |path: &str| {
+            calls.set(calls.get() + 1);
+            std::fs::File::open(path)
+        };
+        assert!(
+            matches!(files.acquire_with_host_file_service(host_path.to_str().unwrap(), &host_open),
+            Err(ExecSourceError::Linux(errno)) if errno.get() == 2)
+        );
+        assert_eq!(
+            calls.get(),
+            0,
+            "a retained magic refusal must not call the host service"
+        );
+        let ordinary = directory.path().join("ordinary");
+        std::fs::write(&ordinary, b"host image").unwrap();
+        let source = files
+            .acquire_with_host_file_service(ordinary.to_str().unwrap(), &host_open)
+            .unwrap();
+        assert_eq!(source.read_all().unwrap(), b"host image");
+        assert_eq!(calls.get(), 1);
+        assert!(
+            files.acquire(ordinary.to_str().unwrap()).is_err(),
+            "host access requires the supplied service"
+        );
     }
 }
