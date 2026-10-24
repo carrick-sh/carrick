@@ -59,7 +59,7 @@ impl HostTable {
             .fd(HostLockWait)
             .fork(self.id, &mut storage);
         if result.is_err() {
-            self.owner.reclaim_descriptors(storage);
+            self.owner.reclaim_descriptors(storage)?;
         }
         let id = result?;
         Ok(Self {
@@ -129,15 +129,15 @@ impl HostTable {
 impl Drop for HostTable {
     fn drop(&mut self) {
         let mut retired = Vec::with_capacity(self.capacity.min(IPC_MAX_OFDS));
-        let extent = self
-            .owner
+        self.owner
             .region()
             .fd(HostLockWait)
             .destroy_table(self.id, |d| retired.push(d))
+            .map_err(AdmissionError::from)
+            .and_then(|extent| self.owner.reclaim_descriptors(extent))
             .unwrap_or_else(|_| {
                 carrick_fatal::carrick_fatal!("ipc::table", "invalid owned table retirement")
             });
-        self.owner.reclaim_descriptors(extent);
         for description in retired {
             self.release(description);
         }

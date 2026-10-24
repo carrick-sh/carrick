@@ -1097,11 +1097,13 @@ mod tests {
                 "final shared writer close retains host endpoint pin"
             );
             for table in [parent, peer] {
-                owner.reclaim_descriptors(
-                    authority
-                        .destroy_table(table, |_| panic!("empty table"))
-                        .unwrap(),
-                );
+                owner
+                    .reclaim_descriptors(
+                        authority
+                            .destroy_table(table, |_| panic!("empty table"))
+                            .unwrap(),
+                    )
+                    .unwrap();
             }
         }
     }
@@ -1155,7 +1157,7 @@ mod tests {
         let extent = authority
             .destroy_table(table, |_| panic!("empty table"))
             .unwrap();
-        owner.reclaim_descriptors(extent);
+        owner.reclaim_descriptors(extent).unwrap();
     }
 
     #[test]
@@ -1318,7 +1320,7 @@ mod tests {
         let extent = authority
             .destroy_table(table, |_| panic!("empty table"))
             .unwrap();
-        owner.reclaim_descriptors(extent);
+        owner.reclaim_descriptors(extent).unwrap();
     }
 
     #[test]

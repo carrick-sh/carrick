@@ -926,7 +926,7 @@ impl HostIpc {
             .fd(HostLockWait)
             .create_table(limit, &mut storage);
         if result.is_err() {
-            self.reclaim_descriptors(storage);
+            self.reclaim_descriptors(storage)?;
         }
         result.map_err(Into::into)
     }
@@ -942,16 +942,21 @@ impl HostIpc {
             .region()
             .fd(HostLockWait)
             .grow_table(table, &mut storage);
-        self.reclaim_descriptors(storage);
+        self.reclaim_descriptors(storage)?;
         result.map_err(Into::into)
     }
     /// Reclaim only an extent returned by this region's destroy/grow operation.
-    pub(crate) fn reclaim_descriptors(&self, mut extent: fd::Extent) {
+    pub(crate) fn reclaim_descriptors(&self, mut extent: fd::Extent) -> Result<(), AdmissionError> {
         self.region()
             .reclaim_descriptors(&mut extent, &HostLockWait)
-            .unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::table", "invalid descriptor extent return")
-            });
+            .map_err(|error| {
+                AdmissionError::Shared(match error {
+                    fd::storage::StorageError::Contended => IpcError::Contended,
+                    fd::storage::StorageError::Invalid | fd::storage::StorageError::Exhausted => {
+                        IpcError::BadStorage
+                    }
+                })
+            })
     }
     pub fn retain_host_resource(
         &self,
@@ -1153,7 +1158,7 @@ mod tests {
             })
             .unwrap();
         owner.release(desc.backing).unwrap();
-        owner.reclaim_descriptors(extent);
+        owner.reclaim_descriptors(extent).unwrap();
         assert_eq!(owner.region().descriptor_allocations(), 0);
     }
 
