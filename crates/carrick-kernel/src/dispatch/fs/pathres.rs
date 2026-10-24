@@ -248,70 +248,8 @@ impl<'a> FsView<'a> {
         Err(crate::linux_abi::LINUX_ELOOP)
     }
 
-    /// Linux caps the TOTAL symlinks followed in a SINGLE pathname resolution at
-    /// MAXSYMLINKS (40); exceeding it is ELOOP. carrick resolves each intermediate
-    /// symlink with its OWN 40-hop cap (`canonicalize_following` /
-    /// `resolve_intermediate_symlinks` run per component), so a path that STACKS
-    /// many shallow intermediate symlinks never accumulates to the cap and wrongly
-    /// resolves. LTP's ELOOP cases (stat03/lstat02/truncate03/readlink03/open13)
-    /// build exactly that: a `test_eloop` directory holding `test_eloop ->
-    /// ../test_eloop`, with the path repeating `test_eloop` ~43 times — each hop is
-    /// a single follow that the per-component resolvers reset. Walk the path once,
-    /// following each component's symlink chain against a SHARED budget, and report
-    /// a cumulative overflow. Only the slow (symlink-bearing) resolution path calls
-    /// this, so symlink-free lookups pay nothing. Resolves entirely through the
-    /// layered view (not the host), so it isn't bounded by the host's own
-    /// MAXSYMLINKS (FreeBSD's 32 < Linux's 40).
     pub(super) fn symlink_follow_budget_exceeded(&self, abs: &str) -> bool {
-        // Only INTERMEDIATE components are followed here — the FINAL component's
-        // symlink is the caller's to interpret (lstat/readlink READ it; stat
-        // follows it via canonicalize_following). Following the final here would
-        // wrongly ELOOP an lstat/readlink of a self-referential link (lstat02,
-        // readlink03, truncate03's cases that pass a trailing self-link).
-        let comps: Vec<&str> = abs
-            .split('/')
-            .filter(|c| !c.is_empty() && *c != ".")
-            .collect();
-        if comps.len() < 2 {
-            return false;
-        }
-        let mut follows = 0usize;
-        let mut base = String::new();
-        for comp in &comps[..comps.len() - 1] {
-            if *comp == ".." {
-                if let Some(i) = base.rfind('/') {
-                    base.truncate(i);
-                }
-                continue;
-            }
-            let mut cur = format!("{base}/{comp}");
-            // Follow this component's symlink chain; every hop counts against the
-            // SHARED budget. A self-referential link keeps `cur` fixed, so the
-            // budget — not a position change — is what terminates the walk.
-            while let Ok(md) = self.layered_lstat(&cur) {
-                if md.kind != RootFsEntryKind::Symlink {
-                    break;
-                }
-                follows += 1;
-                if follows > 40 {
-                    return true;
-                }
-                let Some(target) = self.readlink_layered(&cur) else {
-                    return false;
-                };
-                cur = if target.starts_with('/') {
-                    join_rootfs_path("/", &target)
-                } else {
-                    let parent = Path::new(&cur)
-                        .parent()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "/".to_string());
-                    join_rootfs_path(&parent, &target)
-                };
-            }
-            base = cur;
-        }
-        false
+        self.path_view().symlink_follow_budget_exceeded(abs)
     }
 
     pub(in crate::dispatch) fn resolve_at_path(
@@ -815,11 +753,33 @@ impl<'a> FsView<'a> {
     }
 }
 
+/// Exact namespace identities captured with retained file resources. This
+/// permits traversal to those resources; it does not publish process liveness.
+#[derive(Clone, Copy)]
+pub(in crate::dispatch) struct RetainedProcCaller {
+    pub pid: super::super::NsPid,
+    pub tid: super::super::NsPid,
+}
+
+impl RetainedProcCaller {
+    fn directory(self, path: &str) -> bool {
+        let root = format!("/proc/{}", self.pid.raw());
+        let thread = format!("{root}/task/{}", self.tid.raw());
+        path == root
+            || path == thread
+            || path == format!("{root}/task")
+            || [root, thread]
+                .iter()
+                .any(|base| path == format!("{base}/fd") || path == format!("{base}/fdinfo"))
+    }
+}
+
 /// Read-only layered path authority, independent of a host task binding.
 /// Filesystem syscalls and executable services use this same resolver.
 pub(in crate::dispatch) struct LayeredPathView<'a> {
     pub rootfs: &'a carrick_vfs::RootFsVfs,
     pub mounts: &'a carrick_vfs::VfsMounts,
+    pub proc_caller: Option<RetainedProcCaller>,
     pub resolve_observations: &'a std::cell::RefCell<Vec<Vec<CoherenceStamp>>>,
 }
 
@@ -828,12 +788,79 @@ impl FsView<'_> {
         LayeredPathView {
             rootfs: &self.fs.rootfs_vfs,
             mounts: &self.fs.vfs_mounts,
+            proc_caller: None,
             resolve_observations: &self.resolve_observations,
         }
     }
 }
 
 impl LayeredPathView<'_> {
+    /// Linux caps the TOTAL symlinks followed in a SINGLE pathname resolution at
+    /// MAXSYMLINKS (40); exceeding it is ELOOP. carrick resolves each intermediate
+    /// symlink with its OWN 40-hop cap (`canonicalize_following` /
+    /// `resolve_intermediate_symlinks` run per component), so a path that STACKS
+    /// many shallow intermediate symlinks never accumulates to the cap and wrongly
+    /// resolves. LTP's ELOOP cases (stat03/lstat02/truncate03/readlink03/open13)
+    /// build exactly that: a `test_eloop` directory holding `test_eloop ->
+    /// ../test_eloop`, with the path repeating `test_eloop` ~43 times — each hop is
+    /// a single follow that the per-component resolvers reset. Walk the path once,
+    /// following each component's symlink chain against a SHARED budget, and report
+    /// a cumulative overflow. Only the slow (symlink-bearing) resolution path calls
+    /// this, so symlink-free lookups pay nothing. Resolves entirely through the
+    /// layered view (not the host), so it isn't bounded by the host's own
+    /// MAXSYMLINKS (FreeBSD's 32 < Linux's 40).
+    pub(in crate::dispatch) fn symlink_follow_budget_exceeded(&self, abs: &str) -> bool {
+        // Only INTERMEDIATE components are followed here — the FINAL component's
+        // symlink is the caller's to interpret (lstat/readlink READ it; stat
+        // follows it via canonicalize_following). Following the final here would
+        // wrongly ELOOP an lstat/readlink of a self-referential link (lstat02,
+        // readlink03, truncate03's cases that pass a trailing self-link).
+        let comps: Vec<&str> = abs
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
+        if comps.len() < 2 {
+            return false;
+        }
+        let mut follows = 0usize;
+        let mut base = String::new();
+        for comp in &comps[..comps.len() - 1] {
+            if *comp == ".." {
+                if let Some(i) = base.rfind('/') {
+                    base.truncate(i);
+                }
+                continue;
+            }
+            let mut cur = format!("{base}/{comp}");
+            // Follow this component's symlink chain; every hop counts against the
+            // SHARED budget. A self-referential link keeps `cur` fixed, so the
+            // budget — not a position change — is what terminates the walk.
+            while let Ok(md) = self.layered_lstat(&cur) {
+                if md.kind != RootFsEntryKind::Symlink {
+                    break;
+                }
+                follows += 1;
+                if follows > 40 {
+                    return true;
+                }
+                let Some(target) = self.readlink_layered(&cur) else {
+                    return false;
+                };
+                cur = if target.starts_with('/') {
+                    join_rootfs_path("/", &target)
+                } else {
+                    let parent = Path::new(&cur)
+                        .parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "/".to_string());
+                    join_rootfs_path(&parent, &target)
+                };
+            }
+            base = cur;
+        }
+        false
+    }
+
     pub(in crate::dispatch) fn observe_bind(&self, vfs: &dyn carrick_vfs::Vfs) {
         if let Some(coherence) = vfs.cache_coherence()
             && let Some(observations) = self.resolve_observations.borrow_mut().last_mut()
@@ -843,7 +870,12 @@ impl LayeredPathView<'_> {
     }
 
     pub(in crate::dispatch) fn path_is_directory(&self, path: &str) -> bool {
-        if path == "/" || path.is_empty() {
+        if path == "/"
+            || path.is_empty()
+            || self
+                .proc_caller
+                .is_some_and(|caller| caller.directory(path))
+        {
             return true;
         }
         if let Some(m) = self.mounts.resolve(path) {
@@ -866,6 +898,21 @@ impl LayeredPathView<'_> {
     }
 
     pub(in crate::dispatch) fn readlink_layered(&self, path: &str) -> Option<String> {
+        if let Some(caller) = self.proc_caller {
+            match path {
+                "/proc/self" | "/proc/curproc" | "/proc/this" => {
+                    return Some(format!("/proc/{}", caller.pid.raw()));
+                }
+                "/proc/thread-self" => {
+                    return Some(format!(
+                        "/proc/{}/task/{}",
+                        caller.pid.raw(),
+                        caller.tid.raw()
+                    ));
+                }
+                _ => {}
+            }
+        }
         if let Some(target) = self.rootfs.overlay.read_link(path) {
             return Some(target);
         }
@@ -886,6 +933,17 @@ impl LayeredPathView<'_> {
         &self,
         path: &str,
     ) -> Result<RootFsMetadata, LinuxErrno> {
+        if self
+            .proc_caller
+            .is_some_and(|caller| caller.directory(path))
+        {
+            return Ok(RootFsMetadata {
+                path: path.into(),
+                kind: RootFsEntryKind::Directory,
+                mode: 0o555,
+                size: 0,
+            });
+        }
         if let Some(m) = self.mounts.resolve(path) {
             self.observe_bind(m.vfs);
             if let Ok(md) = m.vfs.lookup_nofollow(&m.full_path) {
@@ -905,23 +963,35 @@ impl LayeredPathView<'_> {
         if !target.split('/').any(|c| c == "..") {
             return Ok(join_rootfs_path(parent, target));
         }
-        match DotdotDepthGuard::enter() {
-            Some(_guard) => self.resolve_dotdot_symlink_aware(parent, target),
-            None => Err(crate::linux_abi::LINUX_ELOOP),
-        }
+        self.resolve_dotdot_symlink_aware(parent, target)
     }
 
     pub(in crate::dispatch) fn canonicalize_following(
         &self,
         path: &str,
     ) -> Result<String, LinuxErrno> {
+        self.canonicalize_with_source(path, &|_| None::<()>)
+            .map(|(path, _)| path)
+    }
+
+    /// A retained magic source terminates traversal before a pathname readlink
+    /// can lose its object identity. All callers share the same bounded walker.
+    pub(in crate::dispatch) fn canonicalize_with_source<T>(
+        &self,
+        path: &str,
+        source: &impl Fn(&str) -> Option<T>,
+    ) -> Result<(String, Option<T>), LinuxErrno> {
+        let _guard = DotdotDepthGuard::enter().ok_or(LINUX_ELOOP)?;
         check_component_length(path)?;
         let mut cur = path.to_string();
         for _ in 0..40 {
             check_component_length(&cur)?;
+            if let Some(retained) = source(&cur) {
+                return Ok((cur, Some(retained)));
+            }
             let md = self.layered_lstat(&cur)?;
             if md.kind != RootFsEntryKind::Symlink {
-                return Ok(cur);
+                return Ok((cur, None));
             }
             let target = self
                 .readlink_layered(&cur)
@@ -947,7 +1017,7 @@ impl LayeredPathView<'_> {
             {
                 return Err(crate::linux_abi::LINUX_ELOOP);
             }
-            cur = next;
+            cur = self.resolve_dotdot_symlink_aware("/", &next)?;
         }
         Err(crate::linux_abi::LINUX_ELOOP)
     }
