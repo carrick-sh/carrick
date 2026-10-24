@@ -19,7 +19,7 @@ export SCCACHE_CACHE_SIZE := replace_regex(_build_env, _build_env_fields, '$4')
 export CARRICK_SCCACHE_REQUEST := replace_regex(_build_env, _build_env_fields, '$5')
 export CARRICK_SCCACHE_SEARCH_PATH := replace_regex(_build_env, _build_env_fields, '$6')
 
-# Shared checkout admission spans each foreground Cargo command.
+# Shared checkout admission spans foreground commands or complete recipes.
 _cargo := "cargo --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
 _admit := _cargo + " run --locked -p carrick-xtask -- worktree-run --"
 
@@ -236,7 +236,7 @@ actionlint *ARGS:
 # checks this host's product profiles and reports all other required profiles
 # pending; a partial local pass is not matrix completeness.
 lint-domains: lint-domains-source
-    cargo run --locked -p carrick-xtask -- authority-debt
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- authority-debt
 
 # Emit exact compiler diagnostics for the selected native host profiles.
 # Output is transient; accepted authority identity uses symbolic cohorts only.
@@ -249,20 +249,14 @@ authority-check-cross TARGET CC CFLAGS AR:
 
 # Host-independent domain checks; live compiler capture runs separately.
 lint-domains-source:
-    cargo test --locked -p carrick-xtask --lib terminal_custody
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- terminal-custody
-    # Direct user-memory writes in dispatch/ that bypass the typed copyout
-    # (#711). Exact per-file ceilings; lower them with each migration and
-    # delete the ratchet at zero.
-    cargo test --locked -p carrick-xtask --lib copyout_debt
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- copyout-debt
+    {{_admit}} just --justfile {{justfile()}} _lint-domains-source
+
+[private]
+_lint-domains-source:
+    # Libtest filters are a union; integration targets run without filters.
+    {{_cargo}} test --locked -p carrick-xtask --lib -- terminal_custody copyout_debt
+    {{_cargo}} test --locked -p carrick-xtask --test probe_coverage --test authority_debt
     python3 scripts/conformance/check-next-strategy.py
-    # Every test target is in exactly one gate lane (Cargo metadata), derived
-    # lanes are consumed by their recipes, named-lane targets are named.
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-lanes check
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- probe-coverage
-    {{_admit}} {{_cargo}} test -p carrick-xtask --test probe_coverage
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- probe-emitters check
     ./scripts/closure-assert-vmfree-schedule.sh
     ./scripts/lint-domains.sh
     # The self-tests run FIRST and in the same gate as --check: every one of
@@ -281,28 +275,29 @@ lint-domains-source:
     # before their production checks. Keep the list named
     # so adding unrelated script tests does not silently change this gate.
     python3 -m unittest scripts/tests/test_host_authority_transitions.py scripts/tests/test_runtime_aborts.py scripts/tests/test_runtime_global_state.py scripts/tests/test_authority_debt_retirement.py scripts/tests/test_authority_dialect.py
-    cargo test --locked -p carrick-xtask --test authority_debt
     python3 -m unittest scripts/tests/test_conformance_contract_policy.py
-    {{_admit}} {{_cargo}} run -p carrick-conformance-contract --bin check-contracts -- --root .
+    {{_cargo}} run -p carrick-conformance-contract --bin check-contracts -- --root .
     # All-feature metadata includes dependencies for other hosts and optional
     # features that this host's build never fetched. Populate the locked cache
     # before the offline personality-boundary graph check on fresh runners.
-    {{_admit}} {{_cargo}} fetch --locked
-    {{_admit}} {{_cargo}} metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
+    {{_cargo}} fetch --locked
+    {{_cargo}} metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
     # Nested fixture workspaces (fixtures/*/Cargo.lock) sit outside the root
     # workspace, so the --locked gates above never resolve them; without this
     # step lock drift surfaced only at `just fixtures-publish`. No compile, so it
     # costs a lock resolution per fixture.
     ./scripts/check-fixture-lockfiles.sh
-    {{_admit}} {{_cargo}} run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
+    {{_cargo}} run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
     python3 -m unittest scripts/tests/test_check_contract_change.py
     # Generic scalar rules here; symbol-bound task rules and mandatory owner
-    # discovery run in authority-debt --source-only below.
+    # discovery run in lint-source's authority-debt --source-only below.
     python3 scripts/migrate/check-task-participant-witnesses.py --check
     python3 scripts/migrate/check-mm-authority.py --check
     python3 scripts/migrate/check-address-domains.py --check
     python3 scripts/migrate/check-host-authority-transitions.py --static
-    cargo run --locked -p carrick-xtask -- authority-debt --source-only
+    # Keep scanner self-tests before production checks. All six Rust ratchets
+    # share the standalone dispatch and run even if an earlier ratchet fails.
+    {{_cargo}} run --locked -p carrick-xtask -- lint-source
     python3 scripts/migrate/check-serial-host-tests.py
     python3 scripts/migrate/check-pipe-core-boundary.py
 

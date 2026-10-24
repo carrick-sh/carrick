@@ -30,6 +30,8 @@ pub enum Commands {
     Info,
     #[command(about = "Prove unit shards preserve every unsharded Cargo test selection")]
     CheckTestShards,
+    #[command(about = "Run every source lint ratchet and report all failures")]
+    LintSource,
     #[command(about = "Compile all recipe lanes once and run their test binaries")]
     TestBatch(crate::test_batch::TestBatchArgs),
     #[command(about = "Package a guest carrier image for an arbitrary composition root")]
@@ -216,6 +218,8 @@ pub struct RepoInfo {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("lint-source: {0} check(s) failed")]
+    LintSource(usize),
     #[error("claims: {0}")]
     Claims(#[from] crate::claims::ClaimError),
     #[error("work order: {0}")]
@@ -420,6 +424,7 @@ where
         }
     }
     match cli.command {
+        Commands::LintSource => run_lint_source(cli.root, writer),
         Commands::Workorder(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::workorder::run(&root, args, writer)?;
@@ -685,5 +690,44 @@ where
             crate::commit_trailers::run(&root, args, writer)?;
             Ok(())
         }
+    }
+}
+
+fn run_lint_source<W: Write>(root: Option<PathBuf>, writer: &mut W) -> Result<(), CliError> {
+    let checks: [&[&str]; 6] = [
+        &["terminal-custody"],
+        &["copyout-debt"],
+        &["test-lanes", "check"],
+        &["probe-coverage"],
+        &["probe-emitters", "check"],
+        &["authority-debt", "--source-only"],
+    ];
+    let io = |source| CliError::Io {
+        path: PathBuf::from("stdout"),
+        source,
+    };
+    let mut failed = 0;
+    for args in checks {
+        let mut argv = vec![OsString::from("carrick-xtask")];
+        if let Some(root) = &root {
+            argv.extend([OsString::from("--root"), root.as_os_str().to_owned()]);
+        }
+        argv.extend(args.iter().map(OsString::from));
+        // Reuse the standalone parser and dispatch in-process, so defaults and
+        // environment-base validation have exactly one implementation.
+        let verdict = match run_with_writer(argv, writer) {
+            Ok(()) => "ok",
+            Err(error) => {
+                failed += 1;
+                writeln!(writer, "{error}").map_err(io)?;
+                "FAIL"
+            }
+        };
+        writeln!(writer, "lint-source: {}: {verdict}", args.join(" ")).map_err(io)?;
+    }
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(CliError::LintSource(failed))
     }
 }

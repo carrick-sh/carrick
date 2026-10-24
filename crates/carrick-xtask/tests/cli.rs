@@ -268,6 +268,34 @@ fn worktree_run_preserves_signal_status() {
 }
 
 #[test]
+fn worktree_run_keeps_build_settings_without_package_metadata() {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .arg("--root")
+        .arg(repo.path())
+        .args([
+            "worktree-run",
+            "--",
+            "/bin/sh",
+            "-c",
+            r#"printf '%s\n' "${CARGO_MANIFEST_DIR-unset}" "${CARGO_PKG_NAME-unset}" "${CARGO_PKG_VERSION-unset}" "$CARGO_BUILD_JOBS" "$CARGO_TARGET_DIR""#,
+        ])
+        .env("CARGO_MANIFEST_DIR", "/outer/package")
+        .env("CARGO_PKG_NAME", "outer-package")
+        .env("CARGO_PKG_VERSION", "9.9.9")
+        .env("CARGO_BUILD_JOBS", "2")
+        .env("CARGO_TARGET_DIR", "retained-target")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "unset\nunset\nunset\n2\nretained-target\n"
+    );
+}
+
+#[test]
 fn subcommand_help_exits_zero_on_stdout() {
     let bin = env!("CARGO_BIN_EXE_carrick-xtask");
     let output = Command::new(bin)
@@ -283,4 +311,60 @@ fn subcommand_help_exits_zero_on_stdout() {
     cli::run_with_writer(["carrick-xtask", "remote-accept", "--help"], &mut out)
         .expect("help is not an error");
     assert!(String::from_utf8_lossy(&out).contains("--ref"));
+}
+
+#[test]
+fn lint_source_reports_later_checks_after_a_ratchet_failure() {
+    // Exercise the real entry points against a complete source fixture, without
+    // compiling a second xtask or changing the developer's checkout or env.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = tempfile::tempdir().unwrap();
+    let files = command::run_checked("git", ["ls-files", "-z"], Some(&root)).unwrap();
+    for relative in files.stdout.split('\0').filter(|path| !path.is_empty()) {
+        let source = root.join(relative);
+        let target = fixture.path().join(relative);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        if source.symlink_metadata().unwrap().file_type().is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(source).unwrap(), target).unwrap();
+        } else {
+            std::fs::copy(source, target).unwrap();
+        }
+    }
+    init_git_repo(fixture.path());
+    let policy_path = fixture
+        .path()
+        .join("scripts/terminal-custody-ceilings.json");
+    std::fs::write(&policy_path, "invalid JSON").unwrap();
+
+    let failed = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .arg("--root")
+        .arg(fixture.path())
+        .arg("lint-source")
+        .env_remove("CARRICK_AUTHORITY_BASE")
+        .env_remove("CARRICK_PROBE_COVERAGE_BASE")
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    let stdout = String::from_utf8_lossy(&failed.stdout);
+    let verdicts: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.starts_with("lint-source: "))
+        .collect();
+    assert_eq!(
+        verdicts,
+        [
+            "lint-source: terminal-custody: FAIL",
+            "lint-source: copyout-debt: ok",
+            "lint-source: test-lanes check: ok",
+            "lint-source: probe-coverage: ok",
+            "lint-source: probe-emitters check: ok",
+            "lint-source: authority-debt --source-only: ok",
+        ],
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert!(
+        stdout.contains("expected value"),
+        "ratchet diagnostic: {stdout}"
+    );
 }
