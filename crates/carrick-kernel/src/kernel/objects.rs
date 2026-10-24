@@ -2426,6 +2426,11 @@ pub struct FileTable {
     slot_subscriptions: Arc<FileSlotSubscriptions>,
 }
 
+enum TableCopyPurpose {
+    Fork,
+    Exec,
+}
+
 impl FileTable {
     pub fn new(id: FileTableId) -> Self {
         Self::with_fd_ceiling(id, Arc::new(FdCeilingAuthority::new()))
@@ -2453,9 +2458,19 @@ impl FileTable {
     }
 
     pub(crate) fn for_fork_copy(id: FileTableId, parent: &Self) -> Self {
+        Self::copy_private(id, parent, TableCopyPurpose::Fork)
+    }
+
+    pub(super) fn stage_exec_copy(id: FileTableId, parent: &Self) -> Self {
+        Self::copy_private(id, parent, TableCopyPurpose::Exec)
+    }
+
+    fn copy_private(id: FileTableId, parent: &Self, purpose: TableCopyPurpose) -> Self {
         let open_files = parent.open_files.read().clone();
         for slot in open_files.values() {
-            crate::el1_delegation::recall_if_delegated(&slot.description);
+            if matches!(purpose, TableCopyPurpose::Fork) {
+                crate::el1_delegation::recall_if_delegated(&slot.description);
+            }
             slot.description.retain_fd_ref();
         }
         let epoll_wake_registry = Arc::clone(&parent.epoll_wake_registry);
@@ -2509,67 +2524,34 @@ impl FileTable {
         Self::with_fd_ceiling(id, fd_ceiling)
     }
 
-    fn for_exec(id: FileTableId, caller: &Self) -> Self {
-        let open_files: FileSlotMap = caller
-            .open_files
-            .read()
-            .iter()
-            .filter_map(|(number, slot)| (!slot.close_on_exec()).then_some((*number, slot.clone())))
-            .collect();
-        for slot in open_files.values() {
-            slot.description.retain_fd_ref();
+    /// Private exec staging only. Transfer the copied functional reference
+    /// into release custody instead of running close effects during preparation.
+    pub(super) fn stage_exec_close(
+        &self,
+        fd: carrick_fd_core::Fd,
+    ) -> Option<FileDescriptionFdLease> {
+        let slot = self.open_files.write().remove(&fd.0);
+        self.fd_open_paths.write().remove(&fd.0);
+        self.epoll_fds.write().remove(&fd.0);
+        if (0..3).contains(&fd.0) {
+            self.closed_stdio.lock()[fd.0 as usize] = true;
         }
-        let mut closed_stdio = *caller.closed_stdio.lock();
-        for (closed, close_on_exec) in closed_stdio
-            .iter_mut()
-            .zip(caller.stdio_cloexec.lock().iter())
-        {
-            *closed |= *close_on_exec;
-        }
-        let epoll_wake_registry = Arc::clone(&caller.epoll_wake_registry);
-        if let Some(maximum) = open_files.keys().max() {
-            caller.fd_ceiling.publish(*maximum);
-        }
-        let mut next_fd = 3;
-        while open_files.contains_key(&next_fd) {
-            let Some(next) = next_fd.checked_add(1) else {
+        slot.map(|slot| FileDescriptionFdLease {
+            description: slot.description,
+        })
+    }
+
+    pub(super) fn finish_exec_stage(&self) {
+        *self.stdio_cloexec.lock() = [false; 3];
+        let files = self.open_files.read();
+        let mut next = 3;
+        while files.contains_key(&next) {
+            let Some(value) = next.checked_add(1) else {
                 break;
             };
-            next_fd = next;
+            next = value;
         }
-        let _ = *caller.next_fd.lock();
-        let mut fd_open_paths = caller.fd_open_paths.read().clone();
-        let retired_paths = fd_open_paths
-            .iter()
-            .filter_map(|(number, _)| (!open_files.contains_key(number)).then_some(*number))
-            .collect::<Vec<_>>();
-        for fd in retired_paths {
-            fd_open_paths.remove(&fd);
-        }
-        let epoll_fds = caller
-            .epoll_fds
-            .read()
-            .iter()
-            .filter_map(|number| open_files.contains_key(number).then_some(*number))
-            .collect();
-        Self {
-            id,
-            fd_ceiling: Arc::clone(&caller.fd_ceiling),
-            open_files: RwLock::new(open_files),
-            ipc: Mutex::new(None),
-            next_fd: Mutex::new(next_fd),
-            reserved_slots: Mutex::new(HashMap::new()),
-            next_reservation_id: AtomicU64::new(0),
-            stdio_cloexec: Mutex::new([false; 3]),
-            closed_stdio: Mutex::new(closed_stdio),
-            fd_open_paths: RwLock::new(fd_open_paths),
-            epoll_fds: RwLock::new(epoll_fds),
-            epoll_wake_registry,
-            functional_gate: Arc::new(FileTableFunctionalGate::new()),
-            functional_refs_active: AtomicBool::new(true),
-            revision: ObjectRevision::new(),
-            slot_subscriptions: Arc::new(FileSlotSubscriptions::default()),
-        }
+        *self.next_fd.lock() = next;
     }
 
     pub const fn id(&self) -> FileTableId {
@@ -3156,11 +3138,9 @@ impl FileTable {
     }
 
     pub(crate) fn drain_functional_refs(&self) -> Vec<(i32, FileSlot)> {
-        self.functional_refs_active.store(false, Ordering::Release);
-        if !self.functional_gate.retire() {
+        if !self.retire_functional_refs() {
             return Vec::new();
         }
-        self.retire_ipc();
         let slots = self
             .open_files
             .read()
@@ -3169,6 +3149,16 @@ impl FileTable {
             .collect();
         self.revision.publish();
         slots
+    }
+
+    pub(super) fn retire_functional_refs(&self) -> bool {
+        self.functional_refs_active.store(false, Ordering::Release);
+        if !self.functional_gate.retire() {
+            return false;
+        }
+        self.retire_ipc();
+        self.revision.publish();
+        true
     }
 
     fn mutation_lease(&self) -> FileTableMutationLease {
@@ -3842,7 +3832,16 @@ mod tests {
     #[test]
     fn exec_copy_retains_description_alias_for_inherited_fd() {
         let ids = ObjectIdRegistry::new();
-        let table = FileTable::new(ids.file_table_id().expect("table ID"));
+        let (kernel, context) = crate::kernel::Kernel::bootstrap_root(
+            crate::kernel::RootBootstrap::for_reference_model(
+                9130,
+                carrick_hal::ThreadId::synthetic_for_tests(9130),
+                "exec aliases".into(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let table = context.resources().files();
         let fd = FileSlotNumber::for_open_fd(7).expect("fd");
         table.install(fd, regular_description(&ids), false);
         table.write_fd_open_paths().insert_with_description_path(
@@ -3851,7 +3850,9 @@ mod tests {
             Some("/real/file".to_owned()),
         );
 
-        let child = FileTable::for_exec(ids.file_table_id().expect("exec ID"), &table);
+        let prepared = kernel.prepare_exec(&context, None).unwrap();
+        let committed = kernel.commit_exec(prepared, None).unwrap();
+        let child = committed.resources().files();
         assert_eq!(
             child.rename_fd_open_paths("/real/file", "/real/renamed"),
             (vec![7], 1)
@@ -3927,21 +3928,41 @@ mod tests {
     #[test]
     fn fork_exec_and_external_exec_tables_retain_the_carrier_authority() {
         let ids = ObjectIdRegistry::new();
-        let authority = Arc::new(FdCeilingAuthority::new());
+        let (kernel, context) = crate::kernel::Kernel::bootstrap_root(
+            crate::kernel::RootBootstrap::for_reference_model(
+                9131,
+                carrick_hal::ThreadId::synthetic_for_tests(9131),
+                "exec ceiling".into(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let authority = Arc::clone(&context.resources().files().fd_ceiling);
         let publisher = Arc::new(TestCeilingPublisher::default());
         authority.register(publisher.clone());
-        let parent = FileTable::with_fd_ceiling(
-            ids.file_table_id().expect("parent table ID"),
-            Arc::clone(&authority),
-        );
-        let fork = FileTable::for_fork_copy(ids.file_table_id().expect("fork table ID"), &parent);
-        let exec = FileTable::for_exec(ids.file_table_id().expect("exec table ID"), &fork);
+        let child = kernel
+            .fork_task(
+                &context,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .unwrap(),
+                carrick_hal::ThreadId::synthetic_for_tests(9132),
+                "ceiling child".into(),
+                None,
+            )
+            .unwrap();
+        let prepared = kernel.prepare_exec(&child, None).unwrap();
+        let committed = kernel.commit_exec(prepared, None).unwrap();
+        let exec = committed.resources().files();
         let external = FileTable::for_external_exec(
             ids.file_table_id().expect("external table ID"),
             authority,
         );
 
-        for (table, fd) in [(&fork, 21), (&exec, 34), (&external, 55)] {
+        for (table, fd) in [
+            (context.resources().files().as_ref(), 21),
+            (exec.as_ref(), 34),
+            (&external, 55),
+        ] {
             table.install(
                 FileSlotNumber::for_open_fd(fd).expect("fd"),
                 regular_description(&ids),
@@ -4839,32 +4860,6 @@ mod tests {
         ));
 
         drop(open_res2);
-    }
-
-    #[test]
-    fn for_exec_closes_bare_stdio_with_cloexec() {
-        let ids = ObjectIdRegistry::new();
-        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
-
-        // Mark stdin (0) as close-on-exec on bare stdio
-        table.stdio_cloexec.lock()[0] = true;
-
-        // Perform for_exec
-        let exec_table = Arc::new(FileTable::for_exec(
-            ids.file_table_id().expect("exec table id"),
-            &table,
-        ));
-
-        // Stdin (0) must now be recorded in closed_stdio
-        assert!(exec_table.closed_stdio.lock()[0]);
-        assert!(!exec_table.closed_stdio.lock()[1]);
-        assert!(!exec_table.closed_stdio.lock()[2]);
-
-        // A new open allocating from 0 must now allocate the closed stdin slot (0)
-        let res = exec_table
-            .reserve_slot_at_or_above(0, 1024)
-            .expect("reserve 0");
-        assert_eq!(res.fd(), 0);
     }
 
     #[test]

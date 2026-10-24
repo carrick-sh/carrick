@@ -15,7 +15,7 @@ use super::{
     KernelFailpoint, KernelOperationError, TaskSetReservation, check_failpoint, next_revision,
 };
 use crate::kernel::core::{
-    FileCloseDisposition, FileCloseEvent, Kernel, KernelContext, RegistryState,
+    FileCloseBatch, FileCloseDisposition, FileCloseEvent, Kernel, KernelContext, RegistryState,
     RetiredThreadRecord, RetiringTaskRecord, TaskExitSubscriber, TaskRecord, TaskRevision,
     VforkReleaseReason, ZombieRecord,
 };
@@ -328,7 +328,7 @@ impl Kernel {
     /// its own table while its last thread is still registered — Linux
     /// `exit_files` runs before `exit_notify` — so that fd teardown never
     /// waits behind the exit publication or anything it serialises with.
-    fn file_table_is_live_excluding(
+    pub(in crate::kernel) fn file_table_is_live_excluding(
         &self,
         target: &Arc<FileTable>,
         excluded: Option<TaskKey>,
@@ -338,14 +338,7 @@ impl Kernel {
             .tasks
             .values()
             .filter(|record| excluded.is_none_or(|excluded| record.task.key() != excluded))
-            .any(|record| {
-                record.task.thread_keys().into_iter().any(|thread_key| {
-                    record
-                        .task
-                        .thread(thread_key.tid)
-                        .is_some_and(|thread| Arc::ptr_eq(&thread.resources().files(), target))
-                })
-            })
+            .any(|record| record.task.owns_file_table(target))
     }
 
     /// Current FileTable generations of one exact live task. Exec/CLONE_FILES
@@ -392,14 +385,6 @@ impl Kernel {
         self.retire_file_table_generation(target, None, Some(exiting));
     }
 
-    pub(crate) fn retire_file_table_after_exec(
-        &self,
-        target: &Arc<FileTable>,
-        successor: &Arc<FileTable>,
-    ) {
-        self.retire_file_table_generation(target, Some(successor), None);
-    }
-
     pub(super) fn retire_file_table_generation(
         &self,
         target: &Arc<FileTable>,
@@ -414,9 +399,9 @@ impl Kernel {
             return;
         }
         let successor_slots = successor.map(|table| table.read_open_files());
-        self.pending_file_closes
-            .lock()
-            .extend(events.into_iter().map(|(fd, slot)| {
+        let events = events
+            .into_iter()
+            .map(|(fd, slot)| {
                 let disposition = successor_slots
                     .as_ref()
                     .and_then(|slots| slots.get(&fd))
@@ -425,26 +410,40 @@ impl Kernel {
                         FileCloseDisposition::Transferred
                     });
                 FileCloseEvent {
-                    table: target.id(),
                     fd,
                     slot,
                     disposition,
                 }
-            }));
+            })
+            .collect();
+        self.enqueue_file_close_batch(Box::new(FileCloseBatch {
+            table: target.id(),
+            events,
+            next: None,
+        }));
+    }
+
+    pub(in crate::kernel) fn enqueue_file_close_batch(&self, mut batch: Box<FileCloseBatch>) {
+        let mut pending = self.pending_file_closes.lock();
+        batch.next = pending.take();
+        *pending = Some(batch);
     }
 
     pub(crate) fn take_file_close_events(&self, table: FileTableId) -> Vec<FileCloseEvent> {
         let mut pending = self.pending_file_closes.lock();
-        let mut selected = Vec::new();
-        let mut index = 0;
-        while index < pending.len() {
-            if pending[index].table == table {
-                selected.push(pending.swap_remove(index));
-            } else {
-                index += 1;
+        let mut link = &mut *pending;
+        loop {
+            if link.as_ref().is_some_and(|batch| batch.table == table) {
+                if let Some(mut batch) = link.take() {
+                    *link = batch.next.take();
+                    return std::mem::take(&mut batch.events);
+                }
+            }
+            match link {
+                Some(batch) => link = &mut batch.next,
+                None => return Vec::new(),
             }
         }
-        selected
     }
 
     pub fn register_task_exit_subscriber<T>(
