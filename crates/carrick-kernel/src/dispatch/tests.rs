@@ -403,6 +403,96 @@ mod overlay_dispatch_tests {
     }
 
     #[test]
+    fn exec_child_single_allocation_reuses_cloexec_stdio_with_parent_alive() {
+        exec_child_allocation_reuses_cloexec_stdio(false);
+    }
+
+    #[test]
+    fn exec_child_pair_allocation_reuses_cloexec_stdio_with_parent_alive() {
+        exec_child_allocation_reuses_cloexec_stdio(true);
+    }
+
+    fn exec_child_allocation_reuses_cloexec_stdio(pair: bool) {
+            let mut parent = SyscallDispatcher::new();
+            let parent_context = parent.capture_one_task_context().unwrap();
+            let mut memory = LinearMemory::new(0x10000, vec![0; 4096]);
+            let reporter = CompatReporter::default();
+            assert_eq!(
+                parent.dispatch(&parent_context,
+                    SyscallRequest::new(25, SyscallArgs([0, 2, 1, 0, 0, 0])),
+                    &mut memory, &reporter).unwrap(),
+                DispatchOutcome::Returned { value: 0 },
+                "F_SETFD on parent stdin must succeed; EBADF is errno 9"
+            );
+            let (mut child, child_context) = super::hvpatch_in_process_fork_tests::fork_dispatcher(
+                &parent, parent_context.thread().registry_id(),
+                crate::thread::ThreadId::synthetic_for_tests(4172), 41, 42);
+            let kernel = child_context.kernel();
+            let prepared = kernel.prepare_exec(&child_context, None).unwrap();
+            let child_context = kernel.commit_exec(prepared, None).unwrap();
+            assert!(child.stdio_is_closed(0));
+            if pair {
+                assert_eq!(child.dispatch(&child_context,
+                    SyscallRequest::new(59, SyscallArgs([0; 6])),
+                    &mut memory, &reporter).unwrap(),
+                    DispatchOutcome::errno(crate::linux_abi::LINUX_EFAULT),
+                    "failed pipe copyout is EFAULT, errno 14");
+                assert_eq!(child.dispatch(&child_context,
+                    SyscallRequest::new(25, SyscallArgs([0, 1, 0, 0, 0, 0])),
+                    &mut memory, &reporter).unwrap(),
+                    DispatchOutcome::errno(crate::linux_abi::LINUX_EBADF),
+                    "rollback must leave stdin closed: EBADF, errno 9");
+            }
+            let request = if pair {
+                SyscallRequest::new(59, SyscallArgs([0x10000, 0, 0, 0, 0, 0]))
+            } else {
+                SyscallRequest::new(19, SyscallArgs([0, 0, 0, 0, 0, 0]))
+            };
+            assert_eq!(child.dispatch(&child_context, request, &mut memory, &reporter).unwrap(),
+                DispatchOutcome::Returned { value: 0 },
+                "allocation must reuse fd 0 after exec; EMFILE is errno 24");
+            if pair {
+                let bytes = memory.read_bytes(0x10000, 8).unwrap();
+                assert_eq!(i32::from_ne_bytes(bytes[..4].try_into().unwrap()), 0);
+                assert_eq!(i32::from_ne_bytes(bytes[4..].try_into().unwrap()), 3);
+            }
+            assert_eq!(parent.dispatch(&parent_context,
+                SyscallRequest::new(25, SyscallArgs([0, 1, 0, 0, 0, 0])),
+                &mut memory, &reporter).unwrap(),
+                DispatchOutcome::Returned { value: 1 },
+                "the live parent's stdin and FD_CLOEXEC must be unchanged");
+            assert!(parent.capture_one_task_context().is_ok());
+            assert!(child.capture_one_task_context().is_ok());
+    }
+
+    #[test]
+    fn fork_child_stdio_reuse_keeps_allocation_cursor_above_stdio() {
+        let parent = SyscallDispatcher::new();
+        let parent_context = parent.capture_one_task_context().unwrap();
+        let (mut child, context) = super::hvpatch_in_process_fork_tests::fork_dispatcher(
+            &parent, parent_context.thread().registry_id(),
+            crate::thread::ThreadId::synthetic_for_tests(4173), 41, 42);
+        let mut memory = LinearMemory::new(0x10000, vec![0; 4096]);
+        let reporter = CompatReporter::default();
+        assert_eq!(child.dispatch(&context,
+            SyscallRequest::new(57, SyscallArgs([0; 6])), &mut memory, &reporter).unwrap(),
+            DispatchOutcome::Returned { value: 0 });
+        for index in 0..64 {
+            let expected = if index == 0 { 0 } else { index + 2 };
+            assert_eq!(child.dispatch(&context,
+                SyscallRequest::new(19, SyscallArgs([0; 6])), &mut memory, &reporter).unwrap(),
+                DispatchOutcome::Returned { value: expected });
+            // The reservation selector handles standard streams separately.
+            // Its cursor must skip already visited nonstdio slots, otherwise
+            // each subsequent allocation scans the entire populated prefix.
+            assert_eq!(*child.captured_file_table().lock_next_fd(), (expected + 1).max(3) as i32);
+        }
+        assert!(!parent.stdio_is_closed(0));
+        assert!(parent.capture_one_task_context().is_ok());
+        assert!(child.capture_one_task_context().is_ok());
+    }
+
+    #[test]
     fn host_write_kind_classifies_common_host_fds() {
         use std::os::fd::AsRawFd;
 
