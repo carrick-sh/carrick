@@ -1880,3 +1880,14 @@ consumes it before stage-2 installation. Its VM-free macOS unit fixture forces
 a second-region failure and compares the real IPA ledger while another prepared
 image stays live. Linux cross-checks this fixture but cannot execute it; pooled
 root recovery and unpublished successor-MM rollback are not covered by it.
+
+### Prepared native service delivery
+
+The scheduler service contract also covers custody-bearing responses. A ticket
+transfers its prepared resource to an established recipient under the same exact
+identity reservation as completion publication. Cancellation before transfer
+returns both resource and ticket; failed cleanup retains them without an ACK.
+Cancellation after transfer leaves the recipient responsible for the resource.
+The two-request VM-free witness covers independent completion and stale MM or
+sequence refusal. This transport primitive does not authorize exec adoption or
+claim native loader/new-MM integration.
