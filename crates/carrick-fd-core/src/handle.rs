@@ -831,7 +831,8 @@ fn map_core_error(err: Error) -> HandleError {
         Error::NeedsOfds => HandleError::NeedsObjects,
         Error::NeedsBacking { descriptors } => HandleError::NeedsBacking { slots: descriptors },
         Error::Contended => HandleError::Contended,
-        Error::BadBacking => HandleError::BadBacking,
+        // Numeric reservations never occur in the separate handle storage.
+        Error::BadBacking | Error::Busy => HandleError::BadBacking,
     }
 }
 

@@ -1945,3 +1945,7 @@ contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/fd_exec.rs"
 contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable"]
+
+[[surfaces]]
+path = "crates/carrick-fd-core/src/reservation.rs"
+contracts = ["kernel.el1.ipc-fd-authority", "kernel.fork.filetable"]
