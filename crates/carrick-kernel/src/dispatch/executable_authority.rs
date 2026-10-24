@@ -1221,6 +1221,14 @@ mod tests {
             .acquire_exec_source(&context, &format!("/proc/self/fd/{fd}"))
             .unwrap();
         assert_eq!(retained.read_all().unwrap(), b"program-a");
+        assert_eq!(
+            dispatcher
+                .acquire_exec_source(&context, &format!("/dev/fd/{fd}"))
+                .unwrap()
+                .read_head(9)
+                .unwrap(),
+            b"program-a"
+        );
     }
     #[test]
     fn exec_capabilities_keep_two_callers_without_host_task_bindings() {
@@ -1273,7 +1281,12 @@ mod tests {
             a.acquire("/proc/self/exe").unwrap().read_all().unwrap(),
             b"first"
         );
-        for path in ["//proc/self/exe", "/proc/./self/exe"] {
+        for path in [
+            "//proc/self/exe",
+            "/proc/./self/exe",
+            "/proc/self/fd/../exe",
+            "/proc/../proc/self/fd/../exe",
+        ] {
             assert_eq!(a.acquire(path).unwrap().read_head(5).unwrap(), b"first");
         }
         assert_eq!(
@@ -1286,6 +1299,38 @@ mod tests {
                 || matches!(a.acquire("/absent"), Err(ExecSourceError::Linux(errno)) if errno.get() == 2)
         );
     }
+    #[test]
+    fn exec_capabilities_resolve_nonleader_thread_self_after_task_release() {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/image", b"guest".to_vec())
+            .unwrap();
+        let leader = dispatcher.capture_one_task_context().unwrap();
+        let source = dispatcher.acquire_exec_source(&leader, "/image").unwrap();
+        dispatcher.set_executable_identity_with_source("/image", vec![], vec![], source);
+        let tid = dispatcher
+            .register_one_task_thread(
+                &leader,
+                crate::thread::ThreadId::synthetic_for_tests(91_342),
+            )
+            .unwrap();
+        let thread = dispatcher.capture_kernel_context(tid).unwrap();
+        let files = dispatcher.capture_exec_files(&thread).unwrap();
+        let weak = Arc::downgrade(thread.task());
+        drop(thread);
+        drop(leader);
+        drop(dispatcher);
+        assert!(weak.upgrade().is_none());
+        for path in ["/proc/thread-self/exe", "/proc/thread-self/../../exe"] {
+            assert_eq!(files.acquire(path).unwrap().read_head(5).unwrap(), b"guest");
+        }
+        assert!(matches!(files.acquire("/proc/2147483647/exe"),
+            Err(ExecSourceError::Linux(errno)) if errno.get() == 2));
+    }
+
     #[test]
     fn exec_capabilities_reject_foreign_context() {
         let first = SyscallDispatcher::new();
@@ -1525,6 +1570,31 @@ mod tests {
             builder
                 .append_link(&mut header, "link", "/dir/nested")
                 .unwrap();
+            for (name, target) in [
+                ("dirlink", "/dir"),
+                ("exelink", "/proc/self/exe"),
+                ("loop", "."),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                builder.append_link(&mut header, name, target).unwrap();
+            }
+            for depth in 0..25 {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                let target = if depth == 24 {
+                    "/dir/nested".to_owned()
+                } else {
+                    format!("depth{}/..", depth + 1)
+                };
+                builder
+                    .append_link(&mut header, format!("depth{depth}"), target)
+                    .unwrap();
+            }
             builder.finish().unwrap();
         }
         let dispatcher = SyscallDispatcher::with_rootfs(
@@ -1551,5 +1621,74 @@ mod tests {
             .acquire_exec_source(&context, "/link/../image")
             .unwrap();
         assert_eq!(source.read_all().unwrap(), b"correct");
+        dispatcher.set_executable_identity_with_source("/dir/image", vec![], vec![], source);
+        let files = dispatcher.capture_exec_files(&context).unwrap();
+        for path in ["/dirlink/image", "/exelink"] {
+            assert_eq!(
+                files.acquire(path).unwrap().read_head(7).unwrap(),
+                b"correct"
+            );
+        }
+        let excessive = format!("/{}/image", vec!["loop"; 41].join("/"));
+        assert!(
+            matches!(files.acquire(&excessive), Err(ExecSourceError::Linux(errno)) if errno.get() == 40)
+        );
+        assert_eq!(
+            files
+                .acquire("/depth0/image")
+                .unwrap()
+                .read_head(5)
+                .unwrap(),
+            b"wrong"
+        );
+        for path in ["/dir/../image/", "/dir/../image/."] {
+            assert!(
+                matches!(dispatcher.acquire_exec_source(&context, path), Err(ExecSourceError::Linux(errno)) if errno.get() == 20),
+                "regular file traversal must report ENOTDIR 20"
+            );
+        }
+    }
+    #[test]
+    fn exec_capabilities_magic_error_never_falls_back_to_host_alias() {
+        use carrick_vfs::rootfs::{LayerSource, RootFs};
+        let directory = tempfile::tempdir().unwrap();
+        let host_path = directory.path().join("alias");
+        std::fs::write(&host_path, b"host must not be selected").unwrap();
+        let mut archive = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut archive);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            builder
+                .append_link(
+                    &mut header,
+                    host_path.strip_prefix("/").unwrap(),
+                    "/proc/self/fd/999999",
+                )
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut dispatcher = SyscallDispatcher::with_rootfs(
+            RootFs::from_layers([LayerSource::Tar(archive)]).unwrap(),
+        );
+        dispatcher.exec_host_fs_fallback = true;
+        let mut parent = std::path::PathBuf::new();
+        for component in directory.path().components() {
+            parent.push(component);
+            if parent != std::path::Path::new("/") {
+                dispatcher
+                    .fs
+                    .rootfs_vfs
+                    .overlay
+                    .make_dir(parent.to_str().unwrap())
+                    .unwrap();
+            }
+        }
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let files = dispatcher.capture_exec_files(&context).unwrap();
+        assert!(matches!(files.acquire(host_path.to_str().unwrap()),
+            Err(ExecSourceError::Linux(errno)) if errno.get() == 2));
     }
 }
