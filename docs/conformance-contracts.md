@@ -1873,3 +1873,10 @@ an independent preparation intact. Sparse payloads retain their offsets and
 zero tails without a full-extent copy. The initial witness is API compile-red.
 These tests do not prove service admission, successor-MM publication, aggregate
 IPA/root-slot rollback, or two executing native processes; those remain #785.
+
+The aggregate `PreparedExecBacking` retains the exact carrier and owns every
+prepared region, unmapped IPA lease and checked-out pooled root slot. Host exec
+consumes it before stage-2 installation. Its VM-free macOS unit fixture forces
+a second-region failure and compares the real IPA ledger while another prepared
+image stays live. Linux cross-checks this fixture but cannot execute it; pooled
+root recovery and unpublished successor-MM rollback are not covered by it.
