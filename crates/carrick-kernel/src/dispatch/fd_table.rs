@@ -2015,6 +2015,98 @@ pub(crate) fn kernel_file_description(
     file_desc
 }
 
+/// Real host-file backing for VM-free native process ownership witnesses.
+#[cfg(feature = "test-support")]
+pub struct NativeFileWitness {
+    backing: OpenDescriptionRef,
+    parent: Option<Arc<crate::kernel::FileDescription>>,
+}
+
+#[cfg(feature = "test-support")]
+impl NativeFileWitness {
+    pub fn new(table: &crate::el1_ipc::HostTable, fd: i32) -> std::io::Result<Self> {
+        use std::io::Write;
+        use std::os::fd::IntoRawFd;
+        let mut file = tempfile::tempfile()?;
+        file.write_all(b"child")?;
+        let backing = Arc::new(RwLock::new(OpenDescription::HostFile {
+            base: OpenDescriptionBase::new(0),
+            host_fd: HostFdRef::new(file.into_raw_fd()),
+            metadata: RootFsMetadata {
+                path: "/native-file-witness".into(),
+                kind: carrick_vfs::rootfs::RootFsEntryKind::File,
+                mode: 0o600,
+                size: 5,
+            },
+            writable: true,
+        }));
+        let description = kernel_file_description(Arc::clone(&backing), 0);
+        description.retain_fd_ref();
+        let witness = Self {
+            backing,
+            parent: Some(Arc::clone(&description)),
+        };
+        table
+            .replace_slot(
+                carrick_el1_abi::ipc::fd::Fd(fd),
+                &crate::kernel::FileSlot::new(description, 0),
+            )
+            .map_err(|error| {
+                std::io::Error::from_raw_os_error(
+                    crate::el1_ipc::CreateError::from_admission(error)
+                        .errno()
+                        .get(),
+                )
+            })?;
+        Ok(witness)
+    }
+
+    pub fn close_parent(&mut self) {
+        if let Some(description) = self.parent.take() {
+            description.release_fd_ref();
+        }
+    }
+
+    pub fn restore_parent_view(&mut self) -> Result<(), crate::kernel::ObjectIdError> {
+        if let Some(parent) = &mut self.parent {
+            *parent = Arc::new(
+                crate::kernel::FileDescription::concrete_restored_with_common(
+                    parent.id().raw(),
+                    Arc::clone(&self.backing),
+                    parent.common_arc(),
+                )?,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn mapping(&self) -> Option<Arc<crate::kernel::objects::MappedFileReference>> {
+        self.parent.as_ref()?.retain_mapping()
+    }
+
+    pub fn read(&self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let backing = self.backing.read();
+        let OpenDescription::HostFile { host_fd, .. } = &*backing else {
+            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+        };
+        // SAFETY: the backing read guard retains this exact host fd; the
+        // caller's mutable slice is writable for the requested byte count.
+        let read = unsafe { libc::pread(host_fd.raw(), bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+        if read < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(read as usize)
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for NativeFileWitness {
+    fn drop(&mut self) {
+        self.close_parent();
+    }
+}
+
 fn kernel_file_description_unregistered(
     description: OpenDescriptionRef,
     status_flags: u64,
