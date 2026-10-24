@@ -455,7 +455,6 @@ pub struct IpcDirectory {
     object_count: AtomicU64,
     _reserved: [u64; 5],
     fd: IpcFdCore,
-    descriptor_storage: fd::storage::Storage<IPC_DESCRIPTOR_STORAGE_NODES>,
     free_operations: AtomicU64,
     /// Ring stock: two tagged lock-free stacks over `ring_stock` slots, the
     /// provisioned rings and the empty slots.
@@ -490,14 +489,22 @@ pub const IPC_WAKE_LEAVES_OFFSET: usize =
 /// Offset of the zone epoll item array ([`epoll::IpcEpollItem`]).
 pub const IPC_EPOLL_ITEMS_OFFSET: usize =
     page_round(IPC_WAKE_LEAVES_OFFSET + HOST_WAKE_LEAF_WORDS * core::mem::size_of::<AtomicU64>());
+/// Offset of pointer-free descriptor allocation metadata, outside the fixed head.
+pub const IPC_DESCRIPTOR_STORAGE_OFFSET: usize = page_round(
+    IPC_EPOLL_ITEMS_OFFSET + epoll::IPC_EPOLL_ITEMS * core::mem::size_of::<epoll::IpcEpollItem>(),
+);
+type DescriptorStorage = fd::storage::Storage<IPC_DESCRIPTOR_STORAGE_NODES>;
 /// Length of the directory mapping: fixed head plus every store's
 /// reservation, a multiple of 16 KiB (the host's stage-2 granule).
-pub const IPC_DIRECTORY_BYTES: usize = (IPC_EPOLL_ITEMS_OFFSET
-    + epoll::IPC_EPOLL_ITEMS * core::mem::size_of::<epoll::IpcEpollItem>())
+pub const IPC_DIRECTORY_BYTES: usize = (IPC_DESCRIPTOR_STORAGE_OFFSET
+    + core::mem::size_of::<DescriptorStorage>())
 .next_multiple_of(0x4000);
 const _: () =
     assert!(IPC_EPOLL_ITEMS_OFFSET.is_multiple_of(core::mem::align_of::<epoll::IpcEpollItem>()));
 const _: () = assert!(IPC_OBJECTS_OFFSET.is_multiple_of(core::mem::align_of::<IpcObjectRecord>()));
+const _: () = assert!(
+    IPC_DESCRIPTOR_STORAGE_OFFSET.is_multiple_of(core::mem::align_of::<DescriptorStorage>())
+);
 // The elastic stores' reservations follow the head, in order, without overlap.
 const _: () = assert!(IPC_OBJECTS_OFFSET >= core::mem::size_of::<IpcDirectory>());
 const _: () = assert!(
@@ -529,7 +536,8 @@ const LAYOUT_FACTS: &[u64] = &[
     core::mem::align_of::<IpcDirectory>() as u64,
     core::mem::offset_of!(IpcDirectory, owed_host_wakes_without_target) as u64,
     core::mem::offset_of!(IpcDirectory, fd) as u64,
-    core::mem::offset_of!(IpcDirectory, descriptor_storage) as u64,
+    IPC_DESCRIPTOR_STORAGE_OFFSET as u64,
+    core::mem::size_of::<DescriptorStorage>() as u64,
     core::mem::size_of::<IpcFdCore>() as u64,
     core::mem::size_of::<IpcObjectRecord>() as u64,
     core::mem::offset_of!(IpcObjectRecord, generation) as u64,
@@ -949,9 +957,6 @@ impl<'a> IpcRegion<'a> {
             return Err(IpcError::BadRegion);
         }
         d.fd.initialize(identity).map_err(IpcError::Fd)?;
-        d.descriptor_storage
-            .initialize(pool_len as u64 / IPC_POOL_AREAS)
-            .map_err(|_| IpcError::BadRegion)?;
         let region = Self {
             dir: d,
             base: dir.cast(),
@@ -960,6 +965,10 @@ impl<'a> IpcRegion<'a> {
             holder: IpcLockHolder::Host,
             _pool: PhantomData,
         };
+        region
+            .descriptor_storage()
+            .initialize(pool_len as u64 / IPC_POOL_AREAS)
+            .map_err(|_| IpcError::BadRegion)?;
         region.grow_ofds()?;
         region.grow_objects()?;
         for i in (0..IPC_RING_STOCK).rev() {
@@ -1037,6 +1046,17 @@ impl<'a> IpcRegion<'a> {
         self.dir.fd.bind(self, wait)
     }
 
+    fn descriptor_storage(&self) -> &'a DescriptorStorage {
+        // SAFETY: attach checks the complete directory reservation; this aligned
+        // region contains only synchronized, pointer-free allocator metadata.
+        unsafe {
+            &*self
+                .base
+                .add(IPC_DESCRIPTOR_STORAGE_OFFSET)
+                .cast::<DescriptorStorage>()
+        }
+    }
+
     /// Allocate table backing from the same pointer-free pool in either venue.
     pub fn provision_descriptors(
         &self,
@@ -1047,8 +1067,7 @@ impl<'a> IpcRegion<'a> {
             return Err(fd::storage::StorageError::Invalid);
         }
         let allocation = self
-            .dir
-            .descriptor_storage
+            .descriptor_storage()
             .allocate(descriptor_extent_bytes(capacity), wait)?;
         Ok(Extent {
             token: ipc_descriptor_area(self.pool_len).start + allocation.offset,
@@ -1077,13 +1096,12 @@ impl<'a> IpcRegion<'a> {
             .next_multiple_of(IPC_POOL_ALIGN)
             .checked_next_power_of_two()
             .ok_or(fd::storage::StorageError::Invalid)?;
-        self.dir
-            .descriptor_storage
+        self.descriptor_storage()
             .release(fd::storage::Allocation { offset, bytes }, wait)
     }
 
     pub fn descriptor_allocations(&self) -> u32 {
-        self.dir.descriptor_storage.live_allocations()
+        self.descriptor_storage().live_allocations()
     }
 
     /// Pool bytes `[offset, offset+len)`, authenticated against the pool.
