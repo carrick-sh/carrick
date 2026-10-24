@@ -1279,17 +1279,11 @@ fn ipc_complete_for_owner(
     sigpipe: bool,
     producer: &mut super::signal_ingress_producer::HostSignalIngressProducer,
 ) -> Result<DispatchOutcome, RuntimeError> {
-    if sigpipe
-        && let Some(target) =
-            super::signal_ingress_producer::HostIngressTarget::from_context(context)
+    if sigpipe && super::signal_ingress_producer::HostIngressTarget::from_context(context).is_some()
     {
-        let queue = carrick_el1_abi::signal_ingress_host().ok_or_else(|| {
-            RuntimeError::Configuration("native SIGPIPE ingress has no shared reservation".into())
-        })?;
         producer
-            .publish_deferred_in_zone(
-                queue,
-                target,
+            .publish_in_zone_standard(
+                context,
                 carrick_personality_linux::signal::policy::Signal::PIPE,
             )
             .map_err(|error| {
@@ -1977,6 +1971,43 @@ mod ipc_tests {
         context.shared().sighand().install_action(signal, ign);
         ipc_complete(&dispatcher, &context, tid, epipe, true);
         assert!(!sigpipe_pending(&context), "SIG_IGN suppresses SIGPIPE");
+    }
+
+    #[test]
+    fn native_ipc_epipe_admits_sigpipe_before_returning_errno_32() {
+        use carrick_kernel::kernel::continuation::test_support::publish;
+        use carrick_sched_core::{RecordId, RecordRef};
+
+        let (dispatcher, context, tid) = dispatcher_and_context();
+        assert_eq!(publish(&context, 0x735).raw(), 1);
+        let control = context.thread().control_slot();
+        control.bind_zone_record(RecordRef {
+            id: RecordId::from_raw(7).unwrap(),
+            incarnation: 11,
+        });
+        let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+        custody.commit_registration();
+        custody.commit_native_signal_owner();
+        let mut producer = super::signal_ingress_producer::HostSignalIngressProducer::new();
+
+        assert_eq!(
+            ipc_complete_for_owner(
+                &dispatcher,
+                &context,
+                tid,
+                carrick_abi::LINUX_EPIPE.guest_retval(),
+                true,
+                &mut producer,
+            )
+            .unwrap(),
+            DispatchOutcome::Errno {
+                errno: carrick_abi::LINUX_EPIPE
+            }
+        );
+        let pending = control.take_in_zone_standard_signals();
+        let sigpipe = carrick_personality_linux::signal::policy::Signal::PIPE;
+        assert!(pending.contains(sigpipe));
+        assert!(pending.without(sigpipe).is_empty());
     }
 
     #[test]
