@@ -70,6 +70,19 @@ impl CowResolver for NoopCowResolver {
 }
 
 pub trait PreparedPageResolver {
+    /// Borrow live descriptor words under the caller's exact MM editor and
+    /// apply the shared grant owner's selection. No descriptor venue means
+    /// no supply selection; residency alone cannot authorize a bulk window.
+    fn select_backing_window(
+        &mut self,
+        _root: u64,
+        _window: carrick_core_abi::PortalGrantWindow,
+    ) -> Result<
+        carrick_core_abi::PortalGrantWindow,
+        carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    > {
+        Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::TableOutsidePrimary)
+    }
     fn commit_prepared(
         &mut self,
         ttbr0: u64,

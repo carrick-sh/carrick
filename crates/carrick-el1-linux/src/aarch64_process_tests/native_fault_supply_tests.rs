@@ -10,6 +10,31 @@ struct FaultMemory {
     pages: RefCell<BTreeMap<u64, Vec<u8>>>,
     copies: Cell<usize>,
 }
+struct SelectionWords<'a>(&'a dyn LiveDescriptorWords);
+impl carrick_el1::fault::PreparedPageResolver for SelectionWords<'_> {
+    fn select_backing_window(
+        &mut self,
+        root: u64,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<
+        carrick_el1_abi::PortalGrantWindow,
+        carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    > {
+        carrick_core::mm::frames::select_backing_window::<Aarch64Mmu, _>(self.0, root, window)
+    }
+    fn commit_prepared(
+        &mut self,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: carrick_mmu_core::aarch64::LeafAccess,
+    ) -> Result<
+        carrick_mmu_core::aarch64::GuestPreparedCommit,
+        carrick_mmu_core::aarch64::GuestPreparedCommitError,
+    > {
+        panic!("this fixture faults only on absent leaves or private COW leaves")
+    }
+}
 fn leaf(words: &impl LiveDescriptorWords, root: u64, va: u64) -> u64 {
     let mut table = root & AARCH64_ROOT_ADDRESS_MASK;
     for (level, index) in carrick_mmu_core::aarch64::indices(va)
@@ -112,23 +137,27 @@ impl CowResolver for FaultResolver<'_> {
 
 #[test]
 fn native_child_empty_supply_resumes_cow_without_changing_parent() {
-    composed_native_supply(false, false);
+    composed_native_supply(false, None);
 }
 #[test]
 fn native_backing_reply_observes_a_competing_valid_publication() {
-    composed_native_supply(true, false);
+    composed_native_supply(true, None);
 }
 #[test]
 fn native_child_backing_selection_excludes_inherited_live_neighbor() {
-    composed_native_supply(false, true);
+    composed_native_supply(false, Some(1));
 }
-fn composed_native_supply(competing_publication: bool, inherited_neighbor: bool) {
+#[test]
+fn native_child_backing_selection_excludes_inherited_live_suffix() {
+    composed_native_supply(false, Some(0));
+}
+fn composed_native_supply(competing_publication: bool, absent_page: Option<usize>) {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    if inherited_neighbor {
-        // Parent's two-page reservation has only its first page resident.
+    if let Some(absent_page) = absent_page {
+        // Parent's two-page reservation has only one page resident.
         // Actual native fork must carry that descriptor into the child even
         // though the child's lazy-grant residency table has no corresponding row.
-        fixture.tables.words[1537].store(0, Ordering::Relaxed);
+        fixture.tables.words[1536 + absent_page].store(0, Ordering::Relaxed);
     }
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let window = carrick_el1_abi::EL1_COW_COPY_BASE;
@@ -241,17 +270,19 @@ fn composed_native_supply(competing_publication: bool, inherited_neighbor: bool)
         .unwrap();
     let supply = OwnerFaultSupply::new(portal).with_handle(handle);
     let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
-    if inherited_neighbor {
+    if let Some(absent_page) = absent_page {
+        let fault_page = VA + absent_page as u64 * 4096;
+        let neighbor = VA + (1 - absent_page) as u64 * 4096;
         frame.esr = 0x92000046;
-        frame.far = VA + 4096;
+        frame.far = fault_page;
         let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
         let root = access
             .grant(access.find(identity.mm).unwrap(), identity.mm)
             .unwrap()
             .ttbr0;
-        assert_ne!(leaf(words, root, VA), 0);
-        assert_eq!(leaf(words, root, VA + 4096), 0);
-        assert!(residency.lookup(identity.mm, VA).is_none());
+        assert_ne!(leaf(words, root, neighbor), 0);
+        assert_eq!(leaf(words, root, fault_page), 0);
+        assert!(residency.lookup(identity.mm, neighbor).is_none());
         assert_eq!(
             carrick_el1::fault::dispatch_fault_with_prepared(
                 &mut frame,
@@ -265,7 +296,7 @@ fn composed_native_supply(competing_publication: bool, inherited_neighbor: bool)
                 ),
                 Some(carrick_el1::fault::PreparedFaultPath {
                     residency,
-                    resolver: &mut carrick_el1::fault::NoopPreparedResolver,
+                    resolver: &mut SelectionWords(words),
                     roots: Some(fixture.region.table()),
                     file_slots: Some(portal),
                 }),
@@ -281,10 +312,63 @@ fn composed_native_supply(competing_publication: bool, inherited_neighbor: bool)
             .unwrap();
         assert_eq!(
             window.range.start(),
-            VA + 4096,
-            "physical supply must exclude the inherited live prefix"
+            fault_page,
+            "physical supply must exclude the inherited live neighbor"
         );
         assert_eq!(window.range.len(), 4096);
+        // Trimming a file-backed window advances its retained source by the
+        // same prefix. No adapter may restart at the original file offset.
+        let mut file_window = window;
+        file_window.range = carrick_el1_abi::ReservationRange::new(VA, VA + 8192).unwrap();
+        file_window.host_backing = Some(carrick_el1_abi::HostBackingIdentity::new(
+            NonZeroU64::MIN,
+            NonZeroU64::MIN,
+            0x2000,
+        ));
+        let selected = carrick_core::mm::frames::select_backing_window::<Aarch64Mmu, _>(
+            words,
+            root,
+            file_window,
+        )
+        .unwrap();
+        assert_eq!(selected.range, window.range);
+        assert_eq!(
+            selected.host_backing.unwrap().offset(),
+            0x2000 + fault_page - VA
+        );
+        assert!(
+            portal
+                .grant(0)
+                .unwrap()
+                .cancel_fault_selection(window, window.operation.sequence.get())
+        );
+        // A translation fault observed before a competing publication must
+        // retry the now-live instruction, not allocate backing or signal it.
+        frame.esr = 0x92000006;
+        frame.far = neighbor;
+        let retry = OwnerFaultSupply::new(portal).with_handle(handle);
+        assert_eq!(
+            carrick_el1::fault::dispatch_fault_with_prepared(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                access,
+                crate::cow_resolver::native_fault_supply(
+                    true,
+                    carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                    &retry
+                ),
+                Some(carrick_el1::fault::PreparedFaultPath {
+                    residency,
+                    resolver: &mut SelectionWords(words),
+                    roots: Some(fixture.region.table()),
+                    file_slots: Some(portal),
+                }),
+                &mut resolver,
+            ),
+            carrick_el1_abi::Action::Served
+        );
+        assert!(!portal.grant(0).unwrap().has_outstanding_for(identity.mm));
         return;
     }
     frame.esr = 0x9200004f;
@@ -783,7 +867,7 @@ fn composed_native_supply(competing_publication: bool, inherited_neighbor: bool)
             ),
             Some(carrick_el1::fault::PreparedFaultPath {
                 residency,
-                resolver: &mut carrick_el1::fault::NoopPreparedResolver,
+                resolver: &mut SelectionWords(words),
                 roots: Some(fixture.region.table()),
                 file_slots: Some(portal)
             }),

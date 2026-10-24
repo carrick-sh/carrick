@@ -204,6 +204,31 @@ impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopy
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl PreparedPageResolver for HardwarePreparedResolver {
+    fn select_backing_window(
+        &mut self,
+        root: u64,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<
+        carrick_el1_abi::PortalGrantWindow,
+        carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    > {
+        use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorRefusal, PrimaryTableWords};
+        let table = hardware_target_table_window(root).ok_or(DescriptorRefusal::BadRange)?;
+        // SAFETY: the shared fault owner retains the target MM editor; the
+        // current primary alias and admitted pool remain mapped throughout.
+        let words = unsafe {
+            PrimaryTableWords::new(
+                table.words,
+                table.physical_base,
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
+                &ServiceCopyMaintenance,
+            )
+            .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
+        }?;
+        carrick_core::mm::frames::select_backing_window::<carrick_mmu_core::owner_mmu::Aarch64Mmu, _>(
+            &words, root, window,
+        )
+    }
     fn commit_prepared(
         &mut self,
         ttbr0: u64,
@@ -271,6 +296,22 @@ impl<'a, W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> X86Prepa
 impl<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> PreparedPageResolver
     for X86PreparedResolver<'_, W>
 {
+    fn select_backing_window(
+        &mut self,
+        root: u64,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<
+        carrick_el1_abi::PortalGrantWindow,
+        carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    > {
+        use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+        if crate::isa::x86::hardware_live_root().map(|live| live.address().raw()) != Ok(root) {
+            return Err(DescriptorRefusal::StaleRoot);
+        }
+        carrick_core::mm::frames::select_backing_window::<carrick_mmu_core::x86::owner_mmu::X86Mmu, _>(
+            self.words, root, window,
+        )
+    }
     fn commit_prepared(
         &mut self,
         root_pa: u64,
@@ -1441,10 +1482,12 @@ fn dispatch_classified_fault<
     }
 
     if let FaultSupply::Owner(owner) = supply {
+        let mut retry = false;
         let selected = (|| {
             let roots = prepared.as_ref()?.roots?;
             let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
             let index = spaces.find(mm_key)?;
+            let editor = supply.editor(spaces, index, mm_key, NonZeroU64::new(slot + 1)?)?;
             let observed = supply.observe(
                 spaces,
                 mm_key,
@@ -1458,7 +1501,7 @@ fn dispatch_classified_fault<
                     }
                 })
                 .ok()?;
-            let mut window = match carrick_core::mm::fault::select_fault_window(
+            let window = match carrick_core::mm::fault::select_fault_window(
                 &mut root,
                 owner.slots.carrier()?,
                 carrick_guest_arch::UserVa::new(far),
@@ -1475,27 +1518,28 @@ fn dispatch_classified_fault<
                 }
                 Err(_) => return None,
             };
-            // Coalescing adjacent reservations does not erase existing PRIVATE
-            // or prepared custody. A bulk Prepare must never cover those pages.
-            // The retained residency owner includes prepared neighbors, too.
-            let residency = prepared.as_ref()?.residency;
-            if (window.range.start()..window.range.end())
-                .step_by(4096)
-                .any(|page| residency.lookup(mm_key, page).is_some())
+            let window = match prepared
+                .as_mut()?
+                .resolver
+                .select_backing_window(editor.grant().ttbr0, window)
             {
-                window = carrick_core::mm::fault::select_fault_window(
-                    &mut root,
-                    owner.slots.carrier()?,
-                    carrick_guest_arch::UserVa::new(far),
-                    carrick_guest_arch::GuestLen::new(4096),
-                    carrick_el1_abi::ReservationProtection::from_bits(access)?,
-                )
-                .ok()?;
-            }
+                Ok(window) => window,
+                Err(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::Occupied) => {
+                    // Same verdict as an occupied reply at application: a
+                    // concurrent publication invalidates the observed fault,
+                    // not the instruction. Re-enter without physical supply.
+                    retry = true;
+                    return None;
+                }
+                Err(_) => return None,
+            };
             let slot = owner.slots.grant(slot as usize)?;
             slot.publish_fault_selection(window.operation.sequence.get(), window)
                 .then_some(())
         })();
+        if retry {
+            return Action::Served;
+        }
         if selected.is_some() {
             owner.outcome.set(OwnerFaultSupplyOutcome::Selected);
         }

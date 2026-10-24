@@ -6,6 +6,70 @@ use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
 use carrick_mmu_core::owner_mmu::{OwnerGrantMmu, OwnerMmu};
 use carrick_sched_core::SpaceEditor;
 
+/// Select the contiguous unused part of an admitted window containing the
+/// fault. The caller retains this MM's editor while reading descriptors.
+/// Residency is not a census of inherited live or prepared leaves.
+pub fn select_backing_window<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: u64,
+    mut window: PortalGrantWindow,
+) -> Result<PortalGrantWindow, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+    use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+    if !window.valid() {
+        return Err(DescriptorRefusal::BadRange);
+    }
+    let mut start = window.range.start();
+    let mut end = window.range.end();
+    for page in (start..end).step_by(4096) {
+        if grant_page_available::<B, _>(words, root, page)? {
+            continue;
+        }
+        if page == window.fault_page {
+            return Err(DescriptorRefusal::Occupied);
+        }
+        if page < window.fault_page {
+            start = page + 4096;
+        } else {
+            end = page;
+            break;
+        }
+    }
+    if let Some(backing) = window.host_backing {
+        window.host_backing = Some(
+            backing
+                .advance(start - window.range.start())
+                .ok_or(DescriptorRefusal::BadRange)?,
+        );
+    }
+    window.range = ReservationRange::new(start, end).ok_or(DescriptorRefusal::BadRange)?;
+    Ok(window)
+}
+
+fn grant_page_available<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: u64,
+    va: u64,
+) -> Result<bool, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+    use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+    let mut table = B::root(root)
+        .map_err(|_| DescriptorRefusal::StaleRoot)?
+        .address()
+        .raw();
+    for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
+        let word = words
+            .load(table + ((va >> shift) & 511) * 8)
+            .map_err(|_| DescriptorRefusal::TableOutsidePrimary)?;
+        if word == 0 {
+            return Ok(true);
+        }
+        if !B::is_table(word, level) {
+            return Ok(level != 0 && B::is_retired(word));
+        }
+        table = word & B::ADDRESS_MASK;
+    }
+    Ok(false)
+}
+
 /// An editor retained from target admission through descriptor completion.
 pub struct GrantTarget<
     'a,
@@ -219,24 +283,10 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
         // terminal with fresh backing. Never revive its output, or replace a
         // prepared/live predecessor. The window is at most 512 pages.
         for va in (publication.va..publication.va + publication.len).step_by(4096) {
-            let Ok(root) = B::root(grant.ttbr0) else {
-                return DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot);
-            };
-            let mut table = root.address().raw();
-            for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
-                let Ok(word) = words.load(table + ((va >> shift) & 511) * 8) else {
-                    return DescriptorOutcome::Refused(DescriptorRefusal::TableOutsidePrimary);
-                };
-                if word == 0 {
-                    break;
-                }
-                if !B::is_table(word, level) {
-                    if level != 0 && B::is_retired(word) {
-                        break;
-                    }
-                    return DescriptorOutcome::Refused(DescriptorRefusal::Occupied);
-                }
-                table = word & B::ADDRESS_MASK;
+            match grant_page_available::<B, _>(words, grant.ttbr0, va) {
+                Ok(true) => {}
+                Ok(false) => return DescriptorOutcome::Refused(DescriptorRefusal::Occupied),
+                Err(reason) => return DescriptorOutcome::Refused(reason),
             }
         }
         let identity = carrick_core_abi::FrameGrantResidencyIdentity {

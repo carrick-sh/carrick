@@ -559,6 +559,17 @@ settlement and neutral physical retirement. The former was red when carrier
 generation 5 was submitted as the fresh mapping's generation. The existing
 two-grant refill and bounded page-copy assertions remain unchanged.
 
+Native backing selection must exclude live or prepared inherited neighbors,
+even when the child's lazy-grant residency table has no row for them.
+`native_child_backing_selection_excludes_inherited_live_neighbor` forks an
+actual child from a two-page reservation with one resident parent page and
+requires the first supply window to contain only the absent page. The neutral
+grant owner selects the contiguous available span under the exact MM editor,
+using the same predicate that authenticates publication. Work is bounded by
+the selected window (at most 512 pages, four descriptor loads per page), not
+the MM population. The adapter submits that exact window and never crops a
+decoded transaction or changes its receipt digest.
+
 The KVM vfork VM rebuild also publishes each selected shadow pointer to the
 host-side window descriptor under its write lock. The real-KVM binding
 `vfork_rebuild_host_reads_shadow_bytes` reads distinct child bytes through
