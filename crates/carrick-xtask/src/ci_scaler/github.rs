@@ -25,7 +25,7 @@ impl AdmissionNotices {
     fn record(&mut self, run: &Value, reason: &str) -> Option<String> {
         self.0.insert(Self::key(run)).then(|| {
             format!(
-                "dispatch review run={} attempt={} refused: {reason}",
+                "dispatch run={} attempt={} refused: {reason}",
                 run["id"], run["run_attempt"]
             )
         })
@@ -418,24 +418,29 @@ impl Github {
         if markers.len() != 1 {
             return Ok(false);
         }
-        let numbers: Vec<_> = markers[0]
-            .split_whitespace()
-            .map(str::parse::<u64>)
-            .collect::<Result<_, _>>()
-            .map_err(|_| ScalerError::Guard("invalid comment marker"))?;
-        let [number, comment_id] = numbers.as_slice() else {
+        let parts: Vec<_> = markers[0].split_whitespace().collect();
+        let [number, comment_id, digest] = parts.as_slice() else {
             return Ok(false);
         };
+        let (number, comment_id) = (
+            number
+                .parse::<u64>()
+                .map_err(|_| ScalerError::Guard("invalid issue marker"))?,
+            comment_id
+                .parse::<u64>()
+                .map_err(|_| ScalerError::Guard("invalid comment marker"))?,
+        );
         let comment = request(
             "GET",
             &format!("repos/{REPOSITORY}/issues/comments/{comment_id}"),
             None,
             false,
         )?;
-        if comment["id"].as_u64() != Some(*comment_id)
+        if comment["id"].as_u64() != Some(comment_id)
             || comment["issue_url"]
                 != format!("https://api.github.com/repos/{REPOSITORY}/issues/{number}")
             || !crate::dispatch_worker::agent_comment(&comment)
+            || crate::dispatch_worker::comment_digest(&comment) != *digest
         {
             return Ok(false);
         }
@@ -781,11 +786,13 @@ mod tests {
         let mut original = review_run(42);
         original["event"] = "issues".into();
         original["head_branch"] = "main".into();
+        let mut unsafe_cases = Vec::new();
         for (case, allowed) in [
             ("issue", true),
             ("pr", true),
             ("outsider", false),
             ("edited", false),
+            ("same_timestamp_edit", false),
             ("wrong_command", false),
             ("unowned", false),
             ("stale", false),
@@ -794,6 +801,10 @@ mod tests {
             ("wrong_issue", false),
         ] {
             let mut comment = json!({"id":123,"issue_url":format!("https://api.github.com/repos/{REPOSITORY}/issues/800"),"user":{"login":"tjfontaine","type":"User"},"created_at":"2026-10-24T00:00:00Z","updated_at":"2026-10-24T00:00:00Z","body":"/agent resolve the conflict"});
+            let digest = crate::dispatch_worker::comment_digest(&comment);
+            if case == "same_timestamp_edit" {
+                comment["body"] = "/agent changed".into();
+            }
             if case == "outsider" {
                 comment["user"]["login"] = "outsider".into();
             }
@@ -820,7 +831,7 @@ mod tests {
             let admitted = Github::admits_run(&Admission::Agent, &run, &mut |_, endpoint, _, _| {
                 calls.push(endpoint.to_owned());
                 Ok(if endpoint.contains("/jobs?") {
-                    json!([{"jobs":[{"name":"guard","status":"completed","conclusion":if case=="no_guard" {"failure"} else {"success"},"steps":[{"name":"Dispatch comment 800 123","conclusion":"success"},{"name":format!("Dispatch head {}","a".repeat(40)),"conclusion":"success"}]}]}])
+                    json!([{"jobs":[{"name":"guard","status":"completed","conclusion":if case=="no_guard" {"failure"} else {"success"},"steps":[{"name":format!("Dispatch comment 800 123 {digest}"),"conclusion":"success"},{"name":format!("Dispatch head {}","a".repeat(40)),"conclusion":"success"}]}]}])
                 } else if endpoint.ends_with("/issues/comments/123") { comment.clone() }
                 else if endpoint.ends_with("/issues/800") { if pr_case { json!({"pull_request":{}}) } else { issue.clone() } }
                 else if endpoint.ends_with("/pulls/800") { pr.clone() }
@@ -828,8 +839,14 @@ mod tests {
                 else if endpoint.ends_with("/issues/799") { issue.clone() }
                 else { panic!("unexpected endpoint {endpoint}") })
             }).unwrap();
-            assert_eq!(admitted, allowed, "controller case {case}; {calls:?}");
+            if admitted != allowed {
+                unsafe_cases.push(case);
+            }
         }
+        assert!(
+            unsafe_cases.is_empty(),
+            "controller unsafe cases: {unsafe_cases:?}"
+        );
     }
     #[test]
     fn dispatch_review_refusals_log_once_per_active_attempt() {

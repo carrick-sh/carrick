@@ -21,7 +21,8 @@ fn disposable_worker_has_no_publisher_or_artifact_transfer() {
     assert_eq!(worker["timeout-minutes"].as_i64(), Some(60));
     assert_eq!(worker["runs-on"][0].as_str(), Some("carrick-agent"));
     let permissions = worker["permissions"].as_hash().unwrap();
-    assert_eq!(permissions.len(), 3);
+    assert_eq!(permissions.len(), 4);
+    assert_eq!(worker["permissions"]["actions"].as_str(), Some("read"));
     for name in ["contents", "pull-requests", "issues"] {
         assert_eq!(worker["permissions"][name].as_str(), Some("write"));
     }
@@ -68,6 +69,20 @@ fn disposable_worker_has_no_publisher_or_artifact_transfer() {
             .as_str()
             .unwrap()
             .contains("steps.loop.outcome == 'success'")
+    );
+    assert!(
+        steps[upload]["if"]
+            .as_str()
+            .unwrap()
+            .contains("steps.loop.outcome == 'failure'"),
+        "failed runs must preserve their handoff"
+    );
+    assert!(
+        steps[upload]["if"]
+            .as_str()
+            .unwrap()
+            .contains("steps.loop.outputs.artifacts_ready == 'true'"),
+        "unscanned artifacts must never upload"
     );
     for (index, step) in steps.iter().enumerate() {
         if index != bootstrap {
@@ -663,7 +678,7 @@ fn all_dispatch_triggers_use_one_loop() {
 }
 
 #[test]
-fn issue_label_and_agent_comment_continue_the_server_selected_owned_pr() {
+fn issue_triggers_default_to_run_branch_without_parsing_body_directives() {
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -712,7 +727,8 @@ esac
                 .env("RUNNER_TEMP", temp.path())
                 .env("GITHUB_RUN_ID", "999")
                 .env("GITHUB_RUN_ATTEMPT", "1")
-                .env("GITHUB_SHA", "a".repeat(40))
+                .env("GITHUB_SHA", "b".repeat(40))
+                .env("CARRICK_DISPATCH_BASE", "a".repeat(40))
                 .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
                 .env("GH_TOKEN", "fixture-token")
                 .output()
@@ -723,15 +739,16 @@ esac
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(snapshot["dispatch"]["resume"], owned);
             assert_eq!(
-                snapshot["dispatch"]["branch"],
-                if owned {
-                    branch
+                snapshot["dispatch"]["base"],
+                if trigger == "comment" {
+                    "a".repeat(40)
                 } else {
-                    "work/dispatch-587-999"
+                    "b".repeat(40)
                 }
             );
+            assert_eq!(snapshot["dispatch"]["resume"], false);
+            assert_eq!(snapshot["dispatch"]["branch"], "work/dispatch-587-999");
             assert!(
                 snapshot["dispatch"]["body"]
                     .as_str()

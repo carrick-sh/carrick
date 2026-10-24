@@ -23,15 +23,21 @@ non-owner triggers are refused. The guard never parses issue structure. The
 loop reads the full issue, so #587's problem statement and acceptance need no
 special heading. Unclear work can finish blocked with a question for the owner.
 
-For issue work, the server discovers open dispatch PRs and verifies ownership
-through `dispatch_run_identity`: bot-authored draft, same-repo head and main
-base, run-derived branch, exact `Closes #N` and dispatch-run footer, and the
-original run's repository, workflow and owner identities. If one exists it
-continues that branch. Multiple open owned PRs are refused as ambiguous.
-Otherwise the server assigns `work/dispatch-<issue>-<run>`. Model requests
-cannot supply a repository, issue, PR, branch or scope. PR triggers require an
-open owner-authored linked issue and an owned PR. Unowned PRs are refused.
-The branch never comes from issue prose or model notes.
+For issue work, the server starts `work/dispatch-<issue>-<run>`. The loop can
+select another linked `work/dispatch-*` branch before invoking workers. A
+candidate must have an open owned dispatch draft PR closing this issue, or an
+authenticated earlier run's handoff recording its publication. The server
+verifies the original run, workflow, owner identities and issue-scoped artifact
+name, then reads the live remote tip. A suggestive branch name alone grants no
+authority. Other issues' branches, non-dispatch names and unlinked branches are
+refused. The explicit `select_branch` tool is the sole request schema with a
+branch field; no schema has issue, PR, repository or scope fields. PR triggers
+start on their owned branch and require an open owner-authored linked issue.
+The branch never comes from issue prose or coordinator notes. The checkout
+preserves a conflicted branch and supplies the admitted main commit at
+`refs/carrick/dispatch-main`. Rebasing and conflict resolution happen in the
+isolated worker, before publication verifies main ancestry; runner-side Git
+never stops the worker at a conflict.
 
 The hosted guard compares review heads with the live PR before checkout or
 build. Both hosted and clone admission check the live head again. For PR
@@ -57,7 +63,7 @@ head ref. The expected-tip push lease closes cross-key races.
 ## Accounts and credentials
 
 The runner holds the job-scoped `GITHUB_TOKEN` with exactly `contents: write`,
-`pull-requests: write` and `issues: write`. No long-lived write token or
+`pull-requests: write`, `issues: write` and `actions: read`. No long-lived write token or
 publisher job exists. The tool server alone uses it for GitHub and publication.
 
 The dedicated nologin accounts `carrick-dispatch-loop` and
@@ -83,8 +89,7 @@ boundary. The private launcher is not secret (owner decision #231). Trusted
 bodies can still misdirect a credential-bearing model. The collaborators-only
 interaction limit expires on 2027-04-04 and is not a lasting trust boundary.
 Earlier jobs capped exposure at 40 minutes; the current window reserves time
-for bootstrap, a 45-minute loop and reporting. The job token can write other
-runs' branches: the uid split and fixed refspec enforce normal scope, not its
+for bootstrap, a 45-minute loop and reporting. The job token can write branches belonging to other runs: the uid split and fixed refspec enforce normal scope, not its
 repository grant. Ruleset 25522481 was deleted after it blocked merge queue
 creation; tag ruleset 25523683 is active.
 
@@ -99,20 +104,22 @@ agent hooks, filters or scripts. The clone is destroyed after the job.
 The loop runs Gemini Flash via `agy --model high`. It calls
 `dispatch-worker tool <name>` with a JSON argument object on stdin. The
 newline-delimited protocol rejects unknown fields in envelopes and arguments.
-There are no tool arguments for issue, PR, branch, repository or scope.
+There are no tool arguments for issue, PR, repository or scope. Only `select_branch` accepts a branch, checked against issue linkage.
 
 | Tool | Policy |
 | --- | --- |
-| `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, issue/PR comments, earlier verified runs and their outcome comments. Includes the label/comment/review trigger verbatim and provenance. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
+| `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, commits, issue/PR comments, earlier verified runs with URLs, conclusions, artifact names and outcome contracts. Includes their outcome comments and available branch candidates; board status is explicitly unavailable with this token. Includes the label/comment/review trigger verbatim and provenance. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
+| `select_branch {branch}` | Before workers begin, selects the new run branch or an authenticated issue-linked branch. Reads and retains its remote tip for the publication lease. |
+| `read_artifact {run, name}` | Reads one fixed text filename (`contract.json`, `handoff.json`, `raw.log`, `transcript.md`, `diffstat.txt`) from a completed earlier run. Verifies workflow/run/owner identity and the issue-derived upload bundle name. Rejects another issue, workflow, current run, expired/oversized bundle or unknown filename. Download is runner-private and the final read refuses symlinks and exceeds neither 64 KiB nor the event wall budget. |
 | `read_capacity {}` | Runs pinned `agy_worker.py capacity --json` as the worker account. Reads the real `backends` map from `capacity_report`, with `installed`, `free_slots`, `quota_free`, `score` and agy `quota.groups`/`group_scores`. Augments it with exact current IDs from the launcher's live `models --backend` roster, excluding superseded IDs. Returns numeric capacity and model IDs only, never credentials or raw diagnostics. Each query/output is bounded (120 s, 64 KiB) inside the event wall budget. |
-| `invoke_worker {notes, backend, model}` | Notes at most 8 KiB, with the model choice and reason. Refreshes capacity, refuses missing/uninstalled/full/exhausted backends and missing/exhausted models before charging either call or worker budget. Agy quota is checked for the selected model's group. Runs the shared isolated worker path on the server's branch; owner trigger and inline review text are supplied verbatim, with coordinator notes separately labelled. |
+| `invoke_worker {notes, backend, model}` | Notes at most 8 KiB, with the model choice and reason. Refreshes capacity, refuses missing/uninstalled/full/exhausted backends and missing/exhausted models before charging either call or worker budget. Agy quota is checked for the selected model's group. Runs workers sequentially on the selected branch; each later worker sees earlier commits and a server-built handoff of contract summaries, tests and risks. All workers share 35 total minutes; owner trigger and inline review text are supplied verbatim, with coordinator notes separately labelled. |
 | `publish {}` | Shared receipt/ownership checks; refuses `.github/workflows/*`; only the admitted branch, fixed refspec and expected-tip lease. Creates a draft with the first commit's title, PR template, `Closes #N` and run URL, or retains the owned PR. |
 | `comment {body}` | At most 8 KiB; posts only on this issue or its continued PR, with token masking, credential redaction and a verified run footer. |
-| `finish {status, summary}` | `done`, `blocked` or `failed`; posts an outcome with worker contract excerpt, selected backend/model and reasoning, budgets and run URL. One attempt, exempt from call budget; failed posting stops the loop and triggers one server fallback. |
+| `finish {status, summary}` | `done`, `blocked` or `failed`; posts an outcome with a bounded contract preview (full claims remain in artifacts), worker contract excerpt, selected backend/model and reasoning, budgets and run URL. One attempt, exempt from call budget; failed posting stops the loop and triggers one server fallback. |
 
 The only ceilings are `[loop]` in `.github/dispatch-tiers.toml`: 12 tool calls,
-two state reads, one worker, one publication, two optional comments, 64 KiB
-state, 45 wall minutes including a worker turn of at most 35 minutes. There
+two state reads, three workers, one publication, two optional comments, 64 KiB
+state, 45 wall minutes including at most 35 total worker minutes. There
 are no dispatch tier tables or tier-selected credentials. The loop chooses
 from live capacity and explains its choice in the outcome. No retries or
 budget increases occur on refusals. If the loop exits or times out without
@@ -129,7 +136,7 @@ widen tool permissions. Admission is bound to the webhook digest in private
 runner state; auth and the loop consume it without reinterpreting labels.
 
 Output is token-masked and scanned before upload: `raw.log`, `transcript.md`,
-`contract.json` and `diffstat.txt`, retained 30 days. Unknown or nonregular
+`contract.json`, `handoff.json` and `diffstat.txt`, retained 30 days after successful or failed loop outcomes once uid retirement and artifact scanning succeed. The final contract and handoff persist each worker's claims and publication context for future runs; runs share no local state. Unknown or nonregular
 files are refused. Worker contracts are claims for review; incomplete contracts
 fail the job. PR review and repository gates establish correctness.
 

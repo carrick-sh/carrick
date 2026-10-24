@@ -255,10 +255,14 @@ fn agent_auth_provisions_all_worker_credentials_and_only_agy_for_loop() {
                 .output()
                 .unwrap()
         };
-        use sha2::Digest;
-        let digest = format!("{:x}", sha2::Sha256::digest(std::fs::read(&event).unwrap()));
-        let admission = serde_json::json!({"dispatch":carrick_xtask::dispatch_worker::validate_event(&serde_json::from_str(&std::fs::read_to_string(&event).unwrap()).unwrap(), "", "tjfontaine").unwrap(), "trigger":{"name":label}, "event_digest":digest});
-        std::fs::write(state.join("admission.json"), admission.to_string()).unwrap();
+        let admitted = invoke(&[
+            "dispatch-worker",
+            "guard",
+            "--admit",
+            "--event",
+            event.to_str().unwrap(),
+        ]);
+        assert!(admitted.status.success(), "{admitted:?}");
         let output = invoke(&["agent-runner", "auth", "--event", event.to_str().unwrap()]);
         assert!(output.status.success(), "{output:?}");
         for secret in ["codex-only-secret", "agy-only-secret"] {
