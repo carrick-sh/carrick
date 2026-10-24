@@ -239,6 +239,31 @@ impl IpcTableMap {
         }
         None
     }
+
+    /// EL1 or host: authoritative lookup serialized against concurrent table
+    /// publication/withdrawal so probe-chain updates cannot cause a transient
+    /// miss during fork.
+    pub fn lookup_authoritative(&self, file_table: u64) -> Option<RawTableId> {
+        if file_table == EMPTY || file_table == TOMBSTONE {
+            return None;
+        }
+        let _writer = self.lock();
+        for i in Self::probe(file_table) {
+            let entry = &self.entries[i];
+            let key = entry.file_table.load(Ordering::Relaxed);
+            if key == file_table {
+                return Some(RawTableId {
+                    authority: entry.authority.load(Ordering::Relaxed),
+                    index: entry.index.load(Ordering::Relaxed),
+                    generation: entry.generation.load(Ordering::Relaxed),
+                });
+            }
+            if key == EMPTY {
+                return None;
+            }
+        }
+        None
+    }
 }
 
 struct WriterGuard<'a>(&'a AtomicU32);

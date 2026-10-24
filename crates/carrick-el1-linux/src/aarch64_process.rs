@@ -1873,22 +1873,19 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         ) {
             return Err(NativeProcessError::Exhausted);
         }
-        if let Some((region, map)) = self.crossing.ipc_binding() {
-            let result = map
-                .lookup(parent_table)
-                .ok_or(NativeProcessError::Stale)
-                .and_then(|parent| {
-                    region
-                        .fork_descriptors(
-                            carrick_el1_abi::ipc::fd::TableId::from_raw(parent),
-                            &carrick_sched_core::ShortLockSpin,
-                            |child| {
-                                map.publish_owned(child_table, child.to_raw())
-                                    .map_err(|_| carrick_el1_abi::ipc::fd::Error::NoMemory)
-                            },
-                        )
-                        .map_err(|_| NativeProcessError::Exhausted)
-                });
+        if let Some((region, map)) = self.crossing.ipc_binding()
+            && let Some(parent) = map.lookup_authoritative(parent_table)
+        {
+            let result = region
+                .fork_descriptors(
+                    carrick_el1_abi::ipc::fd::TableId::from_raw(parent),
+                    &carrick_sched_core::ShortLockSpin,
+                    |child| {
+                        map.publish_owned(child_table, child.to_raw())
+                            .map_err(|_| carrick_el1_abi::ipc::fd::Error::NoMemory)
+                    },
+                )
+                .map_err(|_| NativeProcessError::Exhausted);
             if let Err(error) = result {
                 super::file_table::retire_fd_map(
                     self.crossing.fd_map(),
