@@ -166,10 +166,10 @@ or host-backed path.
   threads during exit_group, and late Born/ExitedInZone publication without a
   closed participant gate.
 
-- [ ] **Step 1: Compose the existing delayed-exit and blocked-adopter fixtures into an exact no-leak assertion after both parent and child are reaped.**
+- [x] **Step 1: Compose the existing delayed-exit and blocked-adopter fixtures into an exact no-leak assertion after both parent and child are reaped.**
 
-- [ ] **Step 2: Tighten the two-live-thread exit_group witness to prove the sibling's late lifecycle receipt settles before the one group zombie becomes reapable.**
+- [x] **Step 2: Tighten the two-live-thread exit_group witness to prove the sibling's late lifecycle receipt settles before the one group zombie becomes reapable.**
 
-- [ ] **Step 3: Bind the exact adopter, two-thread, late Born, and late ExitedInZone witnesses to `process.native.terminal-child`, then run the focused registry checks.**
+- [x] **Step 3: Bind the exact adopter, two-thread, late Born, and late ExitedInZone witnesses to `process.native.terminal-child`, then run the focused registry checks.**
 
 - [ ] **Step 4: Commit, then execute Task 3's full portable and EL1 budget gates and refresh `/tmp/740-s5-handoff.md`.**
