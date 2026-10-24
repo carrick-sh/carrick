@@ -4,6 +4,108 @@ use super::*;
 use std::sync::{Mutex, OnceLock};
 use std::{boxed::Box, vec, vec::Vec};
 
+// Reservation custody stays in one authority, including across backing growth.
+#[test]
+fn owned_reservations_two_live_tables_keep_targets_and_fork_private() {
+    let c = authority::<3, 8>();
+    let parent = c.create_table(16, &mut storage(4)).unwrap();
+    let source = c.open(parent, Fd(0), description(41), false).unwrap();
+    let target = c.open(parent, Fd(0), description(42), true).unwrap();
+    let peer = c.fork(parent, &mut storage(4)).unwrap();
+    let exact = c.reserve_exact(parent, target).unwrap();
+    assert_eq!(c.get(parent, target).unwrap().backing, BackingToken(42));
+    assert_eq!(c.dup2(parent, source, target), Err(Error::Busy));
+    assert_eq!(c.dup3(parent, source, target, true), Err(Error::Busy));
+    assert_eq!(c.getfd(parent, target), Ok(true));
+    let hole = c.reserve_min(parent, Fd(0)).unwrap();
+    assert_eq!(hole.fd(), Fd(2));
+    let (pending_pin, _) = c.pin(peer, source).unwrap();
+    assert_eq!(
+        c.install_pin(parent, hole.fd(), &pending_pin, false),
+        Err(Error::Busy)
+    );
+    assert_eq!(c.holds(&pending_pin), Ok((2, 1)));
+    assert_eq!(c.unpin(pending_pin), Ok(None));
+    assert_eq!(c.dup(parent, source), Ok(Fd(3)));
+    assert_eq!(
+        c.dup(peer, source),
+        Ok(Fd(2)),
+        "peer has no parent reservation"
+    );
+    c.grow_table(parent, &mut storage(16)).unwrap();
+    let child = c.fork(parent, &mut storage(16)).unwrap();
+    assert_eq!(
+        c.dup(child, source),
+        Ok(Fd(2)),
+        "fork copies entries, not operations"
+    );
+    assert_eq!(c.close(parent, target), Ok(None));
+    assert_eq!(
+        c.dup2(parent, source, target),
+        Err(Error::Busy),
+        "close does not cancel another operation"
+    );
+    let (pin, _) = c.pin(parent, source).unwrap();
+    assert_eq!(c.commit_reservation(exact, &pin, true).unwrap(), None);
+    assert_eq!(c.getfd(parent, target), Ok(true));
+    c.cancel_reservation(hole).unwrap();
+    assert_eq!(c.dupfd(parent, source, Fd(2), false), Ok(Fd(2)));
+    assert_eq!(c.unpin(pin), Ok(None));
+    let mut released = std::collections::BTreeMap::new();
+    for table in [parent, peer, child] {
+        c.destroy_table(table, |d| *released.entry(d.backing.0).or_insert(0) += 1)
+            .unwrap();
+    }
+    assert_eq!(released.get(&41), Some(&1));
+    assert_eq!(released.get(&42), Some(&1));
+}
+
+#[test]
+fn owned_reservation_refusal_retains_custody_and_exact_prior_description() {
+    let c = authority::<2, 2>();
+    let table = c.create_table(4, &mut storage(4)).unwrap();
+    let peer = c.create_table(4, &mut storage(4)).unwrap();
+    let fd = c.open(table, Fd(0), description(1), false).unwrap();
+    let other = c.open(peer, Fd(0), description(2), false).unwrap();
+    let reservation = c.reserve_exact(table, fd).unwrap();
+    let (pin, _) = c.pin(peer, other).unwrap();
+    let ofd = c.ofd(pin.key().index).unwrap();
+    ofd.holds.store((FREE_INDEX << 32) | PIN, Ordering::Relaxed);
+    let refused = c.commit_reservation(reservation, &pin, true).unwrap_err();
+    assert_eq!(refused.error(), Error::NoMemory);
+    assert_eq!(c.get(table, fd).unwrap().backing, BackingToken(1));
+    assert_eq!(c.getfd(table, fd), Ok(false));
+    ofd.holds.store(REF | PIN, Ordering::Relaxed);
+    c.cancel_reservation(refused.into_reservation()).unwrap();
+    assert_eq!(c.dup2(table, fd, fd), Ok(None));
+    assert_eq!(c.unpin(pin), Ok(None));
+    c.destroy_table(table, |_| {}).unwrap();
+    c.destroy_table(peer, |_| {}).unwrap();
+}
+
+#[test]
+fn owned_reservation_foreign_pin_and_retired_table_cannot_touch_reuse() {
+    let c = authority::<2, 2>();
+    let foreign = authority::<1, 1>();
+    let table = c.create_table(4, &mut storage(4)).unwrap();
+    let peer = c.create_table(4, &mut storage(4)).unwrap();
+    let claim = c.reserve_min(table, Fd(0)).unwrap();
+    let pin = foreign.create_pinned(description(99)).unwrap();
+    let refused = c.commit_reservation(claim, &pin, false).unwrap_err();
+    assert_eq!(refused.error(), Error::StalePin);
+    let claim = refused.into_reservation();
+    assert_eq!(c.open(table, Fd(0), description(1), false), Ok(Fd(1)));
+    c.destroy_table(table, |_| {}).unwrap();
+    let reused = c.create_table(4, &mut storage(4)).unwrap();
+    assert_eq!(c.open(reused, Fd(0), description(2), false), Ok(Fd(0)));
+    let refused = c.cancel_reservation(claim).unwrap_err();
+    assert_eq!(refused.error(), Error::StaleTable);
+    assert_eq!(c.get(reused, Fd(0)).unwrap().backing, BackingToken(2));
+    foreign.unpin(pin).unwrap();
+    c.destroy_table(reused, |_| {}).unwrap();
+    c.destroy_table(peer, |_| {}).unwrap();
+}
+
 // The red commit used two single installs here; the owner now uses one
 // typed transaction without a temporary fd, host type or second table.
 fn b_prep_install_pair<const T: usize>(
