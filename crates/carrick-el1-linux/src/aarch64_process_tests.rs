@@ -7438,3 +7438,183 @@ fn native_child_resources(mapping_last: Option<bool>) {
     drop(table);
     assert_eq!(ipc.descriptor_allocations(), 0);
 }
+
+#[test]
+fn serial_host_native_fork_concurrent_sibling_table_publish_does_not_einval() {
+    use carrick_el1_abi::ipc::{IpcBacking, RawTableId, fd, pipe::End};
+    use carrick_kernel::el1_ipc::{HostIpc, HostTable, IpcLimits};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let fixture = Fixture::new(0x10000, asid(1));
+    let words = fixture.tables.live(&fixture.maintenance);
+    let owner = Arc::new(
+        HostIpc::with_limits(
+            1 << 20,
+            IpcLimits {
+                descriptions: carrick_el1_abi::ipc::IPC_OFD_SEGMENT,
+                ..IpcLimits::ZONE
+            },
+        )
+        .unwrap(),
+    );
+    let table = HostTable::create(Arc::clone(&owner), 64, 64).unwrap();
+    let object = owner.create_pipe(65536).unwrap();
+    let reader = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Reader,
+            }
+            .encode(),
+            fd::AccessMode::ReadOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    reader.install(table.id(), fd::Fd(3), false).unwrap();
+
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    let home_of = |key: u64| {
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize
+            % carrick_el1_abi::ipc_tables::IPC_TABLE_MAP_ENTRIES
+    };
+    let mut colliding = (6..u64::MAX).filter(|&k| home_of(k) == home_of(5));
+    let sibling_keys: Vec<u64> = (0..8).map(|_| colliding.next().unwrap()).collect();
+    // Place 8 sibling entries ahead of parent_table (5) on their shared probe chain.
+    for (idx, &k) in sibling_keys.iter().enumerate() {
+        map.publish(
+            k,
+            RawTableId {
+                authority: 99,
+                index: idx as u64 + 1,
+                generation: 1,
+            },
+        )
+        .unwrap();
+    }
+    map.publish(5, table.id().to_raw()).unwrap();
+
+    let pages: Vec<_> = (0..64).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = TestStockCrossing::new(&pages);
+    crossing.ipc = Some((Arc::clone(&owner), map));
+
+    let stop = AtomicBool::new(false);
+    let ready = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let churn = s.spawn(|| {
+            ready.store(true, Ordering::Release);
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                for &k in &sibling_keys {
+                    n = n.wrapping_add(1);
+                    map.publish(
+                        k,
+                        RawTableId {
+                            authority: 99,
+                            index: n,
+                            generation: n + 1,
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        while !ready.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        let mut service = Aarch64NativeProcessService::with_crossing(
+            &fixture.task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            &crossing,
+        )
+        .with_words(&words);
+        for i in 0..512u64 {
+            let child_ft = 100_000 + i;
+            let res = service.fork_fd_table(5, child_ft);
+            if let Err(e) = res {
+                stop.store(true, Ordering::Release);
+                panic!(
+                    "concurrent sibling table publish caused fork_fd_table failure with errno {}",
+                    -e.errno()
+                );
+            }
+            service.retire_fd_table(child_ft);
+            assert_eq!(
+                owner.drain_retired_tables().unwrap(),
+                1,
+                "child IPC table must be published"
+            );
+        }
+        stop.store(true, Ordering::Release);
+        churn.join().unwrap();
+    });
+}
+
+#[test]
+fn serial_host_native_fork_unpublished_parent_ipc_table_succeeds_without_einval() {
+    use carrick_kernel::el1_ipc::{HostIpc, IpcLimits};
+    use std::sync::Arc;
+
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let owner = Arc::new(HostIpc::with_limits(1 << 20, IpcLimits::ZONE).unwrap());
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    // Carrier has IPC bound, but parent_table (5) is unpublished (e.g. after
+    // host IPC publication withdrew on shared-OFD exhaustion).
+    assert!(map.lookup(5).is_none());
+    let pages: Vec<_> = (0..16).map(|n| 0x20000 + n * 0x1000).collect();
+    let mut crossing = TestStockCrossing::new(&pages);
+    crossing.ipc = Some((Arc::clone(&owner), map));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let mut entry = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap();
+    let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE) else {
+        panic!("native fork must return");
+    };
+    assert!(
+        result.raw() > 0,
+        "fork after host IPC withdrawal must not fail with EINVAL (22); got errno {}",
+        -result.raw()
+    );
+}
