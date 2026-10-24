@@ -1333,6 +1333,8 @@ pub struct FutexTable {
     /// Exact shared-word identities belong to this queue owner. Two kernel
     /// instances may use the same file word without sharing a wait queue.
     shared_buckets: Arc<SharedBucketMap>,
+    #[cfg(any(test, feature = "test-support"))]
+    word_wait_enrollment_observer: ParkingMutex<Option<std::sync::mpsc::Sender<FutexKey>>>,
 }
 
 impl FutexTable {
@@ -1349,7 +1351,20 @@ impl FutexTable {
             shared_buckets: Arc::new(SharedBucketMap {
                 shards: Box::new(std::array::from_fn(|_| ParkingMutex::new(HashMap::new()))),
             }),
+            #[cfg(any(test, feature = "test-support"))]
+            word_wait_enrollment_observer: ParkingMutex::new(None),
         }
+    }
+
+    /// Observe successful blocking word-wait enrollment on this table only.
+    /// The event is sent after parking registration releases its bucket lock;
+    /// it neither creates a waiter nor changes the wait/wake protocol.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn observe_word_wait_enrollment_for_test(
+        &self,
+        observer: std::sync::mpsc::Sender<FutexKey>,
+    ) {
+        *self.word_wait_enrollment_observer.lock() = Some(observer);
     }
 
     pub fn shared_key(&self, location: SharedFutexLocation) -> FutexKey {
@@ -1833,6 +1848,9 @@ impl FutexTable {
         use std::time::Instant;
 
         let park_token = ParkToken(usize::try_from(tid.raw()).unwrap_or(0));
+        let addr = addr.into();
+        #[cfg(any(test, feature = "test-support"))]
+        let enrollment_observer = self.word_wait_enrollment_observer.lock().clone();
         let bucket = self.bucket(addr);
         let deadline = timeout.map(|duration| Instant::now() + duration);
         // SAFETY: caller guarantees `word` outlives the wait.
@@ -1908,7 +1926,15 @@ impl FutexTable {
                         bucket.waiters.fetch_add(1, Ordering::AcqRel);
                         true
                     },
-                    || {},
+                    || {
+                        // This callback runs only after actual parking
+                        // registration, with the bucket lock released. A send
+                        // cannot panic if the fixture has already gone away.
+                        #[cfg(any(test, feature = "test-support"))]
+                        if let Some(observer) = &enrollment_observer {
+                            let _ = observer.send(addr);
+                        }
+                    },
                     |_, _| {
                         bucket.waiters.fetch_sub(1, Ordering::AcqRel);
                     },
