@@ -123,6 +123,21 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
             .iter()
             .any(|s| s["run"].as_str() == Some("just check-test-shards"))
     );
+    assert!(
+        !jobs["lint-domains"]["steps"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .any(|s| s["run"].as_str() == Some("just check-test-shards"))
+    );
+    assert!(
+        needs.iter().any(|v| v.as_str() == Some("lint")),
+        "ci-ok must require lint"
+    );
+    assert!(
+        needs.iter().any(|v| v.as_str() == Some("lint-domains")),
+        "ci-ok must require lint-domains"
+    );
     let runs = |job: &str, command: &str| {
         jobs[job]["steps"]
             .as_vec()

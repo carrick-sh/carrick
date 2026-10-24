@@ -488,6 +488,7 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
       "linked-issue": { "result": "success" },
       "commit-trailers": { "result": "success" },
       "lint": { "result": "success" },
+      "lint-domains": { "result": "success" },
       "portable": { "result": "skipped" },
       "linux-doc": { "result": "skipped" },
       "macos-clippy": { "result": "skipped" },
@@ -516,6 +517,24 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
     assert!(
         !run_ci_results("pull_request", Some("true"), &draft_failed_lint),
         "draft PR with failing lint must fail ci-results"
+    );
+
+    let draft_failed_lint_domains = draft_needs.replace(
+        r#""lint-domains": { "result": "success" }"#,
+        r#""lint-domains": { "result": "failure" }"#,
+    );
+    assert!(
+        !run_ci_results("pull_request", Some("true"), &draft_failed_lint_domains),
+        "draft PR with failing lint-domains must fail ci-results"
+    );
+
+    let draft_skipped_lint_domains = draft_needs.replace(
+        r#""lint-domains": { "result": "success" }"#,
+        r#""lint-domains": { "result": "skipped" }"#,
+    );
+    assert!(
+        !run_ci_results("pull_request", Some("true"), &draft_skipped_lint_domains),
+        "draft PR with skipped lint-domains on heavy PR must fail ci-results"
     );
 }
 
@@ -700,6 +719,7 @@ fn stack_layer_detection_and_ci_results_gating() {
       "linked-issue": { "result": "success" },
       "commit-trailers": { "result": "success" },
       "lint": { "result": "success" },
+      "lint-domains": { "result": "success" },
       "portable": { "result": "skipped" },
       "linux-doc": { "result": "skipped" },
       "macos-clippy": { "result": "skipped" },
@@ -734,6 +754,19 @@ fn stack_layer_detection_and_ci_results_gating() {
         "ci-results step summary must contain lower stack layer reason, got: {ci_ok_summary_text}"
     );
 
+    let lower_layer_skipped_lint_domains = lower_layer_needs.replace(
+        r#""lint-domains": { "result": "success" }"#,
+        r#""lint-domains": { "result": "skipped" }"#,
+    );
+    assert!(
+        !run_ci_results(
+            "pull_request",
+            Some("false"),
+            &lower_layer_skipped_lint_domains
+        ),
+        "lower layer PR with skipped lint-domains must fail ci-results"
+    );
+
     let top_layer_needs_with_skips =
         lower_layer_needs.replace(r#""lower_layer": "true""#, r#""lower_layer": "false""#);
     assert!(
@@ -753,6 +786,7 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
       "linked-issue": { "result": "success" },
       "commit-trailers": { "result": "success" },
       "lint": { "result": "success" },
+      "lint-domains": { "result": "success" },
       "portable": { "result": "success" },
       "linux-doc": { "result": "success" },
       "macos-clippy": { "result": "success" },
@@ -770,6 +804,15 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
     assert!(
         run_ci_results("push", None, full_needs),
         "full push must pass ci-results"
+    );
+
+    let push_failed_lint_domains = full_needs.replace(
+        r#""lint-domains": { "result": "success" }"#,
+        r#""lint-domains": { "result": "failure" }"#,
+    );
+    assert!(
+        !run_ci_results("push", None, &push_failed_lint_domains),
+        "push with failing lint-domains must fail ci-results"
     );
 
     // Merge groups run macos-build and macos-clippy only: the unit and
@@ -790,6 +833,14 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
     assert!(
         run_ci_results("merge_group", None, &mg_needs),
         "merge_group with only the macOS skew check must pass ci-results"
+    );
+    let mg_failed_lint_domains = mg_needs.replace(
+        r#""lint-domains": { "result": "success" }"#,
+        r#""lint-domains": { "result": "failure" }"#,
+    );
+    assert!(
+        !run_ci_results("merge_group", None, &mg_failed_lint_domains),
+        "merge_group with failing lint-domains must fail ci-results"
     );
     assert!(
         !run_ci_results("push", None, &mg_needs),
@@ -850,6 +901,7 @@ fn heavy_same_repo_pr_requires_the_full_macos_suite() {
       "linked-issue": { "result": "success" },
       "commit-trailers": { "result": "success" },
       "lint": { "result": "success" },
+      "lint-domains": { "result": "success" },
       "portable": { "result": "success" },
       "linux-doc": { "result": "success" },
       "macos-clippy": { "result": "success" },
@@ -915,7 +967,7 @@ fn fork_prs_never_look_up_child_layers() {
     }
 }
 
-/// `just ci-results` requires every heavy pull-request job except `lint` (and
+/// `just ci-results` requires every heavy pull-request job except `lint` and `lint-domains` (and
 /// the `macos-*` jobs, which never run on pull requests) to be skipped on a
 /// lower stack layer. A heavy job without the matching `lower_layer` guard runs
 /// anyway and turns `ci-ok` red on every lower layer, which blocks the stack.
@@ -947,7 +999,7 @@ fn every_heavy_pr_job_skips_on_lower_stack_layers() {
         let Some(name) = job.as_deref() else {
             continue;
         };
-        if name == "lint" || name.starts_with("macos-") {
+        if name == "lint" || name == "lint-domains" || name.starts_with("macos-") {
             continue;
         }
         if condition.contains("needs.changes.outputs.heavy == 'true'")
