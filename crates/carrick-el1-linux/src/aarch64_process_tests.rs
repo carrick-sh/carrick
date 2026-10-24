@@ -1216,6 +1216,21 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
     let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
     let child_binding = runtime.task_binding(child_key).unwrap();
 
+    {
+        let mut parent_entry = runtime
+            .enter(source, &fixture.task, parked, &mut service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = parent_entry.wait4(
+            ProcessWaitPid::from_syscall_argument(u64::from(child_pid)),
+            UserVa::new(0),
+            LinuxWaitOptions::WNOHANG,
+            UserVa::new(0),
+        ) else {
+            panic!("WNOHANG must return without parking")
+        };
+        assert_eq!(result.raw(), 0, "a live native child is not waitable");
+    }
+
     // Parent yields slot to child
     fixture
         .zone
@@ -3525,6 +3540,146 @@ fn arm_native_signal_calls_route_to_shared_owner() {
             "ARM signal syscall {ordinal} must use the shared process owner"
         );
     }
+}
+
+#[test]
+fn arm_native_sigsuspend_dispatches_to_owned_continuation() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let mask = 0u64;
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = &raw const mask as u64;
+    frame.x[1] = 8;
+    frame.x[8] = 133;
+
+    let route = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+        "rt_sigsuspend must park its owned continuation instead of forwarding"
+    );
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+}
+
+#[test]
+fn native_child_sigsuspend_wakes_from_parent_signal() {
+    use carrick_personality_linux::signal::{
+        ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
+    };
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, SigBlockMask, Signal};
+
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let child_task = CurrentTask::new();
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let crossing = TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ]);
+    let mut parent_service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+
+    let child_pid = {
+        let mut parent = runtime
+            .enter(source, &fixture.task, parked, &mut parent_service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = parent.fork(ProcessForkChildTid::NONE)
+        else {
+            panic!("fork must return the native child pid")
+        };
+        result.raw() as u32
+    };
+    let parent_key = TaskKey {
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let parent_binding = runtime.task_binding(parent_key).unwrap();
+    let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
+    let child_binding = runtime.task_binding(child_key).unwrap();
+
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, parent_binding.record.id);
+    activate(source, &child_task, &child_binding);
+    let mut child_service = Aarch64NativeProcessService::with_crossing(
+        &child_task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    {
+        let mut child = runtime
+            .enter(source, &child_task, child_binding.words, &mut child_service)
+            .unwrap();
+        child
+            .rt_sigaction(
+                Signal::from_number(10).unwrap(),
+                Some(Action {
+                    disposition: Disposition::Handler(HandlerAddress(0x700000)),
+                    ..Action::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            child.rt_sigsuspend(SigBlockMask::NONE, SigBlockMask::NONE),
+            Ok(true)
+        );
+        assert!(child.take_handoff_receipt().is_some());
+    }
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+
+    activate(source, &fixture.task, &parent_binding);
+    {
+        let mut parent = runtime
+            .enter(
+                source,
+                &fixture.task,
+                parent_binding.words,
+                &mut parent_service,
+            )
+            .unwrap();
+        parent
+            .kill(
+                SignalProcessSelector::from_abi(u64::from(child_pid)),
+                SignalRequest::from_abi(10).unwrap(),
+                SignalInfo::Generated(None),
+            )
+            .unwrap();
+    }
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, parent_binding.record.id);
+    activate(source, &child_task, &child_binding);
+    let mut child = runtime
+        .enter(source, &child_task, child_binding.words, &mut child_service)
+        .unwrap();
+    assert!(
+        matches!(child.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == carrick_syscall_abi::LINUX_EINTR.guest_retval())
+    );
+    assert_eq!(child.take_suspend_mask(), Some(SigBlockMask::NONE));
 }
 
 #[cfg(test)]
