@@ -314,6 +314,92 @@ pub(crate) struct GlobalExecPlan {
     pub(crate) stage2_leases: std::collections::BTreeMap<(u64, u64), GlobalFrameStage2Lease>,
 }
 
+/// Uninstalled physical backing: this preparation installs no stage-2 mappings
+/// and publishes no inventory or process lifecycle state. Root slots may already
+/// be mapped by their pool. Drop releases host mappings, unmapped IPA leases and
+/// checked-out root slots before releasing the retained carrier.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct PreparedExecBacking {
+    plan: GuestMappingPlan,
+    regions: Vec<PreparedExecRegion>,
+    private_file_artifacts_elapsed_ns: u64,
+    map_backings_started: std::time::Instant,
+    // Keep the allocator/pool's carrier alive through every retained region.
+    custody: std::sync::Arc<CarrierVmCustody>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct PreparedExecRegion {
+    region: HvfMappedRegion,
+    lease: GlobalFrameStage2Lease,
+    root: Option<crate::frame_pool::PooledRootSlotHandle>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PreparedExecBacking {
+    fn prepare(
+        custody: std::sync::Arc<CarrierVmCustody>,
+        global: GlobalExecPlan,
+    ) -> Result<Self, TrapError> {
+        let GlobalExecPlan {
+            mut plan,
+            mut stage2_leases,
+        } = global;
+        let started = std::time::Instant::now();
+        attach_exec_private_file_backings(&mut plan)?;
+        let private_file_artifacts_elapsed_ns =
+            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let map_backings_started = std::time::Instant::now();
+        let mut regions = Vec::new();
+        for mapping in plan.mappings.iter().filter(|mapping| {
+            !is_sparse_hvpatch_mmap_mapping(mapping)
+                && !is_persistent_executor_carrier_guest_mapping(mapping)
+        }) {
+            let key = (mapping.ipa_start, mapping.mapped_size);
+            let lease = stage2_leases.remove(&key).ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "HVPatch exec mapping IPA 0x{:x} size {} has no owning lease",
+                    key.0, key.1
+                ))
+            })?;
+            let pooled_root = mapping.guest_start == crate::memory::LINUX_PAGE_TABLES_BASE
+                && lease.length() > mapping.mapped_size;
+            let root = if pooled_root {
+                Some(custody.root_slot_pool()
+                    .and_then(|pool| pool.allocate_slot_at(mapping.ipa_start))
+                    .ok_or_else(|| TrapError::Hypervisor(format!(
+                        "HVPatch exec root slot IPA 0x{:x} is still held by the root-slot pool",
+                        mapping.ipa_start
+                    )))?)
+            } else {
+                None
+            };
+            let region = match root.as_ref() {
+                Some(handle) => prepare_pooled_exec_root_region_in(&custody, mapping, handle)?,
+                None => prepare_exec_region_raw_in(&custody, mapping)?,
+            };
+            regions.push(PreparedExecRegion {
+                region,
+                lease,
+                root,
+            });
+        }
+        if !stage2_leases.is_empty() {
+            return Err(TrapError::Hypervisor(format!(
+                "HVPatch exec left {} reserved stage-2 leases unmaterialized",
+                stage2_leases.len()
+            )));
+        }
+        Ok(Self {
+            plan,
+            regions,
+            private_file_artifacts_elapsed_ns,
+            map_backings_started,
+            custody,
+        })
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(
     ::core::clone::Clone,
@@ -1003,17 +1089,15 @@ impl HvfVmState {
             None
         };
         let frame_plan_started = std::time::Instant::now();
-        let GlobalExecPlan {
-            plan: mut global_plan,
-            mut stage2_leases,
-        } = self.global_frame_exec_plan(plan)?;
+        let global = self.global_frame_exec_plan(plan)?;
         self.pending_exec_mm_root_slot = None;
         self.pending_exec_asid = None;
         let frame_plan_elapsed_ns = frame_plan_started
             .elapsed()
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
-        let replacement_mapping_count = global_plan
+        let replacement_mapping_count = global
+            .plan
             .mappings
             .iter()
             .filter(|mapping| {
@@ -1021,7 +1105,8 @@ impl HvfVmState {
                     && !is_persistent_executor_carrier_guest_mapping(mapping)
             })
             .count() as u64;
-        let replacement_mapped_bytes = global_plan
+        let replacement_mapped_bytes = global
+            .plan
             .mappings
             .iter()
             .filter(|mapping| {
@@ -1038,69 +1123,44 @@ impl HvfVmState {
                 replacement_mapped_bytes,
             ),
         );
-        let private_file_artifacts_started = std::time::Instant::now();
-        if self.persistent_vm_lifecycle {
-            attach_exec_private_file_backings(&mut global_plan)?;
-        }
-        let private_file_artifacts_elapsed_ns = private_file_artifacts_started
-            .elapsed()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64;
+        // Consume the uninstalled result before the existing installation
+        // transaction marks leases mapped. Retain its carrier through transfer
+        // into installed ownership; the nonpersistent path keeps unused leases
+        // through the same scope as before this extraction.
+        let (
+            global_plan,
+            mut prepared_exec_regions,
+            private_file_artifacts_elapsed_ns,
+            map_backings_started,
+            _unmaterialized_leases,
+            _prepared_carrier,
+        ) = if self.persistent_vm_lifecycle {
+            let PreparedExecBacking {
+                plan,
+                regions,
+                private_file_artifacts_elapsed_ns,
+                map_backings_started,
+                custody,
+            } = PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), global)?;
+            (
+                plan,
+                regions,
+                private_file_artifacts_elapsed_ns,
+                map_backings_started,
+                None,
+                Some(custody),
+            )
+        } else {
+            (
+                global.plan,
+                Vec::new(),
+                0,
+                std::time::Instant::now(),
+                Some(global.stage2_leases),
+                None,
+            )
+        };
         let plan = &global_plan;
-        let map_backings_started = std::time::Instant::now();
-        let mut prepared_exec_regions = Vec::new();
-        if self.persistent_vm_lifecycle {
-            for mapping in plan.mappings.iter().filter(|mapping| {
-                !is_sparse_hvpatch_mmap_mapping(mapping)
-                    && !is_persistent_executor_carrier_guest_mapping(mapping)
-            }) {
-                let key = (mapping.ipa_start, mapping.mapped_size);
-                let lease = stage2_leases.remove(&key).ok_or_else(|| {
-                    TrapError::Hypervisor(format!(
-                        "HVPatch exec mapping IPA 0x{:x} size {} has no owning lease",
-                        key.0, key.1
-                    ))
-                })?;
-                let pooled_root_lease = mapping.guest_start
-                    == crate::memory::LINUX_PAGE_TABLES_BASE
-                    && lease.length() > mapping.mapped_size;
-                if pooled_root_lease {
-                    // The plan leased the whole root slot because the pool
-                    // serves it. Take the slot; if it is momentarily held by a
-                    // retiring predecessor, back the same 2 MiB extent with an
-                    // owned mapping so the lease and the record stay exact.
-                    let handle = custody
-                        .root_slot_pool()
-                        .and_then(|pool| pool.allocate_slot_at(mapping.ipa_start));
-                    match handle {
-                        Some(handle) => {
-                            let region =
-                                prepare_pooled_exec_root_region_in(&custody, mapping, &handle)?;
-                            prepared_exec_regions.push((region, lease, Some(handle)));
-                        }
-                        None => {
-                            // The pool pre-maps this IPA; an owned mapping
-                            // here can only collide with it. The slot is
-                            // released at its previous owner's retirement
-                            // proof, before the runtime reissues it.
-                            return Err(TrapError::Hypervisor(format!(
-                                "HVPatch exec root slot IPA 0x{:x} is still held by the root-slot pool",
-                                mapping.ipa_start
-                            )));
-                        }
-                    }
-                } else {
-                    let region = prepare_exec_region_raw_in(&custody, mapping)?;
-                    prepared_exec_regions.push((region, lease, None));
-                }
-            }
-            if !stage2_leases.is_empty() {
-                return Err(TrapError::Hypervisor(format!(
-                    "HVPatch exec left {} reserved stage-2 leases unmaterialized",
-                    stage2_leases.len()
-                )));
-            }
-        }
         let emit_replace_stage =
             |phase: carrick_observability::probes::HvpatchExecReplaceStagePhase,
              started: std::time::Instant| {
@@ -1154,8 +1214,8 @@ impl HvfVmState {
                         && !is_persistent_executor_carrier_guest_mapping(mapping)
                 })
                 .zip(prepared_exec_regions.iter())
-                .map(|(mapping, (region, _, handle))| {
-                    exec_stage2_install(mapping, region, handle.is_some())
+                .map(|(mapping, prepared)| {
+                    exec_stage2_install(mapping, &prepared.region, prepared.root.is_some())
                 })
                 .collect::<Vec<_>>();
             let authority_before = self.exec_authority_fingerprint();
@@ -1255,11 +1315,11 @@ impl HvfVmState {
                 }
                 return Err(error);
             }
-            for (_, lease, handle) in &mut prepared_exec_regions {
-                if handle.is_some() {
-                    lease.mark_pre_mapped();
+            for prepared in &mut prepared_exec_regions {
+                if prepared.root.is_some() {
+                    prepared.lease.mark_pre_mapped();
                 } else {
-                    lease.mark_mapped();
+                    prepared.lease.mark_mapped();
                 }
             }
             if let Some((Some(retired), _)) = inventory_reservations.as_mut() {
@@ -1538,8 +1598,13 @@ impl HvfVmState {
         // host owners only after predecessor retirement can no longer roll
         // back. Mature VMM still maps through the historical helper here.
         if self.persistent_vm_lifecycle {
-            for (mut region, lease, handle) in prepared_exec_regions.drain(..) {
-                match handle {
+            for PreparedExecRegion {
+                mut region,
+                lease,
+                root,
+            } in prepared_exec_regions.drain(..)
+            {
+                match root {
                     Some(handle) => {
                         publish_pooled_exec_root_owner_in(&custody, &mut region, lease, handle)
                     }
@@ -1878,5 +1943,77 @@ impl HvfVmState {
             replace_destroyed_vm(self, new_vm.into_inner());
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod backing_preparation_tests {
+    use super::*;
+
+    fn plan(invalid_second: bool) -> Result<GlobalExecPlan, TrapError> {
+        let mut leases = std::collections::BTreeMap::new();
+        let mut mappings = Vec::new();
+        for index in 0..if invalid_second { 2 } else { 1 } {
+            let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x20_0000)?;
+            let ipa = lease.key().0;
+            leases.insert((ipa, 0x4000), lease);
+            mappings.push(GuestMapping {
+                guest_start: 0x20_0000 + index * 0x4000,
+                ipa_start: ipa,
+                mapped_size: 0x4000,
+                offset_in_mapping: if index == 1 { u64::MAX } else { 0 },
+                payload_size: 4,
+                perms: carrick_mem::elf::SegmentPerms::default(),
+                shared: false,
+                image: std::sync::Arc::new(b"peer".to_vec()),
+                private_file_backing: None,
+            });
+        }
+        Ok(GlobalExecPlan {
+            plan: GuestMappingPlan {
+                arm_ring_first: Default::default(),
+                mappings,
+                entry: 0x20_0000,
+                initial_stack_pointer: None,
+                el0_trampoline_entry: None,
+                el1_vectors_base: None,
+                stage1_page_tables_base: None,
+                ro_spans: Vec::new(),
+                rw_spans: Vec::new(),
+            },
+            stage2_leases: leases,
+        })
+    }
+
+    #[test]
+    fn exec_backing_partial_preparation_releases_leases_and_preserves_peer() {
+        let _serialize = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new_live_fixture());
+        let weak = std::sync::Arc::downgrade(&custody);
+        let baseline = global_frame_ipa_allocator().lock().live.clone();
+        let peer =
+            PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), plan(false).unwrap())
+                .unwrap();
+        let peer_live = global_frame_ipa_allocator().lock().live.clone();
+        assert_ne!(peer_live, baseline);
+        // The first extent is materialized; the second has an invalid payload.
+        // Unwinding must release both acquired and unused allocator custody.
+        assert!(
+            PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), plan(true).unwrap())
+                .is_err()
+        );
+        assert_eq!(global_frame_ipa_allocator().lock().live, peer_live);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(peer.regions[0].region.host_addr, 4) },
+            b"peer"
+        );
+        drop(custody);
+        assert!(
+            weak.upgrade().is_some(),
+            "preparation retains its exact carrier"
+        );
+        drop(peer);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(global_frame_ipa_allocator().lock().live, baseline);
     }
 }
