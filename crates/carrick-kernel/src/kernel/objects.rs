@@ -2524,26 +2524,58 @@ impl FileTable {
         Self::with_fd_ceiling(id, fd_ceiling)
     }
 
-    /// Private exec staging only. Transfer the copied functional reference
-    /// into release custody instead of running close effects during preparation.
+    /// Enumerate an exclusively owned private successor, including implicit
+    /// streams. No live-table lock authority or publication exists yet.
+    pub(super) fn exec_descriptors(
+        &mut self,
+    ) -> (
+        usize,
+        impl Iterator<Item = (carrick_fd_core::exec::ExecDescriptor, Option<FileSlot>)> + '_,
+    ) {
+        let closed = *self.closed_stdio.get_mut();
+        let flags = *self.stdio_cloexec.get_mut();
+        let slots = &*self.open_files.get_mut();
+        let entries = slots.iter().map(|(&fd, slot)| {
+            (
+                carrick_fd_core::exec::ExecDescriptor {
+                    fd: carrick_fd_core::Fd(fd),
+                    close_on_exec: slot.close_on_exec(),
+                },
+                Some(slot.clone()),
+            )
+        });
+        let implicit = (0..3).filter_map(move |number| {
+            (!closed[number] && !slots.contains_key(&(number as i32))).then_some((
+                carrick_fd_core::exec::ExecDescriptor {
+                    fd: carrick_fd_core::Fd(number as i32),
+                    close_on_exec: flags[number],
+                },
+                None,
+            ))
+        });
+        (slots.len() + 3, entries.chain(implicit))
+    }
+
+    /// Transfer the private copy's functional reference into release custody.
+    /// Exclusive access proves this cannot mutate a guest-visible namespace.
     pub(super) fn stage_exec_close(
-        &self,
+        &mut self,
         fd: carrick_fd_core::Fd,
     ) -> Option<FileDescriptionFdLease> {
-        let slot = self.open_files.write().remove(&fd.0);
-        self.fd_open_paths.write().remove(&fd.0);
-        self.epoll_fds.write().remove(&fd.0);
+        let slot = self.open_files.get_mut().remove(&fd.0);
+        self.fd_open_paths.get_mut().remove(&fd.0);
+        self.epoll_fds.get_mut().remove(&fd.0);
         if (0..3).contains(&fd.0) {
-            self.closed_stdio.lock()[fd.0 as usize] = true;
+            self.closed_stdio.get_mut()[fd.0 as usize] = true;
         }
         slot.map(|slot| FileDescriptionFdLease {
             description: slot.description,
         })
     }
 
-    pub(super) fn finish_exec_stage(&self) {
-        *self.stdio_cloexec.lock() = [false; 3];
-        let files = self.open_files.read();
+    pub(super) fn finish_exec_stage(&mut self, events: &mut [super::core::FileCloseEvent]) {
+        *self.stdio_cloexec.get_mut() = [false; 3];
+        let files = self.open_files.get_mut();
         let mut next = 3;
         while files.contains_key(&next) {
             let Some(value) = next.checked_add(1) else {
@@ -2551,7 +2583,12 @@ impl FileTable {
             };
             next = value;
         }
-        *self.next_fd.lock() = next;
+        *self.next_fd.get_mut() = next;
+        for event in events {
+            if !files.contains_key(&event.fd) {
+                event.disposition = super::core::FileCloseDisposition::Closed;
+            }
+        }
     }
 
     pub const fn id(&self) -> FileTableId {

@@ -20,6 +20,11 @@
       "from": "carrick_kernel::dispatch::mem::backing::MemView<'a>::snapshot_private_mmap_description",
       "to": "carrick_kernel::dispatch::mem::backing::snapshot_private_mmap_description",
       "issue": 783
+    },
+    {
+      "from": "carrick_kernel::kernel::objects::FileTable::for_fork_copy",
+      "to": "carrick_kernel::kernel::objects::FileTable::copy_private",
+      "issue": 784
     }
   ],
   "terminal_custody": []
