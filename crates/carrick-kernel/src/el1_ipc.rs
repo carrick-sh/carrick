@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use carrick_el1_abi::ipc::{
     HostResourceToken, IPC_DIRECTORY_BYTES, IPC_MAX_OBJECTS, IPC_MAX_OFDS, IPC_OBJECT_SEGMENT,
     IPC_OFD_SEGMENT, IPC_PIPE_PAGE_SIZE, IPC_POOL_ALIGN, IPC_POOL_AREAS, IPC_STOCK_RING_BYTES,
-    IpcDirectory, IpcError, IpcObjectHandle, IpcPipeStorage, IpcRegion, IpcReleased, IpcWake,
-    descriptor_extent_bytes, fd, ipc_descriptor_area, ipc_ring_area, pipe,
+    IpcDirectory, IpcError, IpcObjectHandle, IpcPipeStorage, IpcRegion, IpcReleased, IpcWake, fd,
+    ipc_ring_area, pipe,
 };
 use parking_lot::Mutex;
 
@@ -392,13 +392,12 @@ pub struct HostIpc {
     directory: Mapping,
     bytes: Mapping,
     /// The pool's two type-stable areas ([`ipc_ring_area`],
-    /// [`ipc_descriptor_area`]), each allocated only for its own kind: a
-    /// descriptor extent retired while a lock-free EL1 or host lookup still
+    /// [`carrick_el1_abi::ipc::ipc_descriptor_area`]), each allocated only for its
+    /// own kind: a descriptor extent retired while a lock-free lookup still
     /// reads it is only ever reused as another extent (atomic words), never
     /// as ring bytes, and the pool memory lives as long as this owner (every
     /// view borrows it; the carrier retains the owner while it maps it).
     rings: Mutex<Pool>,
-    descriptors: Mutex<Pool>,
     resources: Mutex<HostResources>,
     /// Host wake targets by object index, sized to the highest index used.
     host_wakes: Mutex<Vec<Option<HostWakeEntry>>>,
@@ -456,10 +455,6 @@ impl HostIpc {
             bytes: Mapping::new(pool_bytes)?,
             rings: Mutex::new(Pool::new(
                 ipc_ring_area(pool_bytes as u64).start,
-                pool_bytes / IPC_POOL_AREAS as usize,
-            )),
-            descriptors: Mutex::new(Pool::new(
-                ipc_descriptor_area(pool_bytes as u64).start,
                 pool_bytes / IPC_POOL_AREAS as usize,
             )),
             host_wakes: Mutex::new(Vec::new()),
@@ -887,17 +882,13 @@ impl HostIpc {
         }
     }
     fn provision_descriptors(&self, capacity: usize) -> Result<fd::Extent, AdmissionError> {
-        if capacity == 0 || capacity > i32::MAX as usize {
-            return Err(AdmissionError::NoMemory);
-        }
-        let token = self
-            .descriptors
-            .lock()
-            .allocate(descriptor_extent_bytes(capacity))?;
-        Ok(fd::Extent {
-            token,
-            capacity: capacity as u64,
-        })
+        self.region()
+            .provision_descriptors(capacity, &HostLockWait)
+            .map_err(|error| match error {
+                fd::storage::StorageError::Exhausted => AdmissionError::NoMemory,
+                fd::storage::StorageError::Invalid => AdmissionError::Shared(IpcError::BadStorage),
+                fd::storage::StorageError::Contended => AdmissionError::Shared(IpcError::Contended),
+            })
     }
     /// Admit an owned host description before installing any numeric fd.
     /// On refusal the caller still owns and must release the backing.
@@ -955,7 +946,11 @@ impl HostIpc {
     }
     /// Reclaim only an extent returned by this region's destroy/grow operation.
     pub(crate) fn reclaim_descriptors(&self, extent: fd::Extent) {
-        self.descriptors.lock().release(extent.token);
+        self.region()
+            .reclaim_descriptors(extent, &HostLockWait)
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("ipc::table", "invalid descriptor extent return")
+            });
     }
     pub fn retain_host_resource(
         &self,
@@ -1158,7 +1153,7 @@ mod tests {
             .unwrap();
         owner.release(desc.backing).unwrap();
         owner.reclaim_descriptors(extent);
-        assert!(owner.descriptors.lock().allocated.is_empty());
+        assert_eq!(owner.region().descriptor_allocations(), 0);
     }
 
     /// Creating a pipe takes no pool storage (Linux allocates pipe pages on

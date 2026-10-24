@@ -206,11 +206,11 @@ mod tests {
             // The three live tables own distinct extents. In particular,
             // successful fork must not reclaim its consumed (zeroed) token,
             // because pool offset zero may still belong to the parent.
-            assert_eq!(owner.descriptors.lock().allocated.len(), 3);
+            assert_eq!(owner.region().descriptor_allocations(), 3);
             parent.ensure_capacity(64).unwrap();
-            assert_eq!(owner.descriptors.lock().allocated.len(), 3);
+            assert_eq!(owner.region().descriptor_allocations(), 3);
             drop((parent, child, third));
-            assert!(owner.descriptors.lock().allocated.is_empty());
+            assert_eq!(owner.region().descriptor_allocations(), 0);
         }
     }
 
