@@ -1135,22 +1135,22 @@ impl Server<'_> {
                 items.push(state_item("pr", "unverified", pr));
                 continue;
             };
-            if let Some(branch) = pr["head"]["ref"].as_str() {
-                if let Ok(id) = branch_run(self.dispatch.issue, branch)
-                    && let Ok(id_number) = id.parse::<u64>()
+            if let Some(branch) = pr["head"]["ref"].as_str()
+                && let Ok(id) = branch_run(self.dispatch.issue, branch)
+                && let Ok(id_number) = id.parse::<u64>()
+            {
+                earlier.insert(RunId(id_number));
+                if pr["state"] == "open"
+                    && owned_pr(&pr, &origin, self.dispatch.issue, branch)
+                    && authenticate_artifact_run(origin, self.dispatch.issue, |endpoint| {
+                        api(self.root, endpoint).ok()
+                    })
+                    .is_ok()
                 {
-                    earlier.insert(RunId(id_number));
-                    if pr["state"] == "open"
-                        && owned_pr(&pr, &origin, self.dispatch.issue, branch)
-                        && authenticate_artifact_run(origin, self.dispatch.issue, |endpoint| {
-                            api(self.root, endpoint).ok()
-                        })
-                        .is_ok()
-                    {
-                        items.push(json!({"kind":"branch_candidate","provenance":format!("dispatch-agent(run {id})"),"data":{"branch":branch,"pr":number}}));
-                    }
+                    items.push(json!({"kind":"branch_candidate","provenance":format!("dispatch-agent(run {id})"),"data":{"branch":branch,"pr":number}}));
                 }
             }
+
             endpoints.extend([
                 ("commit", format!("pulls/{number}/commits"), true),
                 ("pr", format!("pulls/{number}"), false),
@@ -2202,7 +2202,7 @@ esac
     #[test]
     fn shared_state_artifacts_and_branch_selection_are_issue_scoped() {
         shared_fixture(|root| {
-            let mut server = server(&root);
+            let mut server = server(root);
             server.dispatch.branch = "work/dispatch-799-999".into();
             server.pr = None;
             server.trigger = json!({"name":"dispatch:any owner context"});
@@ -2280,17 +2280,17 @@ esac
                 "unlinked branches admitted: {admitted:?}"
             );
             assert!(
-                prior_artifact(&root, 799, RunId(42), "contract.json")
+                prior_artifact(root, 799, RunId(42), "contract.json")
                     .unwrap()
                     .contains("prior result")
             );
             for id in [44, 45] {
                 assert!(
-                    prior_artifact(&root, 799, RunId(id), "contract.json").is_err(),
+                    prior_artifact(root, 799, RunId(id), "contract.json").is_err(),
                     "foreign run {id} read"
                 );
             }
-            assert!(prior_artifact(&root, 799, RunId(42), "../contract.json").is_err());
+            assert!(prior_artifact(root, 799, RunId(42), "../contract.json").is_err());
             std::fs::write(root.join("prs.json"), "[]").unwrap();
             assert_eq!(
                 server.select_branch("work/dispatch-799-42").unwrap()["pr"],
