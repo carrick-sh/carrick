@@ -177,7 +177,6 @@ impl NativeService {
                         [carrick_guest_arch::FrameGpa::new(ipa)],
                         0,
                         carrick_el1_abi::COW_GRANT_SIZE,
-                        core::num::NonZeroU64::new(generation).ok_or_else(stale)?,
                         owner,
                         carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
                     )?;
@@ -319,7 +318,6 @@ impl NativeService {
                 ))),
             MAX_TABLE_GRANTS,
             data_len,
-            core::num::NonZeroU64::new(generation).ok_or_else(stale)?,
             owner,
             carrick_hal::MemPerms {
                 read: true,

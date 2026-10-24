@@ -549,6 +549,16 @@ same-VA isolation. Lookup work follows the physical extent index and selected
 records, without scanning other MM populations. Signed fork acceptance remains
 required.
 
+Fresh physical-grant inventory mappings start at their own initial generation;
+the carrier allocation generation remains with physical backing custody.
+Shared `StagedPhysicalGrants` owns initialization and accepts no generation
+from a backend. `native_child_empty_supply_resumes_cow_without_changing_parent`
+and `native_backing_reply_observes_a_competing_valid_publication` compose
+carrier generations 5, 6 and 7 with fresh inventory publications, USED
+settlement and neutral physical retirement. The former was red when carrier
+generation 5 was submitted as the fresh mapping's generation. The existing
+two-grant refill and bounded page-copy assertions remain unchanged.
+
 The KVM vfork VM rebuild also publishes each selected shadow pointer to the
 host-side window descriptor under its write lock. The real-KVM binding
 `vfork_rebuild_host_reads_shadow_bytes` reads distinct child bytes through

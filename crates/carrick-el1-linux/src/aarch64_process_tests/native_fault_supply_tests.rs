@@ -532,18 +532,15 @@ fn composed_native_supply(competing_publication: bool) {
             [FrameGpa::new(gpa)],
             0,
             16384,
-            physical_generation,
             physical_owner,
             carrick_hal::physical_grants::COW_GRANT_PERMISSIONS,
         )
         .unwrap();
-        let retained = crossing
-            .physical
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .backing(&staged, 16384, physical_generation);
+        let retained = crossing.physical.as_ref().unwrap().lock().unwrap().backing(
+            &staged,
+            16384,
+            physical_generation,
+        );
         physical_grants
             .publish_cow(staged, retained, pool, exclusion.proof())
             .unwrap();
@@ -798,7 +795,6 @@ fn composed_native_supply(competing_publication: bool) {
         [FrameGpa::new(0xa0020000)],
         0,
         16384,
-        NonZeroU64::new(7).unwrap(),
         physical_owner,
     )
     .unwrap();

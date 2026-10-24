@@ -87,7 +87,6 @@ impl StagedPhysicalGrants {
         gpas: impl IntoIterator<Item = FrameGpa>,
         table_grants: usize,
         frame_len: u64,
-        owner_generation: NonZeroU64,
         owner: GuestFrameOwner,
     ) -> Result<Self, TrapError> {
         Self::stage_with_permissions(
@@ -96,7 +95,6 @@ impl StagedPhysicalGrants {
             gpas,
             table_grants,
             frame_len,
-            owner_generation,
             owner,
             MemPerms {
                 read: true,
@@ -105,14 +103,12 @@ impl StagedPhysicalGrants {
             },
         )
     }
-    #[allow(clippy::too_many_arguments)]
     pub fn stage_with_permissions(
         rollback: Arc<PhysicalGrantRollback>,
         source: Arc<dyn PhysicalFrameInventory>,
         gpas: impl IntoIterator<Item = FrameGpa>,
         table_grants: usize,
         frame_len: u64,
-        owner_generation: NonZeroU64,
         owner: GuestFrameOwner,
         permissions: MemPerms,
     ) -> Result<Self, TrapError> {
@@ -132,6 +128,10 @@ impl StagedPhysicalGrants {
             .reserve(gpas.len(), gpas.len(), capacity.get())
             .map_err(|error| fail(format!("initial inventory reserve: {error}")))?;
         let transaction = reservation.transaction();
+        // These mapping IDs were just reserved. Their inventory generation
+        // starts here, independently of the retained carrier extent's owner
+        // generation. Backends cannot supply that other domain as this one.
+        let owner_generation = NonZeroU64::MIN;
         let generation = MappingGeneration::from_backend_counter(owner_generation);
         let length = FrameLength::from_mapping_extent(
             NonZeroU64::new(frame_len).ok_or_else(|| fail("initial frame length".into()))?,

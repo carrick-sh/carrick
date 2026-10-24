@@ -542,7 +542,6 @@ impl InitialInventory {
         gpas: impl IntoIterator<Item = FrameGpa>,
         table_grants: usize,
         frame_len: u64,
-        owner_generation: NonZeroU64,
         owner: carrick_hal::GuestFrameOwner,
     ) -> Result<(Self, Vec<X86InitialBootGrant>), TrapError> {
         let mm = owner.native_mm;
@@ -552,7 +551,6 @@ impl InitialInventory {
             gpas,
             table_grants,
             frame_len,
-            owner_generation,
             owner,
         )?
         .handoff()?;
@@ -2989,7 +2987,6 @@ mod initial_reply_tests {
             [FrameGpa::new(0x2_0000_0000)],
             0,
             4096,
-            NonZeroU64::MIN,
             carrick_hal::GuestFrameOwner {
                 native_mm: MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).unwrap()),
                 root_generation: ContextGeneration::new(NonZeroU64::MIN),
@@ -3032,7 +3029,6 @@ mod initial_reply_tests {
             [FrameGpa::new(0x2_0000_0000)],
             0,
             4096,
-            NonZeroU64::MIN,
             carrick_hal::GuestFrameOwner {
                 native_mm: MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).unwrap()),
                 root_generation: ContextGeneration::new(NonZeroU64::MIN),
@@ -3064,7 +3060,6 @@ mod initial_reply_tests {
             [FrameGpa::new(0x2_0000_0000)],
             0,
             4096,
-            NonZeroU64::MIN,
             carrick_hal::GuestFrameOwner {
                 native_mm: MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).unwrap()),
                 root_generation: ContextGeneration::new(NonZeroU64::MIN),
@@ -3100,7 +3095,6 @@ mod initial_reply_tests {
                 [FrameGpa::new(0x2_0000_0000 + index as u64 * 4096)],
                 0,
                 4096,
-                NonZeroU64::MIN,
                 carrick_hal::GuestFrameOwner {
                     native_mm: MmGeneration::new(NonZeroU64::new(mm.raw()).unwrap()),
                     root_generation: ContextGeneration::new(NonZeroU64::MIN),
@@ -3135,7 +3129,6 @@ mod initial_reply_tests {
             [FrameGpa::new(0x2_0000_0000)],
             0,
             4096,
-            NonZeroU64::MIN,
             carrick_hal::GuestFrameOwner {
                 native_mm: MmGeneration::new(
                     NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM"),
@@ -3199,7 +3192,6 @@ mod initial_reply_tests {
             [FrameGpa::new(0x2_0000_0000)],
             0,
             4096,
-            NonZeroU64::MIN,
             carrick_hal::GuestFrameOwner {
                 native_mm: MmGeneration::new(
                     NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM"),
@@ -3225,7 +3217,6 @@ mod initial_reply_tests {
                 [FrameGpa::new(0x2_0000_0000)],
                 0,
                 4096,
-                NonZeroU64::MIN,
                 carrick_hal::GuestFrameOwner {
                     native_mm: MmGeneration::new(
                         NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM"),
@@ -3256,7 +3247,6 @@ mod initial_reply_tests {
             (0..4).map(|index| FrameGpa::new(base + index * 4096)),
             2,
             4096,
-            NonZeroU64::MIN,
             carrick_hal::GuestFrameOwner {
                 native_mm: MmGeneration::new(
                     NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM"),
