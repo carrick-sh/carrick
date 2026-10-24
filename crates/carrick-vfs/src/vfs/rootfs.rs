@@ -111,6 +111,8 @@ pub enum OpenDispatchResult {
     RootFsBackedFile {
         metadata: RootFsMetadata,
         contents: SharedFileContents,
+        /// Same inode selected by open; executable readers retain it across unlink.
+        object: Option<Arc<crate::fs_backend::SharedFileObject>>,
         writable: bool,
     },
     /// A regular file backed by a REAL host fd (disk-backed overlay,
@@ -1360,6 +1362,7 @@ impl RootFsVfs {
             return Ok(OpenDispatchResult::RootFsBackedFile {
                 metadata: entry.metadata,
                 contents: entry.contents,
+                object: entry.object,
                 writable: writable_request,
             });
         }
@@ -1421,6 +1424,7 @@ impl RootFsVfs {
                     return Ok(OpenDispatchResult::RootFsBackedFile {
                         metadata,
                         contents,
+                        object: None,
                         writable: writable_request,
                     });
                 }
@@ -1591,7 +1595,16 @@ impl RootFsVfs {
                                 writable: true,
                             });
                         }
+                        if let Some(entry) = self.overlay.shared_file_entry(path, false) {
+                            return Ok(OpenDispatchResult::RootFsBackedFile {
+                                metadata: entry.metadata,
+                                contents: entry.contents,
+                                object: entry.object,
+                                writable: true,
+                            });
+                        }
                         return Ok(OpenDispatchResult::RootFsBackedFile {
+                            object: None,
                             metadata,
                             contents: SharedFileContents {
                                 object_id: crate::fs_backend::fresh_file_object_id(),

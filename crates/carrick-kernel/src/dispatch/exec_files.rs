@@ -11,7 +11,6 @@ use super::executable_authority::{ExecSource, ExecSourceError};
 /// with host exec ownership; it uses the same file capability implementation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecCaller {
-    Service(carrick_core_abi::service::ServiceIdentity),
     Host {
         task: crate::kernel::TaskKey,
         thread: crate::kernel::ThreadKey,
@@ -23,26 +22,24 @@ pub enum ExecCaller {
 /// Read-only lookup into the FD authority. Exec does not interpret descriptor
 /// flags, copy tables, or perform close-on-exec here.
 pub trait ExecFdSources: Send + Sync {
-    fn source(&self, fd: crate::kernel::FileSlotNumber) -> Option<ExecFdSource>;
-}
-
-pub enum ExecFdSource {
-    Retained(ExecSource),
-    Path(String),
+    fn source(&self, fd: crate::kernel::FileSlotNumber) -> Result<ExecSource, ExecSourceError>;
 }
 
 struct HostExecFdSources(Arc<crate::kernel::FileTable>);
 impl ExecFdSources for HostExecFdSources {
-    fn source(&self, fd: crate::kernel::FileSlotNumber) -> Option<ExecFdSource> {
-        let _lease = self.0.acquire_functional_lease()?;
-        let file = self.0.read_open_files().get(&fd.raw()).cloned()?;
+    fn source(&self, fd: crate::kernel::FileSlotNumber) -> Result<ExecSource, ExecSourceError> {
+        let absent = || ExecSourceError::Linux(carrick_abi::LINUX_ENOENT);
+        let _lease = self.0.acquire_functional_lease().ok_or_else(absent)?;
+        let file = self
+            .0
+            .read_open_files()
+            .get(&fd.raw())
+            .cloned()
+            .ok_or_else(absent)?;
         if let Some(source) = file.description.retained_exec_source() {
-            return Some(ExecFdSource::Retained(source));
+            return Ok(source);
         }
-        file.description.inspect_kind(|open| {
-            open.open_path()
-                .map(|path| ExecFdSource::Path(path.to_owned()))
-        })?
+        ExecSource::from_open_description(file.description).map_err(ExecSourceError::Host)
     }
 }
 
@@ -57,7 +54,7 @@ pub struct ExecFilesystem {
 }
 
 /// Caller-selected resources, retained independently of any host TaskRef.
-pub struct ExecFileContext {
+struct ExecFileContext {
     pub caller: ExecCaller,
     pub visible_pid: Option<super::NsPid>,
     pub cwd: String,
@@ -73,7 +70,7 @@ pub struct ExecFiles {
 }
 
 impl ExecFiles {
-    pub fn new(filesystem: ExecFilesystem, context: ExecFileContext) -> Self {
+    fn new(filesystem: ExecFilesystem, context: ExecFileContext) -> Self {
         Self {
             filesystem,
             context,
@@ -91,34 +88,49 @@ impl ExecFiles {
     }
 
     pub fn resolve_path(&self, path: &str) -> String {
-        resolve_exec_path(path, &self.context.cwd)
+        // This spelling is also passed as the script argument to a shebang
+        // interpreter. Keep `..` until filesystem traversal follows symlinks.
+        if path.starts_with('/') {
+            path.to_owned()
+        } else {
+            format!("{}/{}", self.context.cwd.trim_end_matches('/'), path)
+        }
     }
 
     pub fn acquire(&self, path: &str) -> Result<ExecSource, ExecSourceError> {
         use super::fs::proc_synthetic::{proc_self_fd_number, proc_self_magic_link};
+        super::fs::check_path_length(path).map_err(ExecSourceError::Linux)?;
         let path = self.resolve_path(path);
+        super::fs::check_path_length(&path).map_err(ExecSourceError::Linux)?;
+        // Redundant separators and interior `.` do not change these directory
+        // prefixes. Never collapse `..`, or a trailing directory requirement.
+        let magic_path = if path.ends_with('/') || path.ends_with("/.") {
+            path.clone()
+        } else {
+            format!(
+                "/{}",
+                path.split('/')
+                    .filter(|part| !part.is_empty() && *part != ".")
+                    .collect::<Vec<_>>()
+                    .join("/")
+            )
+        };
         let visible = self
             .context
             .visible_pid
             .and_then(|pid| u32::try_from(pid.raw()).ok());
-        if proc_self_magic_link(&path, visible) == Some("exe") {
+        if proc_self_magic_link(&magic_path, visible) == Some("exe") {
             return self
                 .context
                 .executable
                 .clone()
                 .ok_or(ExecSourceError::Linux(carrick_abi::LINUX_ENOENT));
         }
-        let path = if let Some(fd) = proc_self_fd_number(&path, visible) {
+        if let Some(fd) = proc_self_fd_number(&magic_path, visible) {
             let fd = crate::kernel::FileSlotNumber::for_open_fd(fd)
                 .map_err(|_| ExecSourceError::Linux(carrick_abi::LINUX_ENOENT))?;
-            match self.context.descriptors.source(fd) {
-                Some(ExecFdSource::Retained(source)) => return Ok(source),
-                Some(ExecFdSource::Path(path)) => path,
-                None => return Err(ExecSourceError::Linux(carrick_abi::LINUX_ENOENT)),
-            }
-        } else {
-            path
-        };
+            return self.context.descriptors.source(fd);
+        }
         self.filesystem.acquire(&path)
     }
 
@@ -162,8 +174,15 @@ impl ExecFilesystem {
                 mounts: &self.mounts,
                 resolve_observations: &observations,
             };
+            let walked = if path.split('/').any(|part| part == "..") {
+                paths
+                    .resolve_dotdot_symlink_aware("/", path)
+                    .map_err(ExecSourceError::Linux)?
+            } else {
+                path.to_owned()
+            };
             let resolved = paths
-                .canonicalize_following(path)
+                .canonicalize_following(&walked)
                 .map_err(ExecSourceError::Linux)?;
             if paths
                 .layered_lstat(&resolved)
@@ -194,9 +213,28 @@ impl SyscallDispatcher {
         }
     }
 
-    pub fn capture_exec_files(&self, context: &crate::kernel::KernelContext) -> ExecFiles {
+    pub fn capture_exec_files(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> Result<ExecFiles, LinuxErrno> {
+        let binding = self.kernel_binding.read();
+        if binding.task_key() != context.task().key()
+            || !Arc::ptr_eq(binding.kernel(), context.kernel())
+        {
+            return Err(carrick_abi::LINUX_ESRCH);
+        }
+        let live = binding
+            .capture(context.thread().key().tid)
+            .map_err(|_| carrick_abi::LINUX_ESRCH)?;
+        if !Arc::ptr_eq(live.task(), context.task())
+            || !Arc::ptr_eq(live.thread(), context.thread())
+            || !Arc::ptr_eq(live.shared(), context.shared())
+            || !Arc::ptr_eq(live.resources(), context.resources())
+        {
+            return Err(carrick_abi::LINUX_ESRCH);
+        }
         let credentials = context.resources().credentials();
-        ExecFiles::new(
+        Ok(ExecFiles::new(
             self.exec_filesystem(),
             ExecFileContext {
                 caller: ExecCaller::Host {
@@ -215,7 +253,7 @@ impl SyscallDispatcher {
                     .map(|current| current.source().clone()),
                 descriptors: Arc::new(HostExecFdSources(context.resources().files())),
             },
-        )
+        ))
     }
 }
 
