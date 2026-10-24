@@ -229,6 +229,79 @@ impl Frames {
                 .required("::park_service::")?
                 .max(self.required("::park_owner_wait::")? + self.maximum("::finish_owner_wait::"))
             + self.maximum("::finish_service::");
+        // FD inheritance is distinct from the page-table descriptor executor.
+        // Optional helpers can inline into their caller in one feature closure
+        // and remain emitted in another; charge both when both retain frames.
+        let fd_storage = self.qualified("carrick_fd_core::Authority", "::storage::")
+            + self.qualified("carrick_fd_core::TableStorage", "::new::")
+            + self.qualified("SlotBacking", "::resolve::");
+        let fd_panic = self.sum(&[
+            "::panic_bounds_check",
+            "::panic_fmt",
+            "__rustc::rust_begin_unwind",
+            "::panic_const::panic_const_add_overflow",
+            "::panic_const::panic_const_mul_overflow",
+        ]);
+        let fd_publish = self.sum(&[
+            "IpcTableMap::publish_owned::",
+            "IpcTableMap::publish_with_owner::",
+            "IpcTableMap::store::",
+            "IpcTableMap::lock::",
+        ]);
+        let fd_references = self.qualified("carrick_fd_core::Authority", "::drop_hold::")
+            + self.qualified("carrick_fd_core::Authority", "::snapshot::")
+            + self.qualified("carrick_fd_core::Authority", "::free_ofd::")
+            + self.maximum("carrick_fd_core::free_list::push::");
+        let fd_pool = self.sum(&[
+            "IpcRegion::provision_descriptors::",
+            "IpcRegion::reclaim_descriptors::",
+        ]) + self
+            .qualified("carrick_fd_core::storage::Storage", "::allocate::")
+            .max(self.qualified("carrick_fd_core::storage::Storage", "::release::"))
+            + self.qualified("carrick_fd_core::storage::Storage", "::acquire::")
+            + self.qualified("carrick_fd_core::storage::Storage", "::order::");
+        let fd_fork = self.sum(&["::fork_descriptors::", "::fork_published::"])
+            + (fd_storage + self.qualified("carrick_fd_core::Authority", "::backing_capacity::"))
+                .max(fd_publish)
+                .max(fd_references)
+                .max(fd_pool)
+                .max(self.qualified("carrick_fd_core::TableStorage", "::clear::"))
+                .max(self.qualified("carrick_fd_core::TableStorage", "::rebuild::"))
+            + fd_panic;
+        // Retirement follows publish_exit's return; it does not nest beneath
+        // finish_exit or receipt publication. Object release and wake delivery
+        // are separate tails of the release callback. Sibling leaf sums below
+        // conservatively cover differences between image feature closures.
+        let fd_release = self.sum(&[
+            "::release_backing::",
+            "::detach_all_member_items::",
+            "::lock_epoll::",
+            "IpcObjectGuard::publish::",
+            "IpcObjectGuard::free::",
+            "IpcObjectGuard::pipe::",
+            "IpcObjectGuard::eventfd::",
+            "::epoll_state::",
+            "::unlink_item::",
+            "::unlink_member_item::",
+            "::drain_ready_stack::",
+            "::free_item::",
+            "::EpollWakes::add::",
+        ]) + fd_panic;
+        let fd_notify = self.maximum("carrick_core::wait::notify_object::")
+            + self.qualified("carrick_sched_core::object_wait", "::object_wait::")
+            + self.qualified("ObjectWaitGuard", "::notify_object::")
+            + self.sum(&["::claim_for_el1::", "::claim_for_el1_with_wait::"])
+            + schedule;
+        let fd_deliver = self.sum(&[
+            "::object_wait::deliver_wake_effects::",
+            "::object_wait::deliver_effects_with::",
+        ]) + self.qualified("FlatMap", "::next::")
+            + schedule;
+        let fd_retire = self.sum(&["::ipc::retire_namespace::", "::retire_table::"])
+            + (fd_storage.max(fd_references) + fd_panic).max(
+                self.maximum("::ipc::release_native_description::")
+                    + fd_release.max(fd_notify).max(fd_deliver),
+            );
         let chains = [
             (
                 "native admission",
@@ -257,6 +330,21 @@ impl Frames {
                     + self.required("::prepare_mm::")?
                     + self.maximum("::prepare_fork::")
                     + descriptors,
+            ),
+            (
+                "native fd inheritance",
+                native
+                    + self.required("::fork_owned::")?
+                    + self.required("::fork_fd_table::")?
+                    + fd_fork,
+            ),
+            (
+                "native fd retirement",
+                ((native + delivery).max(resume)
+                    + self.sum(&["::exit_with_signal::", "::exit_with_status::"]))
+                .max(native + self.required("::fork_owned::")?)
+                    + self.required("::retire_fd_table::")?
+                    + fd_retire,
             ),
             (
                 "native fork context",
@@ -406,8 +494,7 @@ mod tests {
         assert_eq!(frames.maximum("leaf"), 16);
     }
 
-    #[test]
-    fn cumulative_frames_and_an_oversized_new_function_are_rejected() {
+    fn small_frames() -> Frames {
         let mut values = BTreeMap::new();
         for name in [
             "carrick_el1_syscall",
@@ -421,6 +508,8 @@ mod tests {
             "x::signal_delivery::deliver_signal_on_syscall_return::h0",
             "x::admit_entry_runtime::h0",
             "x::fork_owned::h0",
+            "x::fork_fd_table::h0",
+            "x::retire_fd_table::h0",
             "x::settle_mm::h0",
             "x::prepare_mm::h0",
             "x::fork_child_context_boxed::h0",
@@ -438,7 +527,12 @@ mod tests {
         ] {
             values.insert(name.to_owned(), 128);
         }
-        let mut frames = Frames(values);
+        Frames(values)
+    }
+
+    #[test]
+    fn cumulative_frames_and_an_oversized_new_function_are_rejected() {
+        let mut frames = small_frames();
         assert!(frames.check(16384, 288).is_ok());
         frames.0.insert("x::settle_mm::h0".to_owned(), 12000);
         assert!(
@@ -463,6 +557,46 @@ mod tests {
                 .check(16384, 288)
                 .unwrap_err()
                 .contains("individual frame")
+        );
+    }
+
+    fn reject_fd_chain(chain: &str, methods: &[&str]) {
+        let mut frames = small_frames();
+        for method in methods {
+            frames.0.insert(format!("{method}::h0"), 3000);
+        }
+        let error = frames
+            .check(16384, 288)
+            .expect_err("FD chain must be charged");
+        assert!(error.contains(chain), "{error}");
+        assert!(!error.contains("individual frame"), "{error}");
+    }
+
+    #[test]
+    fn fd_inheritance_charges_retained_core_and_storage_frames() {
+        reject_fd_chain(
+            "native fd inheritance",
+            &[
+                "x::fork_fd_table",
+                "x::fork_descriptors",
+                "x::fork_published",
+                "carrick_fd_core::Authority::storage",
+                "carrick_fd_core::TableStorage::new",
+            ],
+        );
+    }
+
+    #[test]
+    fn fd_retirement_charges_release_callbacks_after_revocation() {
+        reject_fd_chain(
+            "native fd retirement",
+            &[
+                "x::retire_fd_table",
+                "x::retire_table",
+                "x::ipc::release_native_description",
+                "x::release_backing",
+                "x::detach_all_member_items",
+            ],
         );
     }
 
