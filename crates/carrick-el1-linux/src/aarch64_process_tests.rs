@@ -3505,9 +3505,26 @@ fn arm_signal_setup_uses_one_native_owner() {
 }
 
 #[test]
-fn arm_signal_wait_stays_unported_until_owned_wait_slice() {
+fn arm_native_signal_calls_route_to_shared_owner() {
     use carrick_personality_linux::dispatch::{Family, route_aarch64};
-    assert_eq!(route_aarch64(133, u64::MAX), Family::Unported);
+    use carrick_personality_linux::signal::SignalCall;
+
+    for (ordinal, call) in [
+        (129, SignalCall::Kill),
+        (130, SignalCall::Tkill),
+        (131, SignalCall::Tgkill),
+        (133, SignalCall::RtSigsuspend),
+        (136, SignalCall::RtSigpending),
+        (137, SignalCall::RtSigtimedwait),
+        (138, SignalCall::RtSigqueueinfo),
+        (240, SignalCall::RtTgsigqueueinfo),
+    ] {
+        assert_eq!(
+            route_aarch64(ordinal, u64::MAX),
+            Family::Signal(call),
+            "ARM signal syscall {ordinal} must use the shared process owner"
+        );
+    }
 }
 
 #[cfg(test)]
