@@ -3628,6 +3628,8 @@ pub(crate) mod tests {
         pub(crate) copyout_owner_probe: Option<CopyoutOwnerProbe>,
         // Frame result, result already completed when injected, restart flag.
         pub(crate) injected_signals: Vec<(Option<i64>, Option<i64>, bool)>,
+        pub(crate) injected_fault_siginfo: Vec<Option<(i32, u64)>>,
+        pub(crate) fail_signal_frame_write: bool,
     }
 
     struct TestPreparedClear<'a> {
@@ -3936,12 +3938,17 @@ pub(crate) mod tests {
         }
 
         fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
+            self.injected_fault_siginfo.push(signal.fault_siginfo);
             self.injected_signals.push((
                 signal.pending_syscall_retval,
                 self.completed_syscalls.last().copied(),
                 signal.restart_syscall,
             ));
-            Ok(())
+            if self.fail_signal_frame_write {
+                Err(TrapError::SignalDeliveryFault)
+            } else {
+                Ok(())
+            }
         }
 
         fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {

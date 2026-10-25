@@ -450,10 +450,16 @@ pub struct CarrierVmCustody {
     pub(crate) carrier_stage2_records:
         parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2RecordIdentity>>,
     /// Carrier-MM teardown records whose exact neutral owner has requested
-    /// retirement. These are driven by the request itself when already
-    /// unpinned, or by the last-pin-drop event, rather than executor idleness.
+    /// retirement. Request and last-pin-drop only arm this queue; backend
+    /// unmap runs at the persistent executor's carrier-safe boundary.
     pending_carrier_stage2_retirements: parking_lot::Mutex<
-        std::collections::BTreeMap<CarrierStage2RecordId, (CarrierStage2RecordIdentity, bool)>,
+        std::collections::BTreeMap<CarrierStage2RecordId, (CarrierStage2RecordIdentity, bool, u8)>,
+    >,
+    /// Exact retirements whose backend operation failed at a carrier-safe
+    /// boundary. Their waiters wake and reselect/fault instead of parking on a
+    /// producer that can no longer complete.
+    terminal_carrier_stage2_retirements: parking_lot::Mutex<
+        std::collections::BTreeMap<CarrierStage2RecordId, CarrierStage2RecordIdentity>,
     >,
     pub(crate) global_frame_host_owners: GlobalFrameHostOwnerDirectory,
     pub(crate) pending_global_frame_owners: parking_lot::Mutex<
@@ -801,6 +807,9 @@ impl CarrierVmCustody {
             structural_backings: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             carrier_stage2_records: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             pending_carrier_stage2_retirements: parking_lot::Mutex::new(
+                std::collections::BTreeMap::new(),
+            ),
+            terminal_carrier_stage2_retirements: parking_lot::Mutex::new(
                 std::collections::BTreeMap::new(),
             ),
             global_frame_host_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
@@ -1561,10 +1570,13 @@ impl CarrierVmCustody {
     }
 
     pub(crate) fn enqueue_carrier_stage2_retirement(&self, identity: CarrierStage2RecordIdentity) {
+        self.terminal_carrier_stage2_retirements
+            .lock()
+            .remove(&identity.record_id);
         self.pending_carrier_stage2_retirements
             .lock()
             .entry(identity.record_id)
-            .or_insert((identity, false));
+            .or_insert((identity, false, 0));
     }
 
     pub(crate) fn cancel_carrier_stage2_retirement(&self, identity: CarrierStage2RecordIdentity) {
@@ -1579,7 +1591,7 @@ impl CarrierVmCustody {
         identity: CarrierStage2RecordIdentity,
     ) -> bool {
         let mut pending = self.pending_carrier_stage2_retirements.lock();
-        let Some((expected, in_flight)) = pending.get_mut(&identity.record_id) else {
+        let Some((expected, in_flight, _failures)) = pending.get_mut(&identity.record_id) else {
             return false;
         };
         if *expected != identity || *in_flight {
@@ -1600,9 +1612,71 @@ impl CarrierVmCustody {
         }
         if complete {
             pending.remove(&identity.record_id);
-        } else if let Some((_, in_flight)) = pending.get_mut(&identity.record_id) {
+            self.terminal_carrier_stage2_retirements
+                .lock()
+                .remove(&identity.record_id);
+        } else if let Some((_, in_flight, _failures)) = pending.get_mut(&identity.record_id) {
             *in_flight = false;
         }
+    }
+
+    /// Record one backend refusal from a distinct carrier-safe turn. A small
+    /// finite budget admits a transient concurrent teardown without letting a
+    /// permanently impossible unmap strand its exact waiter forever.
+    pub(crate) fn note_carrier_stage2_retirement_failure(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> bool {
+        const MAX_BACKEND_FAILURES: u8 = 3;
+        let mut pending = self.pending_carrier_stage2_retirements.lock();
+        let Some((expected, in_flight, failures)) = pending.get_mut(&identity.record_id) else {
+            return true;
+        };
+        if *expected != identity {
+            return true;
+        }
+        *in_flight = false;
+        *failures = failures.saturating_add(1);
+        *failures >= MAX_BACKEND_FAILURES
+    }
+
+    pub(crate) fn terminalize_carrier_stage2_retirement(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) {
+        self.pending_carrier_stage2_retirements
+            .lock()
+            .remove(&identity.record_id);
+        self.terminal_carrier_stage2_retirements
+            .lock()
+            .insert(identity.record_id, identity);
+        self.stage2_retirement_changed.publish(0);
+    }
+
+    pub(crate) fn carrier_stage2_retirement_is_terminal(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> bool {
+        self.terminal_carrier_stage2_retirements
+            .lock()
+            .get(&identity.record_id)
+            .is_some_and(|terminal| *terminal == identity)
+    }
+
+    pub(crate) fn pending_carrier_stage2_retirement_candidates(
+        &self,
+        limit: usize,
+    ) -> Vec<CarrierStage2RecordIdentity> {
+        self.pending_carrier_stage2_retirements
+            .lock()
+            .values()
+            .filter_map(|(identity, in_flight, _failures)| (!*in_flight).then_some(*identity))
+            .take(limit)
+            .collect()
+    }
+
+    pub(crate) fn pending_carrier_stage2_retirement_count(&self) -> usize {
+        self.pending_carrier_stage2_retirements.lock().len()
     }
 
     pub(crate) fn carrier_stage2_retirement_is_ready(
@@ -1696,6 +1770,9 @@ impl Stage2RetirementWait {
         let Some(identity) = self.identity else {
             return true;
         };
+        if custody.carrier_stage2_retirement_is_terminal(identity) {
+            return true;
+        }
         let state = custody.state.lock();
         let Some(record) = state.stage2_records.get(&identity.record_id) else {
             return true;
@@ -1738,15 +1815,15 @@ impl CarrierVmCustody {
     /// Release one pin on the exact record `identity` (the drop half of
     /// [`Self::pin_stage2_record`]).
     pub(crate) fn release_stage2_pin(&self, identity: CarrierStage2RecordIdentity) {
-        self.release_stage2_pin_using(identity, |custody, identity| {
-            super::drive_pending_carrier_stage2_retirement(custody, identity);
+        self.release_stage2_pin_using(identity, |custody| {
+            custody.request_global_frame_retirement_retry();
         });
     }
 
     fn release_stage2_pin_using(
         &self,
         identity: CarrierStage2RecordIdentity,
-        drive_carrier: impl FnOnce(&Self, CarrierStage2RecordIdentity),
+        schedule_safe_point: impl FnOnce(&Self),
     ) {
         use carrick_core::mm::retirement::{RecordPinRelease, release_record_pin_outcome};
         let outcome = {
@@ -1761,13 +1838,14 @@ impl CarrierVmCustody {
             outcome
         };
         if self.carrier_stage2_retirement_is_ready(identity) {
-            drive_carrier(self, identity);
+            schedule_safe_point(self);
             return;
         }
         if let RecordPinRelease::ReadyToRetire { ipa } = outcome
             && self.is_active_root_slot_pool_ipa(ipa)
         {
-            let _ = super::retire_carrier_stage2_record_at_safe_point(self, identity);
+            self.enqueue_carrier_stage2_retirement(identity);
+            schedule_safe_point(self);
         }
     }
 }
@@ -4746,7 +4824,7 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
-    fn carrier_teardown_request_and_last_pin_drive_the_exact_owner_without_idle() {
+    fn carrier_teardown_last_pin_only_schedules_safe_point_retirement() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         for (index, pinned) in [false, true].into_iter().enumerate() {
             let (custody, generation) = live_custody();
@@ -4768,31 +4846,37 @@ mod carrier_vm_custody_tests {
                 custody.request_stage2_record_retirement(identity),
                 CarrierStage2RetireOutcome::DeferredActivePins
             );
-            let attempts = std::cell::Cell::new(0_u32);
-            let drive = |custody: &CarrierVmCustody, identity| {
-                super::drive_pending_carrier_stage2_retirement_using(custody, identity, || {
-                    attempts.set(attempts.get() + 1);
-                    super::retire_carrier_stage2_record_at_safe_point_using(
-                        custody,
-                        identity,
-                        |_, _| Ok(()),
-                        |_, _| Ok(()),
-                    )
-                });
+            let schedules = std::cell::Cell::new(0_u32);
+            let schedule = |custody: &CarrierVmCustody| {
+                schedules.set(schedules.get() + 1);
+                custody.request_global_frame_retirement_retry();
             };
             if let Some(pin) = pin {
                 let identity = pin.into_transferred_identity();
-                custody.release_stage2_pin_using(identity, drive);
+                custody.release_stage2_pin_using(identity, schedule);
             } else if custody.carrier_stage2_retirement_is_ready(identity) {
-                drive(&custody, identity);
+                schedule(&custody);
             }
+            let attempts = std::cell::Cell::new(0_u32);
+            assert_eq!(attempts.get(), 0, "pin drop must not unmap inline");
+            assert!(custody.stage2_record_snapshot(identity.record_id).is_some());
+            assert_eq!(schedules.get(), 1);
+            let report = super::retry_pending_global_frame_retirements_at_idle_in_and_release_using(
+                &custody,
+                &mut |_, _| {
+                    attempts.set(attempts.get() + 1);
+                    Ok(())
+                },
+                &mut |_, _| Ok(()),
+            );
+            assert_eq!(report.inspected_carrier, 1);
             assert_eq!(attempts.get(), 1);
             assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
         }
     }
 
     #[test]
-    fn carrier_teardown_retry_pending_gets_a_bounded_producer_redrive() {
+    fn carrier_teardown_retry_pending_does_not_retry_until_green() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, generation) = live_custody();
         let spec = stage2_spec(generation, 923);
@@ -4810,24 +4894,29 @@ mod carrier_vm_custody_tests {
         );
         let attempts = std::cell::Cell::new(0_u32);
 
-        super::drive_pending_carrier_stage2_retirement_using(&custody, identity, || {
-            attempts.set(attempts.get() + 1);
-            if attempts.get() == 1 {
-                Err(super::TrapError::Hypervisor(
-                    "injected transient backend-unmap refusal".to_owned(),
-                ))
-            } else {
-                super::retire_carrier_stage2_record_at_safe_point_using(
-                    &custody,
-                    identity,
-                    |_, _| Ok(()),
-                    |_, _| Ok(()),
-                )
+        let wait = custody.stage2_retirement_wait(Some(identity));
+        custody.request_global_frame_retirement_retry();
+        for turn in 1..=3 {
+            let report = super::retry_pending_global_frame_retirements_at_idle_in_and_release_using(
+                &custody,
+                &mut |_, _| {
+                    attempts.set(attempts.get() + 1);
+                    Err(super::CarrierStage2BackendError::HvReturn(0xfae9_4001))
+                },
+                &mut |_, _| Ok(()),
+            );
+            assert_eq!(report.inspected_carrier, 1);
+            assert_eq!(attempts.get(), turn, "one safe-point turn gets one attempt");
+            if turn < 3 {
+                assert!(!wait.0.is_ready(), "a bounded retry still owns a producer");
             }
-        });
+        }
 
-        assert_eq!(attempts.get(), 2);
-        assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
+        assert!(custody.carrier_stage2_retirement_is_terminal(identity));
+        assert!(
+            wait.0.is_ready(),
+            "terminal backend refusal wakes the waiter"
+        );
     }
 
     #[test]

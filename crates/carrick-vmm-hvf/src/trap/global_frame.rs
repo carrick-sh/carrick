@@ -1653,38 +1653,6 @@ pub(crate) fn retire_carrier_stage2_record_at_safe_point(
     )
 }
 
-/// Drive a carrier-MM teardown record from its named producer event.
-///
-/// The first attempt belongs to the request or last-pin-drop event. A backend
-/// `RetryPending` gets one bounded completion attempt in that same event; it
-/// never waits for a persistent executor to become idle. Persistent backend
-/// failure remains queued and exact for the existing terminal diagnostics.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn drive_pending_carrier_stage2_retirement(
-    custody: &CarrierVmCustody,
-    identity: CarrierStage2RecordIdentity,
-) {
-    drive_pending_carrier_stage2_retirement_using(custody, identity, || {
-        retire_carrier_stage2_record_at_safe_point(custody, identity)
-    });
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn drive_pending_carrier_stage2_retirement_using(
-    custody: &CarrierVmCustody,
-    identity: CarrierStage2RecordIdentity,
-    mut retire: impl FnMut() -> Result<(), TrapError>,
-) {
-    if !custody.claim_carrier_stage2_retirement(identity) {
-        return;
-    }
-    let complete = retire().or_else(|_| retire()).is_ok();
-    custody.settle_carrier_stage2_retirement(identity, complete);
-    if !complete {
-        custody.request_global_frame_retirement_retry();
-    }
-}
-
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_carrier_stage2_record_at_safe_point_using(
     custody: &CarrierVmCustody,
@@ -3703,6 +3671,7 @@ pub(crate) struct PendingGlobalFrameRetirementTurnReport {
     pub(crate) remaining: usize,
     pub(crate) inspected_directory: usize,
     pub(crate) inspected_detached: usize,
+    pub(crate) inspected_carrier: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3746,6 +3715,22 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
     custody: &CarrierVmCustody,
     unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
 ) -> PendingGlobalFrameRetirementTurnReport {
+    retry_pending_global_frame_retirements_at_idle_in_and_release_using(
+        custody,
+        unmap,
+        &mut release_retired_stage2_ipa,
+    )
+}
+
+/// Run one bounded retirement turn after the persistent executor has left its
+/// vCPU run and released carrier locks. Tests inject both backend operations so
+/// the same boundary proves that last-pin drop never performs an inline unmap.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_and_release_using(
+    custody: &CarrierVmCustody,
+    unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    release: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+) -> PendingGlobalFrameRetirementTurnReport {
     if !custody.take_global_frame_retirement_retry_request() {
         return PendingGlobalFrameRetirementTurnReport::default();
     }
@@ -3762,7 +3747,8 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
         custody.request_global_frame_retirement_retry();
         return PendingGlobalFrameRetirementTurnReport {
             remaining: custody.pending_global_frame_directory_retries.lock().len()
-                + custody.pending_global_frame_detached_retries.lock().len(),
+                + custody.pending_global_frame_detached_retries.lock().len()
+                + custody.pending_carrier_stage2_retirement_count(),
             ..PendingGlobalFrameRetirementTurnReport::default()
         };
     }
@@ -3865,9 +3851,52 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_using(
         }
     }
 
+    let carrier_candidates = custody.pending_carrier_stage2_retirement_candidates(
+        PENDING_GLOBAL_FRAME_RETIREMENTS_PER_CLASS_PER_IDLE_TURN,
+    );
+    for identity in carrier_candidates {
+        if !custody.carrier_stage2_retirement_is_ready(identity)
+            || !custody.claim_carrier_stage2_retirement(identity)
+        {
+            continue;
+        }
+        report.inspected_carrier += 1;
+        let retired = retire_carrier_stage2_record_at_safe_point_using(
+            custody,
+            identity,
+            &mut *unmap,
+            &mut *release,
+        );
+        if retired.is_ok() {
+            custody.settle_carrier_stage2_retirement(identity, true);
+        } else if custody.note_carrier_stage2_retirement_failure(identity) {
+            // The bounded safe-point budget is exhausted: no retry-until-green
+            // loop and no producer remain for this exact physical wait.
+            custody.terminalize_carrier_stage2_retirement(identity);
+        } else {
+            custody.request_global_frame_retirement_retry();
+        }
+    }
+
     report.remaining = custody.pending_global_frame_directory_retries.lock().len()
-        + custody.pending_global_frame_detached_retries.lock().len();
-    if report.remaining != 0 {
+        + custody.pending_global_frame_detached_retries.lock().len()
+        + custody.pending_carrier_stage2_retirement_count();
+    let carrier_ready = custody
+        .pending_carrier_stage2_retirement_candidates(1)
+        .into_iter()
+        .any(|identity| custody.carrier_stage2_retirement_is_ready(identity));
+    if !custody
+        .pending_global_frame_directory_retries
+        .lock()
+        .by_item
+        .is_empty()
+        || !custody
+            .pending_global_frame_detached_retries
+            .lock()
+            .by_item
+            .is_empty()
+        || carrier_ready
+    {
         custody.request_global_frame_retirement_retry();
     }
     report

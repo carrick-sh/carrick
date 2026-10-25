@@ -4944,8 +4944,9 @@ fn final_carrier_mm_drop_keeps_a_backend_referenced_stage2_lease_live() {
 }
 
 #[test]
-fn final_carrier_mm_drop_drives_unpinned_stage2_retirement_without_idle() {
+fn final_carrier_mm_drop_schedules_unpinned_stage2_retirement_at_safe_point() {
     let _allocator_test_guard = global_frame_allocator_test_lock().lock();
+    let custody = legacy_test_carrier_vm_custody_arc();
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
     let key = lease.key();
@@ -4956,6 +4957,10 @@ fn final_carrier_mm_drop_drives_unpinned_stage2_retirement_without_idle() {
         frames,
     });
 
+    assert!(global_frame_ipa_allocator().lock().is_live(key.0, key.1));
+    let report =
+        retry_pending_global_frame_retirements_at_idle_in_using(custody, &mut |_, _| Ok(()));
+    assert_eq!(report.inspected_carrier, 1);
     assert!(!global_frame_ipa_allocator().lock().is_live(key.0, key.1));
     assert!(!carrier_stage2_leases().lock().contains_key(&key));
 }
@@ -7790,15 +7795,19 @@ fn final_parked_pin_returns_pooled_arena_after_owner_retirement() {
         "parked pin owns the slot"
     );
     drop(pin);
+    assert!(
+        custody.stage2_record_snapshot(record.record_id).is_some(),
+        "last pin only schedules backend work"
+    );
+    let report =
+        retry_pending_global_frame_retirements_at_idle_in_using(custody, &mut |_, _| Ok(()));
+    assert_eq!(report.inspected_carrier, 1);
     let terminal = custody.stage2_record_snapshot(record.record_id).is_none();
-    if !terminal {
-        retire_carrier_stage2_record_at_safe_point(custody, record).unwrap();
-    }
     let reused = pool
         .allocate_slot_at(base)
         .expect("last parked pin returns exact slot");
     drop(reused);
-    assert!(terminal, "last parked pin left pooled arena pending");
+    assert!(terminal, "safe-point retirement left pooled arena pending");
 }
 
 #[test]

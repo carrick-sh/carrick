@@ -3657,7 +3657,7 @@ fn request_carrier_stage2_record_retirements(
             continue;
         }
         if custody.carrier_stage2_retirement_is_ready(identity) {
-            drive_pending_carrier_stage2_retirement(&custody, identity);
+            custody.request_global_frame_retirement_retry();
         }
     }
 }

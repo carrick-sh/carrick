@@ -992,6 +992,36 @@ where
             .map(PendingChildTidClear::address)
     }
 
+    /// Linux treats a failed `clear_child_tid` store as a best-effort exit
+    /// cleanup: release the retained write without storing zero or waking the
+    /// futex, then let exact thread retirement continue.
+    pub(super) fn skip_terminal_child_tid_write(&mut self) -> Result<(), RuntimeError> {
+        let clear = self.child_tid_clear.take().ok_or_else(|| {
+            RuntimeError::Configuration(
+                "silent terminal child-TID skip lost its retained write".to_owned(),
+            )
+        })?;
+        clear.clear.settle();
+        Ok(())
+    }
+
+    /// Sibling clear-child-TID writes drained by exec/exit have the same
+    /// best-effort Linux contract as the current thread's clear. Settling the
+    /// exact retained write deliberately omits both the store and futex wake.
+    pub(super) fn skip_one_drained_child_tid_write(&mut self) -> Result<(), RuntimeError> {
+        let clear = self
+            .drained_child_tid_clears
+            .as_mut()
+            .and_then(Vec::pop)
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "silent drained child-TID skip lost its retained write".to_owned(),
+                )
+            })?;
+        clear.clear.settle();
+        Ok(())
+    }
+
     pub(super) fn commit_terminal_child_tid<R, D>(
         &mut self,
         kernel: &Kernel,
@@ -1890,6 +1920,55 @@ mod child_tid_owner_tests {
         assert!(!sibling.exact_thread_is_live());
         assert_eq!(engine.guest_memory[&VA], [0; 4]);
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(!registry.is_clear_child_tid_addr(VA));
+        reservation
+            .commit()
+            .expect("thread membership must not invalidate prepared task exit");
+    }
+
+    #[test]
+    fn serial_host_failed_clear_child_tid_skips_store_and_futex_wake() {
+        let (kernel, root) = clear_kernel(72_511);
+        let sibling = clear_sibling(&root);
+        let tid = ThreadId::from_kernel_thread_identity(sibling.thread().key().tid.raw());
+        let registry = Arc::new(ThreadRegistry::new(tid));
+        registry.set_clear_child_tid(tid, VA);
+        let mut state = clear_state(
+            &kernel,
+            &sibling,
+            registry.clone(),
+            VcpuThreadRegistry::new(),
+        );
+        let dependency = Arc::new(ClearDependency::default());
+        let mut engine = clear_engine(&sibling, &dependency);
+        let (wakes, _subscription) = clear_wakes(&state.futex);
+        assert!(matches!(
+            state.handle_persistent_thread_exit(&kernel, &mut engine, 0, 0),
+            PersistentThreadExitDisposition::Memory {
+                error: carrick_guest_mem::MemoryPrepareError::Physical(_),
+                fault_address,
+            } if fault_address.raw() == VA
+        ));
+
+        state.skip_terminal_child_tid_write().unwrap();
+        let reservation = root
+            .kernel()
+            .prepare_task_exit_key(
+                root.task().key(),
+                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.handle_persistent_thread_exit(&kernel, &mut engine, 0, 0),
+            PersistentThreadExitDisposition::Done(VcpuLoopOutcome::ThreadDone)
+        ));
+        assert_eq!(
+            engine.guest_memory[&VA],
+            sibling.thread().key().tid.raw().to_le_bytes()
+        );
+        assert_eq!(engine.prepared_commits, 0);
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
         assert!(!registry.is_clear_child_tid_addr(VA));
         reservation
             .commit()

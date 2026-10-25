@@ -467,6 +467,9 @@ impl UserTransferCustody {
             }
             Err(CarrierStage2PinError::RetirementRequested) => {
                 carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 5);
+                if self.custody.carrier_stage2_retirement_is_terminal(identity) {
+                    return Ok(TransferRetention::StaleSelection);
+                }
                 return Ok(TransferRetention::Physical(
                     self.custody.stage2_retirement_wait(Some(identity)),
                 ));
@@ -749,6 +752,28 @@ pub(super) mod tests {
             ),
             "an absent stage-2 record is a stale selection, not an already-ready physical wait"
         );
+    }
+
+    #[test]
+    fn terminal_stage2_retirement_refusal_reselects_instead_of_reparking() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let ipa = 0xa085_3180_0000;
+        let owner = backing(&custody, ipa);
+        let physical = UserTransferCustody::new(Arc::clone(&custody));
+        custody.enqueue_carrier_stage2_retirement(owner.record_identity);
+        assert_eq!(
+            custody.request_stage2_record_retirement(owner.record_identity),
+            CarrierStage2RetireOutcome::DeferredActivePins
+        );
+        custody.terminalize_carrier_stage2_retirement(owner.record_identity);
+
+        assert!(matches!(
+            physical
+                .retain(selection(ipa), 4, PortalTransferIntent::UserRead)
+                .unwrap(),
+            TransferRetention::StaleSelection
+        ));
     }
 
     #[test]

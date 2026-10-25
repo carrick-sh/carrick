@@ -1770,6 +1770,7 @@ mod tests {
         delivered_handler: u64,
         delivered_interrupted_pc: Option<u64>,
         delivered_fault_siginfo: Option<(i32, u64)>,
+        fail_signal_frame_write: bool,
     }
 
     impl crate::trap::SyscallTrap for NoopTrap {
@@ -1798,7 +1799,11 @@ mod tests {
             self.delivered_handler = signal.handler;
             self.delivered_interrupted_pc = signal.interrupted_pc;
             self.delivered_fault_siginfo = signal.fault_siginfo;
-            Ok(())
+            if self.fail_signal_frame_write {
+                Err(TrapError::SignalDeliveryFault)
+            } else {
+                Ok(())
+            }
         }
 
         fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
@@ -2141,6 +2146,43 @@ mod tests {
                 crate::linux_abi::LINUX_SIGSEGV
             ))
         ));
+    }
+
+    #[test]
+    fn signal_frame_write_failure_forces_sigsegv_at_the_fault_address() {
+        let dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.exact_signal_context_for_test();
+        let tid = ThreadId::main_from_host_pid();
+        let signal =
+            carrick_kernel::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGILL)
+                .expect("SIGILL");
+        let mut caught = carrick_abi::LinuxSigaction::empty();
+        caught.sa_handler = 0x7000;
+        context.signal_authority().install_action(signal, caught);
+        let mut trap = NoopTrap {
+            fail_signal_frame_write: true,
+            ..NoopTrap::default()
+        };
+        let fault_address = 0xfeed_7400;
+
+        assert!(matches!(
+            inject_fault_signal(
+                &mut trap,
+                &dispatcher,
+                &context,
+                tid,
+                &mut FaultSignal {
+                    signum: crate::linux_abi::LINUX_SIGILL,
+                    si_code: 1,
+                    si_addr: fault_address,
+                    interrupted_pc: Some(0x4000_1234),
+                },
+            ),
+            Ok(FaultSignalDisposition::Terminate(
+                crate::linux_abi::LINUX_SIGSEGV
+            ))
+        ));
+        assert_eq!(trap.delivered_fault_siginfo, Some((1, fault_address)));
     }
 
     #[test]

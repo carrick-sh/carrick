@@ -1834,7 +1834,7 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         action: RetainedMemoryAction,
         mut error: carrick_guest_mem::MemoryPrepareError,
-        fault_address: carrick_guest_mem::GuestVa,
+        _fault_address: carrick_guest_mem::GuestVa,
     ) -> Result<RetainedMemoryWaitAttempt, ProductionHvpatchPollError> {
         self.phase = HvpatchProductionPhase::RetainedMemoryRetry {
             action: Box::new(action),
@@ -1861,35 +1861,27 @@ where
                         super::zone::OwnerMemoryPark::NoProducer(
                             super::zone::OwnerMemoryAction::Retained,
                         ) => {
-                            drop(self.take_retained_memory_action()?);
-                            let context = self
-                                .state
-                                .service_kernel_context
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    RuntimeError::Configuration(
-                                        "retained memory fault lost context".to_owned(),
-                                    )
-                                })?
-                                .retain_exact();
-                            let outcome = deliver_fault_signal(
-                                &self.kernel,
-                                &context,
-                                engine,
-                                self.state.this_tid,
-                                self.state.fatal_image_generation,
-                                signal::FaultSignal {
-                                    signum: crate::linux_abi::LINUX_SIGSEGV,
-                                    si_code: 1,
-                                    si_addr: fault_address.raw(),
-                                    interrupted_pc: None,
-                                },
-                                self.traps,
-                            )?;
-                            return Ok(RetainedMemoryWaitAttempt::Exit(match outcome {
-                                Some(outcome) => self.enter_terminal_with_outcome(engine, outcome),
-                                None => executor::ExecutorExit::Syscall,
-                            }));
+                            let action = self.take_retained_memory_action()?;
+                            match action {
+                                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                                RetainedMemoryAction::ChildTid { .. } => {
+                                    self.state
+                                        .complete_precompleted_child(&self.kernel.reporter, 0)?;
+                                    self.phase = HvpatchProductionPhase::Resident;
+                                    return Ok(RetainedMemoryWaitAttempt::Exit(
+                                        executor::ExecutorExit::Syscall,
+                                    ));
+                                }
+                                action @ RetainedMemoryAction::ThreadExit { .. } => {
+                                    self.state.skip_terminal_child_tid_write()?;
+                                    return Ok(RetainedMemoryWaitAttempt::Retry { action });
+                                }
+                                action @ (RetainedMemoryAction::ExecDrain { .. }
+                                | RetainedMemoryAction::ProcessFinish { .. }) => {
+                                    self.state.skip_one_drained_child_tid_write()?;
+                                    return Ok(RetainedMemoryWaitAttempt::Retry { action });
+                                }
+                            }
                         }
                         _ => {
                             return Err(RuntimeError::Configuration(
@@ -7510,7 +7502,7 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    fn retained_write_without_an_editor_producer_delivers_sigsegv_at_its_address() {
+    fn child_tid_write_without_an_editor_producer_skips_silently() {
         use carrick_el1_abi::{PortalOwnerWait, PortalWaitCause};
         use carrick_el1_linux::mm_portal::MmPortal;
         use carrick_el1_linux::mm_portal::test_support::{ROOT, Region, admit_notified, nodes};
@@ -7572,6 +7564,23 @@ mod tests {
             );
             state.service_kernel_context = Some(root.retain_exact());
             state.zone_mm = Some(mm.raw());
+            let prepared = kernel
+                .dispatcher
+                .prepare_syscall(
+                    &root,
+                    SyscallRequest::new(92, crate::compat::SyscallArgs::from([0; 6])),
+                    &kernel.reporter,
+                )
+                .expect("prepare child completion");
+            let PreparedDispatch::Invoke(syscall) = prepared else {
+                panic!("child completion fixture must reach its handler")
+            };
+            state.syscall_completion =
+                SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
+                    syscall,
+                    root.retain_exact(),
+                    kernel.dispatcher.observers().cloned(),
+                ));
             let generation = state.fatal_image_generation;
             let mut job =
                 suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
@@ -7611,14 +7620,60 @@ mod tests {
                 result.is_ok(),
                 "guest fault must not become a carrier error"
             );
-            let fatal = kernel
-                .fatal_signal
-                .recorded_for(generation)
-                .expect("default SIGSEGV action must publish through shared signal custody");
-            assert_eq!(fatal.signo, carrick_abi::LINUX_SIGSEGV);
-            assert_eq!(fatal.addr, FAULT_ADDRESS);
+            assert!(
+                kernel.fatal_signal.recorded_for(generation).is_none(),
+                "set_child_tid failure is a silent Linux lifecycle-write skip"
+            );
+            assert_eq!(engine.injected_signals.len(), 0);
             scheduler.close();
         });
+    }
+
+    #[test]
+    fn signal_frame_write_failure_delivers_sigsegv_at_the_fault_address() {
+        const FAULT_ADDRESS: u64 = 0xfeed_7400;
+        let dispatcher = SyscallDispatcher::new();
+        let (_runtime, _scheduler, kernel, root, _process, _) =
+            test_carrier_graph_with_dispatcher!(73_847, dispatcher);
+        let signal =
+            carrick_kernel::kernel::LinuxSignal::for_signal_number(crate::linux_abi::LINUX_SIGILL)
+                .expect("SIGILL");
+        let mut caught = carrick_abi::LinuxSigaction::empty();
+        caught.sa_handler = 0x7000;
+        root.signal_authority().install_action(signal, caught);
+        let generation = kernel.fatal_signal.current_generation();
+        let mut engine = CrashCaptureTestEngine {
+            fail_signal_frame_write: true,
+            ..CrashCaptureTestEngine::default()
+        };
+
+        let outcome = deliver_fault_signal(
+            &kernel,
+            &root,
+            &mut engine,
+            root.thread().registry_id(),
+            generation,
+            signal::FaultSignal {
+                signum: crate::linux_abi::LINUX_SIGILL,
+                si_code: 1,
+                si_addr: FAULT_ADDRESS,
+                interrupted_pc: Some(0x4000_1234),
+            },
+            0,
+        )
+        .expect("signal-frame failure is a guest terminal result");
+
+        assert!(outcome.is_some());
+        assert_eq!(
+            engine.injected_fault_siginfo,
+            vec![Some((1, FAULT_ADDRESS))]
+        );
+        let fatal = kernel
+            .fatal_signal
+            .recorded_for(generation)
+            .expect("forced SIGSEGV must publish through shared signal custody");
+        assert_eq!(fatal.signo, carrick_abi::LINUX_SIGSEGV);
+        assert_eq!(fatal.addr, FAULT_ADDRESS);
     }
 
     #[test]
