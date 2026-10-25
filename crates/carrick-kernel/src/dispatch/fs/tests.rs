@@ -4826,9 +4826,19 @@ impl SpliceTestRig {
     }
 
     fn run(&mut self, nr: u64, args: [u64; 6]) -> DispatchOutcome {
+        let context = self.dispatcher.capture_one_task_context().unwrap();
+        self.run_in(&context, nr, args)
+    }
+
+    fn run_in(
+        &mut self,
+        context: &crate::kernel::KernelContext,
+        nr: u64,
+        args: [u64; 6],
+    ) -> DispatchOutcome {
         self.dispatcher
             .dispatch(
-                &self.dispatcher.capture_one_task_context().unwrap(),
+                context,
                 SyscallRequest::new(nr, SyscallArgs::from(args)),
                 &mut self.memory,
                 &self.reporter,
@@ -4921,6 +4931,283 @@ fn m1_close_releases_posix_locks_before_last_alias_or_mapping() {
     );
     h.close(4);
     drop(mapping);
+}
+
+#[test]
+fn native_child_close_replays_posix_lock_release_before_last_alias() {
+    use carrick_el1_abi::ipc::fd;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    use std::os::fd::IntoRawFd;
+    use zerocopy::IntoBytes;
+
+    let mut h = SpliceTestRig::new(4096);
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let path = temp.path().to_path_buf();
+    let raw = temp.into_file().into_raw_fd();
+    let installed = h.dispatcher.install_fd(
+        OpenDescription::HostFile {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            host_fd: HostFdRef::new(raw),
+            metadata: RootFsMetadata {
+                path,
+                kind: RootFsEntryKind::File,
+                mode: 0o600,
+                size: 0,
+            },
+            writable: true,
+        },
+        0,
+    );
+    assert_eq!(installed, DispatchOutcome::Returned { value: 3 });
+
+    let root = h.dispatcher.capture_one_task_context().unwrap();
+    let fork_child = |registry_id, name: &str| {
+        root.kernel()
+            .reserve_fork(
+                &root,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty())
+                    .unwrap(),
+                name.into(),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(registry_id)
+            .unwrap()
+            .commit()
+            .unwrap()
+            .into_parts()
+            .unwrap()
+            .0
+    };
+    let child_a = fork_child(
+        carrick_hal::ThreadId::synthetic_for_tests(74_001),
+        "native lock owner",
+    );
+    let child_b = fork_child(
+        carrick_hal::ThreadId::synthetic_for_tests(74_002),
+        "native lock observer",
+    );
+
+    let flock_addr = 0x4000;
+    let lock = LinuxFlock64 {
+        l_type: LINUX_F_WRLCK as i16,
+        l_whence: 0,
+        __pad1: [0; 4],
+        l_start: 0,
+        l_len: 10,
+        l_pid: 0,
+        __pad2: [0; 4],
+    };
+    h.memory.write_bytes(flock_addr, lock.as_bytes()).unwrap();
+    assert_eq!(
+        h.run_in(
+            &child_a,
+            SpliceTestRig::SYS_FCNTL,
+            [3, LINUX_F_SETLK, flock_addr, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(
+        h.run_in(
+            &child_a,
+            SpliceTestRig::SYS_FCNTL,
+            [3, LINUX_F_DUPFD, 4, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 4 },
+    );
+
+    let mut query = lock;
+    query.l_type = LINUX_F_WRLCK as i16;
+    h.memory.write_bytes(flock_addr, query.as_bytes()).unwrap();
+    assert_eq!(
+        h.run_in(
+            &child_b,
+            SpliceTestRig::SYS_FCNTL,
+            [3, LINUX_F_GETLK, flock_addr, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    let conflict: LinuxFlock64 = h.memory.read_struct(flock_addr).unwrap();
+    let conflict_type = conflict.l_type;
+    assert_eq!(conflict_type, LINUX_F_WRLCK as i16);
+
+    let owner = Arc::new(crate::el1_ipc::HostIpc::new(1 << 16).unwrap());
+    let table = crate::el1_ipc::HostTable::create(Arc::clone(&owner), 64, 8).unwrap();
+    let child_files = child_a.resources().files();
+    let slot = child_files
+        .read_open_files()
+        .get(&3)
+        .cloned()
+        .expect("child fd 3");
+    table.replace_slot(fd::Fd(3), &slot).unwrap();
+    table.replace_slot(fd::Fd(4), &slot).unwrap();
+    let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
+    let map = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_IPC_TABLE_MAP_OFFSET as usize)
+            .cast::<carrick_el1_abi::ipc_tables::IpcTableMap>()
+    };
+    map.publish_owned(child_files.id().raw(), table.id().to_raw())
+        .unwrap();
+    let tables = carrick_el1_linux::ipc::MapTables(map);
+    let venue = carrick_el1_linux::ipc::IpcVenue {
+        region: owner.region(),
+        tables: &tables,
+    };
+    let task = carrick_el1_abi::CurrentTask::new();
+    task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(child_a.thread().key().tid.raw()),
+        carrick_el1_abi::SnapshotGeneration::from_raw(child_a.thread().key().serial.raw()),
+        child_files.id().raw(),
+    );
+    let counters = carrick_el1_abi::Counters::new();
+    let names = carrick_el1_abi::InotifyNameCache::new();
+    let run_ring = |nr: u64, fd0: u64| {
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = nr;
+        frame.x[0] = fd0;
+        let route = carrick_el1_linux::dispatch::dispatch_syscall_with_native::<
+            _,
+            carrick_el1::substrate::sched::FakeCpu,
+            carrick_el1::substrate::sched::HardwareUserWord,
+            _,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >(
+            &mut frame,
+            &counters,
+            std::slice::from_ref(&task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            None,
+            Some(&venue),
+            None,
+            None,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        (route, frame.x[0] as i64)
+    };
+    assert_eq!(run_ring(57, 3), (CompletionRoute::WithWork, 0));
+    assert_eq!(
+        task.linux.take_served_boundary(),
+        Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0: 3 }),
+    );
+
+    // Carrier replay uses the one host close authority. The duplicate in the
+    // owned table remains open, but Linux POSIX locks are process/file scoped:
+    // closing fd 3 releases them all before another owner asks F_GETLK.
+    assert_eq!(
+        h.run_in(&child_a, SpliceTestRig::SYS_CLOSE, [3, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    h.memory.write_bytes(flock_addr, query.as_bytes()).unwrap();
+    assert_eq!(
+        h.run_in(
+            &child_b,
+            SpliceTestRig::SYS_FCNTL,
+            [3, LINUX_F_GETLK, flock_addr, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    let released: LinuxFlock64 = h.memory.read_struct(flock_addr).unwrap();
+    let released_type = released.l_type;
+    assert_eq!(released_type, LINUX_F_UNLCK as i16);
+    assert!(
+        owner
+            .region()
+            .fd(crate::el1_zone::HostLockWait)
+            .get(
+                fd::TableId::from_raw(map.lookup_owned(child_files.id().raw()).unwrap()),
+                fd::Fd(4),
+            )
+            .is_ok(),
+        "native duplicate remains open after closing fd A",
+    );
+    assert!(map.take_owned(child_files.id().raw()).is_some());
+}
+
+#[test]
+fn watched_file_close_marks_ring_replay_and_emits_inotify_close() {
+    let backend = carrick_vfs::fs_backend::MemoryBackend::new();
+    backend
+        .set_file_contents("/watched-close", b"payload".to_vec())
+        .unwrap();
+    let mut h = SpliceTestRig::new(0x1000);
+    h.dispatcher.set_fs_backend(Box::new(backend));
+    let file_fd = h.open(0x4000, b"/watched-close\0", LINUX_O_RDWR);
+    let inotify_fd = match h.run(26, [0, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("inotify_init1: {other:?}"),
+    };
+    h.memory.write_bytes(0x4100, b"/watched-close\0").unwrap();
+    assert!(matches!(
+        h.run(
+            27,
+            [
+                inotify_fd,
+                0x4100,
+                u64::from(carrick_abi::LINUX_IN_CLOSE_WRITE),
+                0,
+                0,
+                0,
+            ],
+        ),
+        DispatchOutcome::Returned { value } if value > 0
+    ));
+    let late_fd = h.open(0x4150, b"/watched-close\0", LINUX_O_RDONLY);
+    let late = h
+        .dispatcher
+        .captured_file_table()
+        .read_open_files()
+        .get(&(late_fd as i32))
+        .cloned()
+        .expect("file opened after watch");
+    assert_eq!(
+        late.description.close_effects(),
+        carrick_el1_abi::ipc::fd::CloseEffects::INOTIFY_CLOSE,
+        "an open after watch registration must retain its close event too",
+    );
+
+    let files = h.dispatcher.captured_file_table();
+    assert!(
+        h.dispatcher
+            .fs
+            .inotify_registry
+            .has_watches_covering("/watched-close")
+    );
+    let slot = files
+        .read_open_files()
+        .get(&(file_fd as i32))
+        .cloned()
+        .expect("watched file slot");
+    let ipc = Arc::new(crate::el1_ipc::HostIpc::new(1 << 16).unwrap());
+    let table = crate::el1_ipc::HostTable::create(Arc::clone(&ipc), 64, 8).unwrap();
+    table
+        .replace_slot(carrick_el1_abi::ipc::fd::Fd(file_fd as i32), &slot)
+        .unwrap();
+    assert_eq!(
+        ipc.region()
+            .fd(crate::el1_zone::HostLockWait)
+            .close_effects(table.id(), carrick_el1_abi::ipc::fd::Fd(file_fd as i32),)
+            .unwrap(),
+        carrick_el1_abi::ipc::fd::CloseEffects::INOTIFY_CLOSE,
+        "watched descriptions must retain close through the host event owner",
+    );
+
+    h.close(file_fd);
+    let read = h.run(63, [inotify_fd, 0x4200, 0x100, 0, 0, 0]);
+    let DispatchOutcome::Returned { value } = read else {
+        panic!("read inotify close event: {read:?}")
+    };
+    assert!(value >= 16);
+    let event = h.memory.read_bytes(0x4200, value as usize).unwrap();
+    let mask = u32::from_ne_bytes(event[4..8].try_into().unwrap());
+    assert_ne!(mask & carrick_abi::LINUX_IN_CLOSE_WRITE, 0);
 }
 
 #[test]

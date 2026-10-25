@@ -2333,6 +2333,10 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 }
             }
             nr if nr == carrick_personality_linux::crossing::nr::CLOSE.raw() => {
+                let close_effects = match venue.region.fd(NativeFdWait).close_effects(table, old) {
+                    Ok(effects) => effects,
+                    Err(err) => return map_fd_error(err),
+                };
                 let released = match venue.region.fd(NativeFdWait).close_filtered(
                     table,
                     old,
@@ -2358,7 +2362,16 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 ) {
                     return err;
                 }
-                FamilyCompletion::Complete(0)
+                if close_effects.is_empty() {
+                    FamilyCompletion::Complete(0)
+                } else {
+                    // The numeric fd is already gone from the one shared
+                    // authority. Replay only the host-owned close effects:
+                    // the host FileTable observes the shared BadFd as an
+                    // idempotent projection and runs its canonical record-lock,
+                    // epoll and inotify teardown exactly once.
+                    FamilyCompletion::CommitOwed(0)
+                }
             }
             nr if nr == carrick_personality_linux::crossing::nr::FCNTL.raw() => {
                 let cmd = self.frame.argument(1).unwrap_or(u64::MAX);

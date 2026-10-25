@@ -1232,13 +1232,22 @@ fn el1_ipc_install_pin_shares_cross_table_flags_offsets_and_final_release() {
     )
     .unwrap();
     c.set_offset(a, Fd(1), Offset(12)).unwrap();
+    c.require_pinned_close_effects(&pin, CloseEffects::POSIX_RECORD_LOCKS)
+        .unwrap();
+    c.require_pinned_close_effects(&pin, CloseEffects::EPOLL_DETACH)
+        .unwrap();
     assert_eq!(c.get(a, Fd(1)), c.get(b, Fd(2)));
+    assert_eq!(
+        c.close_effects(b, Fd(2)).unwrap().bits(),
+        CloseEffects::POSIX_RECORD_LOCKS.bits() | CloseEffects::EPOLL_DETACH.bits(),
+    );
     assert!(c.getfl(b, Fd(2)).unwrap().1.nonblock);
     assert!(!c.getfd(a, Fd(1)).unwrap());
     assert!(c.getfd(b, Fd(2)).unwrap());
     assert_eq!(c.close(a, Fd(1)).unwrap(), None);
     assert_eq!(c.close(b, Fd(2)).unwrap(), None);
-    assert_eq!(c.unpin(pin).unwrap().unwrap().backing, BackingToken(71));
+    let released = c.unpin(pin).unwrap().unwrap();
+    assert_eq!(released.backing, BackingToken(71));
 }
 
 #[test]

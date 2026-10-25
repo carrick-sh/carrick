@@ -542,7 +542,10 @@ impl<'a> FsView<'a> {
                 _ => return,
             }
         };
-        let Some(path) = self.lookup_recorded_fd_open_path(fd) else {
+        let Some(path) = self
+            .lookup_recorded_fd_open_path(fd)
+            .or_else(|| open_file.description.open_path_snapshot())
+        else {
             return;
         };
         // Deliver to parent-directory (child) watch (if active) and object's own
@@ -557,7 +560,7 @@ impl<'a> FsView<'a> {
     /// Emit `IN_CLOSE_WRITE` (fd was writable) or `IN_CLOSE_NOWRITE` (read-only)
     /// for a `close(2)` on a watched regular file/directory. Called from the
     /// close path before the fd leaves the table. No-op when unwatched, when the
-    /// fd has no recorded path, or for non-file descriptions.
+    /// open description has no path, or for non-file descriptions.
     pub(in crate::dispatch) fn inotify_close_for_fd(&self, fd: i32) {
         if self.fs.inotify_registry.is_empty() {
             return;
@@ -591,7 +594,10 @@ impl<'a> FsView<'a> {
         }) else {
             return;
         };
-        let Some(path) = self.lookup_recorded_fd_open_path(fd) else {
+        let Some(path) = self
+            .lookup_recorded_fd_open_path(fd)
+            .or_else(|| open_file.description.open_path_snapshot())
+        else {
             return;
         };
         // IN_CLOSE_* is delivered BOTH to a watch on the object itself (self) AND

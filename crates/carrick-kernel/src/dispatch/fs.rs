@@ -1190,14 +1190,64 @@ impl<'a> FsView<'a> {
     }
 
     pub(super) fn record_fd_open_path(&self, fd: i32, path: String) {
+        let description = self.open_file(fd).map(|open_file| open_file.description);
         // The description's own path goes through the inspect authority;
         // only a name distinct from the recorded spelling needs another copy.
-        let description_path = self
-            .open_file(fd)
-            .and_then(|open_file| open_file.description().distinct_open_path_snapshot(&path));
+        let description_path = description
+            .as_ref()
+            .and_then(|description| description.distinct_open_path_snapshot(&path));
         self.captured_file_table()
             .write_fd_open_paths()
             .insert_with_description_path(fd, path, description_path);
+        self.require_close_effects_for_open_fd(fd);
+    }
+
+    pub(super) fn require_close_effects_for_open_fd(&self, fd: i32) {
+        let Some(description) = self.open_file(fd).map(|open_file| open_file.description) else {
+            return;
+        };
+        let path = self
+            .lookup_recorded_fd_open_path(fd)
+            .or_else(|| description.open_path_snapshot());
+        if path
+            .as_deref()
+            .is_some_and(|path| self.fs.inotify_registry.has_watches_covering(path))
+        {
+            description
+                .require_close_effects(carrick_el1_abi::ipc::fd::CloseEffects::INOTIFY_CLOSE);
+        }
+        if !self.fs.classic_record_locks.is_empty() {
+            let file = Self::ring_close_file_identity(&description);
+            let owner = self
+                .capture_one_task_context()
+                .ok()
+                .map(|context| LogicalRecordLockOwner::from(context.task().key()));
+            if file.zip(owner).is_some_and(|(file, owner)| {
+                self.fs.classic_record_locks.holds_file_owner(&file, owner)
+            }) {
+                description.require_close_effects(
+                    carrick_el1_abi::ipc::fd::CloseEffects::POSIX_RECORD_LOCKS,
+                );
+            }
+        }
+    }
+
+    pub(super) fn require_inotify_close_effects_for_open_files(&self) {
+        for fd in self.open_fd_numbers() {
+            let Some(description) = self.open_file(fd).map(|open| open.description) else {
+                continue;
+            };
+            let path = self
+                .lookup_recorded_fd_open_path(fd)
+                .or_else(|| description.open_path_snapshot());
+            if path
+                .as_deref()
+                .is_some_and(|path| self.fs.inotify_registry.has_watches_covering(path))
+            {
+                description
+                    .require_close_effects(carrick_el1_abi::ipc::fd::CloseEffects::INOTIFY_CLOSE);
+            }
+        }
     }
 
     pub(super) fn lookup_recorded_fd_open_path(&self, fd: i32) -> Option<String> {
