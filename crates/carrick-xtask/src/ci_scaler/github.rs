@@ -205,9 +205,14 @@ impl Github {
             &runs,
             |run| self.jobs(run),
             |run| {
-                Self::admits_run(admission, run, &mut |method, endpoint, body, paginate| {
-                    self.request(method, endpoint, body, paginate)
-                })
+                Self::admits_run(
+                    admission,
+                    run,
+                    &mut |method, endpoint, body, paginate| {
+                        self.request(method, endpoint, body, paginate)
+                    },
+                    &mut crate::dispatch_worker::recorded_publication,
+                )
             },
         )
     }
@@ -394,9 +399,12 @@ impl Github {
     /// Re-read admission and attempt immediately before minting a runner.
     /// The hook's policy is bound to this exact run and SHA.
     pub(super) fn vet(&self, admission: &Admission, key: JobKey) -> Result<JobPolicy, ScalerError> {
-        Self::vet_inner(admission, key, |method, endpoint, body, paginate| {
-            self.request(method, endpoint, body, paginate)
-        })
+        Self::vet_inner(
+            admission,
+            key,
+            |method, endpoint, body, paginate| self.request(method, endpoint, body, paginate),
+            &mut crate::dispatch_worker::recorded_publication,
+        )
     }
 
     pub(super) fn vet_assignment(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
@@ -422,6 +430,7 @@ impl Github {
     fn admits_comment(
         run: &Value,
         request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+        publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
     ) -> Result<bool, ScalerError> {
         let id = run["id"]
             .as_u64()
@@ -514,7 +523,18 @@ impl Github {
                 || !full_sha(heads[0])
                 || pr["head"]["sha"] != heads[0]
                 || pr["state"] != "open"
-                || !crate::dispatch_worker::owned_pr(&pr, &original, issue_number, branch)
+                || !crate::dispatch_worker::owned_pr(
+                    &pr,
+                    &original,
+                    issue_number,
+                    branch,
+                    (if pr["user"]["login"] == "carrick-workers[bot]" {
+                        publication(&pr, &original, issue_number, branch)
+                    } else {
+                        None
+                    })
+                    .as_ref(),
+                )
             {
                 return Ok(false);
             }
@@ -536,13 +556,14 @@ impl Github {
         admission: &Admission,
         run: &Value,
         request: &mut impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+        publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
     ) -> Result<bool, ScalerError> {
         let checked = (|| -> Result<bool, ScalerError> {
             if !admission.identifies_run(run) {
                 return Ok(false);
             }
             if matches!(admission, Admission::Agent) && run["event"] == "issue_comment" {
-                return Self::admits_comment(run, request);
+                return Self::admits_comment(run, request, publication);
             }
             if !matches!(admission, Admission::Agent) || run["event"] != "pull_request_review" {
                 return Ok(true);
@@ -571,7 +592,18 @@ impl Github {
             )?;
             if !prs.as_array().into_iter().flatten().any(|pr| {
                 pr["head"]["sha"] == run["head_sha"]
-                    && crate::dispatch_worker::owned_pr(pr, &original, issue, branch)
+                    && crate::dispatch_worker::owned_pr(
+                        pr,
+                        &original,
+                        issue,
+                        branch,
+                        (if pr["user"]["login"] == "carrick-workers[bot]" {
+                            publication(pr, &original, issue, branch)
+                        } else {
+                            None
+                        })
+                        .as_ref(),
+                    )
             }) {
                 return Ok(false);
             }
@@ -598,6 +630,7 @@ impl Github {
         admission: &Admission,
         key: JobKey,
         mut request: impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+        publication: &mut crate::dispatch_worker::PublicationLookup<'_>,
     ) -> Result<JobPolicy, ScalerError> {
         let run = request(
             "GET",
@@ -605,7 +638,7 @@ impl Github {
             None,
             false,
         )?;
-        if !Self::admits_run(admission, &run, &mut request)?
+        if !Self::admits_run(admission, &run, &mut request, publication)?
             || run["id"].as_u64() != Some(key.run.0)
             || run["run_attempt"].as_u64() != Some(u64::from(key.attempt))
         {
@@ -839,7 +872,7 @@ mod tests {
                 else if endpoint.ends_with("/actions/runs/42") { original.clone() }
                 else if endpoint.ends_with("/issues/799") { issue.clone() }
                 else { panic!("unexpected endpoint {endpoint}") })
-            }).unwrap();
+            }, &mut |_, _, _, _| None).unwrap();
             if admitted != allowed {
                 unsafe_cases.push(case);
             }
@@ -898,29 +931,34 @@ mod tests {
                 attempt: 1,
                 job: JobId(9),
             };
-            let result = Github::vet_inner(&Admission::Agent, key, |method, endpoint, _, _| {
-                assert_eq!(method, "GET");
-                if endpoint.ends_with("/99") {
-                    Ok(run.clone())
-                } else if endpoint.ends_with("/42") {
-                    Ok(original.clone())
-                } else if endpoint.contains("/pulls?") {
-                    Ok(json!([pr.clone()]))
-                } else if endpoint.contains("/compare/main...") {
-                    assert!(endpoint.ends_with(&"a".repeat(40)));
-                    Ok(
-                        json!({"merge_base_commit":{"sha":"b".repeat(40)},"files":[{"filename":if changed { DISPATCH_WORKFLOW } else { "source.rs" }}]}),
-                    )
-                } else if endpoint.contains("/contents/") {
-                    Ok(
-                        json!({"type":"file","sha":if endpoint.ends_with("ref=main") { "c".repeat(40) } else { head_blob.repeat(40) }}),
-                    )
-                } else if endpoint.ends_with("/jobs?per_page=100") {
-                    Ok(json!([{"jobs":review_jobs(9)}]))
-                } else {
-                    panic!("unexpected API endpoint: {endpoint}")
-                }
-            });
+            let result = Github::vet_inner(
+                &Admission::Agent,
+                key,
+                |method, endpoint, _, _| {
+                    assert_eq!(method, "GET");
+                    if endpoint.ends_with("/99") {
+                        Ok(run.clone())
+                    } else if endpoint.ends_with("/42") {
+                        Ok(original.clone())
+                    } else if endpoint.contains("/pulls?") {
+                        Ok(json!([pr.clone()]))
+                    } else if endpoint.contains("/compare/main...") {
+                        assert!(endpoint.ends_with(&"a".repeat(40)));
+                        Ok(
+                            json!({"merge_base_commit":{"sha":"b".repeat(40)},"files":[{"filename":if changed { DISPATCH_WORKFLOW } else { "source.rs" }}]}),
+                        )
+                    } else if endpoint.contains("/contents/") {
+                        Ok(
+                            json!({"type":"file","sha":if endpoint.ends_with("ref=main") { "c".repeat(40) } else { head_blob.repeat(40) }}),
+                        )
+                    } else if endpoint.ends_with("/jobs?per_page=100") {
+                        Ok(json!([{"jobs":review_jobs(9)}]))
+                    } else {
+                        panic!("unexpected API endpoint: {endpoint}")
+                    }
+                },
+                &mut |_, _, _, _| None,
+            );
             if result.is_ok() != allowed {
                 failures.push(format!(
                     "bot={bot}, PR changed={changed}, head blob={head_blob}: admitted={}",
@@ -952,7 +990,7 @@ mod tests {
                     blobs.push(endpoint.to_owned());
                     Ok(json!({"type":"file","sha":if endpoint.ends_with(&"a".repeat(40)) {head_blob.repeat(40)} else {"b".repeat(40)}}))
                 } else { panic!("unexpected endpoint {endpoint}") }
-            }).unwrap();
+            }, &mut |_, _, _, _| None).unwrap();
             assert_eq!(admitted, allowed);
             assert_eq!(blobs.len(), 2);
             assert!(blobs[1].ends_with(&format!("ref={}", "b".repeat(40))));
@@ -1001,9 +1039,12 @@ mod tests {
             |run| Ok(review_jobs(run["id"].as_u64().unwrap())),
             |run| {
                 if run["id"] == 99 {
-                    Github::admits_run(&Admission::Agent, run, &mut |_, _, _, _| {
-                        Err(ScalerError::GithubGone)
-                    })
+                    Github::admits_run(
+                        &Admission::Agent,
+                        run,
+                        &mut |_, _, _, _| Err(ScalerError::GithubGone),
+                        &mut |_, _, _, _| None,
+                    )
                 } else {
                     Ok(true)
                 }
@@ -1019,13 +1060,18 @@ mod tests {
             job: JobId(9),
         };
         assert!(
-            Github::vet_inner(&Admission::Agent, key, |_, endpoint, _, _| {
-                if endpoint.ends_with("/99") {
-                    Ok(review_run(99))
-                } else {
-                    Err(ScalerError::GithubGone)
-                }
-            })
+            Github::vet_inner(
+                &Admission::Agent,
+                key,
+                |_, endpoint, _, _| {
+                    if endpoint.ends_with("/99") {
+                        Ok(review_run(99))
+                    } else {
+                        Err(ScalerError::GithubGone)
+                    }
+                },
+                &mut |_, _, _, _| None
+            )
             .is_err()
         );
     }
@@ -1044,17 +1090,24 @@ mod tests {
             ("completed", "failure", false),
             ("completed", "success", true),
         ] {
-            let policy = Github::vet_inner(&Admission::Agent, key, |_, endpoint, _, paginated| {
-                if endpoint.ends_with("/42") {
-                    return Ok(run.clone());
-                }
-                assert_eq!(
-                    endpoint,
-                    "repos/carrick-sh/carrick/actions/runs/42/attempts/2/jobs?per_page=100"
-                );
-                assert!(paginated);
-                Ok(json!([{"jobs":[{"name":"guard", "status":status,"conclusion":conclusion}]}]))
-            });
+            let policy = Github::vet_inner(
+                &Admission::Agent,
+                key,
+                |_, endpoint, _, paginated| {
+                    if endpoint.ends_with("/42") {
+                        return Ok(run.clone());
+                    }
+                    assert_eq!(
+                        endpoint,
+                        "repos/carrick-sh/carrick/actions/runs/42/attempts/2/jobs?per_page=100"
+                    );
+                    assert!(paginated);
+                    Ok(
+                        json!([{"jobs":[{"name":"guard", "status":status,"conclusion":conclusion}]}]),
+                    )
+                },
+                &mut |_, _, _, _| None,
+            );
             assert_eq!(policy.is_ok(), permitted);
             if permitted {
                 assert!(matches!(policy.unwrap(), JobPolicy::Agent(_)));
@@ -1082,11 +1135,16 @@ mod tests {
                 "head_repository":{"full_name":REPOSITORY},
                 "actor":{"login":"tjfontaine"},
                 "triggering_actor":{"login":"tjfontaine"}});
-            let result = Github::vet_inner(&Admission::Standing, key, |method, endpoint, _, _| {
-                assert_eq!(method, "GET");
-                assert!(endpoint.ends_with("/runs/1"), "{endpoint}");
-                Ok(run.clone())
-            });
+            let result = Github::vet_inner(
+                &Admission::Standing,
+                key,
+                |method, endpoint, _, _| {
+                    assert_eq!(method, "GET");
+                    assert!(endpoint.ends_with("/runs/1"), "{endpoint}");
+                    Ok(run.clone())
+                },
+                &mut |_, _, _, _| None,
+            );
             assert_eq!(result.is_ok(), admitted, "{event} {branch}");
             if let Ok(policy) = result {
                 assert!(
