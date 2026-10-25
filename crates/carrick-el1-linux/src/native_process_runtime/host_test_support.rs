@@ -1512,6 +1512,7 @@ fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSib
     }
 }
 
+#[cfg(test)]
 #[test]
 fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
     let fixture = native_exec_fixture();
@@ -1750,16 +1751,19 @@ fn exec_after_sibling_drain(parked_read: bool) {
     assert_eq!(sibling.task.mm.key.load(Ordering::Acquire), 1);
 }
 
+#[cfg(test)]
 #[test]
 fn native_exec_drains_a_spinning_sibling_without_reentering_el0() {
     exec_after_sibling_drain(false);
 }
 
+#[cfg(test)]
 #[test]
 fn native_exec_drains_a_sibling_parked_in_an_owned_read() {
     exec_after_sibling_drain(true);
 }
 
+#[cfg(test)]
 #[test]
 fn native_parent_observes_exec_child_exit_after_successor_first_syscall() {
     let capacity = NativeServiceCapacityFixture::new(1);
