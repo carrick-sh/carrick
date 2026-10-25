@@ -2116,6 +2116,8 @@ enum AppliedBody {
 #[serde(deny_unknown_fields)]
 struct Applied {
     commits: Vec<String>,
+    #[serde(default)]
+    rebased_onto: Option<String>,
     body: AppliedBody,
     board_changes: Vec<String>,
     #[serde(default)]
@@ -2145,7 +2147,7 @@ impl Applied {
     }
     fn report(&self) -> String {
         format!(
-            "- Commits pushed: {}.\n- PR body: {}.\n- Board status: {}.",
+            "- Commits pushed: {}.{}\n- PR body: {}.\n- Board status: {}.",
             if self.commits.is_empty() {
                 "none".into()
             } else {
@@ -2155,6 +2157,10 @@ impl Applied {
                     .collect::<Vec<_>>()
                     .join(", ")
             },
+            self.rebased_onto
+                .as_ref()
+                .map(|base| format!("\n- Rebased onto main at {base}."))
+                .unwrap_or_default(),
             match &self.body {
                 AppliedBody::NotUpdated => "not updated".into(),
                 AppliedBody::Created => "created".into(),
@@ -2796,20 +2802,32 @@ fn publish(
                 pr["number"]
             )?;
         } else if existing != Some(head.trim()) {
-            let since = existing.unwrap_or(&receipt.base);
-            let commits: Vec<_> =
-                git(&work, &["rev-list", "--reverse", &format!("{since}..HEAD")])?
-                    .lines()
-                    .filter(|s| sha(s))
-                    .map(str::to_owned)
-                    .collect();
+            // receipt.base is this event's admitted main. The old remote tip
+            // can precede a rebase and would include other people's main work.
+            let base = git(&work, &["merge-base", &receipt.base, "HEAD"])?;
+            let base = base.trim();
+            let rebased_onto = if receipt.expected_tip.is_empty() {
+                None
+            } else {
+                let previous_base =
+                    git(&work, &["merge-base", &receipt.base, &receipt.expected_tip])?;
+                (previous_base.trim() != base).then(|| base.to_owned())
+            };
+            let commits: Vec<_> = git(&work, &["rev-list", "--reverse", &format!("{base}..HEAD")])?
+                .lines()
+                .filter(|s| sha(s))
+                .map(str::to_owned)
+                .collect();
             output(&mut push_command(
                 &work,
                 dispatch,
                 id,
                 &receipt.expected_tip,
             )?)?;
-            Applied::record(|a| a.commits.extend(commits))?;
+            Applied::record(|a| {
+                a.commits = commits;
+                a.rebased_onto = rebased_onto;
+            })?;
         }
         if !retained {
             std::fs::write(state.join("published-tip"), head.trim())?;
@@ -3224,6 +3242,10 @@ mod tests {
         }
     }
     #[test]
+    fn p849_rebase_reports_only_pr_commits_and_names_main_base() {
+        publication_fixture("rebase-evidence");
+    }
+    #[test]
     fn rev4_transient_reference_read_is_retried() {
         publication_fixture("transient");
     }
@@ -3563,6 +3585,20 @@ fi
             .unwrap()
             .trim()
             .to_owned();
+        if witness == "rebase-evidence" {
+            git(&work, &["checkout", "-b", "advanced-main", &receipt.base]).unwrap();
+            for subject in ["main one", "main two", "main three"] {
+                git(&work, &["commit", "--allow-empty", "-m", subject]).unwrap();
+            }
+            let new_base = git(&work, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_owned();
+            git(&work, &["checkout", &dispatch.branch]).unwrap();
+            git(&work, &["rebase", "--onto", &new_base, &receipt.base]).unwrap();
+            dispatch.base = new_base.clone();
+            receipt.base = new_base;
+        }
         git(
             &work,
             &[
@@ -3626,7 +3662,7 @@ fi
             let applied = Applied::load().unwrap();
             assert_eq!(
                 applied.commits.len(),
-                1,
+                2,
                 "snapshot failure prevented the push"
             );
             assert!(
@@ -3708,7 +3744,13 @@ fi
             assert!(applied.body == AppliedBody::NotUpdated);
             assert_eq!(
                 applied.commits,
-                vec![git(&work, &["rev-parse", "HEAD"]).unwrap().trim()]
+                git(
+                    &work,
+                    &["rev-list", "--reverse", &format!("{}..HEAD", receipt.base)]
+                )
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>()
             );
             return;
         }
@@ -3726,10 +3768,28 @@ fi
             Some(800)
         );
         let applied = Applied::load().unwrap();
+        if witness == "rebase-evidence" {
+            let expected = git(
+                &work,
+                &["rev-list", "--reverse", &format!("{}..HEAD", receipt.base)],
+            )
+            .unwrap();
+            assert_eq!(
+                applied.commits,
+                expected.lines().collect::<Vec<_>>(),
+                "rebased main commits were reported as pushed"
+            );
+            assert!(
+                applied
+                    .report()
+                    .contains(&format!("Rebased onto main at {}", receipt.base)),
+                "rebase base missing from applied report"
+            );
+        }
         if witness == "refused" {
             assert_eq!(
                 applied.commits.len(),
-                1,
+                2,
                 "rejected proposal blocked commit push"
             );
             assert!(

@@ -173,6 +173,13 @@ Fallback outcome contracts come only from authenticated server outcome comments,
 never from PR bodies. `Outcome contract:` is reserved for those reports; body
 proposals and the comment tool refuse the marker.
 
+`[loop].loop_backend` and `[loop].loop_model` select the coordinator itself.
+They are omitted from its event budgets and do not constrain workers. Worker
+choice is the loop's own decision from `read_capacity` and task difficulty.
+The applied outcome lists only `merge-base(admitted main, head)..head` as
+commits pushed, and reports a moved main base separately as “Rebased onto
+main at <sha>”.
+
 The only ceilings are `[loop]` in `.github/dispatch-tiers.toml`: 12 tool calls,
 two state reads, three workers, three refused worker requests, one publication,
 two optional comments, three status updates, 64 KiB state, 42 wall minutes
