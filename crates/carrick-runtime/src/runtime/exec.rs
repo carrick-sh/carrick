@@ -134,11 +134,9 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
         Box<dyn carrick_vmm_hvf::metadata_grant::NativeExecPreparation>,
         carrick_core_abi::service::ServiceFailureCode,
     > {
-        let fail = |errno: LinuxErrno| match carrick_core_abi::service::ServiceFailureCode::new(
-            errno.get() as u32,
-        ) {
-            Some(failure) => failure,
-            None => carrick_fatal!("runtime::native_exec", "zero Linux errno"),
+        let fail = |errno: LinuxErrno| {
+            carrick_core_abi::service::ServiceFailureCode::new(errno.get() as u32)
+                .unwrap_or(carrick_core_abi::service::ServiceFailureCode::MINIMUM)
         };
         let loaded = prepare_native_exec_image(self, payload).map_err(fail)?;
         let plan = carrick_vmm_hvf::trap::GuestMappingPlan::from_address_space(&loaded.image)
