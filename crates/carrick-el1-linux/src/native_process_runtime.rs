@@ -312,6 +312,12 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     type Mm: Clone;
     type PreparedMm;
     type Born;
+    fn prepare_exec_successor_slot(
+        &self,
+        _mm: carrick_core_abi::ReservationMm,
+    ) -> Result<Box<dyn ExecSuccessorSlot + 'a>, NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
     fn adopt_exec_successor(
         &self,
         _identity: carrick_core_abi::service::ServiceIdentity,
@@ -505,6 +511,14 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Result<(), NativeProcessError> {
         Err(NativeProcessError::Unsupported)
     }
+}
+
+/// Ring-owned publication of an exec successor before any host preparation.
+/// Dropping an uncommitted token retires both publications.
+pub trait ExecSuccessorSlot: Send {
+    fn mm(&self) -> carrick_core_abi::ReservationMm;
+    fn root_generation(&self) -> core::num::NonZeroU64;
+    fn commit(self: Box<Self>);
 }
 
 /// The closed successor made installable by one consuming host receipt.

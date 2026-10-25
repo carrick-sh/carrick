@@ -130,14 +130,14 @@ impl NativeService {
             } => (capability, self.exec_payload().ok_or_else(stale)?),
             _ => return self.refuse(),
         };
-        let (successor_mm, manifest) = match self.reply.as_ref() {
+        let (successor_mm, root_generation, manifest) = match self.reply.as_ref() {
             Some(NativeServiceReply::Exec(manifest)) => {
                 // SAFETY: intake pinned the complete aligned ring-owned reply;
                 // request completion has not yet released that allocation.
-                let successor_mm = unsafe { manifest.as_ref() }
+                let (successor_mm, root_generation) = unsafe { manifest.as_ref() }
                     .proposal(request.identity)
                     .ok_or_else(stale)?;
-                (successor_mm, *manifest)
+                (successor_mm, root_generation, *manifest)
             }
             _ => return Err(stale()),
         };
@@ -158,7 +158,7 @@ impl NativeService {
                         );
                     }
                 };
-                self.publish_exec_prepared(successor_mm, manifest, prepared)
+                self.publish_exec_prepared(successor_mm, root_generation, manifest, prepared)
             }
             Err(failure) => self.finish_exec_failure(failure),
         }
@@ -167,6 +167,7 @@ impl NativeService {
     fn publish_exec_prepared(
         self,
         successor_mm: carrick_el1_abi::ReservationMm,
+        root_generation: core::num::NonZeroU64,
         manifest: core::ptr::NonNull<carrick_core_abi::service::ExecSuccessorManifest>,
         prepared: crate::trap::PreparedNativeExecSuccessor,
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
@@ -176,29 +177,12 @@ impl NativeService {
             TrapError::Hypervisor("native exec receipt space exhausted".to_owned())
         })?;
         let asid = prepared.prepared_asid().ok_or_else(stale)?;
-        let region = retained_abi_region(&self.custody).ok_or_else(stale)?;
-        let (_, zone) = stopped_records(
-            region,
-            carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
-        )
-        .ok_or_else(stale)?;
-        let root_index = zone
-            .spaces
-            .next_publication_index(successor_mm.raw())
-            .ok_or_else(stale)?;
-        let root_generation = region
-            .reservations()
-            .ok_or_else(stale)?
-            .next_publication_generation(root_index.index())
-            .map_err(|_| stale())?;
         let sealed = unsafe { manifest.as_ref() }
             .seal(
                 identity,
                 receipt,
                 carrick_core_abi::service::ExecSuccessorBacking {
                     root: prepared.root(),
-                    root_generation: core::num::NonZeroU64::new(root_generation.raw())
-                        .ok_or_else(stale)?,
                     asid: asid.asid(),
                     asid_generation: core::num::NonZeroU64::new(asid.generation())
                         .ok_or_else(stale)?,

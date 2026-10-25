@@ -448,26 +448,6 @@ impl AddressSpaces {
         None
     }
 
-    /// Host, serialized: identify the slot that the next closed publication
-    /// for `key` will use without mutating it. A later publication still
-    /// revalidates the slot; this is only for sealing the exact reservation
-    /// root incarnation into a prepared transaction.
-    pub fn next_publication_index(&self, key: u64) -> Option<SpaceIndex> {
-        if key == 0 || key == FREED {
-            return None;
-        }
-        let start = (key % ADDRESS_SPACES as u64) as usize;
-        for probe in 0..ADDRESS_SPACES {
-            let index = (start + probe) % ADDRESS_SPACES;
-            let entry = &self.entries[index];
-            let current = entry.key.load(Ordering::SeqCst);
-            if (current == 0 || current == FREED) && entry.notifications.reusable() {
-                return SpaceIndex::from_index(index);
-            }
-        }
-        None
-    }
-
     /// Host: let EL1 install the entry (pauses raised meanwhile stay
     /// counted).
     pub fn open(&self, index: SpaceIndex) {
@@ -682,6 +662,34 @@ impl AddressSpaces {
         }
         let ttbr0 = entry.ttbr0.load(Ordering::Acquire);
         (ttbr0 != 0 && entry.key.load(Ordering::SeqCst) == key).then_some(ttbr0)
+    }
+
+    /// Host: bind the physical root to one exact never-opened publication.
+    /// The ring owns publication and the host may only fill the initially-zero
+    /// roots once while the initial-bind gate is still held.
+    pub fn bind_initial_root(&self, index: SpaceIndex, key: u64, ttbr0: u64, ttbr1: u64) -> bool {
+        if ttbr0 == 0 || ttbr1 == 0 {
+            return false;
+        }
+        let entry = self.entry(index);
+        if entry.gate.load(Ordering::SeqCst) != (GATE_CLOSED | GATE_INITIAL_BIND)
+            || entry.key.load(Ordering::SeqCst) != key
+            || entry.ttbr0.load(Ordering::Acquire) != 0
+            || entry.ttbr1.load(Ordering::Acquire) != 0
+        {
+            return false;
+        }
+        entry.ttbr1.store(ttbr1, Ordering::Release);
+        match entry
+            .ttbr0
+            .compare_exchange(0, ttbr0, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(_) => {
+                entry.ttbr1.store(0, Ordering::Release);
+                false
+            }
+        }
     }
 
     /// EL1: a broadcast invalidation of the space's ASID covered the
@@ -952,6 +960,17 @@ impl AddressSpaces {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ring_published_initial_root_binds_exactly_once() {
+        let spaces = AddressSpaces::new();
+        let index = spaces.publish_closed(70, 0, 0).unwrap();
+        assert!(spaces.mark_initial_bindable(index));
+        assert!(spaces.bind_initial_root(index, 70, 0x30_000, 0x30_000));
+        assert_eq!(spaces.closed_root_identity(index, 70), Some(0x30_000));
+        assert!(!spaces.bind_initial_root(index, 70, 0x40_000, 0x40_000));
+        assert!(!spaces.bind_initial_root(index, 71, 0x40_000, 0x40_000));
+    }
 
     #[test]
     fn initial_closed_bind_is_exact_and_expires_at_first_open() {
