@@ -328,20 +328,16 @@ struct PreparedExecBacking {
     custody: std::sync::Arc<CarrierVmCustody>,
 }
 
-/// Completely fallible native exec preparation. It owns no process/MM
-/// publication and installs no stage-2 map; dropping it releases the fresh
-/// ASID and every uninstalled backing/IPA lease.
+/// Completely fallible native exec preparation. Physical mapping and
+/// retention are complete before this value is published to the ring; drop
+/// rolls them back together with the still-unpublished ASID.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct PreparedNativeExecSuccessor {
-    parts: Option<PreparedNativeExecParts>,
-    root: carrick_guest_arch::RootGpa,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-struct PreparedNativeExecParts {
-    backing: PreparedExecBacking,
-    root_slot: (u64, u64),
+    physical: crate::fork_stock::NativeChildPhysical,
     asid: carrick_hal::asid::UnpublishedAsid,
+    root: carrick_guest_arch::RootGpa,
+    entry: u64,
+    stack_pointer: u64,
 }
 
 // SAFETY: this is deliberately a movable, unpublished transaction.  Every raw
@@ -357,16 +353,8 @@ unsafe impl Send for PreparedNativeExecSuccessor {}
 impl core::fmt::Debug for PreparedNativeExecSuccessor {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PreparedNativeExecSuccessor")
-            .field("prepared_backing", &self.parts.is_some())
             .field("root", &self.root)
-            .field(
-                "root_slot",
-                &self.parts.as_ref().map(|parts| parts.root_slot),
-            )
-            .field(
-                "asid",
-                &self.parts.as_ref().map(|parts| parts.asid.generation()),
-            )
+            .field("asid", &self.asid.generation())
             .finish_non_exhaustive()
     }
 }
@@ -377,24 +365,25 @@ impl PreparedNativeExecSuccessor {
         self.root
     }
 
-    pub(crate) fn prepared_asid(&self) -> Option<carrick_hal::asid::AsidGeneration> {
-        self.parts.as_ref().map(|parts| parts.asid.generation())
+    pub(crate) fn prepared_asid(&self) -> carrick_hal::asid::AsidGeneration {
+        self.asid.generation()
     }
 
     pub(crate) fn entry(&self) -> u64 {
-        self.parts
-            .as_ref()
-            .map_or(0, |parts| parts.backing.plan.entry)
+        self.entry
     }
 
-    pub(crate) fn stack_pointer(&self) -> Option<u64> {
-        self.parts
-            .as_ref()
-            .and_then(|parts| parts.backing.plan.initial_stack_pointer)
+    pub(crate) fn stack_pointer(&self) -> u64 {
+        self.stack_pointer
     }
 
-    fn take_install_parts(&mut self) -> Option<PreparedNativeExecParts> {
-        self.parts.take()
+    pub(crate) fn consume(
+        self,
+    ) -> (
+        crate::fork_stock::NativeChildPhysical,
+        carrick_hal::asid::AsidGeneration,
+    ) {
+        (self.physical, self.asid.publish())
     }
 }
 
@@ -427,13 +416,17 @@ pub(crate) fn prepare_native_exec_successor(
         .allocate_unpublished()
         .map_err(|error| TrapError::Hypervisor(format!("allocate native exec ASID: {error}")))?;
     let backing = PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), global)?;
+    let entry = backing.plan.entry;
+    let stack_pointer = backing.plan.initial_stack_pointer.ok_or_else(|| {
+        TrapError::Hypervisor("native exec successor has no initial stack".to_owned())
+    })?;
+    let physical = install_native_exec_physical(backing, root_slot)?;
     Ok(PreparedNativeExecSuccessor {
-        parts: Some(PreparedNativeExecParts {
-            backing,
-            root_slot,
-            asid,
-        }),
+        physical,
+        asid,
         root,
+        entry,
+        stack_pointer,
     })
 }
 
@@ -855,28 +848,13 @@ fn install_prepared_exec_backing(
     Ok(published)
 }
 
-/// Consume the carrier-retained native successor at the same physical
-/// installation transaction used by host-graph exec. The returned custody is
-/// sendable process-stock ownership; no host task or `KernelContext` is
-/// reconstructed.
+/// Complete all fallible physical installation before an adoption receipt can
+/// be published. The returned custody rolls the installation back on drop.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn install_native_exec_successor(
-    mut successor: PreparedNativeExecSuccessor,
-) -> Result<
-    (
-        crate::fork_stock::NativeChildPhysical,
-        carrick_hal::asid::AsidGeneration,
-    ),
-    TrapError,
-> {
-    let parts = successor.take_install_parts().ok_or_else(|| {
-        TrapError::Hypervisor("prepared native exec successor was already consumed".into())
-    })?;
-    let PreparedNativeExecParts {
-        backing: prepared,
-        root_slot,
-        asid,
-    } = parts;
+fn install_native_exec_physical(
+    prepared: PreparedExecBacking,
+    root_slot: (u64, u64),
+) -> Result<crate::fork_stock::NativeChildPhysical, TrapError> {
     let custody = std::sync::Arc::clone(&prepared.custody);
     let published = install_prepared_exec_backing(prepared, root_slot).map_err(|failure| {
         let message = match failure {
@@ -900,9 +878,7 @@ pub(crate) fn install_native_exec_successor(
             })?;
         inherited.push(retained);
     }
-    let physical = crate::fork_stock::NativeChildPhysical::new(inherited);
-    let asid = asid.publish();
-    Ok((physical, asid))
+    Ok(crate::fork_stock::NativeChildPhysical::new(inherited))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

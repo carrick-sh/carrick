@@ -632,8 +632,8 @@ impl<T, C> PendingForkLoan<T, C> {
 struct CommittedChild<T, C> {
     owner: carrick_el1_abi::El1MmHandle,
     root: RootGpa,
-    lifecycle: ForkLifecycleLoan,
-    control: ForkControlCapacity,
+    lifecycle: Option<ForkLifecycleLoan>,
+    control: Option<ForkControlCapacity>,
     tag: ChildTag<T>,
     /// Carrier authenticated physical allocations inherited by this MM.
     /// They stay pinned through quarantine and drop only after neutral release.
@@ -648,7 +648,7 @@ struct CommittedChild<T, C> {
 struct ExecPredecessor<T, C> {
     predecessor: ReservationMm,
     successor: ReservationMm,
-    tag: ChildTag<T>,
+    tag: Option<ChildTag<T>>,
     tables: Vec<RootGpa>,
     physical: C,
     released: bool,
@@ -1003,7 +1003,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     }
 
     pub fn child_lifecycle(&self, mm: ReservationMm) -> Option<ForkLifecycleLoan> {
-        Some(self.children.get(&MmKey::of(mm)?)?.lifecycle)
+        self.children.get(&MmKey::of(mm)?)?.lifecycle
     }
 
     /// Preclaim authenticated EL1 table-pool pages for one exact live child.
@@ -1270,6 +1270,49 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         successor_tag: T::Tag,
         successor_physical: C,
     ) -> Result<ExecPredecessorReceipt<T::Tag>, (ForkStockServiceError, C)> {
+        self.replace_for_exec_with_tag(
+            execution,
+            successor,
+            successor_root,
+            successor_tag,
+            successor_physical,
+            None,
+        )
+    }
+
+    /// Move the authenticated carrier root to an exec successor. The root has
+    /// no fork lifecycle/control row, but after replacement its physical MM is
+    /// represented in the same child stock used by faults and retirement.
+    pub fn replace_root_for_exec_with_tag(
+        &mut self,
+        execution: GrantExecution,
+        successor: carrick_el1_abi::El1MmHandle,
+        successor_root: RootGpa,
+        successor_tag: T::Tag,
+        successor_physical: C,
+    ) -> Result<ExecPredecessorReceipt<T::Tag>, (ForkStockServiceError, C)>
+    where
+        C: Default,
+    {
+        self.replace_for_exec_with_tag(
+            execution,
+            successor,
+            successor_root,
+            successor_tag,
+            successor_physical,
+            Some(C::default()),
+        )
+    }
+
+    fn replace_for_exec_with_tag(
+        &mut self,
+        execution: GrantExecution,
+        successor: carrick_el1_abi::El1MmHandle,
+        successor_root: RootGpa,
+        successor_tag: T::Tag,
+        successor_physical: C,
+        root_predecessor: Option<C>,
+    ) -> Result<ExecPredecessorReceipt<T::Tag>, (ForkStockServiceError, C)> {
         let refuse = |tags: &mut T, error, physical| {
             let released = tags.release_unpublished(successor_tag);
             Err((released.err().unwrap_or(error), physical))
@@ -1296,13 +1339,19 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 successor_physical,
             );
         };
-        let exact_predecessor = self.children.get(&predecessor_key).is_some_and(|child| {
-            child.owner.carrier() == self.carrier
-                && child.owner.mm() == predecessor_mm
-                && child.root == execution.context.root
-                && child.owner.incarnation() == execution.context.generation.raw()
-                && execution.context.mm.raw().get() == predecessor_mm.raw()
-        });
+        let exact_predecessor = match self.children.get(&predecessor_key) {
+            Some(child) if root_predecessor.is_none() => {
+                child.owner.carrier() == self.carrier
+                    && child.owner.mm() == predecessor_mm
+                    && child.root == execution.context.root
+                    && child.owner.incarnation() == execution.context.generation.raw()
+                    && execution.context.mm.raw().get() == predecessor_mm.raw()
+            }
+            None if root_predecessor.is_some() => {
+                execution.context.mm.raw().get() == predecessor_mm.raw()
+            }
+            _ => false,
+        };
         if !exact_predecessor
             || successor.carrier() != self.carrier
             || successor_mm == predecessor_mm
@@ -1331,13 +1380,24 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
 
         // All validation and fallible allocation completed. These removals
         // are exact by the checks above and the mutable owner excludes drift.
-        let Some(predecessor) = self.children.remove(&predecessor_key) else {
-            return refuse(
-                &mut self.tags,
-                ForkStockServiceError::StaleExecution,
-                successor_physical,
-            );
-        };
+        let (lifecycle, control, predecessor_tag, predecessor_physical) =
+            if let Some(predecessor) = self.children.remove(&predecessor_key) {
+                (
+                    predecessor.lifecycle,
+                    predecessor.control,
+                    Some(predecessor.tag),
+                    predecessor.physical,
+                )
+            } else {
+                let Some(predecessor_physical) = root_predecessor else {
+                    return refuse(
+                        &mut self.tags,
+                        ForkStockServiceError::StaleExecution,
+                        successor_physical,
+                    );
+                };
+                (None, None, None, predecessor_physical)
+            };
         let mut tables = self
             .committed_tables
             .remove(&predecessor_key)
@@ -1346,8 +1406,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         let successor_child = CommittedChild {
             owner: successor,
             root: successor_root,
-            lifecycle: predecessor.lifecycle,
-            control: predecessor.control,
+            lifecycle,
+            control,
             tag: ChildTag::bind(successor_tag, successor_mm),
             physical: successor_physical,
         };
@@ -1356,9 +1416,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         let pending = ExecPredecessor {
             predecessor: predecessor_mm,
             successor: successor_mm,
-            tag: predecessor.tag,
+            tag: predecessor_tag,
             tables,
-            physical: predecessor.physical,
+            physical: predecessor_physical,
             released: false,
         };
         let replaced = self.exec_predecessors.insert(sequence, pending);
@@ -1409,7 +1469,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             self.exec_predecessors.insert(receipt.sequence, pending);
             return Err(ForkStockServiceError::ExposedDirtyTable);
         }
-        if let Err(error) = self.tags.retire(pending.tag, absence) {
+        if let Some(tag) = pending.tag
+            && let Err(error) = self.tags.retire(tag, absence)
+        {
             self.exec_predecessors.insert(receipt.sequence, pending);
             return Err(error);
         }
@@ -1903,8 +1965,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             CommittedChild {
                 owner: admitted.completion.child,
                 root: pending.child_tables[0],
-                lifecycle: pending.lifecycle,
-                control: pending.control,
+                lifecycle: Some(pending.lifecycle),
+                control: Some(pending.control),
                 tag: ChildTag::bind(pending.tag, loan.request.child_mm),
                 physical: admitted.physical,
             },
@@ -2129,7 +2191,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                         .ok_or(ForkStockServiceError::InvalidRecord)?
                         .released = true;
                     !clear_tables(pages)
-                        || !clear_lifecycle(lifecycle)
+                        || lifecycle.is_some_and(|lifecycle| !clear_lifecycle(lifecycle))
                         || self.tags.retire(tag, absence).is_err()
                 }
             } else {
@@ -2151,9 +2213,13 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 self.tables.extend(pages);
             }
             if let Some(child) = child {
-                self.lifecycles.push(child.lifecycle);
-                if child.control.is_exclusive() {
-                    self.controls.push(child.control);
+                if let Some(lifecycle) = child.lifecycle {
+                    self.lifecycles.push(lifecycle);
+                }
+                if let Some(control) = child.control
+                    && control.is_exclusive()
+                {
+                    self.controls.push(control);
                 }
                 self.counters.returned_children = self.counters.returned_children.saturating_add(1);
             }
@@ -2169,11 +2235,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     /// root MM rather than the fork stock.
     pub fn retire_exited_root(&mut self, mm: ReservationMm) {
         if let Some(key) = MmKey::of(mm) {
-            self.children.remove(&key);
-            if self
-                .committed_tables
-                .get(&key)
-                .is_some_and(|pages| !pages.is_empty())
+            if self.children.contains_key(&key)
+                || self
+                    .committed_tables
+                    .get(&key)
+                    .is_some_and(|pages| !pages.is_empty())
             {
                 self.quarantine.entry(key).or_default();
             } else {
@@ -2196,7 +2262,10 @@ impl<C> ForkStock<AsidAllocator, C> {
                 .iter()
                 .flatten()
                 .any(|loan| loan.control == control)
-            || self.children.values().any(|child| child.control == control)
+            || self
+                .children
+                .values()
+                .any(|child| child.control == Some(control))
         {
             return Err(ForkStockServiceError::InvalidRecord);
         }

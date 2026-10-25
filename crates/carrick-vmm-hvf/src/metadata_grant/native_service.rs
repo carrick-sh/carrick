@@ -176,7 +176,7 @@ impl NativeService {
         let receipt = custody.reserve_native_exec_receipt().map_err(|()| {
             TrapError::Hypervisor("native exec receipt space exhausted".to_owned())
         })?;
-        let asid = prepared.prepared_asid().ok_or_else(stale)?;
+        let asid = prepared.prepared_asid();
         let sealed = unsafe { manifest.as_ref() }
             .seal(
                 identity,
@@ -189,16 +189,13 @@ impl NativeService {
                 },
                 carrick_core_abi::service::ExecSuccessorEntry {
                     entry: carrick_guest_arch::UserVa::new(prepared.entry()),
-                    stack_pointer: carrick_guest_arch::UserVa::new(
-                        prepared.stack_pointer().ok_or_else(stale)?,
-                    ),
+                    stack_pointer: carrick_guest_arch::UserVa::new(prepared.stack_pointer()),
                 },
             )
             .ok_or_else(stale)?;
-        if sealed
-            .open(identity, receipt)
-            .is_none_or(|view| view.successor_mm != successor_mm)
-        {
+        if sealed.open(identity, receipt).is_none_or(|view| {
+            view.successor_mm != successor_mm || view.root_generation != root_generation
+        }) {
             return Err(stale());
         }
         self.finish_exec_ticket(|ticket| {

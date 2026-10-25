@@ -69,15 +69,6 @@ impl<'a> RetainedAbiRegion<'a> {
             .is_multiple_of(core::mem::align_of::<T>())
             .then_some(pointer.cast())
     }
-
-    fn reservations(self) -> Option<&'a carrick_el1::memory::reservations::SharedReservations> {
-        let pointer = self.record_ptr::<carrick_el1::memory::reservations::SharedReservations>(
-            carrick_el1_abi::EL1_RESERVATIONS_OFFSET as usize,
-        )?;
-        // SAFETY: the retained ABI mapping contains the initialized shared
-        // reservation table at this typed, layout-hashed offset.
-        Some(unsafe { &*pointer })
-    }
 }
 
 /// Runtime-owned handback venue for an already enrolled parent wait.
@@ -1852,16 +1843,7 @@ fn service_native_exec_adopt(
         request.refuse();
         return Ok(refused);
     }
-    let (physical, asid) = match crate::trap::install_native_exec_successor(prepared) {
-        Ok(installed) => installed,
-        Err(_) => {
-            // The receipt has been consumed, so this process cannot retry or
-            // return to the predecessor image. Refuse the adoption crossing;
-            // the ring maps that terminal refusal to process-group death.
-            request.refuse();
-            return Ok(refused);
-        }
-    };
+    let (physical, asid) = prepared.consume();
     // SAFETY: the ring published this exact closed reservation owner before
     // crossing; the sealed manifest binds its incarnation to this receipt.
     let successor_handle = unsafe {
@@ -1873,13 +1855,28 @@ fn service_native_exec_adopt(
     };
     let predecessor = {
         let mut stock = custody.fork_stock.lock();
-        match stock.owner.replace_child_for_exec_with_tag(
-            execution,
-            successor_handle,
-            successor.root,
-            asid,
-            physical,
-        ) {
+        let predecessor_mm = carrick_core_abi::ReservationMm::new(execution.binding.mm.raw());
+        let child = predecessor_mm
+            .and_then(|mm| stock.owner.child_owner(mm))
+            .is_some();
+        let replaced = if child {
+            stock.owner.replace_child_for_exec_with_tag(
+                execution,
+                successor_handle,
+                successor.root,
+                asid,
+                physical,
+            )
+        } else {
+            stock.owner.replace_root_for_exec_with_tag(
+                execution,
+                successor_handle,
+                successor.root,
+                asid,
+                physical,
+            )
+        };
+        match replaced {
             Ok(receipt) => receipt,
             Err((error, _physical)) => {
                 return Err(TrapError::Hypervisor(format!(
