@@ -333,21 +333,85 @@ struct PreparedExecBacking {
 /// ASID and every uninstalled backing/IPA lease.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct PreparedNativeExecSuccessor {
-    global: Option<GlobalExecPlan>,
-    custody: std::sync::Arc<CarrierVmCustody>,
+    parts: Option<PreparedNativeExecParts>,
     root: carrick_guest_arch::RootGpa,
-    root_slot: (u64, u64),
-    asid: Option<carrick_hal::asid::AsidGeneration>,
 }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct PreparedNativeExecParts {
+    backing: PreparedExecBacking,
+    root_slot: (u64, u64),
+    asid: UnpublishedExecAsid,
+}
+
+/// RAII owner for an allocated ASID until physical publication succeeds.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct UnpublishedExecAsid {
+    allocator: carrick_hal::asid::AsidAllocator,
+    generation: carrick_hal::asid::AsidGeneration,
+    armed: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl UnpublishedExecAsid {
+    fn new(
+        allocator: carrick_hal::asid::AsidAllocator,
+        generation: carrick_hal::asid::AsidGeneration,
+    ) -> Self {
+        Self {
+            allocator,
+            generation,
+            armed: true,
+        }
+    }
+
+    fn generation(&self) -> carrick_hal::asid::AsidGeneration {
+        self.generation
+    }
+
+    fn publish(mut self) -> carrick_hal::asid::AsidGeneration {
+        self.armed = false;
+        self.generation
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for UnpublishedExecAsid {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = self.allocator.release_unpublished(self.generation)
+        {
+            carrick_fatal!(
+                "hvpatch::exec_prepare",
+                "release unpublished exec ASID failed: {error}"
+            );
+        }
+    }
+}
+
+// SAFETY: this is deliberately a movable, unpublished transaction.  Every raw
+// host address remains owned by the corresponding `PreparedExecRegion`; no HVF
+// mapping or carrier record names it until consuming installation.  Moving the
+// transaction to the worker that resumes the exact exec continuation therefore
+// moves all backing/lease/root-slot owners together, and Drop performs only the
+// owners' ordinary rollback when installation never begins.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for PreparedNativeExecSuccessor {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl core::fmt::Debug for PreparedNativeExecSuccessor {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PreparedNativeExecSuccessor")
-            .field("prepared_plan", &self.global.is_some())
+            .field("prepared_backing", &self.parts.is_some())
             .field("root", &self.root)
-            .field("root_slot", &self.root_slot)
-            .field("asid", &self.asid)
+            .field(
+                "root_slot",
+                &self.parts.as_ref().map(|parts| parts.root_slot),
+            )
+            .field(
+                "asid",
+                &self.parts.as_ref().map(|parts| parts.asid.generation()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -359,43 +423,23 @@ impl PreparedNativeExecSuccessor {
     }
 
     pub(crate) fn prepared_asid(&self) -> Option<carrick_hal::asid::AsidGeneration> {
-        self.asid
+        self.parts.as_ref().map(|parts| parts.asid.generation())
     }
 
     pub(crate) fn entry(&self) -> u64 {
-        self.global.as_ref().map_or(0, |global| global.plan.entry)
+        self.parts
+            .as_ref()
+            .map_or(0, |parts| parts.backing.plan.entry)
     }
 
     pub(crate) fn stack_pointer(&self) -> Option<u64> {
-        self.global
+        self.parts
             .as_ref()
-            .and_then(|global| global.plan.initial_stack_pointer)
+            .and_then(|parts| parts.backing.plan.initial_stack_pointer)
     }
 
-    fn take_install_parts(
-        &mut self,
-    ) -> Option<(
-        GlobalExecPlan,
-        (u64, u64),
-        carrick_hal::asid::AsidGeneration,
-    )> {
-        let global = self.global.take()?;
-        let Some(asid) = self.asid.take() else {
-            self.global = Some(global);
-            return None;
-        };
-        Some((global, self.root_slot, asid))
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for PreparedNativeExecSuccessor {
-    fn drop(&mut self) {
-        if let Some(asid) = self.asid.take()
-            && let Err(error) = self.custody.asid_allocator().release_unpublished(asid)
-        {
-            tracing::error!(%error, "failed to release unpublished native exec ASID");
-        }
+    fn take_install_parts(&mut self) -> Option<PreparedNativeExecParts> {
+        self.parts.take()
     }
 }
 
@@ -423,16 +467,22 @@ pub(crate) fn prepare_native_exec_successor(
         .ok_or_else(|| {
             TrapError::Hypervisor("native exec successor root mapping is absent".to_owned())
         })?;
-    let asid = custody
-        .asid_allocator()
+    let allocator = custody.asid_allocator().clone();
+    let asid = allocator
         .allocate()
         .map_err(|error| TrapError::Hypervisor(format!("allocate native exec ASID: {error}")))?;
+    let asid = UnpublishedExecAsid::new(allocator, asid);
+    let backing = match PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), global) {
+        Ok(backing) => backing,
+        Err(error) => return Err(error),
+    };
     Ok(PreparedNativeExecSuccessor {
-        global: Some(global),
-        custody,
+        parts: Some(PreparedNativeExecParts {
+            backing,
+            root_slot,
+            asid,
+        }),
         root,
-        root_slot,
-        asid: Some(asid),
     })
 }
 
@@ -868,11 +918,15 @@ pub(crate) fn install_native_exec_successor(
     ),
     TrapError,
 > {
-    let custody = std::sync::Arc::clone(&successor.custody);
-    let (global, root_slot, asid) = successor.take_install_parts().ok_or_else(|| {
+    let parts = successor.take_install_parts().ok_or_else(|| {
         TrapError::Hypervisor("prepared native exec successor was already consumed".into())
     })?;
-    let prepared = PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), global)?;
+    let PreparedNativeExecParts {
+        backing: prepared,
+        root_slot,
+        asid,
+    } = parts;
+    let custody = std::sync::Arc::clone(&prepared.custody);
     let published = install_prepared_exec_backing(prepared, root_slot).map_err(|failure| {
         let message = match failure {
             ExecBackingTransactionError::RolledBack(error) => error.to_string(),
@@ -896,6 +950,7 @@ pub(crate) fn install_native_exec_successor(
         inherited.push(retained);
     }
     let physical = crate::fork_stock::NativeChildPhysical::new(inherited);
+    let asid = asid.publish();
     Ok((physical, asid))
 }
 
