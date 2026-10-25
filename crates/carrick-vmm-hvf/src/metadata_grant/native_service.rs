@@ -173,9 +173,15 @@ impl NativeService {
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let identity = self.request().identity;
         let custody = Arc::clone(&self.custody);
-        let receipt = custody.reserve_native_exec_receipt().map_err(|()| {
-            TrapError::Hypervisor("native exec receipt space exhausted".to_owned())
-        })?;
+        let receipt = match custody.reserve_native_exec_receipt() {
+            Ok(receipt) => receipt,
+            Err(()) => {
+                drop(prepared);
+                return self.finish_exec_failure(
+                    ServiceFailureCode::new(11).unwrap_or(ServiceFailureCode::MINIMUM),
+                );
+            }
+        };
         let asid = prepared.prepared_asid();
         let sealed = unsafe { manifest.as_ref() }
             .seal(
