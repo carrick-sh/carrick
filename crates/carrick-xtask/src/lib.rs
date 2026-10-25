@@ -22,6 +22,7 @@ pub mod fixtures;
 pub mod guest_image;
 pub mod host_lease;
 pub mod host_load;
+#[cfg(feature = "impact")]
 pub mod impact;
 pub mod lease_supervisor;
 pub mod ledger_merge;

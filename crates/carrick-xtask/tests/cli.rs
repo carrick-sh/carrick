@@ -368,3 +368,14 @@ fn lint_source_reports_later_checks_after_a_ratchet_failure() {
         "ratchet diagnostic: {stdout}"
     );
 }
+
+#[test]
+fn impact_is_an_explicit_feature_while_ci_changes_is_always_available() {
+    use clap::CommandFactory;
+    let command = carrick_xtask::cli::Cli::command();
+    assert!(command.find_subcommand("ci-changes").is_some());
+    assert_eq!(
+        command.find_subcommand("impact").is_some(),
+        cfg!(feature = "impact")
+    );
+}
