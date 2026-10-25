@@ -1513,14 +1513,10 @@ pub(crate) fn install_ipc_window_using(
             Ok(record) => records.push(record),
             Err(error) => {
                 for (identity, rollback) in records {
-                    let stage1 = custody
-                        .stage1_unpublished_from_rollback(identity, rollback.rollback())
-                        .ok_or_else(|| {
-                            TrapError::Hypervisor(
-                                "IPC rollback receipt names another stage-2 record".to_owned(),
-                            )
-                        })?;
-                    let requested = custody.request_stage2_record_retirement(identity, stage1);
+                    let requested = custody.request_never_published_stage2_record_retirement(
+                        identity,
+                        rollback.rollback(),
+                    );
                     if requested != CarrierStage2RetireOutcome::DeferredActivePins {
                         return Err(TrapError::Hypervisor(format!(
                             "IPC rollback retirement request failed: {requested:?}"

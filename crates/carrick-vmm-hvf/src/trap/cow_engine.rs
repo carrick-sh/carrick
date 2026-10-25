@@ -3984,14 +3984,14 @@ impl HvfTaskState {
             Ok(split) => split,
             Err(error) => {
                 if fresh_destination && !guest_lane {
-                    if let Some(identity) = global_frame_stage2_identity_in(
+                    if let Some(_identity) = global_frame_stage2_identity_in(
                         custody,
                         new_physical_ipa,
                         CowArmedRanges::COMPOUND_SIZE,
                     ) {
-                        if let Some(stage1) = rollback_receipt.take().and_then(|receipt| {
-                            custody.stage1_unpublished_from_rollback(identity, receipt.rollback())
-                        }) {
+                        if let Some(stage1) =
+                            rollback_receipt.take().map(|receipt| receipt.rollback())
+                        {
                             let _ = retire_global_frame_host_owner_in(
                                 custody,
                                 stage1,
@@ -4324,14 +4324,13 @@ impl HvfTaskState {
                 }
             }
             if fresh_destination && !guest_lane {
-                if let Some(identity) = global_frame_stage2_identity_in(
+                if let Some(_identity) = global_frame_stage2_identity_in(
                     custody,
                     new_physical_ipa,
                     CowArmedRanges::COMPOUND_SIZE,
                 ) {
-                    if let Some(stage1) = rollback_receipt.take().and_then(|receipt| {
-                        custody.stage1_unpublished_from_rollback(identity, receipt.rollback())
-                    }) {
+                    if let Some(stage1) = rollback_receipt.take().map(|receipt| receipt.rollback())
+                    {
                         let _ = retire_global_frame_host_owner_in(
                             custody,
                             stage1,

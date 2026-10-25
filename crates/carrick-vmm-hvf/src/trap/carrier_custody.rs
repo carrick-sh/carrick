@@ -460,6 +460,7 @@ impl NeverPublishedRecord {
 pub(crate) enum Stage2RetirementProof {
     Unpublished(DirectStage1RetirementProof),
     Released(super::frame_inventory::Stage1Unpublished),
+    NeverPublished(NeverPublishedRecord),
     Authorized(std::sync::Arc<Stage2RetirementAuthorization>),
 }
 
@@ -478,6 +479,12 @@ impl From<std::sync::Arc<Stage2RetirementAuthorization>> for Stage2RetirementPro
 impl From<super::frame_inventory::Stage1Unpublished> for Stage2RetirementProof {
     fn from(value: super::frame_inventory::Stage1Unpublished) -> Self {
         Self::Released(value)
+    }
+}
+
+impl From<NeverPublishedRecord> for Stage2RetirementProof {
+    fn from(value: NeverPublishedRecord) -> Self {
+        Self::NeverPublished(value)
     }
 }
 
@@ -829,25 +836,17 @@ impl CarrierVmCustody {
                 let snapshot = self.stage2_record_snapshot(identity.record_id)?;
                 receipt
                     .covers(snapshot.ipa, snapshot.len)
-                    .then_some(DirectStage1RetirementProof {
-                        identity,
-                    })
+                    .then_some(DirectStage1RetirementProof { identity })
             }
             Stage1UnpublicationReceipt::Inventory(receipt) => {
                 Some(self.stage1_unpublished_by_inventory_commit(identity, receipt))
             }
-            Stage1UnpublicationReceipt::NeverPublished(receipt) => self
-                .stage1_unpublished_from_rollback(
-                    identity,
-                    NeverPublishedRecord {
-                        identity: receipt.identity(),
-                    },
-                ),
-            Stage1UnpublicationReceipt::El1Metadata(receipt) => {
-                receipt.matches(identity).then_some(DirectStage1RetirementProof {
-                    identity,
-                })
+            Stage1UnpublicationReceipt::NeverPublished(receipt) => {
+                (receipt.identity() == identity).then_some(DirectStage1RetirementProof { identity })
             }
+            Stage1UnpublicationReceipt::El1Metadata(receipt) => receipt
+                .matches(identity)
+                .then_some(DirectStage1RetirementProof { identity }),
         }
     }
 
@@ -856,16 +855,6 @@ impl CarrierVmCustody {
             custody: self,
             changed: false,
         }
-    }
-
-    pub(crate) fn stage1_unpublished_from_rollback(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-        receipt: NeverPublishedRecord,
-    ) -> Option<DirectStage1RetirementProof> {
-        (receipt.identity == identity).then_some(DirectStage1RetirementProof {
-            identity,
-        })
     }
 
     /// Minted only after an Editor edit has removed the last stage-1 leaf and
@@ -878,9 +867,7 @@ impl CarrierVmCustody {
         let snapshot = self.stage2_record_snapshot(identity.record_id)?;
         receipt
             .names(snapshot.ipa, snapshot.len)
-            .then_some(DirectStage1RetirementProof {
-                identity,
-            })
+            .then_some(DirectStage1RetirementProof { identity })
     }
 
     fn stage1_unpublished_by_retired_arena(
@@ -891,9 +878,7 @@ impl CarrierVmCustody {
         let snapshot = self.stage2_record_snapshot(identity.record_id)?;
         receipt
             .retired_base(snapshot.ipa)
-            .then_some(DirectStage1RetirementProof {
-                identity,
-            })
+            .then_some(DirectStage1RetirementProof { identity })
     }
 
     /// Minted only by the whole-MM inventory commit after that transaction has
@@ -903,9 +888,7 @@ impl CarrierVmCustody {
         identity: CarrierStage2RecordIdentity,
         _inventory: &carrick_core::mm::retirement::Stage1UnpublishedMm,
     ) -> DirectStage1RetirementProof {
-        DirectStage1RetirementProof {
-            identity,
-        }
+        DirectStage1RetirementProof { identity }
     }
 
     /// Test support that obtains the same non-forgeable editor receipt as a
@@ -1995,6 +1978,24 @@ impl CarrierVmCustody {
         if !stage1.matches(identity) {
             return CarrierStage2RetireOutcome::NotFound;
         }
+        self.request_stage2_record_retirement_by_identity(identity)
+    }
+
+    pub(crate) fn request_never_published_stage2_record_retirement(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        proof: NeverPublishedRecord,
+    ) -> CarrierStage2RetireOutcome {
+        if proof.identity != identity {
+            return CarrierStage2RetireOutcome::NotFound;
+        }
+        self.request_stage2_record_retirement_by_identity(identity)
+    }
+
+    fn request_stage2_record_retirement_by_identity(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> CarrierStage2RetireOutcome {
         let mut state = self.state.lock();
         let Some(record) = state.stage2_records.get(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
@@ -2002,9 +2003,7 @@ impl CarrierVmCustody {
         if let Some(mismatch) = Self::stage2_identity_mismatch(record, identity) {
             return mismatch;
         }
-        let authorization = std::sync::Arc::new(Stage2RetirementAuthorization {
-            identity: stage1.identity,
-        });
+        let authorization = std::sync::Arc::new(Stage2RetirementAuthorization { identity });
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };
@@ -2037,12 +2036,7 @@ impl CarrierVmCustody {
         if stage1.lease() != (snapshot.ipa, snapshot.len as u64) {
             return CarrierStage2RetireOutcome::NotFound;
         }
-        self.request_stage2_record_retirement(
-            identity,
-            DirectStage1RetirementProof {
-                identity,
-            },
-        )
+        self.request_stage2_record_retirement(identity, DirectStage1RetirementProof { identity })
     }
 
     pub(crate) fn enqueue_carrier_stage2_retirement(&self, identity: CarrierStage2RecordIdentity) {
@@ -2738,8 +2732,8 @@ mod carrier_vm_custody_tests {
     use super::{
         CarrierLogicalOwner, CarrierStage2BackendError, CarrierStage2PinError,
         CarrierStage2RecordIdentity, CarrierStage2RecordSpec, CarrierStage2RetireOutcome,
-        CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, Stage1UnpublicationReceipt,
-        DirectStage1RetirementProof, create_vm_with_custody_using, destroy_vm_with_custody_using,
+        CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, DirectStage1RetirementProof,
+        Stage1UnpublicationReceipt, create_vm_with_custody_using, destroy_vm_with_custody_using,
     };
     use crate::trap::frame_inventory::{InventoryFrameRegistry, Stage2ReferenceReleaseError};
 

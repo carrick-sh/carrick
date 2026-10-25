@@ -3902,16 +3902,8 @@ fn request_never_published_carrier_stage2_record_retirements(
             );
             continue;
         };
-        let Some(stage1) = custody.stage1_unpublished_from_rollback(identity, never_published)
-        else {
-            debug_assert!(
-                false,
-                "rollback authority names another record: {identity:?}"
-            );
-            continue;
-        };
         custody.enqueue_carrier_stage2_retirement(identity);
-        if custody.request_stage2_record_retirement(identity, stage1)
+        if custody.request_never_published_stage2_record_retirement(identity, never_published)
             != CarrierStage2RetireOutcome::DeferredActivePins
         {
             custody.cancel_carrier_stage2_retirement(identity);
@@ -4964,15 +4956,8 @@ fn abort_prepared_task_and_carrier(
                     "unpublished inventory lost structural publication authority".to_owned(),
                 )
             })?;
-            let stage1 = custody
-                .stage1_unpublished_from_rollback(identity, never_published)
-                .ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "unpublished inventory receipt did not cover prepared structural record"
-                            .to_owned(),
-                    )
-                })?;
-            let outcome = custody.request_stage2_record_retirement(identity, stage1);
+            let outcome =
+                custody.request_never_published_stage2_record_retirement(identity, never_published);
             if outcome != carrier_custody::CarrierStage2RetireOutcome::DeferredActivePins
                 && outcome != carrier_custody::CarrierStage2RetireOutcome::TerminalizedByVmDestroy
             {
@@ -5006,17 +4991,9 @@ fn abort_prepared_task_and_carrier(
                             "prepared task rollback lost global publication authority".to_owned(),
                         )
                     })?;
-                let stage1 = custody
-                    .stage1_unpublished_from_rollback(identity, never_published)
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(
-                            "unpublished inventory receipt did not cover prepared global record"
-                                .to_owned(),
-                        )
-                    })?;
                 let outcome = retire_global_frame_host_owner_if_generation_in(
                     custody,
-                    stage1,
+                    never_published,
                     mapping.physical_ipa,
                     mapping.physical_size as u64,
                     mapping.owner_generation,

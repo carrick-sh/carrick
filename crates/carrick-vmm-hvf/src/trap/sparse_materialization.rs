@@ -1942,14 +1942,8 @@ impl MmAccessState {
                         "rollback arena lost its unpublished stage-2 receipt".to_owned(),
                     )
                 })?;
-                let stage1 = custody
-                    .stage1_unpublished_from_rollback(identity, rollback.rollback())
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(
-                            "rollback arena receipt names another stage-2 record".to_owned(),
-                        )
-                    })?;
-                if custody.request_stage2_record_retirement(identity, stage1)
+                if custody
+                    .request_never_published_stage2_record_retirement(identity, rollback.rollback())
                     != CarrierStage2RetireOutcome::DeferredActivePins
                 {
                     return Err(TrapError::Hypervisor(
@@ -2940,14 +2934,14 @@ impl Drop for PendingTransferGrant {
                     carrick_fatal!("hvpatch::user_transfer", "rollback target backend: {error}")
                 });
             drop(inventory);
-            if let Some(identity) =
+            if let Some(_identity) =
                 global_frame_stage2_identity_in(&self.context.custody, key.0, key.1)
             {
-                if let Some(stage1) = publication.rollback.take().and_then(|receipt| {
-                    self.context
-                        .custody
-                        .stage1_unpublished_from_rollback(identity, receipt.rollback())
-                }) {
+                if let Some(stage1) = publication
+                    .rollback
+                    .take()
+                    .map(|receipt| receipt.rollback())
+                {
                     retire_global_frame_host_owner_if_generation_in(
                         &self.context.custody,
                         stage1,

@@ -460,13 +460,9 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
         let rollback = owner
             .take_unpublished_rollback()
             .ok_or_else(|| "raw Fork rollback lost its publication receipt".to_owned())?;
-        let stage1 = self
-            .custody
-            .stage1_unpublished_from_rollback(identity, rollback.rollback())
-            .ok_or_else(|| "raw Fork rollback receipt names another record".to_owned())?;
         if self
             .custody
-            .request_stage2_record_retirement(identity, stage1)
+            .request_never_published_stage2_record_retirement(identity, rollback.rollback())
             != CarrierStage2RetireOutcome::DeferredActivePins
         {
             return Err("raw Fork rollback could not authorize retirement".to_owned());

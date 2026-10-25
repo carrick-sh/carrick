@@ -2543,11 +2543,11 @@ fn mapped_host_address_is_not_proof_of_a_retired_global_owner() {
         "a live host VA owned by another IPA must not resurrect a retired lease"
     );
 
-    let identity = global_frame_stage2_identity_in(custody, live_ipa, LENGTH).unwrap();
-    let stage1 = custody
-        .stage1_unpublished_from_rollback(identity, rollback.rollback())
-        .unwrap();
-    assert!(retire_global_frame_host_owner_in(custody, stage1, live_ipa, LENGTH).is_retired());
+    let _identity = global_frame_stage2_identity_in(custody, live_ipa, LENGTH).unwrap();
+    assert!(
+        retire_global_frame_host_owner_in(custody, rollback.rollback(), live_ipa, LENGTH)
+            .is_retired()
+    );
     assert!(!global_frame_host_owner_matches(
         live_ipa, LENGTH, host_addr, generation
     ));
@@ -2583,12 +2583,9 @@ fn mapped_host_address_is_not_proof_of_a_retired_global_owner() {
         global_frame_host_owner_matches(live_ipa, LENGTH, reused_addr, successor_generation),
         "the successor's own rows still authenticate"
     );
-    let successor_identity = global_frame_stage2_identity_in(custody, live_ipa, LENGTH).unwrap();
-    let successor_stage1 = custody
-        .stage1_unpublished_from_rollback(successor_identity, successor_rollback.rollback())
-        .unwrap();
+    let _successor_identity = global_frame_stage2_identity_in(custody, live_ipa, LENGTH).unwrap();
     assert!(
-        retire_global_frame_host_owner_in(custody, successor_stage1, live_ipa, LENGTH,)
+        retire_global_frame_host_owner_in(custody, successor_rollback.rollback(), live_ipa, LENGTH,)
             .is_retired()
     );
 }

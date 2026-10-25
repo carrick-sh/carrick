@@ -1768,16 +1768,12 @@ impl GlobalFrameOwnerRollback {
 impl Drop for GlobalFrameOwnerRollback {
     fn drop(&mut self) {
         for ((ipa, length), receipt) in self.keys.drain(..).rev() {
-            let Some(identity) = global_frame_stage2_identity_in(&self.custody, ipa, length) else {
-                continue;
-            };
-            let Some(stage1) = self
-                .custody
-                .stage1_unpublished_from_rollback(identity, receipt.rollback())
+            let Some(_identity) = global_frame_stage2_identity_in(&self.custody, ipa, length)
             else {
                 continue;
             };
-            let outcome = retire_global_frame_host_owner_in(&self.custody, stage1, ipa, length);
+            let outcome =
+                retire_global_frame_host_owner_in(&self.custody, receipt.rollback(), ipa, length);
             if matches!(outcome, GlobalFrameRetirementOutcome::NotFound { .. }) {
                 carrick_fatal!(
                     "hvpatch::frame_inventory",

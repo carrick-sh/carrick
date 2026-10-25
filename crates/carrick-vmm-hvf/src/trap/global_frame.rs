@@ -1899,14 +1899,8 @@ fn register_unpublished_global_frame_host_owner_in_using(
     let mut owners = custody.global_frame_host_owners.lock();
     if owners.contains_key(&key) {
         drop(owners);
-        let Some(stage1) =
-            custody.stage1_unpublished_from_rollback(record_identity, rollback.rollback())
-        else {
-            return Err(TrapError::Hypervisor(
-                "global-frame lease rollback lacks stage-1 proof".to_owned(),
-            ));
-        };
-        let requested = custody.request_stage2_record_retirement(record_identity, stage1);
+        let requested = custody
+            .request_never_published_stage2_record_retirement(record_identity, rollback.rollback());
         if requested != CarrierStage2RetireOutcome::DeferredActivePins {
             return Err(TrapError::Hypervisor(format!(
                 "global-frame lease rollback request failed: {requested:?}"
@@ -1991,14 +1985,8 @@ pub(crate) fn register_unpublished_pooled_global_frame_host_owner_in(
     let mut owners = custody.global_frame_host_owners.lock();
     if owners.contains_key(&key) {
         drop(owners);
-        let Some(stage1) =
-            custody.stage1_unpublished_from_rollback(record_identity, rollback.rollback())
-        else {
-            return Err(TrapError::Hypervisor(
-                "global-frame owner rollback lacks stage-1 proof".to_owned(),
-            ));
-        };
-        let requested = custody.request_stage2_record_retirement(record_identity, stage1);
+        let requested = custody
+            .request_never_published_stage2_record_retirement(record_identity, rollback.rollback());
         if requested != CarrierStage2RetireOutcome::DeferredActivePins {
             return Err(TrapError::Hypervisor(format!(
                 "pooled global-frame rollback request failed: {requested:?}"
@@ -2765,15 +2753,12 @@ pub(crate) fn rollback_partial_process_stage2_authorities(
             });
             continue;
         };
-        let Some(stage1) = custody.stage1_unpublished_from_rollback(identity, never_published)
-        else {
-            rollback_error.get_or_insert_with(|| {
-                TrapError::Hypervisor("unpublished owner authority named another record".to_owned())
-            });
-            continue;
-        };
         let outcome = retire_global_frame_host_owner_if_generation_in(
-            custody, stage1, ipa, length, generation,
+            custody,
+            never_published,
+            ipa,
+            length,
+            generation,
         );
         if !outcome.is_retired() {
             rollback_error.get_or_insert_with(|| {
@@ -2798,16 +2783,8 @@ pub(crate) fn rollback_partial_process_stage2_authorities(
                 });
                 continue;
             };
-            let Some(stage1) = custody.stage1_unpublished_from_rollback(identity, never_published)
-            else {
-                rollback_error.get_or_insert_with(|| {
-                    TrapError::Hypervisor(
-                        "unpublished structural authority named another record".to_owned(),
-                    )
-                });
-                continue;
-            };
-            let _ = custody.request_stage2_record_retirement(identity, stage1);
+            let _ =
+                custody.request_never_published_stage2_record_retirement(identity, never_published);
         }
         if let Err(error) = retry_structural_backing_identities_in_using(
             custody,
@@ -3547,6 +3524,11 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
                     }
                     Stage2RetirementProof::Released(stage1) => custody
                         .request_released_stage2_record_retirement(owner.record_identity, stage1),
+                    Stage2RetirementProof::NeverPublished(stage1) => custody
+                        .request_never_published_stage2_record_retirement(
+                            owner.record_identity,
+                            stage1,
+                        ),
                     Stage2RetirementProof::Authorized(_) => {
                         return GlobalFrameRetirementOutcome::RetryPending {
                             ipa,
