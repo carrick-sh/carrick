@@ -88,6 +88,41 @@ pub struct AsidAllocator {
     state: Arc<Mutex<AsidAllocatorState>>,
 }
 
+/// An ASID allocated for an address space that has not yet been published.
+/// Dropping the reservation returns the numeric ASID directly to the reusable
+/// pool; publishing consumes the rollback authority.
+#[derive(Debug)]
+pub struct UnpublishedAsid {
+    allocator: AsidAllocator,
+    generation: AsidGeneration,
+    armed: bool,
+}
+
+impl UnpublishedAsid {
+    pub fn generation(&self) -> AsidGeneration {
+        self.generation
+    }
+
+    pub fn publish(mut self) -> AsidGeneration {
+        self.armed = false;
+        self.generation
+    }
+}
+
+impl Drop for UnpublishedAsid {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self.allocator.state.lock();
+        let removed = state.live.remove(&self.generation);
+        debug_assert!(removed, "owned unpublished ASID remained live");
+        if removed {
+            state.reusable.push_back(self.generation.asid);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct AsidAllocatorState {
     next: u32,
@@ -152,6 +187,14 @@ impl AsidAllocator {
         let inserted = state.live.insert(generation);
         debug_assert!(inserted, "allocator returned an ASID that was already live");
         Ok(generation)
+    }
+
+    pub fn allocate_unpublished(&self) -> Result<UnpublishedAsid, AsidError> {
+        Ok(UnpublishedAsid {
+            allocator: self.clone(),
+            generation: self.allocate()?,
+            armed: true,
+        })
     }
 
     /// Release an ASID reserved for an address space that was never published
@@ -294,6 +337,32 @@ mod tests {
             allocator.allocate().expect("recycled ASID").asid(),
             asid.asid()
         );
+    }
+
+    #[test]
+    fn owned_unpublished_asid_returns_on_drop() {
+        let allocator = AsidAllocator::with_limit_for_tests(1);
+        let reservation = allocator.allocate_unpublished().expect("reservation");
+        let asid = reservation.generation();
+
+        drop(reservation);
+
+        assert_eq!(
+            allocator.allocate().expect("recycled ASID").asid(),
+            asid.asid()
+        );
+    }
+
+    #[test]
+    fn publishing_owned_unpublished_asid_disarms_rollback() {
+        let allocator = AsidAllocator::with_limit_for_tests(1);
+        let reservation = allocator.allocate_unpublished().expect("reservation");
+        let published = reservation.publish();
+
+        assert_eq!(allocator.allocate(), Err(AsidError::Exhausted));
+        allocator
+            .release_unpublished(published)
+            .expect("published owner releases explicitly");
     }
 
     #[test]
