@@ -98,6 +98,7 @@ pub enum ServiceOperation {
     /// The exact service birth/MM authenticates the stage-1 translation; this
     /// descriptor is never a host pointer.
     Exec {
+        capability: ExecCapabilityId,
         payload: ExecPayloadDescriptor,
     },
 }
@@ -664,17 +665,23 @@ impl ServiceCell {
             ServiceOperation::Exception(exception) => {
                 (4, exception.kind.encode(), exception.address.raw())
             }
-            ServiceOperation::Exec { payload } => {
-                (5, payload.address().raw(), payload.length().raw())
-            }
+            ServiceOperation::Exec {
+                capability: _,
+                payload,
+            } => (5, payload.address().raw(), payload.length().raw()),
         };
         for (index, value) in [(8, execution.raw()), (9, kind), (10, first), (11, second)] {
             self.words[index].store(value, Ordering::Relaxed);
         }
         // The request stamp and completion result occupy disjoint protocol
         // phases. Claim copies the stamp before acknowledgment writes a result.
-        self.result
-            .store(fault_sequence.map_or(0, NonZeroU64::get), Ordering::Relaxed);
+        self.result.store(
+            match operation {
+                ServiceOperation::Exec { capability, .. } => capability.raw().get(),
+                _ => fault_sequence.map_or(0, NonZeroU64::get),
+            },
+            Ordering::Relaxed,
+        );
         self.wait_revision
             .store(reply.map_or(0, |address| address.raw()), Ordering::Relaxed);
         self.sequence.store(next.get(), Ordering::Relaxed);
@@ -796,6 +803,10 @@ impl ServiceCell {
                     ),
                 }),
                 5 => ServiceOperation::Exec {
+                    capability: ExecCapabilityId::new(
+                        NonZeroU64::new(cell.result.load(Ordering::Relaxed))
+                            .ok_or(ServiceError::Stale)?,
+                    ),
                     payload: ExecPayloadDescriptor::checked(
                         GuestVa::new(first),
                         GuestLen::new(cell.words[11].load(Ordering::Relaxed)),
@@ -804,7 +815,11 @@ impl ServiceCell {
                 },
                 _ => return Err(ServiceError::Stale),
             };
-            let fault_sequence = NonZeroU64::new(cell.result.load(Ordering::Relaxed));
+            let fault_sequence = if matches!(operation, ServiceOperation::Fault(_)) {
+                NonZeroU64::new(cell.result.load(Ordering::Relaxed))
+            } else {
+                None
+            };
             if fault_sequence.is_some() && !matches!(operation, ServiceOperation::Fault(_)) {
                 return Err(ServiceError::Stale);
             }
@@ -877,15 +892,20 @@ impl ServiceCell {
                     && cell.words[10].load(Ordering::Relaxed) == exception.kind.encode()
                     && cell.words[11].load(Ordering::Relaxed) == exception.address.raw()
             }
-            ServiceOperation::Exec { payload } => {
+            ServiceOperation::Exec {
+                capability,
+                payload,
+            } => {
                 cell.words[9].load(Ordering::Relaxed) == 5
                     && cell.words[10].load(Ordering::Relaxed) == payload.address().raw()
                     && cell.words[11].load(Ordering::Relaxed) == payload.length().raw()
+                    && cell.result.load(Ordering::Relaxed) == capability.raw().get()
             }
         };
         if !operation_matches
-            || cell.result.load(Ordering::Relaxed)
-                != request.fault_sequence.map_or(0, NonZeroU64::get)
+            || (!matches!(request.operation, ServiceOperation::Exec { .. })
+                && cell.result.load(Ordering::Relaxed)
+                    != request.fault_sequence.map_or(0, NonZeroU64::get))
         {
             cell.state.store(state, Ordering::Release);
             return Err(ServiceError::Stale);
@@ -1231,6 +1251,9 @@ mod tests {
         )
         .unwrap()
     }
+    fn exec_capability() -> ExecCapabilityId {
+        ExecCapabilityId::new(NonZeroU64::new(17).unwrap())
+    }
 
     #[test]
     fn exec_payload_round_trips_without_fixed_word_truncation() {
@@ -1242,14 +1265,20 @@ mod tests {
             .publish(
                 owner,
                 SnapshotGeneration::INITIAL,
-                ServiceOperation::Exec { payload },
+                ServiceOperation::Exec {
+                    capability: exec_capability(),
+                    payload,
+                },
                 None,
             )
             .unwrap();
         let ticket = cell.claim(request).unwrap();
         assert_eq!(
             ticket.request().operation,
-            ServiceOperation::Exec { payload }
+            ServiceOperation::Exec {
+                capability: exec_capability(),
+                payload,
+            }
         );
         assert!(ticket.complete(true).is_ok());
         assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Supplied));
@@ -1278,6 +1307,7 @@ mod tests {
                     owner,
                     SnapshotGeneration::INITIAL,
                     ServiceOperation::Exec {
+                        capability: exec_capability(),
                         payload: exec_payload(0x5000_0000, 64),
                     },
                     None,
@@ -1307,6 +1337,7 @@ mod tests {
                 owner,
                 SnapshotGeneration::INITIAL,
                 ServiceOperation::Exec {
+                    capability: exec_capability(),
                     payload: exec_payload(0x6000_0000, 256),
                 },
                 None,
@@ -1317,6 +1348,15 @@ mod tests {
         assert!(matches!(cell.claim(stale), Err(ServiceError::Stale)));
         stale = request;
         stale.identity.sequence = NonZeroU64::new(request.identity.sequence.get() + 1).unwrap();
+        assert!(matches!(cell.claim(stale), Err(ServiceError::Stale)));
+        stale = request;
+        let ServiceOperation::Exec { payload, .. } = stale.operation else {
+            unreachable!();
+        };
+        stale.operation = ServiceOperation::Exec {
+            capability: ExecCapabilityId::new(NonZeroU64::new(18).unwrap()),
+            payload,
+        };
         assert!(matches!(cell.claim(stale), Err(ServiceError::Stale)));
         assert!(cell.claim(request).unwrap().complete(true).is_ok());
     }
