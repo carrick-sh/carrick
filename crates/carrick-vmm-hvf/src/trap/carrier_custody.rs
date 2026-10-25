@@ -438,6 +438,10 @@ pub struct CarrierVmCustody {
     /// Retirement publishes only after its backend mapping is gone or the VM
     /// terminalizes the record, never merely because a reservation root moved.
     stage2_retirement_changed: carrick_thread::completion::CompletionCallbacks,
+    /// Subscribers recheck an exact IPA after its stage-2 backing authority
+    /// publishes, replaces, or terminalizes a record. The callback is shared;
+    /// each wait probes its own IPA after enrollment.
+    stage2_publication_changed: carrick_thread::completion::CompletionCallbacks,
     pub(crate) structural_backings: parking_lot::Mutex<
         std::collections::BTreeMap<
             CarrierStage2RecordId,
@@ -804,6 +808,7 @@ impl CarrierVmCustody {
                 stage2_extent_index: std::collections::BTreeMap::new(),
             }),
             stage2_retirement_changed: carrick_thread::completion::CompletionCallbacks::default(),
+            stage2_publication_changed: carrick_thread::completion::CompletionCallbacks::default(),
             structural_backings: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             carrier_stage2_records: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             pending_carrier_stage2_retirements: parking_lot::Mutex::new(
@@ -1048,6 +1053,7 @@ impl CarrierVmCustody {
         };
         drop(destroyed_stock);
         self.stage2_retirement_changed.publish(0);
+        self.publish_stage2_availability_change();
         Ok(())
     }
 
@@ -1343,6 +1349,8 @@ impl CarrierVmCustody {
                 "stage-2 map failed: {rc:#x}"
             )));
         }
+        drop(state);
+        self.publish_stage2_availability_change();
         Ok(identity)
     }
 
@@ -1631,6 +1639,7 @@ impl CarrierVmCustody {
             .lock()
             .insert(identity.record_id, identity);
         self.stage2_retirement_changed.publish(0);
+        self.publish_stage2_availability_change();
     }
 
     pub(crate) fn carrier_stage2_retirement_is_terminal(
@@ -1693,6 +1702,7 @@ impl CarrierVmCustody {
                             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
                     ) {
                         self.stage2_retirement_changed.publish(0);
+                        self.publish_stage2_availability_change();
                     }
                     return outcome;
                 }
@@ -1717,6 +1727,7 @@ impl CarrierVmCustody {
                 | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
         ) {
             self.stage2_retirement_changed.publish(0);
+            self.publish_stage2_availability_change();
         }
         outcome
     }
@@ -1740,6 +1751,42 @@ pub(crate) type CarrierStage2Pin = carrick_core::mm::retirement::RecordPin<Carri
 pub(crate) struct Stage2RetirementWait {
     custody: std::sync::Weak<CarrierVmCustody>,
     identity: Option<CarrierStage2RecordIdentity>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(::core::fmt::Debug)]
+pub(crate) struct Stage2PublicationWait {
+    custody: std::sync::Weak<CarrierVmCustody>,
+    ipa: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Stage2PublicationWait {
+    fn is_complete(&self) -> bool {
+        let Some(custody) = self.custody.upgrade() else {
+            return true;
+        };
+        custody.stage2_publication_is_ready(self.ipa)
+            || !custody.stage2_publication_authority_covers(self.ipa)
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_guest_mem::PhysicalMemoryWait for Stage2PublicationWait {
+    fn is_ready(&self) -> bool {
+        self.is_complete()
+    }
+
+    fn enroll(
+        &self,
+        wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+        let Some(custody) = self.custody.upgrade() else {
+            return (Box::new(()), true);
+        };
+        let enrollment = custody.stage2_publication_changed.enroll(move |_| wake());
+        (Box::new(enrollment), self.is_complete())
+    }
 }
 
 impl Stage2RetirementWait {
@@ -1782,6 +1829,128 @@ impl carrick_guest_mem::PhysicalMemoryWait for Stage2RetirementWait {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierVmCustody {
+    fn stage2_publication_is_ready(&self, ipa: u64) -> bool {
+        let Some(identity) = self.stage2_record_covering(ipa, 1) else {
+            return false;
+        };
+        let global_identity = {
+            let owners = self.global_frame_host_owners.lock();
+            owners
+                .range(..=(ipa, u64::MAX))
+                .next_back()
+                .and_then(|(&(base, len), entry)| {
+                    (ipa < base.saturating_add(len))
+                        .then(|| entry.live_owner().map(|owner| owner.record_identity))
+                        .flatten()
+                })
+        };
+        if global_identity.is_some() {
+            return global_identity == Some(identity);
+        }
+        let structural_identity = self
+            .structural_backings
+            .lock()
+            .values()
+            .find(|entry| {
+                !entry
+                    .owner_retired
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    && entry.physical_ipa <= ipa
+                    && ipa
+                        < entry
+                            .physical_ipa
+                            .saturating_add(entry.physical_size as u64)
+            })
+            .map(|entry| *entry.record_identity.lock());
+        if structural_identity.is_some() {
+            return structural_identity == Some(identity);
+        }
+        self.carrier_stage2_records
+            .lock()
+            .range(..=(ipa, u64::MAX))
+            .next_back()
+            .is_some_and(|(&(base, len), &found)| {
+                ipa < base.saturating_add(len) && found == identity
+            })
+    }
+
+    pub(crate) fn stage2_publication_authority_covers(&self, ipa: u64) -> bool {
+        let global_identity = {
+            let owners = self.global_frame_host_owners.lock();
+            owners
+                .range(..=(ipa, u64::MAX))
+                .next_back()
+                .and_then(|(&(base, len), entry)| {
+                    (ipa < base.saturating_add(len))
+                        .then(|| entry.live_owner().map(|owner| owner.record_identity))
+                        .flatten()
+                })
+        };
+        if let Some(identity) = global_identity {
+            return self
+                .stage2_record_snapshot(identity.record_id)
+                .is_none_or(|record| {
+                    record.mapped
+                        || record.terminalized_by_vm_destroy
+                        || !record.retirement_requested
+                });
+        }
+        let structural_identity = self
+            .structural_backings
+            .lock()
+            .values()
+            .find(|entry| {
+                !entry
+                    .owner_retired
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    && entry.physical_ipa <= ipa
+                    && ipa
+                        < entry
+                            .physical_ipa
+                            .saturating_add(entry.physical_size as u64)
+            })
+            .map(|entry| *entry.record_identity.lock());
+        if let Some(identity) = structural_identity {
+            return self
+                .stage2_record_snapshot(identity.record_id)
+                .is_none_or(|record| {
+                    record.mapped
+                        || record.terminalized_by_vm_destroy
+                        || !record.retirement_requested
+                });
+        }
+        let carrier_identity = self
+            .carrier_stage2_records
+            .lock()
+            .range(..=(ipa, u64::MAX))
+            .next_back()
+            .and_then(|(&(base, len), &identity)| {
+                (ipa < base.saturating_add(len)).then_some(identity)
+            });
+        carrier_identity.is_some_and(|identity| {
+            self.stage2_record_snapshot(identity.record_id)
+                .is_none_or(|record| {
+                    record.mapped
+                        || record.terminalized_by_vm_destroy
+                        || !record.retirement_requested
+                })
+        })
+    }
+
+    pub(crate) fn publish_stage2_availability_change(&self) {
+        self.stage2_publication_changed.publish(0);
+    }
+
+    pub(crate) fn stage2_publication_wait(
+        self: &std::sync::Arc<Self>,
+        ipa: u64,
+    ) -> carrick_guest_mem::OwnedMemoryWait {
+        carrick_guest_mem::OwnedMemoryWait::new(std::sync::Arc::new(Stage2PublicationWait {
+            custody: std::sync::Arc::downgrade(self),
+            ipa,
+        }))
+    }
+
     pub(crate) fn stage2_retirement_wait(
         self: &std::sync::Arc<Self>,
         identity: Option<CarrierStage2RecordIdentity>,

@@ -433,25 +433,8 @@ enum RetainedMemoryWaitAttempt {
     Retry { action: RetainedMemoryAction },
 }
 
-enum OwnerRedriveProducer {
-    Owner(carrick_el1_abi::PortalOwnerWait),
-    Physical(carrick_guest_mem::PhysicalMemoryWaitGeneration),
-}
-
-impl PartialEq for OwnerRedriveProducer {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Owner(left), Self::Owner(right)) => left == right,
-            (Self::Physical(left), Self::Physical(right)) => left == right,
-            _ => false,
-        }
-    }
-}
-impl Eq for OwnerRedriveProducer {}
-
 struct OwnerRedriveProgress {
-    last_producer: Option<OwnerRedriveProducer>,
-    unproduced_reselect: Option<carrick_el1_abi::PortalOwnerWait>,
+    unproduced_reselect_used: bool,
     consecutive_stalled_passes: usize,
     committed_bytes: u64,
 }
@@ -462,8 +445,7 @@ struct OwnerRedriveProgress {
 impl Default for OwnerRedriveProgress {
     fn default() -> Self {
         Self {
-            last_producer: None,
-            unproduced_reselect: None,
+            unproduced_reselect_used: false,
             consecutive_stalled_passes: 0,
             committed_bytes: 0,
         }
@@ -471,25 +453,14 @@ impl Default for OwnerRedriveProgress {
 }
 
 impl OwnerRedriveProgress {
-    fn observe(
-        &mut self,
-        producer: Option<OwnerRedriveProducer>,
-        committed: u64,
-    ) -> Result<(), RuntimeError> {
+    fn observe(&mut self, committed: u64) -> Result<(), RuntimeError> {
         if committed != 0 {
             self.committed_bytes =
                 self.committed_bytes.checked_add(committed).ok_or_else(|| {
                     RuntimeError::Configuration("owner redrive byte progress overflow".to_owned())
                 })?;
             self.consecutive_stalled_passes = 0;
-            self.last_producer = None;
-            self.unproduced_reselect = None;
-            return Ok(());
-        }
-        if producer.is_some() && producer != self.last_producer {
-            self.last_producer = producer;
-            self.unproduced_reselect = None;
-            self.consecutive_stalled_passes = 0;
+            self.unproduced_reselect_used = false;
             return Ok(());
         }
         self.consecutive_stalled_passes = self
@@ -506,16 +477,13 @@ impl OwnerRedriveProgress {
         Ok(())
     }
 
-    fn authorize_unproduced_reselect(
-        &mut self,
-        wait: carrick_el1_abi::PortalOwnerWait,
-    ) -> Result<(), RuntimeError> {
-        if self.unproduced_reselect == Some(wait) {
+    fn authorize_unproduced_reselect(&mut self) -> Result<(), RuntimeError> {
+        if self.unproduced_reselect_used {
             return Err(RuntimeError::Configuration(
                 "authoritative owner reselect repeated without a producer".to_owned(),
             ));
         }
-        self.unproduced_reselect = Some(wait);
+        self.unproduced_reselect_used = true;
         Ok(())
     }
 
@@ -545,30 +513,17 @@ enum OwnerResumeWork {
 }
 
 impl OwnerResumeWork {
-    fn progress_observation(&self) -> (Option<OwnerRedriveProducer>, u64) {
+    /// `None` is a terminal/ordinary dispatch result, which is allowed to
+    /// leave the redrive loop without consuming another no-progress pass.
+    fn redrive_committed_progress(&self) -> Option<u64> {
         match self {
             Self::Syscall { outcome, .. } => match outcome {
-                DispatchOutcome::OwnerMemoryWait { wait, committed } => {
-                    (Some(OwnerRedriveProducer::Owner(*wait)), *committed)
-                }
-                DispatchOutcome::OwnerPhysicalWait { wait, committed } => (
-                    Some(OwnerRedriveProducer::Physical(wait.producer_generation())),
-                    *committed,
-                ),
-                DispatchOutcome::OwnerMemorySupply { committed, .. } => (None, *committed),
-                _ => (None, 0),
+                DispatchOutcome::OwnerMemoryWait { committed, .. }
+                | DispatchOutcome::OwnerPhysicalWait { committed, .. }
+                | DispatchOutcome::OwnerMemorySupply { committed, .. } => Some(*committed),
+                _ => None,
             },
-            Self::RetainedWait { error, .. } => match error {
-                carrick_guest_mem::MemoryPrepareError::OwnerWait(wait) => {
-                    (Some(OwnerRedriveProducer::Owner(*wait)), 0)
-                }
-                carrick_guest_mem::MemoryPrepareError::Physical(wait) => (
-                    Some(OwnerRedriveProducer::Physical(wait.producer_generation())),
-                    0,
-                ),
-                _ => (None, 0),
-            },
-            Self::RetainedAction(_) => (None, 0),
+            Self::RetainedWait { .. } | Self::RetainedAction(_) => Some(0),
         }
     }
 }
@@ -3738,8 +3693,9 @@ where
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let mut progress = OwnerRedriveProgress::default();
         loop {
-            let (producer, committed) = work.progress_observation();
-            progress.observe(producer, committed)?;
+            if let Some(committed) = work.redrive_committed_progress() {
+                progress.observe(committed)?;
+            }
             let step = match work {
                 OwnerResumeWork::Syscall {
                     frame,
@@ -3876,7 +3832,8 @@ where
                     wait,
                 } => {
                     debug_assert_eq!(retry_frame, frame);
-                    progress.authorize_unproduced_reselect(wait)?;
+                    let _ = wait;
+                    progress.authorize_unproduced_reselect()?;
                     let outcome =
                         match self.resume_owner_ready_step(engine, control, retry_frame, retry)? {
                             OwnerReadyStep::Exit(exit) => {
@@ -7534,15 +7491,28 @@ mod tests {
 
         for _ in 0..COPY_BYTES / PAGE_BYTES {
             progress
-                .observe(None, PAGE_BYTES)
+                .observe(PAGE_BYTES)
                 .expect("each committed host-copy page resets the stall bound");
             progress
-                .observe(None, 0)
+                .observe(0)
                 .expect("one supply redrive after progress remains bounded");
         }
 
         assert_eq!(progress.committed_bytes(), COPY_BYTES);
         assert_eq!(progress.consecutive_stalled_passes(), 1);
+    }
+
+    #[test]
+    fn owner_redrive_receipt_churn_is_not_progress() {
+        let mut progress = OwnerRedriveProgress::default();
+        progress.observe(0).unwrap();
+        progress.authorize_unproduced_reselect().unwrap();
+        progress.observe(0).unwrap();
+        assert!(
+            progress.authorize_unproduced_reselect().is_err(),
+            "a fresh SELECT receipt cannot authorize another producer-free pass"
+        );
+        assert_eq!(progress.consecutive_stalled_passes(), 2);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

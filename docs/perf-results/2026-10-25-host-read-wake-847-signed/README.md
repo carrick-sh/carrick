@@ -63,6 +63,51 @@ Portable verification on the correction:
 The required signed 20/20 proof must use the exact post-correction fixture
 bundle and is intentionally deferred until that bundle is relayed.
 
+## Stage-2 publication producer correction
+
+Review of `ba1e7db9b` found that its bounded reselect still treated each new
+Editor receipt as progress. SELECT itself advances that receipt, so a valid
+stage-1 leaf whose stage-2 record stayed absent could synchronously cycle
+through SELECT, stale selection, and producer-free redispatch forever.
+
+The follow-up keeps the `kernel.memory.owner-wait` conformance contract:
+Linux `read(2)` returns `EFAULT` only when the destination is inaccessible,
+and a transient physical publication cannot become either EFAULT or executor
+polling. Physical retention now distinguishes an absent record with no live
+backing owner (authoritative EL1 reselect) from an absent or `NotMapped`
+record whose live global-frame, structural, or carrier owner must publish a
+successor. The latter returns an IPA-scoped physical wait. That wait enrolls
+before probing and becomes ready only after the exact mapped record and its
+backing-owner identity are both visible, or after the authority retires so
+EL1 can reselect and deliver the real mapping fault. Registration, replay
+rebind, VM terminalization, and retirement publish after their state locks
+drop.
+
+The red-first VM-free witness
+`valid_leaf_with_absent_stage2_record_waits_for_physical_publication` first
+failed because retention returned `StaleSelection`. Green, it holds a live
+owner across a terminal record gap, proves that allocating the successor is
+not yet readiness, enrolls the production physical wait, publishes the exact
+successor owner, observes one wake, and retains the mapped bytes without
+EFAULT. The existing
+`serial_host_stale_selection_without_editor_reselects_and_parks_on_physical_producer`
+witness drives the runtime park and wake. A separate receipt-churn witness
+proves that neither new owner receipts nor physical-wait generations reset
+the redrive budget: only committed bytes reset it; terminal dispatch results
+leave the loop directly.
+
+Portable verification on this follow-up:
+
+- `carrick-vmm-hvf` library: 790 passed, 3 ignored;
+- `carrick-runtime` library: 819 passed, 9 ignored;
+- focused user-transfer population: 15 passed;
+- focused owner-redrive population: 2 passed;
+- `just fmt-check`, `just clippy`, `just clippy-linux`,
+  `just lint-domains`, and `just test-kernel`: passed.
+
+No signed test was run because the source changed. The exact-candidate fixture
+bundle is required before the requested signed 20/20 proof.
+
 The first companion `el1_ipc_two_processes_blocking` repetition,
 `847-final-two-process-01`, hit its 60-second watchdog. Per the director's
 stop condition, the remaining two repetitions and all requested

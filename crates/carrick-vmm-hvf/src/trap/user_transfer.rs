@@ -424,10 +424,18 @@ impl UserTransferCustody {
                 None
             }
         };
+        let publication_authority = self
+            .custody
+            .stage2_publication_authority_covers(selected.ipa);
         // Select the record containing the first byte so a range crossing its
         // end cannot be mistaken for absent backing (and endlessly reselected).
         let Some(identity) = self.custody.stage2_record_covering(selected.ipa, 1) else {
             carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 1);
+            if publication_authority {
+                return Ok(TransferRetention::Physical(
+                    self.custody.stage2_publication_wait(selected.ipa),
+                ));
+            }
             return Ok(TransferRetention::StaleSelection);
         };
         let extent = self
@@ -452,6 +460,15 @@ impl UserTransferCustody {
                 .get(&identity.record_id)
                 .map(|entry| Arc::clone(&entry.mapping))
         };
+        let internal_read = intent == PortalTransferIntent::CarrickInternalRead
+            && selected.ipa >= carrick_el1_abi::EL1_REGION_BASE
+            && selected.ipa + len as u64 <= carrick_el1_abi::EL1_REGION_BASE + 4096;
+        if mapping.is_none() && publication_authority && !internal_read {
+            carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 6);
+            return Ok(TransferRetention::Physical(
+                self.custody.stage2_publication_wait(selected.ipa),
+            ));
+        }
         let pin = match self.custody.pin_stage2_record(identity) {
             Ok(pin) => pin,
             Err(reason @ (CarrierStage2PinError::NotFound | CarrierStage2PinError::NotMapped)) => {
@@ -463,6 +480,11 @@ impl UserTransferCustody {
                         _ => unreachable!(),
                     },
                 );
+                if publication_authority {
+                    return Ok(TransferRetention::Physical(
+                        self.custody.stage2_publication_wait(selected.ipa),
+                    ));
+                }
                 return Ok(TransferRetention::StaleSelection);
             }
             Err(CarrierStage2PinError::RetirementRequested) => {
@@ -482,11 +504,7 @@ impl UserTransferCustody {
         };
         // A bare stage-2 alias does not own its source allocation. Require
         // the retained physical backing before exposing even a read pin.
-        let metadata = if mapping.is_none()
-            && intent == PortalTransferIntent::CarrickInternalRead
-            && selected.ipa >= carrick_el1_abi::EL1_REGION_BASE
-            && selected.ipa + len as u64 <= carrick_el1_abi::EL1_REGION_BASE + 4096
-        {
+        let metadata = if mapping.is_none() && internal_read {
             self.metadata.clone()
         } else {
             None
@@ -752,6 +770,69 @@ pub(super) mod tests {
             ),
             "an absent stage-2 record is a stale selection, not an already-ready physical wait"
         );
+    }
+
+    #[test]
+    fn valid_leaf_with_absent_stage2_record_waits_for_physical_publication() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let ipa = 0xa085_3140_0000;
+        let owner = backing(&custody, ipa);
+        let physical = UserTransferCustody::new(Arc::clone(&custody));
+        let old = custody
+            .stage2_record_snapshot(owner.record_identity.record_id)
+            .unwrap();
+        custody.begin_destroy(old.vm_generation).unwrap();
+        custody.commit_destroy(old.vm_generation).unwrap();
+        let replacement_generation = custody.begin_create().unwrap();
+
+        let TransferRetention::Physical(wait) = physical
+            .retain(selection(ipa), 4, PortalTransferIntent::UserRead)
+            .unwrap()
+        else {
+            panic!("a valid stage-1 leaf must retain its stage-2 publication producer")
+        };
+        assert!(
+            !wait.0.is_ready(),
+            "an absent record must park instead of synchronously reselecting"
+        );
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_count = Arc::clone(&wakes);
+        let (_subscription, ready) = wait.0.enroll(Arc::new(move || {
+            wake_count.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert!(!ready, "publication wait must enroll before it is ready");
+
+        let identity = custody
+            .rebind_terminal_stage2_record(owner.record_identity, old.host_addr, old.perms)
+            .unwrap();
+        assert!(
+            !wait.0.is_ready(),
+            "allocating a replacement record is not publication progress"
+        );
+        custody.global_frame_host_owners.lock().insert(
+            (old.ipa, old.len as u64),
+            GlobalFrameOwnerEntry::Live(Arc::new(GlobalFrameHostOwner::from_record(
+                Arc::clone(&owner.mapping),
+                Arc::clone(&custody),
+                identity,
+            ))),
+        );
+        custody.commit_create(replacement_generation).unwrap();
+        custody.publish_stage2_availability_change();
+
+        assert!(wait.0.is_ready());
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            1,
+            "record publication must wake the parked physical consumer"
+        );
+        assert!(matches!(
+            physical
+                .retain(selection(ipa), 4, PortalTransferIntent::UserRead)
+                .unwrap(),
+            TransferRetention::Retained(_)
+        ));
     }
 
     #[test]

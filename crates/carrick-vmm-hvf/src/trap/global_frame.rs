@@ -1570,6 +1570,8 @@ pub(crate) fn register_carrier_stage2_leases(
         registered.insert(key, identity);
         identities.push(identity);
     }
+    drop(registered);
+    custody.publish_stage2_availability_change();
     Ok(identities)
 }
 
@@ -1852,6 +1854,8 @@ pub(crate) fn register_global_frame_host_owner_in_using(
         )));
     }
     owners.insert(key, GlobalFrameOwnerEntry::Live(owner));
+    drop(owners);
+    custody.publish_stage2_availability_change();
     Ok(generation)
 }
 
@@ -1925,6 +1929,8 @@ pub(crate) fn register_pooled_global_frame_host_owner_in(
         )));
     }
     owners.insert(key, GlobalFrameOwnerEntry::Live(owner));
+    drop(owners);
+    custody.publish_stage2_availability_change();
     Ok(generation)
 }
 
@@ -2266,6 +2272,8 @@ pub(crate) struct StructuralBackingCustodyEntry {
     pub(crate) mapping: std::sync::Arc<GlobalFrameSharedMapping>,
     pub(crate) record_identity: parking_lot::Mutex<CarrierStage2RecordIdentity>,
     pub(crate) owner_retired: std::sync::atomic::AtomicBool,
+    pub(crate) physical_ipa: u64,
+    pub(crate) physical_size: usize,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2342,11 +2350,14 @@ impl StructuralBackingOwner {
             mapping: std::sync::Arc::new(GlobalFrameSharedMapping::new(mapping)),
             record_identity: parking_lot::Mutex::new(identity),
             owner_retired: std::sync::atomic::AtomicBool::new(false),
+            physical_ipa,
+            physical_size,
         });
         custody
             .structural_backings
             .lock()
             .insert(identity.record_id, std::sync::Arc::clone(&retained));
+        custody.publish_stage2_availability_change();
         Ok(std::sync::Arc::new(Self {
             custody: std::sync::Arc::downgrade(custody),
             retained,
@@ -2407,11 +2418,14 @@ impl StructuralBackingOwner {
             mapping: std::sync::Arc::new(GlobalFrameSharedMapping::from_pooled_root(handle)),
             record_identity: parking_lot::Mutex::new(identity),
             owner_retired: std::sync::atomic::AtomicBool::new(false),
+            physical_ipa,
+            physical_size,
         });
         custody
             .structural_backings
             .lock()
             .insert(identity.record_id, std::sync::Arc::clone(&retained));
+        custody.publish_stage2_availability_change();
         Ok(std::sync::Arc::new(Self {
             custody: std::sync::Arc::downgrade(custody),
             retained,
@@ -2933,6 +2947,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             ));
             owners.insert(key, GlobalFrameOwnerEntry::Live(successor));
             drop(owners);
+            custody.publish_stage2_availability_change();
             let _ = custody.remove_terminal_stage2_record(owner.record_identity);
             report.rebound += 1;
             continue;
@@ -3063,6 +3078,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             }
             records.insert(key, new_identity);
             drop(records);
+            custody.publish_stage2_availability_change();
             let _ = custody.remove_terminal_stage2_record(old_identity);
             report.rebound += 1;
             continue;
@@ -3157,6 +3173,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             retained_by_record.remove(&old_identity.record_id);
             retained_by_record.insert(new_identity.record_id, std::sync::Arc::clone(&retained));
             drop(retained_by_record);
+            custody.publish_stage2_availability_change();
             let _ = custody.remove_terminal_stage2_record(old_identity);
             report.rebound += 1;
             continue;
