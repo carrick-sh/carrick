@@ -488,10 +488,13 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
       "actionlint": { "result": "skipped" },
       "linked-issue": { "result": "success" },
       "commit-trailers": { "result": "success" },
-      "lint": { "result": "success" },
+      "lint-clippy": { "result": "success" },
+      "lint-gates": { "result": "success" },
       "lint-domains": { "result": "success" },
       "portable": { "result": "skipped" },
+      "loom": { "result": "skipped" },
       "linux-doc": { "result": "skipped" },
+      "macos-authority": { "result": "skipped" },
       "macos-clippy": { "result": "skipped" },
       "macos-build": { "result": "skipped" },
       "macos-unit-a": { "result": "skipped" },
@@ -512,8 +515,8 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
     );
 
     let draft_failed_lint = draft_needs.replace(
-        r#""lint": { "result": "success" }"#,
-        r#""lint": { "result": "failure" }"#,
+        r#""lint-clippy": { "result": "success" }"#,
+        r#""lint-clippy": { "result": "failure" }"#,
     );
     assert!(
         !run_ci_results("pull_request", Some("true"), &draft_failed_lint),
@@ -720,10 +723,13 @@ fn stack_layer_detection_and_ci_results_gating() {
       "actionlint": { "result": "skipped" },
       "linked-issue": { "result": "success" },
       "commit-trailers": { "result": "success" },
-      "lint": { "result": "success" },
+      "lint-clippy": { "result": "success" },
+      "lint-gates": { "result": "success" },
       "lint-domains": { "result": "success" },
       "portable": { "result": "skipped" },
+      "loom": { "result": "skipped" },
       "linux-doc": { "result": "skipped" },
+      "macos-authority": { "result": "skipped" },
       "macos-clippy": { "result": "skipped" },
       "macos-build": { "result": "skipped" },
       "macos-unit-a": { "result": "skipped" },
@@ -788,10 +794,13 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
       "actionlint": { "result": "success" },
       "linked-issue": { "result": "success" },
       "commit-trailers": { "result": "success" },
-      "lint": { "result": "success" },
+      "lint-clippy": { "result": "success" },
+      "lint-gates": { "result": "success" },
       "lint-domains": { "result": "success" },
       "portable": { "result": "success" },
+      "loom": { "result": "success" },
       "linux-doc": { "result": "success" },
+      "macos-authority": { "result": "skipped" },
       "macos-clippy": { "result": "success" },
       "macos-build": { "result": "success" },
       "macos-unit-a": { "result": "success" },
@@ -822,6 +831,10 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
     // integration suites ran on the PR and run again on push (#650).
     let mg_needs = full_needs
         .replace(
+            r#""macos-authority": { "result": "skipped" }"#,
+            r#""macos-authority": { "result": "success" }"#,
+        )
+        .replace(
             r#""macos-unit-a": { "result": "success" }"#,
             r#""macos-unit-a": { "result": "skipped" }"#,
         )
@@ -837,6 +850,24 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
         run_ci_results("merge_group", None, &mg_needs),
         "merge_group with only the macOS skew check must pass ci-results"
     );
+    for job in ["lint-clippy", "lint-gates", "loom", "macos-authority"] {
+        let mut missing: serde_json::Value = serde_json::from_str(&mg_needs).unwrap();
+        missing.as_object_mut().unwrap().remove(job);
+        assert!(
+            !run_ci_results("merge_group", None, &missing.to_string()),
+            "missing {job}"
+        );
+        for verdict in ["skipped", "failure", "cancelled"] {
+            let broken = mg_needs.replace(
+                &format!(r#""{job}": {{ "result": "success" }}"#),
+                &format!(r#""{job}": {{ "result": "{verdict}" }}"#),
+            );
+            assert!(
+                !run_ci_results("merge_group", None, &broken),
+                "{job}: {verdict}"
+            );
+        }
+    }
     let mg_failed_lint_domains = mg_needs.replace(
         r#""lint-domains": { "result": "success" }"#,
         r#""lint-domains": { "result": "failure" }"#,
@@ -904,10 +935,13 @@ fn heavy_same_repo_pr_requires_the_full_macos_suite() {
       "actionlint": { "result": "skipped" },
       "linked-issue": { "result": "success" },
       "commit-trailers": { "result": "success" },
-      "lint": { "result": "success" },
+      "lint-clippy": { "result": "success" },
+      "lint-gates": { "result": "success" },
       "lint-domains": { "result": "success" },
       "portable": { "result": "success" },
+      "loom": { "result": "success" },
       "linux-doc": { "result": "success" },
+      "macos-authority": { "result": "skipped" },
       "macos-clippy": { "result": "success" },
       "macos-build": { "result": "success" },
       "macos-unit-a": { "result": "success" },
@@ -1003,7 +1037,11 @@ fn every_heavy_pr_job_skips_on_lower_stack_layers() {
         let Some(name) = job.as_deref() else {
             continue;
         };
-        if name == "lint" || name == "lint-domains" || name.starts_with("macos-") {
+        if name == "lint-clippy"
+            || name == "lint-gates"
+            || name == "lint-domains"
+            || name.starts_with("macos-")
+        {
             continue;
         }
         if condition.contains("needs.changes.outputs.heavy == 'true'")

@@ -107,7 +107,7 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
             && runner.ends_with("|| '\"macos-15\"' }}"),
         "changes.outputs.macos_runner must route only same-repo PRs to carrick-macos-ci: {runner}"
     );
-    let job = "lint";
+    let job = "lint-gates";
     assert!(
         jobs[job]["steps"]
             .as_vec()
@@ -131,12 +131,26 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
             .any(|s| s["run"].as_str() == Some("just check-test-shards"))
     );
     assert!(
-        needs.iter().any(|v| v.as_str() == Some("lint")),
-        "ci-ok must require lint"
+        needs.iter().any(|v| v.as_str() == Some("lint-gates")),
+        "ci-ok must require lint-gates"
     );
     assert!(
         needs.iter().any(|v| v.as_str() == Some("lint-domains")),
         "ci-ok must require lint-domains"
+    );
+    for job in ["lint-clippy", "macos-authority", "loom"] {
+        assert!(
+            needs.iter().any(|v| v.as_str() == Some(job)),
+            "ci-ok must require {job}"
+        );
+    }
+    assert_eq!(jobs["loom"]["strategy"]["fail-fast"].as_bool(), Some(false));
+    assert_eq!(
+        jobs["loom"]["strategy"]["matrix"]["shard"]
+            .as_vec()
+            .unwrap()
+            .len(),
+        2
     );
     let runs = |job: &str, command: &str| {
         jobs[job]["steps"]
@@ -153,6 +167,20 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
     );
     assert!(
         runs("macos-clippy", "just xtask authority-debt"),
+        "PR and nightly macOS census must remain in macos-clippy"
+    );
+    let census = jobs["macos-clippy"]["steps"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .find(|s| s["run"].as_str() == Some("just xtask authority-debt"))
+        .unwrap();
+    assert_eq!(
+        census["if"].as_str(),
+        Some("${{ !cancelled() && github.event_name != 'merge_group' }}")
+    );
+    assert!(
+        runs("macos-authority", "just xtask authority-debt"),
         "compiled macOS authority profiles cannot be replaced by Linux discovery"
     );
 }

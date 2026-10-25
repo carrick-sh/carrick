@@ -27,7 +27,7 @@ fn only_trusted_warmer_publishes_bounded_shared_compiler_caches() {
                 assert!(condition.contains("'workflow_dispatch'"));
             }
             if action.starts_with("Swatinem/rust-cache@") {
-                if matches!(job.as_str(), Some("lint" | "macos-clippy")) {
+                if matches!(job.as_str(), Some("lint-clippy" | "macos-clippy")) {
                     let condition = step["with"]["save-if"].as_str().unwrap();
                     assert!(condition.contains("refs/heads/main"));
                     assert!(condition.contains("'schedule'"));
@@ -44,7 +44,7 @@ fn only_trusted_warmer_publishes_bounded_shared_compiler_caches() {
                 assert!(step["with"]["cache-directories"].is_badvalue());
                 assert_eq!(
                     step["with"]["cache-targets"].as_bool(),
-                    Some(matches!(job.as_str(), Some("lint" | "macos-clippy")))
+                    Some(matches!(job.as_str(), Some("lint-clippy" | "macos-clippy")))
                 );
             }
             if step["with"]["key"]
