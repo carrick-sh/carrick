@@ -1873,10 +1873,12 @@ pub fn retire_detached_task_shared_root_with_proof(
     state: &mut HvpatchTaskEngineState,
     expected_root_base: u64,
     expected_root_size: u64,
+    stage1_unpublished: &carrick_core::mm::retirement::Stage1UnpublishedMm,
 ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
     HvfVmState::retire_task_state_mm_root_only(
         &mut state.backend_mut().state.task,
         (expected_root_base, expected_root_size),
+        stage1_unpublished,
     )
 }
 
@@ -1956,12 +1958,17 @@ pub fn retire_detached_task_only_shared_root_with_proof(
     state: &HvpatchTaskOnlyEngineState,
     expected_root_base: u64,
     expected_root_size: u64,
+    stage1_unpublished: &carrick_core::mm::retirement::Stage1UnpublishedMm,
 ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
     let mut parked = state.parked_task.lock();
     let task = parked.as_mut().ok_or_else(|| {
         TrapError::Hypervisor("detached task-only retirement has no parked task state".to_owned())
     })?;
-    HvfVmState::retire_task_state_mm_root_only(task, (expected_root_base, expected_root_size))
+    HvfVmState::retire_task_state_mm_root_only(
+        task,
+        (expected_root_base, expected_root_size),
+        stage1_unpublished,
+    )
 }
 
 /// The final shared-inventory owner may have a relocated bootstrap root,
@@ -2599,11 +2606,9 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn retire_stage1_extension_arenas(
         &mut self,
-        retired_bases: &[u64],
-        receipt: &carrick_aarch64::vmm::Stage1UnpublishedArenas,
+        detached: &[carrick_mmu_core::aarch64::TableArenaDetached],
     ) -> Result<(), TrapError> {
-        self.state
-            .retire_stage1_extension_arenas(retired_bases, receipt)
+        self.state.retire_stage1_extension_arenas(detached)
     }
 
     fn record_stage1_populated_prefix(&mut self, base: u64, prefix: usize) {

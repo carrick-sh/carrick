@@ -4883,11 +4883,9 @@ impl HvfVmState {
 
     pub(crate) fn retire_stage1_extension_arenas(
         &mut self,
-        retired_bases: &[u64],
-        receipt: &carrick_aarch64::vmm::Stage1UnpublishedArenas,
+        detached: &[carrick_mmu_core::aarch64::TableArenaDetached],
     ) -> Result<(), TrapError> {
-        self.task
-            .retire_stage1_extension_arenas(retired_bases, receipt)
+        self.task.retire_stage1_extension_arenas(detached)
     }
 
     pub(crate) fn resolve_frame_cow_fault(
@@ -7497,16 +7495,16 @@ impl HvfTaskState {
 
     pub(crate) fn retire_stage1_extension_arenas(
         &mut self,
-        retired_bases: &[u64],
-        stage1: &carrick_aarch64::vmm::Stage1UnpublishedArenas,
+        detached: &[carrick_mmu_core::aarch64::TableArenaDetached],
     ) -> Result<(), TrapError> {
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let custody = self.custody_arc();
-        for &base in retired_bases {
+        for stage1 in detached {
+            let base = stage1.base();
             HvfVmState::retire_stage2_extent_from_mappings_in(
                 &custody,
                 &mut self.mappings,
-                Stage1UnpublicationReceipt::EditorArenas(stage1),
+                Stage1UnpublicationReceipt::TableArena(stage1),
                 base,
                 TWO_MIB,
             )?;

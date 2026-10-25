@@ -1265,7 +1265,9 @@ fn replace_page_tables_authority(
     page_tables: &mut Stage1Authority,
     license: &impl crate::stage1_authority::Stage1EditLicense,
     replacement: ExecStage1Replacement,
-    mut retire_old: impl FnMut(&[u64], &crate::vmm::Stage1UnpublishedArenas) -> Result<(), TrapError>,
+    mut retire_old: impl FnMut(
+        &[carrick_mmu_core::aarch64::TableArenaDetached],
+    ) -> Result<(), TrapError>,
 ) -> Result<bool, TrapError> {
     match replacement {
         ExecStage1Replacement::Authority(successor) => page_tables
@@ -1276,7 +1278,7 @@ fn replace_page_tables_authority(
             let (successor, shared) = page_tables.replace_for_exec_internal(
                 license,
                 || Ok(manager),
-                |bases, receipt| retire_old(bases, receipt),
+                |detached| retire_old(detached),
             )?;
             *page_tables = successor;
             Ok(shared)
@@ -1289,7 +1291,7 @@ fn replace_and_bind_page_tables_authority(
     page_tables: &mut Stage1Authority,
     license: &impl crate::stage1_authority::Stage1EditLicense,
     manager: Option<PageTableManager>,
-    retire_old: impl FnMut(&[u64], &crate::vmm::Stage1UnpublishedArenas) -> Result<(), TrapError>,
+    retire_old: impl FnMut(&[carrick_mmu_core::aarch64::TableArenaDetached]) -> Result<(), TrapError>,
     mut bind_new: impl FnMut(Stage1Authority),
 ) -> Result<(), TrapError> {
     replace_page_tables_authority(
@@ -1488,7 +1490,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     &mut self.page_tables,
                     license,
                     replacement,
-                    |bases, receipt| self.vm.retire_stage1_extension_arenas(bases, receipt),
+                    |detached| self.vm.retire_stage1_extension_arenas(detached),
                 )
             },
         )?;
@@ -8415,7 +8417,7 @@ mod tests {
             &mut child_authority,
             crate::stage1_authority::tests::test_edit_license(),
             None,
-            |_, _| {
+            |_| {
                 retired = true;
                 Ok(())
             },
@@ -8481,7 +8483,7 @@ mod tests {
             &mut child1_authority,
             crate::stage1_authority::tests::test_edit_license(),
             None,
-            |_, _| {
+            |_| {
                 retired1 = true;
                 Ok(())
             },
@@ -8520,7 +8522,7 @@ mod tests {
             &mut child2_authority,
             crate::stage1_authority::tests::test_edit_license(),
             None,
-            |_, _| {
+            |_| {
                 retired2 = true;
                 Ok(())
             },
@@ -8565,7 +8567,7 @@ mod tests {
             &mut engine,
             crate::stage1_authority::tests::test_edit_license(),
             ExecStage1Replacement::Authority(backend_successor.clone()),
-            |_, _| Ok(()),
+            |_| Ok(()),
         )
         .unwrap();
         assert_eq!(
@@ -8609,7 +8611,7 @@ mod tests {
             &mut child_authority,
             crate::stage1_authority::tests::test_edit_license(),
             None,
-            |_, _| {
+            |_| {
                 retired = true;
                 Ok(())
             },
@@ -8655,7 +8657,7 @@ mod tests {
             &mut authority,
             crate::stage1_authority::tests::test_edit_license(),
             None,
-            |_, _| {
+            |_| {
                 retired = true;
                 Ok(())
             },
@@ -8744,7 +8746,7 @@ mod tests {
             .replace_for_exec(
                 crate::stage1_authority::tests::test_edit_license(),
                 || Ok::<Option<PageTableManager>, ()>(None),
-                |_, _| {
+                |_| {
                     retired = true;
                     Ok(())
                 },

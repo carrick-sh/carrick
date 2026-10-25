@@ -602,7 +602,7 @@ impl InventoryFrameRegistry {
             Stage1UnpublicationReceipt::EditorRange(receipt) => {
                 receipt.names(lease.0, lease.1 as usize)
             }
-            Stage1UnpublicationReceipt::EditorArenas(receipt) => receipt.retired_base(lease.0),
+            Stage1UnpublicationReceipt::TableArena(receipt) => receipt.base() == lease.0,
             Stage1UnpublicationReceipt::FrameAbsence(receipt) => {
                 receipt.covers(lease.0, lease.1 as usize)
             }
@@ -3569,8 +3569,13 @@ impl HvfVmState {
             if inventory.extents.is_empty() {
                 if task.mappings.is_empty() {
                     drop(inventory);
-                    return Self::retire_task_table_capacity(task, custody, expected_root_slot)
-                        .map(|root| root.map(|root| root.proof));
+                    return Self::retire_task_table_capacity(
+                        task,
+                        custody,
+                        expected_root_slot,
+                        &stage1_unpublished,
+                    )
+                    .map(|root| root.map(|root| root.proof));
                 }
                 return Err(TrapError::Hypervisor(
                     "HVPatch process retirement has mappings without frame inventory authority"
@@ -3868,7 +3873,12 @@ impl HvfVmState {
                 }
             }
         }
-        let retired_root = Self::retire_task_table_capacity(task, custody, expected_root_slot)?;
+        let retired_root = Self::retire_task_table_capacity(
+            task,
+            custody,
+            expected_root_slot,
+            &stage1_unpublished,
+        )?;
         if let Some(root) = &retired_root {
             extents.insert(root.physical_extent);
         }
@@ -3945,11 +3955,12 @@ impl HvfVmState {
         task: &HvfTaskState,
         custody: &CarrierVmCustody,
         expected_root_slot: Option<(u64, u64)>,
+        stage1_unpublished: &carrick_core::mm::retirement::Stage1UnpublishedMm,
     ) -> Result<Option<RetiredMmRootStage2>, TrapError> {
         if let Some(root_slot) = expected_root_slot {
             return task
                 .mm_access
-                .retire_mm_root_stage2_in(custody, root_slot)
+                .retire_mm_root_stage2_in(custody, root_slot, stage1_unpublished)
                 .map(Some);
         }
         // Bootstrap relocation owns its primary through the arena source,
@@ -3959,7 +3970,7 @@ impl HvfVmState {
             .retire_table_capacity(
                 None,
                 carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
-                |_, _| Ok(()),
+                |_| Ok(()),
             )
             .map_err(TrapError::Hypervisor)?;
         Ok(None)
@@ -3979,7 +3990,7 @@ impl HvfVmState {
             .retire_table_capacity(
                 None,
                 carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
-                |_, _| Ok(()),
+                |_| Ok(()),
             )
             .map_err(TrapError::Hypervisor)
     }
@@ -3987,6 +3998,7 @@ impl HvfVmState {
     pub(crate) fn retire_task_state_mm_root_only(
         task: &mut HvfTaskState,
         expected_root_slot: (u64, u64),
+        stage1_unpublished: &carrick_core::mm::retirement::Stage1UnpublishedMm,
     ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
         #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&task.custody);
@@ -3999,9 +4011,11 @@ impl HvfVmState {
                 "stage-1 root-only retirement requires persistent HVPatch lifecycle".to_owned(),
             ));
         }
-        let retired = task
-            .mm_access
-            .retire_mm_root_stage2_in(custody, expected_root_slot)?;
+        let retired = task.mm_access.retire_mm_root_stage2_in(
+            custody,
+            expected_root_slot,
+            stage1_unpublished,
+        )?;
         task.mm_root_slot = None;
         Ok(retired.proof)
     }

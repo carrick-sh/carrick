@@ -607,44 +607,6 @@ pub enum FrameCowWriteIntent {
 /// sibling spawn, host memory windows + stage-2 mapping, and the HVF-only
 /// lazy-alias re-map (as the optional [`Self::handle_memory_exit`] hook). Mirrors
 /// `carrick-x86`'s `X86Vmm`.
-#[derive(Debug)]
-pub struct Stage1UnpublishedArenas {
-    retired_bases: Vec<u64>,
-    detached: Vec<carrick_mmu_core::aarch64::TableArenaDetached>,
-}
-
-impl Stage1UnpublishedArenas {
-    pub fn retired_base(&self, ipa: u64) -> bool {
-        self.retired_bases.contains(&ipa)
-    }
-
-    pub fn detached(&self) -> &[carrick_mmu_core::aarch64::TableArenaDetached] {
-        &self.detached
-    }
-
-    /// Retire every detached extension-table arena and bind the receipt to
-    /// that exact manager mutation.  Backends cannot mint this proof from an
-    /// IPA alone.
-    pub(crate) fn retire_extension_arenas(
-        manager: &mut PageTableManager,
-    ) -> (Vec<u64>, Stage1UnpublishedArenas) {
-        let detached = manager.retire_extension_arenas();
-        let retired = detached.iter().map(|receipt| receipt.base()).collect();
-        let receipt = Stage1UnpublishedArenas {
-            retired_bases: retired,
-            detached,
-        };
-        (receipt.retired_bases.clone(), receipt)
-    }
-
-    pub(crate) fn retired_table_capacity(base: Option<u64>) -> Self {
-        Self {
-            retired_bases: base.into_iter().collect(),
-            detached: Vec::new(),
-        }
-    }
-}
-
 pub trait Aarch64Vmm: Sized + GuestVmBackend {
     type Vcpu: Aarch64Vcpu;
 
@@ -848,8 +810,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// Retire and unmap stage-1 extension table arenas belonging to `manager`.
     fn retire_stage1_extension_arenas(
         &mut self,
-        _retired_bases: &[u64],
-        _receipt: &Stage1UnpublishedArenas,
+        _detached: &[carrick_mmu_core::aarch64::TableArenaDetached],
     ) -> Result<(), TrapError> {
         Ok(())
     }

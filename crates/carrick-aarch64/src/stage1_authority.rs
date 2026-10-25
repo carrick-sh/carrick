@@ -72,8 +72,7 @@ pub trait TableArenaPublisher: Send + Sync {
     /// Retire capacity removed from a committed stage-1 image.
     fn retire_published_raw_table_arena(
         &self,
-        _base: u64,
-        _receipt: &crate::vmm::Stage1UnpublishedArenas,
+        _receipt: &carrick_mmu_core::aarch64::TableArenaDetached,
     ) -> Result<(), String> {
         Err("published raw Fork table capacity retirement is unavailable".into())
     }
@@ -1008,33 +1007,30 @@ impl Stage1Authority {
         &self,
         root: Option<u64>,
         disposition: TableArenaRetirement,
-        retire_root: impl FnOnce(
-            Option<&PageTableManager>,
-            &crate::vmm::Stage1UnpublishedArenas,
-        ) -> Result<R, String>,
+        retire_root: impl FnOnce(Option<&PageTableManager>) -> Result<R, String>,
     ) -> Result<R, String> {
         let (result, image, source) = {
             let mut inner = self.inner.lock();
-            if inner
-                .published_arenas
-                .iter()
-                .any(|base| Some(*base) != root)
-            {
+            let detached = inner
+                .manager
+                .as_mut()
+                .map(PageTableManager::retire_extension_arenas)
+                .unwrap_or_default();
+            if !detached.is_empty() {
                 let publisher = inner.arena_publisher.clone().ok_or_else(|| {
                     "published table capacity has no physical retirement authority".to_owned()
                 })?;
-                carrick_core::mm::retirement::retire_table_arenas(
-                    &mut inner.published_arenas,
-                    root,
-                    |base| {
-                        let receipt =
-                            crate::vmm::Stage1UnpublishedArenas::retired_table_capacity(Some(base));
-                        publisher.retire_published_raw_table_arena(base, &receipt)
-                    },
-                )?;
+                for receipt in &detached {
+                    let base = receipt.base();
+                    if Some(base) != root && inner.published_arenas.contains(&base) {
+                        publisher.retire_published_raw_table_arena(receipt)?;
+                        inner
+                            .published_arenas
+                            .retain(|candidate| *candidate != base);
+                    }
+                }
             }
-            let root_receipt = crate::vmm::Stage1UnpublishedArenas::retired_table_capacity(root);
-            let result = retire_root(inner.manager.as_ref(), &root_receipt)?;
+            let result = retire_root(inner.manager.as_ref())?;
             let (image, source) = if disposition == TableArenaRetirement::Terminal {
                 inner.host_resolver = None;
                 inner.published_arenas.clear();
@@ -1668,7 +1664,7 @@ impl Stage1Authority {
     ) -> Result<Stage1Authority, E>
     where
         B: FnOnce() -> Result<Option<PageTableManager>, E>,
-        R: FnMut(&[u64], &crate::vmm::Stage1UnpublishedArenas) -> Result<(), E>,
+        R: FnMut(&[carrick_mmu_core::aarch64::TableArenaDetached]) -> Result<(), E>,
     {
         self.replace_for_exec_internal(license, builder, retirer)
             .map(|(auth, _)| auth)
@@ -1683,7 +1679,7 @@ impl Stage1Authority {
     ) -> Result<(Stage1Authority, bool), E>
     where
         B: FnOnce() -> Result<Option<PageTableManager>, E>,
-        R: FnMut(&[u64], &crate::vmm::Stage1UnpublishedArenas) -> Result<(), E>,
+        R: FnMut(&[carrick_mmu_core::aarch64::TableArenaDetached]) -> Result<(), E>,
     {
         let is_shared = {
             let mut inner = self.inner.lock();
@@ -1706,9 +1702,8 @@ impl Stage1Authority {
                 (inner.manager.take(), inner.arena_source.take())
             };
             if let Some(mut old) = old_mgr.take() {
-                let (retired, receipt) =
-                    crate::vmm::Stage1UnpublishedArenas::retire_extension_arenas(&mut old);
-                retirer(&retired, &receipt)?;
+                let detached = old.retire_extension_arenas();
+                retirer(&detached)?;
                 self.inner.lock().image_pool.recycle(old);
             }
             // The retired image's source retires with it: its extension
@@ -2775,7 +2770,7 @@ pub(crate) mod tests {
             .replace_for_exec(
                 test_edit_license(),
                 || Ok::<_, ()>(Some(manager())),
-                |_, _| Ok(()),
+                |_| Ok(()),
             )
             .unwrap();
         assert!(authority.shares_exact_authority(&exact));
@@ -2786,7 +2781,7 @@ pub(crate) mod tests {
                 .replace_for_exec(
                     test_edit_license(),
                     || Err::<Option<PageTableManager>, _>(()),
-                    |_, _| Ok(()),
+                    |_| Ok(()),
                 )
                 .is_err()
         );
@@ -2859,7 +2854,7 @@ pub(crate) mod tests {
             .replace_for_exec(
                 test_edit_license(),
                 || Ok::<_, PageTableError>(Some(test_manager())),
-                |_, _| Ok(()),
+                |_| Ok(()),
             )
             .expect("exec replacement");
         assert_eq!(
@@ -2895,7 +2890,7 @@ pub(crate) mod tests {
             .replace_for_exec(
                 test_edit_license(),
                 || Ok::<_, PageTableError>(Some(test_manager())),
-                |_, _| Ok(()),
+                |_| Ok(()),
             )
             .expect("exclusive exec replacement");
         assert!(retired.shares_exact_authority(&authority));
@@ -3138,7 +3133,7 @@ pub(crate) mod tests {
             .replace_for_exec(
                 test_edit_license(),
                 || Ok::<_, ()>(Some(test_manager_at(0x9a_0020_0000))),
-                |_, _| {
+                |_| {
                     retired1 = true;
                     Ok(())
                 },
@@ -3165,7 +3160,7 @@ pub(crate) mod tests {
             .replace_for_exec(
                 test_edit_license(),
                 || Ok::<_, ()>(Some(test_manager_at(0x9a_0040_0000))),
-                |_, _| {
+                |_| {
                     retired2 = true;
                     Ok(())
                 },
@@ -3193,7 +3188,7 @@ pub(crate) mod tests {
             .replace_for_exec(
                 test_edit_license(),
                 || Ok::<_, ()>(Some(test_manager_at(0x9a_0060_0000))),
-                |_, _| {
+                |_| {
                     retired_parent = true;
                     Ok(())
                 },
@@ -3241,7 +3236,7 @@ pub(crate) mod tests {
             .replace_for_exec_internal(
                 test_edit_license(),
                 || Ok::<_, ()>(Some(test_manager_at(0x9a_0020_0000))),
-                |_, _| {
+                |_| {
                     retired = true;
                     Ok(())
                 },
@@ -3763,10 +3758,9 @@ pub(crate) mod tests {
         }
         fn retire_published_raw_table_arena(
             &self,
-            base: u64,
-            receipt: &crate::vmm::Stage1UnpublishedArenas,
+            receipt: &carrick_mmu_core::aarch64::TableArenaDetached,
         ) -> Result<(), String> {
-            assert!(receipt.retired_base(base));
+            let base = receipt.base();
             self.resolver.arenas.lock().unwrap().remove(&base);
             self.retired.lock().unwrap().push(base);
             Ok(())

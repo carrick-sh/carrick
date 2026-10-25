@@ -15,6 +15,17 @@ const TEST_VA: u64 = 0x6000_2000_0000;
 const OWNER_LEN: usize = 0x4000;
 use crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK;
 
+fn test_whole_mm_stage1_proof() -> carrick_core::mm::retirement::Stage1UnpublishedMm {
+    let mut task = hvpatch_neutral_task_state_for_test();
+    task.cow_identity = Some(carrick_hal::FrameCowIdentity {
+        linux_pid: 1,
+        linux_tid: 1,
+        mm: 1,
+        asid: 1,
+    });
+    prepare_test_whole_mm_retirement(&mut task)
+}
+
 #[test]
 fn cow_refusal_history_is_bounded_and_selects_the_exact_carrier_extent() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
@@ -11963,20 +11974,27 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
 
     // 3. Exercise real pooled-root retirement path: retire_mm_root_stage2_in -> release_pooled_root_slot
     let table_authority = installed.state.page_tables_authority();
+    let stage1_unpublished = test_whole_mm_stage1_proof();
     let mut saw_unmap = false;
     let mut retirement_excluded_access = false;
     let retired_root = installed
         .state
-        .retire_mm_root_stage2_in_using(&transport.custody, root_slot, true, &mut |_, _| {
-            saw_unmap = true;
-            retirement_excluded_access = table_authority.try_with_manager_until(
-                std::time::Instant::now(),
-                "busy",
-                "absent",
-                |_| Ok(()),
-            ) == Err("busy");
-            Ok(())
-        })
+        .retire_mm_root_stage2_in_using(
+            &transport.custody,
+            root_slot,
+            &stage1_unpublished,
+            true,
+            &mut |_, _| {
+                saw_unmap = true;
+                retirement_excluded_access = table_authority.try_with_manager_until(
+                    std::time::Instant::now(),
+                    "busy",
+                    "absent",
+                    |_| Ok(()),
+                ) == Err("busy");
+                Ok(())
+            },
+        )
         .expect("retire pooled root slot via real path");
     assert!(
         saw_unmap,
@@ -12122,7 +12140,7 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
 
     installed
         .state
-        .retire_mm_root_stage2_in(&transport.custody, root_slot)
+        .retire_mm_root_stage2_in(&transport.custody, root_slot, &test_whole_mm_stage1_proof())
         .expect("retire the reissued pooled root through its exact arena receipt");
 
     // 8. Dropping state invalidates cached root lookup on old resolver

@@ -307,12 +307,19 @@ impl PendingExecStage2Cleanup {
                 .retire_table_capacity(
                     None,
                     carrick_aarch64::stage1_authority::TableArenaRetirement::ExecHandoff,
-                    |_, _| Ok(()),
+                    |_| Ok(()),
                 )
                 .map_err(TrapError::Hypervisor)?;
         }
         if let (Some(mm_access), Some(root_slot)) = (&self.mm_access, self.mm_root_slot) {
-            let retired_root = mm_access.retire_exec_mm_root_stage2_in(custody, root_slot)?;
+            let stage1_unpublished = stage1_unpublished.ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "exec predecessor root retirement lacks whole-MM unpublication proof"
+                        .to_owned(),
+                )
+            })?;
+            let retired_root =
+                mm_access.retire_exec_mm_root_stage2_in(custody, root_slot, stage1_unpublished)?;
             let (ipa, size) = retired_root.physical_extent;
             if !retired_extents.iter().any(|retired| {
                 (retired.physical_ipa, retired.physical_length) == (ipa, size as u64)

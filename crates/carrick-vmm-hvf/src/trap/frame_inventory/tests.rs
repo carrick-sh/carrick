@@ -1322,7 +1322,7 @@ fn exec_successor_root_publication_installs_exact_structural_authority() {
         .install_structural_mapping_authority(Some(root_slot), owner)
         .expect("install exec successor's exact root authority");
     let proof = access
-        .retire_mm_root_stage2_in(&custody, root_slot)
+        .retire_mm_root_stage2_in(&custody, root_slot, &test_whole_mm_stage1_proof())
         .expect("retire exec successor root by exact authority")
         .proof;
     assert_eq!((proof.root_slot_base(), proof.root_slot_size()), root_slot);
@@ -3162,8 +3162,10 @@ fn shared_inventory_final_owner_retires_only_its_exact_structural_root() {
         );
     }
 
-    let proof = HvfVmState::retire_task_state_mm_root_only(&mut task, root_slot)
-        .expect("retire only final shared-inventory root");
+    let stage1_unpublished = test_whole_mm_stage1_proof();
+    let proof =
+        HvfVmState::retire_task_state_mm_root_only(&mut task, root_slot, &stage1_unpublished)
+            .expect("retire only final shared-inventory root");
 
     assert_eq!((proof.root_slot_base(), proof.root_slot_size()), root_slot);
     assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
@@ -3184,9 +3186,11 @@ fn root_retirement_refuses_mismatched_coordinates_and_active_pins() {
     let root_slot = (0x7d60_0000_0000_u64, 0x20_0000_u64);
     let (custody, mut task, owner, identity) = shared_inventory_root_fixture(root_slot);
 
+    let stage1_unpublished = test_whole_mm_stage1_proof();
     let mismatch = HvfVmState::retire_task_state_mm_root_only(
         &mut task,
         (root_slot.0 + root_slot.1, root_slot.1),
+        &stage1_unpublished,
     )
     .expect_err("foreign root coordinates must not mint a proof");
     assert!(mismatch.to_string().contains("coordinates mismatch"));
@@ -3199,14 +3203,16 @@ fn root_retirement_refuses_mismatched_coordinates_and_active_pins() {
     let pin = custody
         .pin_stage2_record(identity)
         .expect("pin exact structural root record");
-    let pinned = HvfVmState::retire_task_state_mm_root_only(&mut task, root_slot)
-        .expect_err("an active record pin must prevent a root proof");
+    let pinned =
+        HvfVmState::retire_task_state_mm_root_only(&mut task, root_slot, &stage1_unpublished)
+            .expect_err("an active record pin must prevent a root proof");
     assert!(pinned.to_string().contains("remained nonterminal"));
     assert!(custody.stage2_record_snapshot(identity.record_id).is_some());
 
     drop(pin);
-    let proof = HvfVmState::retire_task_state_mm_root_only(&mut task, root_slot)
-        .expect("retry exact root retirement after pin release");
+    let proof =
+        HvfVmState::retire_task_state_mm_root_only(&mut task, root_slot, &stage1_unpublished)
+            .expect("retry exact root retirement after pin release");
     assert_eq!((proof.root_slot_base(), proof.root_slot_size()), root_slot);
     assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
     drop(owner);
@@ -8094,7 +8100,7 @@ fn two_live_mm_pinned_table_retirement_detaches_without_returning_physical_capac
     let result = first.page_tables_authority().retire_table_capacity(
         None,
         carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
-        |_, _| Ok(()),
+        |_| Ok(()),
     );
     let kept_owner = first
         .mm_access

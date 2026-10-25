@@ -494,7 +494,7 @@ impl From<NeverPublishedRecord> for Stage2RetirementProof {
 #[derive(::core::marker::Copy, ::core::clone::Clone)]
 pub(crate) enum Stage1UnpublicationReceipt<'a> {
     EditorRange(&'a carrick_aarch64::stage1_authority::Stage1LeafRetired),
-    EditorArenas(&'a carrick_aarch64::vmm::Stage1UnpublishedArenas),
+    TableArena(&'a carrick_mmu_core::aarch64::TableArenaDetached),
     FrameAbsence(&'a super::frame_inventory::Stage1UnpublishedFrames),
     Inventory(&'a carrick_core::mm::retirement::Stage1UnpublishedMm),
     #[allow(dead_code)] // consumed by the frame-ledger path as callers migrate
@@ -828,7 +828,7 @@ impl CarrierVmCustody {
             Stage1UnpublicationReceipt::EditorRange(receipt) => {
                 self.stage1_unpublished_by_editor(identity, receipt)
             }
-            Stage1UnpublicationReceipt::EditorArenas(receipt) => {
+            Stage1UnpublicationReceipt::TableArena(receipt) => {
                 self.stage1_unpublished_by_retired_arena(identity, receipt)
             }
             Stage1UnpublicationReceipt::FrameAbsence(receipt) => {
@@ -869,12 +869,10 @@ impl CarrierVmCustody {
     fn stage1_unpublished_by_retired_arena(
         &self,
         identity: CarrierStage2RecordIdentity,
-        receipt: &carrick_aarch64::vmm::Stage1UnpublishedArenas,
+        receipt: &carrick_mmu_core::aarch64::TableArenaDetached,
     ) -> Option<DirectStage1RetirementProof> {
         let snapshot = self.stage2_record_snapshot(identity.record_id)?;
-        receipt
-            .retired_base(snapshot.ipa)
-            .then_some(DirectStage1RetirementProof { identity })
+        (receipt.base() == snapshot.ipa).then_some(DirectStage1RetirementProof { identity })
     }
 
     /// Minted only by the whole-MM inventory commit after that transaction has

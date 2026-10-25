@@ -486,9 +486,9 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
 
     fn retire_published_raw_table_arena(
         &self,
-        base: u64,
-        receipt: &carrick_aarch64::vmm::Stage1UnpublishedArenas,
+        receipt: &carrick_mmu_core::aarch64::TableArenaDetached,
     ) -> Result<(), String> {
+        let base = receipt.base();
         let state = self
             .state
             .upgrade()
@@ -513,7 +513,7 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
             .custody
             .stage1_unpublished_from_receipt(
                 identity,
-                Stage1UnpublicationReceipt::EditorArenas(receipt),
+                Stage1UnpublicationReceipt::TableArena(receipt),
             )
             .ok_or_else(|| "raw Fork arena receipt names another record".to_owned())?;
         if self
@@ -1423,10 +1423,12 @@ impl MmAccessState {
         &self,
         custody: &CarrierVmCustody,
         expected_root_slot: (u64, u64),
+        stage1_unpublished: &carrick_core::mm::retirement::Stage1UnpublishedMm,
     ) -> Result<RetiredMmRootStage2, TrapError> {
         self.retire_mm_root_stage2_in_using(
             custody,
             expected_root_slot,
+            stage1_unpublished,
             true,
             &mut unmap_global_frame_stage2_record,
         )
@@ -1438,10 +1440,12 @@ impl MmAccessState {
         &self,
         custody: &CarrierVmCustody,
         expected_root_slot: (u64, u64),
+        stage1_unpublished: &carrick_core::mm::retirement::Stage1UnpublishedMm,
     ) -> Result<RetiredMmRootStage2, TrapError> {
         self.retire_mm_root_stage2_in_using(
             custody,
             expected_root_slot,
+            stage1_unpublished,
             false,
             &mut unmap_global_frame_stage2_record,
         )
@@ -1451,6 +1455,7 @@ impl MmAccessState {
         &self,
         custody: &CarrierVmCustody,
         expected_root_slot: (u64, u64),
+        stage1_unpublished: &carrick_core::mm::retirement::Stage1UnpublishedMm,
         terminal: bool,
         unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
     ) -> Result<RetiredMmRootStage2, TrapError> {
@@ -1458,88 +1463,85 @@ impl MmAccessState {
         // through backend retirement and pool release. A cached owner Arc keeps
         // storage resident, but does not stop a pooled slot being reissued.
         let page_tables = self.page_tables.read();
-        let mut retire =
-            |manager: Option<&carrick_mmu_core::aarch64::PageTableManager>,
-             unpublished: &carrick_aarch64::vmm::Stage1UnpublishedArenas| {
-                // Descriptor publication records the root high-water mark while
-                // holding this authority, then takes mm_root_stage2. Match that
-                // order so retirement cannot wait for the publisher while holding
-                // the root-slot lock the publisher needs.
-                let mut slot = self.mm_root_stage2.lock();
-                let authority = slot.as_ref().ok_or_else(|| {
+        let mut retire = |manager: Option<&carrick_mmu_core::aarch64::PageTableManager>| {
+            // Descriptor publication records the root high-water mark while
+            // holding this authority, then takes mm_root_stage2. Match that
+            // order so retirement cannot wait for the publisher while holding
+            // the root-slot lock the publisher needs.
+            let mut slot = self.mm_root_stage2.lock();
+            let authority = slot.as_ref().ok_or_else(|| {
                 TrapError::Hypervisor(format!(
                     "stage-1 root slot ({:#x}, {:#x}) has no exact structural stage-2 authority",
                     expected_root_slot.0, expected_root_slot.1
                 ))
             })?;
-                if authority.root_slot != expected_root_slot {
-                    return Err(TrapError::Hypervisor(format!(
-                        "stage-1 root retirement coordinates mismatch: expected=({:#x}, {:#x}) authority=({:#x}, {:#x})",
-                        expected_root_slot.0,
-                        expected_root_slot.1,
-                        authority.root_slot.0,
-                        authority.root_slot.1
-                    )));
-                }
-                if authority.owner.record_identity() != authority.record_identity
-                    || (authority.owner.physical_ipa, authority.owner.physical_size)
-                        != authority.physical_extent
-                {
-                    return Err(TrapError::Hypervisor(
-                        "stage-1 root structural owner identity drifted before retirement"
+            if authority.root_slot != expected_root_slot {
+                return Err(TrapError::Hypervisor(format!(
+                    "stage-1 root retirement coordinates mismatch: expected=({:#x}, {:#x}) authority=({:#x}, {:#x})",
+                    expected_root_slot.0,
+                    expected_root_slot.1,
+                    authority.root_slot.0,
+                    authority.root_slot.1
+                )));
+            }
+            if authority.owner.record_identity() != authority.record_identity
+                || (authority.owner.physical_ipa, authority.owner.physical_size)
+                    != authority.physical_extent
+            {
+                return Err(TrapError::Hypervisor(
+                    "stage-1 root structural owner identity drifted before retirement".to_owned(),
+                ));
+            }
+
+            let copied_bytes = manager.map_or(0, |m| m.copied_bytes());
+            authority
+                .owner
+                .record_populated_prefix(copied_bytes as usize);
+
+            let stage1 = custody
+                .stage1_unpublished_from_receipt(
+                    authority.record_identity,
+                    Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
+                )
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "stage-1 root retirement receipt did not name its physical arena"
                             .to_owned(),
-                    ));
-                }
-
-                let copied_bytes = manager.map_or(0, |m| m.copied_bytes());
-                authority
-                    .owner
-                    .record_populated_prefix(copied_bytes as usize);
-
-                let stage1 = custody
-                    .stage1_unpublished_from_receipt(
-                        authority.record_identity,
-                        Stage1UnpublicationReceipt::EditorArenas(unpublished),
                     )
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(
-                            "stage-1 root retirement receipt did not name its physical arena"
-                                .to_owned(),
-                        )
-                    })?;
-                if custody.request_stage2_record_retirement(authority.record_identity, stage1)
-                    != CarrierStage2RetireOutcome::DeferredActivePins
-                {
-                    return Err(TrapError::Hypervisor(
-                        "stage-1 root retirement could not authorize its exact stage-2 record"
-                            .to_owned(),
-                    ));
-                }
+                })?;
+            if custody.request_stage2_record_retirement(authority.record_identity, stage1)
+                != CarrierStage2RetireOutcome::DeferredActivePins
+            {
+                return Err(TrapError::Hypervisor(
+                    "stage-1 root retirement could not authorize its exact stage-2 record"
+                        .to_owned(),
+                ));
+            }
 
-                authority
-                    .owner
-                    .retained
-                    .owner_retired
-                    .store(true, std::sync::atomic::Ordering::Release);
-                retry_structural_backing_identities_in_using(
-                    custody,
-                    &[authority.record_identity],
-                    unmap,
-                    &mut release_retired_stage2_ipa,
-                )?;
-                if let Some(snapshot) =
-                    custody.stage2_record_snapshot(authority.record_identity.record_id)
-                {
-                    return Err(TrapError::Hypervisor(format!(
-                        "stage-1 root structural record remained nonterminal: {snapshot:?}"
-                    )));
-                }
-                // The record is terminal: the runtime may reissue this root slot the
-                // moment it holds the proof below, so a pooled slot goes back to the
-                // pool here rather than at the last `Arc` drop of the retained mapping.
-                authority.owner.release_pooled_root_slot();
+            authority
+                .owner
+                .retained
+                .owner_retired
+                .store(true, std::sync::atomic::Ordering::Release);
+            retry_structural_backing_identities_in_using(
+                custody,
+                &[authority.record_identity],
+                unmap,
+                &mut release_retired_stage2_ipa,
+            )?;
+            if let Some(snapshot) =
+                custody.stage2_record_snapshot(authority.record_identity.record_id)
+            {
+                return Err(TrapError::Hypervisor(format!(
+                    "stage-1 root structural record remained nonterminal: {snapshot:?}"
+                )));
+            }
+            // The record is terminal: the runtime may reissue this root slot the
+            // moment it holds the proof below, so a pooled slot goes back to the
+            // pool here rather than at the last `Arc` drop of the retained mapping.
+            authority.owner.release_pooled_root_slot();
 
-                let authority = slot.take().unwrap_or_else(|| {
+            let authority = slot.take().unwrap_or_else(|| {
                 carrick_fatal!(
                     "hvpatch::mm_authority",
                     "stage-1 root authority disappeared before retirement completion: root_slot=(0x{:x}, 0x{:x})",
@@ -1547,33 +1549,31 @@ impl MmAccessState {
                     expected_root_slot.1
                 );
             });
-                let key = authority.physical_extent;
-                let owner = InventoryStage2OwnerIdentity {
-                    host_addr: authority.owner.ptr() as usize,
-                    generation: authority.owner.epoch().raw(),
-                };
-                self.remove_structural_owner_if(custody, key, |owner| {
-                    std::sync::Arc::ptr_eq(owner, &authority.owner)
-                });
-                Ok(RetiredMmRootStage2 {
-                    proof: HvpatchMmRootRetirementProof {
-                        root_slot: expected_root_slot,
-                    },
-                    physical_extent: key,
-                    owner,
-                })
+            let key = authority.physical_extent;
+            let owner = InventoryStage2OwnerIdentity {
+                host_addr: authority.owner.ptr() as usize,
+                generation: authority.owner.epoch().raw(),
             };
+            self.remove_structural_owner_if(custody, key, |owner| {
+                std::sync::Arc::ptr_eq(owner, &authority.owner)
+            });
+            Ok(RetiredMmRootStage2 {
+                proof: HvpatchMmRootRetirementProof {
+                    root_slot: expected_root_slot,
+                },
+                physical_extent: key,
+                owner,
+            })
+        };
         let disposition = if terminal {
             carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal
         } else {
             carrick_aarch64::stage1_authority::TableArenaRetirement::ExecHandoff
         };
         page_tables
-            .retire_table_capacity(
-                Some(expected_root_slot.0),
-                disposition,
-                |manager, receipt| retire(manager, receipt).map_err(|error| error.to_string()),
-            )
+            .retire_table_capacity(Some(expected_root_slot.0), disposition, |manager| {
+                retire(manager).map_err(|error| error.to_string())
+            })
             .map_err(TrapError::Hypervisor)
     }
 

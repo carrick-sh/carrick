@@ -327,6 +327,7 @@ impl HvpatchTaskEngineBindingState {
                                 state,
                                 ticket.base(),
                                 ticket.size(),
+                                &stage1_unpublished,
                             )?;
                             ticket.redeem(proof).map(Some).map_err(|error| {
                                 TrapError::Hypervisor(format!(
