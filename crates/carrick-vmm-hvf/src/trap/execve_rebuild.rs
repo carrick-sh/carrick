@@ -328,6 +328,98 @@ struct PreparedExecBacking {
     custody: std::sync::Arc<CarrierVmCustody>,
 }
 
+/// Completely fallible native exec preparation. It owns no process/MM
+/// publication and installs no stage-2 map; dropping it releases the fresh
+/// ASID and every uninstalled backing/IPA lease.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct PreparedNativeExecSuccessor {
+    global: Option<GlobalExecPlan>,
+    custody: std::sync::Arc<CarrierVmCustody>,
+    root: carrick_guest_arch::RootGpa,
+    root_slot: (u64, u64),
+    asid: Option<carrick_hal::asid::AsidGeneration>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl core::fmt::Debug for PreparedNativeExecSuccessor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PreparedNativeExecSuccessor")
+            .field("prepared_plan", &self.global.is_some())
+            .field("root", &self.root)
+            .field("root_slot", &self.root_slot)
+            .field("asid", &self.asid)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl PreparedNativeExecSuccessor {
+    pub(crate) fn root(&self) -> carrick_guest_arch::RootGpa {
+        self.root
+    }
+
+    pub(crate) fn asid(&self) -> carrick_hal::asid::AsidGeneration {
+        match self.asid {
+            Some(asid) => asid,
+            None => carrick_fatal!(
+                "hvf::exec_preparation",
+                "prepared native exec lost its ASID"
+            ),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for PreparedNativeExecSuccessor {
+    fn drop(&mut self) {
+        if let Some(asid) = self.asid.take()
+            && let Err(error) = self.custody.asid_allocator().release_unpublished(asid)
+        {
+            carrick_fatal!(
+                "hvf::exec_preparation",
+                "release unpublished native exec ASID: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn prepare_native_exec_successor(
+    custody: std::sync::Arc<CarrierVmCustody>,
+    plan: GuestMappingPlan,
+) -> Result<PreparedNativeExecSuccessor, TrapError> {
+    let global = prepare_global_exec_plan(&plan, None)?;
+    let root_raw = global.plan.stage1_page_tables_base.ok_or_else(|| {
+        TrapError::Hypervisor("native exec successor has no stage-1 root".to_owned())
+    })?;
+    let root =
+        carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(root_raw))
+            .ok_or_else(|| {
+                TrapError::Hypervisor("native exec successor root is unaligned".to_owned())
+            })?;
+    let root_slot = global
+        .plan
+        .mappings
+        .iter()
+        .find(|mapping| mapping.guest_start == crate::memory::LINUX_PAGE_TABLES_BASE)
+        .map(|mapping| (mapping.ipa_start, mapping.mapped_size))
+        .filter(|(base, _)| *base == root_raw)
+        .ok_or_else(|| {
+            TrapError::Hypervisor("native exec successor root mapping is absent".to_owned())
+        })?;
+    let asid = custody
+        .asid_allocator()
+        .allocate()
+        .map_err(|error| TrapError::Hypervisor(format!("allocate native exec ASID: {error}")))?;
+    Ok(PreparedNativeExecSuccessor {
+        global: Some(global),
+        custody,
+        root,
+        root_slot,
+        asid: Some(asid),
+    })
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct PreparedExecRegion {
     region: HvfMappedRegion,

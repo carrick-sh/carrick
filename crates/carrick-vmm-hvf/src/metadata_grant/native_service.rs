@@ -130,13 +130,14 @@ impl NativeService {
             } => (capability, self.exec_payload().ok_or_else(stale)?),
             _ => return self.refuse(),
         };
-        let _successor_mm = match self.reply.as_ref() {
+        let (successor_mm, manifest) = match self.reply.as_ref() {
             Some(NativeServiceReply::Exec(manifest)) => {
                 // SAFETY: intake pinned the complete aligned ring-owned reply;
                 // request completion has not yet released that allocation.
-                unsafe { manifest.as_ref() }
+                let successor_mm = unsafe { manifest.as_ref() }
                     .proposal(request.identity)
-                    .ok_or_else(stale)?
+                    .ok_or_else(stale)?;
+                (successor_mm, *manifest)
             }
             _ => return Err(stale()),
         };
@@ -145,23 +146,58 @@ impl NativeService {
             .native_exec_service(capability)
             .ok_or_else(stale)?;
         match service.prepare(request, payload) {
-            Ok(prepared) => self.publish_exec_prepared(prepared),
+            Ok(prepared) => {
+                let prepared = match crate::trap::prepare_native_exec_successor(
+                    Arc::clone(&self.custody),
+                    prepared.into_mapping_plan(),
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(_) => {
+                        return self.finish_exec_failure(
+                            ServiceFailureCode::new(12).unwrap_or(ServiceFailureCode::MINIMUM),
+                        );
+                    }
+                };
+                self.publish_exec_prepared(successor_mm, manifest, prepared)
+            }
             Err(failure) => self.finish_exec_failure(failure),
         }
     }
 
     fn publish_exec_prepared(
         self,
-        prepared: Box<dyn NativeExecPreparation>,
+        successor_mm: carrick_el1_abi::ReservationMm,
+        manifest: core::ptr::NonNull<carrick_core_abi::service::ExecSuccessorManifest>,
+        prepared: crate::trap::PreparedNativeExecSuccessor,
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let identity = self.request().identity;
         let custody = Arc::clone(&self.custody);
         let receipt = custody.reserve_native_exec_receipt().map_err(|()| {
             TrapError::Hypervisor("native exec receipt space exhausted".to_owned())
         })?;
+        let asid = prepared.asid();
+        let sealed = unsafe { manifest.as_ref() }
+            .seal(
+                identity,
+                receipt,
+                prepared.root(),
+                receipt.raw(),
+                asid.asid(),
+                core::num::NonZeroU64::new(asid.generation()).ok_or_else(stale)?,
+            )
+            .ok_or_else(stale)?;
+        if sealed
+            .open(identity, receipt)
+            .is_none_or(|view| view.successor_mm != successor_mm)
+        {
+            return Err(stale());
+        }
         self.finish_exec_ticket(|ticket| {
             match ticket.publish_exec_prepared(receipt, prepared, |receipt, prepared| {
                 custody.retain_native_exec_preparation(receipt, identity, prepared);
+                // SAFETY: the exact ticket retains this pinned, aligned reply
+                // until the release-store completion below.
+                unsafe { manifest.as_ptr().write(sealed) };
             }) {
                 Ok(()) => Ok(()),
                 Err((_, ticket, prepared)) => {
