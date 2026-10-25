@@ -952,13 +952,7 @@ fn retire_metadata_record_using(
     unmap: impl FnOnce(u64, usize) -> Result<(), crate::trap::CarrierStage2BackendError>,
 ) -> bool {
     use crate::trap::CarrierStage2RetireOutcome;
-    let Some(stage1) = custody.stage1_unpublished_from_receipt(
-        identity,
-        crate::trap::Stage1UnpublicationReceipt::El1Metadata(retirement),
-    ) else {
-        return false;
-    };
-    if custody.request_stage2_record_retirement(identity, stage1)
+    if custody.request_el1_metadata_stage2_record_retirement(identity, retirement)
         != CarrierStage2RetireOutcome::DeferredActivePins
     {
         return false;

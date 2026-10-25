@@ -499,7 +499,6 @@ pub(crate) enum Stage1UnpublicationReceipt<'a> {
     Inventory(&'a carrick_core::mm::retirement::Stage1UnpublishedMm),
     #[allow(dead_code)] // consumed by the frame-ledger path as callers migrate
     NeverPublished(&'a NeverPublishedRecord),
-    El1Metadata(&'a crate::metadata_grant::El1MetadataRetirement),
 }
 
 impl DirectStage1RetirementProof {
@@ -844,9 +843,6 @@ impl CarrierVmCustody {
             Stage1UnpublicationReceipt::NeverPublished(receipt) => {
                 (receipt.identity() == identity).then_some(DirectStage1RetirementProof { identity })
             }
-            Stage1UnpublicationReceipt::El1Metadata(receipt) => receipt
-                .matches(identity)
-                .then_some(DirectStage1RetirementProof { identity }),
         }
     }
 
@@ -1987,6 +1983,17 @@ impl CarrierVmCustody {
         proof: NeverPublishedRecord,
     ) -> CarrierStage2RetireOutcome {
         if proof.identity != identity {
+            return CarrierStage2RetireOutcome::NotFound;
+        }
+        self.request_stage2_record_retirement_by_identity(identity)
+    }
+
+    pub(crate) fn request_el1_metadata_stage2_record_retirement(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        proof: &crate::metadata_grant::El1MetadataRetirement,
+    ) -> CarrierStage2RetireOutcome {
+        if !proof.matches(identity) {
             return CarrierStage2RetireOutcome::NotFound;
         }
         self.request_stage2_record_retirement_by_identity(identity)

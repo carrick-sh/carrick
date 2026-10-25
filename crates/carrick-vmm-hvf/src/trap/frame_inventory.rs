@@ -601,9 +601,6 @@ impl InventoryFrameRegistry {
             Stage1UnpublicationReceipt::NeverPublished(receipt) => {
                 identity == Some(receipt.identity())
             }
-            Stage1UnpublicationReceipt::El1Metadata(receipt) => {
-                identity.is_some_and(|identity| receipt.matches(identity))
-            }
         };
         if !names {
             return Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease));
