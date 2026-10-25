@@ -8,6 +8,7 @@ workers = 3
 refused_workers = 3
 publishes = 1
 comments = 2
+status_updates = 3
 response_bytes = 65536
 wall_minutes = 42
 worker_minutes = 35

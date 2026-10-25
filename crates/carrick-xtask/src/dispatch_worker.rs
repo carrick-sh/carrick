@@ -493,6 +493,8 @@ fn worker_prompt(dispatch: &Dispatch) -> String {
         This is an ephemeral runner. Use local shared carrick leases for builds.\n\
         Contabo leases are per VM under owner decision #639; never acquire a hypervisor lease.\n\
         Run only gates supported by this host; report unavailable Docker, KVM or HVF honestly.\n\
+        To propose a PR body, write ../pr-body.md beside result.json (relative to the checkout root).\n\
+        Keep it at most 8 KiB, write for people, and omit closing references and dispatch footers; the server adds them.\n\
         Return the requested JSON contract, stating unrun gates and blockers honestly.\n\n{}{}",
         dispatch.issue,
         dispatch.branch,
@@ -889,7 +891,9 @@ fn output(command: &mut Command) -> Result<Vec<u8>, ScalerError> {
 }
 pub(crate) fn git_invocation(root: &Path, args: &[&str]) -> Command {
     // Worktree .gitattributes is honored; it has no driver without config.
-    crate::safe_copy::git_command(root, args)
+    let mut command = crate::safe_copy::git_command(root, args);
+    command.env_remove("DISPATCH_BOARD_TOKEN");
+    command
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
@@ -941,19 +945,24 @@ fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
         _ => "GitHub operation".into(),
     };
     let result = timed_phase(&format!("github:{endpoint}"), || {
-        output(Command::new("gh").args(args).current_dir(root))
-            .and_then(|bytes| {
-                String::from_utf8(bytes).map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
-            })
-            .map_err(|error| {
-                // execute already drains and redacts a bounded stderr prefix. Mask
-                // again before clipping so a cut credential cannot escape.
-                let detail = crate::dispatch_redaction::redact(error.to_string().as_bytes());
-                ScalerError::Usage(format!(
-                    "GitHub {endpoint}: {}",
-                    detail.chars().take(2048).collect::<String>()
-                ))
-            })
+        output(
+            Command::new("gh")
+                .args(args)
+                .current_dir(root)
+                .env_remove("DISPATCH_BOARD_TOKEN"),
+        )
+        .and_then(|bytes| {
+            String::from_utf8(bytes).map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
+        })
+        .map_err(|error| {
+            // execute already drains and redacts a bounded stderr prefix. Mask
+            // again before clipping so a cut credential cannot escape.
+            let detail = crate::dispatch_redaction::redact(error.to_string().as_bytes());
+            ScalerError::Usage(format!(
+                "GitHub {endpoint}: {}",
+                detail.chars().take(2048).collect::<String>()
+            ))
+        })
     });
     GITHUB_FAILURES.with(|failures| {
         let mut failures = failures.borrow_mut();
@@ -1263,6 +1272,9 @@ struct Receipt {
     exit_code: i32,
     expected_tip: String,
     refused_workflow: bool,
+    // The proposal belongs to the same atomic checkpoint as the tree.
+    #[serde(default)]
+    pr_body: Option<String>,
 }
 
 /// One predicate for continuation and publication: a scoped receipt and tree.
@@ -1790,6 +1802,7 @@ fn produce(
         .map(|receipt| receipt.expected_tip.clone())
         .unwrap_or_default();
     let mut candidate = None;
+    let mut proposed_body = None;
     let mut raw = if package.join("raw.log").is_file() {
         regular_text(&package.join("raw.log"))?
     } else {
@@ -1868,6 +1881,7 @@ fn produce(
         (contract, refused_workflow, diffstat, code) = timed_phase("worker.harvest", || {
             harvest_worker(&actor, &staging.path().join("candidate"), dispatch, result)
         })?;
+        proposed_body = read_pr_body(&actor)?;
         candidate = Some(staging);
     }
     std::fs::write(package.join("raw.log"), &raw)?;
@@ -1907,8 +1921,17 @@ fn produce(
                 exit_code: code,
                 expected_tip,
                 refused_workflow,
+                pr_body: proposed_body,
             },
         )?;
+    }
+    // Mirror only the installed checkpoint proposal into the upload population.
+    if let Some(receipt) = worker_checkpoint(&state, dispatch)? {
+        if let Some(body) = receipt.pr_body {
+            std::fs::write(package.join("pr-body.md"), body)?;
+        } else if package.join("pr-body.md").exists() {
+            std::fs::remove_file(package.join("pr-body.md"))?;
+        }
     }
     Ok(())
 }
@@ -1971,15 +1994,14 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
             "handoff.json",
             "loop.log",
             "loop-transcript.log",
+            "pr-body.md",
         ]
         .contains(&name)
         {
             return Err(ScalerError::Guard("unexpected dispatch artifact"));
         }
         let text = regular_text(&entry.path())?;
-        let mask = |text: &str| {
-            crate::dispatch_redaction::redact(text.replace(token, "[REDACTED]").as_bytes())
-        };
+        let mask = |text: &str| agent_loop::masked(text, token);
         let masked = if name == "contract.json" {
             let mut contract: Contract = serde_json::from_str(&text)?;
             contract.summary = mask(&contract.summary);
@@ -2028,9 +2050,11 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
         return Err(ScalerError::Guard("incomplete dispatch artifacts"));
     }
     for name in &names {
-        if regular_text(&package.join(name))?.contains(token) {
+        let text = regular_text(&package.join(name))?;
+        if text.contains(token) {
             return Err(ScalerError::Guard("job token found in upload"));
         }
+        crate::dispatch_redaction::DiagnosticSecrets::capture()?.check(text.as_bytes())?;
     }
     #[cfg(test)]
     LAST_SCANNED_ARTIFACTS.with(|scanned| {
@@ -2041,6 +2065,182 @@ fn mask_artifacts(package: &Path, token: &str) -> Result<(), ScalerError> {
         Ok::<_, std::io::Error>(())
     })?;
     Ok(())
+}
+
+#[derive(Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AppliedBody {
+    #[default]
+    NotUpdated,
+    Created,
+    Updated,
+}
+/// Runner-owned evidence of successful side effects, including partial publication.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Applied {
+    commits: Vec<String>,
+    body: AppliedBody,
+    board_changes: Vec<String>,
+}
+impl Applied {
+    fn load() -> Result<Self, ScalerError> {
+        let path = crate::agent_runner::state()?.join("applied.json");
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.into()),
+            Ok(_) => Ok(serde_json::from_str(&regular_text(&path)?)?),
+        }
+    }
+    fn record(update: impl FnOnce(&mut Self)) -> Result<(), ScalerError> {
+        let mut applied = Self::load()?;
+        update(&mut applied);
+        std::fs::write(
+            crate::agent_runner::state()?.join("applied.json"),
+            serde_json::to_vec(&applied)?,
+        )?;
+        Ok(())
+    }
+    fn report(&self) -> String {
+        format!(
+            "Commits pushed: {}.\nPR body: {}.\nBoard status: {}.",
+            if self.commits.is_empty() {
+                "none".into()
+            } else {
+                self.commits
+                    .iter()
+                    .map(|s| s.chars().take(12).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            match self.body {
+                AppliedBody::NotUpdated => "not updated",
+                AppliedBody::Created => "created",
+                AppliedBody::Updated => "updated",
+            },
+            if self.board_changes.is_empty() {
+                "not changed".into()
+            } else {
+                self.board_changes.join(", ")
+            }
+        )
+    }
+}
+/// Remove template instructions before publishing prose for people to read.
+fn body_without_comments(text: &str) -> Result<String, ScalerError> {
+    let mut body = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<!--") {
+        body.push_str(&rest[..start]);
+        rest = rest[start + 4..]
+            .split_once("-->")
+            .ok_or(ScalerError::Guard("unterminated PR body comment"))?
+            .1;
+    }
+    body.push_str(rest);
+    Ok(body)
+}
+fn closing_reference(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+    ]
+    .iter()
+    .any(|keyword| {
+        lower.match_indices(*keyword).any(|(start, _)| {
+            let end = start + keyword.len();
+            if text[..start].ends_with(|c: char| c.is_ascii_alphabetic())
+                || text[end..].starts_with(|c: char| c.is_ascii_alphabetic())
+            {
+                return false;
+            }
+            let reference = text[end..]
+                .trim_start_matches(|c: char| c.is_whitespace() || ":*_`[('\"".contains(c))
+                .split_whitespace()
+                .next()
+                .unwrap_or_default();
+            reference.contains('#') || reference.contains("https://github.com/")
+        })
+    })
+}
+fn read_pr_body(directory: &Path) -> Result<Option<String>, ScalerError> {
+    let path = directory.join("pr-body.md");
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
+    Ok(Some(crate::safe_copy::text(&path, 8192)?))
+}
+fn proposed_pr_body(
+    proposal: Option<&str>,
+    issue: u64,
+    id: &str,
+    token: &str,
+) -> Result<Option<String>, ScalerError> {
+    let Some(text) = proposal else {
+        return Ok(None);
+    };
+    if text.len() > 8192 {
+        return Err(ScalerError::Guard("PR body exceeds 8 KiB"));
+    }
+    let canonical = format!("Closes #{issue}");
+    let mut closing = false;
+    let mut lines = Vec::new();
+    for line in body_without_comments(text)?.lines() {
+        if line.trim() == canonical && !closing {
+            closing = true;
+            continue;
+        }
+        if line.contains("Dispatch run:") || closing_reference(line) {
+            return Err(ScalerError::Guard(
+                "PR body contains an extra closing reference or dispatch footer",
+            ));
+        }
+        lines.push(line.to_owned());
+    }
+    let text = lines.join("\n");
+    if closing_reference(&text) {
+        return Err(ScalerError::Guard(
+            "PR body contains an extra closing reference",
+        ));
+    }
+    Ok(Some(final_pr_body(&text, issue, id, token)))
+}
+fn final_pr_body(text: &str, issue: u64, id: &str, token: &str) -> String {
+    format!(
+        "{}\n\nCloses #{issue}\n\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/{id}\n",
+        agent_loop::masked(text, token).trim()
+    )
+}
+fn template_pr_body(
+    contract: &Contract,
+    issue: u64,
+    id: &str,
+    token: &str,
+) -> Result<String, ScalerError> {
+    let summary =
+        if closing_reference(&contract.summary) || contract.summary.contains("Dispatch run:") {
+            "Worker claims are available in the dispatch outcome.".to_owned()
+        } else {
+            contract.summary.chars().take(4_000).collect::<String>()
+        };
+    let template = include_str!("../../../.github/pull_request_template.md")
+        .replace("Closes #\n", "")
+        .replace(
+            "<!-- Approach and any candid divergence from Linux. -->",
+            &summary,
+        )
+        .replace("NEW: none / FIXED: none", "Not compared")
+        .replace("NEW: / FIXED:", "Not compared")
+        .replace("HEAD, SHA-256, CDHash", "Not collected");
+    // Claims can contain closing syntax too; never promote them into linkage.
+    let text = body_without_comments(&template)?
+        .lines()
+        .filter(|line| !closing_reference(line) && !line.contains("Dispatch run:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(final_pr_body(&text, issue, id, token))
 }
 
 fn publish(
@@ -2060,9 +2260,13 @@ fn publish(
     let state = crate::agent_runner::state()?;
     let work = state.join("work");
     let id = branch_run(dispatch.issue, &dispatch.branch)?;
+    // Preserve the creation-run footer required by owned_pr for branch ownership.
+    // A continuation outcome carries the current run footer through Server::post.
+    // Validate the selected checkpoint proposal before the first GitHub side effect.
+    let proposal = proposed_pr_body(receipt.pr_body.as_deref(), dispatch.issue, id, token)?;
     if !receipt.refused_workflow
         && work.is_dir()
-        && git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base
+        && (dispatch.resume || git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base)
     {
         git(
             &work,
@@ -2096,12 +2300,20 @@ fn publish(
                 pr["number"]
             )?;
         } else if existing != Some(head.trim()) {
+            let since = existing.unwrap_or(&receipt.base);
+            let commits: Vec<_> =
+                git(&work, &["rev-list", "--reverse", &format!("{since}..HEAD")])?
+                    .lines()
+                    .filter(|s| sha(s))
+                    .map(str::to_owned)
+                    .collect();
             output(&mut push_command(
                 &work,
                 dispatch,
                 id,
                 &receipt.expected_tip,
             )?)?;
+            Applied::record(|a| a.commits.extend(commits))?;
         }
         if !retained {
             std::fs::write(state.join("published-tip"), head.trim())?;
@@ -2109,27 +2321,38 @@ fn publish(
         let prs = open_prs(root, &dispatch.branch)?;
         if prs.as_array().is_some_and(|prs| !prs.is_empty()) {
             let pr = require_owned_pr(root, dispatch)?;
+            if !retained && let Some(body) = &proposal {
+                let path = state.join("pr-body.md");
+                std::fs::write(&path, body)?;
+                gh(
+                    root,
+                    &[
+                        "pr",
+                        "edit",
+                        &pr["number"]
+                            .as_u64()
+                            .ok_or(ScalerError::Guard("invalid PR number"))?
+                            .to_string(),
+                        "--repo",
+                        REPOSITORY,
+                        "--body-file",
+                        path.to_str().ok_or(ScalerError::Guard("body path"))?,
+                    ],
+                )?;
+                Applied::record(|a| a.body = AppliedBody::Updated)?;
+            }
             return Ok(Some(
                 pr["number"]
                     .as_u64()
                     .ok_or(ScalerError::Guard("invalid PR number"))?,
             ));
         } else {
-            let template = include_str!("../../../.github/pull_request_template.md")
-                .replace("Closes #\n", &format!("Closes #{}\n", dispatch.issue))
-                .replace(
-                    "<!-- Approach and any candid divergence from Linux. -->",
-                    &contract.summary.chars().take(4_000).collect::<String>(),
-                )
-                .replace("NEW: none / FIXED: none", "Not compared")
-                .replace("NEW: / FIXED:", "Not compared")
-                .replace("HEAD, SHA-256, CDHash", "Not collected");
-            let body = format!(
-                "{template}\nCloses #{}\n\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/{id}\n",
-                dispatch.issue
-            );
+            let body = match proposal {
+                Some(body) => body,
+                None => template_pr_body(contract, dispatch.issue, id, token)?,
+            };
             let path = state.join("pr-body.md");
-            std::fs::write(&path, body.replace(token, "[REDACTED]"))?;
+            std::fs::write(&path, body)?;
             gh(
                 root,
                 &[
@@ -2148,6 +2371,7 @@ fn publish(
                     path.to_str().ok_or(ScalerError::Guard("body path"))?,
                 ],
             )?;
+            Applied::record(|a| a.body = AppliedBody::Created)?;
             return Ok(require_owned_pr(root, dispatch)?["number"].as_u64());
         }
     }
@@ -2158,6 +2382,48 @@ fn publish(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn proposed_body_is_bounded_and_cannot_add_linkage_or_provenance() {
+        let body = proposed_pr_body(
+            Some("A concrete explanation.\n\nCloses #634\n"),
+            634,
+            "42",
+            "fixture-token",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with("Closes #"))
+                .count(),
+            1
+        );
+        for text in [
+            "Closes #634\nCloses #634",
+            "Fixes #800",
+            "Fixes:#800",
+            "cLoSeS#800",
+            "Resolves: [issue](https://github.com/carrick-sh/carrick/issues/800)",
+            "Closes\n#800",
+            "Closes #634 and #800",
+            "Dispatch run: forged",
+            "<!-- unterminated",
+        ] {
+            assert!(
+                proposed_pr_body(Some(text), 634, "42", "fixture-token").is_err(),
+                "unsafe proposal admitted: {text}"
+            );
+        }
+        assert!(proposed_pr_body(Some(&"x".repeat(8193)), 634, "42", "fixture-token").is_err());
+        let directory = tempfile::tempdir().unwrap();
+        assert!(read_pr_body(directory.path()).unwrap().is_none());
+        std::os::unix::fs::symlink("elsewhere", directory.path().join("pr-body.md")).unwrap();
+        assert!(read_pr_body(directory.path()).is_err());
+    }
+    #[test]
+    fn failed_body_edit_keeps_confirmed_push_evidence() {
+        publication_fixture("edit-failure");
+    }
     #[test]
     fn merge_conflicted_branch_reaches_the_isolated_worker_checkout() {
         let temp = tempfile::tempdir().unwrap();
@@ -2210,6 +2476,17 @@ mod tests {
     }
     #[test]
     fn label_publication_creates_draft_and_continues_the_owned_branch() {
+        publication_fixture("original");
+    }
+    #[test]
+    fn created_pr_has_one_closing_line() {
+        publication_fixture("closing");
+    }
+    #[test]
+    fn continuation_applies_proposed_body() {
+        publication_fixture("body");
+    }
+    fn publication_fixture(witness: &str) {
         const CHILD: &str = "CARRICK_TEST_DISPATCH_PUBLICATION";
         if std::env::var_os(CHILD).is_none() {
             let temp = tempfile::tempdir().unwrap();
@@ -2239,6 +2516,10 @@ if test "$1" = api; then
  *'/pulls?'*) if test -f "$RUNNER_TEMP/created"; then cat "$RUNNER_TEMP/pr.json"; else echo '[]'; fi ;;
  *) exit 91 ;;
  esac
+elif test "$1 $2" = 'pr edit'; then
+ test ! -f "$RUNNER_TEMP/fail-edit" || exit 94
+ while test "$1" != --body-file; do shift; done
+ cp "$2" "$RUNNER_TEMP/applied-body.md"
 elif test "$1 $2" = 'pr create'; then
  test ! -f "$RUNNER_TEMP/created" || exit 92
  touch "$RUNNER_TEMP/created"
@@ -2253,12 +2534,19 @@ fi
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
             let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "dispatch_worker::tests::label_publication_creates_draft_and_continues_the_owned_branch", "--nocapture"])
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
                 .env(CHILD, "1")
-                .env("GH_TOKEN", "fixture-token").env("RUNNER_TEMP", temp.path())
-                .env("GITHUB_RUN_ID", "42").env("GITHUB_RUN_ATTEMPT", "1")
+                .env("GH_TOKEN", "fixture-token")
+                .env("RUNNER_TEMP", temp.path())
+                .env("GITHUB_RUN_ID", "42")
+                .env("GITHUB_RUN_ATTEMPT", "1")
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-                .output().unwrap();
+                .output()
+                .unwrap();
             assert!(
                 output.status.success(),
                 "{}",
@@ -2302,6 +2590,7 @@ fi
             exit_code: 0,
             expected_tip: String::new(),
             refused_workflow: false,
+            pr_body: None,
         };
         let report = state.join("report.md");
         std::fs::write(&report, "").unwrap();
@@ -2320,6 +2609,13 @@ fi
         );
         let body = regular_text(&state.join("pr-body.md")).unwrap();
         assert!(body.contains("Closes #634") && body.contains("Dispatch run:"));
+        if witness == "closing" {
+            assert_eq!(
+                body.lines().filter(|s| s.starts_with("Closes #")).count(),
+                1,
+                "created PR has duplicate closing lines"
+            );
+        }
         let calls = regular_text(&outer.join("gh.args")).unwrap();
         assert!(calls.contains(&format!(
             "--draft\n--base\nmain\n--head\n{}\n--title\n{subject}",
@@ -2338,6 +2634,7 @@ fi
                 .unwrap()
                 .is_none()
         );
+        std::fs::remove_file(state.join("applied.json")).unwrap();
         dispatch.resume = true;
         receipt.expected_tip = git(&work, &["rev-parse", "HEAD"])
             .unwrap()
@@ -2353,6 +2650,40 @@ fi
             ],
         )
         .unwrap();
+        if witness == "body" || witness == "edit-failure" {
+            let package = outer.join("dispatch-output");
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(
+                package.join("pr-body.md"),
+                "Explain the implemented fix. fixture-token\n",
+            )
+            .unwrap();
+        }
+        if witness == "body" || witness == "edit-failure" {
+            receipt.pr_body = read_pr_body(&outer.join("dispatch-output")).unwrap();
+        }
+        if witness == "edit-failure" {
+            std::fs::write(outer.join("fail-edit"), "").unwrap();
+            assert!(
+                publish(
+                    &work,
+                    &dispatch,
+                    &receipt,
+                    &contract,
+                    &report,
+                    "fixture-token",
+                    &mut agent_loop::RunCache::default()
+                )
+                .is_err()
+            );
+            let applied = Applied::load().unwrap();
+            assert!(applied.body == AppliedBody::NotUpdated);
+            assert_eq!(
+                applied.commits,
+                vec![git(&work, &["rev-parse", "HEAD"]).unwrap().trim()]
+            );
+            return;
+        }
         assert_eq!(
             publish(
                 &work,
@@ -2366,6 +2697,24 @@ fi
             .unwrap(),
             Some(800)
         );
+        let applied = Applied::load().unwrap();
+        assert_eq!(applied.body == AppliedBody::Updated, witness == "body");
+        let sha = git(&work, &["rev-parse", "HEAD"]).unwrap();
+        assert!(applied.report().contains(&sha[..12]));
+        if witness == "body" {
+            let applied = regular_text(&outer.join("applied-body.md"))
+                .expect("continuation did not apply proposed PR body");
+            assert!(applied.contains("Explain the implemented fix."));
+            assert!(!applied.contains("fixture-token"));
+            assert_eq!(
+                applied
+                    .lines()
+                    .filter(|s| s.starts_with("Closes #"))
+                    .count(),
+                1
+            );
+            assert!(applied.contains("Dispatch run:"));
+        }
         let calls = regular_text(&outer.join("gh.args")).unwrap();
         assert_eq!(calls.lines().filter(|s| *s == "create").count(), 1);
         let pushes = regular_text(&outer.join("push.args")).unwrap();
@@ -2660,12 +3009,18 @@ fi
         cmd.env("GH_TOKEN", "planted")
             .env("GITHUB_TOKEN", "planted")
             .env("AGENT_DIRECTOR_TOKEN", "planted")
+            .env("DISPATCH_BOARD_TOKEN", "planted")
             .env("GITHUB_OUTPUT", "/runner/set_output")
             .env("GIT_CONFIG_GLOBAL", "/credential/helper")
             .env("RUSTC_WRAPPER", "/runner/sccache")
             .env("SCCACHE_SERVER_UDS", "/runner/sccache.sock");
         private_environment(&mut cmd);
-        for key in ["GITHUB_TOKEN", "GH_TOKEN", "AGENT_DIRECTOR_TOKEN"] {
+        for key in [
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "AGENT_DIRECTOR_TOKEN",
+            "DISPATCH_BOARD_TOKEN",
+        ] {
             assert!(
                 !cmd.get_envs()
                     .any(|(name, value)| name == key && value.is_some()),

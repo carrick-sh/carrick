@@ -66,8 +66,17 @@ head ref. The expected-tip push lease closes cross-key races.
 ## Accounts and credentials
 
 The runner holds the job-scoped `GITHUB_TOKEN` with exactly `contents: write`,
-`pull-requests: write`, `issues: write` and `actions: read`. No long-lived write token or
-publisher job exists. The tool server alone uses it for GitHub and publication.
+`pull-requests: write`, `issues: write` and `actions: read`. The tool server
+alone uses it for GitHub and publication.
+
+`DISPATCH_BOARD_TOKEN` is a separate one-hour `carrick-workers` App installation
+token, down-scoped at mint to `{"organization_projects":"write"}`. Only the
+loop step receives the secret, and only the runner-uid tool server uses it.
+Both model accounts receive cleared environments. The workflow masks it before
+the loop starts; diagnostic redaction and the complete artifact scan also cover
+its exact bytes. No App private key enters GitHub Actions. The director adds
+the Mac minter after landing; until the secret exists, reads and status updates
+report `unavailable` with the missing-token reason and the run continues.
 
 The dedicated nologin accounts `carrick-dispatch-loop` and
 `carrick-dispatch-agent` have distinct uids and groups, no sudo rights and no
@@ -112,19 +121,20 @@ There are no tool arguments for issue, PR, repository or scope. Only `select_bra
 
 | Tool | Policy |
 | --- | --- |
-| `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, commits, issue/PR comments, earlier verified runs with URLs, conclusions, artifact names and outcome contracts. Includes their outcome comments and available branch candidates; board status is explicitly unavailable with this token. Includes the label/comment/review trigger verbatim and provenance. Optional sources degrade individually to `unavailable` with endpoint, HTTP status when available, and bounded redacted stderr; unverifiable authors remain `unverified`. Errors are request-scoped, deduplicated and tagged `github-api(error)` with `untrusted:true`. `sources` is a fixed response field retained when chronological context is clipped; `sources_omitted` reports overflow of its half-response budget. Only trigger/issue reads are mandatory. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
+| `read_state {}` | Full issue and linked dispatch PRs (including closed state), reviews, inline comments, commits, issue/PR comments, earlier verified runs with URLs, conclusions, artifact names and outcome contracts. Includes their outcome comments and available branch candidates; includes project-1 status for this issue and its current owned dispatch PR when present. Board reads use the separate board token, are tagged `github-api(project-1)` and untrusted, and degrade to `unavailable` on missing credentials or API failure. The query caps fields and each item’s project memberships at 100 and rejects truncated connections; responses are capped at 64 KiB. Includes the label/comment/review trigger verbatim and provenance. Optional sources degrade individually to `unavailable` with endpoint, HTTP status when available, and bounded redacted stderr; unverifiable authors remain `unverified`. Errors are request-scoped, deduplicated and tagged `github-api(error)` with `untrusted:true`. `sources` is a fixed response field retained when chronological context is clipped; `sources_omitted` reports overflow of its half-response budget. Only trigger/issue reads are mandatory. Two reads, bounded to 64 KiB; oldest items are dropped with a count, keeping the trigger. |
+| `set_status {status}` | Three attempts. Accepts exactly `Todo`, `In progress`, `In review` or `Blocked`; Done stays with merges. The server freshly resolves only the admitted issue and its owned dispatch PR in org project 1. No item/project fields are accepted. Items absent from the board are left absent. Each confirmed mutation is recorded; a partial failure reports only confirmed changes and marks the board unavailable without failing the run. |
 | `select_branch {branch}` | Before workers begin, selects the new run branch or an authenticated issue-linked branch. Reads and retains its remote tip for the publication lease. |
 | `read_artifact {run, name}` | Reads one fixed text filename (`contract.json`, `handoff.json`, `raw.log`, `transcript.md`, `diffstat.txt`) from a completed earlier run. Verifies workflow/run/owner identity, a completed `carrick-agent` worker with successful upload, and the issue-derived upload bundle name. Review runs must keep the workflow blob from their head’s merge base with main. The returned contract, handoff or worker-transcript text is tagged with its dispatch provenance and marked untrusted. Rejects another issue, workflow, current run, expired/oversized bundle or unknown filename. Download is runner-private and the final read refuses symlinks and exceeds neither 64 KiB nor the event wall budget. |
 | `read_capacity {}` | Runs pinned `agy_worker.py capacity --json` as the worker account. Reads the real `backends` map from `capacity_report`, with `installed`, `free_slots`, `quota_free`, `score` and agy `quota.groups`/`group_scores`. Augments it with exact current IDs from the launcher's live `models --backend` roster, excluding superseded IDs. Returns numeric capacity and model IDs only, never credentials or raw diagnostics. Only successful capacity reports are cached. Each admitted worker consumes its snapshot, so the next worker requires a fresh report; refused choices can reuse the current successful report. Total probes are capped at `workers + refused_workers`. Each subprocess/output is bounded (120 s, 64 KiB) inside the event wall budget. |
 | `invoke_worker {notes, backend, model}` | Notes at most 8 KiB, with the model choice and reason. Checks remaining worker, tool-call and time budgets before consulting the cached capacity snapshot; refuses missing/uninstalled/full/exhausted backends and missing/exhausted models before charging either call or worker budget. Agy quota is checked for the selected model's group. Three refused worker requests exhaust their separate refusal budget without charging workers. Runs workers sequentially on the selected branch; each later worker sees earlier commits and a server-built handoff of contract summaries, tests and risks. All workers share 35 total minutes; owner trigger and inline review text are supplied verbatim, with coordinator notes separately labelled. |
-| `publish {}` | Shared receipt/ownership checks; refuses `.github/workflows/*`; only the admitted branch, fixed refspec and expected-tip lease. Creates a draft with the first commit's title, PR template, `Closes #N` and run URL, or retains the owned PR. |
+| `publish {}` | Shared receipt/ownership checks; refuses `.github/workflows/*`; only the admitted branch, fixed refspec and expected-tip lease. Creates a draft with the first commit’s title or continues the owned PR. A worker can write `pr-body.md` beside `result.json`, outside its checkout, to propose a body (8 KiB, regular UTF-8 file, no symlinks). The server masks tokens, strips template instructions, refuses extra closing references and supplied run footers, then adds exactly one `Closes #N` line and its run footer. The same body is used for creation or `gh pr edit --body-file` on continuation. The creation-run footer stays in the PR body to preserve branch ownership; the outcome carries the current run footer. With no proposal, creation fills today’s template and continuation leaves the body alone. Bodies remain untrusted dispatch-agent text in later reads. |
 | `comment {body}` | At most 8 KiB; posts only on this issue or its continued PR, with token masking, credential redaction and a verified run footer. |
-| `finish {status, summary}` | `done`, `blocked` or `failed`; posts an outcome with a bounded contract preview (full claims remain in artifacts), worker contract excerpt, selected backend/model and reasoning, budgets and run URL. One attempt, exempt from call budget; failed posting stops the loop and triggers one server fallback. |
+| `finish {status, summary}` | `done`, `blocked` or `failed`; posts a human-readable outcome led by server-confirmed commits pushed (short SHAs), whether the body was created, updated or left alone, and confirmed board changes. Loop and worker statements are separately labelled as unverified claims. Raw contracts, backend/model choices and budgets sit in collapsed details. The full claims remain in artifacts. One attempt, exempt from call budget; failed posting stops the loop and triggers one server fallback. |
 
 The only ceilings are `[loop]` in `.github/dispatch-tiers.toml`: 12 tool calls,
 two state reads, three workers, three refused worker requests, one publication,
-two optional comments, 64 KiB state, 42 wall minutes including at most 35 total
-worker minutes. Each worker allocation includes `[loop].harvest_seconds`
+two optional comments, three status updates, 64 KiB state, 42 wall minutes
+including at most 35 total worker minutes. Each worker allocation includes `[loop].harvest_seconds`
 (default 180 seconds): the agent deadline is that much earlier than the
 worker deadline. Retirement, permission hand-back, snapshot, checkpoint and
 result collection use the reserved window. A timed-out worker retains partial
@@ -171,8 +181,8 @@ widen tool permissions. Admission is bound to the webhook digest in private
 runner state; auth and the loop consume it without reinterpreting labels.
 
 Output is token-masked and scanned before upload: `raw.log`, `transcript.md`,
-`contract.json`, `handoff.json`, `diffstat.txt`, `loop.log` and
-`loop-transcript.log`, retained 30 days after successful or failed loop outcomes once uid retirement and artifact scanning succeed. The final contract and handoff persist each worker's claims and publication context for future runs; runs share no local state. Unknown or nonregular
+`contract.json`, `handoff.json`, `diffstat.txt`, `loop.log`,
+`loop-transcript.log` and optional `pr-body.md`, retained 30 days after successful or failed loop outcomes once uid retirement and artifact scanning succeed. The final contract and handoff persist each worker's claims and publication context for future runs; runs share no local state. Unknown or nonregular
 files are refused. `loop.log` is capped at 64 KiB and records tool selectors,
 text lengths (never note or comment bodies), outcomes and durations, plus
 GitHub source, capacity, worker and harvest phase timings. It keeps opening
@@ -256,6 +266,12 @@ ownership, publication, socket/environment isolation and workflow wiring. They
 cannot establish deployed acceptance. The director must push from the Mac
 (App tokens cannot push workflow edits), deploy the new controller and verify
 agent-template accounts/tools and the pinned launcher roster/capacity APIs.
+For #811/#842 rollout, add the Mac board-token minter, then verify a trial
+reads both board items and changes only those items through the scoped tool.
+Continue an owned PR with a worker-proposed body and check the live body,
+exactly one closing line, outcome action list and retired model uids. These live
+checks require the deployed workflow and credential; portable fixture tests do
+not establish them.
 Then label #587 as written with `dispatch`, observe a draft PR, request changes
 as owner, and observe a new commit on that PR branch plus an outcome comment.
 Exercise `/agent` on an issue and a merge-conflicted owned PR, verify refusal

@@ -161,7 +161,9 @@ jobs:
         timeout-minutes: 47
         env:
           GH_TOKEN: ${{ github.token }}
+          DISPATCH_BOARD_TOKEN: ${{ secrets.DISPATCH_BOARD_TOKEN }}
         run: |
+          if [ -n "$DISPATCH_BOARD_TOKEN" ]; then echo "::add-mask::$DISPATCH_BOARD_TOKEN"; fi
           CARRICK_DISPATCH_STEP_STARTED_AT=$(date +%s)
           export CARRICK_DISPATCH_STEP_STARTED_AT
           "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode carrick --check-load -- \
