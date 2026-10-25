@@ -1,8 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use serde_json::{Value, json};
+use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -410,6 +411,91 @@ fn concurrent_expired_reclaimers_have_exactly_one_winner() {
     );
 }
 
+struct HolderGuard(Option<Child>);
+
+impl HolderGuard {
+    fn spawn(command: &mut Command) -> Self {
+        use std::os::unix::process::CommandExt;
+        Self(Some(command.process_group(0).spawn().unwrap()))
+    }
+
+    fn take_stdout(&mut self) -> std::process::ChildStdout {
+        self.0
+            .as_mut()
+            .expect("holder child present")
+            .stdout
+            .take()
+            .expect("holder stdout")
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        let child = self.0.as_mut().expect("holder child present");
+        if let Ok(pgid) = i32::try_from(child.id()) {
+            // SAFETY: `child` was spawned with `process_group(0)` and has not
+            // been waited yet, so `-pgid` targets only its process group.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        child.kill()
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.take().expect("holder child present").wait()
+    }
+}
+
+impl Drop for HolderGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            if let Ok(pgid) = i32::try_from(child.id()) {
+                // SAFETY: `child` was spawned with `process_group(0)` and has
+                // not been waited yet, so `-pgid` targets only its process group.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn wait_for_pipe_readiness(fd: BorrowedFd<'_>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "holder readiness timed out after {timeout:?}"
+        );
+        let timeout_ms =
+            libc::c_int::try_from(remaining.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+        let mut pollfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` is a valid single-element local struct, and `fd`
+        // borrows a live pipe descriptor for the duration of `poll`.
+        let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            panic!("poll failed: {err}");
+        }
+        assert!(ret > 0, "holder readiness timed out after {timeout:?}");
+        assert_eq!(
+            pollfd.revents & libc::POLLNVAL,
+            0,
+            "poll reported invalid descriptor"
+        );
+        break;
+    }
+}
+
 #[test]
 fn killed_holder_is_reclaimable_only_after_ttl() {
     let remote = Remote::new();
@@ -418,30 +504,30 @@ fn killed_holder_is_reclaimable_only_after_ttl() {
     // This shell is the supervisor: acquire, publish a receipt, then stay alive.
     let receipt = remote.clients[0].join("receipt.json");
     let lease = remote.lease(0, ttl_end);
-    let mut holder = Command::new("sh")
-        .env("CARRICK_XTASK_TEST_NOW", "1")
-        .arg("-c")
-        .arg("\"$1\" --root \"$2\" claims --remote \"$3\" --now \"$4\" acquire \"$5\" --lease \"$6\" > \"$7\" && exec sleep 30")
-        .arg("holder")
-        .arg(env!("CARGO_BIN_EXE_carrick-xtask"))
-        .arg(&remote.clients[0])
-        .arg(remote.url())
-        .arg(t0.to_string())
-        .arg(ISSUE)
-        .arg(lease)
-        .arg(&receipt)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let old = loop {
-        if let Ok(bytes) = std::fs::read(&receipt)
-            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-        {
-            break value[0]["sha"].as_str().unwrap().to_owned();
-        }
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    let mut holder = HolderGuard::spawn(
+        Command::new("sh")
+            .env("CARRICK_XTASK_TEST_NOW", "1")
+            .arg("-c")
+            .arg("\"$1\" --root \"$2\" claims --remote \"$3\" --now \"$4\" acquire \"$5\" --lease \"$6\" > \"$7\" && printf ready && exec sleep 30")
+            .arg("holder")
+            .arg(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .arg(&remote.clients[0])
+            .arg(remote.url())
+            .arg(t0.to_string())
+            .arg(ISSUE)
+            .arg(lease)
+            .arg(&receipt)
+            .stdout(Stdio::piped()),
+    );
+    let mut stdout = holder.take_stdout();
+    wait_for_pipe_readiness(stdout.as_fd(), Duration::from_secs(60));
+    let mut buf = [0u8; 1];
+    stdout
+        .read_exact(&mut buf)
+        .expect("holder exited before signaling readiness");
+    let bytes = std::fs::read(&receipt).expect("receipt file must exist");
+    let value = serde_json::from_slice::<Value>(&bytes).expect("receipt must be valid json");
+    let old = value[0]["sha"].as_str().expect("sha in receipt").to_owned();
     holder.kill().unwrap();
     holder.wait().unwrap();
     let reclaim_at = |clock: u64| {
