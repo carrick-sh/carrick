@@ -856,6 +856,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             unsafe { self.read_stack_record::<u64, I>(lease, execution.context, address) }?;
         match carrick_el1_abi::ForkStockKind::decode(tag) {
             Some(carrick_el1_abi::ForkStockKind::Loan) => {}
+            Some(carrick_el1_abi::ForkStockKind::Descriptor) => {
+                self.settle_native_descriptor_reply(lease, execution, address)?;
+                return Ok(None);
+            }
             Some(carrick_el1_abi::ForkStockKind::Reserve) => {
                 self.reserve_fork_stock(lease, execution, address)?;
                 return Ok(None);
@@ -910,6 +914,97 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .write(physical, bytes)
             .map_err(|error| fail(error.to_string()))?;
         Ok(None)
+    }
+
+    /// Settle native table stock by the same exact reply receipt as HVF.
+    /// Refused or withdrawn submissions return all grants; applied receipts
+    /// retain only their linked prefix in the shared fork stock.
+    fn settle_native_descriptor_reply<I: CarrierCpuIo>(
+        &mut self,
+        lease: &StoppedCpuLease<'_, I>,
+        execution: GrantExecution,
+        address: u64,
+    ) -> Result<(), TrapError> {
+        use carrick_el1_abi::{NativeDescriptorSettlement, PortalGrantSlot};
+        // SAFETY: the wire record consists entirely of initialized u64 words.
+        let (physical, mut settlement) = unsafe {
+            self.read_stack_record::<NativeDescriptorSettlement, I>(
+                lease,
+                execution.context,
+                address,
+            )
+        }?;
+        let accepted = (|| -> Option<()> {
+            let (owner, generation, reply_address) = settlement.request()?;
+            if execution.binding.mm.raw() != owner.mm().raw()
+                || self.fork_stock.child_owner(owner.mm()) != Some(owner)
+                || self.fork_stock.child_root(owner.mm()) != Some(execution.context.root)
+            {
+                return None;
+            }
+            let txn = self.fork_stock.pending_native_descriptor_transaction(
+                owner,
+                execution.context.root,
+                generation,
+            )?;
+            let reply_physical = kernel_pod_physical(
+                &self.kernel_pod_storage,
+                reply_address,
+                size_of::<PortalGrantSlot>(),
+                align_of::<PortalGrantSlot>(),
+            )?;
+            // SAFETY: declared writable kernel storage retains the complete
+            // aligned atomic-only reply slot for this synchronous crossing.
+            let reply =
+                unsafe { self._vm.retained_record::<PortalGrantSlot>(reply_physical) }.ok()?;
+            let window = reply.window()?;
+            if window.operation.carrier != owner.carrier()
+                || window.operation.mm != owner.mm()
+                || window.operation.incarnation != owner.incarnation()
+                || window.operation.sequence != generation
+            {
+                return None;
+            }
+            if let Some(receipt) = reply.take_receipt(window, &txn) {
+                self.fork_stock
+                    .settle_native_descriptor_tables(
+                        &mut NoTableLedger,
+                        owner,
+                        execution.context.root,
+                        &receipt,
+                    )
+                    .ok()?;
+            } else if reply.withdraw(window, &txn) {
+                self.fork_stock
+                    .cancel_submitted_native_descriptor_tables(
+                        &mut NoTableLedger,
+                        owner,
+                        execution.context.root,
+                        generation,
+                    )
+                    .ok()?;
+            } else {
+                return None;
+            }
+            Some(())
+        })()
+        .is_some();
+        if accepted {
+            settlement.accept();
+        } else {
+            settlement.refuse();
+        }
+        // SAFETY: copy only the initialized words of the aligned wire record
+        // back to the validated stack owned exclusively by the stopped CPU.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw const settlement).cast::<u8>(),
+                size_of::<NativeDescriptorSettlement>(),
+            )
+        };
+        self._vm
+            .write(physical, bytes)
+            .map_err(|error| fail(error.to_string()))
     }
 
     fn reserve_fork_stock<I: CarrierCpuIo>(
