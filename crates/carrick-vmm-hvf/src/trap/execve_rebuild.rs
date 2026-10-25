@@ -358,14 +358,8 @@ impl PreparedNativeExecSuccessor {
         self.root
     }
 
-    pub(crate) fn asid(&self) -> carrick_hal::asid::AsidGeneration {
-        match self.asid {
-            Some(asid) => asid,
-            None => carrick_fatal!(
-                "hvf::exec_preparation",
-                "prepared native exec lost its ASID"
-            ),
-        }
+    pub(crate) fn prepared_asid(&self) -> Option<carrick_hal::asid::AsidGeneration> {
+        self.asid
     }
 
     pub(crate) fn entry(&self) -> u64 {
@@ -380,24 +374,17 @@ impl PreparedNativeExecSuccessor {
 
     fn take_install_parts(
         &mut self,
-    ) -> (
+    ) -> Option<(
         GlobalExecPlan,
         (u64, u64),
         carrick_hal::asid::AsidGeneration,
-    ) {
-        let global = self.global.take().unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvf::exec_preparation",
-                "prepared native exec plan consumed twice"
-            )
-        });
-        let asid = self.asid.take().unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvf::exec_preparation",
-                "prepared native exec ASID consumed twice"
-            )
-        });
-        (global, self.root_slot, asid)
+    )> {
+        let global = self.global.take()?;
+        let Some(asid) = self.asid.take() else {
+            self.global = Some(global);
+            return None;
+        };
+        Some((global, self.root_slot, asid))
     }
 }
 
@@ -407,10 +394,7 @@ impl Drop for PreparedNativeExecSuccessor {
         if let Some(asid) = self.asid.take()
             && let Err(error) = self.custody.asid_allocator().release_unpublished(asid)
         {
-            carrick_fatal!(
-                "hvf::exec_preparation",
-                "release unpublished native exec ASID: {error}"
-            );
+            tracing::error!(%error, "failed to release unpublished native exec ASID");
         }
     }
 }
@@ -885,7 +869,9 @@ pub(crate) fn install_native_exec_successor(
     TrapError,
 > {
     let custody = std::sync::Arc::clone(&successor.custody);
-    let (global, root_slot, asid) = successor.take_install_parts();
+    let (global, root_slot, asid) = successor.take_install_parts().ok_or_else(|| {
+        TrapError::Hypervisor("prepared native exec successor was already consumed".into())
+    })?;
     let prepared = PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), global)?;
     let published = install_prepared_exec_backing(prepared, root_slot).map_err(|failure| {
         let message = match failure {
