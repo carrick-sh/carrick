@@ -864,7 +864,7 @@ mod overlay_dispatch_tests {
 
             let removed = dispatcher
                 .captured_file_table()
-                .write_open_files()
+                .write_open_files(None)
                 .remove(&fd)
                 .expect("surviving lock fd");
             dispatcher.close_open_file_and_free_pty(&removed);
@@ -975,7 +975,7 @@ mod overlay_dispatch_tests {
 
         let removed = dispatcher
             .captured_file_table()
-            .write_open_files()
+            .write_open_files(None)
             .remove(&fd)
             .expect("surviving slot");
         dispatcher.close_open_file_and_free_pty(&removed);
@@ -5225,7 +5225,7 @@ mod hvpatch_in_process_fork_tests {
         );
         parent
             .captured_file_table()
-            .write_open_files()
+            .write_open_files(None)
             .insert(3, OpenFile::new(Arc::clone(&description), 0));
         retain_open_file(&description);
         let parent_files = parent.captured_file_table();
@@ -5499,7 +5499,7 @@ mod hvpatch_in_process_fork_tests {
             })),
             crate::linux_abi::LINUX_O_RDWR,
         );
-        parent.captured_file_table().write_open_files().insert(
+        parent.captured_file_table().write_open_files(None).insert(
             3,
             OpenFile::new(Arc::clone(&description), crate::linux_abi::LINUX_FD_CLOEXEC),
         );
@@ -5532,7 +5532,7 @@ mod hvpatch_in_process_fork_tests {
         assert_eq!(child.proc.lock().membarrier_ready, 0);
         assert_eq!(child.mem().lock().program_break(), 0x1234_0000);
 
-        child.captured_file_table().write_open_files().remove(&3);
+        child.captured_file_table().write_open_files(None).remove(&3);
         child.mem().lock().seed_brk_current_for_test(0x5678_0000);
         assert!(
             parent
@@ -5580,9 +5580,9 @@ mod hvpatch_in_process_fork_tests {
 
         parent
             .captured_file_table()
-            .write_open_files()
+            .write_open_files(None)
             .insert(3, OpenFile::new(Arc::clone(&desc_non_cloexec), 0));
-        parent.captured_file_table().write_open_files().insert(
+        parent.captured_file_table().write_open_files(None).insert(
             4,
             OpenFile::new(
                 Arc::clone(&desc_cloexec),
@@ -5611,7 +5611,7 @@ mod hvpatch_in_process_fork_tests {
         // 3. Exec retains non-CLOEXEC file (fd 3) and closes CLOEXEC file (fd 4)
         {
             let child_files = child.captured_file_table();
-            let mut table = child_files.write_open_files();
+            let mut table = child_files.write_open_files(None);
             let cloexec: Vec<i32> = table
                 .iter()
                 .filter(|(_, of)| {
@@ -5638,7 +5638,7 @@ mod hvpatch_in_process_fork_tests {
         let write_host_fd = host_fds[1];
 
         let parent = SyscallDispatcher::new();
-        parent.captured_file_table().write_open_files().insert(
+        parent.captured_file_table().write_open_files(None).insert(
             3,
             OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
@@ -5655,7 +5655,7 @@ mod hvpatch_in_process_fork_tests {
                 0,
             ),
         );
-        parent.captured_file_table().write_open_files().insert(
+        parent.captured_file_table().write_open_files(None).insert(
             4,
             OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
@@ -5681,7 +5681,7 @@ mod hvpatch_in_process_fork_tests {
         let (child, child_context) = fork_dispatcher(&parent, parent_tid, child_tid, 51, 52);
         let parent_writer = parent
             .captured_file_table()
-            .write_open_files()
+            .write_open_files(None)
             .remove(&4)
             .unwrap();
         parent.close_open_file_and_free_pty(&parent_writer);
@@ -5729,7 +5729,7 @@ mod hvpatch_in_process_fork_tests {
         let write_host_fd = host_fds[1];
 
         let parent = SyscallDispatcher::new();
-        parent.captured_file_table().write_open_files().insert(
+        parent.captured_file_table().write_open_files(None).insert(
             3,
             OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
@@ -5746,7 +5746,7 @@ mod hvpatch_in_process_fork_tests {
                 0,
             ),
         );
-        parent.captured_file_table().write_open_files().insert(
+        parent.captured_file_table().write_open_files(None).insert(
             4,
             OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
@@ -5772,7 +5772,7 @@ mod hvpatch_in_process_fork_tests {
         let (child, child_context) = fork_dispatcher(&parent, parent_tid, child_tid, 53, 54);
         let parent_writer = parent
             .captured_file_table()
-            .write_open_files()
+            .write_open_files(None)
             .remove(&4)
             .unwrap();
         parent.close_open_file_and_free_pty(&parent_writer);
@@ -5841,7 +5841,7 @@ mod hvpatch_in_process_fork_tests {
 
         let child_file = child
             .captured_file_table()
-            .write_open_files()
+            .write_open_files(None)
             .remove(&fd)
             .unwrap();
         child.close_open_file_and_free_pty(&child_file);

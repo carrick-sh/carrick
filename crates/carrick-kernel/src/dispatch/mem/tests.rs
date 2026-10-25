@@ -1346,19 +1346,22 @@ fn file_private_fixed_shared_aperture_repoints_snapshot_and_publishes_map_time_b
 
     let mut file_bytes = vec![0x7d; LINUX_PAGE_SIZE as usize];
     file_bytes.extend_from_slice(&[0x90, 0xc3, 0x4a]);
-    dispatcher.captured_file_table().write_open_files().insert(
-        FD,
-        OpenFile::from_open_description_with_status_flags(
-            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
-                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
-                path: "private-replacement".into(),
-                contents: file_bytes,
-                offset: 0,
-            })),
-            crate::linux_abi::LINUX_O_RDONLY,
-            0,
-        ),
-    );
+    dispatcher
+        .captured_file_table()
+        .write_open_files(None)
+        .insert(
+            FD,
+            OpenFile::from_open_description_with_status_flags(
+                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                    path: "private-replacement".into(),
+                    contents: file_bytes,
+                    offset: 0,
+                })),
+                crate::linux_abi::LINUX_O_RDONLY,
+                0,
+            ),
+        );
 
     let replaced = returned(threaded_memory_call(
         &dispatcher,
@@ -1514,34 +1517,40 @@ fn private_file_snapshot_computes_identical_bus_tail_for_memfd_synthetic_and_hos
         crate::linux_abi::LINUX_O_RDWR,
     ));
     memfd_common.set_seals(Some(0));
-    dispatcher.captured_file_table().write_open_files().insert(
-        20,
-        OpenFile::from_open_description_with_common(
-            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
-                base: OpenDescriptionBase::new(0),
-                path: "/memfd:private-eof".into(),
-                metadata: metadata.clone(),
-                contents: FileContents::dense(payload.clone()),
-                offset: 0,
-                writable: true,
-            })),
-            memfd_common,
-            0,
-        ),
-    );
-    dispatcher.captured_file_table().write_open_files().insert(
-        21,
-        OpenFile::from_open_description_with_status_flags(
-            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
-                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
-                path: "/synthetic-private-eof".into(),
-                contents: payload.clone(),
-                offset: 0,
-            })),
-            crate::linux_abi::LINUX_O_RDONLY,
-            0,
-        ),
-    );
+    dispatcher
+        .captured_file_table()
+        .write_open_files(None)
+        .insert(
+            20,
+            OpenFile::from_open_description_with_common(
+                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
+                    base: OpenDescriptionBase::new(0),
+                    path: "/memfd:private-eof".into(),
+                    metadata: metadata.clone(),
+                    contents: FileContents::dense(payload.clone()),
+                    offset: 0,
+                    writable: true,
+                })),
+                memfd_common,
+                0,
+            ),
+        );
+    dispatcher
+        .captured_file_table()
+        .write_open_files(None)
+        .insert(
+            21,
+            OpenFile::from_open_description_with_status_flags(
+                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::SyntheticFile {
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                    path: "/synthetic-private-eof".into(),
+                    contents: payload.clone(),
+                    offset: 0,
+                })),
+                crate::linux_abi::LINUX_O_RDONLY,
+                0,
+            ),
+        );
     let host_file = tempfile::tempfile().expect("temporary host private-map source");
     assert_eq!(
         unsafe {
@@ -1554,19 +1563,22 @@ fn private_file_snapshot_computes_identical_bus_tail_for_memfd_synthetic_and_hos
         },
         payload.len() as isize
     );
-    dispatcher.captured_file_table().write_open_files().insert(
-        22,
-        OpenFile::from_open_description_with_status_flags(
-            std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
-                base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
-                host_fd: HostFdRef::new(host_file.into_raw_fd()),
-                metadata,
-                writable: false,
-            })),
-            crate::linux_abi::LINUX_O_RDONLY,
-            0,
-        ),
-    );
+    dispatcher
+        .captured_file_table()
+        .write_open_files(None)
+        .insert(
+            22,
+            OpenFile::from_open_description_with_status_flags(
+                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::HostFile {
+                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDONLY),
+                    host_fd: HostFdRef::new(host_file.into_raw_fd()),
+                    metadata,
+                    writable: false,
+                })),
+                crate::linux_abi::LINUX_O_RDONLY,
+                0,
+            ),
+        );
 
     for (fd, source) in [(20, "memfd"), (21, "synthetic"), (22, "host")] {
         let snapshot = dispatcher
@@ -1604,26 +1616,29 @@ fn shared_mmap_refreshes_an_independently_opened_vfs_inode() {
         .set_file_contents(PATH, Vec::new())
         .expect("create shared overlay inode");
     let install_snapshot = |fd| {
-        dispatcher.captured_file_table().write_open_files().insert(
-            fd,
-            OpenFile::from_open_description_with_status_flags(
-                std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
-                    base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
-                    path: PATH.into(),
-                    metadata: RootFsMetadata {
+        dispatcher
+            .captured_file_table()
+            .write_open_files(None)
+            .insert(
+                fd,
+                OpenFile::from_open_description_with_status_flags(
+                    std::sync::Arc::new(parking_lot::RwLock::new(OpenDescription::File {
+                        base: OpenDescriptionBase::new(crate::linux_abi::LINUX_O_RDWR),
                         path: PATH.into(),
-                        kind: RootFsEntryKind::File,
-                        mode: 0o600,
-                        size: 0,
-                    },
-                    contents: FileContents::dense(Vec::new()),
-                    offset: 0,
-                    writable: true,
-                })),
-                crate::linux_abi::LINUX_O_RDWR,
-                0,
-            ),
-        );
+                        metadata: RootFsMetadata {
+                            path: PATH.into(),
+                            kind: RootFsEntryKind::File,
+                            mode: 0o600,
+                            size: 0,
+                        },
+                        contents: FileContents::dense(Vec::new()),
+                        offset: 0,
+                        writable: true,
+                    })),
+                    crate::linux_abi::LINUX_O_RDWR,
+                    0,
+                ),
+            );
     };
     install_snapshot(WRITER_FD);
     install_snapshot(MAPPER_FD);
@@ -1763,7 +1778,7 @@ pub(crate) fn install_host_file_fd_with_source(
     open_file.description.retain_fd_ref();
     dispatcher
         .captured_file_table()
-        .write_open_files()
+        .write_open_files(None)
         .insert(fd, open_file);
 }
 

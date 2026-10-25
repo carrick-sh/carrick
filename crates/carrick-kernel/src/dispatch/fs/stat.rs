@@ -938,7 +938,7 @@ mod tests {
         assert_ne!(null_identity, 0);
         {
             let file_table = dispatcher.captured_file_table();
-            let mut files = file_table.write_open_files();
+            let mut files = file_table.write_open_files(None);
             files.insert(
                 20,
                 host_stream_file(pipe_fds[0], pipe_identity, true, HostWriteKind::PipeLike),

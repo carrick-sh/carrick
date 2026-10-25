@@ -1655,7 +1655,7 @@ impl<'a> FsView<'a> {
                 }
                 LINUX_F_SETFD => {
                     let fd_flags = LinuxFdFlags::from_bits_truncate(arg);
-                    if let Some(open_file) = this.captured_file_table().write_open_files().get_mut(&fd.0) {
+                    if let Some(open_file) = this.captured_file_table().write_open_files(None).get_mut(&fd.0) {
                         open_file.fd_flags = fd_flags.bits();
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }

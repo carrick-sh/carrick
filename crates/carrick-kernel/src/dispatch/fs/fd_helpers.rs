@@ -395,7 +395,10 @@ impl<'a> FsView<'a> {
     /// through the shared teardown so a host fd or pty entry cannot leak.
     pub(in crate::dispatch) fn close_fd_for_internal_rollback(&self, fd: i32) {
         self.detach_fd_from_epolls(fd);
-        let removed = self.captured_file_table().write_open_files().remove(&fd);
+        let removed = self
+            .captured_file_table()
+            .write_open_files(None)
+            .remove(&fd);
         if let Some(open_file) = removed {
             self.close_open_file_and_free_pty(&open_file);
             self.note_fd_closed(fd);

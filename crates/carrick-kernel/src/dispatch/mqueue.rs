@@ -1933,7 +1933,7 @@ mod tests {
             &mqueue_open
         ));
 
-        let guard = files.write_open_files();
+        let guard = files.write_open_files(None);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = {
             let dispatcher = Arc::clone(&dispatcher);
@@ -2599,7 +2599,7 @@ mod tests {
         child
             .resources()
             .files()
-            .write_open_files()
+            .write_open_files(None)
             .get_mut(&mqd)
             .expect("child mqd")
             .fd_flags |= LINUX_FD_CLOEXEC;

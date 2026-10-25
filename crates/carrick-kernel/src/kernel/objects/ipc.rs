@@ -508,24 +508,15 @@ impl Drop for FileTableStdioGuard<'_> {
 }
 
 impl FileTable {
-    pub(super) fn stdio_guard(&self, field: StdioField) -> FileTableStdioGuard<'_> {
-        let mutation = self.mutation_lease();
-        self.stdio_guard_with_custody(field, FileTableMutationCustody::Owned(mutation))
-    }
-
-    pub(super) fn stdio_guard_borrowing<'a>(
+    pub(super) fn stdio_guard<'a>(
         &'a self,
         field: StdioField,
-        mutation: &'a FileTableMutationLease,
+        mutation: Option<&'a FileTableMutationLease>,
     ) -> FileTableStdioGuard<'a> {
-        self.stdio_guard_with_custody(field, FileTableMutationCustody::Borrowed(mutation))
-    }
-
-    fn stdio_guard_with_custody<'a>(
-        &'a self,
-        field: StdioField,
-        mutation: FileTableMutationCustody<'a>,
-    ) -> FileTableStdioGuard<'a> {
+        let mutation = mutation.map_or_else(
+            || FileTableMutationCustody::Owned(self.mutation_lease()),
+            FileTableMutationCustody::Borrowed,
+        );
         let mut guard = match field {
             StdioField::Closed => self.closed_stdio.lock(),
             StdioField::Cloexec => self.stdio_cloexec.lock(),
@@ -800,12 +791,12 @@ mod tests {
         );
         assert_eq!(authority.getfd(shared, fd::Fd(3)), Ok(true));
         assert_eq!(authority.holds(&operation), Ok((0, 1)));
-        table.write_open_files().get_mut(&3).unwrap().fd_flags = 0;
+        table.write_open_files(None).get_mut(&3).unwrap().fd_flags = 0;
         assert_eq!(authority.getfd(shared, fd::Fd(3)), Ok(false));
         // High-number admission must grow storage and keep the same table ID.
         replacement.retain_fd_ref();
         table
-            .write_open_files()
+            .write_open_files(None)
             .insert(63, FileSlot::new(Arc::clone(&replacement), 0));
         assert_eq!(
             authority.get(shared, fd::Fd(63)).unwrap(),
@@ -816,7 +807,7 @@ mod tests {
         table.lock_closed_stdio()[0] = false;
         table.lock_stdio_cloexec()[0] = true;
         assert_eq!(authority.getfd(shared, fd::Fd(0)), Ok(true));
-        let removed = table.write_open_files().remove(&63).unwrap();
+        let removed = table.write_open_files(None).remove(&63).unwrap();
         removed.description.release_fd_ref();
         assert_eq!(authority.get(shared, fd::Fd(63)), Err(fd::Error::BadFd));
         // A diagnostic reference remains, but no new operation can enter.

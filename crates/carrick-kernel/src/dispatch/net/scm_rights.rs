@@ -264,7 +264,7 @@ mod tests {
                 let (key, placeholder) = park(Arc::clone(&original)).unwrap();
                 placeholders +=
                     usize::from(PlaceholderKey::of_host_fd(placeholder.as_raw_fd()).is_some());
-                let old = sender.write_open_files().remove(&3).unwrap();
+                let old = sender.write_open_files(None).remove(&3).unwrap();
                 old.description.release_fd_ref();
                 let replacement = eventfd_description();
                 replacement.retain_fd_ref();
@@ -284,12 +284,12 @@ mod tests {
                 );
                 received.release_fd_ref();
                 assert_eq!(original.fd_ref_count(), 1);
-                let installed = receiver.write_open_files().remove(&3).unwrap();
+                let installed = receiver.write_open_files(None).remove(&3).unwrap();
                 assert_ne!(installed.fd_flags, 0);
                 installed.description.release_fd_ref();
                 assert_eq!(original.fd_ref_count(), 0);
                 sender
-                    .write_open_files()
+                    .write_open_files(None)
                     .remove(&3)
                     .unwrap()
                     .description
@@ -395,7 +395,7 @@ mod tests {
                 drop(right_placeholder);
                 for table in [&first, &second] {
                     table
-                        .write_open_files()
+                        .write_open_files(None)
                         .remove(&3)
                         .unwrap()
                         .description
