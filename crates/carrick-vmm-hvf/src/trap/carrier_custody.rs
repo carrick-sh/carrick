@@ -439,13 +439,11 @@ struct Stage2RecordRemoval<'a> {
 #[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct Stage1Unpublished {
     identity: CarrierStage2RecordIdentity,
-    source: Stage1UnpublishedSource,
 }
 
 #[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct Stage2RetirementAuthorization {
     identity: CarrierStage2RecordIdentity,
-    source: Stage1UnpublishedSource,
 }
 
 #[derive(::core::fmt::Debug)]
@@ -495,21 +493,6 @@ pub(crate) enum Stage1UnpublicationReceipt<'a> {
     #[allow(dead_code)] // consumed by the frame-ledger path as callers migrate
     NeverPublished(&'a NeverPublishedRecord),
     El1Metadata(&'a crate::metadata_grant::El1MetadataRetirement),
-}
-
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::PartialEq,
-)]
-enum Stage1UnpublishedSource {
-    EditorRelease,
-    FrameInventoryCommit,
-    InventoryCommit,
-    NeverPublished,
-    El1MetadataRetirement,
 }
 
 impl Stage1Unpublished {
@@ -848,7 +831,6 @@ impl CarrierVmCustody {
                     .covers(snapshot.ipa, snapshot.len)
                     .then_some(Stage1Unpublished {
                         identity,
-                        source: Stage1UnpublishedSource::FrameInventoryCommit,
                     })
             }
             Stage1UnpublicationReceipt::Inventory(receipt) => {
@@ -864,7 +846,6 @@ impl CarrierVmCustody {
             Stage1UnpublicationReceipt::El1Metadata(receipt) => {
                 receipt.matches(identity).then_some(Stage1Unpublished {
                     identity,
-                    source: Stage1UnpublishedSource::El1MetadataRetirement,
                 })
             }
         }
@@ -884,7 +865,6 @@ impl CarrierVmCustody {
     ) -> Option<Stage1Unpublished> {
         (receipt.identity == identity).then_some(Stage1Unpublished {
             identity,
-            source: Stage1UnpublishedSource::NeverPublished,
         })
     }
 
@@ -900,7 +880,6 @@ impl CarrierVmCustody {
             .names(snapshot.ipa, snapshot.len)
             .then_some(Stage1Unpublished {
                 identity,
-                source: Stage1UnpublishedSource::EditorRelease,
             })
     }
 
@@ -914,7 +893,6 @@ impl CarrierVmCustody {
             .retired_base(snapshot.ipa)
             .then_some(Stage1Unpublished {
                 identity,
-                source: Stage1UnpublishedSource::EditorRelease,
             })
     }
 
@@ -927,7 +905,6 @@ impl CarrierVmCustody {
     ) -> Stage1Unpublished {
         Stage1Unpublished {
             identity,
-            source: Stage1UnpublishedSource::InventoryCommit,
         }
     }
 
@@ -2027,7 +2004,6 @@ impl CarrierVmCustody {
         }
         let authorization = std::sync::Arc::new(Stage2RetirementAuthorization {
             identity: stage1.identity,
-            source: stage1.source,
         });
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
@@ -2065,7 +2041,6 @@ impl CarrierVmCustody {
             identity,
             Stage1Unpublished {
                 identity,
-                source: Stage1UnpublishedSource::FrameInventoryCommit,
             },
         )
     }
