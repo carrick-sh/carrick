@@ -127,18 +127,25 @@ There are no tool arguments for issue, PR, repository or scope. Only `select_bra
 | `read_artifact {run, name}` | Reads one fixed text filename (`contract.json`, `handoff.json`, `raw.log`, `transcript.md`, `diffstat.txt`) from a completed earlier run. Verifies workflow/run/owner identity, a completed `carrick-agent` worker with successful upload, and the issue-derived upload bundle name. Review runs must keep the workflow blob from their head’s merge base with main. The returned contract, handoff or worker-transcript text is tagged with its dispatch provenance and marked untrusted. Rejects another issue, workflow, current run, expired/oversized bundle or unknown filename. Download is runner-private and the final read refuses symlinks and exceeds neither 64 KiB nor the event wall budget. |
 | `read_capacity {}` | Runs pinned `agy_worker.py capacity --json` as the worker account. Reads the real `backends` map from `capacity_report`, with `installed`, `free_slots`, `quota_free`, `score` and agy `quota.groups`/`group_scores`. Augments it with exact current IDs from the launcher's live `models --backend` roster, excluding superseded IDs. Returns numeric capacity and model IDs only, never credentials or raw diagnostics. Only successful capacity reports are cached. Each admitted worker consumes its snapshot, so the next worker requires a fresh report; refused choices can reuse the current successful report. Total probes are capped at `workers + refused_workers`. Each subprocess/output is bounded (120 s, 64 KiB) inside the event wall budget. |
 | `invoke_worker {notes, backend, model}` | Notes at most 8 KiB, with the model choice and reason. Checks remaining worker, tool-call and time budgets before consulting the cached capacity snapshot; refuses missing/uninstalled/full/exhausted backends and missing/exhausted models before charging either call or worker budget. Agy quota is checked for the selected model's group. Three refused worker requests exhaust their separate refusal budget without charging workers. Runs workers sequentially on the selected branch; each later worker sees earlier commits and a server-built handoff of contract summaries, tests and risks. All workers share 35 total minutes; owner trigger and inline review text are supplied verbatim, with coordinator notes separately labelled. |
-| `publish {}` | Shared receipt/ownership checks; refuses `.github/workflows/*`; only the admitted branch, fixed refspec and expected-tip lease. Creates a draft with the first commit’s title or continues the owned PR. A worker can write `pr-body.md` beside `result.json`, outside its checkout, to propose a body (8 KiB, regular UTF-8 file, no symlinks). The server masks tokens, neutralises mentions with a U+2060 WORD JOINER, strips template instructions, refuses extra closing references and supplied run footers, then adds exactly one `Closes #N` line and its run footer. A refused proposal is reported with its reason and never blocks the commit push. The same body is used for creation or a REST `PATCH` on continuation. After each write, the server verifies closing references with the job token using the bounded consistency protocol below. A failed create restores the default template; a failed edit restores the previous body. Both restorations are verified. Failure outcomes are posted on the PR, and an unverified restoration puts a manual repair warning first. The creation-run footer stays in the PR body to preserve branch ownership, and an edit ends with the current run footer. An earlier checkpoint’s proposal is passed to later workers for revision and retained when they write no proposal. With no proposal, creation fills today’s template and continuation leaves the body alone. Bodies remain untrusted dispatch-agent text in later reads. |
+| `publish {}` | Shared receipt/ownership checks; refuses `.github/workflows/*`; only the admitted branch, fixed refspec and expected-tip lease. Creates a draft with the first commit’s title or continues the owned PR. A worker can write `pr-body.md` beside `result.json`, outside its checkout, to propose a body (8 KiB, regular UTF-8 file, no symlinks). The server masks tokens, neutralises mentions with a U+2060 WORD JOINER, strips template instructions, refuses extra closing references and supplied run footers, then adds exactly one `Closes #N` line and its run footer. A refused proposal is reported with its reason and never blocks the commit push. The same body is used for creation or a REST `PATCH` on continuation. After each write, the server verifies closing references with the job token using the bounded consistency protocol below. An observed extra reference or persistent read error restores the default template on create, or the previous body on edit. A deadline alone keeps the locally validated new body and reports it as unverified. Both restorations are verified. Failure outcomes are posted on the PR, and an unverified restoration puts a manual repair warning first. The creation-run footer stays in the PR body to preserve branch ownership, and an edit ends with the current run footer. An earlier checkpoint’s proposal is passed to later workers for revision and retained when they write no proposal. With no proposal, creation fills today’s template and continuation leaves the body alone. Bodies remain untrusted dispatch-agent text in later reads. |
 | `comment {body}` | At most 8 KiB; posts only on this issue or its continued PR, with token masking, credential redaction, mentions neutralised with a WORD JOINER and a verified run footer. |
 | `finish {status, summary}` | `done`, `blocked` or `failed`; posts a human-readable outcome led by a markdown list of server-confirmed commits pushed (short SHAs), whether the body was created, updated, refused or left alone, and confirmed board changes or protected items left alone. Loop and worker statements are separately labelled as unverified claims; the loop summary is blockquoted and retained separately as `loop_summary` in `contract.json`. Raw contracts, backend/model choices and budgets sit in collapsed details. The full claims remain in artifacts. One attempt, exempt from call budget; failed posting stops the loop and triggers one server fallback. |
 
 GitHub's closing-reference index updates asynchronously. After each create or
 PATCH, the server waits three seconds, then requires two consecutive matching
 reads at least two seconds apart. An unexpected extra reference fails immediately.
-Each write's verification has a twenty-second limit, including API time, and is
-also bounded by the remaining publish command window. A missing or unsettled
-index is reported as `closing references unverified`, with the body restoration
-and its verification reported separately. Recovery never turns the failed
-publication into a successful outcome.
+Each read gets one retry for a transient API failure. Each write's verification
+has a twenty-second limit, including API time, and is bounded by the publish
+command window. Primary publication reserves thirty seconds within that window
+for restoration and its verification; recovery never extends the caller's budget.
+A failed pre-edit snapshot skips the body update, names the refusal in the
+applied report, and preserves the commit push.
+
+A deadline alone, without an observed extra reference, leaves the locally
+validated new body in place. The outcome reports `closing references unverified`
+and says the body was kept, rather than calling the update successful. Other
+verification failures attempt restoration and report its verification separately.
+Recovery never turns the failed publication into a successful outcome.
 
 Before an edit, the server snapshots all closing references and GitHub's
 body-derived view (`excludeUserLinked: true`). The expected set is this issue
@@ -149,11 +156,17 @@ includes both repository and issue number, so the write cannot introduce a new
 closing reference in any repository. Both connections are bounded at 100 nodes;
 truncated or malformed responses, and responses over 64 KiB, are unverifiable.
 
+At harvest, the server applies the same conservative closing-keyword filter to
+messages of commits added by that worker, before accepting the checkpoint for
+publication. Closing this issue in this repository is allowed. A keyword for
+another issue or any cross-repository target refuses the harvest and names the
+commit, so rebase landing cannot close an unrelated issue through its message.
+
 Every PR body write (including restoration) and loop-authored post, including
 the loop summary and worker-choice reasons,
 inserts a WORD JOINER after mention-leading `@` characters. This works inside
 HTML and code blocks. Numeric at-sign entities and `&commat;` are decoded before
-neutralisation. An alphanumeric prefix leaves an address such as
+neutralisation. An ASCII alphanumeric or underscore prefix leaves an address such as
 `user@example.com` or `https://user@host` intact.
 
 Fallback outcome contracts come only from authenticated server outcome comments,

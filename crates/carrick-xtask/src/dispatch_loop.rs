@@ -4119,6 +4119,37 @@ esac
         });
     }
     #[test]
+    fn rev4_harvest_refuses_closing_another_issue_and_names_commit() {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            std::fs::create_dir(&base).unwrap();
+            git(&base, &["init", "-b", "main"]).unwrap();
+            git(&base, &["commit", "--allow-empty", "-m", "base"]).unwrap();
+            let mut server = server(&base);
+            server.dispatch.resume = false;
+            server.dispatch.base = git(&base, &["rev-parse", "HEAD"]).unwrap().trim().into();
+            let actor = root.join("actor");
+            std::fs::create_dir(&actor).unwrap();
+            let work = actor.join("work");
+            worker_checkout(&base, &root.join("unused"), &work, &server.dispatch, None).unwrap();
+            git(&work, &["commit", "--allow-empty", "-m", "Fixes #999"]).unwrap();
+            let bad = git(&work, &["rev-parse", "HEAD"]).unwrap();
+            let result = harvest_worker(
+                &actor,
+                &root.join("harvest"),
+                &server.dispatch,
+                Ok(0),
+                &server.dispatch.base,
+            );
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains(bad.trim())),
+                "harvest accepted a closing keyword for another issue without naming its commit"
+            );
+        });
+    }
+    #[test]
     fn review_timeout_retains_worker_summary() {
         shared_fixture(|root| {
             let base = root.join("base");
@@ -4139,8 +4170,14 @@ esac
             )
             .unwrap();
             std::fs::write(actor.join("result.json"), json!({"structured_output":{"status":"blocked","summary":"implemented parser; linker failed","tests":["unit test passed"],"risks":[]}}).to_string()).unwrap();
-            let (contract, _, _, _) =
-                harvest_worker(&actor, &root.join("harvest"), &server.dispatch, Ok(124)).unwrap();
+            let (contract, _, _, _) = harvest_worker(
+                &actor,
+                &root.join("harvest"),
+                &server.dispatch,
+                Ok(124),
+                &server.dispatch.base,
+            )
+            .unwrap();
             assert!(
                 contract
                     .summary
