@@ -297,11 +297,17 @@ impl TerminalKind for Process {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessCloseDisposition {
+    Exit,
+    Exec,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessTerminalIdentity {
     task: TaskKey,
     address: AddressContext<RootGpa>,
     status: TerminationStatus,
-    exec: bool,
+    disposition: ProcessCloseDisposition,
 }
 
 impl ProcessTerminalIdentity {
@@ -314,7 +320,7 @@ impl ProcessTerminalIdentity {
             task,
             address,
             status,
-            exec: false,
+            disposition: ProcessCloseDisposition::Exit,
         }
     }
 
@@ -323,7 +329,7 @@ impl ProcessTerminalIdentity {
             task,
             address,
             status: TerminationStatus::SUCCESS,
-            exec: true,
+            disposition: ProcessCloseDisposition::Exec,
         }
     }
 
@@ -802,7 +808,7 @@ impl TerminalCustody<Process, Closing> {
     }
     pub fn can_settle(&self, page: &impl Lifecycle, receipts: &CompletedMemberReceipts) -> bool {
         self.identity == receipts.process
-            && if self.identity.exec {
+            && if self.identity.disposition == ProcessCloseDisposition::Exec {
                 // Exec retains its caller and prepared service through adopt.
                 page.live() == 1 && page.claimed_count() == 1
             } else {
