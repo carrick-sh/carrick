@@ -108,7 +108,222 @@ pub struct ExecPayloadDescriptor {
     address: GuestVa,
     length: GuestLen,
 }
-pub const MAX_EXEC_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024;
+/// Linux's aggregate argv/envp accounting ceiling. String bytes include their
+/// terminating NUL and each vector entry consumes one 64-bit pointer slot.
+pub const EXEC_ARGUMENT_BYTES_MAX: usize = 2 * 1024 * 1024;
+/// Linux `MAX_ARG_STRLEN` for Carrick's 4 KiB guest page ABI, including NUL.
+pub const MAX_ARG_STRLEN: usize = 32 * 4096;
+pub const MAX_EXEC_PATH_BYTES: usize = 4096;
+pub const EXEC_PAYLOAD_HEADER_BYTES: usize = 32;
+/// The wire record includes the path and a small header in addition to bytes
+/// charged to Linux argv/envp accounting.
+pub const MAX_EXEC_PAYLOAD_BYTES: u64 =
+    (EXEC_ARGUMENT_BYTES_MAX + MAX_EXEC_PATH_BYTES + EXEC_PAYLOAD_HEADER_BYTES) as u64;
+
+const EXEC_PAYLOAD_MAGIC: u32 = u32::from_le_bytes(*b"CEXE");
+const EXEC_PAYLOAD_VERSION: u16 = 1;
+
+/// Which Linux exec entry produced the staged request. All raw user pointers
+/// have already been consumed by the ring before this value crosses the ABI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecCall {
+    Execve,
+    Execveat { dirfd: i32, flags: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecPayloadError {
+    Invalid,
+    TooLarge,
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+/// Encode the fixed prefix after the ring has finished staging all strings.
+pub fn encode_exec_payload_header(
+    bytes: &mut [u8],
+    call: ExecCall,
+    path_len: usize,
+    argc: usize,
+    envc: usize,
+) -> Result<(), ExecPayloadError> {
+    if bytes.len() > MAX_EXEC_PAYLOAD_BYTES as usize
+        || path_len == 0
+        || path_len > MAX_EXEC_PATH_BYTES
+    {
+        return Err(ExecPayloadError::TooLarge);
+    }
+    let (kind, dirfd, flags) = match call {
+        ExecCall::Execve => (1u16, 0i32, 0u32),
+        ExecCall::Execveat { dirfd, flags } => (2, dirfd, flags),
+    };
+    let encoded_len = bytes.len();
+    let header = bytes
+        .get_mut(..EXEC_PAYLOAD_HEADER_BYTES)
+        .ok_or(ExecPayloadError::Invalid)?;
+    header.fill(0);
+    header[0..4].copy_from_slice(&EXEC_PAYLOAD_MAGIC.to_le_bytes());
+    header[4..6].copy_from_slice(&EXEC_PAYLOAD_VERSION.to_le_bytes());
+    header[6..8].copy_from_slice(&kind.to_le_bytes());
+    header[8..12].copy_from_slice(&dirfd.to_le_bytes());
+    header[12..16].copy_from_slice(&flags.to_le_bytes());
+    for (offset, value) in [(16, path_len), (20, argc), (24, envc), (28, encoded_len)] {
+        header[offset..offset + 4].copy_from_slice(
+            &u32::try_from(value)
+                .map_err(|_| ExecPayloadError::TooLarge)?
+                .to_le_bytes(),
+        );
+    }
+    Ok(())
+}
+
+/// Authenticated view of one complete contiguous ring-owned exec record.
+#[derive(Clone, Copy, Debug)]
+pub struct ExecPayloadView<'a> {
+    bytes: &'a [u8],
+    call: ExecCall,
+    path_len: usize,
+    argc: usize,
+    envc: usize,
+}
+
+impl<'a> ExecPayloadView<'a> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, ExecPayloadError> {
+        if bytes.len() > MAX_EXEC_PAYLOAD_BYTES as usize
+            || read_u32(bytes, 0) != Some(EXEC_PAYLOAD_MAGIC)
+            || read_u16(bytes, 4) != Some(EXEC_PAYLOAD_VERSION)
+            || read_u32(bytes, 28).and_then(|len| usize::try_from(len).ok()) != Some(bytes.len())
+        {
+            return Err(ExecPayloadError::Invalid);
+        }
+        let dirfd = read_u32(bytes, 8)
+            .map(|raw| i32::from_le_bytes(raw.to_le_bytes()))
+            .ok_or(ExecPayloadError::Invalid)?;
+        let flags = read_u32(bytes, 12).ok_or(ExecPayloadError::Invalid)?;
+        let call = match read_u16(bytes, 6) {
+            Some(1) if dirfd == 0 && flags == 0 => ExecCall::Execve,
+            Some(2) => ExecCall::Execveat { dirfd, flags },
+            _ => return Err(ExecPayloadError::Invalid),
+        };
+        let path_len = read_u32(bytes, 16)
+            .and_then(|raw| usize::try_from(raw).ok())
+            .ok_or(ExecPayloadError::Invalid)?;
+        let argc = read_u32(bytes, 20)
+            .and_then(|raw| usize::try_from(raw).ok())
+            .ok_or(ExecPayloadError::Invalid)?;
+        let envc = read_u32(bytes, 24)
+            .and_then(|raw| usize::try_from(raw).ok())
+            .ok_or(ExecPayloadError::Invalid)?;
+        let path_end = EXEC_PAYLOAD_HEADER_BYTES
+            .checked_add(path_len)
+            .ok_or(ExecPayloadError::Invalid)?;
+        let path = bytes
+            .get(EXEC_PAYLOAD_HEADER_BYTES..path_end)
+            .ok_or(ExecPayloadError::Invalid)?;
+        if path.is_empty() || path.last() != Some(&0) || path[..path.len() - 1].contains(&0) {
+            return Err(ExecPayloadError::Invalid);
+        }
+        let mut cursor = path_end;
+        let mut accounting = (argc + envc)
+            .checked_add(2)
+            .and_then(|entries| entries.checked_mul(8))
+            .ok_or(ExecPayloadError::TooLarge)?;
+        for _ in 0..argc.checked_add(envc).ok_or(ExecPayloadError::TooLarge)? {
+            let len = read_u32(bytes, cursor)
+                .and_then(|raw| usize::try_from(raw).ok())
+                .ok_or(ExecPayloadError::Invalid)?;
+            if len == 0 || len > MAX_ARG_STRLEN {
+                return Err(ExecPayloadError::TooLarge);
+            }
+            cursor = cursor.checked_add(4).ok_or(ExecPayloadError::Invalid)?;
+            let string = bytes
+                .get(cursor..cursor.checked_add(len).ok_or(ExecPayloadError::Invalid)?)
+                .ok_or(ExecPayloadError::Invalid)?;
+            if string.last() != Some(&0) || string[..string.len() - 1].contains(&0) {
+                return Err(ExecPayloadError::Invalid);
+            }
+            cursor += len;
+            accounting = accounting
+                .checked_add(len)
+                .ok_or(ExecPayloadError::TooLarge)?;
+            if accounting > EXEC_ARGUMENT_BYTES_MAX {
+                return Err(ExecPayloadError::TooLarge);
+            }
+        }
+        if cursor != bytes.len() {
+            return Err(ExecPayloadError::Invalid);
+        }
+        Ok(Self {
+            bytes,
+            call,
+            path_len,
+            argc,
+            envc,
+        })
+    }
+
+    pub const fn call(self) -> ExecCall {
+        self.call
+    }
+
+    pub fn path(self) -> &'a [u8] {
+        &self.bytes[EXEC_PAYLOAD_HEADER_BYTES..EXEC_PAYLOAD_HEADER_BYTES + self.path_len - 1]
+    }
+
+    pub fn argv(self) -> ExecPayloadStrings<'a> {
+        ExecPayloadStrings {
+            bytes: self.bytes,
+            cursor: EXEC_PAYLOAD_HEADER_BYTES + self.path_len,
+            remaining: self.argc,
+        }
+    }
+
+    pub fn envp(self) -> ExecPayloadStrings<'a> {
+        let mut argv = self.argv();
+        while argv.next().is_some() {}
+        ExecPayloadStrings {
+            bytes: self.bytes,
+            cursor: argv.cursor,
+            remaining: self.envc,
+        }
+    }
+
+    pub fn encoded_len(self) -> usize {
+        self.bytes.len()
+    }
+}
+
+pub struct ExecPayloadStrings<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+    remaining: usize,
+}
+
+impl<'a> Iterator for ExecPayloadStrings<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let len = read_u32(self.bytes, self.cursor)? as usize;
+        self.cursor += 4;
+        let string = self.bytes.get(self.cursor..self.cursor + len)?;
+        self.cursor += len;
+        self.remaining -= 1;
+        Some(&string[..string.len() - 1])
+    }
+}
 impl ExecPayloadDescriptor {
     pub const fn checked(address: GuestVa, length: GuestLen) -> Option<Self> {
         if length.raw() == 0

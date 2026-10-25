@@ -34,6 +34,9 @@ fn native_exception_signal(
 
 pub(super) struct PendingService<'a> {
     reply: Option<Box<carrick_el1_abi::PortalGrantSlot>>,
+    /// Exec input is ring-owned guest memory. Its virtual address is published
+    /// in the request and cannot be recycled until completion/cancellation ACK.
+    _exec_payload: Option<Box<[u8]>>,
     request: ServiceRequest,
     pub(super) wait: Option<carrick_core_abi::PortalOwnerWait>,
     claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
@@ -164,7 +167,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         fault_sequence: Option<core::num::NonZeroU64>,
     ) -> Result<NativeResume, NativeProcessError> {
-        self.begin_service_inner(operation, fault_sequence, None)
+        self.begin_service_inner(operation, fault_sequence, None, None)
+    }
+    pub fn begin_exec_service(
+        &mut self,
+        payload: Box<[u8]>,
+    ) -> Result<NativeResume, NativeProcessError> {
+        let descriptor = carrick_core_abi::service::ExecPayloadDescriptor::checked(
+            carrick_guest_arch::GuestVa::new(payload.as_ptr().addr() as u64),
+            carrick_guest_arch::GuestLen::new(payload.len() as u64),
+        )
+        .ok_or(NativeProcessError::Exhausted)?;
+        self.begin_service_inner(
+            ServiceOperation::Exec {
+                payload: descriptor,
+            },
+            None,
+            None,
+            Some(payload),
+        )
     }
     /// Park the exact ring operation on the producer observed before its
     /// failed admission. No physical service notice is published.
@@ -173,7 +194,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         wait: carrick_core_abi::PortalOwnerWait,
     ) -> Result<NativeResume, NativeProcessError> {
-        self.begin_service_inner(operation, None, Some(wait))
+        self.begin_service_inner(operation, None, Some(wait), None)
     }
     #[inline(never)]
     fn begin_service_inner(
@@ -181,7 +202,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         operation: ServiceOperation,
         fault_sequence: Option<core::num::NonZeroU64>,
         owner_wait: Option<carrick_core_abi::PortalOwnerWait>,
+        exec_payload: Option<Box<[u8]>>,
     ) -> Result<NativeResume, NativeProcessError> {
+        if matches!(operation, ServiceOperation::Exec { .. }) != exec_payload.is_some() {
+            return Err(NativeProcessError::Stale);
+        }
         let (page, control) = {
             let graph = self.runtime.graph.lock();
             if graph.has_member_wait(&self.record) {
@@ -264,6 +289,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.record,
             MemberWait::Service(PendingService {
                 reply,
+                _exec_payload: exec_payload,
                 request,
                 wait: owner_wait,
                 claim,

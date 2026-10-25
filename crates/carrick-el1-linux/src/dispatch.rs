@@ -776,6 +776,39 @@ pub(super) fn native_service_operation(
     }
 }
 
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn native_exec_stage(
+    frame: &TrapFrame,
+    task: &CurrentTask,
+) -> Option<Result<alloc::boxed::Box<[u8]>, carrick_syscall_abi::LinuxErrno>> {
+    if (frame.esr >> 26) & 0x3f != 0x15 {
+        return None;
+    }
+    let request = match frame.x[8] {
+        221 => crate::exec_stage::ExecStageRequest {
+            call: carrick_core_abi::service::ExecCall::Execve,
+            path: frame.x[0],
+            argv: frame.x[1],
+            envp: frame.x[2],
+        },
+        281 => crate::exec_stage::ExecStageRequest {
+            call: carrick_core_abi::service::ExecCall::Execveat {
+                dirfd: frame.x[0] as i32,
+                flags: frame.x[4] as u32,
+            },
+            path: frame.x[1],
+            argv: frame.x[2],
+            envp: frame.x[3],
+        },
+        _ => return None,
+    };
+    let mut user = file::ValidatedCopy {
+        task,
+        validator: &file::HardwareValidator,
+    };
+    Some(crate::exec_stage::stage_exec_payload(&mut user, request))
+}
+
 /// Capture the exception while its native owner still owns the trap words.
 /// The host receives a selector only after this continuation has parked.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -795,7 +828,25 @@ fn arm_native_service_exit(
         return None;
     }
     let (page, control) = task.lifecycle_refs()?;
-    let operation = native_service_operation(frame, &task.linux, action)?;
+    let (operation, exec_payload) = match native_exec_stage(frame, task) {
+        Some(Ok(payload)) => {
+            let descriptor = carrick_core_abi::service::ExecPayloadDescriptor::checked(
+                carrick_guest_arch::GuestVa::new(payload.as_ptr().addr() as u64),
+                carrick_guest_arch::GuestLen::new(payload.len() as u64),
+            )?;
+            (
+                carrick_core_abi::service::ServiceOperation::Exec {
+                    payload: descriptor,
+                },
+                Some(payload),
+            )
+        }
+        Some(Err(errno)) => {
+            frame.x[0] = errno.guest_retval() as u64;
+            return Some(arm_signal_user_return(frame));
+        }
+        None => (native_service_operation(frame, &task.linux, action)?, None),
+    };
     // This CPU still exclusively owns its portal slot. Bind its selection
     // before park, so even a delayed first intake cannot steal a successor.
     let fault_sequence =
@@ -823,7 +874,12 @@ fn arm_native_service_exit(
         control,
         &mut service,
         |process| {
-            let result = if let Some(wait) = wait {
+            let result = if let Some(payload) = exec_payload {
+                if wait.is_some() {
+                    return Err(super::native_process_runtime::NativeProcessError::Quarantined);
+                }
+                process.begin_exec_service(payload)?
+            } else if let Some(wait) = wait {
                 process.begin_owner_service_wait(operation, wait)?
             } else {
                 process.begin_service(operation, fault_sequence)?
@@ -2930,6 +2986,30 @@ mod tests {
     use super::super::native_process_runtime::NativeThreadGroupOwner;
     use super::*;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn native_exec_capture_stages_before_releasing_the_ring_lane() {
+        let task = CurrentTask::new();
+        let path = b"/bin/static\0";
+        let arg = b"static\0";
+        let env = b"A=B\0";
+        let argv = [arg.as_ptr().addr() as u64, 0];
+        let envp = [env.as_ptr().addr() as u64, 0];
+        let mut frame = TrapFrame {
+            esr: 0x15 << 26,
+            ..TrapFrame::default()
+        };
+        frame.x[8] = 221;
+        frame.x[0] = path.as_ptr().addr() as u64;
+        frame.x[1] = argv.as_ptr().addr() as u64;
+        frame.x[2] = envp.as_ptr().addr() as u64;
+
+        let payload = native_exec_stage(&frame, &task).unwrap().unwrap();
+        let view = carrick_core_abi::service::ExecPayloadView::parse(&payload).unwrap();
+        assert_eq!(view.path(), b"/bin/static");
+        assert_eq!(view.argv().collect::<alloc::vec::Vec<_>>(), [b"static"]);
+        assert_eq!(view.envp().collect::<alloc::vec::Vec<_>>(), [b"A=B"]);
+    }
 
     #[test]
     fn host_loaded_arm_task_keeps_terminal_calls_on_legacy_route() {
