@@ -1866,6 +1866,31 @@ impl FileSlot {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CANCEL_RESERVATION_NEXT_FD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_cancel_reservation_next_fd_hook(hook: impl FnOnce() + 'static) {
+    CANCEL_RESERVATION_NEXT_FD_HOOK.with(|installed| {
+        assert!(
+            installed.borrow_mut().replace(Box::new(hook)).is_none(),
+            "one cancellation hook per actor"
+        );
+    });
+}
+
+#[cfg(test)]
+fn run_cancel_reservation_next_fd_hook() {
+    CANCEL_RESERVATION_NEXT_FD_HOOK.with(|installed| {
+        if let Some(hook) = installed.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 #[derive(Debug)]
 pub struct FileSlotReservation {
     table: Arc<FileTable>,
@@ -2802,6 +2827,8 @@ impl FileTable {
     pub(crate) fn cancel_reservation(&self, fd: i32, reservation_id: u64) -> bool {
         if fd >= 3 {
             if let Some(mut next_fd) = self.try_lock_next_fd() {
+                #[cfg(test)]
+                run_cancel_reservation_next_fd_hook();
                 let mut reserved = self.lock_reserved_slots();
                 if reserved.get(&fd).copied() == Some(reservation_id) {
                     reserved.remove(&fd);
@@ -2905,6 +2932,9 @@ impl FileTable {
             .acquire_mutation()
             .ok_or(crate::linux_abi::LINUX_EBADF)?;
         let mut open_files = self.write_open_files(Some(&mutation));
+        // Cancellation takes `next_fd` before `reserved_slots`; replacement
+        // must match that order while borrowing this one mutation lease.
+        let mut next_fd = self.mutex_write(&self.next_fd, Some(&mutation));
         let mut reserved = self.lock_reserved_slots();
 
         if reserved.get(&fd).copied() != Some(reservation_id) {
@@ -2916,8 +2946,6 @@ impl FileTable {
         if let Some(installed) = open_files.get(&fd) {
             self.commit_ipc_reservation(fd, reservation_id, installed);
         }
-
-        let mut next_fd = self.mutex_write(&self.next_fd, Some(&mutation));
 
         if (0..3).contains(&fd) {
             self.stdio_guard(ipc::StdioField::Closed, Some(&mutation))[fd as usize] = false;
@@ -5222,6 +5250,95 @@ mod tests {
         );
         assert!(join_res.is_ok());
         assert!(!table.is_slot_reserved(3));
+    }
+
+    #[test]
+    fn exact_replacement_leaves_reserved_slots_to_cancellation_while_awaiting_next_fd() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table id")));
+        let cancelled = table
+            .reserve_slot_at_or_above(0, 1024)
+            .expect("reserve cancellable slot");
+        let cancelled_fd = cancelled.fd();
+        let exact = table
+            .reserve_exact_target(10, 1024)
+            .expect("reserve exact slot");
+
+        // Thread 1 drops a real uncommitted reservation and pauses after
+        // cancellation owns `next_fd`, immediately before it takes
+        // `reserved_slots`. Thread 2 enters the real exact replacement commit.
+        // It may hold `open_files`, but it must wait for `next_fd` without
+        // taking `reserved_slots`, or the two production operations wait on
+        // each other forever.
+        let (cancel_owns_next_tx, cancel_owns_next_rx) = std::sync::mpsc::channel();
+        let (continue_cancel_tx, continue_cancel_rx) = std::sync::mpsc::channel();
+        let cancellation = std::thread::spawn(move || {
+            set_cancel_reservation_next_fd_hook(move || {
+                cancel_owns_next_tx
+                    .send(())
+                    .expect("publish next_fd custody");
+                continue_cancel_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("coordinator releases cancellation");
+            });
+            drop(cancelled);
+        });
+        cancel_owns_next_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("cancellation owns next_fd within bound");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let commit = std::thread::spawn(move || {
+            started_tx.send(()).expect("commit started");
+            exact.commit(dummy_file_slot())
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("commit starts within bound");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut open_files_held = false;
+        while std::time::Instant::now() < deadline {
+            if table.open_files.try_read().is_none() {
+                open_files_held = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        // Once the writer owns `open_files`, the broken order needs only the
+        // uncontended `reserved_slots` acquisition before it blocks on the
+        // `next_fd` guard owned by cancellation.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let reserved_free = open_files_held
+            && table
+                .reserved_slots
+                .try_lock_for(std::time::Duration::from_millis(100))
+                .is_some();
+
+        if reserved_free {
+            continue_cancel_tx
+                .send(())
+                .expect("release cancellation actor");
+            cancellation.join().expect("cancellation thread joins");
+        } else {
+            // Abort the paused cancellation actor so its unwind releases
+            // `next_fd`; this lets the broken commit unwind its side of the
+            // witnessed cycle before the assertion reports RED.
+            drop(continue_cancel_tx);
+            let _ = cancellation.join();
+        }
+        let result = commit.join().expect("commit thread joins");
+
+        assert!(
+            open_files_held,
+            "exact replacement should acquire open_files within the bound"
+        );
+        assert!(
+            reserved_free,
+            "exact replacement must acquire next_fd before reserved_slots so cancellation can finish"
+        );
+        assert!(result.is_ok(), "exact replacement should commit");
+        assert!(!table.is_slot_reserved(cancelled_fd));
     }
 
     #[test]
