@@ -813,6 +813,13 @@ pub(super) mod tests {
         let old = custody
             .stage2_record_snapshot(owner.record_identity.record_id)
             .unwrap();
+        assert_eq!(
+            custody.request_stage2_record_retirement(
+                owner.record_identity,
+                custody.stage1_unpublished_after_editor_unmap(owner.record_identity),
+            ),
+            CarrierStage2RetireOutcome::DeferredActivePins
+        );
         custody.begin_destroy(old.vm_generation).unwrap();
         custody.commit_destroy(old.vm_generation).unwrap();
         let replacement_generation = custody.begin_create().unwrap();
@@ -834,7 +841,7 @@ pub(super) mod tests {
         }));
         assert!(!ready, "publication wait must enroll before it is ready");
 
-        let identity = custody
+        let (identity, _predecessor) = custody
             .rebind_terminal_stage2_record(owner.record_identity, old.host_addr, old.perms)
             .unwrap();
         assert!(

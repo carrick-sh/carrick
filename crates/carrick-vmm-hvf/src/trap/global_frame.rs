@@ -3085,7 +3085,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     "global frame owner changed during replay rebind".to_owned(),
                 ));
             }
-            let new_identity = custody
+            let (new_identity, predecessor) = custody
                 .rebind_terminal_stage2_record(
                     owner.record_identity,
                     replay.host_addr,
@@ -3104,9 +3104,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             owners.insert(key, GlobalFrameOwnerEntry::Live(successor));
             drop(owners);
             custody.stage2_publication_authority().changed();
-            if let Some(stage1) = custody.stage2_retirement_authorization(owner.record_identity) {
-                let _ = custody.remove_terminal_stage2_record(owner.record_identity, stage1);
-            }
+            let _ = custody.remove_terminal_stage2_record(owner.record_identity, predecessor);
             report.rebound += 1;
             continue;
         }
@@ -3217,7 +3215,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             if snapshot.vm_generation == current_generation && snapshot.mapped {
                 continue;
             }
-            let new_identity = custody
+            let (new_identity, predecessor) = custody
                 .rebind_terminal_stage2_record(old_identity, replay.host_addr, replay.perms)
                 .map_err(|error| {
                     TrapError::Hypervisor(format!(
@@ -3233,9 +3231,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             records.insert(key, new_identity);
             drop(records);
             custody.stage2_publication_authority().changed();
-            if let Some(stage1) = custody.stage2_retirement_authorization(old_identity) {
-                let _ = custody.remove_terminal_stage2_record(old_identity, stage1);
-            }
+            let _ = custody.remove_terminal_stage2_record(old_identity, predecessor);
             report.rebound += 1;
             continue;
         }
@@ -3314,7 +3310,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                 continue;
             }
             let old_identity = identity;
-            let new_identity = custody
+            let (new_identity, predecessor) = custody
                 .rebind_terminal_stage2_record(old_identity, replay.host_addr, replay.perms)
                 .map_err(|error| {
                     TrapError::Hypervisor(format!(
@@ -3333,9 +3329,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     "structural stage-2 owner changed during replay rebind".to_owned(),
                 ));
             }
-            if let Some(stage1) = custody.stage2_retirement_authorization(old_identity) {
-                let _ = custody.remove_terminal_stage2_record(old_identity, stage1);
-            }
+            let _ = custody.remove_terminal_stage2_record(old_identity, predecessor);
             report.rebound += 1;
             continue;
         }

@@ -1852,7 +1852,16 @@ impl CarrierVmCustody {
         old_identity: CarrierStage2RecordIdentity,
         host_addr: usize,
         perms: u64,
-    ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
+    ) -> Result<
+        (
+            CarrierStage2RecordIdentity,
+            std::sync::Arc<Stage2RetirementAuthorization>,
+        ),
+        CarrierStage2RecordError,
+    > {
+        let predecessor = self
+            .stage2_retirement_authorization(old_identity)
+            .ok_or(CarrierStage2RecordError::RecordNotTerminal)?;
         let mut state = self.state.lock();
         let live_generation = match state.lifecycle {
             CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation) => {
@@ -1926,7 +1935,7 @@ impl CarrierVmCustody {
             .ok_or(CarrierStage2RecordError::RecordNotFound)?;
         old.snapshot.release_ipa = false;
         old.snapshot.superseded_by_rebind = true;
-        Ok(identity)
+        Ok((identity, predecessor))
     }
 
     pub(crate) fn stage2_record_snapshot(
@@ -6141,13 +6150,20 @@ mod carrier_vm_custody_tests {
         let first = custody
             .register_stage2_record(stage2_spec(first_generation, 51))
             .expect("register predecessor record");
+        assert_eq!(
+            custody.request_stage2_record_retirement(
+                first,
+                custody.stage1_unpublished_after_editor_unmap(first),
+            ),
+            CarrierStage2RetireOutcome::DeferredActivePins
+        );
         destroy_vm_with_custody_using(&custody, "test destroy", || 0, || {})
             .expect("destroy predecessor VM");
         let second_generation = custody.begin_create().expect("begin successor create");
         custody
             .commit_create(second_generation)
             .expect("publish successor generation");
-        let second = custody
+        let (second, _predecessor) = custody
             .rebind_terminal_stage2_record(
                 first,
                 stage2_spec(second_generation, 52).host_addr,
