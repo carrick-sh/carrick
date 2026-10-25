@@ -527,28 +527,23 @@ fn list(root: &Path, path: &str) -> Result<Vec<Value>, ScalerError> {
         .cloned()
         .collect())
 }
-/// The hosted guard has no credential. Fetch whole public comment pages and
-/// refuse incomplete scans, even if an earlier page already held a receipt.
-fn public_comments(root: &Path, path: &str) -> Result<Vec<Value>, ScalerError> {
+/// The hosted guard has no credential. Retain successful public pages: later
+/// comments or a failed page cannot invalidate an earlier authentic receipt.
+fn public_comments(root: &Path, path: &str) -> Vec<Value> {
     let mut comments = Vec::new();
     for page in 1..=5 {
-        let value = api(root, &format!("{path}?per_page=100&page={page}"))?;
-        let entries = value
-            .as_array()
-            .ok_or(ScalerError::Guard("invalid public comments page"))?;
-        if entries.len() > 100 {
-            return Err(ScalerError::Guard("oversized public comments page"));
-        }
+        let Ok(value) = api(root, &format!("{path}?per_page=100&page={page}")) else {
+            break;
+        };
+        let Some(entries) = value.as_array().filter(|entries| entries.len() <= 100) else {
+            break;
+        };
         comments.extend(entries.iter().cloned());
-        // A short final page proves this scan is complete. Full pages require
-        // the next page; a full fifth page is refused rather than truncated.
         if entries.len() < 100 {
-            return Ok(comments);
+            break;
         }
     }
-    Err(ScalerError::Guard(
-        "public comments exceed pagination limit",
-    ))
+    comments
 }
 fn unavailable(source: &str, error: &ScalerError) -> Value {
     json!({"kind":"source","source":source,"status":"unavailable","untrusted":true,"provenance":"github-api(error)",
@@ -1044,12 +1039,12 @@ impl RunCache {
         for destination in [number, issue] {
             let path = format!("repos/{REPOSITORY}/issues/{destination}/comments");
             let comments = if credentialed {
-                list(root, &path)
+                let Ok(comments) = list(root, &path) else {
+                    continue;
+                };
+                comments
             } else {
                 public_comments(root, &path)
-            };
-            let Ok(comments) = comments else {
-                continue;
             };
             for comment in comments {
                 let body = comment["body"].as_str().unwrap_or_default();
@@ -3341,33 +3336,103 @@ API
         });
     }
     #[test]
-    fn guard_publication_without_credentials_refuses_partial_or_unbounded_pages() {
+    fn guard_publication_without_credentials_accepts_receipts_within_page_cap() {
         shared_fixture(|root| {
             let (_, receipt) = guard_publication_fixture(root);
-            std::fs::write(root.join("public-799-1.json"), "[]").unwrap();
-            let mut full = vec![json!({}); 100];
-            full[0] = receipt;
-            std::fs::write(root.join("public-800-1.json"), json!(full).to_string()).unwrap();
-            assert!(
-                guard_publication(root).is_err(),
-                "guard trusted receipt before a failed later page"
-            );
-            for page in 2..=5 {
+            let full = vec![json!({}); 100];
+            let mut with_receipt = full.clone();
+            with_receipt[0] = receipt.clone();
+            for destination in [800, 799] {
+                // Both destinations have 600 comments. Later comments must not
+                // erase a genuine receipt already inside the bounded scan.
+                for number in [800, 799] {
+                    for page in 1..=6 {
+                        std::fs::write(
+                            root.join(format!("public-{number}-{page}.json")),
+                            json!(full).to_string(),
+                        )
+                        .unwrap();
+                    }
+                }
+                std::fs::write(root.join("public-requests"), "").unwrap();
+                assert!(
+                    guard_publication(root).is_err(),
+                    "guard accepted comments without a receipt"
+                );
+                assert!(
+                    !regular_text(&root.join("public-requests"))
+                        .unwrap()
+                        .contains("page=6"),
+                    "receipt-free scan exceeded five pages"
+                );
                 std::fs::write(
-                    root.join(format!("public-800-{page}.json")),
-                    json!(vec![json!({}); 100]).to_string(),
+                    root.join(format!("public-{destination}-2.json")),
+                    json!(with_receipt).to_string(),
                 )
                 .unwrap();
+                std::fs::write(root.join("public-requests"), "").unwrap();
+                assert!(
+                    guard_publication(root).is_ok(),
+                    "guard discarded page-two receipt among 600 comments on {destination}"
+                );
+                let requests = regular_text(&root.join("public-requests")).unwrap();
+                assert!(
+                    !requests.contains("page=6"),
+                    "public comments exceeded five pages"
+                );
+                let pr_page = requests
+                    .find("issues/800/comments?per_page=100&page=1")
+                    .unwrap();
+                if destination == 800 {
+                    assert!(
+                        !requests.contains("issues/799/comments"),
+                        "guard read issue comments after finding a PR receipt"
+                    );
+                } else {
+                    assert!(
+                        pr_page
+                            < requests
+                                .find("issues/799/comments?per_page=100&page=1")
+                                .unwrap(),
+                        "guard did not read PR comments first"
+                    );
+                }
             }
+            std::fs::write(root.join("public-799-1.json"), "[]").unwrap();
+            std::fs::write(root.join("public-800-1.json"), json!(full).to_string()).unwrap();
+            std::fs::remove_file(root.join("public-800-2.json")).unwrap();
             assert!(
                 guard_publication(root).is_err(),
-                "guard accepted comments beyond its page cap"
+                "guard accepted a missing page without an earlier receipt"
             );
-            let requests = regular_text(&root.join("public-requests")).unwrap();
+            std::fs::write(
+                root.join("public-800-1.json"),
+                json!(with_receipt).to_string(),
+            )
+            .unwrap();
             assert!(
-                !requests.contains("page=6"),
-                "public comments exceeded five pages"
+                guard_publication(root).is_ok(),
+                "guard discarded receipt after a later page failure"
             );
+            let mut oversized = vec![json!({}); 101];
+            oversized[0] = receipt.clone();
+            for invalid in [json!({"receipt":receipt}), json!(oversized)] {
+                std::fs::write(root.join("public-800-1.json"), invalid.to_string()).unwrap();
+                assert!(
+                    guard_publication(root).is_err(),
+                    "guard accepted a receipt from an invalid page"
+                );
+                std::fs::write(
+                    root.join("public-800-1.json"),
+                    json!(with_receipt).to_string(),
+                )
+                .unwrap();
+                std::fs::write(root.join("public-800-2.json"), invalid.to_string()).unwrap();
+                assert!(
+                    guard_publication(root).is_ok(),
+                    "invalid later page erased an earlier receipt"
+                );
+            }
         });
     }
     #[test]
