@@ -123,7 +123,12 @@ fn provider_workflow_provisions_every_available_worker_credential() {
 fn only_dispatch_workflow_references_dispatch_secrets() {
     let workflows =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
-    let secrets = ["AGENT_DIRECTOR_TOKEN", "CODEX_AUTH_JSON", "AGY_OAUTH_TOKEN"];
+    let secrets = [
+        "AGENT_DIRECTOR_TOKEN",
+        "CODEX_AUTH_JSON",
+        "AGY_OAUTH_TOKEN",
+        "DISPATCH_BOARD_TOKEN",
+    ];
     let mut saw_dispatch = false;
     let mut other_workflows = 0;
     for entry in std::fs::read_dir(workflows).unwrap() {
@@ -150,6 +155,35 @@ fn only_dispatch_workflow_references_dispatch_secrets() {
     }
     assert!(saw_dispatch, "missing dispatch-worker.yml");
     assert!(other_workflows > 0, "no other workflows checked");
+}
+
+#[test]
+fn board_token_is_scoped_to_the_loop_step_and_explicitly_masked() {
+    let docs = YamlLoader::load_from_str(include_str!(
+        "../../../.github/workflows/dispatch-worker.yml"
+    ))
+    .unwrap();
+    let worker = &docs[0]["jobs"]["worker"];
+    assert!(worker["env"]["DISPATCH_BOARD_TOKEN"].is_badvalue());
+    let mut saw_loop = false;
+    for step in worker["steps"].as_vec().unwrap() {
+        if step["id"].as_str() == Some("loop") {
+            saw_loop = true;
+            assert_eq!(
+                step["env"]["DISPATCH_BOARD_TOKEN"].as_str(),
+                Some("${{ secrets.DISPATCH_BOARD_TOKEN }}")
+            );
+            assert!(
+                step["run"]
+                    .as_str()
+                    .unwrap()
+                    .contains("::add-mask::$DISPATCH_BOARD_TOKEN")
+            );
+        } else {
+            assert!(step["env"]["DISPATCH_BOARD_TOKEN"].is_badvalue());
+        }
+    }
+    assert!(saw_loop);
 }
 
 #[test]

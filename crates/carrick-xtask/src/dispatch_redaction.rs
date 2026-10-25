@@ -4,7 +4,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const REFUSAL: &str = "diagnostic redaction refused unsafe credential state";
-struct DiagnosticSecrets {
+pub(crate) struct DiagnosticSecrets {
     secrets: Vec<String>,
 }
 impl DiagnosticSecrets {
@@ -51,7 +51,12 @@ impl DiagnosticSecrets {
     /// Capture once before agent execution, never from agent-modified state.
     pub(crate) fn capture() -> Result<Self, ScalerError> {
         let mut gate = Self { secrets: vec![] };
-        for key in ["GH_TOKEN", "GITHUB_TOKEN", "AGENT_DIRECTOR_TOKEN"] {
+        for key in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "AGENT_DIRECTOR_TOKEN",
+            "DISPATCH_BOARD_TOKEN",
+        ] {
             if let Ok(value) = std::env::var(key) {
                 gate.add(&value);
             }
