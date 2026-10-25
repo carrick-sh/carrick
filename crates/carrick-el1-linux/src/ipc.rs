@@ -97,43 +97,26 @@ pub struct IpcVenue<'a> {
 /// How a read/write reached the IPC adapter ended.
 pub use carrick_personality_linux::dispatch::IpcServed;
 
-/// Retire a native namespace through the same OFD owner used by host tables.
-/// In-zone releases happen now; host resources and the table extent remain
-/// owned by the core's retirement queue until a host boundary drains them.
-pub fn retire_namespace<C: carrick_el1_abi::EntryContext>(
+/// Retire a native namespace through the same physical-release owner used by
+/// host tables. Exit revokes the numeric namespace in ring, then leaves every
+/// backing and the table extent on the existing retirement queue. The host
+/// drain can take object locks without spinning an EL1 vCPU behind a host
+/// holder that may itself be waiting for that vCPU to return.
+pub fn retire_namespace(
     region: &IpcRegion<'_>,
     table: carrick_el1_abi::ipc::fd::TableId,
-    zone: &carrick_sched_core::ZoneTables<C>,
-    slot: carrick_el1_abi::SlotId,
     task: &CurrentTask,
 ) -> Result<(), carrick_el1_abi::ipc::IpcError> {
     use carrick_el1_abi::ipc::IpcError;
     let authority = region.fd(carrick_sched_core::ShortLockSpin);
-    let mut released = Ok(());
     authority
-        .retire_table(
-            table,
-            |description| {
-                !matches!(
-                    IpcBacking::decode(description.backing),
-                    Some(IpcBacking::Host(_))
-                )
-            },
-            |description| {
-                released = released.and(release_native_description(
-                    region,
-                    description,
-                    zone,
-                    slot,
-                    task,
-                ));
-            },
-        )
+        .retire_table(table, |_| false, |_| {})
         .map_err(IpcError::Fd)?;
-    // Publish boundary work after the retirement link is visible. A peer
-    // boundary may drain concurrently with this venue's final endpoint close.
+    // Publish boundary work after the retirement link is visible. The exit
+    // path already crosses to its lifecycle owner, which drains this exact
+    // queue and applies EOF/EPIPE wakes through the canonical host release.
     task.linux.mark_pending_host_work();
-    released
+    Ok(())
 }
 
 fn release_native_description<C: carrick_el1_abi::EntryContext>(

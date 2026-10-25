@@ -1904,8 +1904,6 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             super::ipc::retire_namespace(
                 &region,
                 carrick_el1_abi::ipc::fd::TableId::from_raw(raw),
-                self.zone,
-                self.slot,
                 self.task,
             )
             .unwrap_or_else(|_| fatal());
