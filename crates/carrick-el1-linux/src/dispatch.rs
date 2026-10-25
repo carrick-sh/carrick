@@ -1700,8 +1700,14 @@ impl<
         // ARM native process returns and the newly published getpid projection
         // otherwise bypass the host's owned return-event publisher. Retain the
         // completed result through the same boundary as other owed host work.
+        // An owned descriptor call is different: its numeric and OFD effects
+        // already committed in the ring. Inventing carrier work for that
+        // completed call can only hand the same child straight back without a
+        // producer changing state. Real descriptor host work still rings the
+        // task doorbell and selects `WithWork` independently.
+        let owned_descriptor = self.native_descriptor_owner() && self.may_serve_descriptor();
         self.frame.arm_frame_ref().is_some()
-            && (self.process.is_some()
+            && ((self.process.is_some() && !owned_descriptor)
                 || self.frame.canonical_ordinal().raw()
                     == carrick_personality_linux::lifecycle::SYS_GETPID as u64)
     }

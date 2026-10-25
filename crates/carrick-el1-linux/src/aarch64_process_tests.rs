@@ -8114,7 +8114,14 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         .zone
         .requeue_preempted(fixture.slot, child_bindings[1].record.id);
     activate_target(source, &task, &child_bindings[0]);
-    assert_eq!(run_in_child(0, sys_close, [2, 0, 0]).1, 0);
+    let (route, result) = run_in_child(0, sys_close, [2, 0, 0]);
+    assert_eq!(result, 0);
+    assert_eq!(route, CompletionRoute::WithWork);
+    assert_eq!(
+        task.linux.take_served_boundary(),
+        Some(carrick_el1_abi::ServedBoundary::Completed),
+        "a real host-resource finalizer must still cross the carrier boundary"
+    );
     assert!(
         task.linux.has_pending_host_work(),
         "final duplicated host close must schedule host drain"
@@ -8339,12 +8346,25 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
 
     // Child 0 is sole writer (closes fd 3); Child 1 is sole reader (closes fd 4).
     activate_target(source, &task, &child_bindings[0]);
-    assert_eq!(run_in_child(0, sys_close, [3, 0, 0]).1, 0);
+    assert!(!task.linux.has_pending_host_work());
+    let (route, result) = run_in_child(0, sys_close, [3, 0, 0]);
+    assert_eq!(result, 0);
+    assert_eq!(
+        route,
+        CompletionRoute::Served,
+        "a completed in-zone close must not bounce through carrier service"
+    );
+    assert_eq!(task.linux.take_served_boundary(), None);
+    assert!(!task.linux.has_pending_host_work());
     fixture
         .zone
         .requeue_preempted(fixture.slot, child_bindings[0].record.id);
     activate_target(source, &task, &child_bindings[1]);
-    assert_eq!(run_in_child(1, sys_close, [4, 0, 0]).1, 0);
+    let (route, result) = run_in_child(1, sys_close, [4, 0, 0]);
+    assert_eq!(result, 0);
+    assert_eq!(route, CompletionRoute::Served);
+    assert_eq!(task.linux.take_served_boundary(), None);
+    assert!(!task.linux.has_pending_host_work());
 
     // Switch to writer (child 0): fill 15 full pages + 2096 bytes (leaving 2000 < PIPE_BUF free).
     fixture
