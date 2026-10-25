@@ -34,10 +34,54 @@ pub struct Physical<'a, C: ProcessContext = ParkedContextWords> {
     pub refuse_copy: bool,
     pub on_signal_clock: Option<Box<dyn FnMut() + 'a>>,
 }
+struct HostExecSlot<'a, C: ProcessContext> {
+    zone: &'a ZoneTables<C>,
+    index: carrick_sched_core::SpaceIndex,
+    mm: carrick_core_abi::ReservationMm,
+    armed: bool,
+}
+impl<C: ProcessContext> ExecSuccessorSlot for HostExecSlot<'_, C> {
+    fn mm(&self) -> carrick_core_abi::ReservationMm {
+        self.mm
+    }
+    fn root_generation(&self) -> NonZeroU64 {
+        NonZeroU64::MIN
+    }
+    fn commit(mut self: Box<Self>) {
+        self.armed = false;
+    }
+}
+impl<C: ProcessContext> Drop for HostExecSlot<'_, C> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.zone.spaces.free(self.index);
+        }
+    }
+}
 impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     type Mm = AddressContext<RootGpa>;
     type PreparedMm = AddressContext<RootGpa>;
     type Born = AddressContext<RootGpa>;
+    fn prepare_exec_successor_slot(
+        &self,
+        mm: carrick_core_abi::ReservationMm,
+    ) -> Result<Box<dyn ExecSuccessorSlot + 'a>, NativeProcessError> {
+        let index = self
+            .zone
+            .spaces
+            .publish_closed(mm.raw(), 0, 0)
+            .ok_or(NativeProcessError::Exhausted)?;
+        if !self.zone.spaces.mark_initial_bindable(index) {
+            self.zone.spaces.free(index);
+            return Err(NativeProcessError::Stale);
+        }
+        Ok(Box::new(HostExecSlot {
+            zone: self.zone,
+            index,
+            mm,
+            armed: true,
+        }))
+    }
     fn cancel_exec_successor(
         &self,
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
@@ -60,10 +104,18 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             generation: ContextGeneration::new(sealed.root_generation),
         };
         let ttbr = (u64::from(sealed.asid.raw()) << 48) | sealed.root.address().raw();
-        self.zone
+        let index = self
+            .zone
             .spaces
-            .publish_closed(sealed.successor_mm.raw(), ttbr, ttbr)
+            .find(sealed.successor_mm.raw())
             .ok_or(NativeProcessError::Stale)?;
+        if !self
+            .zone
+            .spaces
+            .bind_initial_root(index, sealed.successor_mm.raw(), ttbr, ttbr)
+        {
+            return Err(NativeProcessError::Stale);
+        }
         let words = <C as zerocopy::FromZeros>::new_zeroed().fork_child(address);
         Ok(NativeExecSuccessor {
             mm: address,
@@ -1396,7 +1448,7 @@ fn publish_test_exec_reply_for(
     let manifest_address = ticket.reply_address().unwrap();
     // SAFETY: the ring retains this aligned reply record until acknowledgment.
     let manifest = unsafe { &mut *(manifest_address.raw() as *mut ExecSuccessorManifest) };
-    let successor_mm = manifest.proposal(request.identity).unwrap();
+    let (successor_mm, root_generation) = manifest.proposal(request.identity).unwrap();
     let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(receipt_raw).unwrap()).unwrap();
     *manifest = manifest
         .seal(
@@ -1404,7 +1456,6 @@ fn publish_test_exec_reply_for(
             receipt,
             ExecSuccessorBacking {
                 root: RootGpa::page_aligned(FrameGpa::new(root_raw)).unwrap(),
-                root_generation: NonZeroU64::new(receipt_raw + 6).unwrap(),
                 asid: Asid::from_registry_allocation(
                     NonZeroU16::new(u16::try_from(receipt_raw + 12).unwrap()).unwrap(),
                 ),
@@ -1417,7 +1468,7 @@ fn publish_test_exec_reply_for(
         )
         .unwrap();
     if corrupt_after_prepare {
-        *manifest = ExecSuccessorManifest::propose(request.identity, successor_mm);
+        *manifest = ExecSuccessorManifest::propose(request.identity, successor_mm, root_generation);
     }
     assert!(
         ticket

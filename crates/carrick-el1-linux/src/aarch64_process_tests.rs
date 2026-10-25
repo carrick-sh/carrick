@@ -184,6 +184,7 @@ struct TestStockCrossing {
     root_exit_status: AtomicU64,
     publish_child_affinity_aliases: bool,
     metadata_in_el1_window: bool,
+    exec_adopted: core::sync::atomic::AtomicBool,
     #[cfg(all(test, target_os = "linux"))]
     require_stack_commit: bool,
 }
@@ -236,6 +237,7 @@ impl TestStockCrossing {
             root_exit_status: AtomicU64::new(u64::MAX),
             publish_child_affinity_aliases: true,
             metadata_in_el1_window: false,
+            exec_adopted: core::sync::atomic::AtomicBool::new(false),
             #[cfg(all(test, target_os = "linux"))]
             require_stack_commit: false,
         }
@@ -273,6 +275,10 @@ impl ForkStockCrossing for TestStockCrossing {
     fn cross_exec_adopt(&self, record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
         // SAFETY: the synchronous fixture owns this aligned stack record.
         let request = unsafe { &mut *(record_gpa as *mut carrick_el1_abi::NativeExecAdoption) };
+        if self.exec_adopted.swap(true, Ordering::AcqRel) {
+            request.refuse();
+            return Err(NativeProcessError::Stale);
+        }
         request
             .request()
             .and_then(|_| request.accept().then_some(()))
@@ -993,7 +999,6 @@ fn native_exec_adoption_publishes_closed_manifest_before_consuming_receipt() {
 
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let service = fixture.process_service();
-    let generation = NonZeroU64::new(43).unwrap();
     let identity = ServiceIdentity {
         birth: ServiceBirth {
             process: TaskKey {
@@ -1017,15 +1022,16 @@ fn native_exec_adoption_publishes_closed_manifest_before_consuming_receipt() {
         sequence: NonZeroU64::new(31).unwrap(),
     };
     let successor_mm = ReservationMm::new(37).unwrap();
+    let slot = service.prepare_exec_successor_slot(successor_mm).unwrap();
+    let generation = slot.root_generation();
     let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(41).unwrap()).unwrap();
     let root = RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap();
-    let manifest = ExecSuccessorManifest::propose(identity, successor_mm)
+    let manifest = ExecSuccessorManifest::propose(identity, successor_mm, generation)
         .seal(
             identity,
             receipt,
             ExecSuccessorBacking {
                 root,
-                root_generation: generation,
                 asid: asid(47),
                 asid_generation: NonZeroU64::new(53).unwrap(),
             },
@@ -1035,10 +1041,19 @@ fn native_exec_adoption_publishes_closed_manifest_before_consuming_receipt() {
             },
         )
         .unwrap();
+    let index = fixture.zone.spaces.find(successor_mm.raw()).unwrap();
+    let ttbr = (u64::from(asid(47).raw()) << 48) | root.address().raw();
+    assert!(
+        fixture
+            .zone
+            .spaces
+            .bind_initial_root(index, successor_mm.raw(), ttbr, ttbr)
+    );
 
     let adopted = service
         .adopt_exec_successor(identity, receipt, &manifest)
         .unwrap();
+    slot.commit();
     assert_eq!(adopted.address.mm.raw().get(), successor_mm.raw());
     assert_eq!(adopted.address.root, root);
     assert!(
@@ -1124,23 +1139,34 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
     // This key hashes to the just-retired slot. Receipt 1 is intentionally
     // distinct from the real next reservation-root incarnation 2.
     let successor_mm = ReservationMm::new(1031).unwrap();
+    let slot = service.prepare_exec_successor_slot(successor_mm).unwrap();
+    assert_eq!(slot.root_generation(), NonZeroU64::new(2).unwrap());
     let receipt = ExecAdoptionReceipt::checked(NonZeroU64::MIN).unwrap();
-    let manifest = ExecSuccessorManifest::propose(identity, successor_mm)
-        .seal(
-            identity,
-            receipt,
-            ExecSuccessorBacking {
-                root: RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap(),
-                root_generation: NonZeroU64::new(2).unwrap(),
-                asid: asid(47),
-                asid_generation: NonZeroU64::new(53).unwrap(),
-            },
-            ExecSuccessorEntry {
-                entry: UserVa::new(0x40_0000),
-                stack_pointer: UserVa::new(0x7fff_f000),
-            },
-        )
-        .unwrap();
+    let manifest =
+        ExecSuccessorManifest::propose(identity, successor_mm, NonZeroU64::new(2).unwrap())
+            .seal(
+                identity,
+                receipt,
+                ExecSuccessorBacking {
+                    root: RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap(),
+                    asid: asid(47),
+                    asid_generation: NonZeroU64::new(53).unwrap(),
+                },
+                ExecSuccessorEntry {
+                    entry: UserVa::new(0x40_0000),
+                    stack_pointer: UserVa::new(0x7fff_f000),
+                },
+            )
+            .unwrap();
+    let index = fixture.zone.spaces.find(successor_mm.raw()).unwrap();
+    let root = RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap();
+    let ttbr = (u64::from(asid(47).raw()) << 48) | root.address().raw();
+    assert!(
+        fixture
+            .zone
+            .spaces
+            .bind_initial_root(index, successor_mm.raw(), ttbr, ttbr)
+    );
 
     assert!(
         service
@@ -1148,6 +1174,7 @@ fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
             .is_ok(),
         "the first exec after a fork/exit must use slot 7 incarnation 2"
     );
+    slot.commit();
 }
 
 #[test]

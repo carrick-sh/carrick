@@ -54,6 +54,7 @@ pub(super) struct PendingService<'a> {
     /// Exec input is ring-owned guest memory. Its virtual address is published
     /// in the request and cannot be recycled until completion/cancellation ACK.
     _exec_payload: Option<Box<[u8]>>,
+    exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
     request: ServiceRequest,
     pub(super) wait: Option<carrick_core_abi::PortalOwnerWait>,
     pub(super) claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
@@ -319,7 +320,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 Err(error) => return Err(service_error(error)),
             };
-        let successor_mm = matches!(operation, ServiceOperation::Exec { .. })
+        let exec_successor = matches!(operation, ServiceOperation::Exec { .. })
             .then(|| {
                 self.runtime
                     .zone
@@ -327,6 +328,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .allocate()
                     .and_then(|mm| carrick_core_abi::ReservationMm::new(mm.raw().get()))
                     .ok_or(NativeProcessError::Exhausted)
+                    .and_then(|mm| self.service.prepare_exec_successor_slot(mm))
             })
             .transpose()?;
         let mut reply = match operation {
@@ -385,7 +387,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if let Some(PendingServiceReply::Exec(manifest)) = reply.as_mut() {
             **manifest = ExecSuccessorManifest::propose(
                 request.identity,
-                successor_mm.ok_or(NativeProcessError::Stale)?,
+                exec_successor
+                    .as_ref()
+                    .ok_or(NativeProcessError::Stale)?
+                    .mm(),
+                exec_successor
+                    .as_ref()
+                    .ok_or(NativeProcessError::Stale)?
+                    .root_generation(),
             );
         }
         self.runtime.graph.lock().insert_member_wait(
@@ -393,6 +402,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             MemberWait::Service(Box::new(PendingService {
                 reply,
                 _exec_payload: exec_payload,
+                exec_successor,
                 request,
                 wait: owner_wait,
                 claim,
@@ -940,7 +950,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         request: ServiceRequest,
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
-        pending: Box<PendingService<'a>>,
+        mut pending: Box<PendingService<'a>>,
     ) -> Result<NativeResume, NativeProcessError> {
         let manifest = match pending.reply.as_ref() {
             Some(PendingServiceReply::Exec(manifest)) => &**manifest,
@@ -966,6 +976,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             released?;
             return self.kill_refused_exec();
         };
+        if pending.exec_successor.as_ref().is_none_or(|slot| {
+            slot.mm() != sealed.successor_mm || slot.root_generation() != sealed.root_generation
+        }) {
+            let cancelled = self.service.cancel_exec_successor(receipt);
+            let released = self.release_service_claim(pending.claim);
+            cancelled?;
+            released?;
+            return self.kill_refused_exec();
+        }
         let expected_address = AddressContext {
             root: sealed.root,
             mm: MmGeneration::new(mm),
@@ -1047,6 +1066,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return self.kill_refused_exec();
             }
         };
+        let successor_slot = pending
+            .exec_successor
+            .take()
+            .ok_or(NativeProcessError::Quarantined)?;
+        successor_slot.commit();
         if successor.address != expected_address {
             drop(prepared_fds);
             self.release_service_claim(pending.claim)?;
