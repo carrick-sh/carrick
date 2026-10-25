@@ -1,6 +1,9 @@
 //! Real pipe/eventfd request-response workloads. Output reports completed
 //! operations only; EL1 execution and parks are measured by the embed runner.
 use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static PROCESS_PANIC_STAGE: AtomicU64 = AtomicU64::new(0);
 
 struct Channel {
     read: i32,
@@ -189,17 +192,41 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
             )
         })
         .collect();
+    let mut diagnostic = Channel::new(false);
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
     let child = pid == 0;
+    if child {
+        let diagnostic_fd = diagnostic.write;
+        std::panic::set_hook(Box::new(move |_| {
+            let stage = PROCESS_PANIC_STAGE.load(Ordering::Relaxed).to_ne_bytes();
+            unsafe {
+                libc::write(diagnostic_fd, stage.as_ptr().cast(), stage.len());
+            }
+        }));
+        PROCESS_PANIC_STAGE.store(10, Ordering::Relaxed);
+        if let Err(error) = diagnostic.try_close_read_end("child diagnostic") {
+            eprintln!("{error}");
+            unsafe { libc::_exit(102) }
+        }
+    } else {
+        diagnostic
+            .try_close_write_end("parent diagnostic")
+            .expect("close parent diagnostic writer");
+    }
     let workers: Vec<_> = channels
         .into_iter()
         .enumerate()
         .map(|(pair, (mut request, mut response))| {
             std::thread::spawn(move || {
                 if child {
+                    PROCESS_PANIC_STAGE.store(20, Ordering::Relaxed);
+                }
+                if child {
                     request.try_close_write_end("child request")?;
+                    PROCESS_PANIC_STAGE.store(21, Ordering::Relaxed);
                     response.try_close_read_end("child response")?;
+                    PROCESS_PANIC_STAGE.store(22, Ordering::Relaxed);
                 } else {
                     request.try_close_read_end("parent request")?;
                     response.try_close_write_end("parent response")?;
@@ -207,13 +234,16 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
                 for round in 0..rounds {
                     let value = ((pair as u64 + 1) << 32) | (round as u64 + 1);
                     if child {
+                        PROCESS_PANIC_STAGE.store(30, Ordering::Relaxed);
                         let received = request.receive_bounded("inherited request")?;
+                        PROCESS_PANIC_STAGE.store(31, Ordering::Relaxed);
                         if received != value {
                             return Err(format!(
                                 "inherited request identity: got {received:#x}, expected {value:#x}"
                             ));
                         }
                         response.try_send(value ^ 0x1000_0000, "inherited response")?;
+                        PROCESS_PANIC_STAGE.store(32, Ordering::Relaxed);
                     } else {
                         request.try_send(value, "inherited request")?;
                         let received = response.receive_bounded("inherited response")?;
@@ -224,6 +254,9 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
                             ));
                         }
                     }
+                }
+                if child {
+                    PROCESS_PANIC_STAGE.store(40, Ordering::Relaxed);
                 }
                 Ok::<usize, String>(rounds)
             })
@@ -243,6 +276,7 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
         };
     }
     if child {
+        PROCESS_PANIC_STAGE.store(50, Ordering::Relaxed);
         if let Some(error) = worker_failure {
             eprintln!("child IPC worker failed: {error}");
             unsafe { libc::_exit(101) }
@@ -255,10 +289,15 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
         pid,
         "wait child"
     );
+    let panic_stage = if libc::WIFSIGNALED(status) {
+        diagnostic.receive_bounded("child panic stage").ok()
+    } else {
+        None
+    };
     assert!(
         libc::WIFEXITED(status),
-        "child status={status} signal={} parent_worker={worker_failure:?}",
-        libc::WTERMSIG(status)
+        "child status={status} signal={} panic_stage={panic_stage:?} parent_worker={worker_failure:?}",
+        libc::WTERMSIG(status),
     );
     assert_eq!(
         libc::WEXITSTATUS(status),
