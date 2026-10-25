@@ -770,6 +770,50 @@ mod tests {
     }
 
     #[test]
+    fn retained_exec_capability_prepares_a_static_binary_successor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("static-successor");
+        std::fs::write(&path, synthetic_aarch64_exec()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dispatcher = SyscallDispatcher::new();
+        let capability = capture_native_exec_capability(&dispatcher).unwrap();
+        drop(dispatcher);
+
+        let spelling = path.to_str().unwrap();
+        let argv = b"static-successor\0";
+        let env = b"WITNESS=exec\0";
+        let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
+        payload.extend_from_slice(spelling.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(argv);
+        payload.extend_from_slice(env);
+        carrick_core_abi::service::encode_exec_payload_header(
+            &mut payload,
+            carrick_core_abi::service::ExecCall::Execve,
+            spelling.len() + 1,
+            1,
+            1,
+        )
+        .unwrap();
+
+        let loaded = prepare_native_exec_image(&capability, &payload).unwrap();
+        assert_eq!(loaded.image.entry(), 0x400000);
+        assert_eq!(
+            loaded.image.read_bytes(0x400000, 4).unwrap(),
+            0xd503_201f_u32.to_le_bytes()
+        );
+        let stack = loaded.image.initial_stack_pointer().unwrap();
+        assert_eq!(read_image_u64(&loaded.image, stack), 1);
+        let argv0 = read_image_u64(&loaded.image, stack + 8);
+        assert_eq!(
+            read_image_c_string(&loaded.image, argv0),
+            b"static-successor"
+        );
+    }
+
+    #[test]
     fn native_exec_capability_outlives_context_without_host_task_lookup() {
         let dispatcher = SyscallDispatcher::new();
         let context = dispatcher.capture_one_task_context().unwrap();
