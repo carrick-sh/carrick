@@ -527,6 +527,29 @@ fn list(root: &Path, path: &str) -> Result<Vec<Value>, ScalerError> {
         .cloned()
         .collect())
 }
+/// The hosted guard has no credential. Fetch whole public comment pages and
+/// refuse incomplete scans, even if an earlier page already held a receipt.
+fn public_comments(root: &Path, path: &str) -> Result<Vec<Value>, ScalerError> {
+    let mut comments = Vec::new();
+    for page in 1..=5 {
+        let value = api(root, &format!("{path}?per_page=100&page={page}"))?;
+        let entries = value
+            .as_array()
+            .ok_or(ScalerError::Guard("invalid public comments page"))?;
+        if entries.len() > 100 {
+            return Err(ScalerError::Guard("oversized public comments page"));
+        }
+        comments.extend(entries.iter().cloned());
+        // A short final page proves this scan is complete. Full pages require
+        // the next page; a full fifth page is refused rather than truncated.
+        if entries.len() < 100 {
+            return Ok(comments);
+        }
+    }
+    Err(ScalerError::Guard(
+        "public comments exceed pagination limit",
+    ))
+}
 fn unavailable(source: &str, error: &ScalerError) -> Value {
     json!({"kind":"source","source":source,"status":"unavailable","untrusted":true,"provenance":"github-api(error)",
         "error":crate::dispatch_redaction::redact(error.to_string().as_bytes())})
@@ -994,7 +1017,9 @@ impl RunCache {
         if authenticated.run["id"] != run["id"] {
             return None;
         }
-        if let Ok(text) = self.prior_artifact(root, issue, RunId(id), "handoff.json")
+        let credentialed = self.stored_gh_auth || std::env::var_os("GH_TOKEN").is_some();
+        if credentialed
+            && let Ok(text) = self.prior_artifact(root, issue, RunId(id), "handoff.json")
             && let Ok(handoff) = serde_json::from_str::<Value>(&text)
             && handoff["issue"] == issue
             && handoff["branch"] == branch
@@ -1017,10 +1042,13 @@ impl RunCache {
         }
         let number = pr["number"].as_u64()?;
         for destination in [number, issue] {
-            let Ok(comments) = list(
-                root,
-                &format!("repos/{REPOSITORY}/issues/{destination}/comments"),
-            ) else {
+            let path = format!("repos/{REPOSITORY}/issues/{destination}/comments");
+            let comments = if credentialed {
+                list(root, &path)
+            } else {
+                public_comments(root, &path)
+            };
+            let Ok(comments) = comments else {
                 continue;
             };
             for comment in comments {
@@ -3188,6 +3216,183 @@ mod tests {
             );
         });
     }
+    fn guard_publication_fixture(root: &Path) -> (Value, Value) {
+        let mut pr: Value =
+            serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+        pr["user"]["login"] = "carrick-workers[bot]".into();
+        pr["head"]["sha"] = "b".repeat(40).into();
+        std::fs::write(root.join("pr.json"), pr.to_string()).unwrap();
+        std::fs::write(root.join("prs.json"), json!([pr.clone()]).to_string()).unwrap();
+        let mut issue: Value =
+            serde_json::from_str(&regular_text(&root.join("issue.json")).unwrap()).unwrap();
+        issue["number"] = 799.into();
+        issue["state"] = "open".into();
+        std::fs::write(root.join("issue.json"), issue.to_string()).unwrap();
+        let event = json!({"action":"submitted","repository":{"full_name":REPOSITORY},"sender":{"login":"tjfontaine","type":"User"},"review":{"state":"changes_requested","user":{"login":"tjfontaine","type":"User"}},"pull_request":pr});
+        std::fs::write(root.join("event.json"), event.to_string()).unwrap();
+        let mut comments: Value =
+            serde_json::from_str(&regular_text(&root.join("comments.json")).unwrap()).unwrap();
+        let comment = &mut comments[0][0];
+        let body = comment["body"].as_str().unwrap();
+        comment["body"] = body.replace("\nDispatch run:", "\nPublication receipt:\n```json\n{\"issue\":799,\"branch\":\"work/dispatch-799-42\",\"publication_pr\":800}\n```\nDispatch run:").into();
+        let receipt = comment.clone();
+        let curl = root.join("bin/curl");
+        std::fs::write(&curl, r#"#!/bin/sh
+test -z "$GH_TOKEN" && test -z "$GITHUB_TOKEN" || exit 97
+for endpoint do :; done
+exec /usr/bin/python3 - "$RUNNER_TEMP" "$endpoint" <<'API'
+import json,pathlib,sys,urllib.parse
+r=pathlib.Path(sys.argv[1]); u=urllib.parse.urlsplit(sys.argv[2]); endpoint=u.path.removeprefix('/repos/carrick-sh/carrick/')
+with (r/'public-requests').open('a') as f: f.write(endpoint+'?'+u.query+'\n')
+files={'pulls/800':'pr.json','issues/799':'issue.json','actions/runs/42':'run.json','actions/runs/42/jobs':'jobs.json','actions/runs/42/artifacts':'artifacts.json'}
+if endpoint in files: print((r/files[endpoint]).read_text());sys.exit()
+if endpoint in ['issues/800/comments','issues/799/comments']:
+ q=urllib.parse.parse_qs(u.query)
+ if q.get('per_page')!=['100']: sys.exit(96)
+ page=int(q.get('page',['0'])[0]); path=r/('public-'+endpoint.split('/')[1]+'-'+str(page)+'.json')
+ if not path.exists(): sys.exit(95)
+ print(path.read_text());sys.exit()
+sys.exit(94)
+API
+"#).unwrap();
+        std::fs::set_permissions(curl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let gh_path = root.join("bin/gh");
+        let gh_script = regular_text(&gh_path).unwrap();
+        std::fs::write(&gh_path, gh_script.replacen("#!/bin/sh\n", "#!/bin/sh\ntest -n \"$GH_TOKEN\" || { echo 'credential-free guard attempted gh' >&2; exit 97; }\n", 1)).unwrap();
+        (pr, receipt)
+    }
+    fn guard_publication(root: &Path) -> Result<(), ScalerError> {
+        super::super::run(
+            root,
+            DispatchArgs {
+                action: DispatchAction::Guard {
+                    event: root.join("event.json"),
+                    admit: false,
+                    retire: false,
+                },
+            },
+        )
+    }
+    #[test]
+    fn guard_publication_without_credentials_accepts_only_authentic_receipts() {
+        shared_fixture(|root| {
+            assert!(std::env::var_os("GH_TOKEN").is_none());
+            assert!(std::env::var_os("GITHUB_TOKEN").is_none());
+            let (_, receipt) = guard_publication_fixture(root);
+            for destination in [800, 799] {
+                std::fs::write(root.join("public-800-1.json"), "[]").unwrap();
+                std::fs::write(root.join("public-799-1.json"), "[]").unwrap();
+                // A receipt on the second page must be found without gh auth.
+                std::fs::write(
+                    root.join(format!("public-{destination}-1.json")),
+                    json!(vec![json!({}); 100]).to_string(),
+                )
+                .unwrap();
+                std::fs::write(
+                    root.join(format!("public-{destination}-2.json")),
+                    json!([receipt.clone()]).to_string(),
+                )
+                .unwrap();
+                assert!(
+                    guard_publication(root).is_ok(),
+                    "credential-free guard rejected genuine publication receipt on {destination}"
+                );
+                for corruption in ["missing", "author", "footer", "duplicate", "run"] {
+                    let mut comment = receipt.clone();
+                    match corruption {
+                        "author" => comment["user"]["login"] = "carrick-workers[bot]".into(),
+                        "footer" => {
+                            comment["body"] = comment["body"]
+                                .as_str()
+                                .unwrap()
+                                .replace("runs/42", "runs/43")
+                                .into()
+                        }
+                        "duplicate" => {
+                            comment["body"] = comment["body"]
+                                .as_str()
+                                .unwrap()
+                                .replace(
+                                    "Publication receipt:",
+                                    "Publication receipt:\n```json\n{}\n```\nPublication receipt:",
+                                )
+                                .into()
+                        }
+                        "run" => std::fs::write(root.join("run.json"), r#"{"id":42}"#).unwrap(),
+                        _ => (),
+                    }
+                    std::fs::write(
+                        root.join(format!("public-{destination}-2.json")),
+                        if corruption == "missing" {
+                            "[]".into()
+                        } else {
+                            json!([comment]).to_string()
+                        },
+                    )
+                    .unwrap();
+                    assert!(
+                        guard_publication(root).is_err(),
+                        "guard accepted {corruption} publication evidence"
+                    );
+                }
+                let run = json!({"id":42,"status":"completed","conclusion":"success","repository":{"full_name":REPOSITORY},"head_repository":{"full_name":REPOSITORY},"path":".github/workflows/dispatch-worker.yml","head_sha":"a".repeat(40),"head_branch":"main","event":"issues","actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"}});
+                std::fs::write(root.join("run.json"), run.to_string()).unwrap();
+            }
+        });
+    }
+    #[test]
+    fn guard_publication_without_credentials_refuses_partial_or_unbounded_pages() {
+        shared_fixture(|root| {
+            let (_, receipt) = guard_publication_fixture(root);
+            std::fs::write(root.join("public-799-1.json"), "[]").unwrap();
+            let mut full = vec![json!({}); 100];
+            full[0] = receipt;
+            std::fs::write(root.join("public-800-1.json"), json!(full).to_string()).unwrap();
+            assert!(
+                guard_publication(root).is_err(),
+                "guard trusted receipt before a failed later page"
+            );
+            for page in 2..=5 {
+                std::fs::write(
+                    root.join(format!("public-800-{page}.json")),
+                    json!(vec![json!({}); 100]).to_string(),
+                )
+                .unwrap();
+            }
+            assert!(
+                guard_publication(root).is_err(),
+                "guard accepted comments beyond its page cap"
+            );
+            let requests = regular_text(&root.join("public-requests")).unwrap();
+            assert!(
+                !requests.contains("page=6"),
+                "public comments exceeded five pages"
+            );
+        });
+    }
+    #[test]
+    fn guard_publication_credentialed_admission_rechecks_artifact_ownership() {
+        shared_fixture(|root| {
+            let (pr, _) = guard_publication_fixture(root);
+            assert_eq!(std::env::var("GH_TOKEN").unwrap(), "fixture-token");
+            // A credentialed recheck must work even when public API access fails.
+            std::fs::write(root.join("bin/curl"), "#!/bin/sh\nexit 96\n").unwrap();
+            let mut handoff: Value =
+                serde_json::from_str(&regular_text(&root.join("handoff.json")).unwrap()).unwrap();
+            handoff["applied"] = json!({"publication_pr":800});
+            std::fs::write(root.join("handoff.json"), handoff.to_string()).unwrap();
+            assert!(guard_publication(root).is_ok());
+            let mut dispatch = server(root).dispatch;
+            dispatch.branch = pr["head"]["ref"].as_str().unwrap().into();
+            assert!(require_owned_pr(root, &dispatch).is_ok());
+            handoff["applied"]["publication_pr"] = 801.into();
+            std::fs::write(root.join("handoff.json"), handoff.to_string()).unwrap();
+            assert!(
+                require_owned_pr(root, &dispatch).is_err(),
+                "admission reused guard's old publication proof"
+            );
+        });
+    }
     #[test]
     fn controller_publication_uses_handoff_without_current_actions_run() {
         shared_fixture(|root| {
@@ -3214,6 +3419,12 @@ mod tests {
                 "work/dispatch-799-42",
                 Some(&publication)
             ));
+            handoff["applied"]["publication_pr"] = 801.into();
+            std::fs::write(root.join("handoff.json"), handoff.to_string()).unwrap();
+            assert!(
+                recorded_publication(&pr, &run, 799, "work/dispatch-799-42").is_none(),
+                "controller reused stale publication proof"
+            );
             pr["number"] = 801.into();
             assert!(!owned_pr(
                 &pr,
@@ -4724,6 +4935,9 @@ exec /usr/bin/git "$@"
                 .env("RUNNER_TEMP", temp.path())
                 .env_remove("GITHUB_RUN_ID")
                 .env_remove("GH_TOKEN")
+                .env_remove("GITHUB_TOKEN")
+                .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
+                .env("CARRICK_DISPATCH_BASE", "a".repeat(40))
                 .envs(
                     if std::thread::current()
                         .name()
@@ -4732,7 +4946,15 @@ exec /usr/bin/git "$@"
                     {
                         vec![]
                     } else {
-                        vec![("GITHUB_RUN_ID", "999"), ("GH_TOKEN", "fixture-token")]
+                        if std::thread::current()
+                            .name()
+                            .unwrap()
+                            .contains("::tests::guard_publication_without_")
+                        {
+                            vec![("GITHUB_RUN_ID", "999")]
+                        } else {
+                            vec![("GITHUB_RUN_ID", "999"), ("GH_TOKEN", "fixture-token")]
+                        }
                     },
                 )
                 .env("GITHUB_RUN_ATTEMPT", "1")

@@ -949,10 +949,18 @@ fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
 }
 /// Only publication writes use the scoped App credential. Reads and comments
 /// continue to inherit the job token from the runner's environment.
+#[derive(Clone, Copy)]
+enum PublishEvent {
+    BranchPush,
+    PrPush,
+    PrCreate,
+    BodyPatch,
+}
 struct PublishCredential<'a> {
     app: Option<String>,
     job: &'a str,
     wrote: bool,
+    ci_triggered: bool,
 }
 impl<'a> PublishCredential<'a> {
     fn new(job: &'a str) -> Self {
@@ -962,10 +970,12 @@ impl<'a> PublishCredential<'a> {
                 .filter(|s| !s.is_empty()),
             job,
             wrote: false,
+            ci_triggered: false,
         }
     }
     fn write<T>(
         &mut self,
+        event: PublishEvent,
         mut operation: impl FnMut(&str) -> Result<T, ScalerError>,
     ) -> Result<T, ScalerError> {
         let mut result = operation(self.app.as_deref().unwrap_or(self.job));
@@ -979,14 +989,21 @@ impl<'a> PublishCredential<'a> {
         }
         if result.is_ok() {
             self.wrote = true;
+            self.ci_triggered |= self.app.is_some()
+                && matches!(event, PublishEvent::PrPush | PublishEvent::PrCreate);
         }
-        if self.app.is_none() && self.wrote {
-            Applied::record(|a| a.ci_requires_owner = true)?;
+        if self.wrote {
+            Applied::record(|a| a.ci_requires_owner = self.app.is_none() && !self.ci_triggered)?;
         }
         result
     }
-    fn gh(&mut self, root: &Path, args: &[&str]) -> Result<String, ScalerError> {
-        self.write(|token| gh_with_token(root, args, Some(token)))
+    fn gh(
+        &mut self,
+        root: &Path,
+        args: &[&str],
+        event: PublishEvent,
+    ) -> Result<String, ScalerError> {
+        self.write(event, |token| gh_with_token(root, args, Some(token)))
     }
 }
 fn publish_auth_failure(error: &str) -> bool {
@@ -2703,6 +2720,7 @@ fn patch_pr_body(
             "-F",
             &format!("body=@{}", path.display()),
         ],
+        PublishEvent::BodyPatch,
     )?;
     Ok(())
 }
@@ -3122,6 +3140,12 @@ fn publish(
         let proposal = proposal
             .map(|body| publication_body(&body, &source, dispatch.issue))
             .transpose()?;
+        let prs = open_prs(root, &dispatch.branch)?;
+        let push_event = if prs.as_array().is_some_and(|prs| !prs.is_empty()) {
+            PublishEvent::PrPush
+        } else {
+            PublishEvent::BranchPush
+        };
         let existing = tip.split_whitespace().next();
         let retained =
             existing.is_some() && receipt.expected_tip.is_empty() && existing != Some(head.trim());
@@ -3184,7 +3208,7 @@ fn publish(
                 } else {
                     commits.clone()
                 };
-                credential.write(|token| {
+                credential.write(push_event, |token| {
                     let mut push = push_command(&work, dispatch, id, &receipt.expected_tip)?;
                     push.env("GH_TOKEN", token).env_remove("GITHUB_TOKEN");
                     output(&mut push)
@@ -3204,7 +3228,6 @@ fn publish(
         if !retained {
             std::fs::write(state.join("published-tip"), head.trim())?;
         }
-        let prs = open_prs(root, &dispatch.branch)?;
         if prs.as_array().is_some_and(|prs| !prs.is_empty()) {
             let pr = require_owned_pr(root, dispatch)?;
             if !retained && let Some(body) = &proposal {
@@ -3296,6 +3319,7 @@ fn publish(
                     "--body-file",
                     path.to_str().ok_or(ScalerError::Guard("body path"))?,
                 ],
+                PublishEvent::PrCreate,
             )?;
             let created_number = created
                 .trim()
@@ -3857,6 +3881,10 @@ mod tests {
         publication_fixture("publish-token-auth-patch");
     }
     #[test]
+    fn publish_auth_failure_on_patch_without_push_needs_ci_note() {
+        publication_fixture("publish-token-auth-patch-no-push");
+    }
+    #[test]
     fn publish_lease_rejection_is_not_retried_or_labelled_permission() {
         publication_fixture("publish-token-lease");
     }
@@ -4171,11 +4199,17 @@ fi
                 | "publish-token-recovery-create"
                 | "publish-token-auth-create"
                 | "publish-token-auth-patch"
+                | "publish-token-auth-patch-no-push"
                 | "publish-token-lease"
                 | "publish-token-network"
                 | "publish-empty-noop"
         ) {
-            std::fs::write(outer.join("publish-mode"), witness).unwrap();
+            let mode = if witness.starts_with("publish-token-auth-patch") {
+                "publish-token-auth-patch"
+            } else {
+                witness
+            };
+            std::fs::write(outer.join("publish-mode"), mode).unwrap();
             if witness == "publish-token-recovery-create" {
                 std::fs::write(outer.join("remote-tip"), &receipt.head).unwrap();
                 receipt.expected_tip = receipt.head.clone();
@@ -4188,7 +4222,7 @@ fi
                 )
                 .unwrap();
             }
-            if witness == "publish-token-auth-patch" {
+            if witness.starts_with("publish-token-auth-patch") {
                 std::fs::remove_file(outer.join("publish-mode")).unwrap();
                 publish(
                     &work,
@@ -4200,13 +4234,15 @@ fi
                     &mut agent_loop::RunCache::default(),
                 )
                 .unwrap();
-                std::fs::write(outer.join("publish-mode"), witness).unwrap();
+                std::fs::write(outer.join("publish-mode"), mode).unwrap();
                 receipt.expected_tip = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
-                git(
-                    &work,
-                    &["commit", "--allow-empty", "-m", "fix(ci): continue App PR"],
-                )
-                .unwrap();
+                if witness != "publish-token-auth-patch-no-push" {
+                    git(
+                        &work,
+                        &["commit", "--allow-empty", "-m", "fix(ci): continue App PR"],
+                    )
+                    .unwrap();
+                }
                 receipt.pr_body = Some("Update the explanation.".into());
             }
             let result = publish(
@@ -4234,10 +4270,10 @@ fi
             } else {
                 assert_eq!(result.unwrap(), Some(800));
                 let applied = Applied::load().unwrap().report();
-                if witness == "publish-empty-noop" {
+                if witness == "publish-empty-noop" || witness == "publish-token-auth-patch" {
                     assert!(
                         !applied.contains("CI won't start automatically"),
-                        "no-op publication claimed fallback"
+                        "App synchronize or no-op publication claimed CI would not start"
                     );
                 } else {
                     assert!(
@@ -4246,7 +4282,7 @@ fi
                     );
                     let file = if witness == "publish-token-auth-push" {
                         "push-attempts"
-                    } else if witness == "publish-token-auth-patch" {
+                    } else if witness.starts_with("publish-token-auth-patch") {
                         "patch-attempts"
                     } else {
                         "create-attempts"
@@ -4258,6 +4294,16 @@ fi
                         } else {
                             "app\njob\n"
                         }
+                    );
+                }
+                if witness == "publish-token-auth-patch" {
+                    assert_eq!(
+                        regular_text(&outer.join("push-attempts")).unwrap(),
+                        "app\napp\n"
+                    );
+                    assert_eq!(
+                        regular_text(&outer.join("patch-attempts")).unwrap(),
+                        "app\njob\n"
                     );
                 }
             }
