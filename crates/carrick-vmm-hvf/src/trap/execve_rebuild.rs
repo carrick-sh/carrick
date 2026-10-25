@@ -472,10 +472,7 @@ pub(crate) fn prepare_native_exec_successor(
         .allocate()
         .map_err(|error| TrapError::Hypervisor(format!("allocate native exec ASID: {error}")))?;
     let asid = UnpublishedExecAsid::new(allocator, asid);
-    let backing = match PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), global) {
-        Ok(backing) => backing,
-        Err(error) => return Err(error),
-    };
+    let backing = PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), global)?;
     Ok(PreparedNativeExecSuccessor {
         parts: Some(PreparedNativeExecParts {
             backing,
