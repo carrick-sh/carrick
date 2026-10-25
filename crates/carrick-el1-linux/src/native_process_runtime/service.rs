@@ -1126,7 +1126,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     #[inline(never)]
-    fn park_exec_drain(&mut self, channel: &Arc<WaitChannel>) -> Result<bool, NativeProcessError> {
+    fn park_exec_closing(
+        &mut self,
+        channel: &Arc<WaitChannel>,
+    ) -> Result<bool, NativeProcessError> {
         let zone = self.source.zone;
         let record = zone
             .slot(self.source.slot)
@@ -1185,7 +1188,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     #[inline(never)]
-    fn begin_exec_drain(
+    fn begin_exec_closing(
         &mut self,
         request: ServiceRequest,
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
@@ -1198,11 +1201,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .task_mut(self.key)
                 .map_err(|_| NativeProcessError::Stale)?;
             let resources = row.native_mut().resources_mut();
-            let custody = carrick_core::terminal::ExecDrainCustody::begin(
-                resources.page,
-                self.key,
-                self.caller_address,
-            )
+            let custody = carrick_core::terminal::TerminalCustody::<
+                carrick_core::terminal::Process,
+                carrick_core::terminal::Live,
+            >::begin_exec(resources.page, self.key, self.caller_address)
             .map_err(|_| NativeProcessError::Busy)?;
             let channel = Arc::new(WaitChannel {
                 generation: ProcessWake::new(),
@@ -1256,13 +1258,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 bindings.push(identity);
                 outstanding.push(OutstandingExitReceipt::HostBorn { identity, index });
             }
-            let members = custody.cancel_members(pool, bindings);
+            let carrick_core::terminal::RetirementVerdict::CancelMembers { members, .. } =
+                custody.cancel_members(pool, bindings)
+            else {
+                return Err(NativeProcessError::Quarantined);
+            };
             let page = resources.page;
             let caller = pending.control.clone();
             graph.pending.insert_exec(
                 self.key,
                 PendingExit {
-                    operation: PendingCloseOperation::Exec(PendingExecDrain {
+                    operation: PendingCloseOperation::Exec(PendingExecAdoption {
                         request,
                         receipt,
                         pending,
@@ -1274,7 +1280,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     }),
                     outstanding,
                     members,
-                    custody: PendingCloseCustody::Exec(custody),
+                    custody: Some(custody),
                 },
             );
             (page, channel, siblings, service_records)
@@ -1297,14 +1303,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .cancel_service(record, self.source.slot, self.service)?;
         }
         self.current.linux.mark_pending_host_work();
-        if self.park_exec_drain(&channel)? {
+        if self.park_exec_closing(&channel)? {
             Ok(NativeResume::Left(None))
         } else {
-            self.finish_exec_drain_ready(page)
+            self.finish_exec_closing_ready(page)
         }
     }
 
-    fn finish_exec_drain_ready(
+    fn finish_exec_closing_ready(
         &mut self,
         page: &ThreadLifecyclePage,
     ) -> Result<NativeResume, NativeProcessError> {
@@ -1329,7 +1335,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         result
     }
 
-    pub(super) fn resume_exec_drain(&mut self) -> Option<Result<NativeResume, NativeProcessError>> {
+    pub(super) fn resume_exec_closing(
+        &mut self,
+    ) -> Option<Result<NativeResume, NativeProcessError>> {
         let (page, channel) = {
             let graph = self.runtime.graph.lock();
             let pending = graph.pending.exit(&self.key)?;
@@ -1347,9 +1355,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .record(self.record.id)
                 .consume_owner_continuation();
         }
-        Some(match self.park_exec_drain(&channel) {
+        Some(match self.park_exec_closing(&channel) {
             Ok(true) => Ok(NativeResume::Left(None)),
-            Ok(false) => self.finish_exec_drain_ready(page),
+            Ok(false) => self.finish_exec_closing_ready(page),
             Err(error) => Err(error),
         })
     }
@@ -1447,7 +1455,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .consume_owner_continuation();
             }
             return if members > 1 {
-                self.begin_exec_drain(*request, receipt, pending)
+                self.begin_exec_closing(*request, receipt, pending)
             } else {
                 self.complete_exec_prepared(*request, receipt, pending)
             };

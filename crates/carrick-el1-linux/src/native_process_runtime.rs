@@ -810,10 +810,15 @@ struct PendingExit<'a> {
     wake: Option<ExitWakeCustody>,
     outstanding: Vec<OutstandingExitReceipt<'a>>,
     members: carrick_core::terminal::MemberSet,
-    custody: PendingCloseCustody,
+    custody: Option<
+        carrick_core::terminal::TerminalCustody<
+            carrick_core::terminal::Process,
+            carrick_core::terminal::Closing,
+        >,
+    >,
 }
 
-struct PendingExecDrain<'a> {
+struct PendingExecAdoption<'a> {
     request: carrick_core_abi::service::ServiceRequest,
     receipt: carrick_core_abi::service::ExecAdoptionReceipt,
     pending: Box<service::PendingService<'a>>,
@@ -824,19 +829,7 @@ enum PendingCloseOperation<'a> {
         status: LinuxWaitStatus,
         entry: OwnerEntry,
     },
-    Exec(PendingExecDrain<'a>),
-}
-
-enum PendingCloseCustody {
-    Exit(
-        Option<
-            carrick_core::terminal::TerminalCustody<
-                carrick_core::terminal::Process,
-                carrick_core::terminal::Closing,
-            >,
-        >,
-    ),
-    Exec(carrick_core::terminal::ExecDrainCustody),
+    Exec(PendingExecAdoption<'a>),
 }
 
 // Pool entries and the carrier's bounded record registry are the maximum
@@ -891,15 +884,11 @@ impl<'a> PendingExit<'a> {
     #[inline(never)]
     fn ready_or_record(&self, page: &ThreadLifecyclePage, is_owner: bool) -> bool {
         let verdict = self.readiness(page);
-        let ready = match (&self.custody, &verdict) {
-            (PendingCloseCustody::Exit(Some(custody)), Some(Ok(receipts))) => {
-                custody.can_settle(page, receipts)
-            }
-            (PendingCloseCustody::Exec(custody), Some(Ok(receipts))) => {
-                custody.can_adopt(page, receipts)
-            }
-            _ => false,
-        };
+        let ready = self
+            .custody
+            .as_ref()
+            .zip(verdict.as_ref().and_then(|result| result.as_ref().ok()))
+            .is_some_and(|(custody, receipts)| custody.can_settle(page, receipts));
         if !ready
             && is_owner
             && let Some(verdict) = verdict
@@ -923,19 +912,14 @@ impl<'a> PendingExit<'a> {
         let mut pool = Vec::new();
         let mut host = Vec::new();
         self.observations(&mut pool, &mut host);
-        Some(match &self.custody {
-            PendingCloseCustody::Exit(custody) => {
-                custody
-                    .as_ref()?
-                    .observe_members_verdict(page, &self.members, &pool, &host)
-            }
-            PendingCloseCustody::Exec(custody) => {
-                custody.observe_members_verdict(page, &self.members, &pool, &host)
-            }
-        })
+        Some(
+            self.custody
+                .as_ref()?
+                .observe_members_verdict(page, &self.members, &pool, &host),
+        )
     }
 
-    fn exec(&self) -> Option<&PendingExecDrain<'a>> {
+    fn exec(&self) -> Option<&PendingExecAdoption<'a>> {
         match &self.operation {
             PendingCloseOperation::Exec(exec) => Some(exec),
             PendingCloseOperation::Exit { .. } => None,
@@ -1083,7 +1067,7 @@ impl<'a> PendingTable<'a> {
             _ => unreachable!(),
         }
     }
-    fn exec(&self, key: &TaskKey) -> Option<&PendingExecDrain<'a>> {
+    fn exec(&self, key: &TaskKey) -> Option<&PendingExecAdoption<'a>> {
         match self.rows.get(&PendingKey::Exit(*key))?.as_ref() {
             PendingState::Exit(pending) => pending.exec(),
             _ => None,
@@ -1092,7 +1076,7 @@ impl<'a> PendingTable<'a> {
     fn insert_exec(&mut self, key: TaskKey, pending: PendingExit<'a>) {
         self.insert_row(PendingKey::Exit(key), PendingState::Exit(Box::new(pending)));
     }
-    fn remove_exec(&mut self, key: &TaskKey) -> Option<PendingExecDrain<'a>> {
+    fn remove_exec(&mut self, key: &TaskKey) -> Option<PendingExecAdoption<'a>> {
         match self.take_row(&PendingKey::Exit(*key))? {
             PendingState::Exit(pending) => match *pending {
                 PendingExit {
@@ -4807,7 +4791,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn resume_checkpoint(
         &mut self,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
-        if let Some(result) = self.resume_exec_drain() {
+        if let Some(result) = self.resume_exec_closing() {
             return result.map_err(NativeProcessError::run_failure_reason);
         }
         if let Some(result) = self.resume_service() {
@@ -5284,7 +5268,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         wake,
                         outstanding,
                         members,
-                        custody: PendingCloseCustody::Exit(Some(custody)),
+                        custody: Some(custody),
                     },
                 );
             } else if !is_owner
@@ -5424,14 +5408,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .exit_mut(&self.key)
                     .ok_or(NativeProcessError::Quarantined)?;
                 let receipts = pending.completed_receipts(page);
-                let custody = match &mut pending.custody {
-                    PendingCloseCustody::Exit(custody) => {
-                        custody.take().ok_or(NativeProcessError::Quarantined)?
-                    }
-                    PendingCloseCustody::Exec(_) => {
-                        return Err(NativeProcessError::Quarantined);
-                    }
-                };
+                let custody = pending
+                    .custody
+                    .take()
+                    .ok_or(NativeProcessError::Quarantined)?;
                 let result = match receipts {
                     Some(receipts) => custody.settle(page, receipts),
                     None => Err(custody),
@@ -5439,7 +5419,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 match result {
                     Ok(settled) => Some(settled),
                     Err(closing) => {
-                        pending.custody = PendingCloseCustody::Exit(Some(closing));
+                        pending.custody = Some(closing);
                         None
                     }
                 }
