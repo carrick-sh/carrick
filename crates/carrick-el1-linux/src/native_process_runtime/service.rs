@@ -56,7 +56,7 @@ pub(super) struct PendingService<'a> {
     _exec_payload: Option<Box<[u8]>>,
     request: ServiceRequest,
     pub(super) wait: Option<carrick_core_abi::PortalOwnerWait>,
-    claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
+    pub(super) claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
     control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
 }
 
@@ -153,7 +153,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'_, 'a, M, C, S>
 {
     #[inline(never)]
-    fn release_service_claim(
+    pub(super) fn release_service_claim(
         &mut self,
         claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
     ) -> Result<(), NativeProcessError> {
@@ -983,12 +983,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         );
         let ready = {
             let graph = self.runtime.graph.lock();
-            graph.pending.exec(&self.key).is_some_and(|pending| {
-                core::ptr::eq(pending.caller.control(), self.control)
-                    && graph
-                        .owner
-                        .task(self.key)
-                        .is_ok_and(|row| row.native().resources().members.len() == 1)
+            let page = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeProcessError::Stale)?
+                .native()
+                .resources()
+                .page;
+            graph.pending.exit(&self.key).is_some_and(|pending| {
+                pending.exec().is_some()
+                    && core::ptr::eq(pending.caller.control(), self.control)
+                    && pending.ready_or_record(page, true)
             })
         };
         if ready {
@@ -1023,17 +1028,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
         pending: Box<PendingService<'a>>,
     ) -> Result<NativeResume, NativeProcessError> {
-        let (page, channel, siblings) = {
+        let (page, channel, siblings, service_records) = {
             let mut graph = self.runtime.graph.lock();
             let row = graph
                 .owner
                 .task_mut(self.key)
                 .map_err(|_| NativeProcessError::Stale)?;
             let resources = row.native_mut().resources_mut();
-            resources
-                .page
-                .close_for_fork()
-                .map_err(|_| NativeProcessError::Busy)?;
+            let custody = carrick_core::terminal::ExecDrainCustody::begin(
+                resources.page,
+                self.key,
+                self.caller_address,
+            )
+            .map_err(|_| NativeProcessError::Busy)?;
             let channel = Arc::new(WaitChannel {
                 generation: ProcessWake::new(),
                 mm: self.binding.mm.raw(),
@@ -1044,24 +1051,87 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .filter(|member| member.record != self.record)
                 .map(|member| member.control.clone())
                 .collect();
+            let service_records = resources
+                .members
+                .iter()
+                .map(|member| member.record)
+                .collect::<Vec<_>>();
+            let mut outstanding = Vec::with_capacity(MEMBER_SET_CAPACITY);
+            let mut pool = Vec::new();
+            let mut bindings = Vec::new();
+            for member in resources
+                .members
+                .iter()
+                .filter(|member| member.record != self.record)
+            {
+                if let Some(entry) = member.control.entry() {
+                    pool.push(entry);
+                    outstanding.push(OutstandingExitReceipt::Pool {
+                        entry,
+                        control: member.control.clone(),
+                        expected_host: member.expected_host,
+                    });
+                } else {
+                    let birth = member.expected_host;
+                    bindings.push(birth);
+                    outstanding.push(OutstandingExitReceipt::Adopted {
+                        birth,
+                        control: member.control.clone(),
+                    });
+                }
+            }
+            for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
+                let Some(identity) = resources.page.host_birth_identity(index) else {
+                    continue;
+                };
+                if resources.page.host_birth_receipt_returned(index)
+                    || self.control.host_birth_identity() == Some(identity)
+                    || bindings.contains(&identity)
+                {
+                    continue;
+                }
+                bindings.push(identity);
+                outstanding.push(OutstandingExitReceipt::HostBorn { identity, index });
+            }
+            let members = custody.cancel_members(pool, bindings);
             let page = resources.page;
             let caller = pending.control.clone();
             graph.pending.insert_exec(
                 self.key,
-                PendingExecDrain {
-                    request,
-                    receipt,
-                    pending,
+                PendingExit {
+                    operation: PendingCloseOperation::Exec(PendingExecDrain {
+                        request,
+                        receipt,
+                        pending,
+                    }),
                     caller,
                     channel: channel.clone(),
+                    wake: Some(ExitWakeCustody {
+                        channel: channel.clone(),
+                    }),
+                    outstanding,
+                    members,
+                    custody: PendingCloseCustody::Exec(custody),
                 },
             );
-            (page, channel, siblings)
+            (page, channel, siblings, service_records)
         };
         page.publish_exit_wait(self.binding.mm, WaitChannel::address(&channel));
+        for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
+            if page.host_birth_identity(index).is_some()
+                && !page.host_birth_receipt_returned(index)
+                && self.control.host_birth_identity() != page.host_birth_identity(index)
+            {
+                page.request_host_birth_cancel(index);
+            }
+        }
         for sibling in siblings {
             sibling.commit_registration();
             sibling.control().request_host_exit();
+        }
+        for record in service_records {
+            self.runtime
+                .cancel_service(record, self.source.slot, self.service)?;
         }
         self.current.linux.mark_pending_host_work();
         if self.park_exec_drain(&channel)? {
@@ -1083,7 +1153,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .remove_exec(&self.key)
             .ok_or(NativeProcessError::Stale)?;
         page.clear_exit_wait();
-        page.await_exec_binding()
+        page.await_exec_binding_after_close()
             .map_err(|_| NativeProcessError::Stale)?;
         let result = self.complete_exec_prepared(pending.request, pending.receipt, pending.pending);
         if !matches!(result, Err(NativeProcessError::Quarantined)) {
@@ -1100,7 +1170,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub(super) fn resume_exec_drain(&mut self) -> Option<Result<NativeResume, NativeProcessError>> {
         let (page, channel) = {
             let graph = self.runtime.graph.lock();
-            let pending = graph.pending.exec(&self.key)?;
+            let pending = graph.pending.exit(&self.key)?;
+            pending.exec()?;
             if !core::ptr::eq(pending.caller.control(), self.control) {
                 return Some(Err(NativeProcessError::Stale));
             }
@@ -1132,6 +1203,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Err(NativeProcessError::Quarantined);
         }
         if self.runtime.graph.lock().pending.has_exit(&self.key) {
+            if let (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(receipt)) =
+                (request.operation, result)
+            {
+                self.service.cancel_exec_successor(receipt)?;
+            }
             // The terminal checkpoint must consume both winner and losing
             // caller custody; none may return a cancelled service to EL0.
             unsafe {

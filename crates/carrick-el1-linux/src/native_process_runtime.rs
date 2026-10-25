@@ -789,27 +789,39 @@ enum OutstandingExitReceipt<'a> {
 }
 
 struct PendingExit<'a> {
-    status: LinuxWaitStatus,
-    entry: OwnerEntry,
+    operation: PendingCloseOperation<'a>,
     caller: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
     channel: Arc<WaitChannel>,
     wake: Option<ExitWakeCustody>,
     outstanding: Vec<OutstandingExitReceipt<'a>>,
     members: carrick_core::terminal::MemberSet,
-    custody: Option<
-        carrick_core::terminal::TerminalCustody<
-            carrick_core::terminal::Process,
-            carrick_core::terminal::Closing,
-        >,
-    >,
+    custody: PendingCloseCustody,
 }
 
 struct PendingExecDrain<'a> {
     request: carrick_core_abi::service::ServiceRequest,
     receipt: carrick_core_abi::service::ExecAdoptionReceipt,
     pending: Box<service::PendingService<'a>>,
-    caller: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
-    channel: Arc<WaitChannel>,
+}
+
+enum PendingCloseOperation<'a> {
+    Exit {
+        status: LinuxWaitStatus,
+        entry: OwnerEntry,
+    },
+    Exec(PendingExecDrain<'a>),
+}
+
+enum PendingCloseCustody {
+    Exit(
+        Option<
+            carrick_core::terminal::TerminalCustody<
+                carrick_core::terminal::Process,
+                carrick_core::terminal::Closing,
+            >,
+        >,
+    ),
+    Exec(carrick_core::terminal::ExecDrainCustody),
 }
 
 // Pool entries and the carrier's bounded record registry are the maximum
@@ -818,7 +830,7 @@ struct PendingExecDrain<'a> {
 const MEMBER_SET_CAPACITY: usize =
     carrick_el1_abi::THREAD_POOL_ENTRIES + carrick_sched_core::ZONE_RECORDS;
 
-impl PendingExit<'_> {
+impl<'a> PendingExit<'a> {
     fn completed_receipts(
         &self,
         page: &ThreadLifecyclePage,
@@ -863,11 +875,16 @@ impl PendingExit<'_> {
     /// verdict must not grow the bounded EL1 exit frame.
     #[inline(never)]
     fn ready_or_record(&self, page: &ThreadLifecyclePage, is_owner: bool) -> bool {
-        let Some(custody) = self.custody.as_ref() else {
-            return false;
-        };
         let verdict = self.readiness(page);
-        let ready = matches!(&verdict, Some(Ok(receipts)) if custody.can_settle(page, receipts));
+        let ready = match (&self.custody, &verdict) {
+            (PendingCloseCustody::Exit(Some(custody)), Some(Ok(receipts))) => {
+                custody.can_settle(page, receipts)
+            }
+            (PendingCloseCustody::Exec(custody), Some(Ok(receipts))) => {
+                custody.can_adopt(page, receipts)
+            }
+            _ => false,
+        };
         if !ready
             && is_owner
             && let Some(verdict) = verdict
@@ -891,11 +908,23 @@ impl PendingExit<'_> {
         let mut pool = Vec::new();
         let mut host = Vec::new();
         self.observations(&mut pool, &mut host);
-        Some(
-            self.custody
-                .as_ref()?
-                .observe_members_verdict(page, &self.members, &pool, &host),
-        )
+        Some(match &self.custody {
+            PendingCloseCustody::Exit(custody) => {
+                custody
+                    .as_ref()?
+                    .observe_members_verdict(page, &self.members, &pool, &host)
+            }
+            PendingCloseCustody::Exec(custody) => {
+                custody.observe_members_verdict(page, &self.members, &pool, &host)
+            }
+        })
+    }
+
+    fn exec(&self) -> Option<&PendingExecDrain<'a>> {
+        match &self.operation {
+            PendingCloseOperation::Exec(exec) => Some(exec),
+            PendingCloseOperation::Exit { .. } => None,
+        }
     }
 }
 
@@ -981,8 +1010,7 @@ enum PendingKey {
 }
 enum PendingState<'a> {
     Operation(PendingContinuation),
-    Exit(PendingExit<'a>),
-    Exec(PendingExecDrain<'a>),
+    Exit(Box<PendingExit<'a>>),
     Member(MemberWaitState<'a>),
 }
 #[derive(Default)]
@@ -1032,26 +1060,32 @@ impl<'a> PendingTable<'a> {
         self.rows.contains_key(&PendingKey::Exit(*key))
     }
     fn insert_exit(&mut self, key: TaskKey, pending: PendingExit<'a>) {
-        self.insert_row(PendingKey::Exit(key), PendingState::Exit(pending));
+        self.insert_row(PendingKey::Exit(key), PendingState::Exit(Box::new(pending)));
     }
     fn remove_exit(&mut self, key: &TaskKey) -> Option<PendingExit<'a>> {
         match self.take_row(&PendingKey::Exit(*key))? {
-            PendingState::Exit(pending) => Some(pending),
+            PendingState::Exit(pending) => Some(*pending),
             _ => unreachable!(),
         }
     }
     fn exec(&self, key: &TaskKey) -> Option<&PendingExecDrain<'a>> {
         match self.rows.get(&PendingKey::Exit(*key))?.as_ref() {
-            PendingState::Exec(pending) => Some(pending),
+            PendingState::Exit(pending) => pending.exec(),
             _ => None,
         }
     }
-    fn insert_exec(&mut self, key: TaskKey, pending: PendingExecDrain<'a>) {
-        self.insert_row(PendingKey::Exit(key), PendingState::Exec(pending));
+    fn insert_exec(&mut self, key: TaskKey, pending: PendingExit<'a>) {
+        self.insert_row(PendingKey::Exit(key), PendingState::Exit(Box::new(pending)));
     }
     fn remove_exec(&mut self, key: &TaskKey) -> Option<PendingExecDrain<'a>> {
         match self.take_row(&PendingKey::Exit(*key))? {
-            PendingState::Exec(pending) => Some(pending),
+            PendingState::Exit(pending) => match *pending {
+                PendingExit {
+                    operation: PendingCloseOperation::Exec(pending),
+                    ..
+                } => Some(pending),
+                _ => unreachable!(),
+            },
             _ => unreachable!(),
         }
     }
@@ -4632,16 +4666,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
     /// Resume owned lifecycle custody before the execution lane returns to EL0.
     /// Exit keeps its original status and cannot become a guest syscall return.
+    #[inline(never)]
     pub fn resume_pending_lifecycle(&mut self) -> Option<LifecycleOutcome> {
-        let status = self
+        let owner_exit = self
             .runtime
             .graph
             .lock()
             .pending
             .exit(&self.key)
             .filter(|pending| core::ptr::eq(pending.caller.control(), self.control))
-            .map(|p| (p.status, p.entry));
-        if let Some((status, entry)) = status {
+            .and_then(|pending| match pending.operation {
+                PendingCloseOperation::Exit { status, entry } => Some((status, entry)),
+                PendingCloseOperation::Exec(_) => None,
+            });
+        if let Some((status, entry)) = owner_exit {
             // SAFETY: this exact record is selected by the execution owner;
             // the same checkpoint serves in-zone and host re-entry.
             unsafe {
@@ -4668,19 +4706,81 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .record(self.record.id)
                     .consume_owner_continuation();
             }
-            self.retire_thread_identity(self.calling_tid);
-            let Some(receipt) =
-                carrick_core::entry::retire_current(self.binding, self.source, self.record.id)
-            else {
-                return Some(self.run_failed(NativeProcessError::Quarantined.run_failure_reason()));
-            };
-            self.handoff = Some(receipt);
-            return Some(LifecycleOutcome::Transferred {
-                progress: carrick_core::Served::Idle,
-                result: SyscallResult::new(0),
+            let status = self.pending_close_status()?;
+            return Some(match self.retire_closing_member(status) {
+                Ok(outcome) => outcome,
+                Err(error) => self.run_failed(error.run_failure_reason()),
             });
         }
         self.resume_pending_wait()
+    }
+
+    fn pending_close_status(&self) -> Option<carrick_sched_core::process::TerminationStatus> {
+        self.runtime
+            .graph
+            .lock()
+            .pending
+            .exit(&self.key)
+            .map(|pending| match pending.operation {
+                PendingCloseOperation::Exit { status, .. } => status.to_termination_status(),
+                PendingCloseOperation::Exec(_) => {
+                    carrick_sched_core::process::TerminationStatus::signaled(9, false)
+                }
+            })
+    }
+
+    /// Retire a non-owner through the same lifecycle-page transaction as a
+    /// raw thread `exit`. A cancelled service continuation reaches this path
+    /// without returning to EL0, so it must publish both scheduler and page
+    /// retirement before the process-close owner can resume.
+    #[inline(never)]
+    fn retire_closing_member(
+        &mut self,
+        status: carrick_sched_core::process::TerminationStatus,
+    ) -> Result<LifecycleOutcome, NativeProcessError> {
+        let page = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .page;
+        let entry = self.control.entry().ok_or(NativeProcessError::Stale)?;
+        let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+            self.binding,
+            Some(entry),
+            status,
+        )
+        .ok_or(NativeProcessError::Stale)?;
+        let custody = carrick_core::terminal::TerminalCustody::<
+            carrick_core::terminal::Thread,
+            carrick_core::terminal::Live,
+        >::admitted(identity)
+        .begin();
+        let (custody, membership) = custody
+            .reserve_nonfinal(page)
+            .map_err(|_| NativeProcessError::Quarantined)?;
+        let receipt =
+            carrick_core::entry::retire_current(self.binding, self.source, self.record.id)
+                .ok_or(NativeProcessError::Quarantined)?;
+        carrick_core::lifecycle::retire_cancelled_pool_member(
+            page,
+            entry,
+            self.control,
+            membership,
+        )
+        .map_err(|_| NativeProcessError::Quarantined)?;
+        self.retire_thread_verdict(custody.into_verdict(page));
+        self.lifecycle_admission_settled()
+            .map_err(|_| NativeProcessError::Quarantined)?;
+        self.handoff = Some(receipt);
+        Ok(LifecycleOutcome::Transferred {
+            progress: carrick_core::Served::Idle,
+            result: SyscallResult::new(0),
+        })
     }
 
     /// The ISA execution lane's single checkpoint after selecting a parked
@@ -4898,9 +4998,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         let mut adopted = Vec::new();
         let mut member_notification = None;
+        let mut cancelled_exec = None;
         let (page, channel, first_close) = {
             let mut graph = self.runtime.graph.lock();
-            let first_close = !graph.pending.has_exit(&self.key);
+            let upgraded = if graph.pending.exec(&self.key).is_some() {
+                graph.pending.remove_exit(&self.key)
+            } else {
+                None
+            };
+            let upgraded_channel = upgraded.as_ref().map(|pending| pending.channel.clone());
+            let upgraded_exec = upgraded_channel.is_some();
+            if let Some(PendingExit {
+                operation: PendingCloseOperation::Exec(exec),
+                ..
+            }) = upgraded
+            {
+                cancelled_exec = Some(exec);
+            }
+            let first_close = upgraded_exec || !graph.pending.has_exit(&self.key);
             let is_owner = first_close
                 || graph
                     .pending
@@ -4933,9 +5048,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 if page.live() == 0 {
                     return Err(NativeProcessError::Quarantined);
                 }
-                let channel = Arc::new(WaitChannel {
-                    generation: ProcessWake::new(),
-                    mm: self.binding.mm.raw(),
+                let channel = upgraded_channel.unwrap_or_else(|| {
+                    Arc::new(WaitChannel {
+                        generation: ProcessWake::new(),
+                        mm: self.binding.mm.raw(),
+                    })
                 });
                 if let Some(state) = registry_state.as_deref() {
                     adopted = NativeProcessRegistry::adopted_members(
@@ -5140,14 +5257,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 graph.pending.insert_exit(
                     self.key,
                     PendingExit {
-                        status: wait_status,
-                        entry,
+                        operation: PendingCloseOperation::Exit {
+                            status: wait_status,
+                            entry,
+                        },
                         caller,
                         channel,
                         wake,
                         outstanding,
                         members,
-                        custody: Some(custody),
+                        custody: PendingCloseCustody::Exit(Some(custody)),
                     },
                 );
             } else if !is_owner
@@ -5197,6 +5316,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
         };
         drop(registry_state);
+        if let Some(exec) = cancelled_exec {
+            let cancelled = self.service.cancel_exec_successor(exec.receipt);
+            let released = self.release_service_claim(exec.pending.claim);
+            cancelled?;
+            released?;
+        }
         #[cfg(test)]
         if first_close {
             let hook = self.runtime.closing_race_hook.lock().take();
@@ -5281,10 +5406,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .exit_mut(&self.key)
                     .ok_or(NativeProcessError::Quarantined)?;
                 let receipts = pending.completed_receipts(page);
-                let custody = pending
-                    .custody
-                    .take()
-                    .ok_or(NativeProcessError::Quarantined)?;
+                let custody = match &mut pending.custody {
+                    PendingCloseCustody::Exit(custody) => {
+                        custody.take().ok_or(NativeProcessError::Quarantined)?
+                    }
+                    PendingCloseCustody::Exec(_) => {
+                        return Err(NativeProcessError::Quarantined);
+                    }
+                };
                 let result = match receipts {
                     Some(receipts) => custody.settle(page, receipts),
                     None => Err(custody),
@@ -5292,7 +5421,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 match result {
                     Ok(settled) => Some(settled),
                     Err(closing) => {
-                        pending.custody = Some(closing);
+                        pending.custody = PendingCloseCustody::Exit(Some(closing));
                         None
                     }
                 }
@@ -6342,13 +6471,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                     .map_err(|_| NativeProcessError::Quarantined)
                     .map(|row| row.native().resources().page);
                 page.map(|page| {
-                    let ready = graph.pending.exit(&self.key).is_some_and(|pending| {
-                        pending.custody.as_ref().is_some_and(|custody| {
-                            pending
-                                .completed_receipts(page)
-                                .is_some_and(|receipts| custody.can_settle(page, &receipts))
-                        })
-                    });
+                    let ready = graph
+                        .pending
+                        .exit(&self.key)
+                        .is_some_and(|pending| pending.ready_or_record(page, false));
                     if ready {
                         graph
                             .pending
