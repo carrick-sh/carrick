@@ -3170,6 +3170,7 @@ fn foreign_cow_prepare_write_rejects_in_span_leaf_discontinuity() {
         let page_tables = child.state.page_tables_authority();
         page_tables
             .edit(
+                crate::trap::test_stage1_edit_license(),
                 || Err(TrapError::Hypervisor("manager must be present".to_owned())),
                 |editor| {
                     editor
@@ -3318,6 +3319,7 @@ fn foreign_cow_prepare_write_rejects_out_of_span_alias() {
         let page_tables = child.state.page_tables_authority();
         page_tables
             .edit(
+                crate::trap::test_stage1_edit_license(),
                 || Err(TrapError::Hypervisor("manager must be present".to_owned())),
                 |editor| {
                     editor
@@ -4727,6 +4729,7 @@ fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() 
     let mut block = crate::memory::LINUX_MMAP_BASE + 64 * TWO_MIB;
     pt_auth
         .edit(
+            crate::trap::test_stage1_edit_license(),
             || Err(TrapError::Hypervisor("manager must be present".to_owned())),
             |editor| {
                 while editor.pool_stats().3 < 2 {
@@ -4905,6 +4908,7 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
         let mut block = crate::memory::LINUX_MMAP_BASE + 64 * TWO_MIB;
         pt_auth
             .edit(
+                crate::trap::test_stage1_edit_license(),
                 || Err(TrapError::Hypervisor("manager must be present".to_owned())),
                 |editor| {
                     while editor.pool_stats().3 < 2 {
@@ -5067,6 +5071,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     let mut mapped_vas = Vec::new();
     parent_authority
         .edit(
+            crate::trap::test_stage1_edit_license(),
             || Err(TrapError::Hypervisor("parent manager present".to_owned())),
             |editor| {
                 while editor.pool_stats().3 < 2 {
@@ -6199,6 +6204,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
     if let Some(pages) = owner_cow_pages {
         child_page_tables_authority
             .edit(
+                crate::trap::test_stage1_edit_license(),
                 || panic!("prepared child tables"),
                 |editor| {
                     for page in 0..4 {
@@ -9101,6 +9107,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     let tables = task.page_tables_authority();
     tables
         .edit(
+            crate::trap::test_stage1_edit_license(),
             || Err(TrapError::Hypervisor("missing test tables".to_owned())),
             |manager| {
                 manager
@@ -9135,6 +9142,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     assert_eq!(task.mappings.len(), before_mappings);
     tables
         .edit(
+            crate::trap::test_stage1_edit_license(),
             || Err(TrapError::Hypervisor("missing test tables".to_owned())),
             |manager| {
                 manager
@@ -9160,6 +9168,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     assert_eq!(task.mappings.len(), before_mappings);
     tables
         .edit(
+            crate::trap::test_stage1_edit_license(),
             || Err(TrapError::Hypervisor("missing test tables".to_owned())),
             |manager| {
                 manager
@@ -12267,6 +12276,7 @@ fn retained_reuse_fixture(
     // live descriptors to the requested lane.
     tables
         .edit(
+            crate::trap::test_stage1_edit_license(),
             || Err(carrick_mmu_core::aarch64::PageTableError::BadAddress),
             |editor| {
                 editor.manager.invalidate(TEST_VA, OWNER_LEN, None)?;
@@ -12815,6 +12825,7 @@ mod guest_cow {
             .state
             .page_tables_authority()
             .edit(
+                crate::trap::test_stage1_edit_license(),
                 || panic!("fixture manager"),
                 |editor| {
                     editor.manager.provision_cow_copy_window(None)?;
@@ -12839,6 +12850,7 @@ mod guest_cow {
                 .state
                 .page_tables_authority()
                 .edit(
+                    crate::trap::test_stage1_edit_license(),
                     || panic!("fixture manager"),
                     |editor| {
                         editor
@@ -14539,6 +14551,7 @@ fn exercise_retained_import(journal_case: u8) {
         let original = tables.with_manager(|manager| manager.translate(loader_va));
         tables
             .edit(
+                crate::trap::test_stage1_edit_license(),
                 || panic!("loader tables missing"),
                 |editor| {
                     editor.begin_undo().unwrap();
@@ -14593,7 +14606,8 @@ fn exercise_retained_import(journal_case: u8) {
                 .pin_count,
             0
         );
-        unsafe { tables.rollback_undo(&resolver) }.unwrap();
+        unsafe { tables.rollback_undo(crate::trap::test_stage1_edit_license(), &resolver) }
+            .unwrap();
         assert_eq!(
             tables.with_manager(|manager| manager.translate(loader_va)),
             original

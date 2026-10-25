@@ -4958,6 +4958,7 @@ pub(crate) mod tests {
                         if let Some(tables) = munmap_tables_for_peer {
                             let (_, receipt) = tables
                                 .edit_unpublishing(
+                                    &editor,
                                     || unreachable!("installed munmap witness manager"),
                                     0x71_1000,
                                     4096,

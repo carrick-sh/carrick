@@ -7881,7 +7881,10 @@ fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
     let successor_record = relocate_exit_fixture_root(&mut new, base + 0x20_0000);
     let mut engine = old.page_tables_authority();
     engine
-        .install_exec_successor(new.page_tables_authority())
+        .install_exec_successor(
+            crate::trap::test_stage1_edit_license(),
+            new.page_tables_authority(),
+        )
         .unwrap();
     let successor_owner =
         new.mm_access.structural_owners.read()[&(base + 0x20_0000, 0x20_0000)].clone();

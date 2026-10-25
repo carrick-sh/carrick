@@ -797,6 +797,7 @@ pub(super) mod tests {
         custody.register_guest_cow_state(mm.get(), &state);
         let (_, receipt) = tables
             .edit_unpublishing(
+                crate::trap::test_stage1_edit_license(),
                 || unreachable!("installed manager"),
                 va,
                 4096,
@@ -866,6 +867,7 @@ pub(super) mod tests {
 
         tables
             .edit(
+                crate::trap::test_stage1_edit_license(),
                 || unreachable!("installed manager"),
                 |editor| {
                     editor
@@ -1273,6 +1275,7 @@ pub(super) mod tests {
                 let owner = backing(&custody, ipa);
                 tables
                     .edit(
+                        crate::trap::test_stage1_edit_license(),
                         || unreachable!("installed manager"),
                         |editor| {
                             editor
@@ -1303,6 +1306,7 @@ pub(super) mod tests {
                 ));
                 let (_, receipt) = tables
                     .edit_unpublishing(
+                        crate::trap::test_stage1_edit_license(),
                         || unreachable!("installed manager"),
                         va,
                         4096,

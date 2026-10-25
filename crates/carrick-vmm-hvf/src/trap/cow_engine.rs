@@ -2068,6 +2068,13 @@ impl HvfVmState {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfTaskState {
+    fn with_stage1_edit_license<R>(
+        &self,
+        edit: impl FnOnce(&carrick_hal::el1_editor_exclusion::El1EditorExcluded) -> Result<R, TrapError>,
+    ) -> Result<R, TrapError> {
+        self.mm_access.with_stage1_edit_license(edit)
+    }
+
     /// Whether the frame backing `ipa` is referenced by MORE than one extent in
     /// the shared backend registry — i.e., some other mm (a fork parent or
     /// child) still lives on it. The registry `Arc` is shared across every
@@ -2494,8 +2501,10 @@ impl HvfTaskState {
             // cloning the whole 1.75 MiB table region (see `begin_undo`).
             let publication = {
                 let page_tables_authority = self.page_tables_authority();
-                page_tables_authority
-                    .edit(
+                let edit_access = std::sync::Arc::clone(&self.mm_access);
+                edit_access.with_stage1_edit_license(|license| {
+                    page_tables_authority.edit(
+                        license,
                         || {
                             Err(TrapError::Hypervisor(
                                 "HVPatch retained reuse page tables are absent".to_owned(),
@@ -2568,19 +2577,23 @@ impl HvfTaskState {
                             Ok::<(), TrapError>(())
                         },
                     )
+                })
             };
             if let Err(error) = publication {
-                let _ = self.page_tables_authority().edit(
-                    || Err(()),
-                    |editor| {
-                        let manager_base = editor.base();
-                        let page_table_resolver =
-                            self.page_table_resolver(manager_base, Some(page_table_host));
-                        // SAFETY: the COW quiesce and topology guards remain held.
-                        let _ = unsafe { editor.rollback_undo(page_table_resolver) };
-                        Ok::<(), ()>(())
-                    },
-                );
+                let _ = self.with_stage1_edit_license(|license| {
+                    self.page_tables_authority().edit(
+                        license,
+                        || Err(TrapError::Hypervisor("page tables disappeared".into())),
+                        |editor| {
+                            let manager_base = editor.base();
+                            let page_table_resolver =
+                                self.page_table_resolver(manager_base, Some(page_table_host));
+                            // SAFETY: the COW quiesce and topology guards remain held.
+                            let _ = unsafe { editor.rollback_undo(page_table_resolver) };
+                            Ok::<(), TrapError>(())
+                        },
+                    )
+                });
                 if let Err(flush_error) = flush_stage1.flush() {
                     carrick_fatal!(
                         "hvpatch::mm_authority",
@@ -2594,13 +2607,16 @@ impl HvfTaskState {
                 return Err(error);
             }
             // Publication succeeded: the journalled pre-images are no longer needed.
-            let _ = self.page_tables_authority().edit(
-                || Err(()),
-                |editor| {
-                    editor.commit_undo();
-                    Ok::<(), ()>(())
-                },
-            );
+            let _ = self.with_stage1_edit_license(|license| {
+                self.page_tables_authority().edit(
+                    license,
+                    || Err(TrapError::Hypervisor("page tables disappeared".into())),
+                    |editor| {
+                        editor.commit_undo();
+                        Ok::<(), TrapError>(())
+                    },
+                )
+            });
             if let Err(error) = flush_stage1.flush() {
                 carrick_fatal!(
                     "hvpatch::mm_authority",
@@ -3149,7 +3165,9 @@ impl HvfTaskState {
         let span_end = span.va.saturating_add(span.len as u64);
         let page_table_result = {
             let page_tables_authority = self.page_tables_authority();
-            page_tables_authority.edit(
+            let edit_access = std::sync::Arc::clone(&self.mm_access);
+            edit_access.with_stage1_edit_license(|license| page_tables_authority.edit(
+                license,
                 || {
                     page_tables_authority.emit_absent_probe(2);
                     Err(TrapError::Hypervisor(
@@ -3266,21 +3284,24 @@ impl HvfTaskState {
                     }
                     Ok(())
                 },
-            )
+            ))
         };
         if let Err(error) = page_table_result {
-            let _ = self.page_tables_authority().edit(
-                || Err(()),
-                |manager| {
-                    let page_table_resolver =
-                        self.page_table_resolver(manager.base(), Some(page_table_host));
-                    // SAFETY: the COW quiesce and topology guards remain held;
-                    // no vCPU walks or edits this mm while the journalled
-                    // pre-images are replayed into its live backing.
-                    let _ = unsafe { manager.rollback_undo(page_table_resolver) };
-                    Ok::<(), ()>(())
-                },
-            );
+            let _ = self.with_stage1_edit_license(|license| {
+                self.page_tables_authority().edit(
+                    license,
+                    || Err(TrapError::Hypervisor("page tables disappeared".into())),
+                    |manager| {
+                        let page_table_resolver =
+                            self.page_table_resolver(manager.base(), Some(page_table_host));
+                        // SAFETY: the COW quiesce and topology guards remain held;
+                        // no vCPU walks or edits this mm while the journalled
+                        // pre-images are replayed into its live backing.
+                        let _ = unsafe { manager.rollback_undo(page_table_resolver) };
+                        Ok::<(), TrapError>(())
+                    },
+                )
+            });
             if let Err(flush_error) = flush_stage1.flush() {
                 carrick_fatal!(
                     "hvpatch::mm_authority",
@@ -3289,13 +3310,16 @@ impl HvfTaskState {
             }
             return Err(error);
         }
-        let _ = self.page_tables_authority().edit(
-            || Err(()),
-            |manager| {
-                manager.commit_undo();
-                Ok::<(), ()>(())
-            },
-        );
+        let _ = self.with_stage1_edit_license(|license| {
+            self.page_tables_authority().edit(
+                license,
+                || Err(TrapError::Hypervisor("page tables disappeared".into())),
+                |manager| {
+                    manager.commit_undo();
+                    Ok::<(), TrapError>(())
+                },
+            )
+        });
         if let Err(error) = flush_stage1.flush() {
             carrick_fatal!(
                 "hvpatch::mm_authority",
@@ -4121,8 +4145,10 @@ impl HvfTaskState {
             const TYPE_TABLE_OR_PAGE: u64 = 0b11;
             const NON_GLOBAL: u64 = 1 << 11;
             let page_tables_authority = self.page_tables_authority();
-            page_tables_authority
-                .edit(
+            let edit_access = std::sync::Arc::clone(&self.mm_access);
+            edit_access.with_stage1_edit_license(|license| {
+                page_tables_authority.edit(
+                    license,
                     || {
                         page_tables_authority.emit_absent_probe(2);
                         Err(TrapError::Hypervisor(
@@ -4270,22 +4296,26 @@ impl HvfTaskState {
                         Ok(())
                     },
                 )
+            })
         };
         if let Err(error) = page_table_result {
             if !guest_lane {
-                let _ = self.page_tables_authority().edit(
-                    || Err(()),
-                    |manager| {
-                        let manager_base = manager.base();
-                        let page_table_resolver =
-                            self.page_table_resolver(manager_base, Some(page_table_host));
-                        // SAFETY: the COW quiesce and topology guards remain held;
-                        // no vCPU can walk or edit this mm while the journalled
-                        // pre-images are replayed into its live backing.
-                        let _ = unsafe { manager.rollback_undo(page_table_resolver) };
-                        Ok::<(), ()>(())
-                    },
-                );
+                let _ = self.with_stage1_edit_license(|license| {
+                    self.page_tables_authority().edit(
+                        license,
+                        || Err(TrapError::Hypervisor("page tables disappeared".into())),
+                        |manager| {
+                            let manager_base = manager.base();
+                            let page_table_resolver =
+                                self.page_table_resolver(manager_base, Some(page_table_host));
+                            // SAFETY: the COW quiesce and topology guards remain held;
+                            // no vCPU can walk or edit this mm while the journalled
+                            // pre-images are replayed into its live backing.
+                            let _ = unsafe { manager.rollback_undo(page_table_resolver) };
+                            Ok::<(), TrapError>(())
+                        },
+                    )
+                });
                 if let Err(flush_error) = flush_stage1.flush() {
                     carrick_fatal!(
                         "hvpatch::mm_authority",
@@ -4315,13 +4345,16 @@ impl HvfTaskState {
         }
         // Publication succeeded: the journalled pre-images are no longer needed.
         if !guest_lane {
-            let _ = self.page_tables_authority().edit(
-                || Err(()),
-                |manager| {
-                    manager.commit_undo();
-                    Ok::<(), ()>(())
-                },
-            );
+            let _ = self.with_stage1_edit_license(|license| {
+                self.page_tables_authority().edit(
+                    license,
+                    || Err(TrapError::Hypervisor("page tables disappeared".into())),
+                    |manager| {
+                        manager.commit_undo();
+                        Ok::<(), TrapError>(())
+                    },
+                )
+            });
             if let Err(error) = flush_stage1.flush() {
                 carrick_fatal!(
                     "hvpatch::mm_authority",

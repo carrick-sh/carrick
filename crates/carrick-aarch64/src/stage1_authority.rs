@@ -81,6 +81,32 @@ pub trait TableArenaPublisher: Send + Sync {
 
 pub use carrick_core::mm::retirement::TableArenaRetirement;
 
+mod edit_license_sealed {
+    pub trait Sealed {}
+
+    impl Sealed for carrick_hal::el1_editor_exclusion::El1EditorExcluded {}
+
+    impl<C> Sealed for carrick_sched_core::SpaceEditor<'_, C> where
+        C: Copy + Send + Sync + zerocopy::FromZeros
+    {
+    }
+}
+
+/// Proof that this stage-1 mutation is serialized by the MM's one Editor.
+///
+/// The host implementation is minted only while an [`El1EditorExclusion`]
+/// is held; ring edits use the admitted [`carrick_sched_core::SpaceEditor`]
+/// itself. The sealed trait prevents a caller from manufacturing a third
+/// mutation lane.
+pub trait Stage1EditLicense: edit_license_sealed::Sealed {}
+
+impl Stage1EditLicense for carrick_hal::el1_editor_exclusion::El1EditorExcluded {}
+
+impl<C> Stage1EditLicense for carrick_sched_core::SpaceEditor<'_, C> where
+    C: Copy + Send + Sync + zerocopy::FromZeros
+{
+}
+
 struct Stage1AuthorityInner {
     manager: TrackedStage1Image,
     arena_source: Option<Box<dyn TableArenaSource>>,
@@ -899,7 +925,7 @@ impl Stage1Authority {
     }
 
     /// Discard the open undo journal, committing all edits in the current transaction.
-    pub fn commit_undo(&self) {
+    pub fn commit_undo(&self, _license: &impl Stage1EditLicense) {
         if let Some(manager) = self.inner.lock().manager.as_mut() {
             manager.commit_undo();
         }
@@ -912,6 +938,7 @@ impl Stage1Authority {
     /// `resolver` must return valid host pointers for all touched page table arenas.
     pub unsafe fn rollback_undo(
         &self,
+        _license: &impl Stage1EditLicense,
         resolver: impl HostArenaResolver,
     ) -> Result<Vec<u64>, PageTableError> {
         let mut inner = self.inner.lock();
@@ -931,6 +958,7 @@ impl Stage1Authority {
     #[allow(clippy::expect_used)]
     pub fn try_edit_until<B, F, R, E>(
         &self,
+        _license: &impl Stage1EditLicense,
         deadline: std::time::Instant,
         on_timeout: E,
         on_absent: E,
@@ -1205,8 +1233,24 @@ impl Stage1Authority {
     /// If the `PageTableManager` is not yet present, lazily constructs it using `builder()`,
     /// firing probe site 4 with `applied = 1` if an arena source was already present, or
     /// `0` if absent.
+    ///
+    /// An edit without an admitted Editor license does not compile:
+    /// ```compile_fail
+    /// use carrick_aarch64::Stage1Authority;
+    /// use carrick_mmu_core::aarch64::PageTableManager;
+    /// let authority = Stage1Authority::new();
+    /// let _ = authority.edit(
+    ///     || Err::<PageTableManager, ()>(()),
+    ///     |_| Ok::<(), ()>(()),
+    /// );
+    /// ```
     #[allow(clippy::expect_used)]
-    pub fn edit<B, F, R, E>(&self, builder: B, f: F) -> Result<R, E>
+    pub fn edit<B, F, R, E>(
+        &self,
+        _license: &impl Stage1EditLicense,
+        builder: B,
+        f: F,
+    ) -> Result<R, E>
     where
         B: FnOnce() -> Result<PageTableManager, E>,
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
@@ -1260,6 +1304,7 @@ impl Stage1Authority {
     /// crate and therefore cannot be replaced by a bare IPA identity.
     pub fn edit_unpublishing<B, F, R, E>(
         &self,
+        license: &impl Stage1EditLicense,
         builder: B,
         va: u64,
         len: usize,
@@ -1269,7 +1314,7 @@ impl Stage1Authority {
         B: FnOnce() -> Result<PageTableManager, E>,
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
     {
-        self.edit(builder, |editor| {
+        self.edit(license, builder, |editor| {
             let plan = crate::vmm::Stage1UnpublishedRange::capture(va, len, |address| {
                 editor.translate(address)
             });
@@ -1289,6 +1334,7 @@ impl Stage1Authority {
     /// restores quiesced descriptors to live host memory, and replaces the manager. Returns the replaced manager.
     pub fn restore_image(
         &self,
+        _license: &impl Stage1EditLicense,
         image: &mut Option<PageTableManager>,
         site: u32,
     ) -> Result<Option<PageTableManager>, PageTableError> {
@@ -1328,6 +1374,7 @@ impl Stage1Authority {
     /// across manager image restores.
     pub unsafe fn restore_image_and_host<H>(
         &self,
+        _license: &impl Stage1EditLicense,
         image: &mut Option<PageTableManager>,
         site: u32,
         resolve_page_table_host: H,
@@ -1359,7 +1406,11 @@ impl Stage1Authority {
     /// Adopt the backend's exact new-MM authority after exec. Retained old-MM
     /// cleanup keeps its manager, publisher and capacity until its own proof.
     /// Only this exec's vfork share is consumed; other sharers remain live.
-    pub fn install_exec_successor(&mut self, successor: Self) -> Result<bool, String> {
+    pub fn install_exec_successor(
+        &mut self,
+        _license: &impl Stage1EditLicense,
+        successor: Self,
+    ) -> Result<bool, String> {
         if self.shares_exact_authority(&successor) {
             return Err("exec successor reused its predecessor table authority".into());
         }
@@ -1390,6 +1441,7 @@ impl Stage1Authority {
     ///   site 5, and returns `self.clone()` — the authority identity survives.
     pub fn replace_for_exec<B, R, E>(
         &mut self,
+        license: &impl Stage1EditLicense,
         builder: B,
         retirer: R,
     ) -> Result<Stage1Authority, E>
@@ -1397,13 +1449,14 @@ impl Stage1Authority {
         B: FnOnce() -> Result<Option<PageTableManager>, E>,
         R: FnMut(&[u64], &crate::vmm::Stage1UnpublishedArenas) -> Result<(), E>,
     {
-        self.replace_for_exec_internal(builder, retirer)
+        self.replace_for_exec_internal(license, builder, retirer)
             .map(|(auth, _)| auth)
     }
 
     /// Pure transition for `execve` authority replacement returning `(new_authority, was_shared)`.
     pub(crate) fn replace_for_exec_internal<B, R, E>(
         &mut self,
+        _license: &impl Stage1EditLicense,
         builder: B,
         mut retirer: R,
     ) -> Result<(Stage1Authority, bool), E>
@@ -2037,6 +2090,22 @@ impl<'a> Stage1Editor<'a> {
 pub(crate) mod tests {
     use super::*;
 
+    pub(crate) fn test_edit_license() -> &'static carrick_sched_core::SpaceEditor<'static> {
+        thread_local! {
+            static LICENSE: &'static carrick_sched_core::SpaceEditor<'static> = {
+                let spaces = Box::leak(Box::new(carrick_sched_core::AddressSpaces::new()));
+                let index = spaces.publish_closed(1, 0x1000, 0).expect("test space");
+                spaces.open(index);
+                Box::leak(Box::new(
+                    spaces
+                        .try_begin_edit(index, 1, std::num::NonZeroU64::new(1).unwrap())
+                        .expect("test Editor license"),
+                ))
+            };
+        }
+        LICENSE.with(|license| *license)
+    }
+
     /// Raw `(base, host)` arenas for a VM-free test whose edits publish
     /// executable leaves (production refuses those on page-table-only
     /// resolvers).
@@ -2390,6 +2459,7 @@ pub(crate) mod tests {
             "reads preserve generation"
         );
         let failed = authority.edit(
+            test_edit_license(),
             || Err(()),
             |editor| {
                 editor.set_readonly(0x40_0000, 0x1000, false).unwrap();
@@ -2399,12 +2469,15 @@ pub(crate) mod tests {
         assert!(failed.is_err());
         let after_error = observed_generation(&authority);
         assert_ne!(after_error, original);
-        authority.restore_image(&mut Some(image), 0).unwrap();
+        authority
+            .restore_image(test_edit_license(), &mut Some(image), 0)
+            .unwrap();
         let after_restore = observed_generation(&authority);
         assert_ne!(after_restore, original);
         assert_ne!(after_restore, after_error);
         authority
             .try_edit_until(
+                test_edit_license(),
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
                 (),
                 (),
@@ -2429,14 +2502,22 @@ pub(crate) mod tests {
         let before_exec = observed_generation(&authority);
         let exact = authority.clone();
         authority
-            .replace_for_exec(|| Ok::<_, ()>(Some(manager())), |_, _| Ok(()))
+            .replace_for_exec(
+                test_edit_license(),
+                || Ok::<_, ()>(Some(manager())),
+                |_, _| Ok(()),
+            )
             .unwrap();
         assert!(authority.shares_exact_authority(&exact));
         assert_ne!(observed_generation(&authority), before_exec);
         // Taking an image invalidates even if exec preparation subsequently fails.
         assert!(
             authority
-                .replace_for_exec(|| Err::<Option<PageTableManager>, _>(()), |_, _| Ok(()))
+                .replace_for_exec(
+                    test_edit_license(),
+                    || Err::<Option<PageTableManager>, _>(()),
+                    |_, _| Ok(()),
+                )
                 .is_err()
         );
         assert!(authority.is_none());
@@ -2450,7 +2531,11 @@ pub(crate) mod tests {
         authority.inner.lock().manager.generation = std::num::NonZeroU64::new(u64::MAX);
         for _ in 0..2 {
             authority
-                .edit(|| Err::<PageTableManager, ()>(()), |_| Ok(()))
+                .edit(
+                    test_edit_license(),
+                    || Err::<PageTableManager, ()>(()),
+                    |_| Ok(()),
+                )
                 .unwrap();
             assert_eq!(observed_generation(&authority), None);
         }
@@ -2502,6 +2587,7 @@ pub(crate) mod tests {
         let pool = authority.image_pool();
         authority
             .replace_for_exec(
+                test_edit_license(),
                 || Ok::<_, PageTableError>(Some(test_manager())),
                 |_, _| Ok(()),
             )
@@ -2537,6 +2623,7 @@ pub(crate) mod tests {
             .expect("install the pre-exec source");
         let retired = authority
             .replace_for_exec(
+                test_edit_license(),
                 || Ok::<_, PageTableError>(Some(test_manager())),
                 |_, _| Ok(()),
             )
@@ -2625,6 +2712,7 @@ pub(crate) mod tests {
 
         authority
             .edit(
+                test_edit_license(),
                 || panic!("manager must be present"),
                 |editor| {
                     editor.begin_undo().unwrap();
@@ -2708,13 +2796,21 @@ pub(crate) mod tests {
         let mut first = parent.clone();
         let mut second = parent.clone();
         let successor = Stage1Authority::new_with_manager(Some(test_manager_at(0x9a_0020_0000)));
-        assert!(first.install_exec_successor(successor.clone()).unwrap());
+        assert!(
+            first
+                .install_exec_successor(test_edit_license(), successor.clone())
+                .unwrap()
+        );
         assert!(first.shares_exact_authority(&successor));
         assert!(parent.is_shared_with_vfork_child());
         assert!(parent.has_source());
         assert_eq!(parent.root_base(), Some(LINUX_PAGE_TABLES_BASE));
         let successor = Stage1Authority::new_with_manager(Some(test_manager_at(0x9a_0040_0000)));
-        assert!(second.install_exec_successor(successor).unwrap());
+        assert!(
+            second
+                .install_exec_successor(test_edit_license(), successor)
+                .unwrap()
+        );
         assert!(parent.is_exclusive());
         assert!(parent.has_source());
         assert_eq!(parent.root_base(), Some(LINUX_PAGE_TABLES_BASE));
@@ -2725,7 +2821,11 @@ pub(crate) mod tests {
         let mut authority = Stage1Authority::new_with_manager(Some(test_manager()));
         authority.share_with_vfork_child();
         let retained = authority.clone();
-        assert!(authority.install_exec_successor(retained.clone()).is_err());
+        assert!(
+            authority
+                .install_exec_successor(test_edit_license(), retained.clone())
+                .is_err()
+        );
         assert!(authority.shares_exact_authority(&retained));
         assert!(retained.is_shared_with_vfork_child());
         assert_eq!(retained.root_base(), Some(LINUX_PAGE_TABLES_BASE));
@@ -2766,6 +2866,7 @@ pub(crate) mod tests {
         let mut retired1 = false;
         let new_child1 = child1
             .replace_for_exec(
+                test_edit_license(),
                 || Ok::<_, ()>(Some(test_manager_at(0x9a_0020_0000))),
                 |_, _| {
                     retired1 = true;
@@ -2792,6 +2893,7 @@ pub(crate) mod tests {
         let mut retired2 = false;
         let new_child2 = child2
             .replace_for_exec(
+                test_edit_license(),
                 || Ok::<_, ()>(Some(test_manager_at(0x9a_0040_0000))),
                 |_, _| {
                     retired2 = true;
@@ -2819,6 +2921,7 @@ pub(crate) mod tests {
         let mut parent_exec = parent.clone();
         let exec_parent = parent_exec
             .replace_for_exec(
+                test_edit_license(),
                 || Ok::<_, ()>(Some(test_manager_at(0x9a_0060_0000))),
                 |_, _| {
                     retired_parent = true;
@@ -2866,6 +2969,7 @@ pub(crate) mod tests {
         // Child execs: the internal decision sees vfork_shares > 0
         let (new_child, was_shared) = child
             .replace_for_exec_internal(
+                test_edit_license(),
                 || Ok::<_, ()>(Some(test_manager_at(0x9a_0020_0000))),
                 |_, _| {
                     retired = true;
@@ -2898,6 +3002,7 @@ pub(crate) mod tests {
         let va = 0x40_0000;
         authority
             .edit(
+                test_edit_license(),
                 || panic!("manager must be present"),
                 |editor| {
                     editor.set_rw(va, 0x1000, false).expect("initial mapping");
@@ -2910,6 +3015,7 @@ pub(crate) mod tests {
         // Open undo, perform edit, then rollback
         authority
             .edit(
+                test_edit_license(),
                 || panic!("manager must be present"),
                 |editor| {
                     editor.begin_undo().unwrap();
@@ -2925,13 +3031,16 @@ pub(crate) mod tests {
         // Rollback via Stage1Authority::rollback_undo
         let before_rollback = observed_generation(&authority);
         unsafe {
-            authority.rollback_undo(resolver).unwrap();
+            authority
+                .rollback_undo(test_edit_license(), resolver)
+                .unwrap();
         }
         assert_ne!(observed_generation(&authority), before_rollback);
 
         // Verify that after rollback, the mapping is restored to writable
         authority
             .edit(
+                test_edit_license(),
                 || panic!("manager must be present"),
                 |editor| {
                     assert!(!editor.undo_is_open());
@@ -2945,6 +3054,7 @@ pub(crate) mod tests {
         // Now test commit_undo: open undo, edit, commit
         authority
             .edit(
+                test_edit_license(),
                 || panic!("manager must be present"),
                 |editor| {
                     editor.begin_undo().unwrap();
@@ -2957,10 +3067,11 @@ pub(crate) mod tests {
             )
             .expect("edit");
 
-        authority.commit_undo();
+        authority.commit_undo(test_edit_license());
 
         authority
             .edit(
+                test_edit_license(),
                 || panic!("manager must be present"),
                 |editor| {
                     assert!(!editor.undo_is_open());
@@ -3166,6 +3277,7 @@ pub(crate) mod tests {
         // Map initial translation to ipa1
         authority
             .edit(
+                test_edit_license(),
                 || panic!("manager must be present"),
                 |editor| {
                     editor.map_aliased(va, ipa1, 0x1000, RWX).expect("map 1");
@@ -3181,6 +3293,7 @@ pub(crate) mod tests {
         // Map translation to ipa2
         authority
             .edit(
+                test_edit_license(),
                 || panic!("manager must be present"),
                 |editor| {
                     editor.map_aliased(va, ipa2, 0x1000, RWX).expect("map 2");
@@ -3195,7 +3308,9 @@ pub(crate) mod tests {
         });
 
         // Restore snapshot 1
-        authority.restore_image(&mut Some(snap1), 1).unwrap();
+        authority
+            .restore_image(test_edit_license(), &mut Some(snap1), 1)
+            .unwrap();
 
         // Hardware memory and live translation must now reflect ipa1
         authority.with_manager(|mgr| {
@@ -3243,7 +3358,9 @@ pub(crate) mod tests {
 
         // Attempt restore with a failing resolver
         let mut snapshot = Some(snap);
-        let res = unsafe { authority.restore_image_and_host(&mut snapshot, 0, FailingResolver) };
+        let res = unsafe {
+            authority.restore_image_and_host(test_edit_license(), &mut snapshot, 0, FailingResolver)
+        };
         assert!(
             snapshot.is_some(),
             "failed restore retains caller recovery image"
@@ -3257,6 +3374,7 @@ pub(crate) mod tests {
         let mut host = vec![0u8; LINUX_PAGE_TABLES_SIZE as usize];
         let restored = unsafe {
             authority.restore_image_and_host(
+                test_edit_license(),
                 &mut snapshot,
                 0,
                 TestArenas([(LINUX_PAGE_TABLES_BASE, host.as_mut_ptr())]),
@@ -3275,6 +3393,7 @@ pub(crate) mod tests {
         // Attempt rollback with failing resolver
         authority
             .edit(
+                test_edit_license(),
                 || panic!("manager must be present"),
                 |editor| {
                     editor.begin_undo().unwrap();
@@ -3674,6 +3793,7 @@ pub(crate) mod tests {
         // Establish initial valid mapping and commit
         authority
             .edit(
+                test_edit_license(),
                 || panic!("manager must be present"),
                 |editor| {
                     assert!(!editor.undo_is_open());
@@ -3697,6 +3817,7 @@ pub(crate) mod tests {
         test_allocator::REFUSED_ALLOCS.with(|c| c.set(0));
         test_allocator::FAIL_AFTER.with(|c| c.set(Some(0)));
         let edit_res = authority.edit(
+            test_edit_license(),
             || panic!("manager must be present"),
             |editor| {
                 editor.begin_undo()?;
@@ -3732,6 +3853,7 @@ pub(crate) mod tests {
         // Inject allocator refusal during set_rw with journal open and verify rollback on same authority
         authority
             .edit(
+                test_edit_license(),
                 || panic!("manager must be present"),
                 |editor| {
                     editor.begin_undo().unwrap();
@@ -3757,6 +3879,7 @@ pub(crate) mod tests {
         // Subsequent transaction on the SAME authority succeeds
         authority
             .edit(
+                test_edit_license(),
                 || panic!("manager must be present"),
                 |editor| {
                     editor.begin_undo().unwrap();
@@ -3805,6 +3928,7 @@ pub(crate) mod tests {
 
         multi_authority
             .edit(
+                test_edit_license(),
                 || panic!("manager present"),
                 |editor| {
                     // Attach extension arenas (>8 inline threshold in sync_to_host)
@@ -3919,6 +4043,7 @@ pub(crate) mod tests {
 
         // The engine edit funnel: staging is refused publication.
         let edit = authority.edit(
+            test_edit_license(),
             || panic!("manager must be present"),
             |editor| {
                 editor.set_readonly(LINUX_MMAP_BASE, 0x1000, false)?;
@@ -3929,14 +4054,20 @@ pub(crate) mod tests {
         // Snapshot restores are live stores too, through every entry point.
         let mut image = Some(snapshot.snapshot_image().unwrap());
         assert_eq!(
-            authority.restore_image(&mut image, 0).err(),
+            authority
+                .restore_image(test_edit_license(), &mut image, 0)
+                .err(),
             Some(PageTableError::GuestOwnsLiveDescriptors)
         );
         assert_eq!(
-            unsafe { authority.restore_image_and_host(&mut image, 0, &*resolver) }.err(),
+            unsafe {
+                authority.restore_image_and_host(test_edit_license(), &mut image, 0, &*resolver)
+            }
+            .err(),
             Some(PageTableError::GuestOwnsLiveDescriptors)
         );
         let editor_restore = authority.edit(
+            test_edit_license(),
             || panic!("manager must be present"),
             |editor| editor.restore_image(&mut image, 0, 0),
         );

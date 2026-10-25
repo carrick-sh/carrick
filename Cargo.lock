@@ -327,6 +327,7 @@ dependencies = [
  "parking_lot",
  "sha2",
  "tracing",
+ "zerocopy",
 ]
 
 [[package]]

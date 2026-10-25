@@ -1562,6 +1562,23 @@ pub(crate) struct HvfVmState {
     pub(crate) last_fork_projection_rows_visited: std::sync::atomic::AtomicU64,
 }
 
+#[cfg(test)]
+pub(crate) fn test_stage1_edit_license() -> &'static carrick_sched_core::SpaceEditor<'static> {
+    thread_local! {
+        static LICENSE: &'static carrick_sched_core::SpaceEditor<'static> = {
+            let spaces = Box::leak(Box::new(carrick_sched_core::AddressSpaces::new()));
+            let index = spaces.publish_closed(1, 0x1000, 0).expect("test space");
+            spaces.open(index);
+            Box::leak(Box::new(
+                spaces
+                    .try_begin_edit(index, 1, std::num::NonZeroU64::new(1).unwrap())
+                    .expect("test Editor license"),
+            ))
+        };
+    }
+    LICENSE.with(|license| *license)
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::clone::Clone)]
 pub(crate) struct ForkAliasSnapshot {

@@ -1263,16 +1263,18 @@ fn seed_heap_unmapped(protections: &MemoryProtections) {
 /// Install the exec successor without modifying a backend-retained old MM.
 fn replace_page_tables_authority(
     page_tables: &mut Stage1Authority,
+    license: &impl crate::stage1_authority::Stage1EditLicense,
     replacement: ExecStage1Replacement,
     mut retire_old: impl FnMut(&[u64], &crate::vmm::Stage1UnpublishedArenas) -> Result<(), TrapError>,
 ) -> Result<bool, TrapError> {
     match replacement {
         ExecStage1Replacement::Authority(successor) => page_tables
-            .install_exec_successor(successor)
+            .install_exec_successor(license, successor)
             .map_err(TrapError::Hypervisor),
         ExecStage1Replacement::Image(manager) => {
             let manager = manager.map(|image| *image);
             let (successor, shared) = page_tables.replace_for_exec_internal(
+                license,
                 || Ok(manager),
                 |bases, receipt| retire_old(bases, receipt),
             )?;
@@ -1285,12 +1287,14 @@ fn replace_page_tables_authority(
 #[cfg(test)]
 fn replace_and_bind_page_tables_authority(
     page_tables: &mut Stage1Authority,
+    license: &impl crate::stage1_authority::Stage1EditLicense,
     manager: Option<PageTableManager>,
     retire_old: impl FnMut(&[u64], &crate::vmm::Stage1UnpublishedArenas) -> Result<(), TrapError>,
     mut bind_new: impl FnMut(Stage1Authority),
 ) -> Result<(), TrapError> {
     replace_page_tables_authority(
         page_tables,
+        license,
         ExecStage1Replacement::Image(manager.map(Box::new)),
         retire_old,
     )?;
@@ -1472,10 +1476,22 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         &mut self,
         replacement: ExecStage1Replacement,
     ) -> Result<bool, TrapError> {
-        let was_shared =
-            replace_page_tables_authority(&mut self.page_tables, replacement, |bases, receipt| {
-                self.vm.retire_stage1_extension_arenas(bases, receipt)
-            })?;
+        let was_shared = carrick_hal::el1_editor_exclusion::with_held_exclusion(
+            self.mm_generation,
+            |license| {
+                let license = license.ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "exec stage-1 replacement lacks its Editor exclusion".to_owned(),
+                    )
+                })?;
+                replace_page_tables_authority(
+                    &mut self.page_tables,
+                    license,
+                    replacement,
+                    |bases, receipt| self.vm.retire_stage1_extension_arenas(bases, receipt),
+                )
+            },
+        )?;
         self.vm.bind_stage1_page_tables(self.page_tables.clone());
         Ok(was_shared)
     }
@@ -1669,9 +1685,19 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             None
         };
         let mut outcome = PageTableApplyOutcome::default();
-        let edit_res: Result<(), MemoryError> = page_tables.edit(
-            || live_mgr.ok_or_else(|| MemoryError::HostMap("stage-1 manager absent".to_string())),
-            |editor| {
+        let edit_res: Result<(), MemoryError> =
+            carrick_hal::el1_editor_exclusion::with_held_exclusion(self.mm_generation, |license| {
+                let license = license.ok_or_else(|| {
+                    MemoryError::HostMap("stage-1 edit lacks its Editor exclusion".to_owned())
+                })?;
+                page_tables.edit(
+                        license,
+                        || {
+                            live_mgr.ok_or_else(|| {
+                                MemoryError::HostMap("stage-1 manager absent".to_string())
+                            })
+                        },
+                        |editor| {
                 if editor.base() != pt_base {
                     return Err(MemoryError::HostMap(format!(
                         "page-table manager root 0x{:x} does not match TTBR0 root 0x{pt_base:x}",
@@ -1779,8 +1805,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                         Err(guest_owned_live_edit_error())
                     }
                 }
-            },
-        );
+                        },
+                    )
+            });
         edit_res?;
         Ok(outcome)
     }
@@ -2018,11 +2045,16 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             host,
             size,
         };
-        unsafe {
-            self.page_tables
-                .rollback_undo(resolver)
-                .map_err(page_table_rollback_error_to_memory_error)?;
-        }
+        carrick_hal::el1_editor_exclusion::with_held_exclusion(self.mm_generation, |license| {
+            let license = license.ok_or_else(|| {
+                MemoryError::HostMap("stage-1 rollback lacks its Editor exclusion".to_owned())
+            })?;
+            unsafe {
+                self.page_tables
+                    .rollback_undo(license, resolver)
+                    .map_err(page_table_rollback_error_to_memory_error)
+            }
+        })?;
         self.run_stage1_maintenance()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
     }
@@ -6849,7 +6881,15 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             return Ok(());
         }
         let _ = self.pending_process_fork.take();
-        self.page_tables.commit_undo();
+        carrick_hal::el1_editor_exclusion::with_held_exclusion(self.mm_generation, |license| {
+            let license = license.unwrap_or_else(|| {
+                carrick_fatal::carrick_fatal!(
+                    "aarch64::stage1",
+                    "descriptor commit lost its Editor exclusion"
+                )
+            });
+            self.page_tables.commit_undo(license);
+        });
         Ok(())
     }
 
@@ -8364,6 +8404,7 @@ mod tests {
         let mut bound = false;
         replace_and_bind_page_tables_authority(
             &mut child_authority,
+            crate::stage1_authority::tests::test_edit_license(),
             None,
             |_, _| {
                 retired = true;
@@ -8429,6 +8470,7 @@ mod tests {
         let mut bound1 = false;
         replace_and_bind_page_tables_authority(
             &mut child1_authority,
+            crate::stage1_authority::tests::test_edit_license(),
             None,
             |_, _| {
                 retired1 = true;
@@ -8467,6 +8509,7 @@ mod tests {
         let mut bound2 = false;
         replace_and_bind_page_tables_authority(
             &mut child2_authority,
+            crate::stage1_authority::tests::test_edit_license(),
             None,
             |_, _| {
                 retired2 = true;
@@ -8511,6 +8554,7 @@ mod tests {
         let backend_successor = Stage1Authority::new_with_manager(Some(manager(new_root)));
         replace_page_tables_authority(
             &mut engine,
+            crate::stage1_authority::tests::test_edit_license(),
             ExecStage1Replacement::Authority(backend_successor.clone()),
             |_, _| Ok(()),
         )
@@ -8554,6 +8598,7 @@ mod tests {
         // vfork_shares > 0 guarantees the exclusive path is NOT taken.
         replace_and_bind_page_tables_authority(
             &mut child_authority,
+            crate::stage1_authority::tests::test_edit_license(),
             None,
             |_, _| {
                 retired = true;
@@ -8599,6 +8644,7 @@ mod tests {
         let mut retired = false;
         replace_and_bind_page_tables_authority(
             &mut authority,
+            crate::stage1_authority::tests::test_edit_license(),
             None,
             |_, _| {
                 retired = true;
@@ -8652,6 +8698,7 @@ mod tests {
         let snapshot = authority.snapshot_image().expect("snapshot");
         authority
             .edit(
+                crate::stage1_authority::tests::test_edit_license(),
                 || unreachable!(),
                 |editor| {
                     assert!(editor.has_arena_source());
@@ -8686,6 +8733,7 @@ mod tests {
         let mut retired = false;
         let new_child = child
             .replace_for_exec(
+                crate::stage1_authority::tests::test_edit_license(),
                 || Ok::<Option<PageTableManager>, ()>(None),
                 |_, _| {
                     retired = true;
@@ -8718,6 +8766,7 @@ mod tests {
 
         sibling
             .edit(
+                crate::stage1_authority::tests::test_edit_license(),
                 || {
                     let bytes = carrick_mem::memory::stage1_identity_page_tables();
                     Ok::<PageTableManager, PageTableError>(PageTableManager::new(
@@ -8755,6 +8804,7 @@ mod tests {
 
         clone2
             .edit(
+                crate::stage1_authority::tests::test_edit_license(),
                 || {
                     let bytes = carrick_mem::memory::stage1_identity_page_tables();
                     Ok::<PageTableManager, PageTableError>(PageTableManager::new(

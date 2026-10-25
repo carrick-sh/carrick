@@ -924,7 +924,7 @@ impl CarrierVmCustody {
         };
         let va = 0x4000_0000_u64;
         authority
-            .edit(builder, |editor| {
+            .edit(crate::trap::test_stage1_edit_license(), builder, |editor| {
                 editor
                     .map_aliased(
                         va,
@@ -936,9 +936,13 @@ impl CarrierVmCustody {
             })
             .expect("test stage-1 leaf publication");
         let (_, receipt) = authority
-            .edit_unpublishing(builder, va, 0x1000, |editor| {
-                editor.invalidate(va, 0x1000).map(|_| ())
-            })
+            .edit_unpublishing(
+                crate::trap::test_stage1_edit_license(),
+                builder,
+                va,
+                0x1000,
+                |editor| editor.invalidate(va, 0x1000).map(|_| ()),
+            )
             .expect("test stage-1 leaf unpublication");
         receipt.expect("editor removed the exact test stage-1 leaf")
     }
@@ -4821,7 +4825,7 @@ mod carrier_vm_custody_tests {
         };
         let va = 0x4800_0000;
         authority
-            .edit(builder, |editor| {
+            .edit(crate::trap::test_stage1_edit_license(), builder, |editor| {
                 editor
                     .map_aliased(
                         va,
@@ -4833,9 +4837,13 @@ mod carrier_vm_custody_tests {
             })
             .unwrap();
         let (_, receipt) = authority
-            .edit_unpublishing(builder, va, 4096, |editor| {
-                editor.invalidate(va, 4096).map(|_| ())
-            })
+            .edit_unpublishing(
+                crate::trap::test_stage1_edit_license(),
+                builder,
+                va,
+                4096,
+                |editor| editor.invalidate(va, 4096).map(|_| ()),
+            )
             .unwrap();
         assert!(
             custody
