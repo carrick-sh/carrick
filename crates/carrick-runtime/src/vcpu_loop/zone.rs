@@ -63,6 +63,53 @@ fn editor_is_held(zone: &ZoneTables, mm: carrick_el1_abi::ReservationMm) -> bool
         .is_some_and(|index| zone.spaces.active_editor(index).is_some())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditorRefusalDisposition {
+    Reselect,
+    Park,
+    Invariant,
+}
+
+/// Classify one refused SELECT receipt. A changed revision is consumed by one
+/// reselect; observing the same revision again can only park behind its held
+/// editor or terminate the inconsistent MM.
+fn editor_refusal_disposition(
+    selected_revision: u64,
+    current_revision: u64,
+    editor_held: bool,
+) -> EditorRefusalDisposition {
+    if current_revision != selected_revision {
+        EditorRefusalDisposition::Reselect
+    } else if editor_held {
+        EditorRefusalDisposition::Park
+    } else {
+        EditorRefusalDisposition::Invariant
+    }
+}
+
+#[cfg(test)]
+mod editor_refusal_tests {
+    use super::{EditorRefusalDisposition, editor_refusal_disposition};
+
+    #[test]
+    fn a_revision_change_buys_exactly_one_reselect() {
+        assert_eq!(
+            editor_refusal_disposition(7, 8, false),
+            EditorRefusalDisposition::Reselect
+        );
+        assert_eq!(
+            editor_refusal_disposition(8, 8, true),
+            EditorRefusalDisposition::Park,
+            "the new SELECT receipt parks only behind its live editor producer"
+        );
+        assert_eq!(
+            editor_refusal_disposition(8, 8, false),
+            EditorRefusalDisposition::Invariant,
+            "the same revision cannot authorize another synchronous reselect"
+        );
+    }
+}
+
 fn space_is_closed(zone: &ZoneTables, mm: carrick_el1_abi::ReservationMm) -> bool {
     zone.spaces
         .find(mm.raw())
@@ -909,12 +956,22 @@ where
             zone.free_record(record);
             return Ok(OwnerMemoryPark::Recheck(action));
         }
-        if enrollment.current_revision() == enrollment.revision()
-            && cause == carrick_sched_core::spaces::notification::SpaceWaitCause::Editor
-            && !editor_is_held(zone, wait_mm)
-        {
-            zone.free_record(record);
-            return Ok(OwnerMemoryPark::Stage2AuthorityInvariant { action, wait });
+        if cause == carrick_sched_core::spaces::notification::SpaceWaitCause::Editor {
+            match editor_refusal_disposition(
+                enrollment.revision(),
+                enrollment.current_revision(),
+                editor_is_held(zone, wait_mm),
+            ) {
+                EditorRefusalDisposition::Reselect => {
+                    zone.free_record(record);
+                    return Ok(OwnerMemoryPark::Recheck(action));
+                }
+                EditorRefusalDisposition::Park => {}
+                EditorRefusalDisposition::Invariant => {
+                    zone.free_record(record);
+                    return Ok(OwnerMemoryPark::Stage2AuthorityInvariant { action, wait });
+                }
+            }
         }
         match enrollment.park_host_rechecked(record, token, &complete, || match cause {
             carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations => {
