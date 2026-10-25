@@ -454,6 +454,55 @@ pub struct CarrierVmCustody {
     /// into the state its executors use, never a stale copy found by scan.
     pub(crate) guest_cow_states:
         parking_lot::Mutex<std::collections::HashMap<u64, std::sync::Weak<MmAccessState>>>,
+    pub(crate) native_exec_services: parking_lot::Mutex<
+        Vec<(
+            carrick_core_abi::service::ExecCapabilityId,
+            std::sync::Arc<dyn crate::metadata_grant::NativeExecHostService>,
+        )>,
+    >,
+    pub(crate) native_exec_preparations: parking_lot::Mutex<
+        Vec<(
+            carrick_core_abi::service::ServiceIdentity,
+            Box<dyn crate::metadata_grant::NativeExecPreparation>,
+        )>,
+    >,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CarrierVmCustody {
+    pub(crate) fn install_native_exec_service(
+        &self,
+        capability: carrick_core_abi::service::ExecCapabilityId,
+        service: std::sync::Arc<dyn crate::metadata_grant::NativeExecHostService>,
+    ) -> Result<(), ()> {
+        let mut services = self.native_exec_services.lock();
+        if services.iter().any(|(id, _)| *id == capability) {
+            return Err(());
+        }
+        services.push((capability, service));
+        Ok(())
+    }
+
+    pub(crate) fn native_exec_service(
+        &self,
+        capability: carrick_core_abi::service::ExecCapabilityId,
+    ) -> Option<std::sync::Arc<dyn crate::metadata_grant::NativeExecHostService>> {
+        self.native_exec_services
+            .lock()
+            .iter()
+            .find(|(id, _)| *id == capability)
+            .map(|(_, service)| std::sync::Arc::clone(service))
+    }
+
+    pub(crate) fn retain_native_exec_preparation(
+        &self,
+        identity: carrick_core_abi::service::ServiceIdentity,
+        prepared: Box<dyn crate::metadata_grant::NativeExecPreparation>,
+    ) {
+        self.native_exec_preparations
+            .lock()
+            .push((identity, prepared));
+    }
 }
 
 /// Who owns an executable output's bytes, for the instruction-cache
@@ -670,6 +719,8 @@ impl CarrierVmCustody {
             frame_pool: parking_lot::Mutex::new(CarrierFramePoolState::Uninitialized),
             root_slot_pool: parking_lot::Mutex::new(CarrierRootSlotPoolState::Uninitialized),
             guest_cow_states: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            native_exec_services: parking_lot::Mutex::new(Vec::new()),
+            native_exec_preparations: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
