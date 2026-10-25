@@ -8018,6 +8018,11 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         "F_DUPFD with negative 32-bit arg must fail with EINVAL (-22)"
     );
     assert_eq!(
+        run_in_child(0, sys_fcntl, [4, LINUX_F_DUPFD, 1u64 << 32]).1,
+        -22,
+        "F_DUPFD must reject a minimum outside i32 instead of truncating it to fd 0"
+    );
+    assert_eq!(
         run_in_child(0, sys_fcntl, [99, LINUX_F_DUPFD, 64]).1,
         -9,
         "F_DUPFD checks bad oldfd EBADF (-9) before min arg EINVAL (-22)"

@@ -2360,7 +2360,12 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                 match cmd {
                     carrick_abi::LINUX_F_DUPFD | carrick_abi::LINUX_F_DUPFD_CLOEXEC => {
                         let cloexec = cmd == carrick_abi::LINUX_F_DUPFD_CLOEXEC;
-                        let min = Fd(arg as i32);
+                        let Ok(min) = i32::try_from(arg) else {
+                            return FamilyCompletion::Complete(
+                                carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
+                            );
+                        };
+                        let min = Fd(min);
                         let new_fd = match self.duplicate_owned_ipc(
                             venue,
                             task,
