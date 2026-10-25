@@ -18,8 +18,9 @@ pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
 
 /// Opaque fallibly prepared image. Exact carrier custody retains this result
 /// until the ring consumes successor adoption or terminal cleanup drops it.
-pub trait NativeExecPreparation: core::fmt::Debug + Send + 'static {}
-impl<T: core::fmt::Debug + Send + 'static> NativeExecPreparation for T {}
+pub trait NativeExecPreparation: core::fmt::Debug + Send + 'static {
+    fn into_mapping_plan(self: Box<Self>) -> crate::trap::GuestMappingPlan;
+}
 
 struct ServicePin {
     cell: core::ptr::NonNull<ServiceCell>,
@@ -140,9 +141,12 @@ impl NativeService {
     ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
         let identity = self.request().identity;
         let custody = Arc::clone(&self.custody);
+        let receipt = custody.reserve_native_exec_receipt().map_err(|()| {
+            TrapError::Hypervisor("native exec receipt space exhausted".to_owned())
+        })?;
         self.finish_exec_ticket(|ticket| {
-            match ticket.publish_prepared(prepared, |prepared| {
-                custody.retain_native_exec_preparation(identity, prepared);
+            match ticket.publish_exec_prepared(receipt, prepared, |receipt, prepared| {
+                custody.retain_native_exec_preparation(receipt, identity, prepared);
             }) {
                 Ok(()) => Ok(()),
                 Err((_, ticket, prepared)) => {

@@ -21,6 +21,25 @@ impl ExecCapabilityId {
     }
 }
 
+/// Opaque, carrier-minted authority to consume one prepared exec image.
+/// The carrier separately binds it to the complete [`ServiceIdentity`]; the
+/// numeric value is selection only and can never authorize adoption alone.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct ExecAdoptionReceipt(NonZeroU64);
+impl ExecAdoptionReceipt {
+    pub const fn checked(raw: NonZeroU64) -> Option<Self> {
+        if raw.get() & !EXEC_PREPARED_VALUE_MASK == 0 {
+            Some(Self(raw))
+        } else {
+            None
+        }
+    }
+    pub const fn raw(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServiceBirth {
     pub process: TaskKey,
@@ -353,6 +372,7 @@ pub struct ServiceRequest {
 pub enum ServiceResult {
     BackingFault,
     Supplied,
+    ExecPrepared(ExecAdoptionReceipt),
     Refused,
     Cancelled,
     Wait(crate::PortalOwnerWait),
@@ -990,6 +1010,8 @@ impl ServiceCell {
             ServiceResult::BackingFault
         } else if self.result.load(Ordering::Relaxed) == 1 {
             ServiceResult::Supplied
+        } else if let Some(receipt) = decode_exec_prepared(self.result.load(Ordering::Relaxed)) {
+            ServiceResult::ExecPrepared(receipt)
         } else if let Some(failure) = decode_failure(self.result.load(Ordering::Relaxed)) {
             ServiceResult::Failed(failure)
         } else if let Some(cause) =
@@ -1148,6 +1170,35 @@ impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
         Ok(())
     }
 
+    /// Transfer one prepared exec image and publish the carrier-minted,
+    /// single-consumption receipt that selects it. The transfer callback must
+    /// bind the receipt to this ticket's exact identity before it returns.
+    pub fn publish_exec_prepared<T>(
+        mut self,
+        receipt: ExecAdoptionReceipt,
+        prepared: T,
+        transfer: impl FnOnce(ExecAdoptionReceipt, T),
+    ) -> Result<(), (PreparedDeliveryError, Self, T)> {
+        if !matches!(self.request.operation, ServiceOperation::Exec { .. }) {
+            return Err((
+                PreparedDeliveryError::Service(ServiceError::Stale),
+                self,
+                prepared,
+            ));
+        }
+        let cancelled = match self.reserve_acknowledgment() {
+            Ok(cancelled) => cancelled,
+            Err(error) => return Err((PreparedDeliveryError::Service(error), self, prepared)),
+        };
+        if cancelled {
+            self.cell.state.store(CANCEL_REQUESTED, Ordering::Release);
+            return Err((PreparedDeliveryError::Cancelled, self, prepared));
+        }
+        transfer(receipt, prepared);
+        self.finish_acknowledgment(EXEC_PREPARED_TAG | receipt.raw().get(), 0, false);
+        Ok(())
+    }
+
     fn reserve_acknowledgment(&self) -> Result<bool, ServiceError> {
         let cell = &**self.cell;
         let state = cell.state.load(Ordering::Acquire);
@@ -1197,6 +1248,14 @@ fn fault_bits(fault: FaultInfo) -> u64 {
 }
 
 const FAILURE_TAG: u64 = 1 << 63;
+const EXEC_PREPARED_TAG: u64 = 1 << 62;
+const EXEC_PREPARED_VALUE_MASK: u64 = EXEC_PREPARED_TAG - 1;
+fn decode_exec_prepared(raw: u64) -> Option<ExecAdoptionReceipt> {
+    (raw & (FAILURE_TAG | EXEC_PREPARED_TAG) == EXEC_PREPARED_TAG)
+        .then(|| NonZeroU64::new(raw & EXEC_PREPARED_VALUE_MASK))
+        .flatten()
+        .and_then(ExecAdoptionReceipt::checked)
+}
 fn decode_failure(raw: u64) -> Option<ServiceFailureCode> {
     (raw & FAILURE_TAG != 0)
         .then(|| u32::try_from(raw & !FAILURE_TAG).ok())
@@ -1283,6 +1342,40 @@ mod tests {
         );
         assert!(ticket.complete(true).is_ok());
         assert_eq!(cell.consume(request.identity), Ok(ServiceResult::Supplied));
+    }
+
+    #[test]
+    fn exec_preparation_returns_one_typed_adoption_receipt() {
+        let cell = ServiceCell::new();
+        let owner = birth(1, 7);
+        cell.bind(owner).unwrap();
+        let request = cell
+            .publish(
+                owner,
+                SnapshotGeneration::INITIAL,
+                ServiceOperation::Exec {
+                    capability: exec_capability(),
+                    payload: exec_payload(0x4000_0000, 4096),
+                },
+                None,
+            )
+            .unwrap();
+        let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(41).unwrap()).unwrap();
+        let mut delivered = None;
+        assert!(
+            cell.claim(request)
+                .unwrap()
+                .publish_exec_prepared(receipt, 17u8, |receipt, resource| {
+                    delivered = Some((receipt, resource));
+                })
+                .is_ok()
+        );
+        assert_eq!(delivered, Some((receipt, 17)));
+        assert_eq!(
+            cell.consume(request.identity),
+            Ok(ServiceResult::ExecPrepared(receipt))
+        );
+        assert_eq!(cell.consume(request.identity), Err(ServiceError::Busy));
     }
 
     #[test]

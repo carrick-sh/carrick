@@ -721,6 +721,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // before this ordinary syscall-return mapping is reachable.
                 Err(NativeProcessError::Quarantined)
             }
+            (_, ServiceResult::ExecPrepared(_)) => {
+                // The typed receipt has no ordinary syscall-return meaning.
+                // The successor adoption transaction consumes it before this
+                // completion path releases retained process/MM custody.
+                Err(NativeProcessError::Quarantined)
+            }
             (ServiceOperation::Exec { .. }, ServiceResult::Refused) => Ok(NativeResume::Returned(
                 SyscallResult::new(carrick_syscall_abi::LINUX_ENOSYS.guest_retval()),
             )),
