@@ -1073,9 +1073,6 @@ impl<'a> PendingTable<'a> {
             _ => None,
         }
     }
-    fn insert_exec(&mut self, key: TaskKey, pending: PendingExit<'a>) {
-        self.insert_row(PendingKey::Exit(key), PendingState::Exit(Box::new(pending)));
-    }
     fn remove_exec(&mut self, key: &TaskKey) -> Option<PendingExecAdoption<'a>> {
         match self.take_row(&PendingKey::Exit(*key))? {
             PendingState::Exit(pending) => match *pending {
@@ -4979,9 +4976,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     #[inline(never)]
     fn begin_closing(
         &mut self,
-        wait_status: LinuxWaitStatus,
-        entry: OwnerEntry,
+        operation: PendingCloseOperation<'a>,
     ) -> Result<(&'a ThreadLifecyclePage, Arc<WaitChannel>), NativeProcessError> {
+        let incoming_exec = matches!(&operation, PendingCloseOperation::Exec(_));
+        let member_status = match &operation {
+            PendingCloseOperation::Exit { status, .. } => status.to_termination_status(),
+            PendingCloseOperation::Exec(_) => {
+                carrick_sched_core::process::TerminationStatus::signaled(9, false)
+            }
+        };
         let registry = *self.runtime.registry.lock();
         let address = self
             .runtime
@@ -5001,9 +5004,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let mut adopted = Vec::new();
         let mut member_notification = None;
         let mut cancelled_exec = None;
+        let mut refused_exec = None;
         let (page, channel, first_close) = {
             let mut graph = self.runtime.graph.lock();
-            let upgraded = if graph.pending.exec(&self.key).is_some() {
+            let upgraded = if matches!(&operation, PendingCloseOperation::Exit { .. })
+                && graph.pending.exec(&self.key).is_some()
+            {
                 graph.pending.remove_exit(&self.key)
             } else {
                 None
@@ -5222,16 +5228,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // drops preparation with admission still closed and no begun
                 // claim or caller live unit consumed.
                 let caller = retain_member_control(self.control)?;
-                let custody = carrick_core::terminal::TerminalCustody::<
-                    carrick_core::terminal::Process,
-                    carrick_core::terminal::Live,
-                >::begin_exit(
-                    admission,
-                    self.key,
-                    address,
-                    wait_status.to_termination_status(),
-                )
-                .map_err(|_| NativeProcessError::Quarantined)?;
+                let custody = match &operation {
+                    PendingCloseOperation::Exit { status, .. } => {
+                        carrick_core::terminal::TerminalCustody::<
+                            carrick_core::terminal::Process,
+                            carrick_core::terminal::Live,
+                        >::begin_exit(
+                            admission, self.key, address, status.to_termination_status()
+                        )
+                        .map_err(|_| NativeProcessError::Quarantined)?
+                    }
+                    PendingCloseOperation::Exec(_) => {
+                        carrick_core::terminal::TerminalCustody::<
+                            carrick_core::terminal::Process,
+                            carrick_core::terminal::Live,
+                        >::begin_exec(admission, self.key, address)
+                    }
+                };
                 let carrick_core::terminal::RetirementVerdict::CancelMembers { members, .. } =
                     custody.cancel_members(pool, bindings)
                 else {
@@ -5259,10 +5272,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 graph.pending.insert_exit(
                     self.key,
                     PendingExit {
-                        operation: PendingCloseOperation::Exit {
-                            status: wait_status,
-                            entry,
-                        },
+                        operation,
                         caller,
                         channel,
                         wake,
@@ -5271,6 +5281,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         custody: Some(custody),
                     },
                 );
+            } else if incoming_exec {
+                let PendingCloseOperation::Exec(exec) = operation else {
+                    return Err(NativeProcessError::Quarantined);
+                };
+                refused_exec = Some(Box::new(exec));
             } else if !is_owner
                 && let Some(entry) = self.control.entry()
                 && carrick_el1_abi::Lifecycle::expected_exit_receipt(
@@ -5282,7 +5297,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
                     self.binding,
                     Some(entry),
-                    wait_status.to_termination_status(),
+                    member_status,
                 )
                 .ok_or(NativeProcessError::Quarantined)?;
                 let custody = carrick_core::terminal::TerminalCustody::<
@@ -5321,6 +5336,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if let Some(exec) = cancelled_exec {
             let cancelled = self.service.cancel_exec_successor(exec.receipt);
             let released = self.release_service_claim(exec.pending.claim);
+            cancelled?;
+            released?;
+        }
+        if let Some(exec) = refused_exec {
+            let cancelled = self.service.cancel_exec_successor(exec.receipt);
+            let released = self.release_service_claim(exec.pending.claim);
+            // The process-closing owner already retained this exact member.
+            // It must enter that lifecycle continuation and never return the
+            // losing exec to the predecessor image.
+            unsafe {
+                self.source
+                    .zone
+                    .record(self.record.id)
+                    .publish_owner_continuation(OwnerEntry::Syscall);
+            }
             cancelled?;
             released?;
         }
@@ -5389,7 +5419,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .metadata()
             .namespace_pid;
         let root_exit = self.is_root_process();
-        let (page, channel) = self.begin_closing(wait_status, entry)?;
+        let (page, channel) = self.begin_closing(PendingCloseOperation::Exit {
+            status: wait_status,
+            entry,
+        })?;
         let settled = loop {
             if let Some(outcome) = self.park_pending_exit(page, &channel, entry)? {
                 return Ok(outcome);
@@ -11573,7 +11606,10 @@ mod tests {
                             .contains_key(&parent_entry.record)
                     );
                     parent_entry
-                        .begin_closing(LinuxWaitStatus::exited(7), OwnerEntry::Syscall)
+                        .begin_closing(PendingCloseOperation::Exit {
+                            status: LinuxWaitStatus::exited(7),
+                            entry: OwnerEntry::Syscall,
+                        })
                         .unwrap();
                     assert!(
                         runtime

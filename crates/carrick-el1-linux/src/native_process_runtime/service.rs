@@ -1193,129 +1193,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(true)
     }
 
-    #[inline(never)]
-    fn begin_exec_closing(
-        &mut self,
-        request: ServiceRequest,
-        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
-        pending: Box<PendingService<'a>>,
-    ) -> Result<NativeResume, NativeProcessError> {
-        let (page, channel, siblings, service_records) = {
-            let mut graph = self.runtime.graph.lock();
-            let row = graph
-                .owner
-                .task_mut(self.key)
-                .map_err(|_| NativeProcessError::Stale)?;
-            let resources = row.native_mut().resources_mut();
-            let custody = carrick_core::terminal::TerminalCustody::<
-                carrick_core::terminal::Process,
-                carrick_core::terminal::Live,
-            >::begin_exec(resources.page, self.key, self.caller_address)
-            .map_err(|_| NativeProcessError::Busy)?;
-            let channel = Arc::new(WaitChannel {
-                generation: ProcessWake::new(),
-                mm: self.binding.mm.raw(),
-            });
-            let siblings: Vec<_> = resources
-                .members
-                .iter()
-                .filter(|member| member.record != self.record)
-                .map(|member| member.control.clone())
-                .collect();
-            let service_records = resources
-                .members
-                .iter()
-                .map(|member| member.record)
-                .collect::<Vec<_>>();
-            let mut outstanding = Vec::with_capacity(MEMBER_SET_CAPACITY);
-            let mut pool = Vec::new();
-            let mut bindings = Vec::new();
-            for member in resources
-                .members
-                .iter()
-                .filter(|member| member.record != self.record)
-            {
-                if let Some(entry) = member.control.entry() {
-                    pool.push(entry);
-                    outstanding.push(OutstandingExitReceipt::Pool {
-                        entry,
-                        control: member.control.clone(),
-                        expected_host: member.expected_host,
-                    });
-                } else {
-                    let birth = member.expected_host;
-                    bindings.push(birth);
-                    outstanding.push(OutstandingExitReceipt::Adopted {
-                        birth,
-                        control: member.control.clone(),
-                    });
-                }
-            }
-            for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
-                let Some(identity) = resources.page.host_birth_identity(index) else {
-                    continue;
-                };
-                if resources.page.host_birth_receipt_returned(index)
-                    || self.control.host_birth_identity() == Some(identity)
-                    || bindings.contains(&identity)
-                {
-                    continue;
-                }
-                bindings.push(identity);
-                outstanding.push(OutstandingExitReceipt::HostBorn { identity, index });
-            }
-            let carrick_core::terminal::RetirementVerdict::CancelMembers { members, .. } =
-                custody.cancel_members(pool, bindings)
-            else {
-                return Err(NativeProcessError::Quarantined);
-            };
-            let page = resources.page;
-            let caller = pending.control.clone();
-            graph.pending.insert_exec(
-                self.key,
-                PendingExit {
-                    operation: PendingCloseOperation::Exec(PendingExecAdoption {
-                        request,
-                        receipt,
-                        pending,
-                    }),
-                    caller,
-                    channel: channel.clone(),
-                    wake: Some(ExitWakeCustody {
-                        channel: channel.clone(),
-                    }),
-                    outstanding,
-                    members,
-                    custody: Some(custody),
-                },
-            );
-            (page, channel, siblings, service_records)
-        };
-        page.publish_exit_wait(self.binding.mm, WaitChannel::address(&channel));
-        for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
-            if page.host_birth_identity(index).is_some()
-                && !page.host_birth_receipt_returned(index)
-                && self.control.host_birth_identity() != page.host_birth_identity(index)
-            {
-                page.request_host_birth_cancel(index);
-            }
-        }
-        for sibling in siblings {
-            sibling.commit_registration();
-            sibling.control().request_host_exit();
-        }
-        for record in service_records {
-            self.runtime
-                .cancel_service(record, self.source.slot, self.service)?;
-        }
-        self.current.linux.mark_pending_host_work();
-        if self.park_exec_closing(&channel)? {
-            Ok(NativeResume::Left(None))
-        } else {
-            self.finish_exec_closing_ready(page)
-        }
-    }
-
     fn finish_exec_closing_ready(
         &mut self,
         page: &ThreadLifecyclePage,
@@ -1441,17 +1318,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if let (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(receipt)) =
             (request.operation, result)
         {
-            let members = self
-                .runtime
-                .graph
-                .lock()
-                .owner
-                .task(self.key)
-                .map_err(|_| NativeProcessError::Stale)?
-                .native()
-                .resources()
-                .members
-                .len();
             // SAFETY: completion belongs to this exact selected record. A
             // drain publishes a new owned continuation before giving up CPU.
             unsafe {
@@ -1460,10 +1326,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .record(self.record.id)
                     .consume_owner_continuation();
             }
-            return if members > 1 {
-                self.begin_exec_closing(*request, receipt, pending)
+            let (page, channel) =
+                self.begin_closing(PendingCloseOperation::Exec(PendingExecAdoption {
+                    request: *request,
+                    receipt,
+                    pending,
+                }))?;
+            let started = self
+                .runtime
+                .graph
+                .lock()
+                .pending
+                .exit(&self.key)
+                .is_some_and(|pending| {
+                    pending.exec().is_some()
+                        && core::ptr::eq(pending.caller.control(), self.control)
+                });
+            if !started {
+                return Ok(NativeResume::NoPending);
+            }
+            self.current.linux.mark_pending_host_work();
+            return if self.park_exec_closing(&channel)? {
+                Ok(NativeResume::Left(None))
             } else {
-                self.complete_exec_prepared(*request, receipt, pending)
+                self.finish_exec_closing_ready(page)
             };
         }
         // SAFETY: completion belongs to this exact selected record.
