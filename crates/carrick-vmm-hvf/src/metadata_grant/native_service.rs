@@ -623,7 +623,7 @@ pub(super) fn take(
                     (None, None)
                 };
                 let exec_payload = match ticket.request().operation {
-                    carrick_core_abi::service::ServiceOperation::Exec { payload } => {
+                    carrick_core_abi::service::ServiceOperation::Exec { payload, .. } => {
                         Some(retain_exec_payload(
                             custody,
                             region,

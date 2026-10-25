@@ -829,28 +829,20 @@ fn arm_native_service_exit(
     }
     let (page, control) = task.lifecycle_refs()?;
     let (operation, exec_payload) = match native_exec_stage(frame, task) {
-        Some(Ok(payload)) => {
-            let descriptor = carrick_core_abi::service::ExecPayloadDescriptor::checked(
-                carrick_guest_arch::GuestVa::new(payload.as_ptr().addr() as u64),
-                carrick_guest_arch::GuestLen::new(payload.len() as u64),
-            )?;
-            (
-                carrick_core_abi::service::ServiceOperation::Exec {
-                    payload: descriptor,
-                },
-                Some(payload),
-            )
-        }
+        Some(Ok(payload)) => (None, Some(payload)),
         Some(Err(errno)) => {
             frame.x[0] = errno.guest_retval() as u64;
             return Some(arm_signal_user_return(frame));
         }
-        None => (native_service_operation(frame, &task.linux, action)?, None),
+        None => (
+            Some(native_service_operation(frame, &task.linux, action)?),
+            None,
+        ),
     };
     // This CPU still exclusively owns its portal slot. Bind its selection
     // before park, so even a delayed first intake cannot steal a successor.
     let fault_sequence =
-        if let carrick_core_abi::service::ServiceOperation::Fault(fault) = operation {
+        if let Some(carrick_core_abi::service::ServiceOperation::Fault(fault)) = operation {
             // SAFETY: fixed initialized ABI region of this carrier.
             let portal = unsafe {
                 &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
@@ -880,9 +872,17 @@ fn arm_native_service_exit(
                 }
                 process.begin_exec_service(payload)?
             } else if let Some(wait) = wait {
-                process.begin_owner_service_wait(operation, wait)?
+                process.begin_owner_service_wait(
+                    operation
+                        .ok_or(super::native_process_runtime::NativeProcessError::Quarantined)?,
+                    wait,
+                )?
             } else {
-                process.begin_service(operation, fault_sequence)?
+                process.begin_service(
+                    operation
+                        .ok_or(super::native_process_runtime::NativeProcessError::Quarantined)?,
+                    fault_sequence,
+                )?
             };
             if matches!(result, NativeResume::Left(_)) && process.take_handoff_receipt().is_none() {
                 return Err(super::native_process_runtime::NativeProcessError::Quarantined);
