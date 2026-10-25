@@ -2220,6 +2220,20 @@ struct FileTableMutationLease {
     gate: Arc<FileTableFunctionalGate>,
 }
 
+enum FileTableMutationCustody<'a> {
+    Owned(FileTableMutationLease),
+    Borrowed(&'a FileTableMutationLease),
+}
+
+impl FileTableMutationCustody<'_> {
+    fn lease(&self) -> &FileTableMutationLease {
+        match self {
+            Self::Owned(lease) => lease,
+            Self::Borrowed(lease) => lease,
+        }
+    }
+}
+
 impl Drop for FileTableMutationLease {
     fn drop(&mut self) {
         let mut state = self.gate.state.lock();
@@ -2667,7 +2681,7 @@ impl FileTable {
         // reserved_slots) and publish_ipc (open_files.read -> reserved_slots)
         // never invert or race with admission.
         let open_files = self.read_open_files();
-        let mut next_fd = self.lock_next_fd();
+        let mut next_fd = self.lock_next_fd_borrowing(&_mutation);
         let mut reserved = self.lock_reserved_slots();
         let reservation_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(selected) = self.reserve_ipc_min(min_fd, limit, reservation_id) {
@@ -2687,7 +2701,7 @@ impl FileTable {
             });
         }
 
-        let closed_stdio = self.lock_closed_stdio();
+        let closed_stdio = self.stdio_guard_borrowing(ipc::StdioField::Closed, &_mutation);
 
         let mut fd = None;
 
@@ -2823,7 +2837,7 @@ impl FileTable {
             .functional_gate
             .acquire_mutation()
             .ok_or(crate::linux_abi::LINUX_EBADF)?;
-        let mut open_files = self.write_open_files();
+        let mut open_files = self.write_open_files_borrowing(&_mutation);
         let mut reserved = self.lock_reserved_slots();
         let ipc = self.ipc.lock();
         let ipc_bound = matches!(*ipc, Some(Ok(_)));
@@ -2854,7 +2868,8 @@ impl FileTable {
                 self.commit_ipc_reservation(fd, reservation_id, installed);
             }
             if (0..3).contains(&fd) {
-                self.lock_closed_stdio()[fd as usize] = false;
+                self.stdio_guard_borrowing(ipc::StdioField::Closed, &_mutation)[fd as usize] =
+                    false;
             }
         }
         Ok(())
@@ -2870,8 +2885,8 @@ impl FileTable {
             .functional_gate
             .acquire_mutation()
             .ok_or(crate::linux_abi::LINUX_EBADF)?;
-        let mut open_files = self.write_open_files();
-        let mut next_fd = self.lock_next_fd();
+        let mut open_files = self.write_open_files_borrowing(&_mutation);
+        let mut next_fd = self.lock_next_fd_borrowing(&_mutation);
         let mut reserved = self.lock_reserved_slots();
 
         if reserved.get(&fd).copied() != Some(reservation_id) {
@@ -2885,12 +2900,12 @@ impl FileTable {
         }
 
         if (0..3).contains(&fd) {
-            self.lock_closed_stdio()[fd as usize] = false;
+            self.stdio_guard_borrowing(ipc::StdioField::Closed, &_mutation)[fd as usize] = false;
         }
 
         if fd >= 3 && fd == *next_fd {
             let mut candidate = fd.saturating_add(1);
-            let closed = self.lock_closed_stdio();
+            let closed = self.stdio_guard_borrowing(ipc::StdioField::Closed, &_mutation);
             loop {
                 let reserved_stdio = (0..3).contains(&candidate) && !closed[candidate as usize];
                 if !open_files.contains_key(&candidate)
@@ -3144,7 +3159,25 @@ impl FileTable {
         let guard = self.open_files.write();
         FileTableWriteGuard {
             guard,
-            _mutation: mutation,
+            mutation: FileTableMutationCustody::Owned(mutation),
+            fd_ceiling: &self.fd_ceiling,
+            revision: &self.revision,
+            table: self.id,
+            subscriptions: &self.slot_subscriptions,
+            touched: TouchedSlots::new(),
+            owner: self,
+        }
+    }
+
+    fn write_open_files_borrowing<'a>(
+        &'a self,
+        mutation: &'a FileTableMutationLease,
+    ) -> FileTableWriteGuard<'a> {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_table_write_lock();
+        FileTableWriteGuard {
+            guard: self.open_files.write(),
+            mutation: FileTableMutationCustody::Borrowed(mutation),
             fd_ceiling: &self.fd_ceiling,
             revision: &self.revision,
             table: self.id,
@@ -3160,6 +3193,13 @@ impl FileTable {
 
     pub(crate) fn lock_next_fd(&self) -> FileTableMutexGuard<'_, i32> {
         self.mutex_write(&self.next_fd)
+    }
+
+    fn lock_next_fd_borrowing<'a>(
+        &'a self,
+        mutation: &'a FileTableMutationLease,
+    ) -> FileTableMutexGuard<'a, i32> {
+        self.mutex_write_borrowing(&self.next_fd, mutation)
     }
 
     pub(crate) fn lock_stdio_cloexec(&self) -> FileTableStdioGuard<'_> {
@@ -3267,7 +3307,7 @@ impl FileTable {
         let mutation = self.functional_gate.acquire_mutation()?;
         Some(FileTableMutexGuard {
             guard: lock.lock(),
-            _mutation: mutation,
+            _mutation: FileTableMutationCustody::Owned(mutation),
             revision: &self.revision,
         })
     }
@@ -3276,7 +3316,19 @@ impl FileTable {
         let mutation = self.mutation_lease();
         FileTableMutexGuard {
             guard: lock.lock(),
-            _mutation: mutation,
+            _mutation: FileTableMutationCustody::Owned(mutation),
+            revision: &self.revision,
+        }
+    }
+
+    fn mutex_write_borrowing<'a, T>(
+        &'a self,
+        lock: &'a Mutex<T>,
+        mutation: &'a FileTableMutationLease,
+    ) -> FileTableMutexGuard<'a, T> {
+        FileTableMutexGuard {
+            guard: lock.lock(),
+            _mutation: FileTableMutationCustody::Borrowed(mutation),
             revision: &self.revision,
         }
     }
@@ -3285,7 +3337,7 @@ impl FileTable {
         let mutation = self.mutation_lease();
         FileTableRwWriteGuard {
             guard: lock.write(),
-            _mutation: mutation,
+            _mutation: FileTableMutationCustody::Owned(mutation),
             revision: &self.revision,
         }
     }
@@ -3416,7 +3468,7 @@ impl TouchedSlots {
 pub struct FileTableWriteGuard<'a> {
     owner: &'a FileTable,
     guard: RwLockWriteGuard<'a, FileSlotMap>,
-    _mutation: FileTableMutationLease,
+    mutation: FileTableMutationCustody<'a>,
     fd_ceiling: &'a FdCeilingAuthority,
     revision: &'a ObjectRevision,
     table: FileTableId,
@@ -3474,7 +3526,9 @@ impl FileTableWriteGuard<'_> {
         // Do this under the namespace guard so rollback cannot resurrect bare
         // stdin/stdout/stderr between removal and projection publication.
         if (0..3).contains(number) {
-            self.owner.lock_closed_stdio()[*number as usize] = true;
+            self.owner
+                .stdio_guard_borrowing(ipc::StdioField::Closed, self.mutation.lease())
+                [*number as usize] = true;
         }
         removed
     }
@@ -3560,7 +3614,7 @@ impl Drop for FileTableWriteGuard<'_> {
 
 pub struct FileTableMutexGuard<'a, T> {
     guard: MutexGuard<'a, T>,
-    _mutation: FileTableMutationLease,
+    _mutation: FileTableMutationCustody<'a>,
     revision: &'a ObjectRevision,
 }
 
@@ -3586,7 +3640,7 @@ impl<T> Drop for FileTableMutexGuard<'_, T> {
 
 pub struct FileTableRwWriteGuard<'a, T> {
     guard: RwLockWriteGuard<'a, T>,
-    _mutation: FileTableMutationLease,
+    _mutation: FileTableMutationCustody<'a>,
     revision: &'a ObjectRevision,
 }
 
@@ -4291,6 +4345,104 @@ mod tests {
         done_rx.recv().expect("mutation released");
         worker.join().expect("mutation worker");
         assert_eq!(*table.lock_next_fd(), 4096);
+    }
+
+    #[test]
+    fn clone_files_close_stdio_completes_while_peer_exec_waits_for_its_mutation() {
+        let (kernel, parent) = crate::kernel::Kernel::bootstrap_root(
+            crate::kernel::RootBootstrap::for_reference_model(
+                9_180,
+                carrick_hal::ThreadId::synthetic_for_tests(9_180),
+                "exec-freeze parent".into(),
+            )
+            .expect("bootstrap input"),
+        )
+        .expect("kernel");
+        let child = kernel
+            .fork_task(
+                &parent,
+                crate::kernel::ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::FILES)
+                    .expect("CLONE_FILES plan"),
+                carrick_hal::ThreadId::synthetic_for_tests(9_181),
+                "stdio closer".into(),
+                None,
+            )
+            .expect("fork CLONE_FILES child");
+        let files = parent.resources().files();
+        assert!(Arc::ptr_eq(&files, &child.resources().files()));
+        assert!(kernel.task_key_is_live(parent.task().key()));
+        assert!(kernel.task_key_is_live(child.task().key()));
+
+        let (guard_tx, guard_rx) = std::sync::mpsc::channel();
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let closing_files = Arc::clone(&files);
+        let closer = std::thread::spawn(move || {
+            let mut slots = closing_files.write_open_files();
+            guard_tx.send(()).expect("close holds mutation");
+            close_rx.recv().expect("race exec freeze");
+            assert!(slots.remove(&2).is_none(), "stderr starts implicit");
+            drop(slots);
+            closed_tx.send(()).expect("close completed");
+        });
+        guard_rx.recv().expect("close admitted before exec");
+
+        let (exec_tx, exec_rx) = std::sync::mpsc::channel();
+        let exec_files = Arc::clone(&files);
+        let execer = std::thread::spawn(move || {
+            let freeze = exec_files.freeze_for_exec();
+            exec_tx
+                .send(freeze.is_some())
+                .expect("exec freeze completed");
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !files.functional_gate_is_frozen() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer exec did not freeze the shared file table"
+            );
+            std::thread::yield_now();
+        }
+
+        close_tx.send(()).expect("continue close");
+        closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("close(2) must finish from its already admitted mutation");
+        assert!(exec_rx.recv().expect("exec result"));
+        closer.join().expect("close worker");
+        execer.join().expect("exec worker");
+        assert!(files.lock_closed_stdio()[2]);
+    }
+
+    #[test]
+    fn admitted_stdio_close_borrows_its_mutation_when_retirement_starts() {
+        let ids = ObjectIdRegistry::new();
+        let table = Arc::new(FileTable::new(ids.file_table_id().expect("table ID")));
+        let mut slots = table.write_open_files();
+        let (retired_tx, retired_rx) = std::sync::mpsc::channel();
+        let retiring = Arc::clone(&table);
+        let retire = std::thread::spawn(move || {
+            retired_tx
+                .send(retiring.retire_functional_refs())
+                .expect("retirement result");
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !table.functional_gate.state.lock().accepting {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retirement did not close mutation admission"
+            );
+            std::thread::yield_now();
+        }
+
+        assert!(slots.remove(&2).is_none(), "stderr starts implicit");
+        drop(slots);
+        assert!(retired_rx.recv().expect("retirement completed"));
+        retire.join().expect("retirement worker");
+        assert!(table.closed_stdio.lock()[2]);
     }
 
     #[test]
