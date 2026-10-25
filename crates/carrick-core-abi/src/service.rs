@@ -1,6 +1,6 @@
 //! Exact native service operations. The ring retains semantic custody until
 //! an exact completion or cancellation acknowledgment is consumed.
-use crate::{El1MmHandle, EntryThreadGeneration, SnapshotGeneration};
+use crate::{El1MmHandle, EntryThreadGeneration, ReservationMm, SnapshotGeneration};
 use carrick_guest_arch::{Access, FaultInfo, GuestLen, GuestVa, NativeOrdinal};
 use carrick_sched_core::{RecordRef, object_wait::OwnerEntry, process::TaskKey};
 use core::num::{NonZeroU32, NonZeroU64};
@@ -552,6 +552,170 @@ impl ServiceBirth {
         ]
     }
 }
+
+const EXEC_SUCCESSOR_MANIFEST_REVISION: u64 = 1;
+const EXEC_SUCCESSOR_PROPOSED: u64 = 1;
+const EXEC_SUCCESSOR_SEALED: u64 = 2;
+
+/// Ring-owned reply record for one prepared exec successor. The proposal is
+/// written before request publication; the exact service ticket may seal it
+/// once. Completion publication is the release/acquire edge protecting these
+/// plain words. The digest detects tearing, while exact retained service and
+/// receipt identity provide authority.
+#[repr(C, align(64))]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    zerocopy::FromZeros,
+)]
+pub struct ExecSuccessorManifest {
+    revision: u64,
+    phase: u64,
+    identity: [u64; 10],
+    successor_mm: u64,
+    root: u64,
+    root_generation: u64,
+    asid: u64,
+    asid_generation: u64,
+    receipt: u64,
+    digest: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecSuccessorManifestView {
+    pub successor_mm: ReservationMm,
+    pub root: carrick_guest_arch::RootGpa,
+    pub root_generation: NonZeroU64,
+    pub asid: carrick_guest_arch::Asid,
+    pub asid_generation: NonZeroU64,
+}
+
+impl ServiceIdentity {
+    fn manifest_words(self) -> [u64; 10] {
+        let birth = self.birth.words();
+        [
+            birth[0],
+            birth[1],
+            birth[2],
+            birth[3],
+            birth[4],
+            birth[5],
+            birth[6],
+            birth[7],
+            self.execution.raw(),
+            self.sequence.get(),
+        ]
+    }
+}
+
+impl ExecSuccessorManifest {
+    fn words(&self) -> [u64; 19] {
+        [
+            self.revision,
+            self.phase,
+            self.identity[0],
+            self.identity[1],
+            self.identity[2],
+            self.identity[3],
+            self.identity[4],
+            self.identity[5],
+            self.identity[6],
+            self.identity[7],
+            self.identity[8],
+            self.identity[9],
+            self.successor_mm,
+            self.root,
+            self.root_generation,
+            self.asid,
+            self.asid_generation,
+            self.receipt,
+            0,
+        ]
+    }
+
+    fn has_valid_digest(&self) -> bool {
+        self.digest == crate::integrity_digest(&self.words())
+    }
+
+    pub fn propose(identity: ServiceIdentity, successor_mm: ReservationMm) -> Self {
+        let mut manifest = Self {
+            revision: EXEC_SUCCESSOR_MANIFEST_REVISION,
+            phase: EXEC_SUCCESSOR_PROPOSED,
+            identity: identity.manifest_words(),
+            successor_mm: successor_mm.raw(),
+            root: 0,
+            root_generation: 0,
+            asid: 0,
+            asid_generation: 0,
+            receipt: 0,
+            digest: 0,
+        };
+        manifest.digest = crate::integrity_digest(&manifest.words());
+        manifest
+    }
+
+    pub fn proposal(&self, identity: ServiceIdentity) -> Option<ReservationMm> {
+        (self.revision == EXEC_SUCCESSOR_MANIFEST_REVISION
+            && self.phase == EXEC_SUCCESSOR_PROPOSED
+            && self.identity == identity.manifest_words()
+            && self.root == 0
+            && self.root_generation == 0
+            && self.asid == 0
+            && self.asid_generation == 0
+            && self.receipt == 0
+            && self.has_valid_digest())
+        .then(|| ReservationMm::new(self.successor_mm))?
+    }
+
+    pub fn seal(
+        mut self,
+        identity: ServiceIdentity,
+        receipt: ExecAdoptionReceipt,
+        root: carrick_guest_arch::RootGpa,
+        root_generation: NonZeroU64,
+        asid: carrick_guest_arch::Asid,
+        asid_generation: NonZeroU64,
+    ) -> Option<Self> {
+        self.proposal(identity)?;
+        self.phase = EXEC_SUCCESSOR_SEALED;
+        self.root = root.address().raw();
+        self.root_generation = root_generation.get();
+        self.asid = u64::from(asid.raw());
+        self.asid_generation = asid_generation.get();
+        self.receipt = receipt.raw().get();
+        self.digest = crate::integrity_digest(&self.words());
+        Some(self)
+    }
+
+    pub fn open(
+        &self,
+        identity: ServiceIdentity,
+        receipt: ExecAdoptionReceipt,
+    ) -> Option<ExecSuccessorManifestView> {
+        if self.revision != EXEC_SUCCESSOR_MANIFEST_REVISION
+            || self.phase != EXEC_SUCCESSOR_SEALED
+            || self.identity != identity.manifest_words()
+            || self.receipt != receipt.raw().get()
+            || !self.has_valid_digest()
+        {
+            return None;
+        }
+        Some(ExecSuccessorManifestView {
+            successor_mm: ReservationMm::new(self.successor_mm)?,
+            root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                self.root,
+            ))?,
+            root_generation: NonZeroU64::new(self.root_generation)?,
+            asid: carrick_guest_arch::Asid::from_registry_allocation(core::num::NonZeroU16::new(
+                u16::try_from(self.asid).ok()?,
+            )?),
+            asid_generation: NonZeroU64::new(self.asid_generation)?,
+        })
+    }
+}
 impl ServiceCell {
     /// Publish only after the native owner has authenticated the complete
     /// lifecycle birth and admitted MM. No execution slot is part of custody.
@@ -663,8 +827,11 @@ impl ServiceCell {
             || !self.same_birth(birth)
             || (fault_sequence.is_some() && !matches!(operation, ServiceOperation::Fault(_)))
             || (reply.is_some()
-                && (fault_sequence.is_none()
-                    || !matches!(operation, ServiceOperation::Fault(fault) if !fault.present)))
+                && !matches!(
+                    operation,
+                    ServiceOperation::Fault(fault) if !fault.present && fault_sequence.is_some()
+                )
+                && !matches!(operation, ServiceOperation::Exec { .. }))
             || reply.is_some_and(|address| address.raw() == 0)
         {
             self.state.store(IDLE, Ordering::Release);
@@ -1379,6 +1546,57 @@ mod tests {
             Ok(ServiceResult::ExecPrepared(receipt))
         );
         assert_eq!(cell.consume(request.identity), Err(ServiceError::Busy));
+    }
+
+    #[test]
+    fn exec_successor_manifest_is_exactly_bound_and_torn_records_refuse() {
+        let identity = ServiceIdentity {
+            birth: birth(17, 23),
+            execution: SnapshotGeneration::from_raw(29),
+            sequence: NonZeroU64::new(31).unwrap(),
+        };
+        let successor = ReservationMm::new(37).unwrap();
+        let proposal = ExecSuccessorManifest::propose(identity, successor);
+        assert_eq!(proposal.proposal(identity), Some(successor));
+
+        let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(41).unwrap()).unwrap();
+        let root =
+            carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x90_0000))
+                .unwrap();
+        let root_generation = NonZeroU64::new(43).unwrap();
+        let asid = carrick_guest_arch::Asid::from_registry_allocation(
+            core::num::NonZeroU16::new(47).unwrap(),
+        );
+        let asid_generation = NonZeroU64::new(53).unwrap();
+        let sealed = proposal
+            .seal(
+                identity,
+                receipt,
+                root,
+                root_generation,
+                asid,
+                asid_generation,
+            )
+            .unwrap();
+        assert_eq!(
+            sealed.open(identity, receipt),
+            Some(ExecSuccessorManifestView {
+                successor_mm: successor,
+                root,
+                root_generation,
+                asid,
+                asid_generation,
+            })
+        );
+        let mut stale = identity;
+        stale.sequence = NonZeroU64::new(59).unwrap();
+        assert_eq!(sealed.open(stale, receipt), None);
+        let other = ExecAdoptionReceipt::checked(NonZeroU64::new(61).unwrap()).unwrap();
+        assert_eq!(sealed.open(identity, other), None);
+
+        let mut torn = sealed;
+        torn.root_generation = 67;
+        assert_eq!(torn.open(identity, receipt), None);
     }
 
     #[test]
