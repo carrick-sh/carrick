@@ -627,6 +627,14 @@ impl<'a, T> NativeProcessSignals<'a, T> {
         let mut res = self.resources.lock();
         res.actions = res.actions.clone_for_exec();
     }
+    pub fn reset_for_exec_survivor(&self, survivor: carrick_sched_core::RecordRef) {
+        let mut res = self.resources.lock();
+        res.actions = res.actions.clone_for_exec();
+        res.thread_pending.retain(|(record, _)| *record == survivor);
+        res.forced_faults.retain(|(record, _)| *record == survivor);
+        res.projections
+            .retain(|(record, projection)| *record == survivor && projection.strong_count() != 0);
+    }
     pub fn pending_count(&self) -> usize {
         self.resources.lock().inbox.pending().len()
     }

@@ -227,6 +227,49 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
 }
 
 #[test]
+fn root_exec_enters_shared_stock_and_reclaims_without_child_capacity() {
+    let mut stock = stock(UntaggedRoots, 4, 0);
+    let predecessor_mm = mm(PARENT_MM);
+    let predecessor = execution(1, 0, PARENT_MM, 0x80_0000);
+    let successor_mm = mm(303);
+    // SAFETY: this fixture owns the closed successor incarnation.
+    let successor = unsafe {
+        El1MmHandle::from_admitted_owner(CARRIER, successor_mm, NonZeroU64::new(9).unwrap())
+    };
+    let receipt = stock
+        .replace_root_for_exec_with_tag(predecessor, successor, page(0x90_0000), (), ())
+        .unwrap();
+    assert_eq!(stock.child_owner(successor_mm), Some(successor));
+    assert_eq!(stock.child_root(successor_mm), Some(page(0x90_0000)));
+    assert_eq!(stock.child_lifecycle(successor_mm), None);
+
+    stock
+        .settle_exec_predecessor(
+            &mut NoTableLedger,
+            receipt,
+            absent(predecessor_mm).unwrap(),
+            |_| true,
+            |_, absence| absence.mm() == predecessor_mm,
+        )
+        .unwrap();
+    stock.retire_exited_root(successor_mm);
+    assert_eq!(
+        stock
+            .reclaim(
+                &mut NoTableLedger,
+                predecessor_mm,
+                absent,
+                |_| true,
+                |_| false,
+                |_| true,
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(stock.child_owner(successor_mm), None);
+}
+
+#[test]
 fn exec_replacement_absorbs_pending_descriptor_tables_with_peer_live() {
     use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
 
