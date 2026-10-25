@@ -197,7 +197,7 @@ impl PendingExecStage2Cleanup {
             publish(classification);
             return Ok(None);
         }
-        let stage1_reference_proofs = if self.stage2_reference_releases.is_empty() {
+        let mut stage1_reference_proofs = if self.stage2_reference_releases.is_empty() {
             std::collections::BTreeMap::new()
         } else {
             let stage1_unpublished = stage1_unpublished.ok_or_else(|| {
@@ -236,7 +236,7 @@ impl PendingExecStage2Cleanup {
             {
                 continue;
             }
-            let stage1_reference = stage1_reference_proofs.get(&lease).ok_or_else(|| {
+            let stage1_reference = stage1_reference_proofs.remove(&lease).ok_or_else(|| {
                 TrapError::Hypervisor(format!(
                     "exec predecessor extent {lease:?} did not cross the stage-1 reference ledger"
                 ))
@@ -265,19 +265,7 @@ impl PendingExecStage2Cleanup {
                 } else {
                     let outcome = retire_global_frame_host_owner_if_generation_in(
                         custody,
-                        custody
-                            .stage1_unpublished_from_receipt(
-                                global_frame_stage2_identity_in(custody, ipa, size as u64)
-                                    .ok_or_else(|| {
-                                        TrapError::Hypervisor(
-                                            "exec owner lost record identity".to_owned(),
-                                        )
-                                    })?,
-                                Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
-                            )
-                            .ok_or_else(|| {
-                                TrapError::Hypervisor("exec owner lacks stage-1 proof".to_owned())
-                            })?,
+                        stage1_reference,
                         ipa,
                         size as u64,
                         owner_generation,

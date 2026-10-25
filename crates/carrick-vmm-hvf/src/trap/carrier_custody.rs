@@ -467,6 +467,7 @@ pub(crate) struct NeverPublishedRecord {
 
 pub(crate) enum Stage2RetirementProof {
     Unpublished(Stage1Unpublished),
+    Released(super::frame_inventory::Stage1Unpublished),
     Authorized(Stage2RetirementAuthorization),
 }
 
@@ -479,6 +480,12 @@ impl From<Stage1Unpublished> for Stage2RetirementProof {
 impl From<Stage2RetirementAuthorization> for Stage2RetirementProof {
     fn from(value: Stage2RetirementAuthorization) -> Self {
         Self::Authorized(value)
+    }
+}
+
+impl From<super::frame_inventory::Stage1Unpublished> for Stage2RetirementProof {
+    fn from(value: super::frame_inventory::Stage1Unpublished) -> Self {
+        Self::Released(value)
     }
 }
 
@@ -2023,6 +2030,26 @@ impl CarrierVmCustody {
             return CarrierStage2RetireOutcome::NotFound;
         };
         carrick_core::mm::retirement::request_record_retirement(record, identity)
+    }
+
+    pub(crate) fn request_released_stage2_record_retirement(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        stage1: super::frame_inventory::Stage1Unpublished,
+    ) -> CarrierStage2RetireOutcome {
+        let Some(snapshot) = self.stage2_record_snapshot(identity.record_id) else {
+            return CarrierStage2RetireOutcome::NotFound;
+        };
+        if stage1.lease() != (snapshot.ipa, snapshot.len as u64) {
+            return CarrierStage2RetireOutcome::NotFound;
+        }
+        self.request_stage2_record_retirement(
+            identity,
+            Stage1Unpublished {
+                identity,
+                source: Stage1UnpublishedSource::FrameInventoryCommit,
+            },
+        )
     }
 
     pub(crate) fn enqueue_carrier_stage2_retirement(&self, identity: CarrierStage2RecordIdentity) {

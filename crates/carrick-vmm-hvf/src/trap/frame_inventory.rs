@@ -448,7 +448,7 @@ impl StagedProcessStage2Retirement {
     ) -> Result<
         (
             std::collections::BTreeSet<(u64, u64)>,
-            std::collections::BTreeMap<(u64, u64), ReleasedStage1Reference>,
+            std::collections::BTreeMap<(u64, u64), Stage1Unpublished>,
         ),
         TrapError,
     > {
@@ -557,11 +557,11 @@ pub(crate) struct InventoryFrameRegistry {
 /// This value is deliberately non-cloneable: retirement must consume the
 /// zero-reference crossing rather than rediscovering or caching it.
 #[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
-pub(crate) struct ReleasedStage1Reference {
+pub(crate) struct Stage1Unpublished {
     lease: (u64, u64),
 }
 
-impl ReleasedStage1Reference {
+impl Stage1Unpublished {
     pub(crate) fn lease(&self) -> (u64, u64) {
         self.lease
     }
@@ -582,7 +582,7 @@ impl InventoryFrameRegistry {
         lease: (u64, u64),
         identity: Option<CarrierStage2RecordIdentity>,
         receipt: Stage1UnpublicationReceipt<'_>,
-    ) -> Result<Option<ReleasedStage1Reference>, Stage2ReferenceReleaseError> {
+    ) -> Result<Option<Stage1Unpublished>, Stage2ReferenceReleaseError> {
         let names = match receipt {
             Stage1UnpublicationReceipt::EditorRange(receipt) => {
                 receipt.names(lease.0, lease.1 as usize)
@@ -611,7 +611,7 @@ impl InventoryFrameRegistry {
             return Ok(None);
         }
         self.stage2_references.remove(&lease);
-        Ok(Some(ReleasedStage1Reference { lease }))
+        Ok(Some(Stage1Unpublished { lease }))
     }
 }
 
@@ -3742,7 +3742,7 @@ impl HvfVmState {
             (staged, frames, reservation.commit(()), stage2_owners)
         };
 
-        let (candidates, stage1_reference_proofs) = {
+        let (candidates, mut stage1_reference_proofs) = {
             let mut registry = frames.lock();
             staged.release_with(
                 &mut registry,
@@ -3765,7 +3765,7 @@ impl HvfVmState {
                     "HVPatch process retirement candidate {lease:?} lost inventory owner identity"
                 ))
             })?;
-            let stage1_reference = stage1_reference_proofs.get(&lease).ok_or_else(|| {
+            let stage1_reference = stage1_reference_proofs.remove(&lease).ok_or_else(|| {
                 TrapError::Hypervisor(format!(
                     "process retirement candidate {lease:?} did not cross the stage-1 reference ledger"
                 ))
@@ -3799,23 +3799,7 @@ impl HvfVmState {
                     if Self::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
                         let outcome = retire_global_frame_host_owner_if_generation_in(
                             custody,
-                            custody
-                                .stage1_unpublished_from_receipt(
-                                    global_frame_stage2_identity_in(custody, ipa, length)
-                                        .ok_or_else(|| {
-                                            TrapError::Hypervisor(
-                                                "process retirement lost global record identity"
-                                                    .to_owned(),
-                                            )
-                                        })?,
-                                    Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
-                                )
-                                .ok_or_else(|| {
-                                    TrapError::Hypervisor(
-                                        "process retirement could not bind stage-1 proof"
-                                            .to_owned(),
-                                    )
-                                })?,
+                            stage1_reference,
                             ipa,
                             length,
                             owner.generation,

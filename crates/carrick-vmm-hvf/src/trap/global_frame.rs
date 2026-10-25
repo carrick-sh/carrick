@@ -3534,24 +3534,29 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
                 stage1
             }
             None => {
-                let Stage2RetirementProof::Unpublished(stage1) = stage1_receipt else {
-                    return GlobalFrameRetirementOutcome::RetryPending {
-                        ipa,
-                        length,
-                        generation,
-                        error: "stored stage-1 retirement authorization disappeared".to_owned(),
-                    };
+                let outcome = match stage1_receipt {
+                    Stage2RetirementProof::Unpublished(stage1) => {
+                        if !stage1.matches(owner.record_identity) {
+                            return GlobalFrameRetirementOutcome::RetryPending {
+                                ipa,
+                                length,
+                                generation,
+                                error: "stage-1 receipt names another stage-2 record".to_owned(),
+                            };
+                        }
+                        custody.request_stage2_record_retirement(owner.record_identity, stage1)
+                    }
+                    Stage2RetirementProof::Released(stage1) => custody
+                        .request_released_stage2_record_retirement(owner.record_identity, stage1),
+                    Stage2RetirementProof::Authorized(_) => {
+                        return GlobalFrameRetirementOutcome::RetryPending {
+                            ipa,
+                            length,
+                            generation,
+                            error: "stored stage-1 retirement authorization disappeared".to_owned(),
+                        };
+                    }
                 };
-                if !stage1.matches(owner.record_identity) {
-                    return GlobalFrameRetirementOutcome::RetryPending {
-                        ipa,
-                        length,
-                        generation,
-                        error: "stage-1 receipt names another stage-2 record".to_owned(),
-                    };
-                }
-                let outcome =
-                    custody.request_stage2_record_retirement(owner.record_identity, stage1);
                 if outcome != CarrierStage2RetireOutcome::DeferredActivePins {
                     return GlobalFrameRetirementOutcome::RetryPending {
                         ipa,
