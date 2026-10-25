@@ -312,6 +312,31 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     type Mm: Clone;
     type PreparedMm;
     type Born;
+    fn adopt_exec_successor(
+        &self,
+        _identity: carrick_core_abi::service::ServiceIdentity,
+        _receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+        _manifest: &carrick_core_abi::service::ExecSuccessorManifest,
+    ) -> Result<NativeExecSuccessor<Self::Mm, C>, NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
+    /// After graph publication has made the successor authoritative, switch
+    /// the physical execution to it and settle the retained predecessor.
+    /// Refusal is terminal: the consuming adoption crossing was the point of
+    /// no return, so callers must complete all validation before it.
+    fn finish_exec_successor(
+        &self,
+        _predecessor: AddressContext<RootGpa>,
+        _successor: AddressContext<RootGpa>,
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
+    fn exec_fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
+        &[]
+    }
+    fn exec_open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
+        &[]
+    }
     /// Authenticate the admitted MM incarnation, never the address generation.
     fn service_mm_handle(
         &self,
@@ -474,6 +499,14 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Result<(), NativeProcessError> {
         Err(NativeProcessError::Unsupported)
     }
+}
+
+/// The closed successor made installable by one consuming host receipt.
+/// Kept boxed at call sites: an ISA context is too large for EL1 frames.
+pub struct NativeExecSuccessor<M, C: ProcessContext> {
+    pub mm: M,
+    pub address: AddressContext<RootGpa>,
+    pub words: Box<C>,
 }
 pub struct NativeClaim {
     namespace: Arc<SpinLock<NamespaceState>>,
@@ -765,6 +798,14 @@ struct PendingExit<'a> {
     >,
 }
 
+struct PendingExecDrain<'a> {
+    request: carrick_core_abi::service::ServiceRequest,
+    receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+    pending: Box<service::PendingService<'a>>,
+    caller: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
+    channel: Arc<WaitChannel>,
+}
+
 // Pool entries and the carrier's bounded record registry are the maximum
 // member population. A concurrent retirement may lower live() after the
 // snapshot without reducing the receipts Closing still owes.
@@ -935,6 +976,7 @@ enum PendingKey {
 enum PendingState<'a> {
     Operation(PendingContinuation),
     Exit(PendingExit<'a>),
+    Exec(PendingExecDrain<'a>),
     Member(MemberWaitState<'a>),
 }
 #[derive(Default)]
@@ -971,17 +1013,17 @@ impl<'a> PendingTable<'a> {
     fn exit(&self, key: &TaskKey) -> Option<&PendingExit<'a>> {
         match self.rows.get(&PendingKey::Exit(*key))?.as_ref() {
             PendingState::Exit(pending) => Some(pending),
-            _ => unreachable!(),
+            _ => None,
         }
     }
     fn exit_mut(&mut self, key: &TaskKey) -> Option<&mut PendingExit<'a>> {
         match self.rows.get_mut(&PendingKey::Exit(*key))?.as_mut() {
             PendingState::Exit(pending) => Some(pending),
-            _ => unreachable!(),
+            _ => None,
         }
     }
     fn has_exit(&self, key: &TaskKey) -> bool {
-        self.exit(key).is_some()
+        self.rows.contains_key(&PendingKey::Exit(*key))
     }
     fn insert_exit(&mut self, key: TaskKey, pending: PendingExit<'a>) {
         self.insert_row(PendingKey::Exit(key), PendingState::Exit(pending));
@@ -989,6 +1031,21 @@ impl<'a> PendingTable<'a> {
     fn remove_exit(&mut self, key: &TaskKey) -> Option<PendingExit<'a>> {
         match self.take_row(&PendingKey::Exit(*key))? {
             PendingState::Exit(pending) => Some(pending),
+            _ => unreachable!(),
+        }
+    }
+    fn exec(&self, key: &TaskKey) -> Option<&PendingExecDrain<'a>> {
+        match self.rows.get(&PendingKey::Exit(*key))?.as_ref() {
+            PendingState::Exec(pending) => Some(pending),
+            _ => None,
+        }
+    }
+    fn insert_exec(&mut self, key: TaskKey, pending: PendingExecDrain<'a>) {
+        self.insert_row(PendingKey::Exit(key), PendingState::Exec(pending));
+    }
+    fn remove_exec(&mut self, key: &TaskKey) -> Option<PendingExecDrain<'a>> {
+        match self.take_row(&PendingKey::Exit(*key))? {
+            PendingState::Exec(pending) => Some(pending),
             _ => unreachable!(),
         }
     }
@@ -4620,6 +4677,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn resume_checkpoint(
         &mut self,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+        if let Some(result) = self.resume_exec_drain() {
+            return result.map_err(NativeProcessError::run_failure_reason);
+        }
         if let Some(result) = self.resume_service() {
             match result.map_err(NativeProcessError::run_failure_reason)? {
                 NativeResume::NoPending => {}

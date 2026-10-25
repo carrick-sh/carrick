@@ -1870,6 +1870,97 @@ fn service_native_exec_adopt(
     Ok([METADATA_GRANT_SUCCESS, 0, 0, 0])
 }
 
+/// Release the exact predecessor retained by native exec after the ring has
+/// removed its reservation owner and switched every slot to the successor.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+fn service_native_exec_settle(
+    custody: &crate::trap::CarrierVmCustody,
+    generation: Option<crate::trap::CarrierVmGeneration>,
+    region: RetainedAbiRegion<'_>,
+    cpu: carrick_guest_arch::CpuId,
+    predecessor_raw: u64,
+    successor_raw: u64,
+    claimed_cpu: u64,
+    ttbr0: u64,
+) -> [u64; 4] {
+    use carrick_hal::fork_stock::SlotAbsence;
+    let denied = [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    if claimed_cpu != u64::from(cpu.raw()) || !request_has_live_vm(custody, generation) {
+        return denied;
+    }
+    let Some(predecessor) = carrick_el1_abi::ReservationMm::new(predecessor_raw) else {
+        return denied;
+    };
+    let Some(successor) = carrick_el1_abi::ReservationMm::new(successor_raw) else {
+        return denied;
+    };
+    let Some(execution) = stopped_execution(region, cpu, ttbr0) else {
+        return denied;
+    };
+    if execution.binding.mm.raw() != successor.raw()
+        || execution.context.mm.raw().get() != successor.raw()
+    {
+        return denied;
+    }
+    let Some((_, zone)) = stopped_records(region, cpu) else {
+        return denied;
+    };
+    if zone.spaces.find(predecessor.raw()).is_some() {
+        return denied;
+    }
+    let Some(absence) = SlotAbsence::scan(
+        predecessor,
+        (0..carrick_sched_core::ZONE_SLOTS)
+            .filter_map(carrick_guest_arch::SlotId::from_index)
+            .map(|slot| zone.installed_space(slot)),
+    ) else {
+        return denied;
+    };
+    let receipt = {
+        let receipts = custody.native_exec_predecessors.lock();
+        receipts.iter().copied().find(|receipt| {
+            receipt.predecessor() == predecessor && receipt.successor() == successor
+        })
+    };
+    let Some(receipt) = receipt else {
+        return denied;
+    };
+    let Some(inventory) = custody.fork_stock.lock().inventory() else {
+        return denied;
+    };
+    let Some(pointer) = region.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
+        carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
+    ) else {
+        return denied;
+    };
+    // SAFETY: initialized atomic ABI record in the retained carrier mapping.
+    let residency = unsafe { &*pointer };
+    let settled = {
+        let mut stock = custody.fork_stock.lock();
+        let mut ledger = crate::fork_stock::fork_table_accounting(custody);
+        stock.owner.settle_exec_predecessor(
+            &mut ledger,
+            receipt,
+            absence,
+            |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
+            |_, absence| {
+                carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence.mm())
+            },
+        )
+    };
+    if settled.is_err() {
+        return denied;
+    }
+    let mut receipts = custody.native_exec_predecessors.lock();
+    if let Some(index) = receipts.iter().position(|candidate| *candidate == receipt) {
+        receipts.swap_remove(index);
+        [METADATA_GRANT_SUCCESS, 0, 0, 0]
+    } else {
+        denied
+    }
+}
+
 /// Physical process crossings use HVC #6. Metadata allocation uses its mailbox.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn handle_metadata_grant_trap(
@@ -1961,6 +2052,15 @@ pub(crate) fn handle_metadata_grant_trap(
                 arg2,
                 ttbr0,
             )?
+        } else {
+            [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
+        }
+    } else if op == carrick_el1_abi::GRANT_OP_EXEC_SETTLE {
+        let ttbr0 = vcpu
+            .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
+            .map_err(|e| TrapError::Hypervisor(format!("read exec successor root: {e}")))?;
+        if let Some(region) = region {
+            service_native_exec_settle(custody, generation, region, cpu, arg1, arg2, arg3, ttbr0)
         } else {
             [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
         }

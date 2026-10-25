@@ -358,6 +358,9 @@ pub const GRANT_OP_CHILD_RECLAIM: u64 = 10;
 /// Consume one authenticated native exec preparation and adopt its physical
 /// successor backing for the stopped execution.
 pub const GRANT_OP_EXEC_ADOPT: u64 = 11;
+/// Settle the exact native-exec predecessor after the ring has switched to
+/// the authenticated successor translation and retired the old MM owner.
+pub const GRANT_OP_EXEC_SETTLE: u64 = 12;
 
 /// Bounded debug rendering of a typed refusal, retained on the stopped EL1 stack.
 #[repr(C, align(64))]

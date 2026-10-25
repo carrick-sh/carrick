@@ -36,6 +36,8 @@ use carrick_personality_linux::lifecycle::{
 };
 #[cfg(test)]
 use carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
+#[cfg(test)]
+use carrick_sched_core::RecordId;
 use carrick_sched_core::process::{TaskKey, TaskSerial};
 use carrick_sched_core::{Aarch64ParkedContext, ThreadCtx, ZoneTables};
 use core::num::NonZeroU64;
@@ -266,6 +268,15 @@ impl ForkStockCrossing for TestStockCrossing {
             physical.lock().unwrap().reclaim(zone);
         }
         Ok(())
+    }
+
+    fn cross_exec_adopt(&self, record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
+        // SAFETY: the synchronous fixture owns this aligned stack record.
+        let request = unsafe { &mut *(record_gpa as *mut carrick_el1_abi::NativeExecAdoption) };
+        request
+            .request()
+            .and_then(|_| request.accept().then_some(()))
+            .ok_or(NativeProcessError::Stale)
     }
 
     fn open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
@@ -957,6 +968,76 @@ fn native_process_entry_uses_parked_root_generation_after_record_reuse() {
     let other_root = ttbr0 + 0x1000;
     assert!(matches!(
         unsafe { observed_entry_address(source, &fixture.task, other_root, record) },
+        Err(NativeProcessError::Stale)
+    ));
+}
+
+#[test]
+fn native_exec_adoption_publishes_closed_manifest_before_consuming_receipt() {
+    use carrick_core_abi::service::{
+        ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
+        ServiceBirth, ServiceIdentity,
+    };
+    use carrick_core_abi::{El1MmHandle, EntryThreadGeneration, SnapshotGeneration};
+    use carrick_sched_core::process::TaskId;
+    use core::num::NonZeroI32;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let service = fixture.process_service();
+    let generation = NonZeroU64::new(43).unwrap();
+    let identity = ServiceIdentity {
+        birth: ServiceBirth {
+            process: TaskKey {
+                id: TaskId::from_registry_allocation(NonZeroI32::new(7).unwrap()),
+                serial: TaskSerial::from_registry_allocation(NonZeroU64::new(11).unwrap()),
+            },
+            thread: EntryThreadGeneration::from_raw(13),
+            record: carrick_sched_core::RecordRef {
+                id: RecordId::from_raw(7).unwrap(),
+                incarnation: 17,
+            },
+            mm: unsafe {
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::MIN,
+                    ReservationMm::new(19).unwrap(),
+                    NonZeroU64::new(23).unwrap(),
+                )
+            },
+        },
+        execution: SnapshotGeneration::from_raw(29),
+        sequence: NonZeroU64::new(31).unwrap(),
+    };
+    let successor_mm = ReservationMm::new(37).unwrap();
+    let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(41).unwrap()).unwrap();
+    let root = RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap();
+    let manifest = ExecSuccessorManifest::propose(identity, successor_mm)
+        .seal(
+            identity,
+            receipt,
+            ExecSuccessorBacking {
+                root,
+                root_generation: generation,
+                asid: asid(47),
+                asid_generation: NonZeroU64::new(53).unwrap(),
+            },
+            ExecSuccessorEntry {
+                entry: UserVa::new(0x40_0000),
+                stack_pointer: UserVa::new(0x7fff_f000),
+            },
+        )
+        .unwrap();
+
+    let adopted = service
+        .adopt_exec_successor(identity, receipt, &manifest)
+        .unwrap();
+    assert_eq!(adopted.address.mm.raw().get(), successor_mm.raw());
+    assert_eq!(adopted.address.root, root);
+    assert!(
+        !fixture.zone.spaces.is_open(successor_mm.raw()),
+        "successor stays closed until graph publication commits"
+    );
+    assert!(matches!(
+        service.adopt_exec_successor(identity, receipt, &manifest),
         Err(NativeProcessError::Stale)
     ));
 }
