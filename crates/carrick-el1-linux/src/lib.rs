@@ -12,6 +12,7 @@ pub mod aarch64_process_tests;
 pub mod common_entry;
 pub mod cow_resolver;
 pub mod dispatch;
+pub mod exec_stage;
 pub mod file;
 pub mod file_table;
 pub mod fork_loan;

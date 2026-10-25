@@ -11,6 +11,20 @@ struct ServicePin {
     _mapping: HostMetadataExtentPin,
     _carrier: Arc<crate::trap::CarrierVmCustody>,
 }
+struct RetainedExecPayload {
+    pointer: core::ptr::NonNull<u8>,
+    len: usize,
+    _mapping: Option<HostMetadataExtentPin>,
+}
+
+impl RetainedExecPayload {
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: intake authenticated the whole contiguous range against the
+        // exact live stage-1 root. The ring retains the allocation through ACK;
+        // a dynamic aperture allocation additionally retains its host mapping.
+        unsafe { core::slice::from_raw_parts(self.pointer.as_ptr(), self.len) }
+    }
+}
 impl Deref for ServicePin {
     type Target = ServiceCell;
     fn deref(&self) -> &ServiceCell {
@@ -30,6 +44,7 @@ pub struct NativeService {
     cow: Option<carrick_core_abi::service::ServiceFaultSupply>,
     reply: Option<core::ptr::NonNull<carrick_el1_abi::PortalGrantSlot>>,
     _reply_pin: Option<HostMetadataExtentPin>,
+    exec_payload: Option<RetainedExecPayload>,
 }
 impl core::fmt::Debug for NativeService {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -75,6 +90,11 @@ impl NativeService {
 
     pub fn slot(&self) -> carrick_sched_core::SlotId {
         self.slot
+    }
+
+    /// The single contiguous ring-owned input for a typed exec request.
+    pub fn exec_payload(&self) -> Option<&[u8]> {
+        self.exec_payload.as_ref().map(RetainedExecPayload::bytes)
     }
 
     /// Supply exact-MM physical COW stock; the ring owns fault policy and retry.
@@ -602,9 +622,21 @@ pub(super) fn take(
                 } else {
                     (None, None)
                 };
+                let exec_payload = match ticket.request().operation {
+                    carrick_core_abi::service::ServiceOperation::Exec { payload } => {
+                        Some(retain_exec_payload(
+                            custody,
+                            region,
+                            ticket.request().identity.birth.mm,
+                            payload,
+                        )?)
+                    }
+                    _ => None,
+                };
                 Ok(NativeService {
                     reply,
                     _reply_pin: reply_pin,
+                    exec_payload,
                     ticket,
                     cow,
                     custody: Arc::clone(custody),
@@ -618,6 +650,109 @@ pub(super) fn take(
         }
     })()?;
     Ok(Some(service))
+}
+
+fn retain_exec_payload(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    region: RetainedAbiRegion<'_>,
+    handle: carrick_core_abi::El1MmHandle,
+    payload: carrick_core_abi::service::ExecPayloadDescriptor,
+) -> Result<RetainedExecPayload, TrapError> {
+    let address = payload.address().raw();
+    let len = usize::try_from(payload.length().raw()).map_err(|_| stale())?;
+    let end = address.checked_add(len as u64).ok_or_else(stale)?;
+
+    // Authentication is against the request's retained MM incarnation, not
+    // whichever task a host process lookup happens to find.
+    {
+        let stock = custody.fork_stock.lock();
+        if stock.owner.child_owner(handle.mm()) != Some(handle) {
+            return Err(stale());
+        }
+        let root = stock.owner.child_root(handle.mm()).ok_or_else(stale)?;
+        let mut cursor = address;
+        while cursor < end {
+            if native_output(custody, root, cursor) != Some(cursor & !4095) {
+                return Err(stale());
+            }
+            cursor = end.min((cursor | 4095).checked_add(1).ok_or_else(stale)?);
+        }
+    }
+
+    let bootstrap_start = carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE;
+    let bootstrap_end = bootstrap_start + carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE;
+    if address >= bootstrap_start && end <= bootstrap_end {
+        let offset =
+            usize::try_from(address - carrick_el1_abi::EL1_REGION_BASE).map_err(|_| stale())?;
+        let pointer = core::ptr::NonNull::new(region.record_ptr::<u8>(offset).ok_or_else(stale)?)
+            .ok_or_else(stale)?;
+        return Ok(RetainedExecPayload {
+            pointer,
+            len,
+            _mapping: None,
+        });
+    }
+
+    let address = carrick_guest_arch::KernelVa::new(address);
+    let (_, base, extent_len) =
+        retained_dynamic_metadata(custody, address, len).ok_or_else(stale)?;
+    let generation = custody.live_generation().ok_or_else(stale)?;
+    let pin = {
+        let aperture = metadata_aperture(custody).lock();
+        let index =
+            ((base - EL1_DYNAMIC_METADATA_BASE) / EL1_DYNAMIC_METADATA_EXTENT_SIZE as u64) as usize;
+        let mapping = aperture
+            .slots
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or_else(stale)?;
+        aperture
+            .pin_extent(
+                MetadataExtent::new(base, extent_len as u64, mapping.token).ok_or_else(stale)?,
+                generation.0,
+            )
+            .map_err(|_| stale())?
+    };
+    // SAFETY: retained_dynamic_metadata checked the complete payload range.
+    let pointer = unsafe {
+        pin.host_base()
+            .as_ptr()
+            .add((address.raw() - base) as usize)
+    };
+    Ok(RetainedExecPayload {
+        pointer: core::ptr::NonNull::new(pointer).ok_or_else(stale)?,
+        len,
+        _mapping: Some(pin),
+    })
+}
+
+// The stock lock retains the table arenas; exclusion prevents descriptor edits.
+fn native_output(
+    custody: &crate::trap::CarrierVmCustody,
+    root: carrick_guest_arch::RootGpa,
+    va: u64,
+) -> Option<u64> {
+    let mut table = root.address().raw();
+    for (level, index) in carrick_mmu_core::aarch64::indices(va)
+        .into_iter()
+        .enumerate()
+    {
+        let pointer = crate::fork_stock::ForkStockHostCustody::physical_ptr::<AtomicU64>(
+            custody,
+            carrick_guest_arch::FrameGpa::new(table + index as u64 * 8),
+        )
+        .ok()?;
+        // SAFETY: retained stock tables and exact owner exclusion, atomic word.
+        let word = unsafe { &*pointer }.load(Ordering::Acquire);
+        if level == 3 {
+            return (word != 0).then_some(word & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK);
+        }
+        if word & 3 != 3 {
+            return None;
+        }
+        table = word & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
+    }
+    None
 }
 
 pub(crate) fn settle_native_cow(

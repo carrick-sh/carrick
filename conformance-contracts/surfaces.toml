@@ -1527,7 +1527,7 @@ contracts = ["core.entry.completion"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/dispatch.rs"
-contracts = ["process.native.arm-admission", "core.entry.completion", "core.personality.files", "kernel.el1.ipc-fd-authority"]
+contracts = ["process.native.arm-admission", "core.entry.completion", "core.personality.files", "kernel.el1.ipc-fd-authority", "process.exec.custody"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/trap.rs"
@@ -1945,15 +1945,19 @@ contracts = ["kernel.fs.directory-copyout"]
 
 [[surfaces]]
 path = "crates/carrick-core-abi/src/service.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
+contracts = ["kernel.scheduler.runnable-progress", "process.exec.custody"]
+
+[[surfaces]]
+path = "crates/carrick-el1-linux/src/exec_stage.rs"
+contracts = ["process.exec.custody"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/native_process_runtime/service.rs"
-contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-child"]
+contracts = ["kernel.scheduler.runnable-progress", "process.native.terminal-child", "process.exec.custody"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/metadata_grant/native_service.rs"
-contracts = ["kernel.scheduler.runnable-progress"]
+contracts = ["kernel.scheduler.runnable-progress", "process.exec.custody"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/physical_grants.rs"
