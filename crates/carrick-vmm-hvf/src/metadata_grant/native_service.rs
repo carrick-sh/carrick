@@ -32,6 +32,10 @@ struct RetainedExecPayload {
     len: usize,
     _mapping: Option<HostMetadataExtentPin>,
 }
+enum NativeServiceReply {
+    Fault(core::ptr::NonNull<carrick_el1_abi::PortalGrantSlot>),
+    Exec(core::ptr::NonNull<carrick_core_abi::service::ExecSuccessorManifest>),
+}
 
 impl RetainedExecPayload {
     fn bytes(&self) -> &[u8] {
@@ -58,7 +62,7 @@ pub struct NativeService {
     custody: Arc<crate::trap::CarrierVmCustody>,
     slot: carrick_sched_core::SlotId,
     cow: Option<carrick_core_abi::service::ServiceFaultSupply>,
-    reply: Option<core::ptr::NonNull<carrick_el1_abi::PortalGrantSlot>>,
+    reply: Option<NativeServiceReply>,
     _reply_pin: Option<HostMetadataExtentPin>,
     exec_payload: Option<RetainedExecPayload>,
 }
@@ -118,18 +122,29 @@ impl NativeService {
     /// publishing `Supplied`; the result remains carrier-owned by exact
     /// birth/MM/execution/sequence.
     pub fn prepare_exec(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
-        let (capability, payload) = match self.request().operation {
+        let request = self.request();
+        let (capability, payload) = match request.operation {
             carrick_core_abi::service::ServiceOperation::Exec {
                 capability,
                 payload: _,
             } => (capability, self.exec_payload().ok_or_else(stale)?),
             _ => return self.refuse(),
         };
+        let _successor_mm = match self.reply.as_ref() {
+            Some(NativeServiceReply::Exec(manifest)) => {
+                // SAFETY: intake pinned the complete aligned ring-owned reply;
+                // request completion has not yet released that allocation.
+                unsafe { manifest.as_ref() }
+                    .proposal(request.identity)
+                    .ok_or_else(stale)?
+            }
+            _ => return Err(stale()),
+        };
         let service = self
             .custody
             .native_exec_service(capability)
             .ok_or_else(stale)?;
-        match service.prepare(self.request(), payload) {
+        match service.prepare(request, payload) {
             Ok(prepared) => self.publish_exec_prepared(prepared),
             Err(failure) => self.finish_exec_failure(failure),
         }
@@ -344,7 +359,7 @@ impl NativeService {
             DescriptorOp, DescriptorTxn, DescriptorTxnId, MAX_TABLE_GRANTS, PageSpan,
         };
         use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
-        let Some(reply) = self.reply else {
+        let Some(NativeServiceReply::Fault(reply)) = self.reply else {
             return self.refuse();
         };
         let custody = Arc::clone(&self.custody);
@@ -707,8 +722,24 @@ pub(super) fn take(
                     .take_fault_selection(portal.grant(cpu.raw() as usize).ok_or_else(stale)?)
                     .map_err(|_| stale())?;
                 let (reply, reply_pin) = if let Some(address) = ticket.reply_address() {
-                    let (pointer, pin) = retain_reply(custody, region, address)?;
-                    (Some(pointer), pin)
+                    match ticket.request().operation {
+                        carrick_core_abi::service::ServiceOperation::Fault(fault)
+                            if !fault.present =>
+                        {
+                            let (pointer, pin) = retain_reply::<carrick_el1_abi::PortalGrantSlot>(
+                                custody, region, address,
+                            )?;
+                            (Some(NativeServiceReply::Fault(pointer)), pin)
+                        }
+                        carrick_core_abi::service::ServiceOperation::Exec { .. } => {
+                            let (pointer, pin) =
+                                retain_reply::<carrick_core_abi::service::ExecSuccessorManifest>(
+                                    custody, region, address,
+                                )?;
+                            (Some(NativeServiceReply::Exec(pointer)), pin)
+                        }
+                        _ => return Err(stale()),
+                    }
                 } else {
                     (None, None)
                 };
@@ -880,7 +911,9 @@ pub(super) fn settle_native_descriptor_reply(
         if execution.binding.mm.raw() != owner.mm().raw() {
             return Err(());
         }
-        let (reply, _pin) = retain_reply(custody, region, reply_address).map_err(|_| ())?;
+        let (reply, _pin) =
+            retain_reply::<carrick_el1_abi::PortalGrantSlot>(custody, region, reply_address)
+                .map_err(|_| ())?;
         // SAFETY: retain_reply pins the complete aligned slot until settlement.
         let reply = unsafe { reply.as_ref() };
         let window = reply.window().ok_or(())?;
@@ -935,18 +968,12 @@ pub(super) fn settle_native_descriptor_reply(
     }
 }
 
-pub(super) fn retain_reply(
+pub(super) fn retain_reply<T>(
     custody: &Arc<crate::trap::CarrierVmCustody>,
     region: RetainedAbiRegion<'_>,
     address: carrick_guest_arch::KernelVa,
-) -> Result<
-    (
-        core::ptr::NonNull<carrick_el1_abi::PortalGrantSlot>,
-        Option<HostMetadataExtentPin>,
-    ),
-    TrapError,
-> {
-    let size = core::mem::size_of::<carrick_el1_abi::PortalGrantSlot>();
+) -> Result<(core::ptr::NonNull<T>, Option<HostMetadataExtentPin>), TrapError> {
+    let size = core::mem::size_of::<T>();
     if address.raw() < EL1_DYNAMIC_METADATA_BASE {
         let offset = address
             .raw()
@@ -984,10 +1011,7 @@ pub(super) fn retain_reply(
             .as_ptr()
             .add((address.raw() - base) as usize)
     };
-    if !pointer
-        .addr()
-        .is_multiple_of(core::mem::align_of::<carrick_el1_abi::PortalGrantSlot>())
-    {
+    if !pointer.addr().is_multiple_of(core::mem::align_of::<T>()) {
         return Err(stale());
     }
     Ok((

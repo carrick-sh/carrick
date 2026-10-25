@@ -641,14 +641,7 @@ impl PublicationView {
 /// torn or mis-sized record; it is not a cryptographic authenticator, so the
 /// consumer still authenticates every field against its own ledger.
 fn digest_words(words: &[u64; 15]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for word in words {
-        for byte in word.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    hash
+    crate::integrity_digest(words)
 }
 
 impl MmPublication {
