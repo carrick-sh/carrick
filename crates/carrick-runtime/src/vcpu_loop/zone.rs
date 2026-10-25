@@ -40,7 +40,10 @@ pub(super) enum OwnerMemoryAction {
 pub(super) enum OwnerMemoryPark {
     Parked(executor::ExecutorExit),
     Recheck(OwnerMemoryAction),
-    NoProducer(OwnerMemoryAction),
+    NoProducer {
+        action: OwnerMemoryAction,
+        wait: carrick_el1_abi::PortalOwnerWait,
+    },
 }
 
 /// A Reservations receipt names the root-release stream, but selection can
@@ -899,7 +902,7 @@ where
             && !editor_is_held(zone, wait_mm)
         {
             zone.free_record(record);
-            return Ok(OwnerMemoryPark::NoProducer(action));
+            return Ok(OwnerMemoryPark::NoProducer { action, wait });
         }
         match enrollment.park_host_rechecked(record, token, &complete, || match cause {
             carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations => {

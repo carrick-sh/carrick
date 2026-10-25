@@ -27,6 +27,42 @@ requested repetitions without reproducing the #847 watchdog hang:
   Carrick fatal.
 - Hangs/watchdogs: 0/10.
 
+## Run 06 EFAULT attribution and correction
+
+The failed run exited normally, so it produced no watchdog census or event-ring
+post-mortem. Its exact signed log is retained at
+`/tmp/847-final-hostread-06.log`; the only guest failure is the valid-buffer
+`read(fd=5) iter=427 rc=-1 errno=14` quoted above. The source path was exact:
+physical retention reported a stale selected leaf as an Editor wait, the
+editor revision was current while the editor word was free, and
+`OwnerMemoryPark::NoProducer` fabricated `EFAULT` without asking EL1 to select
+the guest address again. Thus a completed edit or transient stage-2
+replacement could be mistaken for an unmapped guest VMA.
+
+The VM-free production witness
+`serial_host_stale_selection_without_editor_reselects_and_parks_on_physical_producer`
+reproduced that path with a valid mapping. Red-first, the saved syscall
+returned `EFAULT` immediately instead of blocking on the exact physical
+producer. The correction gives a producer-free Editor observation one bounded
+authoritative redispatch. EL1 selection now decides whether the guest address
+is actually unmapped; a still-mapped address either completes against its
+current leaf or returns an exact owner/physical producer. The witness then
+parks without polling, wakes on physical-retirement completion, and commits
+the copyout. A repeated identical producer-free receipt is a carrier invariant
+error, never a guest `EFAULT` and never an unbounded redrive.
+
+Portable verification on the correction:
+
+- focused witness: 1 passed;
+- owner-wait population: 15 passed;
+- serialized `carrick-runtime` library: 818 passed, 9 ignored;
+- `just fmt-check`, `just lint-domains`, `just clippy`, and
+  `just clippy-linux`: passed;
+- `just test-kernel`: passed.
+
+The required signed 20/20 proof must use the exact post-correction fixture
+bundle and is intentionally deferred until that bundle is relayed.
+
 The first companion `el1_ipc_two_processes_blocking` repetition,
 `847-final-two-process-01`, hit its 60-second watchdog. Per the director's
 stop condition, the remaining two repetitions and all requested
@@ -34,6 +70,10 @@ stop condition, the remaining two repetitions and all requested
 `el1_ipc_pipe_blocking_roundtrips` repetitions were not run. Every completed
 outer run was followed by `scripts/sudo/kill.sh <run-id>` and reported zero
 remaining scoped processes.
+
+This two-process watchdog is recorded only as companion evidence. The director
+also reproduced its missing-second-process shape on main and explicitly moved
+it out of this fix's scope.
 
 ## Signed executable identities
 

@@ -451,6 +451,7 @@ impl Eq for OwnerRedriveProducer {}
 
 struct OwnerRedriveProgress {
     last_producer: Option<OwnerRedriveProducer>,
+    unproduced_reselect: Option<carrick_el1_abi::PortalOwnerWait>,
     consecutive_stalled_passes: usize,
     committed_bytes: u64,
 }
@@ -462,6 +463,7 @@ impl Default for OwnerRedriveProgress {
     fn default() -> Self {
         Self {
             last_producer: None,
+            unproduced_reselect: None,
             consecutive_stalled_passes: 0,
             committed_bytes: 0,
         }
@@ -481,10 +483,12 @@ impl OwnerRedriveProgress {
                 })?;
             self.consecutive_stalled_passes = 0;
             self.last_producer = None;
+            self.unproduced_reselect = None;
             return Ok(());
         }
         if producer.is_some() && producer != self.last_producer {
             self.last_producer = producer;
+            self.unproduced_reselect = None;
             self.consecutive_stalled_passes = 0;
             return Ok(());
         }
@@ -499,6 +503,19 @@ impl OwnerRedriveProgress {
                 "owner resume exceeded its consecutive no-progress bound".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    fn authorize_unproduced_reselect(
+        &mut self,
+        wait: carrick_el1_abi::PortalOwnerWait,
+    ) -> Result<(), RuntimeError> {
+        if self.unproduced_reselect == Some(wait) {
+            return Err(RuntimeError::Configuration(
+                "authoritative owner reselect repeated without a producer".to_owned(),
+            ));
+        }
+        self.unproduced_reselect = Some(wait);
         Ok(())
     }
 
@@ -1858,9 +1875,10 @@ where
                             let action = self.take_retained_memory_action()?;
                             return Ok(RetainedMemoryWaitAttempt::Retry { action });
                         }
-                        super::zone::OwnerMemoryPark::NoProducer(
-                            super::zone::OwnerMemoryAction::Retained,
-                        ) => {
+                        super::zone::OwnerMemoryPark::NoProducer {
+                            action: super::zone::OwnerMemoryAction::Retained,
+                            ..
+                        } => {
                             let action = self.take_retained_memory_action()?;
                             match action {
                                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3727,7 +3745,9 @@ where
                     frame,
                     outcome,
                     resume,
-                } => self.service_owner_step(engine, control, frame, outcome, resume)?,
+                } => {
+                    self.service_owner_step(engine, control, frame, outcome, resume, &mut progress)?
+                }
                 OwnerResumeWork::RetainedAction(action) => {
                     match self.drive_retained_memory_attempt(engine, control, action)? {
                         RetainedMemoryAttempt::Exit(exit) => OwnerResumeStep::Exit(exit),
@@ -3775,6 +3795,7 @@ where
         frame: carrick_hal::RawSyscall,
         outcome: DispatchOutcome,
         mut resume: Option<OwnedSyscallResume>,
+        progress: &mut OwnerRedriveProgress,
     ) -> Result<OwnerResumeStep, ProductionHvpatchPollError> {
         if let DispatchOutcome::OwnerMemorySupply { request, committed } = outcome {
             self.state.owner_read_progress = self
@@ -3846,15 +3867,39 @@ where
                 super::zone::OwnerMemoryPark::Parked(exit) => {
                     return Ok(OwnerResumeStep::Exit(exit));
                 }
-                super::zone::OwnerMemoryPark::NoProducer(
-                    super::zone::OwnerMemoryAction::Syscall { .. },
-                ) => {
+                super::zone::OwnerMemoryPark::NoProducer {
+                    action:
+                        super::zone::OwnerMemoryAction::Syscall {
+                            frame: retry_frame,
+                            resume: retry,
+                        },
+                    wait,
+                } => {
+                    debug_assert_eq!(retry_frame, frame);
+                    progress.authorize_unproduced_reselect(wait)?;
+                    let outcome =
+                        match self.resume_owner_ready_step(engine, control, retry_frame, retry)? {
+                            OwnerReadyStep::Exit(exit) => {
+                                return Ok(OwnerResumeStep::Exit(exit));
+                            }
+                            OwnerReadyStep::Outcome(outcome) => outcome,
+                        };
+                    if let Some(park) = self.state.pending_ipc_park.take() {
+                        return self
+                            .ipc_park(engine, control, frame, park)
+                            .map(OwnerResumeStep::Exit);
+                    }
+                    let (outcome, next_resume) = owner_copyin_route(outcome);
+                    resume = next_resume.or_else(|| {
+                        self.state
+                            .pending_ipc_owner
+                            .take()
+                            .map(OwnedSyscallResume::Ipc)
+                    });
                     return Ok(OwnerResumeStep::Continue(OwnerResumeWork::Syscall {
                         frame,
-                        outcome: DispatchOutcome::Errno {
-                            errno: carrick_abi::LINUX_EFAULT,
-                        },
-                        resume: None,
+                        outcome,
+                        resume,
                     }));
                 }
                 super::zone::OwnerMemoryPark::Recheck(

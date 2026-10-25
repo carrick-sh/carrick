@@ -4515,7 +4515,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn serial_host_stale_selection_without_editor_fails_closed() {
+    fn serial_host_stale_selection_without_editor_reselects_and_parks_on_physical_producer() {
         exercise_owner_wait_schedule_at(
             carrick_abi::syscall::nr::FSTAT,
             None,
@@ -5003,6 +5003,8 @@ pub(crate) mod tests {
                             wait,
                             zone: zone as *const _ as usize,
                         });
+                        engine.prepare_dependency =
+                            Some(carrick_guest_mem::OwnedMemoryWait::new(retirement.clone()));
                     }
                     if physical {
                         assert!(matches!(first, DispatchOutcome::OwnerPhysicalWait { .. }));
@@ -5103,7 +5105,8 @@ pub(crate) mod tests {
                         carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::clone(
                             &scheduler,
                         ));
-                    let physical_park = physical || free_reservation_redrive;
+                    let physical_park =
+                        physical || free_reservation_redrive || stale_selection_without_editor;
                     if physical {
                         let binding::OwnedSyscallResume::Ipc(pending) = resume else {
                             panic!("retained pipe read")
@@ -5127,16 +5130,7 @@ pub(crate) mod tests {
                         let parked = job
                             .owner_memory_park(&mut engine, &mut control, frame, wait, resume)
                             .unwrap();
-                        if stale_selection_without_editor {
-                            assert!(matches!(parked, executor::ExecutorExit::Syscall));
-                            assert_eq!(
-                                engine.completed_syscalls,
-                                [carrick_abi::LINUX_EFAULT.guest_retval()]
-                            );
-                            assert_eq!(scheduler.queued_len(), 0);
-                            return;
-                        }
-                        if free_reservation_redrive {
+                        if free_reservation_redrive || stale_selection_without_editor {
                             assert!(matches!(parked, executor::ExecutorExit::Blocked(_)));
                             running
                                 .restore_lease(submission.take_execution_lease().unwrap())
@@ -5266,15 +5260,20 @@ pub(crate) mod tests {
                         }
                     }
                     let killing = signum == Some(carrick_abi::LINUX_SIGKILL);
-                    if free_reservation_redrive {
+                    if free_reservation_redrive || stale_selection_without_editor {
                         assert_eq!(
                             scheduler.queued_len(),
                             0,
                             "a persistently refused physical pin must park without polling"
                         );
+                        if stale_selection_without_editor {
+                            engine.prepare_dependency = None;
+                            engine.copyout_owner_probe = None;
+                            engine.copyout_prepare = Some(Box::new(|| None));
+                        }
                         retirement.complete();
                     }
-                    if !killing {
+                    if !killing && !stale_selection_without_editor {
                         release_tx.send(()).unwrap();
                         peer.take().unwrap().join().unwrap();
                     }
