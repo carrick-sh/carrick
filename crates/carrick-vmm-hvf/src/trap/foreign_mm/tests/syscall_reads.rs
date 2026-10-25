@@ -47,7 +47,7 @@ impl PooledReadFixture {
 
     /// munmap's frame release for this mm's only reference.
     fn retire(&self) -> GlobalFrameRetirementOutcome {
-        retire_global_frame_host_owner_if_generation_in_using(
+        retire_test_global_frame_host_owner_if_generation_in_using(
             &self.custody,
             self.key.0,
             self.key.1,

@@ -426,6 +426,19 @@ struct GrantedSlotRecord {
     generation: u64,
 }
 
+/// Validated EL1 metadata-aperture retirement operation. The aperture has a
+/// permanent carrier-control stage-1 leaf, so it is outside user-MM SELECT;
+/// only the exact validated return transaction may retire its stage-2 record.
+pub(crate) struct El1MetadataRetirement {
+    identity: crate::trap::CarrierStage2RecordIdentity,
+}
+
+impl El1MetadataRetirement {
+    pub(crate) fn matches(&self, identity: crate::trap::CarrierStage2RecordIdentity) -> bool {
+        self.identity == identity
+    }
+}
+
 // SAFETY: each variant owns stable, synchronized storage for its entire lifetime.
 unsafe impl RetainedMetadataBacking for MetadataBacking {
     fn host_base(&self) -> carrick_guest_mem::HostVa {
@@ -587,20 +600,28 @@ impl RetainedMetadataMapping {
             if request_has_live_vm(&self.access.carrier.custody, Some(self.access.generation)) {
                 metadata_aperture(&self.access.carrier.custody)
                     .lock()
-                    .retire_retained_using(self.extent, self.access.generation.0, |record| {
-                        retire_metadata_record_using(
-                            &self.access.carrier.custody,
-                            record.identity,
-                            |ipa, len| {
-                                let rc = unsafe { crate::trap::inventory_hv_vm_unmap(ipa, len) };
-                                if rc == 0 {
-                                    Ok(())
-                                } else {
-                                    Err(crate::trap::CarrierStage2BackendError::HvReturn(rc as u32))
-                                }
-                            },
-                        )
-                    })
+                    .retire_retained_using(
+                        self.extent,
+                        self.access.generation.0,
+                        |record, proof| {
+                            retire_metadata_record_using(
+                                &self.access.carrier.custody,
+                                record.identity,
+                                proof,
+                                |ipa, len| {
+                                    let rc =
+                                        unsafe { crate::trap::inventory_hv_vm_unmap(ipa, len) };
+                                    if rc == 0 {
+                                        Ok(())
+                                    } else {
+                                        Err(crate::trap::CarrierStage2BackendError::HvReturn(
+                                            rc as u32,
+                                        ))
+                                    }
+                                },
+                            )
+                        },
+                    )
             } else {
                 METADATA_GRANT_ERR_DENIED
             };
@@ -738,7 +759,7 @@ impl HostApertureState {
         size: usize,
         token: u64,
         generation: u64,
-        unmap: impl FnOnce(&GrantedSlotRecord) -> bool,
+        unmap: impl FnOnce(&GrantedSlotRecord, &El1MetadataRetirement) -> bool,
     ) -> u64 {
         if self
             .slots
@@ -755,7 +776,7 @@ impl HostApertureState {
         &mut self,
         extent: MetadataExtent,
         generation: u64,
-        unmap: impl FnOnce(&GrantedSlotRecord) -> bool,
+        unmap: impl FnOnce(&GrantedSlotRecord, &El1MetadataRetirement) -> bool,
     ) -> u64 {
         let Some(offset) = extent.base().checked_sub(EL1_DYNAMIC_METADATA_BASE) else {
             return METADATA_GRANT_ERR_INVALID;
@@ -786,7 +807,7 @@ impl HostApertureState {
         size: usize,
         token: u64,
         generation: u64,
-        unmap: impl FnOnce(&GrantedSlotRecord) -> bool,
+        unmap: impl FnOnce(&GrantedSlotRecord, &El1MetadataRetirement) -> bool,
     ) -> u64 {
         let Some(record) = self.slots.get(slot).and_then(Option::as_ref) else {
             return METADATA_GRANT_ERR_NOT_FOUND;
@@ -798,7 +819,10 @@ impl HostApertureState {
         if Arc::strong_count(&record.backing) != 1 {
             return METADATA_GRANT_ERR_DENIED;
         }
-        if !unmap(record) {
+        let retirement = El1MetadataRetirement {
+            identity: record.identity,
+        };
+        if !unmap(record, &retirement) {
             return METADATA_GRANT_ERR_DENIED;
         }
         let count = record.num_slots;
@@ -924,14 +948,26 @@ fn publish_metadata_mapping_using(
 fn retire_metadata_record_using(
     custody: &crate::trap::CarrierVmCustody,
     identity: crate::trap::CarrierStage2RecordIdentity,
+    retirement: &El1MetadataRetirement,
     unmap: impl FnOnce(u64, usize) -> Result<(), crate::trap::CarrierStage2BackendError>,
 ) -> bool {
     use crate::trap::CarrierStage2RetireOutcome;
-    match custody.retire_stage2_record_using(identity, unmap) {
+    let Some(stage1) = custody.stage1_unpublished_from_receipt(
+        identity,
+        crate::trap::Stage1UnpublicationReceipt::El1Metadata(retirement),
+    ) else {
+        return false;
+    };
+    if custody.request_stage2_record_retirement(identity, stage1)
+        != CarrierStage2RetireOutcome::DeferredActivePins
+    {
+        return false;
+    }
+    match custody.retire_stage2_record_using(identity, stage1, unmap) {
         CarrierStage2RetireOutcome::RetiredUnmapped
-        | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
-            custody.remove_terminal_stage2_record(identity).is_some()
-        }
+        | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => custody
+            .remove_terminal_stage2_record(identity, stage1)
+            .is_some(),
         _ => false,
     }
 }
@@ -1124,19 +1160,22 @@ pub(crate) fn service_metadata_operation(
             return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
         }
 
-        let status =
-            aperture
-                .lock()
-                .return_extent_using(slot_idx, size, token, generation, |record| {
-                    retire_metadata_record_using(custody, record.identity, |ipa, size| {
-                        let rc = unsafe { crate::trap::inventory_hv_vm_unmap(ipa, size) };
-                        if rc == 0 {
-                            Ok(())
-                        } else {
-                            Err(crate::trap::CarrierStage2BackendError::HvReturn(rc as u32))
-                        }
-                    })
-                });
+        let status = aperture.lock().return_extent_using(
+            slot_idx,
+            size,
+            token,
+            generation,
+            |record, proof| {
+                retire_metadata_record_using(custody, record.identity, proof, |ipa, size| {
+                    let rc = unsafe { crate::trap::inventory_hv_vm_unmap(ipa, size) };
+                    if rc == 0 {
+                        Ok(())
+                    } else {
+                        Err(crate::trap::CarrierStage2BackendError::HvReturn(rc as u32))
+                    }
+                })
+            },
+        );
         if status == METADATA_GRANT_SUCCESS {
             RETURNS_COMPLETED.fetch_add(1, Ordering::Relaxed);
             BYTES_RETURNED.fetch_add(size as u64, Ordering::Relaxed);
@@ -2908,7 +2947,7 @@ mod tests {
         unsafe { pin.host_base().as_ptr().write(0x5a) };
         let mut unmapped = false;
         assert_eq!(
-            state.return_extent_using(0, size, 19, generation.0, |_| {
+            state.return_extent_using(0, size, 19, generation.0, |_, _| {
                 unmapped = true;
                 true
             }),
@@ -2919,7 +2958,7 @@ mod tests {
         assert_eq!(unsafe { pin.host_base().as_ptr().read() }, 0x5a);
         drop(pin);
         assert_eq!(
-            state.return_extent_using(0, size, 19, generation.0, |_| true),
+            state.return_extent_using(0, size, 19, generation.0, |_, _| true),
             METADATA_GRANT_SUCCESS
         );
         assert!(state.pin_extent(extent, generation.0).is_err());
@@ -3061,18 +3100,18 @@ mod tests {
         });
         for (token, generation) in [(0, 1), (8, 1), (7, 2)] {
             assert_eq!(
-                state.return_extent_using(slot, size, token, generation, |_| panic!(
+                state.return_extent_using(slot, size, token, generation, |_, _| panic!(
                     "mismatched identity must not unmap"
                 )),
                 METADATA_GRANT_ERR_INVALID
             );
         }
         assert_eq!(
-            state.return_extent_using(slot, size, 7, 1, |record| retire_metadata_record_using(
-                &custody,
-                record.identity,
-                |_, _| Err(crate::trap::CarrierStage2BackendError::HvReturn(1))
-            )),
+            state.return_extent_using(slot, size, 7, 1, |record, proof| {
+                retire_metadata_record_using(&custody, record.identity, proof, |_, _| {
+                    Err(crate::trap::CarrierStage2BackendError::HvReturn(1))
+                })
+            }),
             METADATA_GRANT_ERR_DENIED
         );
         let retained = state.slots[slot]
@@ -3087,8 +3126,8 @@ mod tests {
         assert!(state.is_slot_occupied(slot) && state.is_slot_occupied(slot + 1));
         assert_eq!(state.find_and_reserve_slots(1), Some(2));
         assert_eq!(
-            state.return_extent_using(slot, size, 7, 1, |record| {
-                retire_metadata_record_using(&custody, record.identity, |ipa, bytes| {
+            state.return_extent_using(slot, size, 7, 1, |record, proof| {
+                retire_metadata_record_using(&custody, record.identity, proof, |ipa, bytes| {
                     assert_eq!(ipa, EL1_DYNAMIC_METADATA_BASE);
                     assert_eq!(bytes, size);
                     Ok(())
@@ -3107,7 +3146,7 @@ mod tests {
             "unpublished reservation must remain occupied"
         );
         assert_eq!(
-            state.return_extent_using(slot, size, 7, 1, |_| panic!(
+            state.return_extent_using(slot, size, 7, 1, |_, _| panic!(
                 "already returned backing must not unmap twice"
             )),
             METADATA_GRANT_ERR_NOT_FOUND
@@ -3256,18 +3295,18 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            state.return_extent_using(0, 16384, extent.token(), a.0, |_| panic!(
+            state.return_extent_using(0, 16384, extent.token(), a.0, |_, _| panic!(
                 "guest cannot release lifecycle backing"
             )),
             METADATA_GRANT_ERR_DENIED
         );
         assert_eq!(
-            state.retire_retained_using(extent, a.0, |_| panic!("pin excludes retirement")),
+            state.retire_retained_using(extent, a.0, |_, _| panic!("pin excludes retirement")),
             METADATA_GRANT_ERR_DENIED
         );
         drop(pin);
         assert_eq!(
-            state.retire_retained_using(extent, a.0, |_| false),
+            state.retire_retained_using(extent, a.0, |_, _| false),
             METADATA_GRANT_ERR_DENIED
         );
         assert!(
@@ -3275,11 +3314,9 @@ mod tests {
             "failed unmap released live backing"
         );
         assert_eq!(
-            state.retire_retained_using(extent, a.0, |record| retire_metadata_record_using(
-                &first,
-                record.identity,
-                |_, _| Ok(())
-            )),
+            state.retire_retained_using(extent, a.0, |record, proof| {
+                retire_metadata_record_using(&first, record.identity, proof, |_, _| Ok(()))
+            }),
             METADATA_GRANT_SUCCESS
         );
         assert!(weak.upgrade().is_none());

@@ -1396,17 +1396,29 @@ pub(crate) fn final_exec_physical_extents(
 pub(crate) mod tests;
 
 impl HvfVmState {
-    pub(crate) fn retire_stage2_extent(&mut self, ipa: u64, length: u64) -> Result<(), TrapError> {
+    pub(crate) fn retire_stage2_extent(
+        &mut self,
+        stage1: Stage1UnpublicationReceipt<'_>,
+        ipa: u64,
+        length: u64,
+    ) -> Result<(), TrapError> {
         #[cfg(not(test))]
         {
             let custody = std::sync::Arc::clone(&self.custody);
-            Self::retire_stage2_extent_from_mappings_in(&custody, &mut self.mappings, ipa, length)
+            Self::retire_stage2_extent_from_mappings_in(
+                &custody,
+                &mut self.mappings,
+                stage1,
+                ipa,
+                length,
+            )
         }
         #[cfg(test)]
         {
             Self::retire_stage2_extent_from_mappings_in(
                 legacy_test_carrier_vm_custody(),
                 &mut self.mappings,
+                stage1,
                 ipa,
                 length,
             )
@@ -1416,10 +1428,24 @@ impl HvfVmState {
     pub(crate) fn retire_stage2_extent_from_mappings_in(
         custody: &CarrierVmCustody,
         mappings: &mut TaskMappingIndex,
+        stage1_receipt: Stage1UnpublicationReceipt<'_>,
         ipa: u64,
         length: u64,
     ) -> Result<(), TrapError> {
-        let outcome = retire_global_frame_host_owner_in(custody, ipa, length);
+        let outcome = if let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length)
+        {
+            let proof = custody
+                .stage1_unpublished_for_retirement(identity)
+                .or_else(|| custody.stage1_unpublished_from_receipt(identity, stage1_receipt))
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "stage-2 owner remains reachable from authoritative stage-1".to_owned(),
+                    )
+                })?;
+            retire_global_frame_host_owner_in(custody, proof, ipa, length)
+        } else {
+            GlobalFrameRetirementOutcome::NotFound { ipa, length }
+        };
         if outcome.is_retired()
             || matches!(
                 outcome,
@@ -1460,6 +1486,26 @@ impl HvfVmState {
                 .retained
                 .owner_retired
                 .store(true, std::sync::atomic::Ordering::Release);
+            if custody
+                .stage1_unpublished_for_retirement(identity)
+                .is_none()
+            {
+                let proof = custody
+                    .stage1_unpublished_from_receipt(identity, stage1_receipt)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "structural owner remains reachable from authoritative stage-1"
+                                .to_owned(),
+                        )
+                    })?;
+                let requested = custody.request_stage2_record_retirement(identity, proof);
+                if requested != CarrierStage2RetireOutcome::DeferredActivePins {
+                    mappings.restore_structural_owner(row, owner);
+                    return Err(TrapError::Hypervisor(format!(
+                        "structural stage-2 retirement request failed: {requested:?}"
+                    )));
+                }
+            }
             let retirement = retry_structural_backing_identities_in_using(
                 custody,
                 &[identity],
@@ -1488,6 +1534,24 @@ impl HvfVmState {
         // whose lease was still live, and the lease's `Drop` then released it
         // again.
         if let Some(identity) = take_carrier_stage2_record(custody, ipa, length) {
+            if custody
+                .stage1_unpublished_for_retirement(identity)
+                .is_none()
+            {
+                let proof = custody
+                    .stage1_unpublished_from_receipt(identity, stage1_receipt)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "carrier owner remains reachable from authoritative stage-1".to_owned(),
+                        )
+                    })?;
+                let requested = custody.request_stage2_record_retirement(identity, proof);
+                if requested != CarrierStage2RetireOutcome::DeferredActivePins {
+                    return Err(TrapError::Hypervisor(format!(
+                        "carrier stage-2 retirement request failed: {requested:?}"
+                    )));
+                }
+            }
             retire_carrier_stage2_record_at_safe_point(custody, identity)?;
             return Ok(());
         }
@@ -1552,9 +1616,41 @@ impl HvfVmState {
         ipa: u64,
         length: u64,
     ) -> Result<(), TrapError> {
+        let custody = legacy_test_carrier_vm_custody();
+        let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let (_, receipt) =
+            carrick_aarch64::vmm::Stage1UnpublishedRange::retire_extension_arenas(&mut manager);
         Self::retire_stage2_extent_from_mappings_in(
-            legacy_test_carrier_vm_custody(),
+            custody,
             mappings,
+            Stage1UnpublicationReceipt::Editor(&receipt),
+            ipa,
+            length,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retire_test_stage2_extent_from_mappings_in(
+        custody: &CarrierVmCustody,
+        mappings: &mut TaskMappingIndex,
+        ipa: u64,
+        length: u64,
+    ) -> Result<(), TrapError> {
+        let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let (_, receipt) =
+            carrick_aarch64::vmm::Stage1UnpublishedRange::retire_extension_arenas(&mut manager);
+        Self::retire_stage2_extent_from_mappings_in(
+            custody,
+            mappings,
+            Stage1UnpublicationReceipt::Editor(&receipt),
             ipa,
             length,
         )
@@ -2053,8 +2149,19 @@ impl HvfVmState {
             if !retired_by_kernel {
                 continue;
             }
+            let Some(record_identity) = global_frame_stage2_identity_in(custody, lease.0, lease.1)
+            else {
+                continue;
+            };
+            let Some(stage1) = custody.stage1_unpublished_for_retirement(record_identity) else {
+                // Kernel mapping-count retirement alone is not a stage-1
+                // unpublication receipt. The owning MM teardown will provide
+                // the proof and retire this quarantined owner.
+                continue;
+            };
             match retire_global_frame_host_owner_if_generation_in(
                 custody,
+                stage1,
                 lease.0,
                 lease.1,
                 projection.owner.generation,
@@ -3195,8 +3302,8 @@ impl HvfVmState {
         if !task.persistent_vm_lifecycle {
             return Ok(None);
         }
-        #[cfg(not(test))]
-        task.registration
+        let stage1_unpublished = task
+            .registration
             .as_ref()
             .ok_or_else(|| {
                 TrapError::Hypervisor(
@@ -3209,8 +3316,6 @@ impl HvfVmState {
                         .to_owned(),
                 )
             })?)?;
-        #[cfg(test)]
-        let _stage1_unpublished = stage1_unpublished;
         if let Some(mm) = task
             .cow_identity
             .and_then(|identity| carrick_el1_abi::ReservationMm::new(identity.mm))
@@ -3471,6 +3576,23 @@ impl HvfVmState {
                     if Self::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
                         let outcome = retire_global_frame_host_owner_if_generation_in(
                             custody,
+                            custody
+                                .stage1_unpublished_from_receipt(
+                                    global_frame_stage2_identity_in(custody, ipa, length)
+                                        .ok_or_else(|| {
+                                            TrapError::Hypervisor(
+                                                "process retirement lost global record identity"
+                                                    .to_owned(),
+                                            )
+                                        })?,
+                                    Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
+                                )
+                                .ok_or_else(|| {
+                                    TrapError::Hypervisor(
+                                        "process retirement could not bind stage-1 proof"
+                                            .to_owned(),
+                                    )
+                                })?,
                             ipa,
                             length,
                             owner.generation,
@@ -3505,6 +3627,7 @@ impl HvfVmState {
                     Self::retire_stage2_extent_from_mappings_in(
                         custody,
                         &mut task.mappings,
+                        Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
                         ipa,
                         length,
                     )

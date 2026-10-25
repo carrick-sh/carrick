@@ -1105,9 +1105,16 @@ impl Stage1MmRetirement {
     /// Before the retired ASID is invalidated for reuse: no vCPU in the guest
     /// has the address space installed by EL1 any more, and its published
     /// entry is freed.
-    pub(crate) fn retire_address_space(&self) -> carrick_core::mm::retirement::Stage1UnpublishedMm {
-        let space = self.space.lock().take();
-        carrick_core::mm::retirement::drain_publication(space, &self.residency)
+    pub(crate) fn retire_address_space(
+        &self,
+    ) -> Result<carrick_core::mm::retirement::Stage1UnpublishedMm, String> {
+        let space = self.space.lock().take().ok_or_else(|| {
+            "published HVPatch MM retirement lost its address-space publication".to_owned()
+        })?;
+        Ok(carrick_core::mm::retirement::drain_publication(
+            space,
+            &self.residency,
+        ))
     }
 
     pub(crate) fn asid_generation(&self) -> AsidGeneration {
@@ -1784,7 +1791,9 @@ mod tests {
         let retirer = {
             let retirement = Arc::clone(&retirement);
             std::thread::spawn(move || {
-                retirement.retire_address_space();
+                retirement
+                    .retire_address_space()
+                    .expect("retire published address space");
                 decided.send(retirement.needs_invalidation()).unwrap();
             })
         };

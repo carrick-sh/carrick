@@ -800,12 +800,10 @@ pub struct Stage1UnpublishedMm {
 /// Drop the closed publication (draining sched-core occupants) before waiting
 /// for admitted host loads and deciding which hardware invalidation is owed.
 pub fn drain_publication<V: ResidencyVenue, G: Copy + Eq, P: AddressPublication>(
-    publication: Option<P>,
+    publication: P,
     residency: &ResidencyRetirement<V, G>,
 ) -> Stage1UnpublishedMm {
-    if let Some(publication) = publication.as_ref() {
-        publication.retire_reservations();
-    }
+    publication.retire_reservations();
     drop(publication);
     residency.wait_for_admitted_loads();
     Stage1UnpublishedMm { _private: () }
@@ -878,7 +876,7 @@ mod nonce_tests {
             .expect("retirement");
 
         let _stage1_unpublished = drain_publication(
-            Some(OrderedPublication(std::sync::Arc::clone(&order))),
+            OrderedPublication(std::sync::Arc::clone(&order)),
             &residency,
         );
         // This models the first operation a consumer of Stage1UnpublishedMm

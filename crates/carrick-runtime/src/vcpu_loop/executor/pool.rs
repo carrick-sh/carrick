@@ -662,7 +662,7 @@ impl PoolControl {
         // Guest EL1 may have installed the address space on vCPUs itself:
         // they are out of it (and its entry freed) before the ASID's
         // translations are invalidated for reuse.
-        let stage1_unpublished = retirement.retire_address_space();
+        let stage1_unpublished = retirement.retire_address_space()?;
         if !retirement.needs_invalidation() {
             return Ok(stage1_unpublished);
         }

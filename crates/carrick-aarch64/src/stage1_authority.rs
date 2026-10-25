@@ -1218,6 +1218,41 @@ impl Stage1Authority {
         }
     }
 
+    /// Perform one host edit and return a retirement receipt only when the
+    /// complete edited VA range is absent from the authoritative stage-1
+    /// image after the edit. The receipt cannot be constructed outside this
+    /// crate and therefore cannot be replaced by a bare IPA identity.
+    pub fn edit_unpublishing<B, F, R, E>(
+        &self,
+        builder: B,
+        va: u64,
+        len: usize,
+        f: F,
+    ) -> Result<(R, Option<crate::vmm::Stage1UnpublishedRange>), E>
+    where
+        B: FnOnce() -> Result<PageTableManager, E>,
+        F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
+    {
+        self.edit(builder, |editor| {
+            let result = f(editor)?;
+            let end = va.checked_add(len as u64);
+            let unpublished = end.is_some_and(|end| {
+                let mut cursor = va & !0xfff;
+                while cursor < end {
+                    if editor.translate(cursor).is_some() {
+                        return false;
+                    }
+                    cursor = cursor.saturating_add(4096);
+                }
+                true
+            });
+            Ok((
+                result,
+                unpublished.then(|| crate::vmm::Stage1UnpublishedRange::after_engine_edit(va, len)),
+            ))
+        })
+    }
+
     /// Restore a previous manager image (e.g. during rollback).
     /// The input remains owned by the caller on error and is consumed only on success.
     ///

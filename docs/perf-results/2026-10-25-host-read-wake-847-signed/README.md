@@ -370,3 +370,60 @@ Portable verification on this correction:
 
 This correction changes the EL1 ABI layout hash. No signed test was run; an
 exact-candidate fixture bundle is required for the signed 20/20 proof.
+
+## Stage-1-first retirement proof correction after `a5d9b1682`
+
+The stage-2 retirement capability is no longer minted from an IPA identity.
+The exact record witness is private to carrier custody and can be derived only
+from a completed stage-1 editor receipt, the whole-MM inventory drain, an
+unpublished inventory rollback, or the typed EL1 metadata teardown. Final
+record request, unmap, terminal removal, and global-frame retirement all
+require that witness. Whole-MM exit and exec publish their stage-1 drain before
+the detached stage-2 inventory becomes eligible, while publication rollback
+uses the still-unpublished inventory transaction.
+
+Host copies also revalidate a sampled leaf against the authoritative stage-1
+table before reporting `Stage2AuthorityInvariant`. A host-side replacement or
+unmap therefore reselects immediately; closing an MM reads as an Editor change.
+The record directory now maintains a `BTreeMap` extent index and checks only
+the predecessor and successor on registration. Stage-2 publication/removal is
+owned by an RAII guard which publishes after its directory lock drops, including
+rollback. A refused terminal retirement remains indexed as quarantine and its
+IPA cannot be reissued.
+
+Exactly four tests were newly added in this correction:
+
+- `serial_host_mm_exit_close_races_a_parked_sibling_copy_without_invariant_kill`
+  drives the shared exit/exec MM-close path while a sibling host copy is parked;
+- `serial_host_munmap_retirement_races_blocking_read_with_one_executor` drives
+  the production owner-memory park with one executor;
+- `host_stage1_unmap_of_selected_leaf_forces_ready_reselect` removes a selected
+  leaf through the production stage-1 authority and proves ready reselection;
+- `stage2_extent_index_checks_only_adjacent_intervals` proves neighbour-only
+  overlap admission.
+
+Two pre-existing tests were materially strengthened, not counted as new:
+
+- `two_mms_by_n_real_retirements_leave_no_custody_growth` now performs 64 real
+  stage-1 unmaps and typed stage-2 retirements across two MMs and checks the
+  directory returns to its baseline size;
+- `serial_host_global_owner_collision_refuses_before_custody_transfer` now
+  asserts interval collision is refused before backend custody or rollback.
+
+Fresh portable verification:
+
+- the six focused filters above: 6 passed, 0 failed;
+- `just fmt-check`, `just clippy`, `just clippy-linux`, and
+  `just lint-domains`: passed;
+- `just test-kernel`: passed (EL1 ABI 147/147, FD core 54/54,
+  kernel 2,638 passed with one ignored, and every kernel-semantics target
+  completed without a failure);
+- default EL1 image: 1,053,104 / 1,572,864 bytes; maximum checked stack
+  11,503 / 12,288 bytes (`native wait copy`);
+- allocator-test-control EL1 image: 1,057,296 / 1,572,864 bytes; maximum
+  checked stack 11,503 / 12,288 bytes (`native wait copy`);
+- all-target clippy EL1 image: 1,077,712 / 1,572,864 bytes; maximum checked
+  stack 11,951 / 12,288 bytes (`signal terminal exit`).
+
+No signed test was run because this correction changes source and therefore
+requires an exact-candidate fixture bundle.

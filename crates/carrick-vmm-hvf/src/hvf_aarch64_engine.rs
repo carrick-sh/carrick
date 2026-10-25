@@ -449,9 +449,9 @@ use carrick_mem::memory::AddressSpace;
 use crate::syscall_mailbox::{HvfSyscallTransport, MailboxBinding};
 use crate::trap::{
     GuestMappingPlan, HvfInner, HvfTaskState, HvfVmState, HvpatchPreparedCarrierTaskState,
-    HvpatchTaskOnlyBackendState, PersistentExecutorSpec, ProcessSpec, ThreadSpec, VcpuSnapshot,
-    hvf_get_reg, hvf_get_sys_reg, hvf_set_reg, hvf_set_sys_reg, set_simd_fp_reg_v,
-    swap_hvpatch_task_state,
+    HvpatchTaskOnlyBackendState, PersistentExecutorSpec, ProcessSpec, Stage1UnpublicationReceipt,
+    ThreadSpec, VcpuSnapshot, hvf_get_reg, hvf_get_sys_reg, hvf_set_reg, hvf_set_sys_reg,
+    set_simd_fp_reg_v, swap_hvpatch_task_state,
 };
 pub use crate::trap::{
     HvpatchCarrierTaskIdentity, HvpatchCarrierTaskStateDirectory, HvpatchChildKernelBinding,
@@ -2350,6 +2350,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn commit_anonymous_discard(
         &mut self,
+        stage1: &carrick_aarch64::vmm::Stage1UnpublishedRange,
         ticket: Self::AnonymousDiscard,
     ) -> Result<(), TrapError> {
         let identity = self
@@ -2367,6 +2368,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             identity.linux_tid,
         );
         self.state.commit_process_alias_retirement(
+            Stage1UnpublicationReceipt::Editor(stage1),
             ticket.va,
             ticket.len,
             ticket.prepared,
@@ -2960,11 +2962,17 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.shared_futex_location(backing_gpa.raw())
     }
 
-    fn on_unmap(&mut self, va: u64, len: usize) -> Result<(), TrapError> {
+    fn on_unmap(
+        &mut self,
+        stage1: &carrick_aarch64::vmm::Stage1UnpublishedRange,
+        va: u64,
+        len: usize,
+    ) -> Result<(), TrapError> {
         // The shared engine calls this only after checked stage-1 teardown and
         // TLBI succeed. A failed edit therefore retains this process-shared alias
         // owner; successful teardown removes the high-VA lookup (low VA no-op).
-        self.state.unregister_process_alias(va, len)
+        self.state
+            .unregister_process_alias(Stage1UnpublicationReceipt::Editor(stage1), va, len)
     }
 
     fn add_alias(

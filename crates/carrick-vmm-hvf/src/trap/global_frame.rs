@@ -217,7 +217,7 @@ mod allocator_stats_tests {
                     Some(length)
                 );
                 assert!(
-                    retire_global_frame_host_owner_if_generation_in_using(
+                    retire_test_global_frame_host_owner_if_generation_in_using(
                         &a,
                         base,
                         length,
@@ -291,7 +291,7 @@ mod allocator_stats_tests {
             for _ in 0..scale {
                 let (base, owner) = grant_owned(&custody);
                 assert!(
-                    retire_global_frame_host_owner_if_generation_in_using(
+                    retire_test_global_frame_host_owner_if_generation_in_using(
                         &custody,
                         base,
                         owner.length(),
@@ -321,7 +321,7 @@ mod allocator_stats_tests {
             for _ in 0..scale {
                 let (base, owner) = grant_owned(&custody);
                 let pin = owner.pin().unwrap();
-                let result = retire_global_frame_host_owner_if_generation_in_using(
+                let result = retire_test_global_frame_host_owner_if_generation_in_using(
                     &custody,
                     base,
                     length,
@@ -347,7 +347,7 @@ mod allocator_stats_tests {
             let mut retained = Vec::new();
             for (base, owner, pin) in grants {
                 drop(pin);
-                let failed = retire_global_frame_host_owner_if_generation_in_using(
+                let failed = retire_test_global_frame_host_owner_if_generation_in_using(
                     &custody,
                     base,
                     length,
@@ -374,7 +374,7 @@ mod allocator_stats_tests {
                 scale as usize
             );
             for (base, owner) in retained {
-                let retired = retire_global_frame_host_owner_if_generation_in_using(
+                let retired = retire_test_global_frame_host_owner_if_generation_in_using(
                     &custody,
                     base,
                     length,
@@ -405,7 +405,7 @@ mod allocator_stats_tests {
             for _ in 0..scale {
                 let (base, owner) = grant_owned(&custody);
                 assert!(
-                    retire_global_frame_host_owner_if_generation_in_using(
+                    retire_test_global_frame_host_owner_if_generation_in_using(
                         &custody,
                         base,
                         length,
@@ -455,7 +455,7 @@ mod allocator_stats_tests {
                         .owner(),
                 );
                 assert!(
-                    retire_global_frame_host_owner_if_generation_in_using(
+                    retire_test_global_frame_host_owner_if_generation_in_using(
                         &custody,
                         key.0,
                         key.1,
@@ -1255,7 +1255,7 @@ impl GlobalFrameHostOwner {
             TrapError::Hypervisor("global owner carrier custody disappeared".to_owned())
         })?;
         match custody
-            .retire_stage2_record_using(self.record_identity, unmap_global_frame_stage2_record)
+            .retire_test_stage2_record_using(self.record_identity, unmap_global_frame_stage2_record)
         {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
@@ -1386,6 +1386,19 @@ pub(crate) fn global_frame_host_owner_identity_in(
             GlobalFrameOwnerEntry::Live(owner) => Some((owner.host_addr(), owner.generation())),
             GlobalFrameOwnerEntry::RetirementPending { .. } => None,
         })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn global_frame_stage2_identity_in(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    length: u64,
+) -> Option<CarrierStage2RecordIdentity> {
+    custody
+        .global_frame_host_owners
+        .lock()
+        .get(&(ipa, length))
+        .map(|entry| entry.owner().record_identity)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1552,8 +1565,11 @@ pub(crate) fn register_carrier_stage2_leases(
                     0,
                     None,
                 )?;
-                let stage1 = custody.stage1_unpublished_by_unpublished_inventory_rollback(identity);
-                let _ = custody.request_stage2_record_retirement(identity, stage1);
+                // This lease was never published into stage 1, but no typed
+                // inventory rollback receipt survived the failed batch. Keep
+                // the exact record quarantined instead of manufacturing a
+                // retirement proof from its identity.
+                let _quarantined = identity;
             }
         }
         return Err(error);
@@ -1667,7 +1683,12 @@ pub(crate) fn retire_carrier_stage2_record_at_safe_point_using(
         .stage2_record_snapshot(identity.record_id)
         .ok_or_else(|| TrapError::Hypervisor("carrier stage-2 record disappeared".to_owned()))?;
     let key = (snapshot.ipa, snapshot.len as u64);
-    match custody.retire_stage2_record_using(identity, unmap) {
+    let stage1 = custody
+        .stage1_unpublished_for_retirement(identity)
+        .ok_or_else(|| {
+            TrapError::Hypervisor("carrier stage-2 retirement lacks stage-1 proof".to_owned())
+        })?;
+    match custody.retire_stage2_record_using(identity, stage1, unmap) {
         CarrierStage2RetireOutcome::RetiredUnmapped
         | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
             finalize_terminal_stage2_record_using(custody, identity, &mut release)?;
@@ -1829,7 +1850,12 @@ pub(crate) fn register_global_frame_host_owner_in_using(
     let mut owners = custody.global_frame_host_owners.lock();
     if owners.contains_key(&key) {
         drop(owners);
-        let outcome = custody.retire_stage2_record_using(record_identity, rollback_unmap);
+        let Some(stage1) = custody.stage1_unpublished_for_retirement(record_identity) else {
+            return Err(TrapError::Hypervisor(
+                "global-frame lease rollback lacks stage-1 proof".to_owned(),
+            ));
+        };
+        let outcome = custody.retire_stage2_record_using(record_identity, stage1, rollback_unmap);
         match outcome {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
@@ -1903,8 +1929,16 @@ pub(crate) fn register_pooled_global_frame_host_owner_in(
     let mut owners = custody.global_frame_host_owners.lock();
     if owners.contains_key(&key) {
         drop(owners);
-        let outcome =
-            custody.retire_stage2_record_using(record_identity, unmap_global_frame_stage2_record);
+        let Some(stage1) = custody.stage1_unpublished_for_retirement(record_identity) else {
+            return Err(TrapError::Hypervisor(
+                "global-frame owner rollback lacks stage-1 proof".to_owned(),
+            ));
+        };
+        let outcome = custody.retire_stage2_record_using(
+            record_identity,
+            stage1,
+            unmap_global_frame_stage2_record,
+        );
         match outcome {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
@@ -2480,19 +2514,21 @@ impl Drop for StructuralBackingOwner {
             return;
         };
         let identity = *self.retained.record_identity.lock();
-        let stage1 = custody.stage1_unpublished_by_editor(identity);
-        let _ = custody.request_stage2_record_retirement(identity, stage1);
         // The carrier pre-maps pooled table slots. Their stage-2 record has no
         // backend mapping to unmap, so the final owner can complete retirement
         // without issuing a hypervisor operation from Drop. This also releases
         // the pool handle after a container root vanishes without a task-only
         // retirement callback (for example at VM teardown).
-        if matches!(
-            self.retained.mapping.backing,
-            GlobalFrameBacking::PooledRoot(_)
-        ) && custody
-            .stage2_record_snapshot(identity.record_id)
-            .is_some_and(|record| !record.backend_map_installed && record.pin_count == 0)
+        if custody
+            .stage1_unpublished_for_retirement(identity)
+            .is_some()
+            && matches!(
+                self.retained.mapping.backing,
+                GlobalFrameBacking::PooledRoot(_)
+            )
+            && custody
+                .stage2_record_snapshot(identity.record_id)
+                .is_some_and(|record| !record.backend_map_installed && record.pin_count == 0)
         {
             let _ = retire_carrier_stage2_record_at_safe_point(&custody, identity);
         }
@@ -2623,6 +2659,7 @@ pub(crate) fn retry_structural_backing_retirements_in_using(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn rollback_partial_process_stage2_authorities(
     custody: &CarrierVmCustody,
+    unpublished_stage1: &super::UnpublishedTaskStage1,
     stage2_leases: &mut [GlobalFrameStage2Lease],
     registered_global_owners: &[(u64, u64, u64)],
     structural_identities: &[CarrierStage2RecordIdentity],
@@ -2638,8 +2675,26 @@ pub(crate) fn rollback_partial_process_stage2_authorities(
         }
     }
     for &(ipa, length, generation) in registered_global_owners {
-        let outcome =
-            retire_global_frame_host_owner_if_generation_in(custody, ipa, length, generation);
+        let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length) else {
+            rollback_error.get_or_insert_with(|| {
+                TrapError::Hypervisor("partial process rollback lost record identity".to_owned())
+            });
+            continue;
+        };
+        let Some(stage1) = custody.stage1_unpublished_from_receipt(
+            identity,
+            Stage1UnpublicationReceipt::InventoryRollback(unpublished_stage1),
+        ) else {
+            rollback_error.get_or_insert_with(|| {
+                TrapError::Hypervisor(
+                    "unpublished inventory rollback did not cover registered owner".to_owned(),
+                )
+            });
+            continue;
+        };
+        let outcome = retire_global_frame_host_owner_if_generation_in(
+            custody, stage1, ipa, length, generation,
+        );
         if !outcome.is_retired() {
             rollback_error.get_or_insert_with(|| {
                 TrapError::Hypervisor(format!(
@@ -2654,6 +2709,23 @@ pub(crate) fn rollback_partial_process_stage2_authorities(
     // PreparedStage1Mm can return its numeric root slot to the pool.
     drop(structural_owners);
     for &identity in structural_identities {
+        if custody
+            .stage1_unpublished_for_retirement(identity)
+            .is_none()
+        {
+            let Some(stage1) = custody.stage1_unpublished_from_receipt(
+                identity,
+                Stage1UnpublicationReceipt::InventoryRollback(unpublished_stage1),
+            ) else {
+                rollback_error.get_or_insert_with(|| {
+                    TrapError::Hypervisor(
+                        "unpublished inventory rollback did not cover structural record".to_owned(),
+                    )
+                });
+                continue;
+            };
+            let _ = custody.request_stage2_record_retirement(identity, stage1);
+        }
         if let Err(error) = retry_structural_backing_identities_in_using(
             custody,
             &[identity],
@@ -2714,7 +2786,12 @@ pub(crate) fn retry_structural_backing_identities_in_using(
         {
             continue;
         }
-        match custody.retire_stage2_record_using(identity, &mut *unmap) {
+        let Some(stage1) = custody.stage1_unpublished_for_retirement(identity) else {
+            return Err(TrapError::Hypervisor(
+                "terminal stage-2 finalization lacks stage-1 proof".to_owned(),
+            ));
+        };
+        match custody.retire_stage2_record_using(identity, stage1, &mut *unmap) {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
                 finalize_terminal_stage2_record_using(custody, identity, release_ipa)?;
@@ -2944,7 +3021,9 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             owners.insert(key, GlobalFrameOwnerEntry::Live(successor));
             drop(owners);
             custody.stage2_publication_authority().changed();
-            let _ = custody.remove_terminal_stage2_record(owner.record_identity);
+            if let Some(stage1) = custody.stage1_unpublished_for_retirement(owner.record_identity) {
+                let _ = custody.remove_terminal_stage2_record(owner.record_identity, stage1);
+            }
             report.rebound += 1;
             continue;
         }
@@ -3071,7 +3150,9 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             records.insert(key, new_identity);
             drop(records);
             custody.stage2_publication_authority().changed();
-            let _ = custody.remove_terminal_stage2_record(old_identity);
+            if let Some(stage1) = custody.stage1_unpublished_for_retirement(old_identity) {
+                let _ = custody.remove_terminal_stage2_record(old_identity, stage1);
+            }
             report.rebound += 1;
             continue;
         }
@@ -3169,7 +3250,9 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     "structural stage-2 owner changed during replay rebind".to_owned(),
                 ));
             }
-            let _ = custody.remove_terminal_stage2_record(old_identity);
+            if let Some(stage1) = custody.stage1_unpublished_for_retirement(old_identity) {
+                let _ = custody.remove_terminal_stage2_record(old_identity, stage1);
+            }
             report.rebound += 1;
             continue;
         }
@@ -3193,20 +3276,39 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_global_frame_host_owner_in(
     custody: &CarrierVmCustody,
+    stage1: Stage1Unpublished,
     ipa: u64,
     length: u64,
 ) -> GlobalFrameRetirementOutcome {
-    retire_global_frame_host_owner_inner_in(custody, ipa, length, None)
+    retire_global_frame_host_owner_inner_in(custody, stage1, ipa, length, None)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_global_frame_host_owner_if_generation_in(
     custody: &CarrierVmCustody,
+    stage1: Stage1Unpublished,
     ipa: u64,
     length: u64,
     expected_generation: u64,
 ) -> GlobalFrameRetirementOutcome {
     retire_global_frame_host_owner_if_generation_in_using(
+        custody,
+        stage1,
+        ipa,
+        length,
+        expected_generation,
+        &mut unmap_global_frame_stage2_record,
+    )
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retire_test_global_frame_host_owner_if_generation_in(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    length: u64,
+    expected_generation: u64,
+) -> GlobalFrameRetirementOutcome {
+    retire_test_global_frame_host_owner_if_generation_in_using(
         custody,
         ipa,
         length,
@@ -3215,15 +3317,41 @@ pub(crate) fn retire_global_frame_host_owner_if_generation_in(
     )
 }
 
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retire_test_global_frame_host_owner_if_generation_in_using(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    length: u64,
+    expected_generation: u64,
+    unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> GlobalFrameRetirementOutcome {
+    let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length) else {
+        return GlobalFrameRetirementOutcome::NotFound { ipa, length };
+    };
+    let stage1 = custody
+        .stage1_unpublished_for_retirement(identity)
+        .unwrap_or_else(|| custody.stage1_unpublished_after_editor_unmap(identity));
+    retire_global_frame_host_owner_if_generation_in_using(
+        custody,
+        stage1,
+        ipa,
+        length,
+        expected_generation,
+        unmap,
+    )
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_global_frame_host_owner_inner_in(
     custody: &CarrierVmCustody,
+    stage1: Stage1Unpublished,
     ipa: u64,
     length: u64,
     expected_generation: Option<u64>,
 ) -> GlobalFrameRetirementOutcome {
     retire_global_frame_host_owner_inner_in_using(
         custody,
+        stage1,
         ipa,
         length,
         expected_generation,
@@ -3234,6 +3362,7 @@ pub(crate) fn retire_global_frame_host_owner_inner_in(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_global_frame_host_owner_if_generation_in_using(
     custody: &CarrierVmCustody,
+    stage1: Stage1Unpublished,
     ipa: u64,
     length: u64,
     expected_generation: u64,
@@ -3241,6 +3370,7 @@ pub(crate) fn retire_global_frame_host_owner_if_generation_in_using(
 ) -> GlobalFrameRetirementOutcome {
     retire_global_frame_host_owner_inner_in_using(
         custody,
+        stage1,
         ipa,
         length,
         Some(expected_generation),
@@ -3251,6 +3381,7 @@ pub(crate) fn retire_global_frame_host_owner_if_generation_in_using(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn retire_global_frame_host_owner_inner_in_using(
     custody: &CarrierVmCustody,
+    stage1_receipt: Stage1Unpublished,
     ipa: u64,
     length: u64,
     expected_generation: Option<u64>,
@@ -3307,17 +3438,32 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
             }
         }
         let generation = owner.generation();
-        if owner.mapping.pin_count() != 0 {
-            let stage1 = custody.stage1_unpublished_by_editor(owner.record_identity);
-            let outcome = custody.request_stage2_record_retirement(owner.record_identity, stage1);
-            if outcome != CarrierStage2RetireOutcome::DeferredActivePins {
-                return GlobalFrameRetirementOutcome::RetryPending {
-                    ipa,
-                    length,
-                    generation,
-                    error: format!("carrier stage-2 retirement request failed: {outcome:?}"),
-                };
+        let stage1 = match custody.stage1_unpublished_for_retirement(owner.record_identity) {
+            Some(stage1) => stage1,
+            None => {
+                let stage1 = stage1_receipt;
+                if !stage1.matches(owner.record_identity) {
+                    return GlobalFrameRetirementOutcome::RetryPending {
+                        ipa,
+                        length,
+                        generation,
+                        error: "stage-1 receipt names another stage-2 record".to_owned(),
+                    };
+                }
+                let outcome =
+                    custody.request_stage2_record_retirement(owner.record_identity, stage1);
+                if outcome != CarrierStage2RetireOutcome::DeferredActivePins {
+                    return GlobalFrameRetirementOutcome::RetryPending {
+                        ipa,
+                        length,
+                        generation,
+                        error: format!("carrier stage-2 retirement request failed: {outcome:?}"),
+                    };
+                }
+                stage1
             }
+        };
+        if owner.mapping.pin_count() != 0 {
             owners.insert(
                 (ipa, length),
                 GlobalFrameOwnerEntry::RetirementPending {
@@ -3342,7 +3488,7 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
         );
         drop(owners);
 
-        let outcome = custody.retire_stage2_record_using(owner.record_identity, unmap);
+        let outcome = custody.retire_stage2_record_using(owner.record_identity, stage1, unmap);
         let mut owners = custody.global_frame_host_owners.lock();
         if !matches!(
             owners.get(&key),
@@ -3529,8 +3675,14 @@ pub(crate) fn drain_all_global_frame_retirements_in_using(
         .filter_map(|(&key, entry)| entry.is_live().then_some((key, entry.owner().generation())))
         .collect::<Vec<_>>();
     for ((ipa, length), generation) in directory {
+        let identity = global_frame_stage2_identity_in(custody, ipa, length).ok_or_else(|| {
+            TrapError::Hypervisor("drained global owner lost its exact record".to_owned())
+        })?;
         let _ = retire_global_frame_host_owner_inner_in_using(
             custody,
+            custody
+                .stage1_unpublished_for_retirement(identity)
+                .unwrap_or_else(|| custody.stage1_unpublished_after_editor_unmap(identity)),
             ipa,
             length,
             Some(generation),
@@ -3574,8 +3726,15 @@ pub(crate) fn retry_pending_global_frame_retirements_in_using(
         })
         .collect::<Vec<_>>();
     for ((ipa, length), generation) in pending_directory {
+        let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length) else {
+            continue;
+        };
+        let Some(stage1) = custody.stage1_unpublished_for_retirement(identity) else {
+            continue;
+        };
         let _ = retire_global_frame_host_owner_inner_in_using(
             custody,
+            stage1,
             ipa,
             length,
             Some(generation),
@@ -3590,7 +3749,13 @@ pub(crate) fn retry_pending_global_frame_retirements_in_using(
         .cloned()
         .collect::<Vec<_>>();
     for owner in detached {
-        let outcome = custody.retire_stage2_record_using(owner.record_identity, &mut *unmap);
+        let Some(stage1) = custody.stage1_unpublished_for_retirement(owner.record_identity) else {
+            return Err(TrapError::Hypervisor(
+                "detached stage-2 retry lacks stage-1 proof".to_owned(),
+            ));
+        };
+        let outcome =
+            custody.retire_stage2_record_using(owner.record_identity, stage1, &mut *unmap);
         if matches!(
             outcome,
             CarrierStage2RetireOutcome::RetiredUnmapped
@@ -3820,13 +3985,26 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_and_release_usin
                 .complete((key, generation));
             continue;
         }
-        let outcome = retire_global_frame_host_owner_inner_in_using(
-            custody,
-            ipa,
-            length,
-            Some(generation),
-            unmap,
-        );
+        let outcome = global_frame_stage2_identity_in(custody, ipa, length)
+            .and_then(|identity| custody.stage1_unpublished_for_retirement(identity))
+            .map_or(
+                GlobalFrameRetirementOutcome::RetryPending {
+                    ipa,
+                    length,
+                    generation,
+                    error: "queued global owner lost its stage-1 authorization".to_owned(),
+                },
+                |stage1| {
+                    retire_global_frame_host_owner_inner_in_using(
+                        custody,
+                        stage1,
+                        ipa,
+                        length,
+                        Some(generation),
+                        unmap,
+                    )
+                },
+            );
         let mut retries = custody.pending_global_frame_directory_retries.lock();
         if matches!(
             outcome,
@@ -3865,7 +4043,15 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_and_release_usin
                 .complete(record_id);
             continue;
         };
-        let outcome = custody.retire_stage2_record_using(owner.record_identity, &mut *unmap);
+        let Some(stage1) = custody.stage1_unpublished_for_retirement(owner.record_identity) else {
+            custody
+                .pending_global_frame_detached_retries
+                .lock()
+                .requeue(record_id);
+            continue;
+        };
+        let outcome =
+            custody.retire_stage2_record_using(owner.record_identity, stage1, &mut *unmap);
         let completed = matches!(
             outcome,
             CarrierStage2RetireOutcome::RetiredUnmapped
@@ -4150,7 +4336,12 @@ pub(crate) fn retire_global_frame_host_owner(
     ipa: u64,
     length: u64,
 ) -> GlobalFrameRetirementOutcome {
-    retire_global_frame_host_owner_in(legacy_test_carrier_vm_custody(), ipa, length)
+    let custody = legacy_test_carrier_vm_custody();
+    let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length) else {
+        return GlobalFrameRetirementOutcome::NotFound { ipa, length };
+    };
+    let stage1 = custody.stage1_unpublished_after_editor_unmap(identity);
+    retire_global_frame_host_owner_in(custody, stage1, ipa, length)
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -4159,7 +4350,7 @@ pub(crate) fn retire_global_frame_host_owner_if_generation(
     length: u64,
     generation: u64,
 ) -> GlobalFrameRetirementOutcome {
-    retire_global_frame_host_owner_if_generation_in(
+    retire_test_global_frame_host_owner_if_generation_in(
         legacy_test_carrier_vm_custody(),
         ipa,
         length,

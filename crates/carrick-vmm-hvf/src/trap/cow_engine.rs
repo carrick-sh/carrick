@@ -1717,7 +1717,16 @@ impl HvfVmState {
         if !is_exactly_el1_frame_grant(&aliases, grant) {
             return Ok(false);
         }
-        self.unregister_process_alias(grant.semantic_base, len)?;
+        let stage1_authority = self.page_tables_authority();
+        self.unregister_process_alias(
+            Stage1UnpublicationReceipt::AuthoritativeAbsence {
+                authority: &stage1_authority,
+                va: grant.semantic_base,
+                len,
+            },
+            grant.semantic_base,
+            len,
+        )?;
         let deferred = self.deferred_anonymous_state().ok_or_else(|| {
             TrapError::Hypervisor("EL1 frame-grant rollback has no deferred state".to_owned())
         })?;
@@ -1770,7 +1779,18 @@ impl HvfVmState {
             identity.linux_pid,
             identity.linux_tid,
         );
-        self.commit_process_alias_retirement(grant.semantic_base, len, retirement, &registry)?;
+        let stage1_authority = self.page_tables_authority();
+        self.commit_process_alias_retirement(
+            Stage1UnpublicationReceipt::AuthoritativeAbsence {
+                authority: &stage1_authority,
+                va: grant.semantic_base,
+                len,
+            },
+            grant.semantic_base,
+            len,
+            retirement,
+            &registry,
+        )?;
         register_shared_alias(pending.alias);
         drop(registry);
         Ok(())
@@ -1823,7 +1843,13 @@ impl HvfVmState {
             inventory: Some(inventory),
             reservation: None,
         })?;
+        let stage1_authority = self.page_tables_authority();
         self.commit_process_alias_retirement_inner(
+            Stage1UnpublicationReceipt::AuthoritativeAbsence {
+                authority: &stage1_authority,
+                va,
+                len,
+            },
             va,
             len,
             prepared,
@@ -2008,7 +2034,18 @@ impl HvfVmState {
                     // New descriptors and inventory are committed, but the new
                     // alias is not registered yet. Retire only the old rows.
                     // All ordinary allocation failures preceded this boundary.
-                    self.commit_process_alias_retirement(start, semantic_len, retirement, &registry)
+                    let stage1_authority = self.page_tables_authority();
+                    self.commit_process_alias_retirement(
+                        Stage1UnpublicationReceipt::AuthoritativeAbsence {
+                            authority: &stage1_authority,
+                            va: start,
+                            len: semantic_len,
+                        },
+                        start,
+                        semantic_len,
+                        retirement,
+                        &registry,
+                    )
                         .unwrap_or_else(|error| {
                             carrick_fatal!(
                                 "hvpatch::host_alias",
@@ -3955,11 +3992,28 @@ impl HvfTaskState {
             Ok(split) => split,
             Err(error) => {
                 if fresh_destination && !guest_lane {
-                    let _ = retire_global_frame_host_owner_in(
+                    if let Some(identity) = global_frame_stage2_identity_in(
                         custody,
                         new_physical_ipa,
                         CowArmedRanges::COMPOUND_SIZE,
-                    );
+                    ) {
+                        let authority = self.page_tables_authority();
+                        if let Some(stage1) = custody.stage1_unpublished_from_receipt(
+                            identity,
+                            Stage1UnpublicationReceipt::AuthoritativeAbsence {
+                                authority: &authority,
+                                va: receipt_va,
+                                len: span.len,
+                            },
+                        ) {
+                            let _ = retire_global_frame_host_owner_in(
+                                custody,
+                                stage1,
+                                new_physical_ipa,
+                                CowArmedRanges::COMPOUND_SIZE,
+                            );
+                        }
+                    }
                 }
                 return Err(error);
             }
@@ -4278,11 +4332,28 @@ impl HvfTaskState {
                 }
             }
             if fresh_destination && !guest_lane {
-                let _ = retire_global_frame_host_owner_in(
+                if let Some(identity) = global_frame_stage2_identity_in(
                     custody,
                     new_physical_ipa,
                     CowArmedRanges::COMPOUND_SIZE,
-                );
+                ) {
+                    let authority = self.page_tables_authority();
+                    if let Some(stage1) = custody.stage1_unpublished_from_receipt(
+                        identity,
+                        Stage1UnpublicationReceipt::AuthoritativeAbsence {
+                            authority: &authority,
+                            va: receipt_va,
+                            len: span.len,
+                        },
+                    ) {
+                        let _ = retire_global_frame_host_owner_in(
+                            custody,
+                            stage1,
+                            new_physical_ipa,
+                            CowArmedRanges::COMPOUND_SIZE,
+                        );
+                    }
+                }
             }
             return Err(error);
         }
@@ -4324,6 +4395,8 @@ impl HvfTaskState {
             HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
                 self.retire_stage2_extent_for_cow(
                     custody,
+                    span.va,
+                    span.len,
                     split.old.stage2_base,
                     split.old.stage2_length,
                 )
@@ -5999,6 +6072,7 @@ impl HvfVmState {
 
     pub(crate) fn unregister_process_alias(
         &mut self,
+        stage1: Stage1UnpublicationReceipt<'_>,
         va: u64,
         len: usize,
     ) -> Result<(), TrapError> {
@@ -6046,9 +6120,10 @@ impl HvfVmState {
                 identity.linux_pid,
                 identity.linux_tid,
             );
-            self.commit_process_alias_retirement(va, len, prepared, &registry)
+            self.commit_process_alias_retirement(stage1, va, len, prepared, &registry)
         } else {
             self.commit_process_alias_retirement_inner(
+                stage1,
                 va,
                 len,
                 prepared,
@@ -6188,12 +6263,14 @@ impl HvfVmState {
     /// is exactly how the 2026-09-12 `mmap` wedge happened.
     pub(crate) fn commit_process_alias_retirement(
         &mut self,
+        stage1: Stage1UnpublicationReceipt<'_>,
         va: u64,
         len: usize,
         prepared: PreparedProcessAliasRetirement,
         registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
     ) -> Result<(), TrapError> {
         self.commit_process_alias_retirement_inner(
+            stage1,
             va,
             len,
             prepared,
@@ -6210,7 +6287,13 @@ impl HvfVmState {
         prepared: PreparedProcessAliasRetirement,
         registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
     ) -> Result<(), TrapError> {
+        let stage1_authority = self.page_tables_authority();
         self.commit_process_alias_retirement_inner(
+            Stage1UnpublicationReceipt::AuthoritativeAbsence {
+                authority: &stage1_authority,
+                va,
+                len,
+            },
             va,
             len,
             prepared,
@@ -6233,8 +6316,10 @@ impl HvfVmState {
     /// restart therefore reads strictly fewer rows than the last, and a
     /// restart that does not is an ownership violation reported fatally with
     /// the writers that caused it.
+    #[allow(clippy::too_many_arguments)]
     fn commit_process_alias_retirement_inner(
         &mut self,
+        stage1: Stage1UnpublicationReceipt<'_>,
         va: u64,
         len: usize,
         prepared: PreparedProcessAliasRetirement,
@@ -6246,6 +6331,7 @@ impl HvfVmState {
         loop {
             let read = prepared.read_rows.len();
             let Some(stale) = self.try_commit_process_alias_retirement(
+                stage1,
                 va,
                 len,
                 prepared,
@@ -6272,8 +6358,10 @@ impl HvfVmState {
 
     /// One attempt of [`Self::commit_process_alias_retirement_inner`]:
     /// `Some` when the plan was stale and nothing was mutated.
+    #[allow(clippy::too_many_arguments)]
     fn try_commit_process_alias_retirement(
         &mut self,
+        stage1: Stage1UnpublicationReceipt<'_>,
         va: u64,
         len: usize,
         prepared: PreparedProcessAliasRetirement,
@@ -6499,7 +6587,7 @@ impl HvfVmState {
                         "HVPatch alias retirement IPA 0x{ipa:x} size {length} has no exact inventory owner"
                     ))
             })?;
-            self.retire_stage2_extent(ipa, length)?;
+            self.retire_stage2_extent(stage1, ipa, length)?;
             let retired = [retired];
             let cleanup = mutate_known_external_alias_state(
                 AliasWriterActor::Mm {
@@ -7327,11 +7415,13 @@ impl HvfTaskState {
     ) -> Result<(), TrapError> {
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let custody = self.custody_arc();
-        let retired_bases = manager.retire_extension_arenas();
+        let (retired_bases, stage1) =
+            carrick_aarch64::vmm::Stage1UnpublishedRange::retire_extension_arenas(manager);
         for base in retired_bases {
             HvfVmState::retire_stage2_extent_from_mappings_in(
                 &custody,
                 &mut self.mappings,
+                Stage1UnpublicationReceipt::Editor(&stage1),
                 base,
                 TWO_MIB,
             )?;
@@ -7601,10 +7691,23 @@ impl HvfTaskState {
     pub(crate) fn retire_stage2_extent_for_cow(
         &mut self,
         custody: &CarrierVmCustody,
+        va: u64,
+        len: usize,
         ipa: u64,
         length: u64,
     ) -> Result<(), TrapError> {
-        HvfVmState::retire_stage2_extent_from_mappings_in(custody, &mut self.mappings, ipa, length)
+        let authority = self.page_tables_authority();
+        HvfVmState::retire_stage2_extent_from_mappings_in(
+            custody,
+            &mut self.mappings,
+            Stage1UnpublicationReceipt::AuthoritativeAbsence {
+                authority: &authority,
+                va,
+                len,
+            },
+            ipa,
+            length,
+        )
     }
 }
 

@@ -6426,7 +6426,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
     prepared.inventory = HvpatchTaskInventoryAuthority::Absent;
     drop(child_state);
     drop(child_inventory);
-    let retired = retire_global_frame_host_owner_if_generation_in(
+    let retired = retire_test_global_frame_host_owner_if_generation_in(
         &transport.custody,
         child_private_key.0,
         child_private_key.1,
@@ -8826,7 +8826,7 @@ fn semantic_lookup_rejects_foreign_va_alias_at_same_live_ipa() {
         .expect("own live mapping");
     // Retire the fixture even when the assertion below detects the old bug.
     assert!(
-        retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,)
+        retire_test_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,)
             .is_retired()
     );
     assert_eq!(
@@ -9217,11 +9217,11 @@ fn semantic_lookup_isolates_same_va_in_different_mm() {
     );
 
     assert!(
-        retire_global_frame_host_owner_if_generation_in(&custody, key_a.0, key_a.1, gen_a)
+        retire_test_global_frame_host_owner_if_generation_in(&custody, key_a.0, key_a.1, gen_a)
             .is_retired()
     );
     assert!(
-        retire_global_frame_host_owner_if_generation_in(&custody, key_b.0, key_b.1, gen_b)
+        retire_test_global_frame_host_owner_if_generation_in(&custody, key_b.0, key_b.1, gen_b)
             .is_retired()
     );
 }
@@ -9285,7 +9285,7 @@ fn semantic_lookup_rejects_overlapping_row_with_wrong_va_to_ipa_offset() {
     );
 
     assert!(
-        retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
+        retire_test_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
             .is_retired()
     );
 }
@@ -9360,7 +9360,7 @@ fn semantic_lookup_rejects_stale_owner_generation_and_accepts_current() {
     );
 
     assert!(
-        retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
+        retire_test_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
             .is_retired()
     );
     assert!(
@@ -9467,7 +9467,7 @@ fn semantic_lookup_enforces_exact_boundary_length_and_overflow_protection() {
     }
 
     assert!(
-        retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
+        retire_test_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
             .is_retired()
     );
 }
@@ -9673,8 +9673,10 @@ fn invalid_leaf_lookup_selects_the_newest_projection_over_a_shadowed_row() {
 
     for (key, generation) in [(old_key, old_generation), (new_key, new_generation)] {
         assert!(
-            retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
-                .is_retired()
+            retire_test_global_frame_host_owner_if_generation_in(
+                &custody, key.0, key.1, generation
+            )
+            .is_retired()
         );
     }
 
@@ -9771,7 +9773,7 @@ fn semantic_lookup_preserves_map_shared_and_maintenance_fallback() {
     assert_eq!(selected_stage1.sharing, GuestMappingSharing::GlobalShared);
 
     assert!(
-        retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
+        retire_test_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation)
             .is_retired()
     );
 }
@@ -9834,7 +9836,7 @@ fn cow_source_falls_back_to_offset_logical_inventory_with_current_physical_owner
     );
     drop(source);
     assert!(
-        retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,)
+        retire_test_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,)
             .is_retired(),
         "retire exact inventoried COW source fixture",
     );
@@ -9877,7 +9879,7 @@ fn persistent_reusable_cow_alias_rejects_zero_owner_generation() {
         "a persistent reusable alias must not wildcard-authenticate a recycled owner",
     );
     assert!(
-        retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,)
+        retire_test_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,)
             .is_retired(),
     );
 }
@@ -9919,7 +9921,7 @@ fn persistent_reusable_cow_mapping_rejects_zero_owner_generation() {
         "a persistent reusable mapping must not wildcard-authenticate a recycled owner",
     );
     assert!(
-        retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,)
+        retire_test_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,)
             .is_retired(),
     );
 }
@@ -9940,7 +9942,7 @@ fn cow_source_inventory_fallback_rejects_absent_zero_mismatched_or_conflicting_o
         "case1's live stage-1 IPA without inventory must fail closed",
     );
     assert!(
-        retire_global_frame_host_owner_if_generation_in(
+        retire_test_global_frame_host_owner_if_generation_in(
             &absent_custody,
             absent_key.0,
             absent_key.1,
@@ -9958,7 +9960,7 @@ fn cow_source_inventory_fallback_rejects_absent_zero_mismatched_or_conflicting_o
         "an unstamped inventory owner generation must fail closed",
     );
     assert!(
-        retire_global_frame_host_owner_if_generation_in(
+        retire_test_global_frame_host_owner_if_generation_in(
             &zero_custody,
             zero_key.0,
             zero_key.1,
@@ -9976,7 +9978,7 @@ fn cow_source_inventory_fallback_rejects_absent_zero_mismatched_or_conflicting_o
         "inventory from another owner generation must fail closed",
     );
     assert!(
-        retire_global_frame_host_owner_if_generation_in(
+        retire_test_global_frame_host_owner_if_generation_in(
             &mismatch_custody,
             mismatch_key.0,
             mismatch_key.1,
@@ -9994,7 +9996,7 @@ fn cow_source_inventory_fallback_rejects_absent_zero_mismatched_or_conflicting_o
         "logical inventory fragments that disagree on physical owner identity must fail closed",
     );
     assert!(
-        retire_global_frame_host_owner_if_generation_in(
+        retire_test_global_frame_host_owner_if_generation_in(
             &conflict_custody,
             conflict_key.0,
             conflict_key.1,
@@ -10017,7 +10019,7 @@ fn cow_source_inventory_fallback_pins_backing_through_copy_window() {
         .expect("retain exact inventoried COW source");
 
     assert!(matches!(
-        retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,),
+        retire_test_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,),
         GlobalFrameRetirementOutcome::DeferredActivePins { .. }
     ));
     let mut copied = vec![0_u8; OWNER_LEN];
@@ -10030,7 +10032,7 @@ fn cow_source_inventory_fallback_pins_backing_through_copy_window() {
     );
     drop(source);
     assert!(
-        retire_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,)
+        retire_test_global_frame_host_owner_if_generation_in(&custody, key.0, key.1, generation,)
             .is_retired(),
         "retirement may complete only after the COW source copy guard drops",
     );
@@ -10412,7 +10414,7 @@ fn abort_prepared_child_preserves_borrowed_parent_global_frame_owner() {
 
     // The parent retires its own frame exactly once, at its own exit.
     assert!(matches!(
-        retire_global_frame_host_owner_if_generation_in(
+        retire_test_global_frame_host_owner_if_generation_in(
             &custody, parent_ipa, parent_len, parent_gen
         ),
         GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
@@ -13889,7 +13891,7 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
                 let extent = *inventory.extents.get(&key).unwrap();
                 HvfVmState::rollback_unpublished_mappings(&mut inventory, &[(key, extent)])
                     .unwrap();
-                let stage1 = custody.stage1_unpublished_by_editor(owner.record_identity);
+                let stage1 = custody.stage1_unpublished_after_editor_unmap(owner.record_identity);
                 let _ = custody.request_stage2_record_retirement(owner.record_identity, stage1);
             }
             register_shared_alias(successor);
@@ -13961,7 +13963,7 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
                 .pin_count,
             0
         );
-        let _ = retire_global_frame_host_owner_if_generation_in(
+        let _ = retire_test_global_frame_host_owner_if_generation_in(
             &custody,
             key.0,
             key.1,
@@ -14622,7 +14624,7 @@ fn exercise_retained_import(journal_case: u8) {
         .retain_import_source(Gpa::new(source_ipa), 4096, receipt)
         .unwrap();
     assert_eq!(
-        source_custody.retire_stage2_record_using(identity, |_, _| Ok(())),
+        source_custody.retire_test_stage2_record_using(identity, |_, _| Ok(())),
         CarrierStage2RetireOutcome::DeferredActivePins
     );
     source_custody.remove_global_frame_host_owner_if((source_ipa, 16384), |_| true);
@@ -14874,7 +14876,7 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
         0,
         "rolled-back grant must release its temporary physical pin before waking a contender"
     );
-    let _ = retire_global_frame_host_owner_if_generation_in(
+    let _ = retire_test_global_frame_host_owner_if_generation_in(
         &custody,
         first_alias.physical_ipa,
         first_alias.physical_size as u64,
@@ -14924,7 +14926,7 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
     )[0]
     .1;
     drop(next);
-    let _ = retire_global_frame_host_owner_if_generation_in(
+    let _ = retire_test_global_frame_host_owner_if_generation_in(
         &custody,
         next_alias.physical_ipa,
         next_alias.physical_size as u64,

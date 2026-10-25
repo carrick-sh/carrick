@@ -63,6 +63,12 @@ fn editor_is_held(zone: &ZoneTables, mm: carrick_el1_abi::ReservationMm) -> bool
         .is_some_and(|index| zone.spaces.active_editor(index).is_some())
 }
 
+fn space_is_closed(zone: &ZoneTables, mm: carrick_el1_abi::ReservationMm) -> bool {
+    zone.spaces
+        .find(mm.raw())
+        .is_none_or(|index| zone.spaces.is_closed(index))
+}
+
 fn reservation_root_is_held_in(
     roots: &carrick_el1::memory::reservations::SharedReservations,
     zone: &ZoneTables,
@@ -897,6 +903,12 @@ where
             carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects)
         };
         let cause = enrollment.cause();
+        if cause == carrick_sched_core::spaces::notification::SpaceWaitCause::Editor
+            && space_is_closed(zone, wait_mm)
+        {
+            zone.free_record(record);
+            return Ok(OwnerMemoryPark::Recheck(action));
+        }
         if enrollment.current_revision() == enrollment.revision()
             && cause == carrick_sched_core::spaces::notification::SpaceWaitCause::Editor
             && !editor_is_held(zone, wait_mm)

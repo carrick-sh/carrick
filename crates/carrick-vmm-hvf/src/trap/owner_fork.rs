@@ -965,7 +965,7 @@ mod tests {
             );
         }
         assert!(
-            retire_global_frame_host_owner_if_generation_in(&custody, ipa, len, generation,)
+            retire_test_global_frame_host_owner_if_generation_in(&custody, ipa, len, generation,)
                 .is_retired()
         );
     }
@@ -1149,9 +1149,12 @@ mod tests {
         assert_eq!(both._frames.len(), 2);
         drop((a, b, both));
         for ipa in [ipa_a, ipa_b] {
+            let identity = global_frame_stage2_identity_in(&custody, ipa, 0x4000).unwrap();
+            let stage1 = custody.stage1_unpublished_after_editor_unmap(identity);
             assert!(matches!(
                 retire_global_frame_host_owner_inner_in_using(
                     &custody,
+                    stage1,
                     ipa,
                     0x4000,
                     None,

@@ -4215,6 +4215,7 @@ pub(crate) mod tests {
             false,
             false,
             false,
+            false,
             OwnerWaitSelection::Normal,
         );
     }
@@ -4228,6 +4229,7 @@ pub(crate) mod tests {
             false,
             true,
             false,
+            false,
             OwnerWaitSelection::Normal,
         );
     }
@@ -4238,6 +4240,7 @@ pub(crate) mod tests {
             carrick_abi::syscall::nr::READ,
             Some(carrick_abi::LINUX_SIGKILL),
             true,
+            false,
             false,
             false,
             false,
@@ -4253,6 +4256,7 @@ pub(crate) mod tests {
             true,
             false,
             true,
+            false,
             false,
             OwnerWaitSelection::Normal,
         );
@@ -4510,6 +4514,7 @@ pub(crate) mod tests {
             false,
             false,
             true,
+            false,
             OwnerWaitSelection::Normal,
         );
     }
@@ -4523,7 +4528,36 @@ pub(crate) mod tests {
             false,
             false,
             false,
+            false,
             OwnerWaitSelection::Stale,
+        );
+    }
+
+    #[test]
+    fn serial_host_mm_exit_close_races_a_parked_sibling_copy_without_invariant_kill() {
+        exercise_owner_wait_schedule_at(
+            carrick_abi::syscall::nr::FSTAT,
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
+            OwnerWaitSelection::Normal,
+        );
+    }
+
+    #[test]
+    fn serial_host_munmap_retirement_races_blocking_read_with_one_executor() {
+        exercise_owner_wait_schedule_at(
+            carrick_abi::syscall::nr::READ,
+            None,
+            false,
+            false,
+            true,
+            false,
+            false,
+            OwnerWaitSelection::Normal,
         );
     }
 
@@ -4549,6 +4583,7 @@ pub(crate) mod tests {
             release_wins,
             false,
             false,
+            false,
             OwnerWaitSelection::Normal,
         );
     }
@@ -4559,6 +4594,7 @@ pub(crate) mod tests {
         Stale,
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn exercise_owner_wait_schedule_at(
         nr: carrick_abi::CanonicalNr,
         signum: Option<i32>,
@@ -4566,6 +4602,7 @@ pub(crate) mod tests {
         release_wins: bool,
         physical: bool,
         free_reservation_redrive: bool,
+        close_mm_while_parked: bool,
         selection: OwnerWaitSelection,
     ) {
         let stale_selection_without_editor = selection == OwnerWaitSelection::Stale;
@@ -5300,7 +5337,24 @@ pub(crate) mod tests {
                         }
                     }
                     let killing = signum == Some(carrick_abi::LINUX_SIGKILL);
-                    if free_reservation_redrive || stale_selection_without_editor {
+                    if close_mm_while_parked {
+                        let index = zone.spaces.find(mm.raw()).unwrap();
+                        let (closed_tx, closed_rx) = mpsc::sync_channel(1);
+                        let closer = scope.spawn(move || {
+                            zone.spaces
+                                .close_and_wait_for_editor(index, std::hint::spin_loop);
+                            closed_tx.send(()).unwrap();
+                        });
+                        release_tx.send(()).unwrap();
+                        peer.take().unwrap().join().unwrap();
+                        closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        closer.join().unwrap();
+                        assert!(zone.spaces.is_closed(index));
+                    }
+                    if (physical && signum.is_none())
+                        || free_reservation_redrive
+                        || stale_selection_without_editor
+                    {
                         assert_eq!(
                             scheduler.queued_len(),
                             0,
@@ -5313,7 +5367,7 @@ pub(crate) mod tests {
                         }
                         retirement.complete();
                     }
-                    if !killing && !stale_selection_without_editor {
+                    if !killing && !stale_selection_without_editor && !close_mm_while_parked {
                         release_tx.send(()).unwrap();
                         peer.take().unwrap().join().unwrap();
                     }

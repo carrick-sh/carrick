@@ -607,6 +607,35 @@ pub enum FrameCowWriteIntent {
 /// sibling spawn, host memory windows + stage-2 mapping, and the HVF-only
 /// lazy-alias re-map (as the optional [`Self::handle_memory_exit`] hook). Mirrors
 /// `carrick-x86`'s `X86Vmm`.
+/// Non-cloneable receipt that the shared engine removed or retired one exact
+/// stage-1 VA range and completed the required TLBI before backend metadata or
+/// stage-2 authority may retire.
+#[derive(Debug)]
+pub struct Stage1UnpublishedRange {
+    va: u64,
+    len: usize,
+}
+
+impl Stage1UnpublishedRange {
+    pub(crate) fn after_engine_edit(va: u64, len: usize) -> Self {
+        Self { va, len }
+    }
+
+    pub fn range(&self) -> (u64, usize) {
+        (self.va, self.len)
+    }
+
+    /// Retire every detached extension-table arena and bind the receipt to
+    /// that exact manager mutation.  Backends cannot mint this proof from an
+    /// IPA alone.
+    pub fn retire_extension_arenas(
+        manager: &mut PageTableManager,
+    ) -> (Vec<u64>, Stage1UnpublishedRange) {
+        let retired = manager.retire_extension_arenas();
+        (retired, Stage1UnpublishedRange::after_engine_edit(0, 0))
+    }
+}
+
 pub trait Aarch64Vmm: Sized + GuestVmBackend {
     type Vcpu: Aarch64Vcpu;
 
@@ -1269,6 +1298,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// caller; a backend must preserve exact owner generations and fork peers.
     fn commit_anonymous_discard(
         &mut self,
+        _stage1: &Stage1UnpublishedRange,
         _prepared: Self::AnonymousDiscard,
     ) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
@@ -1281,7 +1311,12 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// backend's process-shared alias index (HVF's `alias_registry`) intact and
     /// consistent with its still-owned backing. KVM has no such index; default
     /// no-op.
-    fn on_unmap(&mut self, _va: u64, _len: usize) -> Result<(), TrapError> {
+    fn on_unmap(
+        &mut self,
+        _stage1: &Stage1UnpublishedRange,
+        _va: u64,
+        _len: usize,
+    ) -> Result<(), TrapError> {
         Ok(())
     }
 

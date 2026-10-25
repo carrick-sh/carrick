@@ -12,7 +12,60 @@ pub struct UserTransferCustody {
     transport: Option<Arc<CarrierForeignMmTransport>>,
     metadata: Option<crate::metadata_grant::CarrierMetadataAccess>,
 }
+
+struct ImmediateStage1Reselect;
+
+impl std::fmt::Debug for ImmediateStage1Reselect {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ImmediateStage1Reselect")
+    }
+}
+
+impl carrick_guest_mem::PhysicalMemoryWait for ImmediateStage1Reselect {
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    fn enroll(
+        &self,
+        _wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+        (Box::new(()), true)
+    }
+}
+
 impl UserTransferCustody {
+    fn immediate_stage1_reselect() -> TransferRetention<RetainedUserData> {
+        TransferRetention::Physical(carrick_guest_mem::OwnedMemoryWait::new(Arc::new(
+            ImmediateStage1Reselect,
+        )))
+    }
+
+    /// Re-read the authoritative host stage-1 image before treating an absent
+    /// physical record as an invariant failure. Host COW, exec and teardown
+    /// edits do not all pass through the guest Editor word; a changed leaf is
+    /// therefore immediate reselection evidence, never evidence against the
+    /// MM. `None` means this pre-admission/physical-only caller has no MM to
+    /// authenticate and retains the existing physical-only contract.
+    fn stage1_selection_changed(
+        &self,
+        target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
+        selected: PortalSelectedData,
+    ) -> Option<bool> {
+        let (target, va) = target?;
+        let state = match self.custody.guest_cow_state(target.handle().mm().raw()) {
+            Ok(Some(state)) => state,
+            Ok(None) => return Some(true),
+            Err(()) => return None,
+        };
+        Some(
+            state
+                .page_tables_authority()
+                .with_manager(|manager| manager.translate(va) != Some(selected.ipa))
+                .unwrap_or(true),
+        )
+    }
+
     /// Retain an exact external physical source for pre-admission copying.
     /// This never transfers its source frame or directory into the target.
     pub fn retain_import_source(
@@ -415,7 +468,7 @@ impl UserTransferCustody {
 
     fn retain_exact_for(
         &self,
-        _target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
+        target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
         selected: PortalSelectedData,
         len: usize,
         intent: PortalTransferIntent,
@@ -425,6 +478,9 @@ impl UserTransferCustody {
             || TrapError::Hypervisor("UserTransfer physical custody invariant refused".to_owned());
         if len == 0 || len > 4096 || selected.ipa.checked_add(len as u64).is_none() {
             return Err(error());
+        }
+        if self.stage1_selection_changed(target, selected) == Some(true) {
+            return Ok(Self::immediate_stage1_reselect());
         }
         // A known physical extent overrun is permanent refusal, even if its
         // owner is concurrently retiring. Check it before selecting a wait.
@@ -507,10 +563,16 @@ impl UserTransferCustody {
                         self.custody.stage2_publication_wait(selected.ipa),
                     ));
                 }
+                if self.stage1_selection_changed(target, selected) == Some(true) {
+                    return Ok(Self::immediate_stage1_reselect());
+                }
                 return retry.map(TransferRetention::Editor).ok_or_else(error);
             }
             Err(CarrierStage2PinError::RetirementRequested) => {
                 carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 5);
+                if self.stage1_selection_changed(target, selected) == Some(true) {
+                    return Ok(Self::immediate_stage1_reselect());
+                }
                 return retry.map(TransferRetention::Editor).ok_or_else(error);
             }
             Err(reason) => {
@@ -645,6 +707,108 @@ pub(super) mod tests {
             root_generation: NonZeroU64::new(1).unwrap(),
             offset: 0,
         }
+    }
+
+    #[test]
+    fn host_stage1_unmap_of_selected_leaf_forces_ready_reselect() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let mm = NonZeroU64::new(0x847).unwrap();
+        let va = 0x4800_0000;
+        let ipa = 0xa085_31a0_0000;
+        let owner = backing(&custody, ipa);
+        let tables = carrick_aarch64::Stage1Authority::new();
+        let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        manager
+            .map_aliased(
+                va,
+                ipa,
+                4096,
+                carrick_mmu_core::aarch64::UserLeafAccess {
+                    writable: true,
+                    executable: false,
+                },
+                None,
+            )
+            .unwrap();
+        tables.set_manager(manager);
+        let state = MmAccessState::new_unbound(
+            tables.clone(),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
+            Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
+        );
+        custody.register_guest_cow_state(mm.get(), &state);
+        let (_, receipt) = tables
+            .edit_unpublishing(
+                || unreachable!("installed manager"),
+                va,
+                4096,
+                |editor| editor.invalidate(va, 4096).map(|_| ()),
+            )
+            .unwrap();
+        let receipt = receipt.expect("host edit unpublished the selected leaf");
+        let proof = custody
+            .stage1_unpublished_from_receipt(
+                owner.record_identity,
+                Stage1UnpublicationReceipt::Editor(&receipt),
+            )
+            .expect("editor receipt covers retired owner");
+        assert!(
+            crate::trap::global_frame::retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                proof,
+                ipa,
+                16384,
+                owner.generation(),
+                &mut |_, _| Ok(()),
+            )
+            .is_retired(),
+            "the production retirement must follow the host-side stage-1 edit"
+        );
+
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                custody.transfer_carrier,
+                ReservationMm::new(mm.get()).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            )
+        };
+        let retry = unsafe {
+            carrick_el1_abi::PortalOwnerWait::from_owner(
+                handle,
+                carrick_el1_abi::PortalWaitCause::Editor,
+                17,
+            )
+        };
+        let physical = UserTransferCustody::new(custody);
+        let TransferRetention::Physical(wait) = physical
+            .retain_exact_for(
+                Some((
+                    carrick_aarch64::user_transfer::TransferTarget::from_handle(handle, 0x4000),
+                    va,
+                )),
+                selection(ipa),
+                4,
+                PortalTransferIntent::UserRead,
+                Some(retry),
+            )
+            .unwrap()
+        else {
+            panic!("an authoritative host-side unmap must reselect, not reach the invariant")
+        };
+        assert!(
+            wait.0.is_ready(),
+            "changed stage-1 is immediate reselect evidence, never a park"
+        );
     }
 
     #[test]
@@ -945,7 +1109,7 @@ pub(super) mod tests {
         let owner = backing(&custody, ipa);
         let physical = UserTransferCustody::new(Arc::clone(&custody));
         custody.enqueue_carrier_stage2_retirement(owner.record_identity);
-        let stage1 = custody.stage1_unpublished_by_editor(owner.record_identity);
+        let stage1 = custody.stage1_unpublished_after_editor_unmap(owner.record_identity);
         assert_eq!(
             custody.request_stage2_record_retirement(owner.record_identity, stage1),
             CarrierStage2RetireOutcome::DeferredActivePins
@@ -974,12 +1138,19 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn two_mms_reselect_without_accumulating_retirement_state() {
+    fn two_mms_by_n_real_retirements_leave_no_custody_growth() {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = Arc::new(CarrierVmCustody::new_live_fixture());
         let physical = UserTransferCustody::new(Arc::clone(&custody));
 
         for mm in [901_u64, 902] {
+            let tables = carrick_aarch64::Stage1Authority::new();
+            let manager = carrick_mmu_core::aarch64::PageTableManager::new(
+                carrick_mem::memory::stage1_hvpatch_page_tables(),
+                crate::memory::LINUX_PAGE_TABLES_BASE,
+                carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+            );
+            tables.set_manager(manager);
             let handle = unsafe {
                 carrick_el1_abi::El1MmHandle::from_admitted_owner(
                     custody.transfer_carrier,
@@ -998,21 +1169,66 @@ pub(super) mod tests {
                     7,
                 )
             };
-            for page in 0..128_u64 {
+            for page in 0..32_u64 {
+                let va = 0x4000_0000 + page * 0x4000;
+                let ipa = 0xa086_0000_0000 + (mm - 901) * 0x1000_0000 + page * 0x4000;
+                let owner = backing(&custody, ipa);
+                tables
+                    .edit(
+                        || unreachable!("installed manager"),
+                        |editor| {
+                            editor
+                                .map_aliased(
+                                    va,
+                                    ipa,
+                                    4096,
+                                    carrick_mmu_core::aarch64::UserLeafAccess {
+                                        writable: true,
+                                        executable: false,
+                                    },
+                                )
+                                .map(|_| ())
+                        },
+                    )
+                    .unwrap();
                 assert!(matches!(
                     physical
                         .retain_exact_for(
-                            Some((target, 0x4000_0000 + page * 4096)),
-                            selection(0xa086_0000_0000 + page * 4096),
+                            Some((target, va)),
+                            selection(ipa),
                             4,
                             PortalTransferIntent::UserRead,
                             Some(retry),
                         )
                         .unwrap(),
-                    TransferRetention::Editor(found)
-                        if found.handle() == retry.handle()
-                            && found.revision() == retry.revision()
+                    TransferRetention::Retained(_)
                 ));
+                let (_, receipt) = tables
+                    .edit_unpublishing(
+                        || unreachable!("installed manager"),
+                        va,
+                        4096,
+                        |editor| editor.invalidate(va, 4096).map(|_| ()),
+                    )
+                    .unwrap();
+                let receipt = receipt.expect("retirement edit removed the exact leaf");
+                let stage1 = custody
+                    .stage1_unpublished_from_receipt(
+                        owner.record_identity,
+                        Stage1UnpublicationReceipt::Editor(&receipt),
+                    )
+                    .expect("editor receipt covers retired owner");
+                assert!(
+                    crate::trap::global_frame::retire_global_frame_host_owner_if_generation_in_using(
+                        &custody,
+                        stage1,
+                        ipa,
+                        16384,
+                        owner.generation(),
+                        &mut |_, _| Ok(()),
+                    )
+                    .is_retired()
+                );
             }
         }
 
@@ -1302,7 +1518,7 @@ pub(super) mod tests {
         // Retirement reaches the existing custodian before any backend unmap.
         let mut unmaps = 0;
         assert_eq!(
-            custody.retire_stage2_record_using(owner.record_identity, |_, _| {
+            custody.retire_test_stage2_record_using(owner.record_identity, |_, _| {
                 unmaps += 1;
                 Ok(())
             }),
@@ -1339,7 +1555,7 @@ pub(super) mod tests {
             0
         );
         assert_eq!(
-            custody.retire_stage2_record_using(owner.record_identity, |_, _| {
+            custody.retire_test_stage2_record_using(owner.record_identity, |_, _| {
                 unmaps += 1;
                 Ok(())
             }),

@@ -1511,8 +1511,11 @@ pub(crate) fn install_ipc_window_using(
             Ok(identity) => records.push(identity),
             Err(error) => {
                 for identity in records {
-                    let _ = custody.retire_stage2_record_using(identity, &mut unmap);
-                    let _ = custody.remove_terminal_stage2_record(identity);
+                    let Some(stage1) = custody.stage1_unpublished_for_retirement(identity) else {
+                        continue;
+                    };
+                    let _ = custody.retire_stage2_record_using(identity, stage1, &mut unmap);
+                    let _ = custody.remove_terminal_stage2_record(identity, stage1);
                 }
                 return Err(error);
             }

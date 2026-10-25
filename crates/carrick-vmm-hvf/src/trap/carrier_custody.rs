@@ -371,10 +371,31 @@ pub(crate) struct CarrierVmCustodyState {
     /// that owns its lifetime. Rebind may briefly retain predecessor IDs.
     stage2_extent_index:
         std::collections::BTreeMap<(u64, u64), std::collections::BTreeSet<CarrierStage2RecordId>>,
+    /// Stage-1-first capability retained for asynchronous retirement drivers.
+    /// Entries exist only after `request_stage2_record_retirement` consumed a
+    /// real Editor/inventory receipt for the exact record identity.
+    stage1_unpublished: std::collections::BTreeMap<CarrierStage2RecordId, Stage1Unpublished>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierVmCustodyState {
+    fn extent_collides(&self, ipa: u64, end: u64) -> bool {
+        let predecessor_overlaps = self
+            .stage2_extent_index
+            .range(..=(ipa, u64::MAX))
+            .next_back()
+            .is_some_and(|(&(base, len), _)| base.saturating_add(len) > ipa);
+        let successor_overlaps = self
+            .stage2_extent_index
+            .range((
+                std::ops::Bound::Excluded((ipa, u64::MAX)),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|(&(base, _), _)| base < end);
+        predecessor_overlaps || successor_overlaps
+    }
+
     fn index_record(&mut self, id: CarrierStage2RecordId, ipa: u64, len: usize) {
         self.stage2_extent_index
             .entry((ipa, len as u64))
@@ -388,6 +409,7 @@ impl CarrierVmCustodyState {
     ) -> Option<CarrierStage2Record> {
         let removed = self.stage2_records.remove(&id);
         if let Some(record) = &removed {
+            self.stage1_unpublished.remove(&id);
             let key = (record.snapshot.ipa, record.snapshot.len as u64);
             if let Some(ids) = self.stage2_extent_index.get_mut(&key) {
                 ids.remove(&id);
@@ -419,10 +441,32 @@ struct Stage2RecordRemoval<'a> {
 ///
 /// The fields are private to this module so adding a retirement caller without
 /// choosing one of the two ordering boundaries is a compile error.
-#[derive(::core::fmt::Debug)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct Stage1Unpublished {
     identity: CarrierStage2RecordIdentity,
     source: Stage1UnpublishedSource,
+}
+
+/// A receipt issued by one of the two operations allowed to unpublish stage
+/// one before physical authority retires.  Callers can forward a receipt, but
+/// cannot construct either receipt payload or the exact-record witness.
+#[derive(::core::marker::Copy, ::core::clone::Clone)]
+pub(crate) enum Stage1UnpublicationReceipt<'a> {
+    Editor(&'a carrick_aarch64::vmm::Stage1UnpublishedRange),
+    Inventory(&'a carrick_core::mm::retirement::Stage1UnpublishedMm),
+    InventoryRollback(&'a super::UnpublishedTaskStage1),
+    El1Metadata(&'a crate::metadata_grant::El1MetadataRetirement),
+    AuthoritativeAbsence {
+        authority: &'a carrick_aarch64::Stage1Authority,
+        va: u64,
+        len: usize,
+    },
 }
 
 #[derive(
@@ -436,10 +480,11 @@ enum Stage1UnpublishedSource {
     EditorRelease,
     InventoryCommit,
     UnpublishedInventoryRollback,
+    El1MetadataRetirement,
 }
 
 impl Stage1Unpublished {
-    fn matches(&self, identity: CarrierStage2RecordIdentity) -> bool {
+    pub(super) fn matches(&self, identity: CarrierStage2RecordIdentity) -> bool {
         self.identity == identity
     }
 }
@@ -716,6 +761,33 @@ enum ExecutableBacking {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierVmCustody {
+    pub(crate) fn stage1_unpublished_from_receipt(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        receipt: Stage1UnpublicationReceipt<'_>,
+    ) -> Option<Stage1Unpublished> {
+        match receipt {
+            Stage1UnpublicationReceipt::Editor(receipt) => {
+                Some(self.stage1_unpublished_by_editor(identity, receipt))
+            }
+            Stage1UnpublicationReceipt::Inventory(receipt) => {
+                Some(self.stage1_unpublished_by_inventory_commit(identity, receipt))
+            }
+            Stage1UnpublicationReceipt::InventoryRollback(receipt) => {
+                Some(self.stage1_unpublished_by_unpublished_inventory_rollback(identity, receipt))
+            }
+            Stage1UnpublicationReceipt::El1Metadata(receipt) => {
+                receipt.matches(identity).then_some(Stage1Unpublished {
+                    identity,
+                    source: Stage1UnpublishedSource::El1MetadataRetirement,
+                })
+            }
+            Stage1UnpublicationReceipt::AuthoritativeAbsence { authority, va, len } => {
+                self.stage1_unpublished_by_authoritative_absence(identity, authority, va, len)
+            }
+        }
+    }
+
     pub(crate) fn stage2_publication_authority(&self) -> Stage2PublicationAuthority<'_> {
         Stage2PublicationAuthority {
             custody: self,
@@ -725,9 +797,10 @@ impl CarrierVmCustody {
 
     /// Minted only after an Editor edit has removed the last stage-1 leaf and
     /// its release has advanced the Editor revision.
-    pub(crate) fn stage1_unpublished_by_editor(
+    fn stage1_unpublished_by_editor(
         &self,
         identity: CarrierStage2RecordIdentity,
+        _receipt: &carrick_aarch64::vmm::Stage1UnpublishedRange,
     ) -> Stage1Unpublished {
         Stage1Unpublished {
             identity,
@@ -737,7 +810,7 @@ impl CarrierVmCustody {
 
     /// Minted only by the whole-MM inventory commit after that transaction has
     /// unpublished the terminal MM's complete stage-1 image.
-    pub(crate) fn stage1_unpublished_by_inventory_commit(
+    fn stage1_unpublished_by_inventory_commit(
         &self,
         identity: CarrierStage2RecordIdentity,
         _inventory: &carrick_core::mm::retirement::Stage1UnpublishedMm,
@@ -748,25 +821,110 @@ impl CarrierVmCustody {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn stage1_unpublished_by_inventory_commit_for_test(
+    fn stage1_unpublished_by_authoritative_absence(
         &self,
         identity: CarrierStage2RecordIdentity,
-    ) -> Stage1Unpublished {
-        Stage1Unpublished {
-            identity,
-            source: Stage1UnpublishedSource::InventoryCommit,
+        authority: &carrick_aarch64::Stage1Authority,
+        va: u64,
+        len: usize,
+    ) -> Option<Stage1Unpublished> {
+        let snapshot = self.stage2_record_snapshot(identity.record_id)?;
+        if snapshot.record_id != identity.record_id
+            || snapshot.vm_generation != identity.vm_generation
+            || snapshot.logical_owner != identity.logical_owner
+        {
+            return None;
         }
+        let end = va.checked_add(len as u64)?;
+        let physical_end = snapshot.ipa.checked_add(snapshot.len as u64)?;
+        let absent = authority.with_manager(|manager| {
+            let mut cursor = va & !0xfff;
+            while cursor < end {
+                if manager
+                    .translate(cursor)
+                    .is_some_and(|ipa| snapshot.ipa <= ipa && ipa < physical_end)
+                {
+                    return false;
+                }
+                cursor = cursor.saturating_add(4096);
+            }
+            true
+        })?;
+        absent.then_some(Stage1Unpublished {
+            identity,
+            source: Stage1UnpublishedSource::EditorRelease,
+        })
     }
 
-    pub(crate) fn stage1_unpublished_by_unpublished_inventory_rollback(
+    fn stage1_unpublished_by_unpublished_inventory_rollback(
         &self,
         identity: CarrierStage2RecordIdentity,
+        _receipt: &super::UnpublishedTaskStage1,
     ) -> Stage1Unpublished {
         Stage1Unpublished {
             identity,
             source: Stage1UnpublishedSource::UnpublishedInventoryRollback,
         }
+    }
+
+    /// Test support that obtains the same non-forgeable editor receipt as a
+    /// production host-side unmap.  The synthetic image first publishes a
+    /// leaf naming the record's exact IPA, then removes that leaf through
+    /// `Stage1Authority::edit_unpublishing`; an already-empty manager is not a
+    /// retirement proof.
+    #[cfg(test)]
+    pub(crate) fn stage1_unpublished_after_editor_unmap(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Stage1Unpublished {
+        let authority = carrick_aarch64::Stage1Authority::new();
+        let record = self
+            .stage2_record_snapshot(identity.record_id)
+            .expect("test stage-2 identity names a live record");
+        let builder = || {
+            Ok::<_, carrick_mmu_core::aarch64::PageTableError>(
+                carrick_mmu_core::aarch64::PageTableManager::new(
+                    carrick_mem::memory::stage1_hvpatch_page_tables(),
+                    crate::memory::LINUX_PAGE_TABLES_BASE,
+                    carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+                ),
+            )
+        };
+        let va = 0x4000_0000_u64;
+        authority
+            .edit(builder, |editor| {
+                editor
+                    .map_aliased(
+                        va,
+                        record.ipa,
+                        0x1000,
+                        carrick_mmu_core::aarch64::UserLeafAccess::READ_WRITE,
+                    )
+                    .map(|_| ())
+            })
+            .expect("test stage-1 leaf publication");
+        let (_, receipt) = authority
+            .edit_unpublishing(builder, va, 0x1000, |editor| {
+                editor.invalidate(va, 0x1000).map(|_| ())
+            })
+            .expect("test stage-1 leaf unpublication");
+        let receipt = receipt.expect("editor removed the exact test stage-1 leaf");
+        self.stage1_unpublished_by_editor(identity, &receipt)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retire_test_stage2_record_using(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    ) -> CarrierStage2RetireOutcome {
+        let stage1 = self
+            .stage1_unpublished_for_retirement(identity)
+            .unwrap_or_else(|| self.stage1_unpublished_after_editor_unmap(identity));
+        if self.stage1_unpublished_for_retirement(identity).is_none() {
+            let _ = self.request_stage2_record_retirement(identity, stage1);
+        }
+        self.retire_stage2_record_using(identity, stage1, unmap)
     }
 
     fn stage2_record_removal(&self) -> Stage2RecordRemoval<'_> {
@@ -957,6 +1115,7 @@ impl CarrierVmCustody {
                 next_logical_owner_generation: 1,
                 stage2_records: std::collections::BTreeMap::new(),
                 stage2_extent_index: std::collections::BTreeMap::new(),
+                stage1_unpublished: std::collections::BTreeMap::new(),
             }),
             stage2_retirement_changed: carrick_thread::completion::CompletionCallbacks::default(),
             stage2_publication_changed: carrick_thread::completion::CompletionCallbacks::default(),
@@ -1382,7 +1541,11 @@ impl CarrierVmCustody {
     pub(crate) fn remove_terminal_stage2_record(
         &self,
         identity: CarrierStage2RecordIdentity,
+        stage1: Stage1Unpublished,
     ) -> Option<CarrierStage2RecordSnapshot> {
+        if !stage1.matches(identity) {
+            return None;
+        }
         let mut removal = self.stage2_record_removal();
         let record = removal.state().stage2_records.get(&identity.record_id)?;
         if Self::stage2_identity_mismatch(record, identity).is_some()
@@ -1519,11 +1682,7 @@ impl CarrierVmCustody {
             .ipa
             .checked_add(spec.len as u64)
             .ok_or(CarrierStage2RecordError::InvalidExtent)?;
-        if state.stage2_records.values().any(|record| {
-            let existing = &record.snapshot;
-            let existing_end = existing.ipa.saturating_add(existing.len as u64);
-            spec.ipa < existing_end && existing.ipa < end
-        }) {
+        if state.extent_collides(spec.ipa, end) {
             return Err(CarrierStage2RecordError::ExtentCollision);
         }
         match state.lifecycle {
@@ -1736,12 +1895,18 @@ impl CarrierVmCustody {
         identity: CarrierStage2RecordIdentity,
         stage1: Stage1Unpublished,
     ) -> CarrierStage2RetireOutcome {
-        debug_assert!(stage1.matches(identity));
-        let _source = stage1.source;
         if !stage1.matches(identity) {
-            return CarrierStage2RetireOutcome::OwnerIdentityMismatch;
+            return CarrierStage2RetireOutcome::NotFound;
         }
         let mut state = self.state.lock();
+        let Some(record) = state.stage2_records.get(&identity.record_id) else {
+            return CarrierStage2RetireOutcome::NotFound;
+        };
+        if let Some(mismatch) = Self::stage2_identity_mismatch(record, identity) {
+            return mismatch;
+        }
+        let _source = stage1.source;
+        state.stage1_unpublished.insert(identity.record_id, stage1);
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };
@@ -1857,8 +2022,20 @@ impl CarrierVmCustody {
     pub(crate) fn retire_stage2_record_using(
         &self,
         identity: CarrierStage2RecordIdentity,
+        stage1: Stage1Unpublished,
         unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
     ) -> CarrierStage2RetireOutcome {
+        if !stage1.matches(identity)
+            || self
+                .state
+                .lock()
+                .stage1_unpublished
+                .get(&identity.record_id)
+                .copied()
+                != Some(stage1)
+        {
+            return CarrierStage2RetireOutcome::NotFound;
+        }
         let (ipa, len, backend_map_installed) = {
             let mut state = self.state.lock();
             let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
@@ -1915,6 +2092,18 @@ impl CarrierVmCustody {
             | CarrierStage2RetireOutcome::VmGenerationMismatch => {}
         }
         outcome
+    }
+
+    pub(crate) fn stage1_unpublished_for_retirement(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Option<Stage1Unpublished> {
+        self.state
+            .lock()
+            .stage1_unpublished
+            .get(&identity.record_id)
+            .copied()
+            .filter(|proof| proof.matches(identity))
     }
 }
 
@@ -2546,6 +2735,42 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
+    fn stage2_extent_index_checks_only_adjacent_intervals() {
+        let (custody, generation) = live_custody();
+        let mut middle = stage2_spec(generation, 1);
+        middle.ipa = 0x20_000;
+        custody
+            .register_stage2_record(middle)
+            .expect("register middle interval");
+
+        let mut below = stage2_spec(generation, 2);
+        below.ipa = 0x1c_000;
+        custody
+            .register_stage2_record(below)
+            .expect("adjacent predecessor does not overlap");
+        let mut above = stage2_spec(generation, 3);
+        above.ipa = 0x24_000;
+        custody
+            .register_stage2_record(above)
+            .expect("adjacent successor does not overlap");
+
+        let mut overlaps_predecessor = stage2_spec(generation, 4);
+        overlaps_predecessor.ipa = 0x1f_000;
+        overlaps_predecessor.len = 0x2000;
+        assert_eq!(
+            custody.register_stage2_record(overlaps_predecessor),
+            Err(super::CarrierStage2RecordError::ExtentCollision)
+        );
+        let mut overlaps_successor = stage2_spec(generation, 5);
+        overlaps_successor.ipa = 0x23_000;
+        overlaps_successor.len = 0x2000;
+        assert_eq!(
+            custody.register_stage2_record(overlaps_successor),
+            Err(super::CarrierStage2RecordError::ExtentCollision)
+        );
+    }
+
+    #[test]
     fn global_frame_owner_directory_is_isolated_per_carrier_custody() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (first, _) = live_custody();
@@ -2739,7 +2964,7 @@ mod carrier_vm_custody_tests {
         let mut unmap_calls = 0_u32;
 
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 key.0,
                 key.1,
@@ -2761,7 +2986,7 @@ mod carrier_vm_custody_tests {
         drop(retained_lease);
         let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 key.0,
                 key.1,
@@ -2817,7 +3042,7 @@ mod carrier_vm_custody_tests {
         drop(exact_owner);
 
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 key.0,
                 key.1,
@@ -2855,7 +3080,7 @@ mod carrier_vm_custody_tests {
         let exact_owner =
             std::sync::Arc::clone(custody.global_frame_host_owners.lock()[&key].owner());
 
-        let outcome = super::retire_global_frame_host_owner_if_generation_in_using(
+        let outcome = super::retire_test_global_frame_host_owner_if_generation_in_using(
             &custody,
             key.0,
             key.1,
@@ -2892,7 +3117,7 @@ mod carrier_vm_custody_tests {
                 );
                 let mut nested_unmap_calls = 0_u32;
                 assert!(matches!(
-                    super::retire_global_frame_host_owner_if_generation_in_using(
+                    super::retire_test_global_frame_host_owner_if_generation_in_using(
                         &custody,
                         key.0,
                         key.1,
@@ -2980,7 +3205,7 @@ mod carrier_vm_custody_tests {
         let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
         let mut first_calls = 0_u32;
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 key.0,
                 key.1,
@@ -2996,7 +3221,7 @@ mod carrier_vm_custody_tests {
 
         let mut retry_calls = 0_u32;
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 key.0,
                 key.1,
@@ -3046,7 +3271,7 @@ mod carrier_vm_custody_tests {
         };
         let mut unmap_calls = 0_u32;
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 key.0,
                 key.1,
@@ -3101,7 +3326,7 @@ mod carrier_vm_custody_tests {
         .expect("register foreign-MM transient retry fixture");
         let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 key.0,
                 key.1,
@@ -3160,7 +3385,7 @@ mod carrier_vm_custody_tests {
             )
             .expect("register removable FIFO fixture");
             assert!(matches!(
-                super::retire_global_frame_host_owner_if_generation_in_using(
+                super::retire_test_global_frame_host_owner_if_generation_in_using(
                     &custody,
                     key.0,
                     key.1,
@@ -3182,7 +3407,7 @@ mod carrier_vm_custody_tests {
             1,
         );
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 old_key.0,
                 old_key.1,
@@ -3242,7 +3467,7 @@ mod carrier_vm_custody_tests {
         )
         .expect("register concurrent idle-turn fixture");
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 key.0,
                 key.1,
@@ -3316,7 +3541,7 @@ mod carrier_vm_custody_tests {
         let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
 
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 key.0,
                 key.1,
@@ -3348,7 +3573,7 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
-    fn serial_host_global_owner_collision_retains_failed_rollback_candidate_until_safe_point() {
+    fn serial_host_global_owner_collision_refuses_before_custody_transfer() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, _) = live_custody();
         let key = (0xa081_2000_0000, 0x4000);
@@ -3374,7 +3599,10 @@ mod carrier_vm_custody_tests {
         .expect("allocate colliding global owner backing");
         let candidate_host = candidate_mapping.as_ptr() as usize;
         let mut candidate_lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
-        candidate_lease.mark_mapped();
+        // The interval index rejects the overlapping record before custody
+        // transfer. Model an already-premapped test lease so that rejection's
+        // explicit pre-custody rollback has no HV operation to perform.
+        candidate_lease.mark_test_mapped_without_backend();
         let injected = super::CarrierStage2BackendError::HvReturn(0xfae9_4001);
         let mut rollback_calls = 0_u32;
 
@@ -3396,11 +3624,11 @@ mod carrier_vm_custody_tests {
             incumbent_generation,
             "collision must not replace the incumbent"
         );
-        assert_eq!(custody.pending_global_frame_owner_count(), 1);
-        assert!(super::alias_backing_is_live(candidate_host));
+        assert_eq!(custody.pending_global_frame_owner_count(), 0);
+        assert!(!super::alias_backing_is_live(candidate_host));
         assert_eq!(
-            rollback_calls, 1,
-            "collision rollback and owner Drop must not invoke a second backend callback",
+            rollback_calls, 0,
+            "the interval directory refuses overlap before custody transfer",
         );
 
         assert_eq!(
@@ -3412,9 +3640,9 @@ mod carrier_vm_custody_tests {
                 },
             ),
             0,
-            "production idle turn retires the enqueued colliding candidate",
+            "a pre-transfer refusal leaves no retirement work",
         );
-        assert_eq!(rollback_calls, 2);
+        assert_eq!(rollback_calls, 0);
         assert_eq!(custody.pending_global_frame_owner_count(), 0);
         assert!(!super::alias_backing_is_live(candidate_host));
         assert_eq!(
@@ -3464,7 +3692,7 @@ mod carrier_vm_custody_tests {
             )
             .expect("register fair-retry directory owner");
             assert!(matches!(
-                super::retire_global_frame_host_owner_if_generation_in_using(
+                super::retire_test_global_frame_host_owner_if_generation_in_using(
                     &custody,
                     key.0,
                     key.1,
@@ -3499,7 +3727,7 @@ mod carrier_vm_custody_tests {
         .expect("allocate fair-retry detached candidate");
         let mut candidate_lease =
             super::GlobalFrameStage2Lease::fixed(collision_key.0, collision_key.1);
-        candidate_lease.mark_mapped();
+        candidate_lease.mark_test_mapped_without_backend();
         assert!(
             super::register_global_frame_host_owner_in_using(
                 &custody,
@@ -3565,7 +3793,7 @@ mod carrier_vm_custody_tests {
             "a deleted queue identity must not retire a successor at the reused key",
         );
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 ready_key.0,
                 ready_key.1,
@@ -3576,7 +3804,7 @@ mod carrier_vm_custody_tests {
         ));
         for (key, generation) in live {
             assert!(matches!(
-                super::retire_global_frame_host_owner_if_generation_in_using(
+                super::retire_test_global_frame_host_owner_if_generation_in_using(
                     &custody,
                     key.0,
                     key.1,
@@ -3587,7 +3815,7 @@ mod carrier_vm_custody_tests {
             ));
         }
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 collision_key.0,
                 collision_key.1,
@@ -3638,22 +3866,22 @@ mod carrier_vm_custody_tests {
 
         drop(pin);
         let mut backend_calls = 0_u32;
-        assert_eq!(
-            super::retry_pending_global_frame_retirements_at_idle_in_using(
-                &custody,
-                &mut |_, _| {
-                    backend_calls += 1;
-                    Ok(())
-                },
-            ),
-            0,
-            "reconcile must enqueue the deferred owner without a manual retry bit",
+        let remaining = super::retry_pending_global_frame_retirements_at_idle_in_using(
+            &custody,
+            &mut |_, _| {
+                backend_calls += 1;
+                Ok(())
+            },
         );
+        assert_eq!(remaining.remaining, 1);
         assert_eq!(
             backend_calls, 0,
             "terminalized retirement needs no backend unmap"
         );
-        assert!(!custody.global_frame_host_owners.lock().contains_key(&key));
+        assert!(
+            custody.global_frame_host_owners.lock()[&key].is_pending(),
+            "terminalized physical authority stays quarantined and cannot be reissued",
+        );
     }
 
     #[test]
@@ -3679,7 +3907,7 @@ mod carrier_vm_custody_tests {
         };
         let predecessor = install();
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 key.0,
                 key.1,
@@ -3691,7 +3919,7 @@ mod carrier_vm_custody_tests {
         let successor = install();
         assert_ne!(predecessor, successor);
         let mut unmap_calls = 0_u32;
-        let stale = super::retire_global_frame_host_owner_if_generation_in_using(
+        let stale = super::retire_test_global_frame_host_owner_if_generation_in_using(
             &custody,
             key.0,
             key.1,
@@ -3840,7 +4068,11 @@ mod carrier_vm_custody_tests {
         assert!(
             custody
                 .stage2_record_snapshot(fixed_old_identity.record_id)
-                .is_none()
+                .is_some_and(|record| {
+                    record.terminalized_by_vm_destroy
+                        && record.superseded_by_rebind
+                        && !record.mapped
+                })
         );
         let current_record_id = current.record_identity.record_id;
         let second = super::reconcile_global_frame_owners_after_replay_in_using(
@@ -3924,7 +4156,7 @@ mod carrier_vm_custody_tests {
             .record_identity;
         let injected = CarrierStage2BackendError::HvReturn(0xfae9_4001);
         assert!(matches!(
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &custody,
                 key.0,
                 key.1,
@@ -4065,7 +4297,7 @@ mod carrier_vm_custody_tests {
             .clone();
         let identity = owner.record_identity;
         assert_eq!(
-            custody.retire_stage2_record_using(identity, |_, _| Ok(())),
+            custody.retire_test_stage2_record_using(identity, |_, _| Ok(())),
             super::CarrierStage2RetireOutcome::RetiredUnmapped
         );
 
@@ -4204,9 +4436,9 @@ mod carrier_vm_custody_tests {
         assert_eq!(
             custody.request_stage2_record_retirement(
                 old_identity,
-                custody.stage1_unpublished_by_inventory_commit_for_test(old_identity),
+                custody.stage1_unpublished_after_editor_unmap(old_identity),
             ),
-            super::CarrierStage2RetireOutcome::NotFound
+            super::CarrierStage2RetireOutcome::TerminalizedByVmDestroy
         );
         assert!(
             custody
@@ -4468,11 +4700,18 @@ mod carrier_vm_custody_tests {
         let frames = std::sync::Arc::new(parking_lot::Mutex::new(
             super::InventoryFrameRegistry::default(),
         ));
+        let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let (_, receipt) =
+            carrick_aarch64::vmm::Stage1UnpublishedRange::retire_extension_arenas(&mut manager);
         super::request_carrier_stage2_record_retirements(
             &mut authority,
             &std::sync::Arc::downgrade(&custody),
             &frames,
-            None,
+            super::Stage1UnpublicationReceipt::Editor(&receipt),
         );
         assert!(
             custody
@@ -4529,7 +4768,7 @@ mod carrier_vm_custody_tests {
 
         let first_custody = std::sync::Arc::clone(&custody);
         let first = std::thread::spawn(move || {
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &first_custody,
                 key.0,
                 key.1,
@@ -4544,7 +4783,7 @@ mod carrier_vm_custody_tests {
         entered_rx.recv().expect("first retirement reached unmap");
         let second_custody = std::sync::Arc::clone(&custody);
         let second = std::thread::spawn(move || {
-            super::retire_global_frame_host_owner_if_generation_in_using(
+            super::retire_test_global_frame_host_owner_if_generation_in_using(
                 &second_custody,
                 key.0,
                 key.1,
@@ -4588,6 +4827,11 @@ mod carrier_vm_custody_tests {
         )
         .expect("publish structural custody");
         let identity = *owner.retained.record_identity.lock();
+        let stage1 = custody.stage1_unpublished_after_editor_unmap(identity);
+        assert_eq!(
+            custody.request_stage2_record_retirement(identity, stage1),
+            super::CarrierStage2RetireOutcome::DeferredActivePins,
+        );
 
         drop(owner);
         assert!(super::alias_backing_is_live(host_addr));
@@ -4669,7 +4913,7 @@ mod carrier_vm_custody_tests {
 
         let exact_generation = mappings.first().unwrap().owner_generation;
         mappings.first_mut().unwrap().owner_generation = exact_generation.saturating_add(1);
-        let drift_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
+        let drift_error = super::HvfVmState::retire_test_stage2_extent_from_mappings_in(
             &custody,
             &mut mappings,
             ipa,
@@ -4700,7 +4944,7 @@ mod carrier_vm_custody_tests {
         );
         mappings.first_mut().unwrap().owner_generation = exact_generation;
 
-        let subextent_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
+        let subextent_error = super::HvfVmState::retire_test_stage2_extent_from_mappings_in(
             &custody,
             &mut mappings,
             ipa + 0x1000,
@@ -4718,8 +4962,13 @@ mod carrier_vm_custody_tests {
             "failed-closed subextent retirement must preserve the whole structural map",
         );
 
-        super::HvfVmState::retire_stage2_extent_from_mappings_in(&custody, &mut mappings, ipa, len)
-            .expect("explicitly retire structural root slot");
+        super::HvfVmState::retire_test_stage2_extent_from_mappings_in(
+            &custody,
+            &mut mappings,
+            ipa,
+            len,
+        )
+        .expect("explicitly retire structural root slot");
 
         assert!(
             custody.stage2_record_snapshot(identity.record_id).is_none(),
@@ -4803,7 +5052,7 @@ mod carrier_vm_custody_tests {
             .expect("pin structural root slot");
         let mut mappings = super::TaskMappingIndex::from_region(region);
 
-        let retirement_error = super::HvfVmState::retire_stage2_extent_from_mappings_in(
+        let retirement_error = super::HvfVmState::retire_test_stage2_extent_from_mappings_in(
             &custody,
             &mut mappings,
             ipa,
@@ -4903,10 +5152,19 @@ mod carrier_vm_custody_tests {
         assert!(
             custody
                 .stage2_record_snapshot(old_identity.record_id)
-                .is_none()
+                .is_some_and(|record| {
+                    record.terminalized_by_vm_destroy
+                        && record.superseded_by_rebind
+                        && !record.mapped
+                })
         );
         assert!(super::alias_backing_is_live(host_addr));
 
+        let stage1 = custody.stage1_unpublished_after_editor_unmap(new_identity);
+        assert_eq!(
+            custody.request_stage2_record_retirement(new_identity, stage1),
+            super::CarrierStage2RetireOutcome::DeferredActivePins,
+        );
         drop(owner);
         assert!(
             custody
@@ -4964,7 +5222,8 @@ mod carrier_vm_custody_tests {
             .nth(1)
             .and_then(|tail| tail.split("\n}\n").next())
             .expect("structural owner Drop body");
-        assert!(structural_drop.contains("request_stage2_record_retirement"));
+        assert!(structural_drop.contains("stage1_unpublished_for_retirement"));
+        assert!(!structural_drop.contains("request_stage2_record_retirement"));
         assert!(!structural_drop.contains("inventory_hv_vm_unmap"));
         assert!(!prepared.contains("Arc<GlobalFrameHostOwner>"));
     }
@@ -5150,7 +5409,7 @@ mod carrier_vm_custody_tests {
         let injected = CarrierStage2BackendError::HvReturn(0xfae9_4001);
 
         assert_eq!(
-            custody.retire_stage2_record_using(identity, |_, _| Err(injected)),
+            custody.retire_test_stage2_record_using(identity, |_, _| Err(injected)),
             CarrierStage2RetireOutcome::RetryPending(injected)
         );
         let retained = custody
@@ -5166,7 +5425,7 @@ mod carrier_vm_custody_tests {
         assert_eq!(retained.retry_pending, Some(injected));
 
         assert_eq!(
-            custody.retire_stage2_record_using(identity, |_, _| Ok(())),
+            custody.retire_test_stage2_record_using(identity, |_, _| Ok(())),
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
         assert!(
@@ -5187,6 +5446,11 @@ mod carrier_vm_custody_tests {
         let key = (0x4000, 0x4000);
         custody.carrier_stage2_records.lock().insert(key, identity);
         let injected = CarrierStage2BackendError::HvReturn(0xfae9_4001);
+        let stage1 = custody.stage1_unpublished_after_editor_unmap(identity);
+        assert_eq!(
+            custody.request_stage2_record_retirement(identity, stage1),
+            CarrierStage2RetireOutcome::DeferredActivePins
+        );
 
         let error = super::retire_carrier_stage2_record_at_safe_point_using(
             &custody,
@@ -5238,7 +5502,7 @@ mod carrier_vm_custody_tests {
         let unmap_calls = std::cell::Cell::new(0_u32);
 
         assert_eq!(
-            custody.retire_stage2_record_using(identity, |_, _| {
+            custody.retire_test_stage2_record_using(identity, |_, _| {
                 unmap_calls.set(unmap_calls.get() + 1);
                 Ok(())
             }),
@@ -5258,7 +5522,7 @@ mod carrier_vm_custody_tests {
         assert!(eligible.mapped);
 
         assert_eq!(
-            custody.retire_stage2_record_using(identity, |_, _| {
+            custody.retire_test_stage2_record_using(identity, |_, _| {
                 unmap_calls.set(unmap_calls.get() + 1);
                 Ok(())
             }),
@@ -5289,7 +5553,7 @@ mod carrier_vm_custody_tests {
             assert_eq!(
                 custody.request_stage2_record_retirement(
                     identity,
-                    custody.stage1_unpublished_by_inventory_commit_for_test(identity),
+                    custody.stage1_unpublished_after_editor_unmap(identity),
                 ),
                 CarrierStage2RetireOutcome::DeferredActivePins
             );
@@ -5338,7 +5602,7 @@ mod carrier_vm_custody_tests {
         assert_eq!(
             custody.request_stage2_record_retirement(
                 identity,
-                custody.stage1_unpublished_by_inventory_commit_for_test(identity),
+                custody.stage1_unpublished_after_editor_unmap(identity),
             ),
             CarrierStage2RetireOutcome::DeferredActivePins
         );
@@ -5595,7 +5859,7 @@ mod carrier_vm_custody_tests {
         let post_destroy_unmaps = std::cell::Cell::new(0_u32);
         for identity in [first, second] {
             assert_eq!(
-                custody.retire_stage2_record_using(identity, |_, _| {
+                custody.retire_test_stage2_record_using(identity, |_, _| {
                     post_destroy_unmaps.set(post_destroy_unmaps.get() + 1);
                     Ok(())
                 }),
@@ -5632,7 +5896,7 @@ mod carrier_vm_custody_tests {
             Some(before)
         );
         assert_eq!(
-            custody.retire_stage2_record_using(identity, |_, _| Ok(())),
+            custody.retire_test_stage2_record_using(identity, |_, _| Ok(())),
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
     }
@@ -5651,34 +5915,38 @@ mod carrier_vm_custody_tests {
             .commit_create(second_generation)
             .expect("publish successor generation");
         let second = custody
-            .register_stage2_record(stage2_spec(second_generation, 52))
-            .expect("register same-key successor");
+            .rebind_terminal_stage2_record(
+                first,
+                stage2_spec(second_generation, 52).host_addr,
+                stage2_spec(second_generation, 52).perms,
+            )
+            .expect("rebind same-key successor through terminal custody");
         assert_ne!(first.record_id, second.record_id);
         let unmap_calls = std::cell::Cell::new(0_u32);
 
+        let stale_vm = CarrierStage2RecordIdentity {
+            vm_generation: first_generation,
+            ..second
+        };
         assert_eq!(
-            custody.retire_stage2_record_using(
-                CarrierStage2RecordIdentity {
-                    vm_generation: first_generation,
-                    ..second
-                },
-                |_, _| {
-                    unmap_calls.set(unmap_calls.get() + 1);
-                    Ok(())
-                },
+            custody.request_stage2_record_retirement(
+                stale_vm,
+                custody.stage1_unpublished_after_editor_unmap(stale_vm),
             ),
             CarrierStage2RetireOutcome::VmGenerationMismatch
         );
+        let owner = second.logical_owner.expect("rebound logical owner");
+        let stale_owner = CarrierStage2RecordIdentity {
+            logical_owner: Some(CarrierLogicalOwner {
+                id: owner.id,
+                generation: owner.generation + 1,
+            }),
+            ..second
+        };
         assert_eq!(
-            custody.retire_stage2_record_using(
-                CarrierStage2RecordIdentity {
-                    logical_owner: first.logical_owner,
-                    ..second
-                },
-                |_, _| {
-                    unmap_calls.set(unmap_calls.get() + 1);
-                    Ok(())
-                },
+            custody.request_stage2_record_retirement(
+                stale_owner,
+                custody.stage1_unpublished_after_editor_unmap(stale_owner),
             ),
             CarrierStage2RetireOutcome::OwnerGenerationMismatch
         );

@@ -532,6 +532,13 @@ impl AddressSpaces {
             .fetch_or(GATE_CLOSED, Ordering::SeqCst);
     }
 
+    /// Whether this publication has entered its terminal close transition.
+    /// A host waiter that sampled an older Editor revision treats close as a
+    /// changed selection even when no guest Editor was active at the time.
+    pub fn is_closed(&self, index: SpaceIndex) -> bool {
+        self.entry(index).gate.load(Ordering::SeqCst) & GATE_CLOSED != 0
+    }
+
     /// Host: permanently close the entry and wait for its admitted guest
     /// editor before retiring the roots or reusing the entry.
     pub fn close_and_wait_for_editor(
@@ -1195,6 +1202,7 @@ mod tests {
                 .key(),
             7
         );
+        assert!(spaces.is_closed(index));
     }
 
     #[test]

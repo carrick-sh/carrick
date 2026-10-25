@@ -2265,6 +2265,100 @@ pub(crate) fn hvpatch_task_state_test_fixture(
     }
 }
 
+/// Put a synthetic inventory task through the same directory publication and
+/// core MM-drain crossings as a production whole-MM retirement.
+///
+/// The helper supplies physical test custody only.  It does not construct a
+/// stage-2 proof: `drain_publication` mints the non-cloneable proof, and the
+/// production registration state machine must consume it before retirement.
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn prepare_test_whole_mm_retirement(
+    task: &mut HvfTaskState,
+) -> carrick_core::mm::retirement::Stage1UnpublishedMm {
+    #[derive(Clone, Debug, Default)]
+    struct Venue {
+        state: std::sync::Arc<parking_lot::Mutex<carrick_core::mm::retirement::ResidencyState>>,
+        changed: std::sync::Arc<parking_lot::Condvar>,
+    }
+    // SAFETY: every clone shares one mutex and condition variable.
+    unsafe impl carrick_core::mm::retirement::ResidencyVenue for Venue {
+        type Guard<'a> = parking_lot::MutexGuard<'a, carrick_core::mm::retirement::ResidencyState>;
+
+        fn lock(&self) -> Self::Guard<'_> {
+            self.state.lock()
+        }
+
+        fn wait(&self, guard: &mut Self::Guard<'_>) {
+            self.changed.wait(guard);
+        }
+
+        fn notify_all(&self) {
+            self.changed.notify_all();
+        }
+    }
+    struct Publication;
+    impl carrick_core::mm::retirement::AddressPublication for Publication {
+        fn retire_reservations(&self) {}
+    }
+
+    let residency = carrick_core::mm::retirement::AddressResidency::<Venue, u64>::new(1);
+    let retirement = residency
+        .begin_retirement()
+        .expect("test MM residency begins retirement");
+    let proof = carrick_core::mm::retirement::drain_publication(Publication, &retirement);
+
+    if task.registration.is_none() {
+        let directory = std::sync::Arc::new(HvpatchCarrierTaskStateDirectory::default());
+        let identity = task.cow_identity.expect("test task has a COW identity");
+        let task_serial = u64::try_from(identity.linux_pid).expect("positive test pid");
+        let thread_serial = u64::try_from(identity.linux_tid).expect("positive test tid");
+        let key = HvpatchCarrierTaskStateKey {
+            directory_instance: directory.instance,
+            task_serial,
+            thread_serial,
+            execution_generation: 1,
+            nonce: std::num::NonZeroU64::new(1).expect("nonzero test nonce"),
+        };
+        let mm_key = HvpatchMmAuthorityKey {
+            task_serial,
+            mm_root_slot: task.mm_root_slot,
+            shared_kernel_mm: None,
+        };
+        let carrier_mm = std::sync::Arc::new(HvpatchCarrierMmAuthority::PublicationTest {
+            stage1_lifecycle: parking_lot::Mutex::new(CarrierMmStage1Lifecycle::Published),
+        });
+        directory.inner.lock().states.insert(
+            key,
+            HvpatchCarrierTaskRow {
+                mm_key,
+                _mm: Some(carrier_mm),
+                rollbacks: None,
+            },
+        );
+        let (_, child_token_verifier) = carrick_hal::HvpatchChildTokenIssuer::new_pair();
+        task.registration = Some(HvpatchTaskRegistration {
+            directory,
+            key,
+            expected_identity: HvpatchCarrierTaskIdentity {
+                task_serial,
+                thread_serial,
+                execution_generation: 1,
+                linux_pid: identity.linux_pid,
+                linux_tid: identity.linux_tid,
+                asid: identity.asid,
+            },
+            foreign_mm_registration: None,
+            task_mm: None,
+            cow_authority: task.cow_authority.clone(),
+            cow_identity: task.cow_identity,
+            cow_authority_identity: None,
+            child_token_verifier,
+        });
+    }
+    proof
+}
+
 #[cfg(test)]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(
@@ -3570,8 +3664,7 @@ pub(crate) enum HvpatchCarrierMmAuthority {
         stage2_logical_leases: Vec<CarrierStage2LogicalLease>,
         custody: std::sync::Weak<CarrierVmCustody>,
         frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
-        stage1_unpublished:
-            parking_lot::Mutex<Option<carrick_core::mm::retirement::Stage1UnpublishedMm>>,
+        stage1_lifecycle: parking_lot::Mutex<CarrierMmStage1Lifecycle>,
         _vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     },
     #[cfg(test)]
@@ -3583,6 +3676,27 @@ pub(crate) enum HvpatchCarrierMmAuthority {
         stage2_lease_keys: Vec<(u64, u64)>,
         frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
     },
+    /// A synthetic physical owner used only to put inventory tests through
+    /// the production whole-MM publication state machine.  It deliberately
+    /// carries no retirement shortcut: the directory registration must still
+    /// consume a real [`Stage1UnpublishedMm`] before inventory retirement.
+    #[cfg(test)]
+    PublicationTest {
+        stage1_lifecycle: parking_lot::Mutex<CarrierMmStage1Lifecycle>,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) enum CarrierMmStage1Lifecycle {
+    /// Directory publication has not committed. Its inventory rollback is the
+    /// only authority allowed to retire the prepared stage-2 records.
+    Unpublished(UnpublishedTaskStage1),
+    /// Stage 1 is live. Retirement is forbidden until whole-MM unpublication
+    /// supplies the inventory transaction's proof.
+    Published,
+    /// Whole-MM exit/exec unpublished stage 1 before exposing its stage-2
+    /// retirement inventory.
+    Retired(std::sync::Arc<carrick_core::mm::retirement::Stage1UnpublishedMm>),
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3590,24 +3704,55 @@ impl HvpatchCarrierMmAuthority {
     fn publish_stage1_unpublished(
         &self,
         proof: carrick_core::mm::retirement::Stage1UnpublishedMm,
-    ) -> Result<(), TrapError> {
+    ) -> Result<std::sync::Arc<carrick_core::mm::retirement::Stage1UnpublishedMm>, TrapError> {
         #[cfg(not(test))]
         let Self::Live {
-            stage1_unpublished, ..
+            stage1_lifecycle, ..
         } = self;
         #[cfg(test)]
-        let stage1_unpublished = match self {
+        let stage1_lifecycle = match self {
             Self::Live {
-                stage1_unpublished, ..
-            } => stage1_unpublished,
-            Self::Test { .. } | Self::LeaseTest { .. } => return Ok(()),
+                stage1_lifecycle, ..
+            } => stage1_lifecycle,
+            Self::PublicationTest { stage1_lifecycle } => stage1_lifecycle,
+            Self::Test { .. } | Self::LeaseTest { .. } => {
+                return Err(TrapError::Hypervisor(
+                    "test carrier MM has no production stage-1 publication".to_owned(),
+                ));
+            }
         };
-        let mut slot = stage1_unpublished.lock();
-        if slot.replace(proof).is_some() {
+        let mut lifecycle = stage1_lifecycle.lock();
+        let proof = std::sync::Arc::new(proof);
+        if !matches!(*lifecycle, CarrierMmStage1Lifecycle::Published) {
             return Err(TrapError::Hypervisor(
                 "duplicate stage-1 unpublication proof for carrier MM".to_owned(),
             ));
         }
+        *lifecycle = CarrierMmStage1Lifecycle::Retired(std::sync::Arc::clone(&proof));
+        Ok(proof)
+    }
+
+    fn commit_stage1_publication(&self) -> Result<(), TrapError> {
+        #[cfg(not(test))]
+        let Self::Live {
+            stage1_lifecycle, ..
+        } = self;
+        #[cfg(test)]
+        let stage1_lifecycle = match self {
+            Self::Live {
+                stage1_lifecycle, ..
+            } => stage1_lifecycle,
+            Self::Test { .. } | Self::LeaseTest { .. } | Self::PublicationTest { .. } => {
+                return Ok(());
+            }
+        };
+        let mut lifecycle = stage1_lifecycle.lock();
+        if !matches!(*lifecycle, CarrierMmStage1Lifecycle::Unpublished(_)) {
+            return Err(TrapError::Hypervisor(
+                "carrier MM stage-1 publication has no unpublished inventory receipt".to_owned(),
+            ));
+        }
+        *lifecycle = CarrierMmStage1Lifecycle::Published;
         Ok(())
     }
 }
@@ -3648,7 +3793,7 @@ fn request_carrier_stage2_record_retirements(
     stage2_logical_leases: &mut Vec<CarrierStage2LogicalLease>,
     custody: &std::sync::Weak<CarrierVmCustody>,
     frames: &std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
-    stage1_unpublished: Option<&carrick_core::mm::retirement::Stage1UnpublishedMm>,
+    stage1_unpublished: carrier_custody::Stage1UnpublicationReceipt<'_>,
 ) {
     let Some(custody) = custody.upgrade() else {
         stage2_logical_leases.clear();
@@ -3681,14 +3826,15 @@ fn request_carrier_stage2_record_retirements(
     };
     for identity in retirements {
         custody.enqueue_carrier_stage2_retirement(identity);
-        let stage1 = match stage1_unpublished {
-            Some(stage1_unpublished) => {
-                custody.stage1_unpublished_by_inventory_commit(identity, stage1_unpublished)
-            }
-            #[cfg(test)]
-            None => custody.stage1_unpublished_by_inventory_commit_for_test(identity),
-            #[cfg(not(test))]
-            None => unreachable!("production MM retirement requires stage-1 proof"),
+        let Some(stage1) = custody.stage1_unpublished_from_receipt(identity, stage1_unpublished)
+        else {
+            // A mismatched receipt cannot authorize retirement. Keep the
+            // record quarantined instead of destroying stage-2 authority.
+            debug_assert!(
+                false,
+                "carrier MM retirement receipt does not cover stage-2 record: identity={identity:?}"
+            );
+            continue;
         };
         let outcome = custody.request_stage2_record_retirement(identity, stage1);
         if outcome != CarrierStage2RetireOutcome::DeferredActivePins {
@@ -3709,29 +3855,34 @@ impl Drop for HvpatchCarrierMmAuthority {
                 stage2_logical_leases,
                 custody,
                 frames,
-                stage1_unpublished,
+                stage1_lifecycle,
                 ..
             } => {
                 if stage2_logical_leases.is_empty() {
                     return;
                 }
-                let Some(stage1_unpublished) = stage1_unpublished.get_mut().take() else {
-                    // The typed exit/exec paths publish this proof before the
-                    // last MM authority can drop.  If a future internal path
-                    // violates that contract, leave the stage-2 records in
-                    // the directory: their IPAs stay quarantined instead of
-                    // retiring authority ahead of stage 1.
-                    debug_assert!(
-                        false,
-                        "carrier MM dropped without stage-1 unpublication proof"
-                    );
-                    return;
+                let lifecycle = stage1_lifecycle.get_mut();
+                let receipt = match lifecycle {
+                    CarrierMmStage1Lifecycle::Unpublished(receipt) => {
+                        carrier_custody::Stage1UnpublicationReceipt::InventoryRollback(receipt)
+                    }
+                    CarrierMmStage1Lifecycle::Retired(receipt) => {
+                        carrier_custody::Stage1UnpublicationReceipt::Inventory(receipt)
+                    }
+                    CarrierMmStage1Lifecycle::Published => {
+                        // A live MM may never lose its last carrier authority.
+                        // Quarantine is safer than returning an IPA still named
+                        // by stage 1; the debug assertion makes the ownership
+                        // violation loud without forging a retirement proof.
+                        debug_assert!(false, "live carrier MM dropped before stage-1 retirement");
+                        return;
+                    }
                 };
                 request_carrier_stage2_record_retirements(
                     stage2_logical_leases,
                     custody,
                     frames,
-                    Some(&stage1_unpublished),
+                    receipt,
                 );
             }
             #[cfg(test)]
@@ -3749,13 +3900,24 @@ impl Drop for HvpatchCarrierMmAuthority {
                     .filter_map(|key| custody.carrier_stage2_records.lock().get(&key).copied())
                     .collect::<Vec<_>>();
                 let mut logical_leases = carrier_stage2_logical_leases(custody, &identities);
+                let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
+                    carrick_mem::memory::stage1_hvpatch_page_tables(),
+                    crate::memory::LINUX_PAGE_TABLES_BASE,
+                    carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+                );
+                let (_, receipt) =
+                    carrick_aarch64::vmm::Stage1UnpublishedRange::retire_extension_arenas(
+                        &mut manager,
+                    );
                 request_carrier_stage2_record_retirements(
                     &mut logical_leases,
                     &std::sync::Arc::downgrade(custody),
                     frames,
-                    None,
+                    carrier_custody::Stage1UnpublicationReceipt::Editor(&receipt),
                 );
             }
+            #[cfg(test)]
+            Self::PublicationTest { .. } => {}
         }
     }
 }
@@ -3891,6 +4053,12 @@ impl HvpatchTaskMappingState {
 #[derive(::core::default::Default)]
 #[allow(dead_code)] // retained task authority; worker-side load consumes these fields
 struct HvpatchPreparedTaskAuthority {
+    /// Receipt owned only while this task transaction has not published a
+    /// stage-1 image. Rollback consumes it to retire stage-2 preparations.
+    unpublished_stage1: Option<UnpublishedTaskStage1>,
+    /// Structural stage-2 records created by this unpublished transaction.
+    /// Borrowed parent/sibling owners are deliberately absent.
+    unpublished_structural_identities: Vec<CarrierStage2RecordIdentity>,
     custody: Option<std::sync::Arc<CarrierVmCustody>>,
     foreign_mm_transport: Option<std::sync::Arc<CarrierForeignMmTransport>>,
     mappings: Vec<HvpatchTaskMappingState>,
@@ -3920,6 +4088,22 @@ struct HvpatchPreparedTaskAuthority {
     drop_order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
     #[cfg(test)]
     abort_order: Option<std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>>,
+}
+
+pub(super) struct UnpublishedTaskStage1 {
+    _private: (),
+}
+
+impl Clone for UnpublishedTaskStage1 {
+    fn clone(&self) -> Self {
+        Self { _private: () }
+    }
+}
+
+impl UnpublishedTaskStage1 {
+    fn begin_inventory_transaction() -> Self {
+        Self { _private: () }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4677,14 +4861,71 @@ fn abort_prepared_task_and_carrier(
     let state_result = state.abort();
     let mut owner_rollback_error = None;
     if let Some(custody) = custody.as_ref() {
+        let rollback_receipt = task.unpublished_stage1.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor(
+                "prepared task rollback has no unpublished inventory receipt".to_owned(),
+            )
+        })?;
+        for &identity in &task.unpublished_structural_identities {
+            let stage1 = custody
+                .stage1_unpublished_from_receipt(
+                    identity,
+                    carrier_custody::Stage1UnpublicationReceipt::InventoryRollback(
+                        rollback_receipt,
+                    ),
+                )
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "unpublished inventory receipt did not cover prepared structural record"
+                            .to_owned(),
+                    )
+                })?;
+            let outcome = custody.request_stage2_record_retirement(identity, stage1);
+            if outcome != carrier_custody::CarrierStage2RetireOutcome::DeferredActivePins
+                && outcome != carrier_custody::CarrierStage2RetireOutcome::TerminalizedByVmDestroy
+            {
+                owner_rollback_error = Some(TrapError::Hypervisor(format!(
+                    "prepared structural owner rollback request refused: {outcome:?}"
+                )));
+            }
+        }
         for mapping in &task.mappings {
             // Retire only the owner rows THIS preparation registered. Borrowed
             // rows (a forked child's COW view of its parent's frames, a
             // CLONE_VM sibling's view of its process) stay live for their
             // owner; retiring them here unmapped a running parent's heap.
             if mapping.global_frame_owner_role == GlobalFrameOwnerRole::Registered {
+                let identity = global_frame_stage2_identity_in(
+                    custody,
+                    mapping.physical_ipa,
+                    mapping.physical_size as u64,
+                )
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "prepared task rollback lost global record identity".to_owned(),
+                    )
+                })?;
+                let stage1 = custody
+                    .stage1_unpublished_from_receipt(
+                        identity,
+                        carrier_custody::Stage1UnpublicationReceipt::InventoryRollback(
+                            task.unpublished_stage1.as_ref().ok_or_else(|| {
+                                TrapError::Hypervisor(
+                                    "prepared task rollback has no unpublished inventory receipt"
+                                        .to_owned(),
+                                )
+                            })?,
+                        ),
+                    )
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "unpublished inventory receipt did not cover prepared global record"
+                                .to_owned(),
+                        )
+                    })?;
                 let outcome = retire_global_frame_host_owner_if_generation_in(
                     custody,
+                    stage1,
                     mapping.physical_ipa,
                     mapping.physical_size as u64,
                     mapping.owner_generation,
@@ -5816,7 +6057,7 @@ impl HvpatchCarrierTaskStateDirectory {
                     ),
                     custody: std::sync::Arc::downgrade(custody),
                     frames,
-                    stage1_unpublished: parking_lot::Mutex::new(None),
+                    stage1_lifecycle: parking_lot::Mutex::new(CarrierMmStage1Lifecycle::Published),
                     _vm: _vm.clone(),
                 }))
             }
@@ -5830,6 +6071,12 @@ impl HvpatchCarrierTaskStateDirectory {
             Some(HvpatchCarrierMmAuthority::LeaseTest { .. }) => {
                 return Err(TrapError::Hypervisor(
                     "test carrier lease authority cannot be exec-rebound".to_owned(),
+                ));
+            }
+            #[cfg(test)]
+            Some(HvpatchCarrierMmAuthority::PublicationTest { .. }) => {
+                return Err(TrapError::Hypervisor(
+                    "test publication authority cannot be exec-rebound".to_owned(),
                 ));
             }
             None => None,
@@ -5894,7 +6141,7 @@ impl HvpatchTaskRegistration {
     fn publish_stage1_unpublished(
         &self,
         proof: carrick_core::mm::retirement::Stage1UnpublishedMm,
-    ) -> Result<(), TrapError> {
+    ) -> Result<std::sync::Arc<carrick_core::mm::retirement::Stage1UnpublishedMm>, TrapError> {
         let carrier_mm = self
             .directory
             .inner
@@ -6654,7 +6901,9 @@ impl HvpatchCarrierTaskStateDirectory {
                                 );
                             }),
                         ),
-                        stage1_unpublished: parking_lot::Mutex::new(None),
+                        stage1_lifecycle: parking_lot::Mutex::new(
+                            CarrierMmStage1Lifecycle::Published,
+                        ),
                     }))
                 }),
                 None,
@@ -6674,7 +6923,9 @@ impl HvpatchCarrierTaskStateDirectory {
                                 );
                             }),
                         ),
-                        stage1_unpublished: parking_lot::Mutex::new(None),
+                        stage1_lifecycle: parking_lot::Mutex::new(
+                            CarrierMmStage1Lifecycle::Published,
+                        ),
                     }))
                 }),
                 None,
@@ -6730,7 +6981,16 @@ impl HvpatchCarrierTaskStateDirectory {
                                 );
                             }),
                         ),
-                        stage1_unpublished: parking_lot::Mutex::new(None),
+                        stage1_lifecycle: parking_lot::Mutex::new(
+                            CarrierMmStage1Lifecycle::Unpublished(
+                                task.unpublished_stage1.as_ref().ok_or_else(|| {
+                                    TrapError::Hypervisor(
+                                        "prepared process has no unpublished inventory receipt"
+                                            .to_owned(),
+                                    )
+                                })?.clone(),
+                            ),
+                        ),
                     })),
                     None,
                 )
@@ -6848,6 +7108,9 @@ impl HvpatchCarrierTaskStateDirectory {
             return Err(TrapError::Hypervisor(
                 "injected carrier task-state failure after directory publication".to_owned(),
             ));
+        }
+        if process_owner && let Some(carrier_mm) = carrier_mm.as_ref() {
+            carrier_mm.commit_stage1_publication()?;
         }
         if let Some(carrier_mm) = carrier_mm {
             inner
@@ -7066,6 +7329,7 @@ impl HvfVmState {
         let mut structural_owners = std::collections::BTreeMap::new();
         let mut structural_identities = Vec::new();
         let mut registered_global_owners = Vec::new();
+        let unpublished_stage1 = UnpublishedTaskStage1::begin_inventory_transaction();
         let inventory_mappings = plan.inventory_mappings;
         let mut pending_aliases = Vec::new();
         let mut pending_receipts = Vec::new();
@@ -7131,6 +7395,7 @@ impl HvfVmState {
                     drop(mm_root_stage2.take());
                     if let Err(rollback_error) = rollback_partial_process_stage2_authorities(
                         &plan.carrier_foreign_mm_transport.custody,
+                        &unpublished_stage1,
                         &mut stage2_leases,
                         &registered_global_owners,
                         &structural_identities,
@@ -7446,6 +7711,7 @@ impl HvfVmState {
                         drop(mm_root_stage2.take());
                         let stage2_rollback_error = rollback_partial_process_stage2_authorities(
                             &plan.carrier_foreign_mm_transport.custody,
+                            &unpublished_stage1,
                             &mut stage2_leases,
                             &registered_global_owners,
                             &structural_identities,
@@ -7500,6 +7766,8 @@ impl HvfVmState {
         Ok((
             stage2_leases,
             HvpatchPreparedTaskAuthority {
+                unpublished_stage1: Some(unpublished_stage1),
+                unpublished_structural_identities: structural_identities,
                 custody: Some(std::sync::Arc::clone(
                     &plan.carrier_foreign_mm_transport.custody,
                 )),
@@ -7541,6 +7809,7 @@ impl HvfVmState {
         let mut structural_owners = std::collections::BTreeMap::new();
         let mut structural_identities = Vec::new();
         let mut registered_global_owners = Vec::new();
+        let unpublished_stage1 = UnpublishedTaskStage1::begin_inventory_transaction();
         let inventory_mappings = plan.inventory_mappings;
         let mut aliases_to_publish = Vec::new();
         let mut pending_fork_frame_receipts = Vec::new();
@@ -7608,6 +7877,7 @@ impl HvfVmState {
                     drop(mapped);
                     if let Err(rollback_error) = rollback_partial_process_stage2_authorities(
                         &plan.carrier_foreign_mm_transport.custody,
+                        &unpublished_stage1,
                         &mut prior_stage2_leases,
                         &registered_global_owners,
                         &structural_identities,

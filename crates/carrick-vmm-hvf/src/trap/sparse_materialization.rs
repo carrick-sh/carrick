@@ -2415,7 +2415,7 @@ mod arena_pin_tests {
         state.structural_owners.write().clear();
         assert_eq!(resolver.host_ptr_for_base(base), Some(pointer));
         assert_eq!(
-            custody.retire_stage2_record_using(identity, |_, _| panic!(
+            custody.retire_test_stage2_record_using(identity, |_, _| panic!(
                 "pinned backing must not unmap"
             )),
             CarrierStage2RetireOutcome::DeferredActivePins
@@ -2429,7 +2429,7 @@ mod arena_pin_tests {
             0
         );
         assert_eq!(
-            custody.retire_stage2_record_using(identity, |_, _| Ok(())),
+            custody.retire_test_stage2_record_using(identity, |_, _| Ok(())),
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
     }
@@ -2891,12 +2891,27 @@ impl Drop for PendingTransferGrant {
                     carrick_fatal!("hvpatch::user_transfer", "rollback target backend: {error}")
                 });
             drop(inventory);
-            retire_global_frame_host_owner_if_generation_in(
-                &self.context.custody,
-                key.0,
-                key.1,
-                publication.ready.owner_generation,
-            );
+            if let Some(identity) =
+                global_frame_stage2_identity_in(&self.context.custody, key.0, key.1)
+            {
+                let authority = self.context.state.page_tables_authority();
+                if let Some(stage1) = self.context.custody.stage1_unpublished_from_receipt(
+                    identity,
+                    Stage1UnpublicationReceipt::AuthoritativeAbsence {
+                        authority: &authority,
+                        va: publication.alias.start,
+                        len: publication.alias.size,
+                    },
+                ) {
+                    retire_global_frame_host_owner_if_generation_in(
+                        &self.context.custody,
+                        stage1,
+                        key.0,
+                        key.1,
+                        publication.ready.owner_generation,
+                    );
+                }
+            }
         } else {
             if kernel_live || !record_current {
                 carrick_fatal!(

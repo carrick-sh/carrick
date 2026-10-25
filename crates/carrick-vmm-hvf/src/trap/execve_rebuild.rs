@@ -52,14 +52,20 @@ impl PendingExecStage2Cleanup {
                 "shared exec projection cannot consume MM unpublication proof".to_owned(),
             ));
         }
-        let carrier_mm = self.carrier_mm.as_ref().ok_or_else(|| {
+        let carrier_mm = self.carrier_mm.as_ref().cloned().ok_or_else(|| {
             TrapError::Hypervisor(
                 "exec predecessor stage-1 proof has no retained carrier MM".to_owned(),
             )
         })?;
-        carrier_mm.publish_stage1_unpublished(stage1_unpublished)?;
-        let retired = self.retire();
+        let retired = self
+            .retire_with_cleanup_boundary(
+                &mut |event| crate::probes::hvpatch_exec_predecessor_classification(event),
+                &mut |_| {},
+                Some(&stage1_unpublished),
+            )
+            .map(|_| ());
         if retired.is_ok() {
+            carrier_mm.publish_stage1_unpublished(stage1_unpublished)?;
             drop(self.carrier_mm.take());
         }
         retired
@@ -75,14 +81,29 @@ impl PendingExecStage2Cleanup {
                 "shared exec projection cannot consume MM unpublication proof".to_owned(),
             ));
         }
-        let carrier_mm = self.carrier_mm.as_ref().ok_or_else(|| {
+        let carrier_mm = self.carrier_mm.as_ref().cloned().ok_or_else(|| {
             TrapError::Hypervisor(
                 "exec predecessor stage-1 proof has no retained carrier MM".to_owned(),
             )
         })?;
-        carrier_mm.publish_stage1_unpublished(stage1_unpublished)?;
-        let retired = self.retire_with_root_proof(expected_root_slot);
+        if self.mm_root_slot != Some(expected_root_slot) {
+            return Err(TrapError::Hypervisor(
+                "exec predecessor root retirement coordinates mismatch".to_owned(),
+            ));
+        }
+        let retired = self
+            .retire_with_cleanup_boundary(
+                &mut |event| crate::probes::hvpatch_exec_predecessor_classification(event),
+                &mut |_| {},
+                Some(&stage1_unpublished),
+            )?
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "exec predecessor retirement produced no stage-1 root proof".to_owned(),
+                )
+            });
         if retired.is_ok() {
+            carrier_mm.publish_stage1_unpublished(stage1_unpublished)?;
             drop(self.carrier_mm.take());
         }
         retired
@@ -100,7 +121,7 @@ impl PendingExecStage2Cleanup {
             carrick_observability::probes::HvpatchExecPredecessorClassification,
         ),
     ) -> Result<(), TrapError> {
-        self.retire_with_cleanup_boundary(publish, &mut |_| {})
+        self.retire_with_cleanup_boundary(publish, &mut |_| {}, None)
             .map(|_| ())
     }
 
@@ -117,6 +138,7 @@ impl PendingExecStage2Cleanup {
         self.retire_with_cleanup_boundary(
             &mut |event| crate::probes::hvpatch_exec_predecessor_classification(event),
             &mut |_| {},
+            None,
         )?
         .ok_or_else(|| {
             TrapError::Hypervisor(
@@ -131,6 +153,7 @@ impl PendingExecStage2Cleanup {
             carrick_observability::probes::HvpatchExecPredecessorClassification,
         ),
         after_exact_owner_retirement: &mut dyn FnMut(RetiredStage2Projection),
+        stage1_unpublished: Option<&carrick_core::mm::retirement::Stage1UnpublishedMm>,
     ) -> Result<Option<HvpatchMmRootRetirementProof>, TrapError> {
         #[cfg(not(test))]
         let custody = std::sync::Arc::clone(&self.custody);
@@ -171,6 +194,11 @@ impl PendingExecStage2Cleanup {
             publish(classification);
             return Ok(None);
         }
+        let stage1_unpublished = stage1_unpublished.ok_or_else(|| {
+            TrapError::Hypervisor(
+                "exec predecessor cleanup lacks stage-1 unpublication proof".to_owned(),
+            )
+        })?;
         let mut retired_extents = Vec::new();
         for (&(ipa, size), &owner_identity) in &self.extents {
             let owner_generation = owner_identity.generation;
@@ -191,12 +219,26 @@ impl PendingExecStage2Cleanup {
                     HvfVmState::retire_stage2_extent_from_mappings_in(
                         custody,
                         &mut self.mappings,
+                        Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
                         ipa,
                         size as u64,
                     )
                 } else {
                     let outcome = retire_global_frame_host_owner_if_generation_in(
                         custody,
+                        custody
+                            .stage1_unpublished_from_receipt(
+                                global_frame_stage2_identity_in(custody, ipa, size as u64)
+                                    .ok_or_else(|| {
+                                        TrapError::Hypervisor(
+                                            "exec owner lost record identity".to_owned(),
+                                        )
+                                    })?,
+                                Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
+                            )
+                            .ok_or_else(|| {
+                                TrapError::Hypervisor("exec owner lacks stage-1 proof".to_owned())
+                            })?,
                         ipa,
                         size as u64,
                         owner_generation,
@@ -1690,7 +1732,15 @@ impl GlobalFrameOwnerRollback {
 impl Drop for GlobalFrameOwnerRollback {
     fn drop(&mut self) {
         for &(ipa, length) in self.keys.iter().rev() {
-            let outcome = retire_global_frame_host_owner_in(&self.custody, ipa, length);
+            let Some(identity) = global_frame_stage2_identity_in(&self.custody, ipa, length) else {
+                continue;
+            };
+            let Some(stage1) = self.custody.stage1_unpublished_for_retirement(identity) else {
+                // No stage-1 proof means this rollback must leave the IPA
+                // quarantined; teardown owns eventual release.
+                continue;
+            };
+            let outcome = retire_global_frame_host_owner_in(&self.custody, stage1, ipa, length);
             if matches!(outcome, GlobalFrameRetirementOutcome::NotFound { .. }) {
                 carrick_fatal!(
                     "hvpatch::frame_inventory",

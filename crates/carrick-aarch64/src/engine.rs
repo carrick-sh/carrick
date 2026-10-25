@@ -4228,8 +4228,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
         }
         .map_err(RepointPrivateError::indeterminate)?;
+        let stage1 = crate::vmm::Stage1UnpublishedRange::after_engine_edit(address, len);
         self.vm
-            .commit_anonymous_discard(prepared)
+            .commit_anonymous_discard(&stage1, prepared)
             .map_err(|error| {
                 RepointPrivateError::indeterminate(MemoryError::HostMap(error.to_string()))
             })?;
@@ -4497,7 +4498,8 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         } else {
             self.retire_stage1_range(address, len, false)?;
         }
-        self.vm.on_unmap(address, len).map_err(|error| {
+        let stage1 = crate::vmm::Stage1UnpublishedRange::after_engine_edit(address, len);
+        self.vm.on_unmap(&stage1, address, len).map_err(|error| {
             MappingRetirementError::Indeterminate(MemoryError::HostMap(format!(
                 "retire backend mapping after munmap: {error}"
             )))
@@ -4523,7 +4525,8 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // mistaken for an intact predecessor.
         self.retire_stage1_range(address, len, true)
             .map_err(MappingRetirementError::into_memory_error)?;
-        self.vm.on_unmap(address, len).map_err(|error| {
+        let stage1 = crate::vmm::Stage1UnpublishedRange::after_engine_edit(address, len);
+        self.vm.on_unmap(&stage1, address, len).map_err(|error| {
             MemoryError::HostMap(format!("retire backend alias after munmap: {error}"))
         })?;
         self.set_unmapped(address, len, true);
@@ -5150,7 +5153,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             // The backend retired the span and rolled the grant back.
             GuestAliasRefusal::RolledBack(error) => error,
         };
-        if let Err(unregister) = self.vm.on_unmap(va.raw(), cleanup_len) {
+        let stage1 = crate::vmm::Stage1UnpublishedRange::after_engine_edit(va.raw(), cleanup_len);
+        if let Err(unregister) = self.vm.on_unmap(&stage1, va.raw(), cleanup_len) {
             carrick_fatal!(
                 "aarch64::alias_cleanup",
                 "failed to unregister guest alias at {:#x} (len {:#x}) after a refused publication: {unregister}",

@@ -557,6 +557,11 @@ pub(crate) fn settle_one(
             HvfVmState::retire_stage2_extent_from_mappings_in(
                 custody,
                 &mut TaskMappingIndex::new(),
+                Stage1UnpublicationReceipt::AuthoritativeAbsence {
+                    authority: &tables,
+                    va: span.va,
+                    len: span.len,
+                },
                 split.old.stage2_base,
                 split.old.stage2_length,
             )

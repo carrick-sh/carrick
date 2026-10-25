@@ -3511,12 +3511,18 @@ fn finish_foreign_cow_publication(
         authenticated_owner_generation,
     } = published;
     let host_resolved = owner_rollback.is_some();
+    let stage1_authority = lease.state.page_tables_authority();
     let retired_old_stage2 = {
         let mut inventory = lease.state.frame_inventory.ledger.lock();
         HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
             HvfVmState::retire_stage2_extent_from_mappings_in(
                 &lease.custody,
                 &mut TaskMappingIndex::new(),
+                Stage1UnpublicationReceipt::AuthoritativeAbsence {
+                    authority: &stage1_authority,
+                    va: span.va,
+                    len: span.len,
+                },
                 split.old.stage2_base,
                 split.old.stage2_length,
             )

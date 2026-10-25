@@ -28,14 +28,21 @@ Spec: the latest design comment on issue #847.
 
 ## Task 2: Make retirement stage-1-first by type
 
-- Add `Stage1Unpublished`, with constructors confined to Editor-release and
-  whole-inventory commit paths.
-- Require it at `request_stage2_record_retirement` and thread it through every
-  production retirement driver.
-- Convert whole-MM exit/exec inventory retirement into an Editor edit that
-  unpublishes stage-1 before returning stage-2 candidates.
-- Add a compile-shape/unit witness that a bare identity cannot request
-  retirement and lifecycle tests for exit/exec racing host copy.
+- Make `Stage1Unpublished` constructible only from a completed stage-1 edit
+  receipt or a committed `Stage1UnpublishedMm`; identity alone is not proof.
+- Require that capability at the final mutation APIs, including
+  `retire_stage2_record_using`, terminal-record removal, and global-frame host
+  owner retirement. Delete test-only proof constructors and drive tests through
+  the production edit or inventory path.
+- Close whole-MM exit/exec through an Editor-visible transition. A host copy
+  holding the prior Editor revision must observe the close as changed, never as
+  a stage-2 invariant violation.
+- Before diagnosing a producer-free pin refusal as an invariant violation,
+  revalidate the selected leaf against the authoritative stage-1 table. A
+  host-side edit that changed or removed the leaf reselects and reaches the
+  normal EL1 fault/EFAULT result; it never SIGKILLs the MM.
+- Red first: capability-shape tests, whole-MM close racing a parked host copy,
+  and a production host-side unmap+retire racing a held-revision copy.
 
 ## Task 3: Publication authority and quarantine
 
@@ -43,13 +50,33 @@ Spec: the latest design comment on issue #847.
   for insert/remove/rebind/rollback paths.
 - Preserve terminal retirement records and directory collision refusal so a
   quarantined IPA cannot be registered again.
-- Add refused-retirement, rollback-wake, free-after-Editor-revision, and
-  two-MM bounded-state witnesses.
+- Replace the registration-wide overlap scan with a `BTreeMap` interval index;
+  registration checks only predecessor and successor and all shared removal
+  paths update the index under the same mutation authority.
+- Make authority rollback/drop retire through a real teardown proof; no
+  debug-only leak path remains.
+- Add refused-retirement, rollback-wake, free-after-Editor-revision, real
+  two-MM-by-N retirement/no-growth, and interval-neighbour witnesses.
 
 ## Task 4: End-to-end VM-free and gates
 
-- Add the exhausted-pool munmap/read race witness.
+- Add real production-path witnesses for exit and exec racing a parked
+  sibling host copy, and munmap racing a blocking read under an exhausted
+  executor pool.
+- Record the exact new-test list and distinguish new tests from strengthened
+  pre-existing tests.
 - Run focused crate tests, `just fmt-check`, `just clippy`,
   `just clippy-linux`, `just lint-domains`, and `just test-kernel`.
 - Measure both EL1 images and record loaded size plus maximum checked stack.
 - Commit evidence and update `/tmp/740-s2hw-handoff.md`; do not push.
+
+## Execution rulings for review round 12
+
+- The authoritative stage-1 revalidation is the safety backstop for every
+  host-side edit. It avoids a second Editor observer while ensuring a sampled
+  revision cannot justify SIGKILL after an edit outside the ring Editor path.
+- Editor epoch changes are wake/reselection evidence, not forward progress for
+  the bounded owner-copy driver; committed bytes remain the progress measure.
+- The `kernel.memory.owner-wait` contract applies: a valid mapped buffer cannot
+  become EFAULT or SIGKILL because a private stage-2 transition was observed,
+  and registration/retirement work must remain proportional to live state.

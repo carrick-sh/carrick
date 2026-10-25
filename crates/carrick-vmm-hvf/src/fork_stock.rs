@@ -57,12 +57,18 @@ impl Drop for NativeFrameBacking {
                 .native_frame_backings
                 .lock()
                 .remove(&(self.ipa, self.generation));
-            crate::trap::retire_global_frame_host_owner_if_generation_in(
-                &carrier,
-                self.ipa,
-                self.length,
-                self.generation,
-            );
+            if let Some(identity) =
+                crate::trap::global_frame_stage2_identity_in(&carrier, self.ipa, self.length)
+                && let Some(stage1) = carrier.stage1_unpublished_for_retirement(identity)
+            {
+                crate::trap::retire_global_frame_host_owner_if_generation_in(
+                    &carrier,
+                    stage1,
+                    self.ipa,
+                    self.length,
+                    self.generation,
+                );
+            }
         }
     }
 }
@@ -888,7 +894,7 @@ mod tests {
         assert_eq!(
             custody.request_stage2_record_retirement(
                 owner_b.record_identity(),
-                custody.stage1_unpublished_by_editor(owner_b.record_identity()),
+                custody.stage1_unpublished_after_editor_unmap(owner_b.record_identity()),
             ),
             crate::trap::CarrierStage2RetireOutcome::DeferredActivePins
         );
@@ -1047,7 +1053,7 @@ mod tests {
         assert_eq!(
             custody.request_stage2_record_retirement(
                 owner_a.record_identity(),
-                custody.stage1_unpublished_by_editor(owner_a.record_identity()),
+                custody.stage1_unpublished_after_editor_unmap(owner_a.record_identity()),
             ),
             crate::trap::CarrierStage2RetireOutcome::DeferredActivePins,
             "retirement after Reserve cannot revoke the admitted child's backing"
