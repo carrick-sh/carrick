@@ -833,3 +833,17 @@ fn review_loop_step_clock_precedes_lease_wait() {
         "step clock missing before lease acquisition"
     );
 }
+
+#[test]
+fn guard_skips_labels_that_cannot_be_admitted() {
+    let docs = YamlLoader::load_from_str(include_str!(
+        "../../../.github/workflows/dispatch-worker.yml"
+    ))
+    .unwrap();
+    assert_eq!(
+        docs[0]["jobs"]["guard"]["if"].as_str(),
+        Some(
+            "github.actor == 'tjfontaine' && ((github.event_name == 'issues' && (github.event.label.name == 'dispatch' || startsWith(github.event.label.name, 'dispatch:'))) || (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/agent')) || (github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-')))"
+        )
+    );
+}
