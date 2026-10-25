@@ -67,6 +67,9 @@ jobs:
           CARRICK_DISPATCH_BASE: ${{ steps.base.outputs.base }}
         run: cargo run --locked --release -p carrick-xtask -- dispatch-worker guard --event "$GITHUB_EVENT_PATH"
 
+      - name: Dispatch issue ${{ steps.validate.outputs.issue }}
+        run: ':'
+
       # REST run metadata omits issue_comment payloads. The controller uses
       # these trusted-main step names to fetch and independently verify them.
       - name: Dispatch comment ${{ github.event.issue.number }} ${{ github.event.comment.id }} ${{ steps.validate.outputs.comment }}

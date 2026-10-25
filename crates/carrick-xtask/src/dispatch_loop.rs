@@ -462,8 +462,11 @@ fn provenance_with(
         && user["type"] == "Bot"
         && let Some(id) = run_from_body(item["body"].as_str().unwrap_or_default())
         && run(id).is_some_and(|r| {
-            let r = r.0;
-            r["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id)
+            let issue_bound =
+                r.run["event"] == "pull_request_review" || r.footer_issue == Some(issue);
+            let r = r.run;
+            issue_bound
+                && r["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id)
                 && dispatch_run_identity(&r, Some(issue))
         })
     {
@@ -820,7 +823,11 @@ const ARTIFACT_FILES: [&str; 5] = [
 /// Publication and text provenance require more evidence than PR ownership.
 /// In particular a review's workflow is loaded from the PR merge ref.
 #[derive(Clone)]
-struct ArtifactRun(Value, bool);
+struct ArtifactRun {
+    run: Value,
+    uploaded: bool,
+    footer_issue: Option<u64>,
+}
 fn authenticate_artifact_run(
     run: Value,
     issue: u64,
@@ -843,6 +850,24 @@ fn authenticate_artifact_run(
         "repos/{REPOSITORY}/actions/runs/{id}/jobs?filter=latest&per_page=100"
     ))
     .ok_or_else(refused)?;
+    let footer_issue = jobs["jobs"].as_array().and_then(|jobs| {
+        let guard = jobs.iter().find(|job| {
+            job["name"] == "guard" && job["status"] == "completed" && job["conclusion"] == "success"
+        })?;
+        let markers: Vec<_> = guard["steps"]
+            .as_array()?
+            .iter()
+            .filter(|step| step["conclusion"] == "success")
+            .filter_map(|step| step["name"].as_str()?.strip_prefix("Dispatch issue "))
+            .collect();
+        let [number] = markers.as_slice() else {
+            return None;
+        };
+        number
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0 && n.to_string() == *number)
+    });
     let job = jobs["jobs"]
         .as_array()
         .and_then(|jobs| {
@@ -867,7 +892,11 @@ fn authenticate_artifact_run(
                 && step["conclusion"] == "success"
         })
     });
-    Ok(ArtifactRun(run, uploaded))
+    Ok(ArtifactRun {
+        run,
+        uploaded,
+        footer_issue,
+    })
 }
 fn artifact_scope(run: &Value, artifacts: &[Value], issue: u64) -> Result<Value, ScalerError> {
     let id = run["id"]
@@ -896,16 +925,50 @@ fn artifact_scope(run: &Value, artifacts: &[Value], issue: u64) -> Result<Value,
         .cloned()
         .ok_or(ScalerError::Guard("no issue-linked dispatch artifact"))
 }
-/// Completed-run evidence is immutable for this server invocation. Share it
-/// across provenance, artifacts and branch selection, including failed checks.
+const RUN_LOOKUP_ATTEMPTS: u32 = 3;
+struct LookupCache<K, V> {
+    values: std::collections::BTreeMap<K, Option<V>>,
+    attempts: std::collections::BTreeMap<K, u32>,
+}
+impl<K, V> Default for LookupCache<K, V> {
+    fn default() -> Self {
+        Self {
+            values: Default::default(),
+            attempts: Default::default(),
+        }
+    }
+}
+impl<K: Ord + Clone, V: Clone> LookupCache<K, V> {
+    fn resolve(
+        &mut self,
+        key: K,
+        mut fetch: impl FnMut() -> Result<Option<V>, ScalerError>,
+    ) -> Result<Option<V>, ScalerError> {
+        if let Some(value) = self.values.get(&key) {
+            return Ok(value.clone());
+        }
+        let attempts = self.attempts.entry(key.clone()).or_default();
+        while *attempts < RUN_LOOKUP_ATTEMPTS {
+            *attempts += 1;
+            match fetch() {
+                Ok(value) => {
+                    self.values.insert(key, value.clone());
+                    return Ok(value);
+                }
+                Err(error) if *attempts == RUN_LOOKUP_ATTEMPTS => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Err(ScalerError::Guard("run lookup retry budget exhausted"))
+    }
+}
+/// Completed positive evidence and predicate refusals are immutable. Transport
+/// errors retry within one bounded lookup budget per cache key and event.
 #[derive(Default)]
 pub(super) struct RunCache {
-    authenticated: std::collections::BTreeMap<(u64, RunId), Option<ArtifactRun>>,
-    artifacts: std::collections::BTreeMap<RunId, Option<Vec<Value>>>,
-    bundles: std::collections::BTreeMap<
-        (u64, RunId),
-        Option<std::collections::BTreeMap<String, String>>,
-    >,
+    authenticated: LookupCache<(u64, RunId), ArtifactRun>,
+    artifacts: LookupCache<RunId, Vec<Value>>,
+    bundles: LookupCache<(u64, RunId), std::collections::BTreeMap<String, String>>,
     branches: std::collections::BTreeMap<(u64, String), BranchSnapshot>,
 }
 struct BranchSnapshot {
@@ -920,15 +983,23 @@ impl RunCache {
         mut lookup: impl FnMut(&str) -> Option<Value>,
     ) -> Result<ArtifactRun, ScalerError> {
         self.authenticated
-            .entry((issue, id))
-            .or_insert_with(|| {
-                let run = lookup(&format!("repos/{REPOSITORY}/actions/runs/{}", id.0))?;
+            .resolve((issue, id), || {
+                let run = lookup(&format!("repos/{REPOSITORY}/actions/runs/{}", id.0))
+                    .ok_or(ScalerError::Guard("dispatch run lookup failed"))?;
                 if run["id"].as_u64() != Some(id.0) {
-                    return None;
+                    return Ok(None);
                 }
-                authenticate_artifact_run(run, issue, &mut lookup).ok()
-            })
-            .clone()
+                let mut unavailable = false;
+                let result = authenticate_artifact_run(run, issue, |endpoint| {
+                    let value = lookup(endpoint);
+                    unavailable |= value.is_none();
+                    value
+                });
+                if unavailable {
+                    return Err(ScalerError::Guard("dispatch run evidence lookup failed"));
+                }
+                Ok(result.ok())
+            })?
             .ok_or(ScalerError::Guard("unverified dispatch run"))
     }
     fn authenticate(
@@ -941,20 +1012,19 @@ impl RunCache {
     }
     fn artifacts(&mut self, root: &Path, id: RunId) -> Result<Vec<Value>, ScalerError> {
         self.artifacts
-            .entry(id)
-            .or_insert_with(|| {
+            .resolve(id, || {
                 let data = api(
                     root,
                     &format!(
                         "repos/{REPOSITORY}/actions/runs/{}/artifacts?per_page=100",
                         id.0
                     ),
-                )
-                .ok()?;
-                let artifacts = data["artifacts"].as_array()?;
-                (artifacts.len() < 100).then(|| artifacts.clone())
-            })
-            .clone()
+                )?;
+                Ok(data["artifacts"]
+                    .as_array()
+                    .filter(|a| a.len() < 100)
+                    .cloned())
+            })?
             .ok_or(ScalerError::Guard(
                 "invalid or oversized prior artifact list",
             ))
@@ -969,7 +1039,7 @@ impl RunCache {
             return Err(ScalerError::Guard("current run is not a prior run"));
         }
         let run = self.authenticate(root, issue, id)?;
-        if !run.1 {
+        if !run.uploaded {
             return Err(ScalerError::Guard("prior run upload did not succeed"));
         }
         Ok((run, self.artifacts(root, id)?))
@@ -985,33 +1055,33 @@ impl RunCache {
             return Err(ScalerError::Guard("artifact file is not allowlisted"));
         }
         let (run, artifacts) = self.run_artifacts(root, issue, id)?;
-        let artifact = artifact_scope(&run.0, &artifacts, issue)?;
-        let bundle = self.bundles.entry((issue, id)).or_insert_with(|| {
-            (|| -> Result<_, ScalerError> {
-                let name_on_github = artifact["name"]
-                    .as_str()
-                    .ok_or(ScalerError::Guard("artifact name"))?;
-                let directory = tempfile::tempdir()?;
-                // Only an issue-authenticated bundle is extracted. Final
-                // bounded reads refuse links, and only allowlisted text stays.
-                gh(
-                    root,
-                    &[
-                        "run",
-                        "download",
-                        &id.0.to_string(),
-                        "--repo",
-                        REPOSITORY,
-                        "--name",
-                        name_on_github,
-                        "--dir",
-                        directory
-                            .path()
-                            .to_str()
-                            .ok_or(ScalerError::Guard("artifact directory"))?,
-                    ],
-                )?;
-                Ok(ARTIFACT_FILES
+        let artifact = artifact_scope(&run.run, &artifacts, issue)?;
+        let bundle = self.bundles.resolve((issue, id), || {
+            let name_on_github = artifact["name"]
+                .as_str()
+                .ok_or(ScalerError::Guard("artifact name"))?;
+            let directory = tempfile::tempdir()?;
+            // Only an issue-authenticated bundle is extracted. Final
+            // bounded reads refuse links, and only allowlisted text stays.
+            gh(
+                root,
+                &[
+                    "run",
+                    "download",
+                    &id.0.to_string(),
+                    "--repo",
+                    REPOSITORY,
+                    "--name",
+                    name_on_github,
+                    "--dir",
+                    directory
+                        .path()
+                        .to_str()
+                        .ok_or(ScalerError::Guard("artifact directory"))?,
+                ],
+            )?;
+            Ok(Some(
+                ARTIFACT_FILES
                     .iter()
                     .filter_map(|name| {
                         let text =
@@ -1022,10 +1092,9 @@ impl RunCache {
                             crate::dispatch_redaction::redact(text.as_bytes()),
                         ))
                     })
-                    .collect::<std::collections::BTreeMap<_, _>>())
-            })()
-            .ok()
-        });
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            ))
+        })?;
         bundle
             .as_ref()
             .and_then(|b| b.get(name))
@@ -1115,7 +1184,7 @@ pub(super) fn verified_branch_cached(
     let id = branch_run(issue, branch)?
         .parse::<u64>()
         .map_err(|_| ScalerError::Guard("branch run id"))?;
-    let run = cache.authenticate(root, issue, RunId(id))?.0;
+    let run = cache.authenticate(root, issue, RunId(id))?.run;
     let prs = branch_prs(root, branch, "all")?;
     let remote = git(
         root,
@@ -1186,7 +1255,10 @@ pub(super) fn verified_branch_cached(
                 && let Some(tip) = handoff["published_tip"].as_str().filter(|s| sha(s))
             {
                 let key = (
-                    run.0["updated_at"].as_str().unwrap_or_default().to_owned(),
+                    run.run["updated_at"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
                     prior,
                 );
                 if latest.as_ref().is_none_or(|(last, _)| key > *last) {
@@ -1280,6 +1352,9 @@ fn artifacts_ready(value: bool) -> Result<(), ScalerError> {
 }
 
 trait WorkerLauncher {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
     fn capacity(&mut self, deadline: Instant) -> Result<Value, ScalerError>;
     fn produce(&mut self, root: &Path, dispatch: &Dispatch, setup: &str)
     -> Result<(), ScalerError>;
@@ -1330,7 +1405,7 @@ struct Server<'a> {
     finished: bool,
     setup: &'a str,
     launcher: Box<dyn WorkerLauncher>,
-    capacity: Option<Value>,
+    capacity: Option<(Instant, Value)>,
 }
 impl Server<'_> {
     fn post(&self, body: &str) -> Result<(), ScalerError> {
@@ -1543,9 +1618,12 @@ impl Server<'_> {
         Ok(())
     }
     fn capacity(&mut self) -> Result<Value, ScalerError> {
-        if let Some(report) = &self.capacity {
+        if let Some((at, report)) = &self.capacity
+            && self.launcher.now().saturating_duration_since(*at) < Duration::from_secs(120)
+        {
             return Ok(report.clone());
         }
+        self.capacity = None;
         if self.used.capacity_probes
             >= self
                 .policy
@@ -1557,7 +1635,7 @@ impl Server<'_> {
         self.used.capacity_probes += 1;
         let report = timed_phase("capacity", || self.launcher.capacity(self.deadline))
             .map_err(|error| ScalerError::Usage(masked(&error.to_string(), &self.token)))?;
-        self.capacity = Some(report.clone());
+        self.capacity = Some((self.launcher.now(), report.clone()));
         Ok(report)
     }
     fn admit_worker(&mut self, selection: &Notes, capacity: &Value) -> Result<(), ScalerError> {
@@ -1626,7 +1704,7 @@ impl Server<'_> {
                     self.runs
                         .authenticate(self.root, self.dispatch.issue, RunId(id))
                         .ok()
-                        .map(|run| run.0)
+                        .map(|run| run.run)
                 });
             let Some(origin) = origin else {
                 items.push(state_item("pr", "unverified", pr));
@@ -1730,7 +1808,7 @@ impl Server<'_> {
                 .run_artifacts(self.root, self.dispatch.issue, RunId(id_number))
                 .ok()
                 .filter(|(run, artifacts)| {
-                    artifact_scope(&run.0, artifacts, self.dispatch.issue).is_ok()
+                    artifact_scope(&run.run, artifacts, self.dispatch.issue).is_ok()
                 })
                 .map(|(_, artifacts)| artifacts)
                 .unwrap_or_default();
@@ -1761,7 +1839,7 @@ impl Server<'_> {
             {
                 published_tips.insert(tip.to_owned());
             }
-            let run = run.0;
+            let run = run.run;
             items.push(json!({"kind":"earlier_dispatch_run","provenance":format!("dispatch-agent(run {id})"),"data":{
                 "run":id_number,"run_url":format!("https://github.com/{REPOSITORY}/actions/runs/{id}"),"status":run["status"],"conclusion":run["conclusion"],"created_at":run["created_at"],"updated_at":run["updated_at"],
                 "artifact_names":artifacts.iter().filter_map(|a| a["name"].as_str()).collect::<Vec<_>>(),"outcome_contract":contract}}));
@@ -1867,6 +1945,8 @@ impl Server<'_> {
                             &mut self.runs,
                         )?;
                     }
+                    // Branch authentication may itself outlive the snapshot.
+                    let capacity = self.capacity()?;
                     self.admit_worker(&selection, &capacity)
                 })();
                 if let Err(error) = admission {
@@ -2907,6 +2987,7 @@ mod tests {
     }
     #[derive(Default)]
     struct LaunchRecord {
+        now: Option<Instant>,
         queries: u32,
         prompts: Vec<String>,
         limits: Vec<u64>,
@@ -2916,6 +2997,9 @@ mod tests {
         record: std::rc::Rc<std::cell::RefCell<LaunchRecord>>,
     }
     impl WorkerLauncher for FixtureLauncher {
+        fn now(&self) -> Instant {
+            self.record.borrow().now.unwrap_or_else(Instant::now)
+        }
         fn capacity(&mut self, _: Instant) -> Result<Value, ScalerError> {
             self.record.borrow_mut().queries += 1;
             if self.reports.len() > 1 {
@@ -3410,6 +3494,168 @@ mod tests {
         });
     }
     #[test]
+    fn p816_lookup_errors_are_bounded_and_refusals_are_cached() {
+        let mut runs = RunCache::default();
+        let mut errors = 0;
+        for _ in 0..10 {
+            assert!(
+                runs.authenticate_with(799, RunId(42), |_| {
+                    errors += 1;
+                    None
+                })
+                .is_err()
+            );
+        }
+        assert_eq!(errors, 3, "lookup retries exceeded the event budget");
+        let mut runs = RunCache::default();
+        let mut refusals = 0;
+        for _ in 0..10 {
+            assert!(
+                runs.authenticate_with(799, RunId(42), |_| {
+                    refusals += 1;
+                    Some(json!({"id":42,"path":"other-workflow"}))
+                })
+                .is_err()
+            );
+        }
+        assert_eq!(refusals, 1, "definitive refusal was retried");
+    }
+    #[test]
+    fn p816_footer_requires_one_successful_guard_marker() {
+        assert!(
+            include_str!("../../../.github/workflows/dispatch-worker.yml")
+                .contains("- name: Dispatch issue ${{ steps.validate.outputs.issue }}")
+        );
+        let (run, _) = prior_run_fixture();
+        let item = json!({"user":{"login":"github-actions[bot]","type":"Bot"},
+            "body":format!("Dispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
+        for (conclusion, steps) in [
+            (
+                "failure",
+                json!([{"name":"Dispatch issue 799","conclusion":"success"}]),
+            ),
+            ("success", json!([])),
+            (
+                "success",
+                json!([{"name":"Dispatch issue 799","conclusion":"skipped"}]),
+            ),
+            (
+                "success",
+                json!([{"name":"Dispatch issue 799","conclusion":"success"},{"name":"Dispatch issue 799","conclusion":"success"}]),
+            ),
+        ] {
+            let jobs = json!({"jobs":[
+                {"name":"guard","status":"completed","conclusion":conclusion,"steps":steps},
+                {"name":"worker","status":"completed","runner_name":"carrick-agent-123","steps":[]}
+            ]});
+            assert_eq!(
+                ProvenanceCache::default().classify(
+                    &item,
+                    799,
+                    &mut RunCache::default(),
+                    |endpoint| Some(if endpoint.contains("/jobs?") {
+                        jobs.clone()
+                    } else {
+                        run.clone()
+                    })
+                ),
+                "unverified",
+                "missing or unsuccessful guard licensed footer text"
+            );
+        }
+    }
+    #[test]
+    fn p816_transient_jobs_lookup_admits_branch() {
+        shared_fixture(|root| {
+            let mut server = server(root);
+            server.dispatch.review = false;
+            std::fs::write(root.join("fail-next-endpoint"), "/jobs?").unwrap();
+            assert!(
+                server.select_branch("work/dispatch-799-42").is_ok(),
+                "transient jobs lookup refused the branch instead of retrying"
+            );
+        });
+    }
+    #[test]
+    fn p816_transient_artifact_list_recovers() {
+        shared_fixture(|root| {
+            std::fs::write(root.join("fail-next-endpoint"), "/artifacts?").unwrap();
+            assert!(
+                RunCache::default()
+                    .prior_artifact(root, 799, RunId(42), "contract.json")
+                    .is_ok(),
+                "transient artifact list failure was cached as refusal"
+            );
+        });
+    }
+    #[test]
+    fn p816_transient_bundle_download_recovers() {
+        shared_fixture(|root| {
+            std::fs::write(root.join("fail-next-download"), "").unwrap();
+            assert!(
+                RunCache::default()
+                    .prior_artifact(root, 799, RunId(42), "contract.json")
+                    .is_ok(),
+                "transient bundle download failure was cached as refusal"
+            );
+        });
+    }
+    #[test]
+    fn p816_capacity_snapshot_expires_before_first_admission() {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            let record = install_fixture_launcher(&mut server, live_capacity());
+            let epoch = Instant::now();
+            record.borrow_mut().now = Some(epoch);
+            let mut exhausted = live_capacity();
+            exhausted["backends"]["codex"]["quota_free"] = json!(0);
+            server.launcher = Box::new(FixtureLauncher {
+                reports: std::collections::VecDeque::from([Ok(live_capacity()), Ok(exhausted)]),
+                record: record.clone(),
+            });
+            server.capacity().unwrap();
+            record.borrow_mut().now = Some(epoch + Duration::from_secs(121));
+            let admission = server.execute(worker_request());
+            assert_eq!(
+                record.borrow().queries,
+                2,
+                "first worker reused expired capacity"
+            );
+            assert!(admission.is_err(), "worker admitted against old free quota");
+            assert_eq!(server.used.workers, 0);
+        });
+    }
+    #[test]
+    fn p816_footer_run_is_bound_to_its_issue() {
+        for event in ["issues", "issue_comment"] {
+            let (mut run, _) = prior_run_fixture();
+            run["event"] = event.into();
+            let jobs = json!({"jobs":[
+                {"name":"guard","status":"completed","conclusion":"success","steps":[{"name":"Dispatch issue 799","conclusion":"success"}]},
+                {"name":"worker","status":"completed","runner_name":"carrick-agent-123","steps":[]}
+            ]});
+            let item = json!({"user":{"login":"github-actions[bot]","type":"Bot"},"body":format!("Dispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
+            let mut cache = ProvenanceCache::default();
+            let mut runs = RunCache::default();
+            for (issue, expected) in [(799, "dispatch-agent(run 42)"), (587, "unverified")] {
+                let provenance = cache.classify(&item, issue, &mut runs, |endpoint| {
+                    Some(if endpoint.contains("/jobs?") {
+                        jobs.clone()
+                    } else {
+                        run.clone()
+                    })
+                });
+                assert_eq!(
+                    provenance, expected,
+                    "footer from issue A was trusted on issue B ({event})"
+                );
+            }
+        }
+    }
+    #[test]
     fn transient_capacity_failure_recovers_before_worker_admission() {
         shared_fixture(|temporary| {
             let root = temporary.join("base");
@@ -3618,6 +3864,7 @@ if test "$1 $2" = 'issue comment'; then
  exit 0
 fi
 if test "$1 $2" = 'run download'; then
+ if test -f "$RUNNER_TEMP/fail-next-download"; then rm "$RUNNER_TEMP/fail-next-download"; exit 95; fi
  download_run=$3
  printf 'download/%s\n' "$download_run" >> "$RUNNER_TEMP/api-endpoints"
  while test "$1" != --dir; do shift; done
@@ -3632,6 +3879,9 @@ fi
 slurp=0
 for arg do test "$arg" != --slurp || slurp=1; endpoint=$arg; done
 printf '%s\n' "$endpoint" >> "$RUNNER_TEMP/api-endpoints"
+if test -f "$RUNNER_TEMP/fail-next-endpoint"; then
+ case "$endpoint" in *"$(cat "$RUNNER_TEMP/fail-next-endpoint")"*) rm "$RUNNER_TEMP/fail-next-endpoint"; exit 95 ;; esac
+fi
 if test -f "$RUNNER_TEMP/fail-endpoint"; then
  case "$endpoint" in *"$(cat "$RUNNER_TEMP/fail-endpoint")"*) printf 'gh: Resource not accessible fixture-token (HTTP 403)\n' >&2; exit 1 ;; esac
 fi
@@ -3752,7 +4002,7 @@ esac
         }
         std::fs::write(root.join("repo-artifacts.json"), json!({"artifacts":[{"id":1,"name":"dispatch-799-42-1","expired":false,"workflow_run":{"id":42}}]}).to_string()).unwrap();
         std::fs::write(root.join("workflow-runs.json"), json!({"workflow_runs":[{"id":42,"event":"issues","head_branch":"main","created_at":"2026-10-24T00:00:00Z"}]}).to_string()).unwrap();
-        std::fs::write(root.join("jobs.json"), json!({"jobs":[{"name":"worker","status":"completed","conclusion":"success","runner_name":"carrick-agent-123","labels":["carrick-agent"],"steps":[{"name":"Run actions/upload-artifact@v4","status":"completed","conclusion":"success"}]}]}).to_string()).unwrap();
+        std::fs::write(root.join("jobs.json"), json!({"jobs":[{"name":"guard","status":"completed","conclusion":"success","steps":[{"name":"Dispatch issue 799","conclusion":"success"}]},{"name":"worker","status":"completed","conclusion":"success","runner_name":"carrick-agent-123","labels":["carrick-agent"],"steps":[{"name":"Run actions/upload-artifact@v4","status":"completed","conclusion":"success"}]}]}).to_string()).unwrap();
         std::fs::write(
             root.join("workflow.json"),
             json!({"type":"file","sha":"0".repeat(40)}).to_string(),
@@ -4592,15 +4842,32 @@ esac
             }
         });
     }
+    fn failed_upload_jobs(text: &str) -> String {
+        let mut jobs: Value = serde_json::from_str(text).unwrap();
+        let worker = jobs["jobs"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|job| job["name"] == "worker")
+            .unwrap();
+        let upload = worker["steps"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|step| {
+                step["name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains("actions/upload-artifact@"))
+            })
+            .unwrap();
+        upload["conclusion"] = "failure".into();
+        jobs.to_string()
+    }
     #[test]
     fn failed_upload_does_not_revoke_open_pr_continuation() {
         shared_fixture(|root| {
             let jobs = regular_text(&root.join("jobs.json")).unwrap();
-            std::fs::write(
-                root.join("jobs.json"),
-                jobs.replace("\"success\"", "\"failure\""),
-            )
-            .unwrap();
+            std::fs::write(root.join("jobs.json"), failed_upload_jobs(&jobs)).unwrap();
             assert!(
                 verified_branch(root, 799, "work/dispatch-799-42").is_ok(),
                 "origin upload failure revoked open owned PR continuation"
@@ -4641,11 +4908,7 @@ esac
                         jobs.replace("carrick-agent", "ubuntu"),
                     )
                     .unwrap(),
-                    _ => std::fs::write(
-                        root.join("jobs.json"),
-                        jobs.replace("\"success\"", "\"failure\""),
-                    )
-                    .unwrap(),
+                    _ => std::fs::write(root.join("jobs.json"), failed_upload_jobs(&jobs)).unwrap(),
                 }
                 if prior_artifact(root, 799, RunId(42), "handoff.json").is_ok() {
                     bad.push(scenario);
@@ -5080,7 +5343,11 @@ esac
             provenance_with(
                 &item,
                 799,
-                |id| (id == "42").then(|| ArtifactRun(run.clone(), true)),
+                |id| (id == "42").then(|| ArtifactRun {
+                    run: run.clone(),
+                    uploaded: true,
+                    footer_issue: Some(799)
+                }),
                 false
             ),
             "dispatch-agent(run 42)"
@@ -5187,7 +5454,7 @@ esac
             ] {
                 cache.classify(&item, 799, &mut runs, |endpoint| {
                     calls.push(endpoint.to_owned());
-                    None
+                    Some(json!({"id":42}))
                 });
             }
         }
@@ -5329,7 +5596,13 @@ esac
             if provenance_with(
                 &item,
                 799,
-                |_| Some(ArtifactRun(other.clone(), true)),
+                |_| {
+                    Some(ArtifactRun {
+                        run: other.clone(),
+                        uploaded: true,
+                        footer_issue: Some(799),
+                    })
+                },
                 false,
             ) != "unverified"
             {
@@ -5343,7 +5616,16 @@ esac
         let item = json!({"user":{"login":"github-actions[bot]","type":"Bot"},"body":format!("receipt\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
         let run = json!({"id":42,"repository":{"full_name":REPOSITORY},"path":".github/workflows/dispatch-worker.yml","actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"},"head_repository":{"full_name":REPOSITORY},"head_sha":"a".repeat(40),"event":"issues","head_branch":"main"});
         assert_eq!(
-            provenance_with(&item, 799, |_| Some(ArtifactRun(run.clone(), true)), false),
+            provenance_with(
+                &item,
+                799,
+                |_| Some(ArtifactRun {
+                    run: run.clone(),
+                    uploaded: true,
+                    footer_issue: Some(799)
+                }),
+                false
+            ),
             "dispatch-agent(run 42)"
         );
         for (pointer, value) in [
@@ -5356,7 +5638,16 @@ esac
             let mut bad = run.clone();
             *bad.pointer_mut(pointer).unwrap() = value.into();
             assert_eq!(
-                provenance_with(&item, 799, |_| Some(ArtifactRun(bad.clone(), true)), false),
+                provenance_with(
+                    &item,
+                    799,
+                    |_| Some(ArtifactRun {
+                        run: bad.clone(),
+                        uploaded: true,
+                        footer_issue: Some(799)
+                    }),
+                    false
+                ),
                 "unverified",
                 "{pointer}"
             );
@@ -5368,7 +5659,11 @@ esac
             provenance_with(
                 &item,
                 799,
-                |_| Some(ArtifactRun(review.clone(), true)),
+                |_| Some(ArtifactRun {
+                    run: review.clone(),
+                    uploaded: true,
+                    footer_issue: Some(799)
+                }),
                 false
             ),
             "dispatch-agent(run 42)"
@@ -5378,7 +5673,11 @@ esac
             provenance_with(
                 &item,
                 799,
-                |_| Some(ArtifactRun(review.clone(), true)),
+                |_| Some(ArtifactRun {
+                    run: review.clone(),
+                    uploaded: true,
+                    footer_issue: Some(799)
+                }),
                 false
             ),
             "unverified"
