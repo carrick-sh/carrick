@@ -107,8 +107,10 @@ and its body is withheld. The private server records the number returned by a
 successful create before verifying its newly created PR, then publishes that
 binding in its handoff and outcome. The controller, hosted guard and loop use
 the same evidence resolver. The credential-free hosted guard reads public
-PR and issue comments in pages of 100, up to five pages per destination. It
-requires a complete scan and refuses failed, malformed or over-cap pages.
+PR comments first, then issue comments, in pages of 100 and up to five pages
+per destination. A valid receipt from any successfully read page is enough.
+A failed, malformed or oversized page stops that destination without
+invalidating receipts from earlier pages; reaching the cap also retains them.
 The loop, token-bearing admission step and controller independently resolve
 ownership with authenticated artifact and comment reads; the guard's proof
 is not reused at admission. If an earlier run pushed a branch but never
