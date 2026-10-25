@@ -1474,6 +1474,11 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     mm_issuer: process::identity_allocator::MmIssuerWord,
     /// Installed carrier CPU policy, independent of transient executor slots.
     online_cpus: AtomicU64,
+    /// Producer revisions captured by Reservations enrollment, indexed by
+    /// address space. Every live waiter on one queue sampled the same epoch:
+    /// a publication advances it and detaches all earlier waiters. Appended
+    /// terminal-event diagnostics preserve the hot record's layout contract.
+    reservation_wait_snapshot_revisions: [AtomicU64; ADDRESS_SPACES],
 }
 
 /// A fallible acquisition policy for callers that retain work on refusal.
@@ -5142,6 +5147,29 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     "zone record {index} object wait: queue={} generation={} operation={}:{}",
                     wait.queue, wait.generation, wait.operation, wait.operation_generation,
                 )?;
+                if let Some(space) = self.spaces.find(identity.mm) {
+                    let reservations = object_wait::ObjectWaitKey::live_space_cause(
+                        space.index(),
+                        wait.generation,
+                        spaces::notification::SpaceWaitCause::Reservations,
+                    );
+                    if wait.queue == reservations.index() {
+                        let snapshot_revision = self.reservation_wait_snapshot_revisions
+                            [space.index()]
+                        .load(Ordering::Relaxed);
+                        let current = self
+                            .object_queue_census(wait.queue)
+                            .map(|queue| queue.epoch);
+                        writeln!(
+                            out,
+                            "zone record {index} reservations wait: mm={} root={} incarnation={} snapshot_revision={} current_revision={current:?}",
+                            identity.mm,
+                            space.index(),
+                            wait.generation,
+                            snapshot_revision,
+                        )?;
+                    }
+                }
             }
         }
         // Each queue a record is linked on, once.

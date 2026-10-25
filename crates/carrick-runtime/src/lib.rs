@@ -100,6 +100,16 @@ pub mod dtrace_consumer;
 #[cfg(target_os = "macos")]
 pub mod dtrace_symbols;
 pub mod el1_census;
+
+/// Append the shared reservation owner's live root lock words to a terminal
+/// event census while the EL1 region remains mapped.
+pub fn write_reservation_root_census(out: &mut impl core::fmt::Write) -> core::fmt::Result {
+    if let Some(roots) = carrick_el1::memory::reservations::shared_host() {
+        roots.write_lock_census(out)?;
+    }
+    Ok(())
+}
+
 pub mod host_process;
 pub mod interactive_supervisor;
 // `linux_abi` was lifted into the leaf crate `carrick-abi` (build-graph split,

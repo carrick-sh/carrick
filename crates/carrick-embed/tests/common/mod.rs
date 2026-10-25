@@ -313,6 +313,9 @@ impl Watchdog {
                     }
                     // The flags through which EL1 announces owed host work.
                     let _ = carrick_el1_abi::write_current_task_census(&mut census);
+                    // Root lock words distinguish a missing producer from an
+                    // EL1 critical section that left its image while held.
+                    let _ = carrick_runtime::write_reservation_root_census(&mut census);
                     eprintln!("WATCHDOG zone census:\n{census}");
                 }
                 // The abort's post-mortem names every blocked thread's

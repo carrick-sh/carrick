@@ -1083,6 +1083,64 @@ mod tests {
         );
         entry.retire_entry(access(&zone).venue().unwrap());
     }
+
+    #[test]
+    fn census_pairs_reservations_wait_snapshot_with_current_revision() {
+        let zone = zone();
+        let entry = admitted(&zone);
+        let incarnation = NonZeroU64::new(1).unwrap();
+        let lease = entry.notifications(incarnation).unwrap();
+        let cause = SpaceWaitCause::Reservations;
+        let snapshot = lease.observe(cause);
+        let record = zone
+            .alloc_record(crate::ThreadIdentity {
+                tid: 77,
+                serial: 1,
+                mm: 77,
+                file_table: 1,
+                generation: 1,
+                affinity_source: crate::AffinitySource::UNBOUND,
+                affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        let complete = |effects: OwnedObjectWakeEffects<'_>| {
+            let _ = effects.deliver_handbacks(&mut |_| {});
+        };
+        lease
+            .reserve(cause)
+            .park_host_rechecked(
+                snapshot,
+                record,
+                crate::object_wait::OperationToken::new(77, 1).unwrap(),
+                &complete,
+                || true,
+            )
+            .unwrap();
+
+        let mut census = std::string::String::new();
+        zone.write_census(&mut census).unwrap();
+        assert!(
+            census.contains(&std::format!(
+                "reservations wait: mm=77 root={} incarnation=1 snapshot_revision={} current_revision=Some({})",
+                entry.index().index(),
+                snapshot.revision(),
+                snapshot.revision(),
+            )),
+            "{census}"
+        );
+
+        drop(lease);
+        entry.retire_entry(access(&zone).venue().unwrap());
+        assert_eq!(
+            unsafe { zone.record(record).take_object_operation() }
+                .unwrap()
+                .index(),
+            77
+        );
+    }
+
     #[test]
     fn every_cause_refuses_release_before_enrollment_and_ignores_other_causes() {
         use crate::object_wait::OperationToken;

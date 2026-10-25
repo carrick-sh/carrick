@@ -207,6 +207,22 @@ pub enum RootHolder {
     El1Slot(u32),
 }
 
+/// Read-only terminal-event view of one live reservation root's lock word.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub struct RootLockCensus {
+    pub mm: u64,
+    /// The complete lock word, including the notification-required flag.
+    pub word: u64,
+    pub notification_required: bool,
+    pub holder: Option<RootHolder>,
+}
+
 impl RootHolder {
     const fn word(self) -> u64 {
         match self {
@@ -725,6 +741,45 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.roots.iter().position(|root| {
             root.locked.load(Ordering::Acquire) & !ROOT_NOTIFICATION_REQUIRED == word
         })
+    }
+
+    /// Snapshot one live root's lock state without acquiring it. Values are
+    /// diagnostic and may change immediately after they are read.
+    pub fn root_lock_census(&self, index: usize) -> Option<RootLockCensus> {
+        if self.layout_hash.load(Ordering::Acquire) != Self::LAYOUT_HASH {
+            return None;
+        }
+        let root = self.roots.get(index)?;
+        let mm = root.key.load(Ordering::Acquire);
+        if mm == 0 {
+            return None;
+        }
+        let word = root.locked.load(Ordering::Acquire);
+        let holder_word = word & !ROOT_NOTIFICATION_REQUIRED;
+        Some(RootLockCensus {
+            mm,
+            word,
+            notification_required: word & ROOT_NOTIFICATION_REQUIRED != 0,
+            holder: (holder_word != 0).then(|| RootHolder::of_word(holder_word)),
+        })
+    }
+
+    /// Append every live root lock to the standard terminal-event census.
+    pub fn write_lock_census(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        for index in 0..ROOTS {
+            let Some(lock) = self.root_lock_census(index) else {
+                continue;
+            };
+            core::writeln!(
+                out,
+                "reservation root {index}: mm={} lock_word={:#x} notification_required={} holder={:?}",
+                lock.mm,
+                lock.word,
+                lock.notification_required,
+                lock.holder,
+            )?;
+        }
+        Ok(())
     }
 
     fn lock_using<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
@@ -3822,6 +3877,23 @@ mod tests {
         {
             let _guest = table.lock_el1(3, a, 5).unwrap();
             assert_eq!(table.el1_slot_holding(5), Some(3));
+            assert_eq!(
+                table.root_lock_census(3),
+                Some(RootLockCensus {
+                    mm: a.raw(),
+                    word: 7,
+                    notification_required: false,
+                    holder: Some(RootHolder::El1Slot(5)),
+                })
+            );
+            let mut census = std::string::String::new();
+            table.write_lock_census(&mut census).unwrap();
+            assert!(
+                census.contains(
+                    "reservation root 3: mm=41 lock_word=0x7 notification_required=false holder=Some(El1Slot(5))"
+                ),
+                "{census}"
+            );
             assert_eq!(
                 table.el1_slot_holding(6),
                 None,

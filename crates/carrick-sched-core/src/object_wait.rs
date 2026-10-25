@@ -66,7 +66,16 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
-pub const OBJECT_WAIT_PROTOCOL: u64 = 12;
+
+const fn reservations_space_index(queue: usize) -> Option<usize> {
+    let base = ORIGINAL_OBJECT_WAIT_QUEUES + spaces::ADDRESS_SPACES;
+    if queue >= base && queue < base + spaces::ADDRESS_SPACES {
+        Some(queue - base)
+    } else {
+        None
+    }
+}
+pub const OBJECT_WAIT_PROTOCOL: u64 = 13;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
@@ -84,6 +93,7 @@ pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
         (core::mem::size_of::<crate::completion_queue::CompletionQueue>() * OBJECT_WAIT_QUEUES)
             as u64,
         core::mem::offset_of!(ObjectRecord, expired) as u64,
+        core::mem::offset_of!(crate::ZoneTables, reservation_wait_snapshot_revisions) as u64,
         OBJECT_WAIT_QUEUES as u64,
         ORIGINAL_OBJECT_WAIT_QUEUES as u64,
         METADATA_WAIT_INDEX as u64,
@@ -1257,6 +1267,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
         rec.object
             .generation
             .store(self.key.generation, Ordering::Relaxed);
+        if let Some(space) = reservations_space_index(self.key.index as usize) {
+            self.zone.reservation_wait_snapshot_revisions[space]
+                .store(snapshot.epoch, Ordering::Relaxed);
+        }
         let tail = self.queue().tail.load(Ordering::Relaxed);
         rec.object.prev.store(tail, Ordering::Relaxed);
         rec.object.next.store(NIL, Ordering::Relaxed);
