@@ -487,7 +487,7 @@ impl From<Stage2RetirementAuthorization> for Stage2RetirementProof {
 /// cannot construct either receipt payload or the exact-record witness.
 #[derive(::core::marker::Copy, ::core::clone::Clone)]
 pub(crate) enum Stage1UnpublicationReceipt<'a> {
-    EditorRange(&'a carrick_aarch64::vmm::Stage1UnpublishedRange),
+    EditorRange(&'a carrick_aarch64::stage1_authority::Stage1LeafRetired),
     EditorArenas(&'a carrick_aarch64::vmm::Stage1UnpublishedArenas),
     FrameAbsence(&'a super::frame_inventory::Stage1UnpublishedFrames),
     Inventory(&'a carrick_core::mm::retirement::Stage1UnpublishedMm),
@@ -853,11 +853,11 @@ impl CarrierVmCustody {
     fn stage1_unpublished_by_editor(
         &self,
         identity: CarrierStage2RecordIdentity,
-        receipt: &carrick_aarch64::vmm::Stage1UnpublishedRange,
+        receipt: &carrick_aarch64::stage1_authority::Stage1LeafRetired,
     ) -> Option<Stage1Unpublished> {
         let snapshot = self.stage2_record_snapshot(identity.record_id)?;
         receipt
-            .removed_from_ipa_extent(snapshot.ipa, snapshot.len)
+            .names(snapshot.ipa, snapshot.len)
             .then_some(Stage1Unpublished {
                 identity,
                 source: Stage1UnpublishedSource::EditorRelease,
@@ -908,7 +908,7 @@ impl CarrierVmCustody {
     pub(crate) fn editor_receipt_after_test_unmap(
         &self,
         identity: CarrierStage2RecordIdentity,
-    ) -> carrick_aarch64::vmm::Stage1UnpublishedRange {
+    ) -> carrick_aarch64::stage1_authority::Stage1LeafRetired {
         let authority = carrick_aarch64::Stage1Authority::new();
         let record = self
             .stage2_record_snapshot(identity.record_id)

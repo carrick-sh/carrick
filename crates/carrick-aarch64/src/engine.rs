@@ -1656,6 +1656,22 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         live_range: Option<(u64, usize)>,
         edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
     ) -> Result<PageTableApplyOutcome, MemoryError> {
+        self.pt_edit_locked_after_adopting_inner(live_range, None, edit)
+            .map(|(outcome, _)| outcome)
+    }
+
+    fn pt_edit_locked_after_adopting_inner(
+        &mut self,
+        live_range: Option<(u64, usize)>,
+        unpublish_range: Option<(u64, usize)>,
+        edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
+    ) -> Result<
+        (
+            PageTableApplyOutcome,
+            Option<crate::stage1_authority::Stage1LeafRetired>,
+        ),
+        MemoryError,
+    > {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let pt_base = self
             .vcpu
@@ -1685,131 +1701,137 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             None
         };
         let mut outcome = PageTableApplyOutcome::default();
+        let mut unpublished = None;
         let edit_res: Result<(), MemoryError> =
             carrick_hal::el1_editor_exclusion::with_held_exclusion(self.mm_generation, |license| {
                 let license = license.ok_or_else(|| {
                     MemoryError::HostMap("stage-1 edit lacks its Editor exclusion".to_owned())
                 })?;
-                page_tables.edit(
+                let mut edit = Some(edit);
+                let mut apply = |editor: &mut Stage1Editor<'_>| {
+                    if editor.base() != pt_base {
+                        return Err(MemoryError::HostMap(format!(
+                            "page-table manager root 0x{:x} does not match TTBR0 root 0x{pt_base:x}",
+                            editor.base()
+                        )));
+                    }
+                    editor.set_multi_vcpu(unsafe_to_coalesce);
+                    editor.set_stage1_exclusive(stage1_exclusive);
+                    if let Some((address, len)) = live_range {
+                        let resolver = EngineHostResolver {
+                            vm: &self.vm,
+                            retained: retained.clone(),
+                            pt_base,
+                            host,
+                            size,
+                        };
+                        unsafe {
+                            editor
+                                .manager
+                                .adopt_live_tables_for_range(&resolver, address, len)
+                        }
+                        .map_err(page_table_sync_error_to_memory_error)?;
+                    }
+                    let edit = edit.take().ok_or_else(|| {
+                        MemoryError::HostMap("stage-1 edit closure invoked twice".to_owned())
+                    })?;
+                    match edit(editor) {
+                        Ok(res) => {
+                            outcome = res;
+                            if outcome.changed {
+                                self.vm
+                                    .publish_stage1_extension_arenas(editor.manager)
+                                    .map_err(|error| {
+                                        MemoryError::HostMap(format!(
+                                            "publish stage-1 extension arenas failed: {error:?}"
+                                        ))
+                                    })?;
+                                let resolver = EngineHostResolver {
+                                    vm: &self.vm,
+                                    retained: retained.clone(),
+                                    pt_base,
+                                    host,
+                                    size,
+                                };
+                                unsafe { editor.sync_to_host(resolver) }
+                                    .map_err(page_table_sync_error_to_memory_error)?;
+                                editor.manager.record_populated_prefixes(|base, prefix| {
+                                    self.vm.record_stage1_populated_prefix(base, prefix);
+                                });
+                            }
+                            Ok(())
+                        }
+                        Err(PageTableError::OutOfTables) => {
+                            let (in_use, free, capacity, arenas) = editor.pool_stats();
+                            let source = editor.has_arena_source();
+                            let pmr = stage1_exclusive;
+                            Err(MemoryError::HostMap(format!(
+                                "stage-1 page-table pool exhausted \
+                                 (in_use={in_use} free={free} capacity={capacity} arenas={arenas} source={source} \
+                                 reclaim_disabled={unsafe_to_coalesce} engines={engines} pmr={pmr})"
+                            )))
+                        }
+                        Err(
+                            error @ (PageTableError::BadAddress
+                            | PageTableError::GicWindowOutput
+                            | PageTableError::CarrickOwnedWindow),
+                        ) => {
+                            carrick_observability::probes::guest_internal_write_fault(
+                                0,
+                                0,
+                                8,
+                                &format!("stage-1 edit refused: {error:?}"),
+                            );
+                            Err(MemoryError::OutOfBounds {
+                                address: 0,
+                                length: 0,
+                            })
+                        }
+                        Err(PageTableError::MissingArenaSource) => Err(MemoryError::HostMap(
+                            "stage-1 page-table manager has no arena source".to_owned(),
+                        )),
+                        Err(PageTableError::ConflictingArenaSource) => Err(MemoryError::HostMap(
+                            "stage-1 page-table manager conflicting arena source".to_owned(),
+                        )),
+                        Err(PageTableError::UnresolvedArena(base)) => Err(MemoryError::HostMap(
+                            format!("stage-1 page-table manager unresolved arena 0x{base:x}",),
+                        )),
+                        Err(PageTableError::MetadataAllocation) => {
+                            Err(MemoryError::MetadataAllocation)
+                        }
+                        Err(PageTableError::GuestOwnsLiveDescriptors) => {
+                            Err(guest_owned_live_edit_error())
+                        }
+                    }
+                };
+                if let Some((va, len)) = unpublish_range {
+                    let ((), receipt) = page_tables.edit_unpublishing(
                         license,
                         || {
                             live_mgr.ok_or_else(|| {
                                 MemoryError::HostMap("stage-1 manager absent".to_string())
                             })
                         },
-                        |editor| {
-                if editor.base() != pt_base {
-                    return Err(MemoryError::HostMap(format!(
-                        "page-table manager root 0x{:x} does not match TTBR0 root 0x{pt_base:x}",
-                        editor.base()
-                    )));
-                }
-                editor.set_multi_vcpu(unsafe_to_coalesce);
-                editor.set_stage1_exclusive(stage1_exclusive);
-                if let Some((address, len)) = live_range {
-                    let resolver = EngineHostResolver {
-                        vm: &self.vm,
-                        retained: retained.clone(),
-                        pt_base,
-                        host,
-                        size,
-                    };
-                    unsafe {
-                        editor
-                            .manager
-                            .adopt_live_tables_for_range(&resolver, address, len)
-                    }
-                    .map_err(page_table_sync_error_to_memory_error)?;
-                }
-                match edit(editor) {
-                    Ok(res) => {
-                        outcome = res;
-                        if outcome.changed {
-                            self.vm
-                                .publish_stage1_extension_arenas(editor.manager)
-                                .map_err(|error| {
-                                    MemoryError::HostMap(format!(
-                                        "publish stage-1 extension arenas failed: {error:?}"
-                                    ))
-                                })?;
-                            // SAFETY: `host` backs the live page-table region for the whole process
-                            // lifetime; the manager writes only 8-byte-aligned descriptor slots
-                            // within `[host, host + size)`.
-                            let resolver = EngineHostResolver {
-                                vm: &self.vm,
-                                retained: retained.clone(),
-                                pt_base,
-                                host,
-                                size,
-                            };
-                            unsafe {
-                                editor.sync_to_host(resolver)
-                            }
-                            .map_err(page_table_sync_error_to_memory_error)?;
-                            editor.manager.record_populated_prefixes(|base, prefix| {
-                                self.vm.record_stage1_populated_prefix(base, prefix);
-                            });
-                        }
-                        Ok(())
-                    }
-                    Err(PageTableError::OutOfTables) => {
-                        let (in_use, free, capacity, arenas) = editor.pool_stats();
-                        let source = editor.has_arena_source();
-                        let pmr = stage1_exclusive;
-                        Err(MemoryError::HostMap(format!(
-                            "stage-1 page-table pool exhausted \
-                             (in_use={in_use} free={free} capacity={capacity} arenas={arenas} source={source} \
-                             reclaim_disabled={unsafe_to_coalesce} engines={engines} pmr={pmr})"
-                        )))
-                    }
-                    // An output in the in-kernel GIC's window, or a leaf in
-                    // the Carrick-owned EL1 COW copy window, is an address no
-                    // guest edit may reach, like a bad address.
-                    Err(
-                        error @ (PageTableError::BadAddress
-                        | PageTableError::GicWindowOutput
-                        | PageTableError::CarrickOwnedWindow),
-                    ) => {
-                        // The refusal's kind is lost in the lowered error:
-                        // name it for `guest-internal-write-fault` readers.
-                        carrick_observability::probes::guest_internal_write_fault(
-                            0,
-                            0,
-                            8,
-                            &format!("stage-1 edit refused: {error:?}"),
-                        );
-                        Err(MemoryError::OutOfBounds {
-                            address: 0,
-                            length: 0,
-                        })
-                    }
-                    Err(PageTableError::MissingArenaSource) => {
-                        Err(MemoryError::HostMap(
-                            "stage-1 page-table manager has no arena source".to_owned(),
-                        ))
-                    }
-                    Err(PageTableError::ConflictingArenaSource) => {
-                        Err(MemoryError::HostMap(
-                            "stage-1 page-table manager conflicting arena source".to_owned(),
-                        ))
-                    }
-                    Err(PageTableError::UnresolvedArena(base)) => {
-                        Err(MemoryError::HostMap(format!(
-                            "stage-1 page-table manager unresolved arena 0x{base:x}",
-                        )))
-                    }
-                    Err(PageTableError::MetadataAllocation) => {
-                        Err(MemoryError::MetadataAllocation)
-                    }
-                    Err(PageTableError::GuestOwnsLiveDescriptors) => {
-                        Err(guest_owned_live_edit_error())
-                    }
-                }
+                        va,
+                        len,
+                        &mut apply,
+                    )?;
+                    unpublished = receipt;
+                    Ok(())
+                } else {
+                    page_tables.edit(
+                        license,
+                        || {
+                            live_mgr.ok_or_else(|| {
+                                MemoryError::HostMap("stage-1 manager absent".to_string())
+                            })
                         },
+                        &mut apply,
                     )
+                }
             });
         edit_res?;
-        Ok(outcome)
+        Ok((outcome, unpublished))
     }
 
     /// Edit the stage-1 tables WITHOUT a TLB flush. Reserved for changes that do
@@ -1864,6 +1886,28 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
         self.invalidate_after_edit()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))
+    }
+
+    fn pt_edit_unpublishing_and_flush_after_adopting(
+        &mut self,
+        address: u64,
+        len: usize,
+        edit: impl FnOnce(&mut Stage1Editor<'_>) -> Result<PageTableApplyOutcome, PageTableError>,
+    ) -> Result<crate::stage1_authority::Stage1LeafRetired, MemoryError> {
+        let (outcome, receipt) = self.pt_edit_locked_after_adopting_inner(
+            Some((address, len)),
+            Some((address, len)),
+            edit,
+        )?;
+        if outcome.flush_required {
+            self.invalidate_after_edit()
+                .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))?;
+        }
+        receipt.ok_or_else(|| {
+            MemoryError::HostMap(
+                "stage-1 edit did not retire any translation in its declared range".to_owned(),
+            )
+        })
     }
 
     /// Apply shared stage-1 range rules on either lane, over the adopted
@@ -1940,22 +1984,23 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         va: u64,
         len: usize,
         reclaim: bool,
-    ) -> Result<(), MappingRetirementError> {
+    ) -> Result<Option<crate::stage1_authority::Stage1LeafRetired>, MappingRetirementError> {
         if self.page_tables.live_descriptor_owner() != LiveDescriptorOwner::Guest {
             return self
-                .pt_edit_and_flush_after_adopting(va, len, |editor| {
+                .pt_edit_unpublishing_and_flush_after_adopting(va, len, |editor| {
                     if reclaim {
                         editor.unmap_aliased(va, len)
                     } else {
                         editor.invalidate(va, len)
                     }
                 })
+                .map(Some)
                 .map_err(MappingRetirementError::Indeterminate);
         }
         if !reclaim {
-            return self
-                .apply_stage1_rules((va, len), &[(va, len, TerminalRule::pt(PtOp::Retire))])
-                .map_err(MappingRetirementError::Indeterminate);
+            self.apply_stage1_rules((va, len), &[(va, len, TerminalRule::pt(PtOp::Retire))])
+                .map_err(MappingRetirementError::Indeterminate)?;
+            return Ok(None);
         }
         let failure = |what: String| MemoryError::HostMap(format!("guest stage-1 unmap: {what}"));
         let mut progress = crate::descriptor_drain::RetirementProgress::default();
@@ -2021,7 +2066,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 )))
             })?;
         }
-        retired
+        retired.map(|()| None)
     }
 
     /// Revert uncommitted page table edits from the undo journal to shadow and host memory,
@@ -4253,26 +4298,20 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         else {
             return Ok(false);
         };
-        let stage1 =
-            crate::vmm::Stage1UnpublishedRange::capture(address, len, |va| self.translate_va(va));
         // Keep semantic mapping/protection metadata intact. After editing starts,
         // uncertain publication must fail stopped with old owners still retained.
-        if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
+        let stage1 = if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
             self.retire_stage1_range(address, len, true)
                 .map_err(MappingRetirementError::into_memory_error)
         } else {
-            self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
+            self.pt_edit_unpublishing_and_flush_after_adopting(address, len, |mgr| {
+                mgr.unmap_aliased(address, len)
+            })
+            .map(Some)
         }
         .map_err(RepointPrivateError::indeterminate)?;
-        let stage1 = stage1
-            .and_then(|plan| plan.finish(|va| self.translate_va(va)))
-            .ok_or_else(|| {
-                RepointPrivateError::indeterminate(MemoryError::HostMap(
-                    "anonymous discard did not unpublish its prior stage-1 translation".to_owned(),
-                ))
-            })?;
         self.vm
-            .commit_anonymous_discard(&stage1, prepared)
+            .commit_anonymous_discard(stage1.as_ref(), prepared)
             .map_err(|error| {
                 RepointPrivateError::indeterminate(MemoryError::HostMap(error.to_string()))
             })?;
@@ -4516,8 +4555,6 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         len: usize,
     ) -> Result<(), MappingRetirementError> {
         let address = address.raw();
-        let stage1 =
-            crate::vmm::Stage1UnpublishedRange::capture(address, len, |va| self.translate_va(va));
         let span = carrick_mmu_core::aarch64::descriptor_txn::PageSpan::new(address, len as u64);
         trace_el1_mapping_leafs(
             self,
@@ -4530,7 +4567,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // Only then retire process-shared backend lookup metadata. If the page-
         // table/TLBI operation fails, the alias registry remains an exact owner
         // of the still-published backing instead of becoming a dangling absence.
-        if self.vm.sparse_mmap_arena_enabled()
+        let stage1 = if self.vm.sparse_mmap_arena_enabled()
             && ((address >= carrick_mem::memory::LINUX_MMAP_BASE
                 && address.checked_add(len as u64).is_some_and(|end| {
                     end <= carrick_mem::memory::LINUX_MMAP_BASE
@@ -4538,22 +4575,17 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 }))
                 || carrick_mem::memory::is_high_va(address))
         {
-            self.retire_stage1_range(address, len, true)?;
+            self.retire_stage1_range(address, len, true)?
         } else {
-            self.retire_stage1_range(address, len, false)?;
-        }
-        let stage1 = stage1
-            .and_then(|plan| plan.finish(|va| self.translate_va(va)))
-            .ok_or_else(|| {
-                MappingRetirementError::Indeterminate(MemoryError::HostMap(
-                    "mapping retirement did not unpublish its prior stage-1 translation".to_owned(),
-                ))
+            self.retire_stage1_range(address, len, false)?
+        };
+        self.vm
+            .on_unmap(stage1.as_ref(), address, len)
+            .map_err(|error| {
+                MappingRetirementError::Indeterminate(MemoryError::HostMap(format!(
+                    "retire backend mapping after munmap: {error}"
+                )))
             })?;
-        self.vm.on_unmap(&stage1, address, len).map_err(|error| {
-            MappingRetirementError::Indeterminate(MemoryError::HostMap(format!(
-                "retire backend mapping after munmap: {error}"
-            )))
-        })?;
         self.set_unmapped(address, len, true);
         trace_el1_mapping_leafs(
             self,
@@ -4573,20 +4605,14 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // backend lookup metadata. This legacy API erases the classification;
         // replacement uses retire_mapping so partial publication cannot be
         // mistaken for an intact predecessor.
-        let stage1 =
-            crate::vmm::Stage1UnpublishedRange::capture(address, len, |va| self.translate_va(va));
-        self.retire_stage1_range(address, len, true)
+        let stage1 = self
+            .retire_stage1_range(address, len, true)
             .map_err(MappingRetirementError::into_memory_error)?;
-        let stage1 = stage1
-            .and_then(|plan| plan.finish(|va| self.translate_va(va)))
-            .ok_or_else(|| {
-                MemoryError::HostMap(
-                    "alias retirement did not unpublish its prior stage-1 translation".to_owned(),
-                )
+        self.vm
+            .on_unmap(stage1.as_ref(), address, len)
+            .map_err(|error| {
+                MemoryError::HostMap(format!("retire backend alias after munmap: {error}"))
             })?;
-        self.vm.on_unmap(&stage1, address, len).map_err(|error| {
-            MemoryError::HostMap(format!("retire backend alias after munmap: {error}"))
-        })?;
         self.set_unmapped(address, len, true);
         Ok(())
     }
@@ -4764,6 +4790,7 @@ fn apply_stage1_protection_edit(
     let mut editor = crate::stage1_authority::Stage1Editor {
         manager: mgr,
         arena_source: &mut source,
+        image_generation: None,
     };
     editor.apply_protection_edit(address, len, prot, armed_cow)
 }
@@ -5189,10 +5216,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 "guest alias length {len:#x} exceeded host pointer width during failure cleanup unwinding"
             );
         });
-        let stage1 =
-            crate::vmm::Stage1UnpublishedRange::capture(va.raw(), cleanup_len, |address| {
-                self.translate_va(address)
-            });
         let error = match refusal {
             GuestAliasRefusal::BeforeInventory(error) => {
                 // The authority never saw the mapping: discard the staging
@@ -5215,24 +5238,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             // The backend retired the span and rolled the grant back.
             GuestAliasRefusal::RolledBack(error) => error,
         };
-        let stage1 = stage1
-            .and_then(|plan| plan.finish(|address| self.translate_va(address)))
-            .or_else(|| {
-                crate::vmm::Stage1UnpublishedRange::plan_for_known_translation(
-                    va.raw(),
-                    cleanup_len,
-                    gpa,
-                )
-                .finish(|address| self.translate_va(address))
-            });
-        let unregister = stage1
-            .as_ref()
-            .ok_or_else(|| "cleanup retained its stage-1 translation".to_owned())
-            .and_then(|stage1| {
-                self.vm
-                    .on_unmap(stage1, va.raw(), cleanup_len)
-                    .map_err(|error| error.to_string())
-            });
+        let unregister = self
+            .vm
+            .on_unmap(None, va.raw(), cleanup_len)
+            .map_err(|error| error.to_string());
         if let Err(unregister) = unregister {
             carrick_fatal!(
                 "aarch64::alias_cleanup",

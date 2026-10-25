@@ -107,6 +107,97 @@ impl<C> Stage1EditLicense for carrick_sched_core::SpaceEditor<'_, C> where
 {
 }
 
+/// Non-cloneable proof that one exact authority image stopped translating
+/// the captured VA pages to their former IPAs in an Editor-licensed edit.
+#[derive(Debug)]
+pub struct Stage1LeafRetired {
+    authority: u64,
+    image_generation: std::num::NonZeroU64,
+    va: u64,
+    len: usize,
+    retired: Vec<(u64, u64)>,
+    _tlbi: TlbiComplete,
+}
+
+#[derive(Debug)]
+struct TlbiComplete;
+
+#[derive(Debug)]
+struct Stage1LeafRetirementPlan {
+    authority: u64,
+    image_generation: std::num::NonZeroU64,
+    va: u64,
+    len: usize,
+    retired: Vec<(u64, u64)>,
+}
+
+impl Stage1LeafRetirementPlan {
+    fn capture(
+        authority: u64,
+        image_generation: std::num::NonZeroU64,
+        va: u64,
+        len: usize,
+        mut translate: impl FnMut(u64) -> Option<u64>,
+    ) -> Option<Self> {
+        let end = va.checked_add(len as u64)?;
+        if len == 0 {
+            return None;
+        }
+        let mut retired = Vec::new();
+        let mut cursor = va & !0xfff;
+        while cursor < end {
+            if let Some(ipa) = translate(cursor) {
+                retired.push((cursor, ipa));
+            }
+            cursor = cursor.checked_add(4096)?;
+        }
+        (!retired.is_empty()).then_some(Self {
+            authority,
+            image_generation,
+            va,
+            len,
+            retired,
+        })
+    }
+
+    fn finish(self, mut translate: impl FnMut(u64) -> Option<u64>) -> Option<Stage1LeafRetired> {
+        self.retired
+            .iter()
+            .all(|&(va, ipa)| translate(va) != Some(ipa))
+            .then_some(Stage1LeafRetired {
+                authority: self.authority,
+                image_generation: self.image_generation,
+                va: self.va,
+                len: self.len,
+                retired: self.retired,
+                _tlbi: TlbiComplete,
+            })
+    }
+}
+
+impl Stage1LeafRetired {
+    pub fn authority(&self) -> u64 {
+        self.authority
+    }
+
+    pub fn image_generation(&self) -> std::num::NonZeroU64 {
+        self.image_generation
+    }
+
+    pub fn range(&self) -> (u64, usize) {
+        (self.va, self.len)
+    }
+
+    pub fn names(&self, ipa: u64, len: usize) -> bool {
+        let Some(end) = ipa.checked_add(len as u64) else {
+            return false;
+        };
+        self.retired
+            .iter()
+            .any(|&(_, translated)| ipa <= translated && translated < end)
+    }
+}
+
 struct Stage1AuthorityInner {
     manager: TrackedStage1Image,
     arena_source: Option<Box<dyn TableArenaSource>>,
@@ -991,12 +1082,17 @@ impl Stage1Authority {
             live_owner,
             ..
         } = *inner;
+        let image_generation = manager
+            .generation
+            .and_then(|generation| generation.get().checked_add(1))
+            .and_then(std::num::NonZeroU64::new);
         let manager = manager.as_mut().ok_or(on_absent)?;
         manager.declare_live_hardware_image();
         manager.set_live_descriptor_owner(live_owner);
         let mut editor = Stage1Editor {
             manager,
             arena_source,
+            image_generation,
         };
         f(&mut editor)
     }
@@ -1279,6 +1375,10 @@ impl Stage1Authority {
                     live_owner,
                     ..
                 } = *inner;
+                let image_generation = manager
+                    .generation
+                    .and_then(|generation| generation.get().checked_add(1))
+                    .and_then(std::num::NonZeroU64::new);
                 let manager = manager
                     .as_mut()
                     .expect("manager must be present after lazy initialization");
@@ -1287,6 +1387,7 @@ impl Stage1Authority {
                 let mut editor = Stage1Editor {
                     manager,
                     arena_source,
+                    image_generation,
                 };
                 f(&mut editor)?
             };
@@ -1309,14 +1410,20 @@ impl Stage1Authority {
         va: u64,
         len: usize,
         f: F,
-    ) -> Result<(R, Option<crate::vmm::Stage1UnpublishedRange>), E>
+    ) -> Result<(R, Option<Stage1LeafRetired>), E>
     where
         B: FnOnce() -> Result<PageTableManager, E>,
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
     {
         self.edit(license, builder, |editor| {
-            let plan = crate::vmm::Stage1UnpublishedRange::capture(va, len, |address| {
-                editor.translate(address)
+            let plan = editor.image_generation.and_then(|generation| {
+                Stage1LeafRetirementPlan::capture(
+                    self.authority_id(),
+                    generation,
+                    va,
+                    len,
+                    |address| editor.translate(address),
+                )
             });
             let result = f(editor)?;
             Ok((
@@ -1755,6 +1862,7 @@ impl Drop for ReservedTableArena {
 pub struct Stage1Editor<'a> {
     pub manager: &'a mut PageTableManager,
     pub arena_source: &'a mut Option<Box<dyn TableArenaSource>>,
+    pub(crate) image_generation: Option<std::num::NonZeroU64>,
 }
 
 impl<'a> std::ops::Deref for Stage1Editor<'a> {
@@ -2332,6 +2440,7 @@ pub(crate) mod tests {
             let mut editor = Stage1Editor {
                 manager: &mut planned,
                 arena_source: &mut source,
+                image_generation: None,
             };
             let plan = protection_terminal_rules(address, len, prot, armed_cow, *new_mapping);
             editor.apply_terminal_rules(&plan).unwrap();
@@ -2394,6 +2503,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn edit_unpublishing_binds_retired_leaf_to_old_ipa_and_image() {
+        use carrick_mmu_core::aarch64::UserLeafAccess;
+
+        let va = LINUX_MMAP_BASE;
+        let old_ipa = 0x009b_5000_0000;
+        let new_ipa = old_ipa + 0x20_0000;
+        let authority = Stage1Authority::new_with_manager(Some(test_manager()));
+        authority
+            .edit(
+                test_edit_license(),
+                || Err::<PageTableManager, PageTableError>(PageTableError::BadAddress),
+                |editor| {
+                    editor
+                        .map_aliased(va, old_ipa, 4096, UserLeafAccess::READ_WRITE)
+                        .map(|_| ())
+                },
+            )
+            .unwrap();
+
+        let before = observed_generation(&authority).unwrap();
+        let (_, receipt) = authority
+            .edit_unpublishing(
+                test_edit_license(),
+                || Err::<PageTableManager, PageTableError>(PageTableError::BadAddress),
+                va,
+                4096,
+                |editor| {
+                    editor
+                        .map_aliased(va, new_ipa, 4096, UserLeafAccess::READ_WRITE)
+                        .map(|_| ())
+                },
+            )
+            .unwrap();
+        let receipt = receipt.expect("repoint retires the old translation");
+        assert_eq!(receipt.authority(), authority.authority_id());
+        assert_ne!(receipt.image_generation(), before);
+        assert_eq!(receipt.range(), (va, 4096));
+        assert!(receipt.names(old_ipa, 4096));
+        assert!(!receipt.names(new_ipa, 4096));
+        assert_eq!(
+            authority.with_manager(|manager| manager.translate(va)),
+            Some(Some(new_ipa))
+        );
+    }
+
+    #[test]
     fn protection_edit_preserves_copyout_intent_when_rearming_cow() {
         use carrick_abi::{LINUX_PROT_READ, LINUX_PROT_WRITE};
         use carrick_mmu_core::aarch64::{
@@ -2419,6 +2574,7 @@ pub(crate) mod tests {
         let mut editor = Stage1Editor {
             manager: &mut manager,
             arena_source: &mut source,
+            image_generation: None,
         };
         let cow = [crate::vmm::ForkCowRange {
             va,

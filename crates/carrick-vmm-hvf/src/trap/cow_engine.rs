@@ -6071,7 +6071,7 @@ impl HvfVmState {
 
     pub(crate) fn unregister_process_alias(
         &mut self,
-        stage1: Option<&carrick_aarch64::vmm::Stage1UnpublishedRange>,
+        stage1: Option<&carrick_aarch64::stage1_authority::Stage1LeafRetired>,
         va: u64,
         len: usize,
     ) -> Result<(), TrapError> {

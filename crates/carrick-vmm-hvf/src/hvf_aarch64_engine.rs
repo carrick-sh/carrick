@@ -2350,7 +2350,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn commit_anonymous_discard(
         &mut self,
-        _stage1: &carrick_aarch64::vmm::Stage1UnpublishedRange,
+        _stage1: Option<&carrick_aarch64::stage1_authority::Stage1LeafRetired>,
         ticket: Self::AnonymousDiscard,
     ) -> Result<(), TrapError> {
         let identity = self
@@ -2965,14 +2965,14 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn on_unmap(
         &mut self,
-        stage1: &carrick_aarch64::vmm::Stage1UnpublishedRange,
+        stage1: Option<&carrick_aarch64::stage1_authority::Stage1LeafRetired>,
         va: u64,
         len: usize,
     ) -> Result<(), TrapError> {
         // The shared engine calls this only after checked stage-1 teardown and
         // TLBI succeed. A failed edit therefore retains this process-shared alias
         // owner; successful teardown removes the high-VA lookup (low VA no-op).
-        self.state.unregister_process_alias(Some(stage1), va, len)
+        self.state.unregister_process_alias(stage1, va, len)
     }
 
     fn add_alias(

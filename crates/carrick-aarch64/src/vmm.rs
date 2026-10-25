@@ -607,86 +607,6 @@ pub enum FrameCowWriteIntent {
 /// sibling spawn, host memory windows + stage-2 mapping, and the HVF-only
 /// lazy-alias re-map (as the optional [`Self::handle_memory_exit`] hook). Mirrors
 /// `carrick-x86`'s `X86Vmm`.
-/// Non-cloneable receipt that the shared engine removed or retired one exact
-/// stage-1 VA range and completed the required TLBI before backend metadata or
-/// stage-2 authority may retire.
-#[derive(Debug)]
-pub struct Stage1UnpublishedRange {
-    va: u64,
-    len: usize,
-    removed: Vec<(u64, u64)>,
-}
-
-impl Stage1UnpublishedRange {
-    pub(crate) fn capture(
-        va: u64,
-        len: usize,
-        mut translate: impl FnMut(u64) -> Option<u64>,
-    ) -> Option<Stage1UnpublicationPlan> {
-        let end = va.checked_add(len as u64)?;
-        if len == 0 {
-            return None;
-        }
-        let mut removed = Vec::new();
-        let mut cursor = va & !0xfff;
-        while cursor < end {
-            if let Some(ipa) = translate(cursor) {
-                removed.push((cursor, ipa));
-            }
-            cursor = cursor.checked_add(4096)?;
-        }
-        (!removed.is_empty()).then_some(Stage1UnpublicationPlan { va, len, removed })
-    }
-
-    pub fn range(&self) -> (u64, usize) {
-        (self.va, self.len)
-    }
-
-    pub fn removed_from_ipa_extent(&self, ipa: u64, len: usize) -> bool {
-        let Some(end) = ipa.checked_add(len as u64) else {
-            return false;
-        };
-        self.removed
-            .iter()
-            .any(|&(_, translated)| ipa <= translated && translated < end)
-    }
-
-    pub(crate) fn plan_for_known_translation(
-        va: u64,
-        len: usize,
-        ipa: u64,
-    ) -> Stage1UnpublicationPlan {
-        Stage1UnpublicationPlan {
-            va,
-            len,
-            removed: vec![(va, ipa)],
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Stage1UnpublicationPlan {
-    va: u64,
-    len: usize,
-    removed: Vec<(u64, u64)>,
-}
-
-impl Stage1UnpublicationPlan {
-    pub(crate) fn finish(
-        self,
-        mut translate: impl FnMut(u64) -> Option<u64>,
-    ) -> Option<Stage1UnpublishedRange> {
-        self.removed
-            .iter()
-            .all(|&(va, ipa)| translate(va) != Some(ipa))
-            .then_some(Stage1UnpublishedRange {
-                va: self.va,
-                len: self.len,
-                removed: self.removed,
-            })
-    }
-}
-
 #[derive(Debug)]
 pub struct Stage1UnpublishedArenas {
     retired_bases: Vec<u64>,
@@ -1380,7 +1300,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// caller; a backend must preserve exact owner generations and fork peers.
     fn commit_anonymous_discard(
         &mut self,
-        _stage1: &Stage1UnpublishedRange,
+        _stage1: Option<&crate::stage1_authority::Stage1LeafRetired>,
         _prepared: Self::AnonymousDiscard,
     ) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
@@ -1395,7 +1315,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// no-op.
     fn on_unmap(
         &mut self,
-        _stage1: &Stage1UnpublishedRange,
+        _stage1: Option<&crate::stage1_authority::Stage1LeafRetired>,
         _va: u64,
         _len: usize,
     ) -> Result<(), TrapError> {
