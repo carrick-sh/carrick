@@ -343,6 +343,16 @@ impl TransferCustody for UserTransferCustody {
         )?
         .refill_transfer_cow()
     }
+    fn settle_stage1_rewrites(&self, target: carrick_aarch64::user_transfer::TransferTarget) {
+        if let Some(state) = self
+            .custody
+            .guest_cow_state(target.handle().mm().raw())
+            .ok()
+            .flatten()
+        {
+            state.settle_owed_stage1_rewrites();
+        }
+    }
     fn retain(
         &self,
         selected: PortalSelectedData,
@@ -363,17 +373,19 @@ impl TransferCustody for UserTransferCustody {
     }
 }
 impl UserTransferCustody {
-    fn owed_stage1_rewrite_wait(
+    fn has_owed_stage1_rewrite(
         &self,
         target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
         ipa: u64,
-    ) -> Option<carrick_guest_mem::OwnedMemoryWait> {
-        let (target, va) = target?;
+    ) -> bool {
+        let Some((target, va)) = target else {
+            return false;
+        };
         self.custody
             .guest_cow_state(target.handle().mm().raw())
             .ok()
-            .flatten()?
-            .owed_stage1_rewrite_wait(va, ipa)
+            .flatten()
+            .is_some_and(|state| state.has_owed_stage1_rewrite(va, ipa))
     }
 
     fn publish_claimed_executable(
@@ -469,10 +481,13 @@ impl UserTransferCustody {
                     self.custody.stage2_publication_wait(selected.ipa),
                 ));
             }
-            if let Some(wait) = self.owed_stage1_rewrite_wait(target, selected.ipa) {
-                return Ok(TransferRetention::Physical(wait));
+            if self.has_owed_stage1_rewrite(target, selected.ipa) {
+                return Ok(TransferRetention::PendingStage1Rewrite);
             }
-            return Ok(TransferRetention::StaleSelection);
+            return Ok(TransferRetention::Unmapped {
+                address: target.map_or(0, |(_, va)| va),
+                length: len,
+            });
         };
         let extent = self
             .custody
@@ -521,18 +536,24 @@ impl UserTransferCustody {
                         self.custody.stage2_publication_wait(selected.ipa),
                     ));
                 }
-                if let Some(wait) = self.owed_stage1_rewrite_wait(target, selected.ipa) {
-                    return Ok(TransferRetention::Physical(wait));
+                if self.has_owed_stage1_rewrite(target, selected.ipa) {
+                    return Ok(TransferRetention::PendingStage1Rewrite);
                 }
-                return Ok(TransferRetention::StaleSelection);
+                return Ok(TransferRetention::Unmapped {
+                    address: target.map_or(0, |(_, va)| va),
+                    length: len,
+                });
             }
             Err(CarrierStage2PinError::RetirementRequested) => {
                 carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 5);
                 if self.custody.carrier_stage2_retirement_is_terminal(identity) {
-                    if let Some(wait) = self.owed_stage1_rewrite_wait(target, selected.ipa) {
-                        return Ok(TransferRetention::Physical(wait));
+                    if self.has_owed_stage1_rewrite(target, selected.ipa) {
+                        return Ok(TransferRetention::PendingStage1Rewrite);
                     }
-                    return Ok(TransferRetention::StaleSelection);
+                    return Ok(TransferRetention::Unmapped {
+                        address: target.map_or(0, |(_, va)| va),
+                        length: len,
+                    });
                 }
                 return Ok(TransferRetention::Physical(
                     self.custody.stage2_retirement_wait(Some(identity)),
@@ -628,12 +649,19 @@ pub(super) mod tests {
     use carrick_el1_abi::{PortalByteRange, PortalOperation, PortalTransferSlot, ReservationMm};
     use std::sync::atomic::Ordering;
     pub(crate) fn backing(custody: &Arc<CarrierVmCustody>, ipa: u64) -> Arc<GlobalFrameHostOwner> {
-        backing_len(custody, ipa, 16384)
+        backing_len(custody, ipa, 16384, false)
+    }
+    fn backend_mapped_backing(
+        custody: &Arc<CarrierVmCustody>,
+        ipa: u64,
+    ) -> Arc<GlobalFrameHostOwner> {
+        backing_len(custody, ipa, 16384, true)
     }
     fn backing_len(
         custody: &Arc<CarrierVmCustody>,
         ipa: u64,
         len: usize,
+        backend_mapped: bool,
     ) -> Arc<GlobalFrameHostOwner> {
         let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             len,
@@ -641,7 +669,11 @@ pub(super) mod tests {
         )
         .unwrap();
         let mut lease = GlobalFrameStage2Lease::fixed(ipa, len as u64);
-        lease.mark_test_mapped_without_backend();
+        if backend_mapped {
+            lease.mark_mapped();
+        } else {
+            lease.mark_test_mapped_without_backend();
+        }
         register_global_frame_host_owner_in(
             custody,
             lease,
@@ -722,7 +754,7 @@ pub(super) mod tests {
         let custody = Arc::new(CarrierVmCustody::new_live_fixture());
         let va = 0x6000_2800_1000;
         let ipa = 0xa085_3200_0000;
-        let owner = backing(&custody, ipa);
+        let owner = backend_mapped_backing(&custody, ipa);
         let (state, target) = owed_rewrite_mm(&custody, 811, va, ipa);
         custody.enqueue_carrier_stage2_retirement(owner.record_identity);
         assert_eq!(
@@ -739,24 +771,19 @@ pub(super) mod tests {
         assert!(removed.is_some());
 
         let physical = UserTransferCustody::new(custody);
-        let TransferRetention::Physical(wait) = physical
-            .retain_for(
-                target,
-                va,
-                selection(ipa),
-                4,
-                PortalTransferIntent::UserRead,
-            )
-            .unwrap()
-        else {
-            panic!("retirement must expose its exact owed-rewrite producer")
-        };
-        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = Arc::clone(&wakes);
-        let (_enrollment, ready) = wait.0.enroll(Arc::new(move || {
-            observed.fetch_add(1, Ordering::SeqCst);
-        }));
-        assert!(!ready);
+        assert!(matches!(
+            physical
+                .retain_for(
+                    target,
+                    va,
+                    selection(ipa),
+                    4,
+                    PortalTransferIntent::UserRead,
+                )
+                .unwrap(),
+            TransferRetention::PendingStage1Rewrite
+        ));
+        assert_eq!(state.owed_stage1_rewrite_count(), 1);
 
         state
             .page_tables_authority()
@@ -765,65 +792,58 @@ pub(super) mod tests {
                 |editor| editor.unmap_aliased(va, 4096).map(|_| ()).map_err(|_| ()),
             )
             .unwrap();
-        assert!(wait.0.is_ready());
-        assert_eq!(wakes.load(Ordering::SeqCst), 1);
-
-        let TransferRetention::Physical(late_wait) = physical
-            .retain_for(
-                target,
-                va,
-                selection(ipa),
-                4,
-                PortalTransferIntent::UserRead,
-            )
-            .unwrap()
-        else {
-            panic!("the completed obligation must remain a ready reselect receipt")
-        };
-        let (_late_enrollment, late_ready) = late_wait.0.enroll(Arc::new(|| {}));
-        assert!(
-            late_ready,
-            "a post-publication enrollment must not miss the wake"
-        );
+        physical.settle_stage1_rewrites(target);
+        assert_eq!(state.owed_stage1_rewrite_count(), 0);
+        assert!(matches!(
+            physical
+                .retain_for(
+                    target,
+                    va,
+                    selection(ipa),
+                    4,
+                    PortalTransferIntent::UserRead,
+                )
+                .unwrap(),
+            TransferRetention::Unmapped { .. }
+        ));
     }
 
     #[test]
-    fn terminal_retirement_owed_rewrite_wakes_at_mm_teardown() {
+    fn retry_pending_and_terminal_retirement_keep_the_owed_rewrite_token() {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = Arc::new(CarrierVmCustody::new_live_fixture());
         let va = 0x6000_2840_1000;
         let ipa = 0xa085_3240_0000;
-        let owner = backing(&custody, ipa);
+        let owner = backend_mapped_backing(&custody, ipa);
         let (state, target) = owed_rewrite_mm(&custody, 812, va, ipa);
         custody.enqueue_carrier_stage2_retirement(owner.record_identity);
         assert_eq!(
             custody.request_stage2_record_retirement(owner.record_identity),
             CarrierStage2RetireOutcome::DeferredActivePins
         );
+        let injected = CarrierStage2BackendError::HvReturn(0xfae9_4001);
+        assert_eq!(
+            custody.retire_stage2_record_using(owner.record_identity, |_, _| Err(injected)),
+            CarrierStage2RetireOutcome::RetryPending(injected)
+        );
+        assert_eq!(state.owed_stage1_rewrite_count(), 1);
         custody.terminalize_carrier_stage2_retirement(owner.record_identity);
+        assert_eq!(state.owed_stage1_rewrite_count(), 1);
 
         let physical = UserTransferCustody::new(custody);
-        let TransferRetention::Physical(wait) = physical
-            .retain_for(
-                target,
-                va,
-                selection(ipa),
-                4,
-                PortalTransferIntent::UserRead,
-            )
-            .unwrap()
-        else {
-            panic!("terminal retirement must retain the MM teardown producer")
-        };
-        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = Arc::clone(&wakes);
-        let (_enrollment, ready) = wait.0.enroll(Arc::new(move || {
-            observed.fetch_add(1, Ordering::SeqCst);
-        }));
-        assert!(!ready);
+        assert!(matches!(
+            physical
+                .retain_for(
+                    target,
+                    va,
+                    selection(ipa),
+                    4,
+                    PortalTransferIntent::UserRead,
+                )
+                .unwrap(),
+            TransferRetention::PendingStage1Rewrite
+        ));
         drop(state);
-        assert!(wait.0.is_ready());
-        assert_eq!(wakes.load(Ordering::SeqCst), 1);
     }
     #[test]
     fn user_write_retention_releases_executor_while_code_reader_is_active() {
@@ -873,7 +893,7 @@ pub(super) mod tests {
             }
             fn provision(&mut self, ipa: u64, len: usize) {
                 self.owners
-                    .push(backing_len(&self.custody.custody, ipa, len));
+                    .push(backing_len(&self.custody.custody, ipa, len, false));
             }
             fn retain(
                 &mut self,
@@ -967,7 +987,7 @@ pub(super) mod tests {
                         PortalTransferIntent::UserRead,
                     )
                     .unwrap(),
-                TransferRetention::StaleSelection
+                TransferRetention::Unmapped { .. }
             ),
             "an absent stage-2 record is a stale selection, not an already-ready physical wait"
         );
@@ -1093,7 +1113,7 @@ pub(super) mod tests {
             physical
                 .retain(selection(ipa), 4, PortalTransferIntent::UserRead)
                 .unwrap(),
-            TransferRetention::StaleSelection
+            TransferRetention::Unmapped { .. }
         ));
     }
 
@@ -1431,7 +1451,7 @@ pub(super) mod tests {
                 physical
                     .retain(selected, 4096, PortalTransferIntent::UserRead)
                     .unwrap(),
-                TransferRetention::StaleSelection
+                TransferRetention::Unmapped { .. }
             ),
             "an unmapped stage-2 record is a stale selection, not an already-ready physical wait"
         );

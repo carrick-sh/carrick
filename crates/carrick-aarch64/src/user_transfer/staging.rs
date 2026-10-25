@@ -66,6 +66,7 @@ pub(super) fn stage_page<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
     intent: PortalTransferIntent,
     fork_sequence: Option<NonZeroU64>,
 ) -> Result<Result<prepared::RetainedWritePage<C::Pin>, MemoryPrepareError>, TrapError> {
+    custody.settle_stage1_rewrites(target);
     let service = engine.transfer_service_loan()?;
     Ok(stage_with_loan(
         service,
@@ -297,7 +298,16 @@ fn retain_selected<P>(
     })? {
         TransferRetention::Retained(pin) => Ok(pin),
         TransferRetention::Physical(wait) => Err(MemoryPrepareError::Physical(wait)),
-        TransferRetention::StaleSelection => Err(MemoryPrepareError::OwnerWait(retry)),
+        TransferRetention::PendingStage1Rewrite => Err(MemoryPrepareError::OwnerWait(unsafe {
+            carrick_el1_abi::PortalOwnerWait::from_owner(
+                retry.handle(),
+                carrick_el1_abi::PortalWaitCause::PendingStage1Rewrite,
+                retry.revision(),
+            )
+        })),
+        TransferRetention::Unmapped { address, length } => Err(MemoryPrepareError::Fault(
+            carrick_guest_mem::MemoryError::OutOfBounds { address, length },
+        )),
     }
 }
 
@@ -355,11 +365,34 @@ mod tests {
     }
 
     #[test]
-    fn stale_stage1_selection_returns_exact_editor_producer() {
+    fn owed_stage1_rewrite_returns_exact_editor_producer() {
         let retry = editor_retry();
         assert!(matches!(
-            retain_selected::<()>(Ok(TransferRetention::StaleSelection), retry),
-            Err(MemoryPrepareError::OwnerWait(found)) if found == retry
+            retain_selected::<()>(Ok(TransferRetention::PendingStage1Rewrite), retry),
+            Err(MemoryPrepareError::OwnerWait(found))
+                if found.handle() == retry.handle()
+                    && found.revision() == retry.revision()
+                    && found.cause() == carrick_el1_abi::PortalWaitCause::PendingStage1Rewrite
+        ));
+    }
+
+    #[test]
+    fn producer_free_selection_is_a_guest_mapping_fault() {
+        let retry = editor_retry();
+        assert!(matches!(
+            retain_selected::<()>(
+                Ok(TransferRetention::Unmapped {
+                    address: 0x4040_1000,
+                    length: 4,
+                }),
+                retry,
+            ),
+            Err(MemoryPrepareError::Fault(
+                carrick_guest_mem::MemoryError::OutOfBounds {
+                    address: 0x4040_1000,
+                    length: 4,
+                }
+            ))
         ));
     }
 }

@@ -204,16 +204,22 @@ pub enum TransferPreparation {
 pub enum TransferRetention<P> {
     Retained(P),
     Physical(carrick_guest_mem::OwnedMemoryWait),
-    /// The selected stage-1 leaf no longer has retainable stage-2 backing.
-    /// Retry only after the exact MM editor advances; without an editor this
-    /// is a terminal guest mapping fault, not a physical-retirement wait.
-    StaleSelection,
+    /// Retirement removed stage-2 authority before the exact stage-1 leaf.
+    /// The retirement token guarantees a future Editor publication, so retry
+    /// on the selection's existing Editor receipt.
+    PendingStage1Rewrite,
+    /// No physical or stage-1-edit producer owns this selection.  Only the
+    /// guest-visible mapping-fault path may consume this typed result.
+    Unmapped {
+        address: u64,
+        length: usize,
+    },
 }
 impl<P> TransferRetention<P> {
     pub fn into_retained(self) -> Option<P> {
         match self {
             Self::Retained(pin) => Some(pin),
-            Self::Physical(_) | Self::StaleSelection => None,
+            Self::Physical(_) | Self::PendingStage1Rewrite | Self::Unmapped { .. } => None,
         }
     }
 }
@@ -251,6 +257,11 @@ pub trait TransferCustody {
     ) -> Result<bool, TrapError> {
         Ok(false)
     }
+    /// Settle stage-2 retirement tokens against the current authoritative
+    /// stage-1 image before issuing another owner selection.  Production
+    /// tokens wait on the MM's existing Editor publication; its wake reaches
+    /// this hook before the next SELECT.
+    fn settle_stage1_rewrites(&self, _target: TransferTarget) {}
     fn retain(
         &self,
         selected: PortalSelectedData,
@@ -701,6 +712,9 @@ where
     ) -> Result<bool, TrapError> {
         self.0.refill_maintenance(target, request)
     }
+    fn settle_stage1_rewrites(&self, target: TransferTarget) {
+        self.0.settle_stage1_rewrites(target);
+    }
     fn retain(
         &self,
         selected: PortalSelectedData,
@@ -714,7 +728,10 @@ where
                     TransferRetention::Retained(Box::new(pin) as Box<dyn TransferPin>)
                 }
                 TransferRetention::Physical(wait) => TransferRetention::Physical(wait),
-                TransferRetention::StaleSelection => TransferRetention::StaleSelection,
+                TransferRetention::PendingStage1Rewrite => TransferRetention::PendingStage1Rewrite,
+                TransferRetention::Unmapped { address, length } => {
+                    TransferRetention::Unmapped { address, length }
+                }
             })
     }
     fn retain_for(
@@ -732,7 +749,10 @@ where
                     TransferRetention::Retained(Box::new(pin) as Box<dyn TransferPin>)
                 }
                 TransferRetention::Physical(wait) => TransferRetention::Physical(wait),
-                TransferRetention::StaleSelection => TransferRetention::StaleSelection,
+                TransferRetention::PendingStage1Rewrite => TransferRetention::PendingStage1Rewrite,
+                TransferRetention::Unmapped { address, length } => {
+                    TransferRetention::Unmapped { address, length }
+                }
             })
     }
 }

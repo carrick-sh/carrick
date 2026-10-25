@@ -1815,20 +1815,22 @@ impl CarrierVmCustody {
             backend_result,
         );
         drop(state);
-        if !matches!(
-            outcome,
+        match outcome {
             CarrierStage2RetireOutcome::RetiredUnmapped
-                | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
-        ) {
-            self.cancel_owed_stage1_rewrites(identity);
-        }
-        if matches!(
-            outcome,
-            CarrierStage2RetireOutcome::RetiredUnmapped
-                | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
-        ) {
-            self.stage2_retirement_changed.publish(0);
-            self.publish_stage2_availability_change();
+            | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+                self.stage2_retirement_changed.publish(0);
+                self.publish_stage2_availability_change();
+            }
+            // Backend retry retains the same removed-authority obligation.
+            // Terminalization and its eventual stage-1 rewrite consume it.
+            CarrierStage2RetireOutcome::RetryPending(_) => {}
+            CarrierStage2RetireOutcome::DeferredActivePins
+            | CarrierStage2RetireOutcome::NotFound
+            | CarrierStage2RetireOutcome::OwnerIdentityMismatch
+            | CarrierStage2RetireOutcome::OwnerGenerationMismatch
+            | CarrierStage2RetireOutcome::VmGenerationMismatch => {
+                self.cancel_owed_stage1_rewrites(identity);
+            }
         }
         outcome
     }

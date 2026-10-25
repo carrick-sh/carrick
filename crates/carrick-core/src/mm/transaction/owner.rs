@@ -413,7 +413,9 @@ impl<
             Wire::PendingEdit => Cause::PendingEdit,
             Wire::Gate => Cause::Gate,
             Wire::Metadata => Cause::Metadata,
-            Wire::ReservationPool => return Err(MmError::Invalid),
+            Wire::ReservationPool | Wire::PendingStage1Rewrite => {
+                return Err(MmError::Invalid);
+            }
         };
         // SAFETY: exact live source authenticated above; caller probes afterward.
         Ok(Some(unsafe {

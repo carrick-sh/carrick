@@ -259,3 +259,46 @@ Portable verification on this follow-up:
 
 No signed test was run because this correction changes source. The exact
 candidate bundle is required before the requested signed 20/20 proof.
+
+## Owed-rewrite simplification after review of `0d9d7861c`
+
+The private stage-1 publication observer and per-obligation physical wait are
+gone. An owed rewrite now uses the MM's existing Editor publication queue.
+Retention returns a typed `PendingStage1Rewrite` only when the exact selected
+IPA is covered by a live retirement obligation; after the Editor wake, the
+next authoritative SELECT settles obligations against the live stage-1 image.
+An obligation is removed once every live `(VA, IPA)` selection it covered no
+longer translates to that IPA, so settlement work is O(live obligations), not
+O(all historical retirements).
+
+`RetryPending` no longer rolls the obligation back. The witness
+`retry_pending_and_terminal_retirement_keep_the_owed_rewrite_token` directly
+asserts that the MM has exactly one token after the backend returns
+`RetryPending`, still has exactly one token after terminalization, and that
+production retention returns `PendingStage1Rewrite`. MM teardown then owns
+disposal of that terminal token. The success witness performs a real
+retirement, observes the pending token, commits a sub-16-KiB-offset stage-1
+unmap, settles through the production custody hook, and asserts the token
+count falls from one to zero; a later retention is the typed guest mapping
+fault rather than a stale wait.
+
+The owner-resume pass limit is now only a release-build guest-fault guard for
+the typed-impossible producer-free state. It has a debug assertion and returns
+guest `EFAULT` for that syscall; it never produces a carrier `RuntimeError`.
+
+Portable verification on this correction:
+
+- focused retirement success, RetryPending/terminal-token, production Editor
+  park/wake, typed mapping-fault, redrive guard, retained ChildTid, and stale
+  physical-producer witnesses: pass;
+- serialized `carrick-vmm-hvf` library: 793 passed, 3 ignored;
+- serialized `carrick-runtime` library: 820 passed, 9 ignored;
+- `just fmt-check`, `just clippy`, `just clippy-linux`,
+  `just lint-domains`, and `just test-kernel`: pass;
+- normal EL1 image: 1,053,152 / 1,572,864 bytes; maximum checked stack
+  11,503 / 12,288 bytes (`native wait copy`);
+- all-target clippy EL1 image: 1,077,744 / 1,572,864 bytes; maximum checked
+  stack 12,015 / 12,288 bytes (`signal terminal exit`).
+
+This correction changes the EL1 ABI layout hash. No signed test was run; an
+exact-candidate fixture bundle is required for the signed 20/20 proof.

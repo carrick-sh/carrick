@@ -451,27 +451,14 @@ impl Default for OwnerRedriveProgress {
 }
 
 impl OwnerRedriveProgress {
-    fn observe(&mut self, committed: u64) -> Result<(), RuntimeError> {
+    fn observe(&mut self, committed: u64) -> bool {
         if committed != 0 {
-            self.committed_bytes =
-                self.committed_bytes.checked_add(committed).ok_or_else(|| {
-                    RuntimeError::Configuration("owner redrive byte progress overflow".to_owned())
-                })?;
+            self.committed_bytes = self.committed_bytes.saturating_add(committed);
             self.consecutive_stalled_passes = 0;
-            return Ok(());
+            return true;
         }
-        self.consecutive_stalled_passes = self
-            .consecutive_stalled_passes
-            .checked_add(1)
-            .ok_or_else(|| {
-                RuntimeError::Configuration("owner redrive stall count overflow".to_owned())
-            })?;
-        if self.consecutive_stalled_passes > OWNER_REDRIVE_MAX_STALLED_PASSES {
-            return Err(RuntimeError::Configuration(
-                "owner resume exceeded its consecutive no-progress bound".to_owned(),
-            ));
-        }
-        Ok(())
+        self.consecutive_stalled_passes = self.consecutive_stalled_passes.saturating_add(1);
+        self.consecutive_stalled_passes <= OWNER_REDRIVE_MAX_STALLED_PASSES
     }
 
     #[cfg(test)]
@@ -510,7 +497,7 @@ impl OwnerResumeWork {
                 | DispatchOutcome::OwnerMemorySupply { committed, .. } => Some(*committed),
                 _ => None,
             },
-            Self::RetainedWait { .. } | Self::RetainedAction(_) => Some(0),
+            Self::RetainedWait { .. } | Self::RetainedAction(_) => None,
         }
     }
 }
@@ -3680,8 +3667,22 @@ where
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let mut progress = OwnerRedriveProgress::default();
         loop {
-            if let Some(committed) = work.redrive_committed_progress() {
-                progress.observe(committed)?;
+            if let Some(committed) = work.redrive_committed_progress()
+                && !progress.observe(committed)
+            {
+                debug_assert!(
+                    progress.consecutive_stalled_passes <= OWNER_REDRIVE_MAX_STALLED_PASSES,
+                    "typed owner waits must park or terminate before the no-progress bound"
+                );
+                let OwnerResumeWork::Syscall { frame, .. } = work else {
+                    unreachable!("only syscall owner work participates in the progress bound")
+                };
+                return self.service_outcome(
+                    engine,
+                    control,
+                    frame,
+                    DispatchOutcome::errno(carrick_abi::LINUX_EFAULT),
+                );
             }
             let step = match work {
                 OwnerResumeWork::Syscall {
@@ -7473,16 +7474,30 @@ mod tests {
         let mut progress = OwnerRedriveProgress::default();
 
         for _ in 0..COPY_BYTES / PAGE_BYTES {
-            progress
-                .observe(PAGE_BYTES)
-                .expect("each committed host-copy page resets the stall bound");
-            progress
-                .observe(0)
-                .expect("one supply redrive after progress remains bounded");
+            assert!(
+                progress.observe(PAGE_BYTES),
+                "each committed host-copy page resets the stall bound"
+            );
+            assert!(
+                progress.observe(0),
+                "one supply redrive after progress remains bounded"
+            );
         }
 
         assert_eq!(progress.committed_bytes(), COPY_BYTES);
         assert_eq!(progress.consecutive_stalled_passes(), 1);
+    }
+
+    #[test]
+    fn producer_free_owner_redrive_is_a_bounded_guest_fault_guard() {
+        let mut progress = OwnerRedriveProgress::default();
+        for _ in 0..OWNER_REDRIVE_MAX_STALLED_PASSES {
+            assert!(progress.observe(0));
+        }
+        assert!(
+            !progress.observe(0),
+            "an impossible producer-free syscall must take the guest EFAULT guard"
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

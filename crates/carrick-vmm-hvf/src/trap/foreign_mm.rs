@@ -385,53 +385,13 @@ struct OwedStage1RewriteKey {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
-struct OwedStage1RewriteWait {
-    complete: std::sync::atomic::AtomicBool,
-    changed: carrick_thread::completion::CompletionCallbacks,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl OwedStage1RewriteWait {
-    fn complete(&self) {
-        if !self
-            .complete
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            self.changed.publish(0);
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl carrick_guest_mem::PhysicalMemoryWait for OwedStage1RewriteWait {
-    fn is_ready(&self) -> bool {
-        self.complete.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    fn enroll(
-        &self,
-        wake: std::sync::Arc<dyn Fn() + Send + Sync>,
-    ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
-        let enrollment = self.changed.enroll(move |_| wake());
-        (Box::new(enrollment), self.is_ready())
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(::core::fmt::Debug)]
 struct OwedStage1Rewrite {
     ipa: u64,
     len: u64,
-    waits: std::collections::BTreeMap<(u64, u64), std::sync::Arc<OwedStage1RewriteWait>>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for OwedStage1Rewrite {
-    fn drop(&mut self) {
-        for wait in self.waits.values() {
-            wait.complete();
-        }
-    }
+    /// Stage-1 selections which actually encountered this obligation.  Each
+    /// remains live only until an authoritative reselect observes that the
+    /// leaf no longer names the retired IPA.
+    selections: std::collections::BTreeSet<(u64, u64)>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -439,20 +399,6 @@ impl Drop for OwedStage1Rewrite {
 struct OwedStage1Rewrites {
     next_generation: u64,
     by_key: std::collections::BTreeMap<OwedStage1RewriteKey, OwedStage1Rewrite>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-struct MmStage1PublicationObserver {
-    state: std::sync::Weak<MmAccessState>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl carrick_aarch64::stage1_authority::Stage1PublicationObserver for MmStage1PublicationObserver {
-    fn editor_released(&self) {
-        if let Some(state) = self.state.upgrade() {
-            state.settle_owed_stage1_rewrites();
-        }
-    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -970,7 +916,7 @@ impl MmAccessState {
         host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
         backing_binding: LiveBackingBinding,
     ) -> std::sync::Arc<Self> {
-        let state = std::sync::Arc::new(Self {
+        std::sync::Arc::new(Self {
             backing_binding,
             host_cow_stats,
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
@@ -1001,14 +947,7 @@ impl MmAccessState {
             foreign_cow_failpoint: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
             test_descriptor_slots: parking_lot::Mutex::new(None),
-        });
-        state
-            .page_tables
-            .read()
-            .set_publication_observer(std::sync::Arc::new(MmStage1PublicationObserver {
-                state: std::sync::Arc::downgrade(&state),
-            }));
-        state
+        })
     }
 
     pub(crate) fn owe_stage1_rewrite(
@@ -1037,7 +976,7 @@ impl MmAccessState {
             OwedStage1Rewrite {
                 ipa,
                 len,
-                waits: std::collections::BTreeMap::new(),
+                selections: std::collections::BTreeSet::new(),
             },
         );
     }
@@ -1061,44 +1000,34 @@ impl MmAccessState {
         drop(removed);
     }
 
-    pub(crate) fn owed_stage1_rewrite_wait(
-        &self,
-        va: u64,
-        ipa: u64,
-    ) -> Option<carrick_guest_mem::OwnedMemoryWait> {
-        let wait = {
+    pub(crate) fn has_owed_stage1_rewrite(&self, va: u64, ipa: u64) -> bool {
+        let found = {
             let mut owed = self.owed_stage1_rewrites.lock();
-            let (_, rewrite) = owed.by_key.iter_mut().rev().find(|(_, rewrite)| {
+            let Some((_, rewrite)) = owed.by_key.iter_mut().rev().find(|(_, rewrite)| {
                 rewrite.ipa <= ipa && ipa < rewrite.ipa.saturating_add(rewrite.len)
-            })?;
-            std::sync::Arc::clone(rewrite.waits.entry((va, ipa)).or_insert_with(|| {
-                std::sync::Arc::new(OwedStage1RewriteWait {
-                    complete: std::sync::atomic::AtomicBool::new(false),
-                    changed: carrick_thread::completion::CompletionCallbacks::default(),
-                })
-            }))
+            }) else {
+                return false;
+            };
+            rewrite.selections.insert((va, ipa));
+            true
         };
         let still_selected = self
             .page_tables_authority()
             .with_manager(|manager| manager.translate(va) == Some(ipa))
             .unwrap_or(false);
         if !still_selected {
-            wait.complete();
+            self.settle_owed_stage1_rewrites();
         }
-        Some(carrick_guest_mem::OwnedMemoryWait::new(wait))
+        found
     }
 
-    fn settle_owed_stage1_rewrites(&self) {
+    pub(crate) fn settle_owed_stage1_rewrites(&self) {
         let candidates = {
             let owed = self.owed_stage1_rewrites.lock();
             owed.by_key
-                .values()
-                .flat_map(|rewrite| {
-                    rewrite
-                        .waits
-                        .iter()
-                        .map(|(&(va, ipa), wait)| (va, ipa, std::sync::Arc::clone(wait)))
-                })
+                .iter()
+                .filter(|(_, rewrite)| !rewrite.selections.is_empty())
+                .map(|(&key, rewrite)| (key, rewrite.selections.clone()))
                 .collect::<Vec<_>>()
         };
         if candidates.is_empty() {
@@ -1107,20 +1036,45 @@ impl MmAccessState {
         let translations = self.page_tables_authority().with_manager(|manager| {
             candidates
                 .iter()
-                .map(|(va, _, _)| manager.translate(*va))
-                .collect::<Vec<_>>()
+                .map(|(_, selections)| {
+                    selections
+                        .iter()
+                        .map(|&(va, ipa)| manager.translate(va) != Some(ipa))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<Vec<bool>>>()
         });
-        let Some(translations) = translations else {
-            for (_, _, wait) in candidates {
-                wait.complete();
-            }
-            return;
+        let completed = match translations {
+            Some(translations) => candidates
+                .iter()
+                .zip(translations)
+                .filter_map(|((key, selections), changed)| {
+                    changed
+                        .iter()
+                        .all(|changed| *changed)
+                        .then_some((*key, selections))
+                })
+                .collect::<Vec<_>>(),
+            None => candidates
+                .iter()
+                .map(|(key, selections)| (*key, selections))
+                .collect::<Vec<_>>(),
         };
-        for ((_, selected_ipa, wait), translated) in candidates.into_iter().zip(translations) {
-            if translated != Some(selected_ipa) {
-                wait.complete();
+        let mut owed = self.owed_stage1_rewrites.lock();
+        for (key, observed) in completed {
+            if owed
+                .by_key
+                .get(&key)
+                .is_some_and(|rewrite| &rewrite.selections == observed)
+            {
+                owed.by_key.remove(&key);
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owed_stage1_rewrite_count(&self) -> usize {
+        self.owed_stage1_rewrites.lock().by_key.len()
     }
 
     /// The EL1 region's descriptor-transaction slots this MM's guest
@@ -1348,9 +1302,6 @@ impl MmAccessState {
         self: &std::sync::Arc<Self>,
         page_tables: carrick_aarch64::Stage1Authority,
     ) {
-        page_tables.set_publication_observer(std::sync::Arc::new(MmStage1PublicationObserver {
-            state: std::sync::Arc::downgrade(self),
-        }));
         let previous = {
             let mut slot = self.page_tables.write();
             std::mem::replace(&mut *slot, page_tables.clone())
