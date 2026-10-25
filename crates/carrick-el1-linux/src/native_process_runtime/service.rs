@@ -667,8 +667,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn commit_exec_successor(
         &mut self,
         successor: NativeExecSuccessor<M, C>,
-        successor_service: carrick_core_abi::El1MmHandle,
-        predecessor_birth: carrick_core_abi::service::ServiceBirth,
+        service_rebind: carrick_core_abi::service::PreparedExecServiceRebind<'_>,
         comm: [u8; 16],
         validated: Box<ValidatedExecSuccessor<'a>>,
     ) -> Result<(), NativeProcessError> {
@@ -826,10 +825,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         );
         self.current
             .publish_root_generation(successor.address.generation);
-        self.control
-            .service
-            .rebind_exec_mm(predecessor_birth, successor_service)
-            .map_err(service_error)?;
+        service_rebind.commit();
         self.binding.task = carrick_core_abi::EntryTaskKey::from_raw(leader.raw() as u64);
         self.binding.generation = next_generation;
         self.binding.mm = carrick_core_abi::EntryMmKey::from_raw(successor.address.mm.raw().get());
@@ -1075,6 +1071,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return self.kill_refused_exec();
             }
         };
+        let rebind_control = pending.control.clone();
+        let service_rebind = match rebind_control
+            .service
+            .prepare_exec_rebind(request.identity.birth, successor_service)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(prepared_fds);
+                let cancelled = self.service.cancel_exec_successor(receipt);
+                let released = self.release_service_claim(pending.claim);
+                cancelled?;
+                released?;
+                let _ = error;
+                return self.kill_refused_exec();
+            }
+        };
         let successor = match self
             .service
             .adopt_exec_successor(request.identity, receipt, manifest)
@@ -1105,13 +1117,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let (_table, releases) = carrick_fd_core::exec::commit(prepared_fds);
         drop(releases);
         if self
-            .commit_exec_successor(
-                successor,
-                successor_service,
-                request.identity.birth,
-                comm,
-                validated,
-            )
+            .commit_exec_successor(successor, service_rebind, comm, validated)
             .is_err()
             || self
                 .service

@@ -257,6 +257,20 @@ fn service_terminal_operation(
     drop(exclusion);
     // SAFETY: the synchronous crossing retains the caller's aligned wire record.
     let retire = unsafe { &mut *pointer };
+    let successor_mm = carrick_el1_abi::ReservationMm::new(binding.mm.raw());
+    let predecessor_receipt = successor_mm.and_then(|successor| {
+        custody
+            .native_exec_predecessors
+            .lock()
+            .iter()
+            .copied()
+            .find(|receipt| receipt.successor() == successor)
+    });
+    if predecessor_receipt
+        .is_some_and(|receipt| !settle_native_exec_predecessor(custody, region, zone, receipt))
+    {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    }
     if custody
         .fork_stock
         .lock()
@@ -283,6 +297,60 @@ fn service_terminal_operation(
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     }
     [METADATA_GRANT_SUCCESS, 0, 0, 0]
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn settle_native_exec_predecessor(
+    custody: &crate::trap::CarrierVmCustody,
+    region: RetainedAbiRegion<'_>,
+    zone: &carrick_sched_core::ZoneTables<carrick_el1_abi::Aarch64ParkedContext>,
+    receipt: carrick_hal::fork_stock::ExecPredecessorReceipt<carrick_hal::asid::AsidGeneration>,
+) -> bool {
+    use carrick_hal::fork_stock::SlotAbsence;
+    let predecessor = receipt.predecessor();
+    if zone.spaces.find(predecessor.raw()).is_some() {
+        return false;
+    }
+    let Some(absence) = SlotAbsence::scan(
+        predecessor,
+        (0..carrick_sched_core::ZONE_SLOTS)
+            .filter_map(carrick_guest_arch::SlotId::from_index)
+            .map(|slot| zone.installed_space(slot)),
+    ) else {
+        return false;
+    };
+    let Some(inventory) = custody.fork_stock.lock().inventory() else {
+        return false;
+    };
+    let Some(pointer) = region.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
+        carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
+    ) else {
+        return false;
+    };
+    // SAFETY: initialized atomic ABI record in the retained carrier mapping.
+    let residency = unsafe { &*pointer };
+    let settled = {
+        let mut stock = custody.fork_stock.lock();
+        let mut ledger = crate::fork_stock::fork_table_accounting(custody);
+        stock.owner.settle_exec_predecessor(
+            &mut ledger,
+            receipt,
+            absence,
+            |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
+            |_, absence| {
+                carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence.mm())
+            },
+        )
+    };
+    if settled.is_err() {
+        return false;
+    }
+    let mut receipts = custody.native_exec_predecessors.lock();
+    let Some(index) = receipts.iter().position(|candidate| *candidate == receipt) else {
+        return false;
+    };
+    receipts.swap_remove(index);
+    true
 }
 
 pub const MAX_DYNAMIC_EXTENT_SLOTS: usize = 128;
@@ -1946,7 +2014,6 @@ fn service_native_exec_settle(
     claimed_cpu: u64,
     ttbr0: u64,
 ) -> [u64; 4] {
-    use carrick_hal::fork_stock::SlotAbsence;
     let denied = [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     if claimed_cpu != u64::from(cpu.raw()) || !request_has_live_vm(custody, generation) {
         return denied;
@@ -1968,17 +2035,6 @@ fn service_native_exec_settle(
     let Some((_, zone)) = stopped_records(region, cpu) else {
         return denied;
     };
-    if zone.spaces.find(predecessor.raw()).is_some() {
-        return denied;
-    }
-    let Some(absence) = SlotAbsence::scan(
-        predecessor,
-        (0..carrick_sched_core::ZONE_SLOTS)
-            .filter_map(carrick_guest_arch::SlotId::from_index)
-            .map(|slot| zone.installed_space(slot)),
-    ) else {
-        return denied;
-    };
     let receipt = {
         let receipts = custody.native_exec_predecessors.lock();
         receipts.iter().copied().find(|receipt| {
@@ -1988,35 +2044,7 @@ fn service_native_exec_settle(
     let Some(receipt) = receipt else {
         return denied;
     };
-    let Some(inventory) = custody.fork_stock.lock().inventory() else {
-        return denied;
-    };
-    let Some(pointer) = region.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
-        carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
-    ) else {
-        return denied;
-    };
-    // SAFETY: initialized atomic ABI record in the retained carrier mapping.
-    let residency = unsafe { &*pointer };
-    let settled = {
-        let mut stock = custody.fork_stock.lock();
-        let mut ledger = crate::fork_stock::fork_table_accounting(custody);
-        stock.owner.settle_exec_predecessor(
-            &mut ledger,
-            receipt,
-            absence,
-            |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
-            |_, absence| {
-                carrick_hal::fork_stock::release_child_mm(&*inventory, residency, absence.mm())
-            },
-        )
-    };
-    if settled.is_err() {
-        return denied;
-    }
-    let mut receipts = custody.native_exec_predecessors.lock();
-    if let Some(index) = receipts.iter().position(|candidate| *candidate == receipt) {
-        receipts.swap_remove(index);
+    if settle_native_exec_predecessor(custody, region, zone, receipt) {
         [METADATA_GRANT_SUCCESS, 0, 0, 0]
     } else {
         denied
