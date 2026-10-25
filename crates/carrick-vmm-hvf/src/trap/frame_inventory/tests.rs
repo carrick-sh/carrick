@@ -1525,16 +1525,20 @@ fn serial_host_exec_predecessor_backing_stays_live_until_detached_cleanup() {
         carrier_mm: None,
         armed: true,
     });
+    let stage1_unpublished = prepare_test_whole_mm_retirement(&mut task);
 
     assert!(alias_backing_is_live(host_addr as usize));
-    HvfVmState::retire_task_state_exec_predecessor(&mut task, None)
+    task.pending_exec_stage2_cleanup
+        .as_mut()
+        .unwrap()
+        .retire_with_cleanup_boundary(&mut |_| {}, &mut |_| {}, Some(&stage1_unpublished))
         .expect("post-TLBI detached cleanup");
     assert!(
         !observed.load(std::sync::atomic::Ordering::SeqCst),
         "lease Drop must not execute stage-2 retirement"
     );
     assert!(!alias_backing_is_live(host_addr as usize));
-    assert!(task.pending_exec_stage2_cleanup.is_none());
+    assert!(!task.pending_exec_stage2_cleanup.as_ref().unwrap().armed);
 }
 
 #[test]
@@ -2469,9 +2473,11 @@ fn reserved_global_stage2_lease_rolls_back_before_map() {
 #[test]
 fn mapped_host_address_is_not_proof_of_a_retired_global_owner() {
     let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-    const RETIRED_IPA: u64 = 0x7e00_0000_0000;
-    const LIVE_IPA: u64 = RETIRED_IPA + 0x4000;
     const LENGTH: u64 = 0x4000;
+    let mut lease = GlobalFrameStage2Lease::reserve(LENGTH, LENGTH).unwrap();
+    let live_ipa = lease.key().0;
+    let retired_ipa = live_ipa.checked_add(LENGTH).unwrap();
+    lease.mark_test_mapped_without_backend();
 
     let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         LENGTH as usize,
@@ -2479,46 +2485,37 @@ fn mapped_host_address_is_not_proof_of_a_retired_global_owner() {
     )
     .unwrap();
     let host_addr = host_mapping.as_ptr() as usize;
-    let owner_gen = next_global_frame_owner_generation();
-    let owner = GlobalFrameHostOwner::new(
-        GlobalFrameStage2Lease::fixed(LIVE_IPA, LENGTH),
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let (owner_gen, rollback) = register_unpublished_global_frame_host_owner_in(
+        custody,
+        lease,
         host_mapping,
         u64::from(applevisor::memory::MemPerms::ReadWriteExec),
-        owner_gen,
-        LIVE_IPA,
-        LENGTH,
-    );
-    assert!(
-        global_frame_host_owners()
-            .lock()
-            .insert(
-                (LIVE_IPA, LENGTH),
-                GlobalFrameOwnerEntry::Live(std::sync::Arc::new(owner))
-            )
-            .is_none()
-    );
+    )
+    .unwrap();
 
     assert!(
         alias_backing_is_live(host_addr),
         "the superseded mapped-address predicate must admit this live host VA"
     );
-    let generation = global_frame_host_owner_generation(LIVE_IPA, LENGTH);
+    let generation = global_frame_host_owner_generation(live_ipa, LENGTH);
     assert_ne!(generation, 0, "a registered owner carries an incarnation");
+    assert_eq!(generation, owner_gen);
     assert!(global_frame_host_owner_matches(
-        LIVE_IPA, LENGTH, host_addr, generation
+        live_ipa, LENGTH, host_addr, generation
     ));
     assert!(
-        !global_frame_host_owner_matches(RETIRED_IPA, LENGTH, host_addr, generation),
+        !global_frame_host_owner_matches(retired_ipa, LENGTH, host_addr, generation),
         "a live host VA owned by another IPA must not resurrect a retired lease"
     );
 
-    let owner = global_frame_host_owners()
-        .lock()
-        .remove(&(LIVE_IPA, LENGTH))
+    let identity = global_frame_stage2_identity_in(custody, live_ipa, LENGTH).unwrap();
+    let stage1 = custody
+        .stage1_unpublished_from_rollback(identity, rollback)
         .unwrap();
-    drop(owner);
+    assert!(retire_global_frame_host_owner_in(custody, stage1, live_ipa, LENGTH).is_retired());
     assert!(!global_frame_host_owner_matches(
-        LIVE_IPA, LENGTH, host_addr, generation
+        live_ipa, LENGTH, host_addr, generation
     ));
 
     // The point of the incarnation: re-registering the SAME (ipa, length)
@@ -2532,33 +2529,34 @@ fn mapped_host_address_is_not_proof_of_a_retired_global_owner() {
     )
     .unwrap();
     let reused_addr = remap.as_ptr() as usize;
-    let succ_gen = next_global_frame_owner_generation();
-    let successor = GlobalFrameHostOwner::new(
-        GlobalFrameStage2Lease::fixed(LIVE_IPA, LENGTH),
-        remap,
-        u64::from(applevisor::memory::MemPerms::ReadWriteExec),
-        succ_gen,
-        LIVE_IPA,
-        LENGTH,
-    );
-    let successor_generation = successor.generation();
-    global_frame_host_owners().lock().insert(
-        (LIVE_IPA, LENGTH),
-        GlobalFrameOwnerEntry::Live(std::sync::Arc::new(successor)),
-    );
+    let mut successor_lease = GlobalFrameStage2Lease::fixed(live_ipa, LENGTH);
+    successor_lease.mark_test_mapped_without_backend();
+    let (successor_generation, successor_rollback) =
+        register_unpublished_global_frame_host_owner_in(
+            custody,
+            successor_lease,
+            remap,
+            u64::from(applevisor::memory::MemPerms::ReadWriteExec),
+        )
+        .unwrap();
     assert_ne!(successor_generation, generation);
     assert!(
-        !global_frame_host_owner_matches(LIVE_IPA, LENGTH, reused_addr, generation),
+        !global_frame_host_owner_matches(live_ipa, LENGTH, reused_addr, generation),
         "a stale row must not authenticate against a NEW incarnation of the \
              same (ipa, length, host VA)"
     );
     assert!(
-        global_frame_host_owner_matches(LIVE_IPA, LENGTH, reused_addr, successor_generation),
+        global_frame_host_owner_matches(live_ipa, LENGTH, reused_addr, successor_generation),
         "the successor's own rows still authenticate"
     );
-    global_frame_host_owners()
-        .lock()
-        .remove(&(LIVE_IPA, LENGTH));
+    let successor_identity = global_frame_stage2_identity_in(custody, live_ipa, LENGTH).unwrap();
+    let successor_stage1 = custody
+        .stage1_unpublished_from_rollback(successor_identity, successor_rollback)
+        .unwrap();
+    assert!(
+        retire_global_frame_host_owner_in(custody, successor_stage1, live_ipa, LENGTH,)
+            .is_retired()
+    );
 }
 
 #[test]
@@ -3538,6 +3536,25 @@ fn process_retirement_rejects_a_recycled_owner_generation() {
     let stale_host = task.mappings[0].host_addr as usize;
     let stale_generation = task.mappings[0].owner_generation;
 
+    let old_identity = global_frame_host_owners()
+        .lock()
+        .get(&key)
+        .expect("old owner exists before exact same-IPA successor publication")
+        .owner()
+        .record_identity;
+    let old_stage1 =
+        legacy_test_carrier_vm_custody().stage1_unpublished_after_editor_unmap(old_identity);
+    assert!(
+        retire_global_frame_host_owner_in(
+            legacy_test_carrier_vm_custody(),
+            old_stage1,
+            key.0,
+            key.1,
+        )
+        .is_retired(),
+        "old incarnation must be physically terminal before key reuse"
+    );
+
     let successor_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         key.1 as usize,
         crate::host_mapping::HostMappingKind::FrameCow,
@@ -3609,11 +3626,21 @@ fn process_retirement_rejects_a_recycled_owner_generation() {
     alias_registry()
         .lock()
         .retain(|alias| *alias != successor_alias);
-    let successor = global_frame_host_owners()
-        .lock()
-        .remove(&key)
-        .expect("remove successor owner after test");
-    drop(successor);
+    let successor_identity =
+        global_frame_stage2_identity_in(legacy_test_carrier_vm_custody(), key.0, key.1)
+            .expect("successor has exact stage-2 identity");
+    let successor_stage1 =
+        legacy_test_carrier_vm_custody().stage1_unpublished_after_editor_unmap(successor_identity);
+    assert!(
+        retire_global_frame_host_owner_in(
+            legacy_test_carrier_vm_custody(),
+            successor_stage1,
+            key.0,
+            key.1,
+        )
+        .is_retired(),
+        "successor fixture retires through a real editor receipt"
+    );
 }
 
 #[test]
@@ -4552,7 +4579,7 @@ fn serial_host_failed_stage2_unmap_preserves_custody_and_succeeds_on_retry() {
         u64::from(applevisor::memory::MemPerms::ReadWrite),
     );
     assert!(
-        matches!(collision_res, Err(TrapError::Hypervisor(ref msg)) if msg.contains("collision")),
+        matches!(collision_res, Err(TrapError::Hypervisor(ref msg)) if msg.contains("ExtentCollision")),
         "collision must fail closed: {collision_res:?}",
     );
     assert_eq!(
@@ -4802,7 +4829,7 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
 
     let retired = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, move || {
         observed.store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
+        Ok(true)
     })
     .expect("commit authority-retained COW split");
 
@@ -5302,7 +5329,7 @@ fn cow_collision_is_rejected_before_backend_inventory_mutation() {
         },
     };
 
-    let error = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(()))
+    let error = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(true))
         .expect_err("colliding COW extent must fail closed");
     assert!(error.to_string().contains("before backend mutation"));
     assert_eq!(
@@ -5390,7 +5417,7 @@ fn cow_split_commit_preserves_old_owner_and_publishes_replacement_owner() {
         },
     };
 
-    assert!(!HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(())).unwrap());
+    assert!(!HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(true)).unwrap());
     assert_eq!(
         inventory
             .extents
@@ -5467,7 +5494,7 @@ fn cow_stage2_recycle_holds_the_publication_lock() {
                 frames.try_lock().is_none(),
                 "COW must retain the shared registry lock through old-IPA recycle",
             );
-            Ok(())
+            Ok(true)
         })
         .unwrap(),
     );
@@ -5616,7 +5643,7 @@ fn cow_reuse_commit_keeps_destination_mapping_and_reference_counts() {
     assert_eq!(inventory.extents[&old_key], old);
     assert_eq!(inventory.extents[&new_key], new);
     split.new_extent = new;
-    assert!(HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(())).unwrap());
+    assert!(HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(true)).unwrap());
     assert_eq!(inventory.extents.len(), 1);
     assert_eq!(inventory.extents[&new_key].mapping, new.mapping);
     let frames = inventory.frames.lock();
@@ -7757,7 +7784,7 @@ fn sequential_container_roots_return_their_final_pooled_arena() {
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let base = pool.base_ipa();
     let mut unfinished = Vec::new();
-    let mut predecessor = None;
+    let mut predecessor: Option<CarrierStage2RecordIdentity> = None;
 
     for run in 0..4 {
         let id = 800 + run * 2;
@@ -7765,13 +7792,9 @@ fn sequential_container_roots_return_their_final_pooled_arena() {
             exit_task_holding_owned_lease(id, 0x4000 + run * 0x4000, id, id + 1, &kernel, &frames);
         let record = relocate_exit_fixture_root(&mut task, base);
         if let Some(old) = predecessor {
-            assert_eq!(
-                custody.request_stage2_record_retirement(
-                    old,
-                    custody.stage1_unpublished_after_editor_unmap(old),
-                ),
-                CarrierStage2RetireOutcome::NotFound,
-                "retired predecessor cannot release the successor's reused slot"
+            assert!(
+                custody.stage2_record_snapshot(old.record_id).is_none(),
+                "retired predecessor has no forgeable receipt for the reused slot"
             );
             assert!(
                 custody
@@ -7780,6 +7803,8 @@ fn sequential_container_roots_return_their_final_pooled_arena() {
                     .mapped
             );
         }
+        retire_test_process_mappings(&mut task)
+            .expect("retire sequential container through whole-MM unpublication");
         drop(task);
         let terminal = custody.stage2_record_snapshot(record.record_id).is_none();
         if !terminal {
@@ -7815,6 +7840,8 @@ fn final_parked_pin_returns_pooled_arena_after_owner_retirement() {
     let base = pool.base_ipa();
     let record = relocate_exit_fixture_root(&mut task, base);
     let pin = custody.pin_stage2_record(record).unwrap();
+    retire_test_process_mappings(&mut task)
+        .expect("whole-MM unpublication requests pinned root retirement");
     drop(task);
     assert!(
         pool.allocate_slot_at(base).is_none(),
@@ -8005,8 +8032,7 @@ fn final_rootless_shared_inventory_retires_exact_slot_before_sequential_root() {
 }
 
 #[test]
-fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
-    use carrick_aarch64::stage1_authority::TableArenaPublisher;
+fn two_live_mm_pinned_table_retirement_detaches_without_returning_physical_capacity() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let custody = legacy_test_carrier_vm_custody_arc();
@@ -8024,8 +8050,11 @@ fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
     let record = relocate_exit_fixture_root(&mut first, base);
     let other = relocate_exit_fixture_root(&mut second, base + 0x20_0000);
     let pin = custody.pin_stage2_record(record).unwrap();
-    let publisher = first.mm_access.arena_publisher.read().clone().unwrap();
-    let result = publisher.retire_raw_table_arena(base);
+    let result = first.page_tables_authority().retire_table_capacity(
+        None,
+        carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
+        |_, _| Ok(()),
+    );
     let kept_owner = first
         .mm_access
         .structural_owners
@@ -8058,12 +8087,12 @@ fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
     retire_test_global_frame_host_owner_if_generation_in(custody, key.0, key.1, generation);
     retire_test_process_mappings(&mut second).unwrap();
     assert!(
-        result.is_err(),
-        "deferred physical retirement is not a capacity-return receipt"
+        result.is_ok(),
+        "logical MM retirement must not wait on a host pin"
     );
     assert!(
-        kept_owner,
-        "pinned physical custody must keep its exact MM owner"
+        !kept_owner,
+        "stage-1 retirement detaches the MM owner while carrier custody retains the pin"
     );
     assert!(
         !returned_early,
@@ -8090,6 +8119,17 @@ fn two_live_mm_empty_inventory_releases_already_terminal_table_capacity() {
     let record = relocate_exit_fixture_root(&mut first, base);
     let peer = relocate_exit_fixture_root(&mut second, base + 0x20_0000);
     // An earlier exact physical retirement may finish before MM metadata drops.
+    let stage1_unpublished = prepare_test_whole_mm_retirement(&mut first);
+    let stage1 = custody
+        .stage1_unpublished_from_receipt(
+            record,
+            Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
+        )
+        .expect("whole-MM inventory proof covers its exact table record");
+    assert_eq!(
+        custody.request_stage2_record_retirement(record, stage1),
+        CarrierStage2RetireOutcome::DeferredActivePins
+    );
     retire_carrier_stage2_record_at_safe_point(custody, record).unwrap();
     assert!(pool.allocate_slot_at(base).is_none());
     assert!(

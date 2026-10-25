@@ -445,7 +445,7 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
             )
             .map_err(|error| error.to_string())
     }
-    fn retire_raw_table_arena(&self, base: u64) -> Result<(), String> {
+    fn rollback_raw_table_arena(&self, base: u64) -> Result<(), String> {
         let state = self
             .state
             .upgrade()
@@ -457,6 +457,85 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
             .cloned()
             .ok_or_else(|| "raw Fork capacity lost exact structural owner".to_owned())?;
         let identity = owner.record_identity();
+        let rollback = owner
+            .take_unpublished_rollback()
+            .ok_or_else(|| "raw Fork rollback lost its publication receipt".to_owned())?;
+        let stage1 = self
+            .custody
+            .stage1_unpublished_from_rollback(identity, rollback)
+            .ok_or_else(|| "raw Fork rollback receipt names another record".to_owned())?;
+        if self
+            .custody
+            .request_stage2_record_retirement(identity, stage1)
+            != CarrierStage2RetireOutcome::DeferredActivePins
+        {
+            return Err("raw Fork rollback could not authorize retirement".to_owned());
+        }
+        owner
+            .retained
+            .owner_retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        retire_carrier_stage2_record_at_safe_point(&self.custody, identity)
+            .map_err(|error| error.to_string())?;
+        if self
+            .custody
+            .stage2_record_snapshot(identity.record_id)
+            .is_some()
+        {
+            return Err("raw Fork rollback is still pinned".to_owned());
+        }
+        state.release_structural_owner_at(&self.custody, base, 2 * 1024 * 1024);
+        Ok(())
+    }
+
+    fn retire_published_raw_table_arena(
+        &self,
+        base: u64,
+        receipt: &carrick_aarch64::vmm::Stage1UnpublishedArenas,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .upgrade()
+            .ok_or_else(|| "the MM retired".to_owned())?;
+        let owner = state
+            .structural_owners
+            .read()
+            .get(&(base, 2 * 1024 * 1024))
+            .cloned()
+            .ok_or_else(|| "raw Fork capacity lost exact structural owner".to_owned())?;
+        let identity = owner.record_identity();
+        if self
+            .custody
+            .stage2_record_snapshot(identity.record_id)
+            .is_none()
+        {
+            owner.commit_stage1_publication();
+            state.release_structural_owner_at(&self.custody, base, 2 * 1024 * 1024);
+            return Ok(());
+        }
+        let stage1 = self
+            .custody
+            .stage1_unpublished_from_receipt(
+                identity,
+                Stage1UnpublicationReceipt::EditorArenas(receipt),
+            )
+            .ok_or_else(|| "raw Fork arena receipt names another record".to_owned())?;
+        if self
+            .custody
+            .stage1_unpublished_for_retirement(identity)
+            .is_none()
+            && self
+                .custody
+                .request_stage2_record_retirement(identity, stage1)
+                != CarrierStage2RetireOutcome::DeferredActivePins
+        {
+            return Err("raw Fork arena could not authorize retirement".to_owned());
+        }
+        owner.commit_stage1_publication();
+        owner
+            .retained
+            .owner_retired
+            .store(true, std::sync::atomic::Ordering::Release);
         // Exact records are removed only after terminal retirement. A prior
         // mapping-row retirement can finish before this MM drops its capacity.
         if self
@@ -467,13 +546,10 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
             retire_carrier_stage2_record_at_safe_point(&self.custody, identity)
                 .map_err(|error| error.to_string())?;
         }
-        if self
-            .custody
-            .stage2_record_snapshot(identity.record_id)
-            .is_some()
-        {
-            return Err("raw table capacity retirement is still pinned".to_owned());
-        }
+        // A host transfer may still pin the exact backing. Stage 1 is already
+        // unpublished and retirement is requested, so detach the MM owner;
+        // the custody entry and its pool handle remain live until the final
+        // pin schedules the carrier-safe retirement turn.
         state.release_structural_owner_at(&self.custody, base, 2 * 1024 * 1024);
         Ok(())
     }
@@ -1233,7 +1309,12 @@ impl MmAccessState {
         let removed =
             self.remove_structural_owner_if(custody, (physical_ipa, physical_size), |_| true);
         if let Some(owner) = removed {
-            owner.release_pooled_root_slot();
+            if custody
+                .stage2_record_snapshot(owner.record_identity().record_id)
+                .is_none()
+            {
+                owner.release_pooled_root_slot();
+            }
         }
     }
 
@@ -1359,65 +1440,88 @@ impl MmAccessState {
         // through backend retirement and pool release. A cached owner Arc keeps
         // storage resident, but does not stop a pooled slot being reissued.
         let page_tables = self.page_tables.read();
-        let mut retire = |manager: Option<&carrick_mmu_core::aarch64::PageTableManager>| {
-            // Descriptor publication records the root high-water mark while
-            // holding this authority, then takes mm_root_stage2. Match that
-            // order so retirement cannot wait for the publisher while holding
-            // the root-slot lock the publisher needs.
-            let mut slot = self.mm_root_stage2.lock();
-            let authority = slot.as_ref().ok_or_else(|| {
+        let mut retire =
+            |manager: Option<&carrick_mmu_core::aarch64::PageTableManager>,
+             unpublished: &carrick_aarch64::vmm::Stage1UnpublishedArenas| {
+                // Descriptor publication records the root high-water mark while
+                // holding this authority, then takes mm_root_stage2. Match that
+                // order so retirement cannot wait for the publisher while holding
+                // the root-slot lock the publisher needs.
+                let mut slot = self.mm_root_stage2.lock();
+                let authority = slot.as_ref().ok_or_else(|| {
                 TrapError::Hypervisor(format!(
                     "stage-1 root slot ({:#x}, {:#x}) has no exact structural stage-2 authority",
                     expected_root_slot.0, expected_root_slot.1
                 ))
             })?;
-            if authority.root_slot != expected_root_slot {
-                return Err(TrapError::Hypervisor(format!(
-                    "stage-1 root retirement coordinates mismatch: expected=({:#x}, {:#x}) authority=({:#x}, {:#x})",
-                    expected_root_slot.0,
-                    expected_root_slot.1,
-                    authority.root_slot.0,
-                    authority.root_slot.1
-                )));
-            }
-            if authority.owner.record_identity() != authority.record_identity
-                || (authority.owner.physical_ipa, authority.owner.physical_size)
-                    != authority.physical_extent
-            {
-                return Err(TrapError::Hypervisor(
-                    "stage-1 root structural owner identity drifted before retirement".to_owned(),
-                ));
-            }
+                if authority.root_slot != expected_root_slot {
+                    return Err(TrapError::Hypervisor(format!(
+                        "stage-1 root retirement coordinates mismatch: expected=({:#x}, {:#x}) authority=({:#x}, {:#x})",
+                        expected_root_slot.0,
+                        expected_root_slot.1,
+                        authority.root_slot.0,
+                        authority.root_slot.1
+                    )));
+                }
+                if authority.owner.record_identity() != authority.record_identity
+                    || (authority.owner.physical_ipa, authority.owner.physical_size)
+                        != authority.physical_extent
+                {
+                    return Err(TrapError::Hypervisor(
+                        "stage-1 root structural owner identity drifted before retirement"
+                            .to_owned(),
+                    ));
+                }
 
-            let copied_bytes = manager.map_or(0, |m| m.copied_bytes());
-            authority
-                .owner
-                .record_populated_prefix(copied_bytes as usize);
+                let copied_bytes = manager.map_or(0, |m| m.copied_bytes());
+                authority
+                    .owner
+                    .record_populated_prefix(copied_bytes as usize);
 
-            authority
-                .owner
-                .retained
-                .owner_retired
-                .store(true, std::sync::atomic::Ordering::Release);
-            retry_structural_backing_identities_in_using(
-                custody,
-                &[authority.record_identity],
-                unmap,
-                &mut release_retired_stage2_ipa,
-            )?;
-            if let Some(snapshot) =
-                custody.stage2_record_snapshot(authority.record_identity.record_id)
-            {
-                return Err(TrapError::Hypervisor(format!(
-                    "stage-1 root structural record remained nonterminal: {snapshot:?}"
-                )));
-            }
-            // The record is terminal: the runtime may reissue this root slot the
-            // moment it holds the proof below, so a pooled slot goes back to the
-            // pool here rather than at the last `Arc` drop of the retained mapping.
-            authority.owner.release_pooled_root_slot();
+                let stage1 = custody
+                    .stage1_unpublished_from_receipt(
+                        authority.record_identity,
+                        Stage1UnpublicationReceipt::EditorArenas(unpublished),
+                    )
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "stage-1 root retirement receipt did not name its physical arena"
+                                .to_owned(),
+                        )
+                    })?;
+                if custody.request_stage2_record_retirement(authority.record_identity, stage1)
+                    != CarrierStage2RetireOutcome::DeferredActivePins
+                {
+                    return Err(TrapError::Hypervisor(
+                        "stage-1 root retirement could not authorize its exact stage-2 record"
+                            .to_owned(),
+                    ));
+                }
 
-            let authority = slot.take().unwrap_or_else(|| {
+                authority
+                    .owner
+                    .retained
+                    .owner_retired
+                    .store(true, std::sync::atomic::Ordering::Release);
+                retry_structural_backing_identities_in_using(
+                    custody,
+                    &[authority.record_identity],
+                    unmap,
+                    &mut release_retired_stage2_ipa,
+                )?;
+                if let Some(snapshot) =
+                    custody.stage2_record_snapshot(authority.record_identity.record_id)
+                {
+                    return Err(TrapError::Hypervisor(format!(
+                        "stage-1 root structural record remained nonterminal: {snapshot:?}"
+                    )));
+                }
+                // The record is terminal: the runtime may reissue this root slot the
+                // moment it holds the proof below, so a pooled slot goes back to the
+                // pool here rather than at the last `Arc` drop of the retained mapping.
+                authority.owner.release_pooled_root_slot();
+
+                let authority = slot.take().unwrap_or_else(|| {
                 carrick_fatal!(
                     "hvpatch::mm_authority",
                     "stage-1 root authority disappeared before retirement completion: root_slot=(0x{:x}, 0x{:x})",
@@ -1425,31 +1529,33 @@ impl MmAccessState {
                     expected_root_slot.1
                 );
             });
-            let key = authority.physical_extent;
-            let owner = InventoryStage2OwnerIdentity {
-                host_addr: authority.owner.ptr() as usize,
-                generation: authority.owner.epoch().raw(),
+                let key = authority.physical_extent;
+                let owner = InventoryStage2OwnerIdentity {
+                    host_addr: authority.owner.ptr() as usize,
+                    generation: authority.owner.epoch().raw(),
+                };
+                self.remove_structural_owner_if(custody, key, |owner| {
+                    std::sync::Arc::ptr_eq(owner, &authority.owner)
+                });
+                Ok(RetiredMmRootStage2 {
+                    proof: HvpatchMmRootRetirementProof {
+                        root_slot: expected_root_slot,
+                    },
+                    physical_extent: key,
+                    owner,
+                })
             };
-            self.remove_structural_owner_if(custody, key, |owner| {
-                std::sync::Arc::ptr_eq(owner, &authority.owner)
-            });
-            Ok(RetiredMmRootStage2 {
-                proof: HvpatchMmRootRetirementProof {
-                    root_slot: expected_root_slot,
-                },
-                physical_extent: key,
-                owner,
-            })
-        };
         let disposition = if terminal {
             carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal
         } else {
             carrick_aarch64::stage1_authority::TableArenaRetirement::ExecHandoff
         };
         page_tables
-            .retire_table_capacity(Some(expected_root_slot.0), disposition, |manager| {
-                retire(manager).map_err(|error| error.to_string())
-            })
+            .retire_table_capacity(
+                Some(expected_root_slot.0),
+                disposition,
+                |manager, receipt| retire(manager, receipt).map_err(|error| error.to_string()),
+            )
             .map_err(TrapError::Hypervisor)
     }
 
@@ -2714,7 +2820,7 @@ pub(crate) fn perform_foreign_cow_transaction(
     new_lease.mark_test_mapped_without_backend();
     #[cfg(all(not(test), feature = "foreign-cow-test-support"))]
     new_lease.mark_test_mapped_without_backend();
-    let owner_generation = register_global_frame_host_owner_in(
+    let (owner_generation, rollback) = register_unpublished_global_frame_host_owner_in(
         &lease.custody,
         new_lease,
         new_host,
@@ -2722,7 +2828,7 @@ pub(crate) fn perform_foreign_cow_transaction(
     )
     .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?;
     let mut owner_rollback = GlobalFrameOwnerRollback::new(std::sync::Arc::clone(&lease.custody));
-    owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+    owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE), rollback);
     foreign_cow_failpoint(&lease.state, 2)?;
     let backing = HvfVmState::private_backing_identity();
     let split = match HvfVmState::stage_cow_inventory_split(
@@ -3245,7 +3351,7 @@ fn perform_foreign_guest_cow(
     new_lease.mark_test_mapped_without_backend();
     #[cfg(all(not(test), feature = "foreign-cow-test-support"))]
     new_lease.mark_test_mapped_without_backend();
-    let owner_generation = register_global_frame_host_owner_in(
+    let (owner_generation, rollback) = register_unpublished_global_frame_host_owner_in(
         &lease.custody,
         new_lease,
         new_host,
@@ -3253,7 +3359,7 @@ fn perform_foreign_guest_cow(
     )
     .map_err(|_| Error::MutationFailed)?;
     let mut owner_rollback = GlobalFrameOwnerRollback::new(std::sync::Arc::clone(&lease.custody));
-    owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+    owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE), rollback);
     foreign_cow_failpoint(&lease.state, 2)?;
     let backing = HvfVmState::private_backing_identity();
     let stage2_owner = InventoryStage2OwnerIdentity {
@@ -3511,29 +3617,33 @@ fn finish_foreign_cow_publication(
         authenticated_owner_generation,
     } = published;
     let host_resolved = owner_rollback.is_some();
-    let stage1_authority = lease.state.page_tables_authority();
-    let retired_old_stage2 = {
-        let mut inventory = lease.state.frame_inventory.ledger.lock();
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-            HvfVmState::retire_stage2_extent_from_mappings_in(
-                &lease.custody,
-                &mut TaskMappingIndex::new(),
-                Stage1UnpublicationReceipt::AuthoritativeAbsence {
-                    authority: &stage1_authority,
-                    va: span.va,
-                    len: span.len,
-                },
-                split.old.stage2_base,
-                split.old.stage2_length,
-            )
+    let stage1 = crate::trap::frame_inventory::Stage1UnpublishedFrames::after_cow_split(
+        runtime.authority.as_ref(),
+        &split,
+    );
+    let retired_old_stage2 = stage1
+        .and_then(|stage1| {
+            let mut inventory = lease.state.frame_inventory.ledger.lock();
+            HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
+                let Some(stage1) = stage1.as_ref() else {
+                    return Ok(false);
+                };
+                HvfVmState::retire_stage2_extent_from_mappings_in(
+                    &lease.custody,
+                    &mut TaskMappingIndex::new(),
+                    Stage1UnpublicationReceipt::FrameAbsence(stage1),
+                    split.old.stage2_base,
+                    split.old.stage2_length,
+                )?;
+                Ok(true)
+            })
         })
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|error| {
             carrick_fatal!(
                 "hvpatch::frame_inventory",
-                "committing frame inventory split into carrier ledger failed after kernel publication"
+                "committing frame inventory split into carrier ledger failed after kernel publication: {error}"
             )
-        })
-    };
+        });
     drop(registry);
     let scope = CowInventoryLifecycleScope {
         custody: &lease.custody,

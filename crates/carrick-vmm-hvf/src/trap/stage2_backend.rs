@@ -1507,21 +1507,59 @@ pub(crate) fn install_ipc_window_using(
             perms: READ_WRITE,
             logical_owner: Some(owner),
         };
-        match custody.publish_stage2_record_using(spec, |_| map(host, ipa, len, READ_WRITE)) {
-            Ok(identity) => records.push(identity),
+        match custody
+            .publish_unpublished_stage2_record_using(spec, |_| map(host, ipa, len, READ_WRITE))
+        {
+            Ok(record) => records.push(record),
             Err(error) => {
-                for identity in records {
-                    let Some(stage1) = custody.stage1_unpublished_for_retirement(identity) else {
-                        continue;
-                    };
-                    let _ = custody.retire_stage2_record_using(identity, stage1, &mut unmap);
-                    let _ = custody.remove_terminal_stage2_record(identity, stage1);
+                for (identity, rollback) in records {
+                    let stage1 = custody
+                        .stage1_unpublished_from_rollback(identity, rollback)
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor(
+                                "IPC rollback receipt names another stage-2 record".to_owned(),
+                            )
+                        })?;
+                    let requested = custody.request_stage2_record_retirement(identity, stage1);
+                    if requested != CarrierStage2RetireOutcome::DeferredActivePins {
+                        return Err(TrapError::Hypervisor(format!(
+                            "IPC rollback retirement request failed: {requested:?}"
+                        )));
+                    }
+                    let stage1 = custody
+                        .stage1_unpublished_for_retirement(identity)
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor(
+                                "IPC rollback lost exact retirement authority".to_owned(),
+                            )
+                        })?;
+                    match custody.retire_stage2_record_using(identity, stage1, &mut unmap) {
+                        CarrierStage2RetireOutcome::RetiredUnmapped
+                        | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
+                            if custody
+                                .remove_terminal_stage2_record(identity, stage1)
+                                .is_none()
+                            {
+                                return Err(TrapError::Hypervisor(
+                                    "IPC rollback could not remove its terminal record".to_owned(),
+                                ));
+                            }
+                        }
+                        outcome => {
+                            return Err(TrapError::Hypervisor(format!(
+                                "IPC rollback stage-2 retirement failed: {outcome:?}"
+                            )));
+                        }
+                    }
                 }
                 return Err(error);
             }
         }
     }
     let records: [CarrierStage2RecordIdentity; 2] = records
+        .into_iter()
+        .map(|(identity, _rollback)| identity)
+        .collect::<Vec<_>>()
         .try_into()
         .map_err(|_| TrapError::Hypervisor("IPC window installation lost a record".to_owned()))?;
     Ok(IpcWindowInstallation {

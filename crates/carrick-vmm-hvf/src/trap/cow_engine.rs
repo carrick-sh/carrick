@@ -75,18 +75,6 @@ pub(super) struct ForeignGrantProof {
     pub(super) unmapped: Vec<carrick_hal::MappingId>,
 }
 impl GuestPreparedBacking {
-    fn prepare(
-        custody: std::sync::Arc<CarrierVmCustody>,
-        authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
-        inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
-        reservation: carrick_hal::FrameInventoryReservation,
-        mm: std::num::NonZeroU64,
-        stage: InventoryMappingStage,
-    ) -> Result<Self, TrapError> {
-        let mut owner = GlobalFrameOwnerRollback::new(custody.clone());
-        owner.record((stage.gpa, stage.length));
-        Self::prepare_owned(custody, authority, inventory, reservation, mm, stage, owner)
-    }
     pub(super) fn prepare_owned(
         custody: std::sync::Arc<CarrierVmCustody>,
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
@@ -1717,16 +1705,7 @@ impl HvfVmState {
         if !is_exactly_el1_frame_grant(&aliases, grant) {
             return Ok(false);
         }
-        let stage1_authority = self.page_tables_authority();
-        self.unregister_process_alias(
-            Stage1UnpublicationReceipt::AuthoritativeAbsence {
-                authority: &stage1_authority,
-                va: grant.semantic_base,
-                len,
-            },
-            grant.semantic_base,
-            len,
-        )?;
+        self.unregister_process_alias(None, grant.semantic_base, len)?;
         let deferred = self.deferred_anonymous_state().ok_or_else(|| {
             TrapError::Hypervisor("EL1 frame-grant rollback has no deferred state".to_owned())
         })?;
@@ -1779,18 +1758,7 @@ impl HvfVmState {
             identity.linux_pid,
             identity.linux_tid,
         );
-        let stage1_authority = self.page_tables_authority();
-        self.commit_process_alias_retirement(
-            Stage1UnpublicationReceipt::AuthoritativeAbsence {
-                authority: &stage1_authority,
-                va: grant.semantic_base,
-                len,
-            },
-            grant.semantic_base,
-            len,
-            retirement,
-            &registry,
-        )?;
+        self.commit_process_alias_retirement(grant.semantic_base, len, retirement, &registry)?;
         register_shared_alias(pending.alias);
         drop(registry);
         Ok(())
@@ -1843,13 +1811,7 @@ impl HvfVmState {
             inventory: Some(inventory),
             reservation: None,
         })?;
-        let stage1_authority = self.page_tables_authority();
         self.commit_process_alias_retirement_inner(
-            Stage1UnpublicationReceipt::AuthoritativeAbsence {
-                authority: &stage1_authority,
-                va,
-                len,
-            },
             va,
             len,
             prepared,
@@ -2034,13 +1996,7 @@ impl HvfVmState {
                     // New descriptors and inventory are committed, but the new
                     // alias is not registered yet. Retire only the old rows.
                     // All ordinary allocation failures preceded this boundary.
-                    let stage1_authority = self.page_tables_authority();
                     self.commit_process_alias_retirement(
-                        Stage1UnpublicationReceipt::AuthoritativeAbsence {
-                            authority: &stage1_authority,
-                            va: start,
-                            len: semantic_len,
-                        },
                         start,
                         semantic_len,
                         retirement,
@@ -2440,14 +2396,14 @@ impl HvfTaskState {
             )));
         }
         new_lease.mark_mapped();
-        let owner_generation = register_global_frame_host_owner_in(
+        let (owner_generation, rollback) = register_unpublished_global_frame_host_owner_in(
             custody,
             new_lease,
             new_host,
             u64::from(stage2_perms),
         )?;
         let mut owner_rollback = GlobalFrameOwnerRollback::new(std::sync::Arc::clone(custody));
-        owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+        owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE), rollback);
 
         let retained_stage = || InventoryMappingStage {
             gpa: new_physical_ipa,
@@ -3757,7 +3713,7 @@ impl HvfTaskState {
         } else {
             None
         };
-        let (new_host_ptr, new_physical_ipa, owner_generation) =
+        let (new_host_ptr, new_physical_ipa, owner_generation, mut rollback_receipt) =
             if let Some((destination, extent)) = &reused_destination {
                 // No published alias names this lane. Only the newly touched Linux
                 // page is refreshed; previously written neighbors are never copied.
@@ -3786,6 +3742,7 @@ impl HvfTaskState {
                     destination.host_addr(),
                     destination.physical_ipa(),
                     extent.stage2_owner.generation,
+                    None,
                 )
             } else if let Some(handle) = pooled {
                 let host_ptr = handle.as_mut_ptr();
@@ -3821,12 +3778,13 @@ impl HvfTaskState {
                 if !guest_lane {
                     drop(old_source.take());
                 }
-                let owner_generation = register_pooled_global_frame_host_owner_in(
-                    custody,
-                    handle,
-                    u64::from(stage2_perms),
-                )?;
-                (host_ptr, physical_ipa, owner_generation)
+                let (owner_generation, rollback) =
+                    register_unpublished_pooled_global_frame_host_owner_in(
+                        custody,
+                        handle,
+                        u64::from(stage2_perms),
+                    )?;
+                (host_ptr, physical_ipa, owner_generation, Some(rollback))
             } else {
                 carrick_observability::probes::hvpatch_frame_pool_miss(0, 0);
                 let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
@@ -3886,13 +3844,18 @@ impl HvfTaskState {
                     )));
                 }
                 new_lease.mark_mapped();
-                let owner_generation = register_global_frame_host_owner_in(
+                let (owner_generation, rollback) = register_unpublished_global_frame_host_owner_in(
                     custody,
                     new_lease,
                     new_host,
                     u64::from(stage2_perms),
                 )?;
-                (new_host_ptr, new_physical_ipa, owner_generation)
+                (
+                    new_host_ptr,
+                    new_physical_ipa,
+                    owner_generation,
+                    Some(rollback),
+                )
             };
         let new_ipa = new_physical_ipa
             .checked_add(old_offset)
@@ -3902,7 +3865,11 @@ impl HvfTaskState {
             extent.backing
         });
         let mut guest_backing = if let Some(reservation) = guest_reservation {
-            Some(GuestPreparedBacking::prepare(
+            let mut owner = GlobalFrameOwnerRollback::new(custody.clone());
+            if let Some(rollback) = rollback_receipt.take() {
+                owner.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE), rollback);
+            }
+            Some(GuestPreparedBacking::prepare_owned(
                 custody.clone(),
                 authority.clone(),
                 self.frame_inventory.ledger.clone(),
@@ -3925,6 +3892,7 @@ impl HvfTaskState {
                         generation: owner_generation,
                     },
                 },
+                owner,
             )?)
         } else {
             None
@@ -3997,15 +3965,9 @@ impl HvfTaskState {
                         new_physical_ipa,
                         CowArmedRanges::COMPOUND_SIZE,
                     ) {
-                        let authority = self.page_tables_authority();
-                        if let Some(stage1) = custody.stage1_unpublished_from_receipt(
-                            identity,
-                            Stage1UnpublicationReceipt::AuthoritativeAbsence {
-                                authority: &authority,
-                                va: receipt_va,
-                                len: span.len,
-                            },
-                        ) {
+                        if let Some(stage1) = rollback_receipt.take().and_then(|receipt| {
+                            custody.stage1_unpublished_from_rollback(identity, receipt)
+                        }) {
                             let _ = retire_global_frame_host_owner_in(
                                 custody,
                                 stage1,
@@ -4337,15 +4299,9 @@ impl HvfTaskState {
                     new_physical_ipa,
                     CowArmedRanges::COMPOUND_SIZE,
                 ) {
-                    let authority = self.page_tables_authority();
-                    if let Some(stage1) = custody.stage1_unpublished_from_receipt(
-                        identity,
-                        Stage1UnpublicationReceipt::AuthoritativeAbsence {
-                            authority: &authority,
-                            va: receipt_va,
-                            len: span.len,
-                        },
-                    ) {
+                    if let Some(stage1) = rollback_receipt.take().and_then(|receipt| {
+                        custody.stage1_unpublished_from_rollback(identity, receipt)
+                    }) {
                         let _ = retire_global_frame_host_owner_in(
                             custody,
                             stage1,
@@ -4390,24 +4346,32 @@ impl HvfTaskState {
             );
         }
         let inventory_ledger = std::sync::Arc::clone(&self.frame_inventory.ledger);
-        let retired_old_stage2 = {
-            let mut inventory = inventory_ledger.lock();
-            HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-                self.retire_stage2_extent_for_cow(
-                    custody,
-                    span.va,
-                    span.len,
-                    split.old.stage2_base,
-                    split.old.stage2_length,
-                )
+        let stage1 = crate::trap::frame_inventory::Stage1UnpublishedFrames::after_cow_split(
+            authority.as_ref(),
+            &split,
+        );
+        let retired_old_stage2 = stage1
+            .and_then(|stage1| {
+                let mut inventory = inventory_ledger.lock();
+                HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
+                    let Some(stage1) = stage1.as_ref() else {
+                        return Ok(false);
+                    };
+                    self.retire_stage2_extent_for_cow(
+                        custody,
+                        stage1,
+                        split.old.stage2_base,
+                        split.old.stage2_length,
+                    )?;
+                    Ok(true)
+                })
             })
             .unwrap_or_else(|error| {
                 carrick_fatal!(
                     "hvpatch::frame_inventory",
                     "commit HVPatch backend COW inventory after kernel commit: {error}"
                 );
-            })
-        };
+            });
         drop(registry);
         let scope = CowInventoryLifecycleScope {
             custody,
@@ -4817,9 +4781,11 @@ impl HvfVmState {
 
     pub(crate) fn retire_stage1_extension_arenas(
         &mut self,
-        manager: &mut carrick_mmu_core::aarch64::PageTableManager,
+        retired_bases: &[u64],
+        receipt: &carrick_aarch64::vmm::Stage1UnpublishedArenas,
     ) -> Result<(), TrapError> {
-        self.task.retire_stage1_extension_arenas(manager)
+        self.task
+            .retire_stage1_extension_arenas(retired_bases, receipt)
     }
 
     pub(crate) fn resolve_frame_cow_fault(
@@ -6072,10 +6038,14 @@ impl HvfVmState {
 
     pub(crate) fn unregister_process_alias(
         &mut self,
-        stage1: Stage1UnpublicationReceipt<'_>,
+        stage1: Option<&carrick_aarch64::vmm::Stage1UnpublishedRange>,
         va: u64,
         len: usize,
     ) -> Result<(), TrapError> {
+        // The range receipt is created only by the Editor edit which removed
+        // these leaves. Keeping it in this production boundary prevents a
+        // caller from replacing the exact unmap proof with an IPA assertion.
+        let _stage1_receipt = stage1.map(Stage1UnpublicationReceipt::EditorRange);
         // An unmap is a stage-1 repointer that publishes NO receipt of its own,
         // so it has to void the promises naming the range it is tearing down —
         // the contract `supersede_cow_receipts` states for every repointer.
@@ -6120,10 +6090,9 @@ impl HvfVmState {
                 identity.linux_pid,
                 identity.linux_tid,
             );
-            self.commit_process_alias_retirement(stage1, va, len, prepared, &registry)
+            self.commit_process_alias_retirement(va, len, prepared, &registry)
         } else {
             self.commit_process_alias_retirement_inner(
-                stage1,
                 va,
                 len,
                 prepared,
@@ -6263,14 +6232,12 @@ impl HvfVmState {
     /// is exactly how the 2026-09-12 `mmap` wedge happened.
     pub(crate) fn commit_process_alias_retirement(
         &mut self,
-        stage1: Stage1UnpublicationReceipt<'_>,
         va: u64,
         len: usize,
         prepared: PreparedProcessAliasRetirement,
         registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
     ) -> Result<(), TrapError> {
         self.commit_process_alias_retirement_inner(
-            stage1,
             va,
             len,
             prepared,
@@ -6287,13 +6254,7 @@ impl HvfVmState {
         prepared: PreparedProcessAliasRetirement,
         registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
     ) -> Result<(), TrapError> {
-        let stage1_authority = self.page_tables_authority();
         self.commit_process_alias_retirement_inner(
-            Stage1UnpublicationReceipt::AuthoritativeAbsence {
-                authority: &stage1_authority,
-                va,
-                len,
-            },
             va,
             len,
             prepared,
@@ -6319,7 +6280,6 @@ impl HvfVmState {
     #[allow(clippy::too_many_arguments)]
     fn commit_process_alias_retirement_inner(
         &mut self,
-        stage1: Stage1UnpublicationReceipt<'_>,
         va: u64,
         len: usize,
         prepared: PreparedProcessAliasRetirement,
@@ -6331,7 +6291,6 @@ impl HvfVmState {
         loop {
             let read = prepared.read_rows.len();
             let Some(stale) = self.try_commit_process_alias_retirement(
-                stage1,
                 va,
                 len,
                 prepared,
@@ -6361,7 +6320,6 @@ impl HvfVmState {
     #[allow(clippy::too_many_arguments)]
     fn try_commit_process_alias_retirement(
         &mut self,
-        stage1: Stage1UnpublicationReceipt<'_>,
         va: u64,
         len: usize,
         prepared: PreparedProcessAliasRetirement,
@@ -6551,6 +6509,10 @@ impl HvfVmState {
                 inventory.extents.len(),
             );
         }
+        let stage1 = crate::trap::frame_inventory::Stage1UnpublishedFrames::after_alias_retirement(
+            authority.as_ref(),
+            &retirement,
+        )?;
         let scope = CowInventoryLifecycleScope {
             custody: &custody,
             identity: Some(identity),
@@ -6587,7 +6549,11 @@ impl HvfVmState {
                         "HVPatch alias retirement IPA 0x{ipa:x} size {length} has no exact inventory owner"
                     ))
             })?;
-            self.retire_stage2_extent(stage1, ipa, length)?;
+            self.retire_stage2_extent(
+                Stage1UnpublicationReceipt::FrameAbsence(&stage1),
+                ipa,
+                length,
+            )?;
             let retired = [retired];
             let cleanup = mutate_known_external_alias_state(
                 AliasWriterActor::Mm {
@@ -7411,17 +7377,16 @@ impl HvfTaskState {
 
     pub(crate) fn retire_stage1_extension_arenas(
         &mut self,
-        manager: &mut carrick_mmu_core::aarch64::PageTableManager,
+        retired_bases: &[u64],
+        stage1: &carrick_aarch64::vmm::Stage1UnpublishedArenas,
     ) -> Result<(), TrapError> {
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let custody = self.custody_arc();
-        let (retired_bases, stage1) =
-            carrick_aarch64::vmm::Stage1UnpublishedRange::retire_extension_arenas(manager);
-        for base in retired_bases {
+        for &base in retired_bases {
             HvfVmState::retire_stage2_extent_from_mappings_in(
                 &custody,
                 &mut self.mappings,
-                Stage1UnpublicationReceipt::Editor(&stage1),
+                Stage1UnpublicationReceipt::EditorArenas(stage1),
                 base,
                 TWO_MIB,
             )?;
@@ -7691,20 +7656,14 @@ impl HvfTaskState {
     pub(crate) fn retire_stage2_extent_for_cow(
         &mut self,
         custody: &CarrierVmCustody,
-        va: u64,
-        len: usize,
+        stage1: &crate::trap::frame_inventory::Stage1UnpublishedFrames,
         ipa: u64,
         length: u64,
     ) -> Result<(), TrapError> {
-        let authority = self.page_tables_authority();
         HvfVmState::retire_stage2_extent_from_mappings_in(
             custody,
             &mut self.mappings,
-            Stage1UnpublicationReceipt::AuthoritativeAbsence {
-                authority: &authority,
-                va,
-                len,
-            },
+            Stage1UnpublicationReceipt::FrameAbsence(stage1),
             ipa,
             length,
         )

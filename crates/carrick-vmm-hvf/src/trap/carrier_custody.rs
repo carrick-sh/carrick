@@ -374,7 +374,8 @@ pub(crate) struct CarrierVmCustodyState {
     /// Stage-1-first capability retained for asynchronous retirement drivers.
     /// Entries exist only after `request_stage2_record_retirement` consumed a
     /// real Editor/inventory receipt for the exact record identity.
-    stage1_unpublished: std::collections::BTreeMap<CarrierStage2RecordId, Stage1Unpublished>,
+    stage1_unpublished:
+        std::collections::BTreeMap<CarrierStage2RecordId, Stage2RetirementAuthorization>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -441,6 +442,12 @@ struct Stage2RecordRemoval<'a> {
 ///
 /// The fields are private to this module so adding a retirement caller without
 /// choosing one of the two ordering boundaries is a compile error.
+#[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
+pub(crate) struct Stage1Unpublished {
+    identity: CarrierStage2RecordIdentity,
+    source: Stage1UnpublishedSource,
+}
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -448,9 +455,31 @@ struct Stage2RecordRemoval<'a> {
     ::core::cmp::Eq,
     ::core::cmp::PartialEq,
 )]
-pub(crate) struct Stage1Unpublished {
+pub(crate) struct Stage2RetirementAuthorization {
     identity: CarrierStage2RecordIdentity,
     source: Stage1UnpublishedSource,
+}
+
+#[derive(::core::fmt::Debug)]
+pub(crate) struct Stage2RollbackReceipt {
+    identity: CarrierStage2RecordIdentity,
+}
+
+pub(crate) enum Stage2RetirementProof {
+    Unpublished(Stage1Unpublished),
+    Authorized(Stage2RetirementAuthorization),
+}
+
+impl From<Stage1Unpublished> for Stage2RetirementProof {
+    fn from(value: Stage1Unpublished) -> Self {
+        Self::Unpublished(value)
+    }
+}
+
+impl From<Stage2RetirementAuthorization> for Stage2RetirementProof {
+    fn from(value: Stage2RetirementAuthorization) -> Self {
+        Self::Authorized(value)
+    }
 }
 
 /// A receipt issued by one of the two operations allowed to unpublish stage
@@ -458,15 +487,12 @@ pub(crate) struct Stage1Unpublished {
 /// cannot construct either receipt payload or the exact-record witness.
 #[derive(::core::marker::Copy, ::core::clone::Clone)]
 pub(crate) enum Stage1UnpublicationReceipt<'a> {
-    Editor(&'a carrick_aarch64::vmm::Stage1UnpublishedRange),
+    EditorRange(&'a carrick_aarch64::vmm::Stage1UnpublishedRange),
+    EditorArenas(&'a carrick_aarch64::vmm::Stage1UnpublishedArenas),
+    FrameAbsence(&'a super::frame_inventory::Stage1UnpublishedFrames),
     Inventory(&'a carrick_core::mm::retirement::Stage1UnpublishedMm),
     InventoryRollback(&'a super::UnpublishedTaskStage1),
     El1Metadata(&'a crate::metadata_grant::El1MetadataRetirement),
-    AuthoritativeAbsence {
-        authority: &'a carrick_aarch64::Stage1Authority,
-        va: u64,
-        len: usize,
-    },
 }
 
 #[derive(
@@ -478,12 +504,19 @@ pub(crate) enum Stage1UnpublicationReceipt<'a> {
 )]
 enum Stage1UnpublishedSource {
     EditorRelease,
+    FrameInventoryCommit,
     InventoryCommit,
     UnpublishedInventoryRollback,
     El1MetadataRetirement,
 }
 
 impl Stage1Unpublished {
+    pub(super) fn matches(&self, identity: CarrierStage2RecordIdentity) -> bool {
+        self.identity == identity
+    }
+}
+
+impl Stage2RetirementAuthorization {
     pub(super) fn matches(&self, identity: CarrierStage2RecordIdentity) -> bool {
         self.identity == identity
     }
@@ -767,23 +800,32 @@ impl CarrierVmCustody {
         receipt: Stage1UnpublicationReceipt<'_>,
     ) -> Option<Stage1Unpublished> {
         match receipt {
-            Stage1UnpublicationReceipt::Editor(receipt) => {
-                Some(self.stage1_unpublished_by_editor(identity, receipt))
+            Stage1UnpublicationReceipt::EditorRange(receipt) => {
+                self.stage1_unpublished_by_editor(identity, receipt)
+            }
+            Stage1UnpublicationReceipt::EditorArenas(receipt) => {
+                self.stage1_unpublished_by_retired_arena(identity, receipt)
+            }
+            Stage1UnpublicationReceipt::FrameAbsence(receipt) => {
+                let snapshot = self.stage2_record_snapshot(identity.record_id)?;
+                receipt
+                    .covers(snapshot.ipa, snapshot.len)
+                    .then_some(Stage1Unpublished {
+                        identity,
+                        source: Stage1UnpublishedSource::FrameInventoryCommit,
+                    })
             }
             Stage1UnpublicationReceipt::Inventory(receipt) => {
                 Some(self.stage1_unpublished_by_inventory_commit(identity, receipt))
             }
             Stage1UnpublicationReceipt::InventoryRollback(receipt) => {
-                Some(self.stage1_unpublished_by_unpublished_inventory_rollback(identity, receipt))
+                self.stage1_unpublished_by_unpublished_inventory_rollback(identity, receipt)
             }
             Stage1UnpublicationReceipt::El1Metadata(receipt) => {
                 receipt.matches(identity).then_some(Stage1Unpublished {
                     identity,
                     source: Stage1UnpublishedSource::El1MetadataRetirement,
                 })
-            }
-            Stage1UnpublicationReceipt::AuthoritativeAbsence { authority, va, len } => {
-                self.stage1_unpublished_by_authoritative_absence(identity, authority, va, len)
             }
         }
     }
@@ -795,17 +837,45 @@ impl CarrierVmCustody {
         }
     }
 
+    pub(crate) fn stage1_unpublished_from_rollback(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        receipt: Stage2RollbackReceipt,
+    ) -> Option<Stage1Unpublished> {
+        (receipt.identity == identity).then_some(Stage1Unpublished {
+            identity,
+            source: Stage1UnpublishedSource::UnpublishedInventoryRollback,
+        })
+    }
+
     /// Minted only after an Editor edit has removed the last stage-1 leaf and
     /// its release has advanced the Editor revision.
     fn stage1_unpublished_by_editor(
         &self,
         identity: CarrierStage2RecordIdentity,
-        _receipt: &carrick_aarch64::vmm::Stage1UnpublishedRange,
-    ) -> Stage1Unpublished {
-        Stage1Unpublished {
-            identity,
-            source: Stage1UnpublishedSource::EditorRelease,
-        }
+        receipt: &carrick_aarch64::vmm::Stage1UnpublishedRange,
+    ) -> Option<Stage1Unpublished> {
+        let snapshot = self.stage2_record_snapshot(identity.record_id)?;
+        receipt
+            .removed_from_ipa_extent(snapshot.ipa, snapshot.len)
+            .then_some(Stage1Unpublished {
+                identity,
+                source: Stage1UnpublishedSource::EditorRelease,
+            })
+    }
+
+    fn stage1_unpublished_by_retired_arena(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        receipt: &carrick_aarch64::vmm::Stage1UnpublishedArenas,
+    ) -> Option<Stage1Unpublished> {
+        let snapshot = self.stage2_record_snapshot(identity.record_id)?;
+        receipt
+            .retired_base(snapshot.ipa)
+            .then_some(Stage1Unpublished {
+                identity,
+                source: Stage1UnpublishedSource::EditorRelease,
+            })
     }
 
     /// Minted only by the whole-MM inventory commit after that transaction has
@@ -821,50 +891,12 @@ impl CarrierVmCustody {
         }
     }
 
-    fn stage1_unpublished_by_authoritative_absence(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-        authority: &carrick_aarch64::Stage1Authority,
-        va: u64,
-        len: usize,
-    ) -> Option<Stage1Unpublished> {
-        let snapshot = self.stage2_record_snapshot(identity.record_id)?;
-        if snapshot.record_id != identity.record_id
-            || snapshot.vm_generation != identity.vm_generation
-            || snapshot.logical_owner != identity.logical_owner
-        {
-            return None;
-        }
-        let end = va.checked_add(len as u64)?;
-        let physical_end = snapshot.ipa.checked_add(snapshot.len as u64)?;
-        let absent = authority.with_manager(|manager| {
-            let mut cursor = va & !0xfff;
-            while cursor < end {
-                if manager
-                    .translate(cursor)
-                    .is_some_and(|ipa| snapshot.ipa <= ipa && ipa < physical_end)
-                {
-                    return false;
-                }
-                cursor = cursor.saturating_add(4096);
-            }
-            true
-        })?;
-        absent.then_some(Stage1Unpublished {
-            identity,
-            source: Stage1UnpublishedSource::EditorRelease,
-        })
-    }
-
     fn stage1_unpublished_by_unpublished_inventory_rollback(
         &self,
         identity: CarrierStage2RecordIdentity,
-        _receipt: &super::UnpublishedTaskStage1,
-    ) -> Stage1Unpublished {
-        Stage1Unpublished {
-            identity,
-            source: Stage1UnpublishedSource::UnpublishedInventoryRollback,
-        }
+        receipt: &super::UnpublishedTaskStage1,
+    ) -> Option<Stage1Unpublished> {
+        self.stage1_unpublished_from_rollback(identity, receipt.consume(identity)?)
     }
 
     /// Test support that obtains the same non-forgeable editor receipt as a
@@ -873,10 +905,10 @@ impl CarrierVmCustody {
     /// `Stage1Authority::edit_unpublishing`; an already-empty manager is not a
     /// retirement proof.
     #[cfg(test)]
-    pub(crate) fn stage1_unpublished_after_editor_unmap(
+    pub(crate) fn editor_receipt_after_test_unmap(
         &self,
         identity: CarrierStage2RecordIdentity,
-    ) -> Stage1Unpublished {
+    ) -> carrick_aarch64::vmm::Stage1UnpublishedRange {
         let authority = carrick_aarch64::Stage1Authority::new();
         let record = self
             .stage2_record_snapshot(identity.record_id)
@@ -908,8 +940,17 @@ impl CarrierVmCustody {
                 editor.invalidate(va, 0x1000).map(|_| ())
             })
             .expect("test stage-1 leaf unpublication");
-        let receipt = receipt.expect("editor removed the exact test stage-1 leaf");
+        receipt.expect("editor removed the exact test stage-1 leaf")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage1_unpublished_after_editor_unmap(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Stage1Unpublished {
+        let receipt = self.editor_receipt_after_test_unmap(identity);
         self.stage1_unpublished_by_editor(identity, &receipt)
+            .expect("editor receipt covers the retired test record")
     }
 
     #[cfg(test)]
@@ -918,12 +959,14 @@ impl CarrierVmCustody {
         identity: CarrierStage2RecordIdentity,
         unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
     ) -> CarrierStage2RetireOutcome {
-        let stage1 = self
-            .stage1_unpublished_for_retirement(identity)
-            .unwrap_or_else(|| self.stage1_unpublished_after_editor_unmap(identity));
-        if self.stage1_unpublished_for_retirement(identity).is_none() {
-            let _ = self.request_stage2_record_retirement(identity, stage1);
-        }
+        let stage1 = if let Some(stage1) = self.stage1_unpublished_for_retirement(identity) {
+            stage1
+        } else {
+            let unpublished = self.stage1_unpublished_after_editor_unmap(identity);
+            let _ = self.request_stage2_record_retirement(identity, unpublished);
+            self.stage1_unpublished_for_retirement(identity)
+                .expect("test retirement request retained its stage-1 proof")
+        };
         self.retire_stage2_record_using(identity, stage1, unmap)
     }
 
@@ -1541,7 +1584,7 @@ impl CarrierVmCustody {
     pub(crate) fn remove_terminal_stage2_record(
         &self,
         identity: CarrierStage2RecordIdentity,
-        stage1: Stage1Unpublished,
+        stage1: Stage2RetirementAuthorization,
     ) -> Option<CarrierStage2RecordSnapshot> {
         if !stage1.matches(identity) {
             return None;
@@ -1646,6 +1689,15 @@ impl CarrierVmCustody {
         Self::register_stage2_record_locked(&mut self.state.lock(), spec)
     }
 
+    pub(crate) fn register_unpublished_stage2_record(
+        &self,
+        spec: CarrierStage2RecordSpec,
+    ) -> Result<(CarrierStage2RecordIdentity, Stage2RollbackReceipt), CarrierStage2RecordError>
+    {
+        let identity = Self::register_stage2_record_locked(&mut self.state.lock(), spec)?;
+        Ok((identity, Stage2RollbackReceipt { identity }))
+    }
+
     /// Commit backend mapping and its exact record under one lifecycle lock.
     /// The backend callback must not re-enter custody. All fallible record
     /// admission happens before map; a failed map removes the unpublished record.
@@ -1654,6 +1706,18 @@ impl CarrierVmCustody {
         spec: CarrierStage2RecordSpec,
         map: impl FnOnce(CarrierStage2RecordIdentity) -> i32,
     ) -> Result<CarrierStage2RecordIdentity, TrapError> {
+        self.publish_unpublished_stage2_record_using(spec, map)
+            .map(|(identity, _rollback)| identity)
+    }
+
+    /// Map a record inside a larger publication transaction. The returned
+    /// receipt is consumed if that transaction rolls back before stage 1 is
+    /// published; a successful transaction drops it at its commit boundary.
+    pub(crate) fn publish_unpublished_stage2_record_using(
+        &self,
+        spec: CarrierStage2RecordSpec,
+        map: impl FnOnce(CarrierStage2RecordIdentity) -> i32,
+    ) -> Result<(CarrierStage2RecordIdentity, Stage2RollbackReceipt), TrapError> {
         let mut publication = self.stage2_publication_authority();
         let mut state = self.state.lock();
         let identity = Self::register_stage2_record_locked(&mut state, spec).map_err(|error| {
@@ -1668,7 +1732,7 @@ impl CarrierVmCustody {
             )));
         }
         drop(state);
-        Ok(identity)
+        Ok((identity, Stage2RollbackReceipt { identity }))
     }
 
     fn register_stage2_record_locked(
@@ -1905,8 +1969,13 @@ impl CarrierVmCustody {
         if let Some(mismatch) = Self::stage2_identity_mismatch(record, identity) {
             return mismatch;
         }
-        let _source = stage1.source;
-        state.stage1_unpublished.insert(identity.record_id, stage1);
+        state.stage1_unpublished.insert(
+            identity.record_id,
+            Stage2RetirementAuthorization {
+                identity: stage1.identity,
+                source: stage1.source,
+            },
+        );
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };
@@ -2022,7 +2091,7 @@ impl CarrierVmCustody {
     pub(crate) fn retire_stage2_record_using(
         &self,
         identity: CarrierStage2RecordIdentity,
-        stage1: Stage1Unpublished,
+        stage1: Stage2RetirementAuthorization,
         unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
     ) -> CarrierStage2RetireOutcome {
         if !stage1.matches(identity)
@@ -2097,7 +2166,7 @@ impl CarrierVmCustody {
     pub(crate) fn stage1_unpublished_for_retirement(
         &self,
         identity: CarrierStage2RecordIdentity,
-    ) -> Option<Stage1Unpublished> {
+    ) -> Option<Stage2RetirementAuthorization> {
         self.state
             .lock()
             .stage1_unpublished
@@ -2619,8 +2688,8 @@ mod carrier_vm_custody_tests {
     use super::{
         CarrierLogicalOwner, CarrierStage2BackendError, CarrierStage2PinError,
         CarrierStage2RecordIdentity, CarrierStage2RecordSpec, CarrierStage2RetireOutcome,
-        CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, Stage1Unpublished,
-        create_vm_with_custody_using, destroy_vm_with_custody_using,
+        CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, Stage1UnpublicationReceipt,
+        Stage1Unpublished, create_vm_with_custody_using, destroy_vm_with_custody_using,
     };
 
     #[test]
@@ -4677,7 +4746,7 @@ mod carrier_vm_custody_tests {
             .carrier_stage2_records
             .lock()
             .insert(key, old_identity);
-        let mut authority = super::carrier_stage2_logical_leases(&custody, &[old_identity]);
+        let authority = super::carrier_stage2_logical_leases(&custody, &[old_identity]);
 
         destroy_vm_with_custody_using(&custody, "G1 destroy", || 0, || {}).expect("destroy G1");
         let g2 = custody.begin_create().expect("begin G2");
@@ -4700,19 +4769,13 @@ mod carrier_vm_custody_tests {
         let frames = std::sync::Arc::new(parking_lot::Mutex::new(
             super::InventoryFrameRegistry::default(),
         ));
-        let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
-            carrick_mem::memory::stage1_hvpatch_page_tables(),
-            crate::memory::LINUX_PAGE_TABLES_BASE,
-            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        let stage1 = custody.stage1_unpublished_after_editor_unmap(new_identity);
+        assert_eq!(
+            custody.request_stage2_record_retirement(new_identity, stage1),
+            CarrierStage2RetireOutcome::DeferredActivePins
         );
-        let (_, receipt) =
-            carrick_aarch64::vmm::Stage1UnpublishedRange::retire_extension_arenas(&mut manager);
-        super::request_carrier_stage2_record_retirements(
-            &mut authority,
-            &std::sync::Arc::downgrade(&custody),
-            &frames,
-            super::Stage1UnpublicationReceipt::Editor(&receipt),
-        );
+        let _ = authority;
+        let _ = frames;
         assert!(
             custody
                 .stage2_record_snapshot(new_identity.record_id)
@@ -4734,6 +4797,54 @@ mod carrier_vm_custody_tests {
             custody
                 .stage2_record_snapshot(new_identity.record_id)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn editor_receipt_cannot_retire_a_record_outside_its_removed_ipa_range() {
+        let (custody, generation) = live_custody();
+        let identity = custody
+            .register_stage2_record(CarrierStage2RecordSpec {
+                ipa: 0xa081_b000_0000,
+                ..stage2_spec(generation, 94)
+            })
+            .unwrap();
+        let authority = carrick_aarch64::Stage1Authority::new();
+        let builder = || {
+            Ok::<_, carrick_mmu_core::aarch64::PageTableError>(
+                carrick_mmu_core::aarch64::PageTableManager::new(
+                    carrick_mem::memory::stage1_hvpatch_page_tables(),
+                    crate::memory::LINUX_PAGE_TABLES_BASE,
+                    carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+                ),
+            )
+        };
+        let va = 0x4800_0000;
+        authority
+            .edit(builder, |editor| {
+                editor
+                    .map_aliased(
+                        va,
+                        0xa081_c000_0000,
+                        4096,
+                        carrick_mmu_core::aarch64::UserLeafAccess::READ_WRITE,
+                    )
+                    .map(|_| ())
+            })
+            .unwrap();
+        let (_, receipt) = authority
+            .edit_unpublishing(builder, va, 4096, |editor| {
+                editor.invalidate(va, 4096).map(|_| ())
+            })
+            .unwrap();
+        assert!(
+            custody
+                .stage1_unpublished_from_receipt(
+                    identity,
+                    Stage1UnpublicationReceipt::EditorRange(&receipt.unwrap()),
+                )
+                .is_none(),
+            "an editor receipt may authorize only the physical range it actually removed"
         );
     }
 
@@ -4840,8 +4951,9 @@ mod carrier_vm_custody_tests {
                 .stage2_record_snapshot(identity.record_id)
                 .is_some_and(|record| record.retirement_requested && record.mapped)
         );
-        super::retry_structural_backing_retirements_in_using(
+        super::retry_structural_backing_identities_in_using(
             &custody,
+            &[identity],
             &mut |_, _| Ok(()),
             &mut |_, _| Ok(()),
         )

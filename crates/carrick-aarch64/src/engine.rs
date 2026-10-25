@@ -1264,7 +1264,7 @@ fn seed_heap_unmapped(protections: &MemoryProtections) {
 fn replace_page_tables_authority(
     page_tables: &mut Stage1Authority,
     replacement: ExecStage1Replacement,
-    mut retire_old: impl FnMut(&mut PageTableManager) -> Result<(), TrapError>,
+    mut retire_old: impl FnMut(&[u64], &crate::vmm::Stage1UnpublishedArenas) -> Result<(), TrapError>,
 ) -> Result<bool, TrapError> {
     match replacement {
         ExecStage1Replacement::Authority(successor) => page_tables
@@ -1272,8 +1272,10 @@ fn replace_page_tables_authority(
             .map_err(TrapError::Hypervisor),
         ExecStage1Replacement::Image(manager) => {
             let manager = manager.map(|image| *image);
-            let (successor, shared) =
-                page_tables.replace_for_exec_internal(|| Ok(manager), |old| retire_old(old))?;
+            let (successor, shared) = page_tables.replace_for_exec_internal(
+                || Ok(manager),
+                |bases, receipt| retire_old(bases, receipt),
+            )?;
             *page_tables = successor;
             Ok(shared)
         }
@@ -1284,7 +1286,7 @@ fn replace_page_tables_authority(
 fn replace_and_bind_page_tables_authority(
     page_tables: &mut Stage1Authority,
     manager: Option<PageTableManager>,
-    retire_old: impl FnMut(&mut PageTableManager) -> Result<(), TrapError>,
+    retire_old: impl FnMut(&[u64], &crate::vmm::Stage1UnpublishedArenas) -> Result<(), TrapError>,
     mut bind_new: impl FnMut(Stage1Authority),
 ) -> Result<(), TrapError> {
     replace_page_tables_authority(
@@ -1471,8 +1473,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         replacement: ExecStage1Replacement,
     ) -> Result<bool, TrapError> {
         let was_shared =
-            replace_page_tables_authority(&mut self.page_tables, replacement, |old| {
-                self.vm.retire_stage1_extension_arenas(old)
+            replace_page_tables_authority(&mut self.page_tables, replacement, |bases, receipt| {
+                self.vm.retire_stage1_extension_arenas(bases, receipt)
             })?;
         self.vm.bind_stage1_page_tables(self.page_tables.clone());
         Ok(was_shared)
@@ -4219,6 +4221,8 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         else {
             return Ok(false);
         };
+        let stage1 =
+            crate::vmm::Stage1UnpublishedRange::capture(address, len, |va| self.translate_va(va));
         // Keep semantic mapping/protection metadata intact. After editing starts,
         // uncertain publication must fail stopped with old owners still retained.
         if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
@@ -4228,7 +4232,13 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
         }
         .map_err(RepointPrivateError::indeterminate)?;
-        let stage1 = crate::vmm::Stage1UnpublishedRange::after_engine_edit(address, len);
+        let stage1 = stage1
+            .and_then(|plan| plan.finish(|va| self.translate_va(va)))
+            .ok_or_else(|| {
+                RepointPrivateError::indeterminate(MemoryError::HostMap(
+                    "anonymous discard did not unpublish its prior stage-1 translation".to_owned(),
+                ))
+            })?;
         self.vm
             .commit_anonymous_discard(&stage1, prepared)
             .map_err(|error| {
@@ -4474,6 +4484,8 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         len: usize,
     ) -> Result<(), MappingRetirementError> {
         let address = address.raw();
+        let stage1 =
+            crate::vmm::Stage1UnpublishedRange::capture(address, len, |va| self.translate_va(va));
         let span = carrick_mmu_core::aarch64::descriptor_txn::PageSpan::new(address, len as u64);
         trace_el1_mapping_leafs(
             self,
@@ -4498,7 +4510,13 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         } else {
             self.retire_stage1_range(address, len, false)?;
         }
-        let stage1 = crate::vmm::Stage1UnpublishedRange::after_engine_edit(address, len);
+        let stage1 = stage1
+            .and_then(|plan| plan.finish(|va| self.translate_va(va)))
+            .ok_or_else(|| {
+                MappingRetirementError::Indeterminate(MemoryError::HostMap(
+                    "mapping retirement did not unpublish its prior stage-1 translation".to_owned(),
+                ))
+            })?;
         self.vm.on_unmap(&stage1, address, len).map_err(|error| {
             MappingRetirementError::Indeterminate(MemoryError::HostMap(format!(
                 "retire backend mapping after munmap: {error}"
@@ -4523,9 +4541,17 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // backend lookup metadata. This legacy API erases the classification;
         // replacement uses retire_mapping so partial publication cannot be
         // mistaken for an intact predecessor.
+        let stage1 =
+            crate::vmm::Stage1UnpublishedRange::capture(address, len, |va| self.translate_va(va));
         self.retire_stage1_range(address, len, true)
             .map_err(MappingRetirementError::into_memory_error)?;
-        let stage1 = crate::vmm::Stage1UnpublishedRange::after_engine_edit(address, len);
+        let stage1 = stage1
+            .and_then(|plan| plan.finish(|va| self.translate_va(va)))
+            .ok_or_else(|| {
+                MemoryError::HostMap(
+                    "alias retirement did not unpublish its prior stage-1 translation".to_owned(),
+                )
+            })?;
         self.vm.on_unmap(&stage1, address, len).map_err(|error| {
             MemoryError::HostMap(format!("retire backend alias after munmap: {error}"))
         })?;
@@ -5131,6 +5157,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 "guest alias length {len:#x} exceeded host pointer width during failure cleanup unwinding"
             );
         });
+        let stage1 =
+            crate::vmm::Stage1UnpublishedRange::capture(va.raw(), cleanup_len, |address| {
+                self.translate_va(address)
+            });
         let error = match refusal {
             GuestAliasRefusal::BeforeInventory(error) => {
                 // The authority never saw the mapping: discard the staging
@@ -5153,11 +5183,28 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             // The backend retired the span and rolled the grant back.
             GuestAliasRefusal::RolledBack(error) => error,
         };
-        let stage1 = crate::vmm::Stage1UnpublishedRange::after_engine_edit(va.raw(), cleanup_len);
-        if let Err(unregister) = self.vm.on_unmap(&stage1, va.raw(), cleanup_len) {
+        let stage1 = stage1
+            .and_then(|plan| plan.finish(|address| self.translate_va(address)))
+            .or_else(|| {
+                crate::vmm::Stage1UnpublishedRange::plan_for_known_translation(
+                    va.raw(),
+                    cleanup_len,
+                    gpa,
+                )
+                .finish(|address| self.translate_va(address))
+            });
+        let unregister = stage1
+            .as_ref()
+            .ok_or_else(|| "cleanup retained its stage-1 translation".to_owned())
+            .and_then(|stage1| {
+                self.vm
+                    .on_unmap(stage1, va.raw(), cleanup_len)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(unregister) = unregister {
             carrick_fatal!(
                 "aarch64::alias_cleanup",
-                "failed to unregister guest alias at {:#x} (len {:#x}) after a refused publication: {unregister}",
+                "failed to prove and unregister guest alias at {:#x} (len {:#x}) after a refused publication: {unregister}",
                 va.raw(),
                 cleanup_len
             );
@@ -8318,7 +8365,7 @@ mod tests {
         replace_and_bind_page_tables_authority(
             &mut child_authority,
             None,
-            |_| {
+            |_, _| {
                 retired = true;
                 Ok(())
             },
@@ -8383,7 +8430,7 @@ mod tests {
         replace_and_bind_page_tables_authority(
             &mut child1_authority,
             None,
-            |_| {
+            |_, _| {
                 retired1 = true;
                 Ok(())
             },
@@ -8421,7 +8468,7 @@ mod tests {
         replace_and_bind_page_tables_authority(
             &mut child2_authority,
             None,
-            |_| {
+            |_, _| {
                 retired2 = true;
                 Ok(())
             },
@@ -8465,7 +8512,7 @@ mod tests {
         replace_page_tables_authority(
             &mut engine,
             ExecStage1Replacement::Authority(backend_successor.clone()),
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .unwrap();
         assert_eq!(
@@ -8508,7 +8555,7 @@ mod tests {
         replace_and_bind_page_tables_authority(
             &mut child_authority,
             None,
-            |_| {
+            |_, _| {
                 retired = true;
                 Ok(())
             },
@@ -8553,7 +8600,7 @@ mod tests {
         replace_and_bind_page_tables_authority(
             &mut authority,
             None,
-            |_| {
+            |_, _| {
                 retired = true;
                 Ok(())
             },
@@ -8640,7 +8687,7 @@ mod tests {
         let new_child = child
             .replace_for_exec(
                 || Ok::<Option<PageTableManager>, ()>(None),
-                |_| {
+                |_, _| {
                     retired = true;
                     Ok(())
                 },

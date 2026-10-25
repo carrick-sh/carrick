@@ -362,9 +362,17 @@ impl Drop for OwnerCleanup {
                 (alias.physical_ipa, alias.physical_size as u64) == (ipa, length)
             })
         });
-        let mut owners = global_frame_host_owners().lock();
+        let custody = legacy_test_carrier_vm_custody();
         for key in self.0.drain(..) {
-            owners.remove(&key);
+            let Some(identity) = global_frame_stage2_identity_in(custody, key.0, key.1) else {
+                continue;
+            };
+            let proof = custody.stage1_unpublished_after_editor_unmap(identity);
+            let outcome = retire_global_frame_host_owner_in(custody, proof, key.0, key.1);
+            assert!(
+                outcome.is_retired(),
+                "foreign-COW fixture cleanup must retire exact stage-2 custody: {outcome:?}"
+            );
         }
     }
 }
@@ -374,7 +382,7 @@ struct TestForeignCowAuthority {
     live: Arc<parking_lot::RwLock<TestSnapshot>>,
     old_frame: carrick_hal::FrameId,
     /// Kernel mappings of the old frame across MMs (2: a fork peer shares it).
-    old_frame_mappings: usize,
+    old_frame_mappings: std::sync::atomic::AtomicUsize,
     allow_quiesce: bool,
     serial: std::sync::atomic::AtomicU64,
     published: parking_lot::Mutex<Option<(carrick_hal::MappingId, carrick_hal::FrameId, Gpa, u64)>>,
@@ -394,7 +402,7 @@ impl TestForeignCowAuthority {
         Self {
             live: Arc::clone(&installed.live.0),
             old_frame,
-            old_frame_mappings: 2,
+            old_frame_mappings: std::sync::atomic::AtomicUsize::new(2),
             allow_quiesce: false,
             serial: std::sync::atomic::AtomicU64::new(
                 installed.snapshot.mm.get().saturating_mul(1_000),
@@ -482,6 +490,16 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
         let mut live = self.live.write();
         live.mapping_ids
             .retain(|mapping| !removed.contains(mapping));
+        let removed_count = removed.len();
+        if removed_count != 0 {
+            self.old_frame_mappings
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |count| Some(count.saturating_sub(removed_count)),
+                )
+                .unwrap();
+        }
         live.mapping_ids
             .extend(prepared.iter().map(|(mapping, _, _, _)| *mapping));
         live.mapping_ids.sort_unstable();
@@ -656,7 +674,10 @@ impl carrick_hal::FrameCowAuthority for TestForeignCowAuthority {
         &self,
         frame: carrick_hal::FrameId,
     ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok((frame == self.old_frame).then_some(self.old_frame_mappings))
+        Ok((frame == self.old_frame).then_some(
+            self.old_frame_mappings
+                .load(std::sync::atomic::Ordering::SeqCst),
+        ))
     }
 }
 
@@ -684,6 +705,35 @@ impl carrick_hal::ForeignMmInvalidator for TestInvalidator {
 
 fn nonzero(raw: u64) -> NonZeroU64 {
     NonZeroU64::new(raw).expect("nonzero fixture identity")
+}
+
+fn retire_test_structural_backing_identities_in_using(
+    custody: &CarrierVmCustody,
+    identities: &[CarrierStage2RecordIdentity],
+    unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
+    release_ipa: &mut dyn FnMut(u64, u64) -> Result<(), TrapError>,
+) -> Result<(), TrapError> {
+    for &identity in identities {
+        if custody.stage2_record_snapshot(identity.record_id).is_some()
+            && custody
+                .stage1_unpublished_for_retirement(identity)
+                .is_none()
+        {
+            let receipt = custody.editor_receipt_after_test_unmap(identity);
+            let stage1 = custody
+                .stage1_unpublished_from_receipt(
+                    identity,
+                    Stage1UnpublicationReceipt::EditorRange(&receipt),
+                )
+                .expect("real test editor unmap covers the structural record");
+            assert_eq!(
+                custody.request_stage2_record_retirement(identity, stage1),
+                CarrierStage2RetireOutcome::DeferredActivePins,
+                "real test editor unmap authorizes structural retirement"
+            );
+        }
+    }
+    retry_structural_backing_identities_in_using(custody, identities, unmap, release_ipa)
 }
 
 fn install_owner(ipa: u64, bytes: &[u8]) -> (u64, usize) {
@@ -3582,13 +3632,17 @@ fn foreign_mm_read_rejects_a_missing_descriptor_owner() {
         *b"live",
     );
     let table_key = installed.owners.0[0];
-    global_frame_host_owners().lock().remove(&table_key);
+    let missing = global_frame_host_owners()
+        .lock()
+        .remove(&table_key)
+        .expect("remove exact descriptor owner for the stale-read window");
     let mut bytes = [0_u8; 4];
 
     assert!(matches!(
         read_installed(&transport, &installed, &mut bytes),
         Err(carrick_hal::ForeignMmTransportError::OwnerStale)
     ));
+    global_frame_host_owners().lock().insert(table_key, missing);
 }
 
 #[test]
@@ -3639,7 +3693,14 @@ fn foreign_mm_read_rejects_reused_owner_generation() {
         *b"old!",
     );
     let data_key = installed.owners.0[1];
-    global_frame_host_owners().lock().remove(&data_key);
+    let custody = legacy_test_carrier_vm_custody();
+    let identity = global_frame_stage2_identity_in(custody, data_key.0, data_key.1)
+        .expect("old data owner has exact stage-2 custody");
+    let proof = custody.stage1_unpublished_after_editor_unmap(identity);
+    assert!(
+        retire_global_frame_host_owner_in(custody, proof, data_key.0, data_key.1).is_retired(),
+        "the old incarnation must retire before same-IPA replacement"
+    );
     let replacement = vec![b'n'; data_key.1 as usize];
     let _ = install_owner(data_key.0, &replacement);
     let mut bytes = [0_u8; 4];
@@ -3805,8 +3866,16 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         carrier_mm: None,
         armed: true,
     };
+    let mut proof_task = hvpatch_neutral_task_state_for_test();
+    proof_task.cow_identity = Some(carrick_hal::FrameCowIdentity {
+        linux_pid: 106,
+        linux_tid: 106,
+        mm: snapshot.mm.get(),
+        asid: snapshot.asid.get(),
+    });
+    let stage1_unpublished = prepare_test_whole_mm_retirement(&mut proof_task);
     cleanup
-        .retire_with(&mut |_| {})
+        .retire_with_cleanup_boundary(&mut |_| {}, &mut |_| {}, Some(&stage1_unpublished))
         .expect("production exec predecessor cleanup");
     for &(ipa, length) in &owners.0 {
         assert!(
@@ -4144,7 +4213,7 @@ fn structural_backing_owner_lifecycle_and_retained_backing() {
     assert!(missing.is_err());
     drop(backing);
     drop(owner);
-    retry_structural_backing_identities_in_using(
+    retire_test_structural_backing_identities_in_using(
         legacy_test_carrier_vm_custody(),
         &[identity],
         &mut unmap_global_frame_stage2_record,
@@ -4202,7 +4271,7 @@ fn serial_host_structural_backing_owner_invalid_arguments_and_exact_drop_order()
         alias_backing_is_live(host_addr),
         "custody must retain backing until the explicit safe point"
     );
-    retry_structural_backing_identities_in_using(
+    retire_test_structural_backing_identities_in_using(
         legacy_test_carrier_vm_custody(),
         &[identity],
         &mut unmap_global_frame_stage2_record,
@@ -5224,7 +5293,7 @@ fn initial_fixed_mapping_publishes_exact_structural_owner() {
     );
 
     drop(region);
-    retry_structural_backing_identities_in_using(
+    retire_test_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
         &mut unmap_global_frame_stage2_record,
@@ -5483,7 +5552,7 @@ fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
     drop(desc);
     drop(region);
     drop(owner);
-    retry_structural_backing_identities_in_using(
+    retire_test_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
         &mut unmap_global_frame_stage2_record,
@@ -6047,7 +6116,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
     let cow_authority = Arc::new(TestForeignCowAuthority {
         live: Arc::clone(&child_live.0),
         old_frame: vvar_extent.frame,
-        old_frame_mappings: 2,
+        old_frame_mappings: std::sync::atomic::AtomicUsize::new(2),
         allow_quiesce: true,
         serial: std::sync::atomic::AtomicU64::new(871_000),
         published: parking_lot::Mutex::new(None),
@@ -6426,6 +6495,11 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
     prepared.inventory = HvpatchTaskInventoryAuthority::Absent;
     drop(child_state);
     drop(child_inventory);
+    // The detached table image carries the live resolver and therefore exact
+    // physical pins. Retire it before asking the structural and COW owners to
+    // reach terminal custody; otherwise the next same-IPA fixture observes a
+    // legitimate deferred retirement.
+    drop(child_page_tables_authority);
     let retired = retire_test_global_frame_host_owner_if_generation_in(
         &transport.custody,
         child_private_key.0,
@@ -6437,18 +6511,41 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
         "retire child-private vvar COW fixture: {retired:?}",
     );
     drop(child_private_owner);
+    drop(grandchild_mappings);
+    drop(grandchild_inventory);
+    drop(prepared);
     carrier.abort().expect("retire child carrier fixture");
     drop(projected);
     drop(parent);
     drop(vvar_owner);
     drop(overlay_owner);
-    retry_structural_backing_identities_in_using(
+    retire_test_structural_backing_identities_in_using(
         &transport.custody,
         &[vvar_identity, overlay_identity],
         &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,
     )
     .expect("retire production vvar fixture");
+    assert!(
+        transport
+            .custody
+            .stage2_record_snapshot(vvar_identity.record_id)
+            .is_none(),
+        "production vvar record must be terminal before same-IPA fixture reuse: {:?}",
+        transport
+            .custody
+            .stage2_record_snapshot(vvar_identity.record_id)
+    );
+    assert!(
+        transport
+            .custody
+            .stage2_record_snapshot(overlay_identity.record_id)
+            .is_none(),
+        "production overlay record must be terminal before same-IPA fixture reuse: {:?}",
+        transport
+            .custody
+            .stage2_record_snapshot(overlay_identity.record_id)
+    );
 }
 
 #[test]
@@ -6506,7 +6603,16 @@ fn current_generation_structural_owner_needs_no_replay_rebind() {
     );
     drop(region);
     drop(owner);
-    retry_structural_backing_identities_in_using(
+    let stage1 = transport
+        .custody
+        .stage1_unpublished_after_editor_unmap(identity);
+    assert_eq!(
+        transport
+            .custody
+            .request_stage2_record_retirement(identity, stage1),
+        CarrierStage2RetireOutcome::DeferredActivePins
+    );
+    retire_test_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
         &mut unmap_global_frame_stage2_record,
@@ -6602,7 +6708,7 @@ fn old_generation_structural_owner_still_requires_exact_replay() {
         .expect("publish G2 fixture");
     drop(region);
     drop(owner);
-    retry_structural_backing_identities_in_using(
+    retire_test_structural_backing_identities_in_using(
         &transport.custody,
         &[g2_identity],
         &mut unmap_global_frame_stage2_record,
@@ -6715,7 +6821,7 @@ fn structural_alias_rejects_forged_semantic_host_projection() {
     drop(projected);
     drop(source);
     drop(region);
-    retry_structural_backing_identities_in_using(
+    retire_test_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
         &mut unmap_global_frame_stage2_record,
@@ -6866,7 +6972,7 @@ fn initial_fixed_mapping_composes_through_first_fork_preparation() {
     drop(projected);
     drop(region);
     drop(root_owner);
-    retry_structural_backing_identities_in_using(
+    retire_test_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
         &mut unmap_global_frame_stage2_record,
@@ -7069,7 +7175,7 @@ fn private_overlay_publication_preserves_structural_owner_across_fork() {
     drop(projected);
     drop(region);
     drop(parent_owner);
-    retry_structural_backing_identities_in_using(
+    retire_test_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
         &mut unmap_global_frame_stage2_record,
@@ -7445,7 +7551,16 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
     drop(child_source);
     drop(prepared);
     drop(owner);
-    retry_structural_backing_identities_in_using(
+    let stage1 = transport
+        .custody
+        .stage1_unpublished_after_editor_unmap(identity);
+    assert_eq!(
+        transport
+            .custody
+            .request_stage2_record_retirement(identity, stage1),
+        CarrierStage2RetireOutcome::DeferredActivePins
+    );
+    retire_test_structural_backing_identities_in_using(
         &transport.custody,
         &[identity],
         &mut unmap_global_frame_stage2_record,
@@ -10164,8 +10279,8 @@ fn full_vm_materializer_stamps_fresh_owner_before_alias_mapping_and_inventory() 
         .expect("full-VM process materializer body");
     let registration = full_vm
         .find(concat!(
-            "let owner_generation = register_global_frame_host_",
-            "owner_in("
+            "register_unpublished_global_frame_",
+            "host_owner_in("
         ))
         .expect("owned reusable mapping registers its exact owner");
     let alias = full_vm
@@ -10597,7 +10712,7 @@ fn task_only_partial_map_unmap_failure_fail_stops_before_root_slot_reuse() {
         "the occupied slot cannot be reissued after the carrier fail-stop boundary",
     );
 
-    retry_structural_backing_identities_in_using(
+    retire_test_structural_backing_identities_in_using(
         &custody,
         &new_records,
         &mut unmap_global_frame_stage2_record,
@@ -10648,7 +10763,7 @@ fn task_only_partial_map_rollback_ignores_unrelated_retry_pending_record() {
     drop(sentinel_owner);
     stage2_stub.set_fail_next_unmap(true);
     assert!(
-        retry_structural_backing_identities_in_using(
+        retire_test_structural_backing_identities_in_using(
             &custody,
             &[sentinel_identity],
             &mut unmap_global_frame_stage2_record,
@@ -10675,7 +10790,7 @@ fn task_only_partial_map_rollback_ignores_unrelated_retry_pending_record() {
             .is_some_and(|snapshot| snapshot.retry_pending.is_some()),
     );
 
-    retry_structural_backing_identities_in_using(
+    retire_test_structural_backing_identities_in_using(
         &custody,
         &[sentinel_identity],
         &mut unmap_global_frame_stage2_record,
@@ -11170,7 +11285,8 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
     assert_eq!(
         ScopedStage2MapTestStub::mapped_count(),
         0,
-        "directory publish rollback must abort and unmap all stage2 leases"
+        "directory publish rollback must abort and unmap all stage2 leases: {:?}",
+        ScopedStage2MapTestStub::events(),
     );
     drop(external_state_restore);
 
@@ -11767,10 +11883,21 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
     ));
     let root = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
     let root_slot = (root, 0x20_0000_u64);
+    let fixture_table_root = 0x9a00_7800_0000;
     let data_ipa = 0x9b00_7800_0000;
     let ext_ipa = 0x9a00_7820_0000;
-    let mut installed = install_mm(&transport, 301, root, data_ipa, *b"test");
+    let mut installed = install_mm(&transport, 301, fixture_table_root, data_ipa, *b"test");
     installed.owners.0.push((ext_ipa, 4096));
+    installed
+        .state
+        .frame_inventory
+        .ledger
+        .lock()
+        .extents
+        .remove(&(
+            fixture_table_root,
+            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
+        ));
 
     // 1. Install real pooled root structural owner in custody and state
     let root_mapping = pool.allocate_slot_at(root).expect("allocate pooled root");
@@ -11792,14 +11919,6 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
         .state
         .install_structural_mapping_authority(Some(root_slot), Arc::clone(&root_owner))
         .expect("install root structural authority");
-    installed
-        .state
-        .frame_inventory
-        .ledger
-        .lock()
-        .extents
-        .remove(&(root, carrick_mem::memory::LINUX_PAGE_TABLES_SIZE));
-
     // Add global extension arena to frame inventory
     let ext_bytes = vec![0_u8; 4096];
     let (ext_generation, ext_host) = install_owner(ext_ipa, &ext_bytes);
@@ -11993,6 +12112,11 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
         "querying cached extension after removal from live authority must fail closed"
     );
 
+    installed
+        .state
+        .retire_mm_root_stage2_in(&transport.custody, root_slot)
+        .expect("retire the reissued pooled root through its exact arena receipt");
+
     // 8. Dropping state invalidates cached root lookup on old resolver
     let state_weak = Arc::downgrade(&installed.state);
     drop(installed);
@@ -12046,7 +12170,7 @@ fn live_resolver_records_extension_prefix_before_pool_reuse() {
         .retained
         .owner_retired
         .store(true, std::sync::atomic::Ordering::Release);
-    retry_structural_backing_identities_in_using(
+    retire_test_structural_backing_identities_in_using(
         &transport.custody,
         &[owner.record_identity()],
         &mut unmap_global_frame_stage2_record,
@@ -12074,11 +12198,13 @@ fn live_resolver_records_extension_prefix_before_pool_reuse() {
 /// routes `FrameCowWriteRoute::MaterializeRetired` into
 /// `materialize_retired_reuse`.
 struct RetainedReuseFixture {
-    installed: InstalledMm,
     task: HvfTaskState,
     authority: Arc<TestForeignCowAuthority>,
     root_key: (u64, u64),
     root_host: usize,
+    // Drop the task and its COW authority before retiring the fixture's exact
+    // stage-2 owners; both can retain physical pins into those owners.
+    installed: InstalledMm,
 }
 
 fn retained_reuse_fixture(
@@ -12157,11 +12283,11 @@ fn retained_reuse_fixture(
     assert_eq!(tables.with_manager(|m| m.translate(TEST_VA)), Some(None));
     assert!(task.physical_cow_source(TEST_VA, data_ipa).is_none());
     RetainedReuseFixture {
-        installed,
         task,
         authority,
         root_key,
         root_host,
+        installed,
     }
 }
 
@@ -12969,8 +13095,10 @@ mod guest_cow {
                 0x9a01_2e00_0000 + (ordinal - 742) * 0x100_0000,
                 0x9b01_2e00_0000 + (ordinal - 742) * 0x100_0000,
             );
-            let mut authority = TestForeignCowAuthority::new(&child);
-            authority.old_frame_mappings = mappings;
+            let authority = TestForeignCowAuthority::new(&child);
+            authority
+                .old_frame_mappings
+                .store(mappings, std::sync::atomic::Ordering::SeqCst);
             child.state.cow_runtime.write().as_mut().unwrap().authority = Arc::new(authority);
             let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
             provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();

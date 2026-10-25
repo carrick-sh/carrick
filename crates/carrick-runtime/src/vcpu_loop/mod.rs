@@ -4899,6 +4899,27 @@ pub(crate) mod tests {
             native_owner: native_owner.clone(),
             ..Default::default()
         };
+        let retirement = Arc::new(RetirementRequestedBacking {
+            ready: std::sync::atomic::AtomicBool::new(false),
+            callbacks: carrick_thread::completion::CompletionCallbacks::default(),
+        });
+        let munmap_tables = physical.then(|| {
+            let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
+                carrick_mem::memory::stage1_hvpatch_page_tables(),
+                carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+                carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+            );
+            manager
+                .map_aliased(
+                    0x71_1000,
+                    0xa084_7100_0000,
+                    4096,
+                    carrick_mmu_core::aarch64::UserLeafAccess::READ_WRITE,
+                    None,
+                )
+                .unwrap();
+            carrick_aarch64::Stage1Authority::new_with_manager(Some(manager))
+        });
 
         let handback_scheduler = Arc::downgrade(&scheduler);
         let handback: carrick_kernel::el1_zone::HandbackPublisher = Arc::new(move |event| {
@@ -4918,6 +4939,8 @@ pub(crate) mod tests {
                         }
                     }
                     let _release_on_failure = ReleaseOnDrop(&release_tx);
+                    let retirement_for_peer = Arc::clone(&retirement);
+                    let munmap_tables_for_peer = munmap_tables.clone();
                     let mut peer = Some(scope.spawn(move || {
                         let access = carrick_el1_linux::sched::object_wait::space_access(
                             zone,
@@ -4932,6 +4955,21 @@ pub(crate) mod tests {
                             .unwrap();
                         entered_tx.send(()).unwrap();
                         release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        if let Some(tables) = munmap_tables_for_peer {
+                            let (_, receipt) = tables
+                                .edit_unpublishing(
+                                    || unreachable!("installed munmap witness manager"),
+                                    0x71_1000,
+                                    4096,
+                                    |editor| editor.invalidate(0x71_1000, 4096).map(|_| ()),
+                                )
+                                .unwrap();
+                            assert!(
+                                receipt.is_some(),
+                                "the production host edit must remove the selected leaf"
+                            );
+                            retirement_for_peer.complete();
+                        }
                         let editor = if release_wins {
                             drop(editor);
                             let editor = access
@@ -4961,10 +4999,6 @@ pub(crate) mod tests {
                     engine.copyout_owner_probe = Some(CopyoutOwnerProbe {
                         wait,
                         zone: zone as *const _ as usize,
-                    });
-                    let retirement = Arc::new(RetirementRequestedBacking {
-                        ready: std::sync::atomic::AtomicBool::new(false),
-                        callbacks: carrick_thread::completion::CompletionCallbacks::default(),
                     });
                     if physical {
                         engine.prepare_dependency =
@@ -5365,7 +5399,9 @@ pub(crate) mod tests {
                             engine.copyout_owner_probe = None;
                             engine.copyout_prepare = Some(Box::new(|| None));
                         }
-                        retirement.complete();
+                        if !physical {
+                            retirement.complete();
+                        }
                     }
                     if !killing && !stale_selection_without_editor && !close_mm_while_parked {
                         release_tx.send(()).unwrap();

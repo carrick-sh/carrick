@@ -427,3 +427,61 @@ Fresh portable verification:
 
 No signed test was run because this correction changes source and therefore
 requires an exact-candidate fixture bundle.
+
+## Exact stage-1 and rollback proofs after review of `055bf2354`
+
+Editor retirement receipts now carry the exact VA-to-IPA translations removed
+by their edit. Converting one into a stage-2 retirement witness checks that the
+record's IPA occurs in that receipt; whole-arena retirement likewise checks the
+retired physical bases. The proof and whole-MM inventory drain are consume-once
+types. Tests obtain Editor receipts by performing real stage-1 unmaps.
+
+The caller-constructed `AuthoritativeAbsence` escape hatch is gone. Frame-COW
+and alias retirement use the kernel frame authority's VM-wide reverse-map
+population. The shared COW inventory commit performs that check at the final
+retirement point: if a racing fork peer still maps the frame, the carrier keeps
+stage-2 authority instead of retiring it or aborting. The serialized HVF suite's
+`concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit` test
+exercised this case with one remaining mapping.
+
+Records which never reached stage 1 carry a typed `Stage2RollbackReceipt` from
+registration through the exact publication transaction. Rollback consumes only
+that transaction's receipts, so it cannot skip retirement or accidentally retry
+an unrelated historical owner. Host retention treats a missing host-side table
+view as unknown, not as a ready reselect, and permits only one reselect for a
+given Editor revision.
+
+Exactly two tests are new relative to `055bf2354`:
+
+- `editor_receipt_cannot_retire_a_record_outside_its_removed_ipa_range`;
+- `absent_host_stage1_view_is_unknown_not_ready_reselect`.
+
+The review also materially strengthened or renamed these production-path
+witnesses (they are not counted as new):
+
+- `host_stage1_unmap_allows_one_reselect_per_host_edit_revision`;
+- `serial_host_munmap_retirement_races_blocking_read_with_one_executor`;
+- `serial_host_mm_exit_close_races_a_parked_sibling_copy_without_invariant_kill`;
+- `two_mms_by_n_real_retirements_leave_no_custody_growth`;
+- `serial_host_global_owner_collision_refuses_before_custody_transfer`;
+- `serial_host_foreign_mm_failure_injection_at_composition_boundaries`;
+- `concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit`;
+- the three `stage2_backend::ipc_window_tests` rollback/publication cases.
+
+Fresh portable verification:
+
+- serialized `carrick-vmm-hvf` library: 798 passed, 3 ignored;
+- both production owner-park witnesses above: 1 passed each;
+- `just test-kernel`: passed (kernel 2,638 passed with one ignored and every
+  kernel-semantics target completed without a failure);
+- `just fmt-check`, `just clippy`, `just clippy-linux`, and
+  `just lint-domains`: passed;
+- default EL1 image: 1,053,104 / 1,572,864 bytes; maximum checked stack
+  11,503 / 12,288 bytes (`native wait copy`);
+- allocator-test-control EL1 image: 1,057,296 / 1,572,864 bytes; maximum
+  checked stack 11,503 / 12,288 bytes (`native wait copy`);
+- all-target clippy EL1 image: 1,077,712 / 1,572,864 bytes; maximum checked
+  stack 11,951 / 12,288 bytes (`signal terminal exit`).
+
+No signed test was run because this correction changes source and therefore
+requires an exact-candidate fixture bundle.

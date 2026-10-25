@@ -26,6 +26,7 @@ pub(super) struct PublishedFrameGrant {
     pub(super) ready: carrick_hal::El1FrameGrantReady,
     pub(super) receipt: carrick_hal::FrameInventoryApplyReceipt,
     pub(super) inventory_entry: ((u64, u64), InventoryExtent),
+    pub(super) rollback: Option<Stage2RollbackReceipt>,
 }
 
 pub(super) fn frame_grant_local_lease_is_current(
@@ -114,6 +115,7 @@ pub(super) fn prepare(
         inventory_backing,
         page_granular_arm,
         owner_generation,
+        rollback_receipt,
     ) = if let Some(handle) = pooled_handle {
         let host_ptr = handle.as_mut_ptr();
         let ipa = handle.ipa();
@@ -124,8 +126,12 @@ pub(super) fn prepare(
         let stage2_perms = applevisor::memory::MemPerms::ReadWriteExec;
         let inventory_backing = HvfVmState::private_backing_identity();
         let page_granular_arm = false;
-        let owner_generation =
-            register_pooled_global_frame_host_owner_in(&custody, handle, u64::from(stage2_perms))?;
+        let (owner_generation, rollback_receipt) =
+            register_unpublished_pooled_global_frame_host_owner_in(
+                &custody,
+                handle,
+                u64::from(stage2_perms),
+            )?;
         (
             host_ptr,
             host_ptr,
@@ -135,6 +141,7 @@ pub(super) fn prepare(
             inventory_backing,
             page_granular_arm,
             owner_generation,
+            rollback_receipt,
         )
     } else {
         if can_pool {
@@ -244,7 +251,7 @@ pub(super) fn prepare(
             )));
         }
         lease.mark_mapped();
-        let owner_generation = register_global_frame_host_owner_in(
+        let (owner_generation, rollback_receipt) = register_unpublished_global_frame_host_owner_in(
             &custody,
             lease,
             host_mapping,
@@ -259,10 +266,11 @@ pub(super) fn prepare(
             inventory_backing,
             page_granular_arm,
             owner_generation,
+            rollback_receipt,
         )
     };
     let mut owner_rollback = GlobalFrameOwnerRollback::new(custody);
-    owner_rollback.record((physical_ipa, physical_len));
+    owner_rollback.record((physical_ipa, physical_len), rollback_receipt);
     Ok(PreparedSparseBacking {
         physical_host,
         semantic_host,
@@ -507,15 +515,24 @@ fn publish_frame_grant_backing(
         owner_generation,
         inventory_revision: receipt.revision(),
     };
-    let completion = context
+    let owner = context
         .custody
         .global_frame_host_owners
         .lock()
         .get(&(physical_ipa, physical_len))
         .and_then(GlobalFrameOwnerEntry::live_owner)
         .filter(|owner| owner.generation() == owner_generation)
-        .unwrap_or_else(|| carrick_fatal!("hvpatch::physical_grant", "new grant lost exact owner"))
-        .begin_grant_publication();
+        .cloned();
+    let mut owner_rollback = owner_rollback;
+    let (owner, rollback) = owner
+        .zip(owner_rollback.take((physical_ipa, physical_len)))
+        .unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::physical_grant",
+                "new grant lost its exact owner or unpublished stage-2 rollback receipt"
+            )
+        });
+    let completion = owner.begin_grant_publication();
     owner_rollback.commit();
     Ok(PublishedFrameGrant {
         completion,
@@ -524,6 +541,7 @@ fn publish_frame_grant_backing(
         ready,
         receipt,
         inventory_entry,
+        rollback: Some(rollback),
     })
 }
 
@@ -1908,6 +1926,30 @@ impl MmAccessState {
                 }
             };
             let identity = owner.record_identity();
+            if custody
+                .stage1_unpublished_for_retirement(identity)
+                .is_none()
+            {
+                let rollback = owner.take_unpublished_rollback().ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "rollback arena lost its unpublished stage-2 receipt".to_owned(),
+                    )
+                })?;
+                let stage1 = custody
+                    .stage1_unpublished_from_rollback(identity, rollback)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "rollback arena receipt names another stage-2 record".to_owned(),
+                        )
+                    })?;
+                if custody.request_stage2_record_retirement(identity, stage1)
+                    != CarrierStage2RetireOutcome::DeferredActivePins
+                {
+                    return Err(TrapError::Hypervisor(
+                        "rollback arena could not authorize stage-2 retirement".to_owned(),
+                    ));
+                }
+            }
             owner
                 .retained
                 .owner_retired
@@ -2805,7 +2847,7 @@ impl Drop for PendingTransferGrant {
                     )
                 });
         }
-        let Some(publication) = self.publication.take() else {
+        let Some(mut publication) = self.publication.take() else {
             return;
         };
         let binding = self
@@ -2894,15 +2936,11 @@ impl Drop for PendingTransferGrant {
             if let Some(identity) =
                 global_frame_stage2_identity_in(&self.context.custody, key.0, key.1)
             {
-                let authority = self.context.state.page_tables_authority();
-                if let Some(stage1) = self.context.custody.stage1_unpublished_from_receipt(
-                    identity,
-                    Stage1UnpublicationReceipt::AuthoritativeAbsence {
-                        authority: &authority,
-                        va: publication.alias.start,
-                        len: publication.alias.size,
-                    },
-                ) {
+                if let Some(stage1) = publication.rollback.take().and_then(|receipt| {
+                    self.context
+                        .custody
+                        .stage1_unpublished_from_rollback(identity, receipt)
+                }) {
                     retire_global_frame_host_owner_if_generation_in(
                         &self.context.custody,
                         stage1,

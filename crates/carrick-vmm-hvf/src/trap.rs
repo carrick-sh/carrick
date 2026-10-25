@@ -3899,22 +3899,16 @@ impl Drop for HvpatchCarrierMmAuthority {
                     .drain(..)
                     .filter_map(|key| custody.carrier_stage2_records.lock().get(&key).copied())
                     .collect::<Vec<_>>();
-                let mut logical_leases = carrier_stage2_logical_leases(custody, &identities);
-                let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
-                    carrick_mem::memory::stage1_hvpatch_page_tables(),
-                    crate::memory::LINUX_PAGE_TABLES_BASE,
-                    carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
-                );
-                let (_, receipt) =
-                    carrick_aarch64::vmm::Stage1UnpublishedRange::retire_extension_arenas(
-                        &mut manager,
+                for identity in identities {
+                    let receipt = custody.editor_receipt_after_test_unmap(identity);
+                    let mut logical_leases = carrier_stage2_logical_leases(custody, &[identity]);
+                    request_carrier_stage2_record_retirements(
+                        &mut logical_leases,
+                        &std::sync::Arc::downgrade(custody),
+                        frames,
+                        carrier_custody::Stage1UnpublicationReceipt::EditorRange(&receipt),
                     );
-                request_carrier_stage2_record_retirements(
-                    &mut logical_leases,
-                    &std::sync::Arc::downgrade(custody),
-                    frames,
-                    carrier_custody::Stage1UnpublicationReceipt::Editor(&receipt),
-                );
+                }
             }
             #[cfg(test)]
             Self::PublicationTest { .. } => {}
@@ -4091,18 +4085,32 @@ struct HvpatchPreparedTaskAuthority {
 }
 
 pub(super) struct UnpublishedTaskStage1 {
-    _private: (),
-}
-
-impl Clone for UnpublishedTaskStage1 {
-    fn clone(&self) -> Self {
-        Self { _private: () }
-    }
+    rollback_receipts:
+        parking_lot::Mutex<Vec<(CarrierStage2RecordIdentity, Stage2RollbackReceipt)>>,
 }
 
 impl UnpublishedTaskStage1 {
     fn begin_inventory_transaction() -> Self {
-        Self { _private: () }
+        Self {
+            rollback_receipts: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record(&self, identity: CarrierStage2RecordIdentity, receipt: Stage2RollbackReceipt) {
+        let mut receipts = self.rollback_receipts.lock();
+        debug_assert!(
+            !receipts.iter().any(|(candidate, _)| *candidate == identity),
+            "unpublished stage-2 record received two rollback receipts"
+        );
+        receipts.push((identity, receipt));
+    }
+
+    fn consume(&self, identity: CarrierStage2RecordIdentity) -> Option<Stage2RollbackReceipt> {
+        let mut receipts = self.rollback_receipts.lock();
+        let index = receipts
+            .iter()
+            .position(|(candidate, _)| *candidate == identity)?;
+        Some(receipts.swap_remove(index).1)
     }
 }
 
@@ -4847,6 +4855,7 @@ fn abort_prepared_task_and_carrier(
     state: HvpatchCarrierTaskState,
 ) -> Result<(), TrapError> {
     let custody = task.custody.as_ref().cloned();
+    let structural_identities = task.unpublished_structural_identities.clone();
     // The backend ledger must forget every unpublished mapping BEFORE the
     // carrier leases can return their IPAs to the allocator. Keep `task` alive
     // until after carrier teardown so its host mappings still back any installed
@@ -4941,8 +4950,9 @@ fn abort_prepared_task_and_carrier(
     drop(task);
     state_result?;
     if let Some(custody) = custody.as_ref()
-        && let Err(error) = retry_structural_backing_retirements_in_using(
+        && let Err(error) = retry_structural_backing_identities_in_using(
             custody,
+            &structural_identities,
             &mut unmap_global_frame_stage2_record,
             &mut release_retired_stage2_ipa,
         )
@@ -6741,7 +6751,7 @@ impl HvpatchCarrierTaskStateDirectory {
         self: &std::sync::Arc<Self>,
         identity: HvpatchCarrierTaskIdentity,
         state: HvpatchCarrierTaskState,
-        task: HvpatchPreparedTaskAuthority,
+        mut task: HvpatchPreparedTaskAuthority,
         failpoint: u8,
     ) -> Result<HvpatchTaskOnlyBackendState, TrapError> {
         #[cfg(not(test))]
@@ -6983,12 +6993,12 @@ impl HvpatchCarrierTaskStateDirectory {
                         ),
                         stage1_lifecycle: parking_lot::Mutex::new(
                             CarrierMmStage1Lifecycle::Unpublished(
-                                task.unpublished_stage1.as_ref().ok_or_else(|| {
+                                task.unpublished_stage1.take().ok_or_else(|| {
                                     TrapError::Hypervisor(
                                         "prepared process has no unpublished inventory receipt"
                                             .to_owned(),
                                     )
-                                })?.clone(),
+                                })?,
                             ),
                         ),
                     })),
@@ -7421,17 +7431,29 @@ impl HvfVmState {
                 ) {
                     match (mapping.stage2_lease.take(), mapping.host) {
                         (Some(lease), ProcessMappingHost::Owned(host_mapping)) => {
-                            let owner_generation = register_global_frame_host_owner_in(
-                                &plan.carrier_foreign_mm_transport.custody,
-                                lease,
-                                host_mapping,
-                                u64::from(mapping.perms),
-                            )?;
+                            let (owner_generation, rollback) =
+                                register_unpublished_global_frame_host_owner_in(
+                                    &plan.carrier_foreign_mm_transport.custody,
+                                    lease,
+                                    host_mapping,
+                                    u64::from(mapping.perms),
+                                )?;
                             registered_global_owners.push((
                                 mapping.physical_ipa,
                                 mapping.physical_size as u64,
                                 owner_generation,
                             ));
+                            let identity = global_frame_stage2_identity_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                mapping.physical_ipa,
+                                mapping.physical_size as u64,
+                            )
+                            .ok_or_else(|| {
+                                TrapError::Hypervisor(
+                                    "unpublished global owner lost its stage-2 record".to_owned(),
+                                )
+                            })?;
+                            unpublished_stage1.record(identity, rollback);
                             (
                                 None,
                                 None,
@@ -7493,7 +7515,15 @@ impl HvfVmState {
                                 mapping.physical_size,
                             )?;
                             let owner_generation = epoch.raw();
-                            structural_identities.push(owner.record_identity());
+                            let identity = owner.record_identity();
+                            let rollback = owner.take_unpublished_rollback().ok_or_else(|| {
+                                TrapError::Hypervisor(
+                                    "unpublished structural owner lost its rollback receipt"
+                                        .to_owned(),
+                                )
+                            })?;
+                            structural_identities.push(identity);
+                            unpublished_stage1.record(identity, rollback);
                             structural_owners.insert(
                                 (mapping.physical_ipa, mapping.physical_size),
                                 std::sync::Arc::clone(&owner),
@@ -7524,7 +7554,14 @@ impl HvfVmState {
                                 mapping.physical_size,
                             )?;
                             let owner_generation = epoch.raw();
-                            structural_identities.push(owner.record_identity());
+                            let identity = owner.record_identity();
+                            let rollback = owner.take_unpublished_rollback().ok_or_else(|| {
+                                TrapError::Hypervisor(
+                                    "unpublished pooled root lost its rollback receipt".to_owned(),
+                                )
+                            })?;
+                            structural_identities.push(identity);
+                            unpublished_stage1.record(identity, rollback);
                             structural_owners.insert(
                                 (mapping.physical_ipa, mapping.physical_size),
                                 std::sync::Arc::clone(&owner),
@@ -7903,17 +7940,29 @@ impl HvfVmState {
                 ) {
                     match (mapping.stage2_lease.take(), mapping.host) {
                         (Some(lease), ProcessMappingHost::Owned(host_mapping)) => {
-                            let owner_generation = register_global_frame_host_owner_in(
-                                &plan.carrier_foreign_mm_transport.custody,
-                                lease,
-                                host_mapping,
-                                u64::from(mapping.perms),
-                            )?;
+                            let (owner_generation, rollback) =
+                                register_unpublished_global_frame_host_owner_in(
+                                    &plan.carrier_foreign_mm_transport.custody,
+                                    lease,
+                                    host_mapping,
+                                    u64::from(mapping.perms),
+                                )?;
                             registered_global_owners.push((
                                 mapping.physical_ipa,
                                 mapping.physical_size as u64,
                                 owner_generation,
                             ));
+                            let identity = global_frame_stage2_identity_in(
+                                &plan.carrier_foreign_mm_transport.custody,
+                                mapping.physical_ipa,
+                                mapping.physical_size as u64,
+                            )
+                            .ok_or_else(|| {
+                                TrapError::Hypervisor(
+                                    "unpublished global owner lost its stage-2 record".to_owned(),
+                                )
+                            })?;
+                            unpublished_stage1.record(identity, rollback);
                             (None, None, None, owner_generation)
                         }
                         (None, ProcessMappingHost::Borrowed { .. }) => {
@@ -7960,7 +8009,15 @@ impl HvfVmState {
                                 mapping.physical_size,
                             )?;
                             let owner_generation = epoch.raw();
-                            structural_identities.push(owner.record_identity());
+                            let identity = owner.record_identity();
+                            let rollback = owner.take_unpublished_rollback().ok_or_else(|| {
+                                TrapError::Hypervisor(
+                                    "unpublished structural owner lost its rollback receipt"
+                                        .to_owned(),
+                                )
+                            })?;
+                            structural_identities.push(identity);
+                            unpublished_stage1.record(identity, rollback);
                             structural_owners.insert(
                                 (mapping.physical_ipa, mapping.physical_size),
                                 std::sync::Arc::clone(&owner),
@@ -7985,7 +8042,14 @@ impl HvfVmState {
                                 mapping.physical_size,
                             )?;
                             let owner_generation = epoch.raw();
-                            structural_identities.push(owner.record_identity());
+                            let identity = owner.record_identity();
+                            let rollback = owner.take_unpublished_rollback().ok_or_else(|| {
+                                TrapError::Hypervisor(
+                                    "unpublished pooled root lost its rollback receipt".to_owned(),
+                                )
+                            })?;
+                            structural_identities.push(identity);
+                            unpublished_stage1.record(identity, rollback);
                             structural_owners.insert(
                                 (mapping.physical_ipa, mapping.physical_size),
                                 std::sync::Arc::clone(&owner),

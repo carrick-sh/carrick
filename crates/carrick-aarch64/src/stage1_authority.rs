@@ -65,9 +65,17 @@ pub trait TableArenaPublisher: Send + Sync {
     fn publish_raw_table_arena(&self, _base: u64) -> Result<(), String> {
         Err("raw Fork table capacity is unavailable".into())
     }
-    /// Release unused capacity after the owner's exact abort/unused receipt.
-    fn retire_raw_table_arena(&self, _base: u64) -> Result<(), String> {
+    /// Roll back capacity that no committed stage-1 image ever named.
+    fn rollback_raw_table_arena(&self, _base: u64) -> Result<(), String> {
         Err("raw Fork table capacity retirement is unavailable".into())
+    }
+    /// Retire capacity removed from a committed stage-1 image.
+    fn retire_published_raw_table_arena(
+        &self,
+        _base: u64,
+        _receipt: &crate::vmm::Stage1UnpublishedArenas,
+    ) -> Result<(), String> {
+        Err("published raw Fork table capacity retirement is unavailable".into())
     }
 }
 
@@ -93,6 +101,10 @@ struct Stage1AuthorityInner {
     live_owner: LiveDescriptorOwner,
     /// Last guest descriptor transaction generation issued for this MM.
     txn_generation: u64,
+    /// Monotonic host-edit generation. A transfer may use one changed host
+    /// image to request one fresh EL1 SELECT, but cannot spin by treating the
+    /// same image as new progress on every SELECT.
+    host_edit_revision: u64,
     /// The guest lane was admitted for this MM before its live backing was
     /// bound; `bind_live_backing` completes the selection.
     guest_lane_pending: bool,
@@ -262,6 +274,7 @@ impl Stage1Authority {
                 image_pool,
                 live_owner: LiveDescriptorOwner::Host,
                 txn_generation: 0,
+                host_edit_revision: 0,
                 guest_lane_pending: false,
             })),
         }
@@ -491,6 +504,13 @@ impl Stage1Authority {
     /// The venue that owns this address space's live descriptor stores.
     pub fn live_descriptor_owner(&self) -> LiveDescriptorOwner {
         self.inner.lock().live_owner
+    }
+
+    /// Exact authority identity and monotonic host-edit revision used to
+    /// bound stale-selection revalidation to one SELECT per changed image.
+    pub fn host_edit_observation(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        (self.authority_id(), inner.host_edit_revision)
     }
 
     /// Build one guest descriptor transaction for `mm_key` on the guest-owned
@@ -799,7 +819,10 @@ impl Stage1Authority {
         &self,
         root: Option<u64>,
         disposition: TableArenaRetirement,
-        retire_root: impl FnOnce(Option<&PageTableManager>) -> Result<R, String>,
+        retire_root: impl FnOnce(
+            Option<&PageTableManager>,
+            &crate::vmm::Stage1UnpublishedArenas,
+        ) -> Result<R, String>,
     ) -> Result<R, String> {
         let (result, image, source) = {
             let mut inner = self.inner.lock();
@@ -814,10 +837,15 @@ impl Stage1Authority {
                 carrick_core::mm::retirement::retire_table_arenas(
                     &mut inner.published_arenas,
                     root,
-                    |base| publisher.retire_raw_table_arena(base),
+                    |base| {
+                        let receipt =
+                            crate::vmm::Stage1UnpublishedArenas::retired_table_capacity(Some(base));
+                        publisher.retire_published_raw_table_arena(base, &receipt)
+                    },
                 )?;
             }
-            let result = retire_root(inner.manager.as_ref())?;
+            let root_receipt = crate::vmm::Stage1UnpublishedArenas::retired_table_capacity(root);
+            let result = retire_root(inner.manager.as_ref(), &root_receipt)?;
             let (image, source) = if disposition == TableArenaRetirement::Terminal {
                 inner.host_resolver = None;
                 inner.published_arenas.clear();
@@ -827,7 +855,8 @@ impl Stage1Authority {
             };
             (result, image, source)
         };
-        if let Some(image) = image {
+        if let Some(mut image) = image {
+            image.retire_live_resolver();
             self.inner.lock().image_pool.recycle(image);
         }
         drop(source);
@@ -1199,22 +1228,29 @@ impl Stage1Authority {
                 );
                 *inner.manager = Some(manager);
             }
-            let Stage1AuthorityInner {
-                ref mut manager,
-                ref mut arena_source,
-                live_owner,
-                ..
-            } = *inner;
-            let manager = manager
-                .as_mut()
-                .expect("manager must be present after lazy initialization");
-            manager.declare_live_hardware_image();
-            manager.set_live_descriptor_owner(live_owner);
-            let mut editor = Stage1Editor {
-                manager,
-                arena_source,
+            let result = {
+                let Stage1AuthorityInner {
+                    ref mut manager,
+                    ref mut arena_source,
+                    live_owner,
+                    ..
+                } = *inner;
+                let manager = manager
+                    .as_mut()
+                    .expect("manager must be present after lazy initialization");
+                manager.declare_live_hardware_image();
+                manager.set_live_descriptor_owner(live_owner);
+                let mut editor = Stage1Editor {
+                    manager,
+                    arena_source,
+                };
+                f(&mut editor)?
             };
-            f(&mut editor)
+            // This is a change detector, not a durable identity. A stale
+            // observation can compare equal after wrap only if one host copy
+            // overlaps 2^64 completed, lock-serialized edits of this MM.
+            inner.host_edit_revision = inner.host_edit_revision.wrapping_add(1);
+            Ok(result)
         }
     }
 
@@ -1234,21 +1270,13 @@ impl Stage1Authority {
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
     {
         self.edit(builder, |editor| {
-            let result = f(editor)?;
-            let end = va.checked_add(len as u64);
-            let unpublished = end.is_some_and(|end| {
-                let mut cursor = va & !0xfff;
-                while cursor < end {
-                    if editor.translate(cursor).is_some() {
-                        return false;
-                    }
-                    cursor = cursor.saturating_add(4096);
-                }
-                true
+            let plan = crate::vmm::Stage1UnpublishedRange::capture(va, len, |address| {
+                editor.translate(address)
             });
+            let result = f(editor)?;
             Ok((
                 result,
-                unpublished.then(|| crate::vmm::Stage1UnpublishedRange::after_engine_edit(va, len)),
+                plan.and_then(|plan| plan.finish(|address| editor.translate(address))),
             ))
         })
     }
@@ -1367,7 +1395,7 @@ impl Stage1Authority {
     ) -> Result<Stage1Authority, E>
     where
         B: FnOnce() -> Result<Option<PageTableManager>, E>,
-        R: FnMut(&mut PageTableManager) -> Result<(), E>,
+        R: FnMut(&[u64], &crate::vmm::Stage1UnpublishedArenas) -> Result<(), E>,
     {
         self.replace_for_exec_internal(builder, retirer)
             .map(|(auth, _)| auth)
@@ -1381,7 +1409,7 @@ impl Stage1Authority {
     ) -> Result<(Stage1Authority, bool), E>
     where
         B: FnOnce() -> Result<Option<PageTableManager>, E>,
-        R: FnMut(&mut PageTableManager) -> Result<(), E>,
+        R: FnMut(&[u64], &crate::vmm::Stage1UnpublishedArenas) -> Result<(), E>,
     {
         let is_shared = {
             let mut inner = self.inner.lock();
@@ -1404,7 +1432,9 @@ impl Stage1Authority {
                 (inner.manager.take(), inner.arena_source.take())
             };
             if let Some(mut old) = old_mgr.take() {
-                retirer(&mut old)?;
+                let (retired, receipt) =
+                    crate::vmm::Stage1UnpublishedArenas::retire_extension_arenas(&mut old);
+                retirer(&retired, &receipt)?;
                 self.inner.lock().image_pool.recycle(old);
             }
             // The retired image's source retires with it: its extension
@@ -1657,7 +1687,7 @@ impl ReservedTableArena {
 impl Drop for ReservedTableArena {
     fn drop(&mut self) {
         if let Some(base) = self.base.take() {
-            if self.publisher.retire_raw_table_arena(base.0).is_err() {
+            if self.publisher.rollback_raw_table_arena(base.0).is_err() {
                 // The physical publisher still holds this exact allocation;
                 // quarantine it rather than recycle capacity that remains live.
                 return;
@@ -2399,14 +2429,14 @@ pub(crate) mod tests {
         let before_exec = observed_generation(&authority);
         let exact = authority.clone();
         authority
-            .replace_for_exec(|| Ok::<_, ()>(Some(manager())), |_| Ok(()))
+            .replace_for_exec(|| Ok::<_, ()>(Some(manager())), |_, _| Ok(()))
             .unwrap();
         assert!(authority.shares_exact_authority(&exact));
         assert_ne!(observed_generation(&authority), before_exec);
         // Taking an image invalidates even if exec preparation subsequently fails.
         assert!(
             authority
-                .replace_for_exec(|| Err::<Option<PageTableManager>, _>(()), |_| Ok(()))
+                .replace_for_exec(|| Err::<Option<PageTableManager>, _>(()), |_, _| Ok(()))
                 .is_err()
         );
         assert!(authority.is_none());
@@ -2471,7 +2501,10 @@ pub(crate) mod tests {
         let mut authority = Stage1Authority::new_with_manager(Some(test_manager()));
         let pool = authority.image_pool();
         authority
-            .replace_for_exec(|| Ok::<_, PageTableError>(Some(test_manager())), |_| Ok(()))
+            .replace_for_exec(
+                || Ok::<_, PageTableError>(Some(test_manager())),
+                |_, _| Ok(()),
+            )
             .expect("exec replacement");
         assert_eq!(
             pool.retained(),
@@ -2503,7 +2536,10 @@ pub(crate) mod tests {
             .install_source(Box::new(old))
             .expect("install the pre-exec source");
         let retired = authority
-            .replace_for_exec(|| Ok::<_, PageTableError>(Some(test_manager())), |_| Ok(()))
+            .replace_for_exec(
+                || Ok::<_, PageTableError>(Some(test_manager())),
+                |_, _| Ok(()),
+            )
             .expect("exclusive exec replacement");
         assert!(retired.shares_exact_authority(&authority));
         assert!(
@@ -2731,7 +2767,7 @@ pub(crate) mod tests {
         let new_child1 = child1
             .replace_for_exec(
                 || Ok::<_, ()>(Some(test_manager_at(0x9a_0020_0000))),
-                |_| {
+                |_, _| {
                     retired1 = true;
                     Ok(())
                 },
@@ -2757,7 +2793,7 @@ pub(crate) mod tests {
         let new_child2 = child2
             .replace_for_exec(
                 || Ok::<_, ()>(Some(test_manager_at(0x9a_0040_0000))),
-                |_| {
+                |_, _| {
                     retired2 = true;
                     Ok(())
                 },
@@ -2784,7 +2820,7 @@ pub(crate) mod tests {
         let exec_parent = parent_exec
             .replace_for_exec(
                 || Ok::<_, ()>(Some(test_manager_at(0x9a_0060_0000))),
-                |_| {
+                |_, _| {
                     retired_parent = true;
                     Ok(())
                 },
@@ -2831,7 +2867,7 @@ pub(crate) mod tests {
         let (new_child, was_shared) = child
             .replace_for_exec_internal(
                 || Ok::<_, ()>(Some(test_manager_at(0x9a_0020_0000))),
-                |_| {
+                |_, _| {
                     retired = true;
                     Ok(())
                 },
@@ -3331,7 +3367,17 @@ pub(crate) mod tests {
             }
             Ok(())
         }
-        fn retire_raw_table_arena(&self, base: u64) -> Result<(), String> {
+        fn rollback_raw_table_arena(&self, base: u64) -> Result<(), String> {
+            self.resolver.arenas.lock().unwrap().remove(&base);
+            self.retired.lock().unwrap().push(base);
+            Ok(())
+        }
+        fn retire_published_raw_table_arena(
+            &self,
+            base: u64,
+            receipt: &crate::vmm::Stage1UnpublishedArenas,
+        ) -> Result<(), String> {
+            assert!(receipt.retired_base(base));
             self.resolver.arenas.lock().unwrap().remove(&base);
             self.retired.lock().unwrap().push(base);
             Ok(())

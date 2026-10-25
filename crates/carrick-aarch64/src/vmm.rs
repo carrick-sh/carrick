@@ -614,25 +614,106 @@ pub enum FrameCowWriteIntent {
 pub struct Stage1UnpublishedRange {
     va: u64,
     len: usize,
+    removed: Vec<(u64, u64)>,
 }
 
 impl Stage1UnpublishedRange {
-    pub(crate) fn after_engine_edit(va: u64, len: usize) -> Self {
-        Self { va, len }
+    pub(crate) fn capture(
+        va: u64,
+        len: usize,
+        mut translate: impl FnMut(u64) -> Option<u64>,
+    ) -> Option<Stage1UnpublicationPlan> {
+        let end = va.checked_add(len as u64)?;
+        if len == 0 {
+            return None;
+        }
+        let mut removed = Vec::new();
+        let mut cursor = va & !0xfff;
+        while cursor < end {
+            if let Some(ipa) = translate(cursor) {
+                removed.push((cursor, ipa));
+            }
+            cursor = cursor.checked_add(4096)?;
+        }
+        (!removed.is_empty()).then_some(Stage1UnpublicationPlan { va, len, removed })
     }
 
     pub fn range(&self) -> (u64, usize) {
         (self.va, self.len)
     }
 
+    pub fn removed_from_ipa_extent(&self, ipa: u64, len: usize) -> bool {
+        let Some(end) = ipa.checked_add(len as u64) else {
+            return false;
+        };
+        self.removed
+            .iter()
+            .any(|&(_, translated)| ipa <= translated && translated < end)
+    }
+
+    pub(crate) fn plan_for_known_translation(
+        va: u64,
+        len: usize,
+        ipa: u64,
+    ) -> Stage1UnpublicationPlan {
+        Stage1UnpublicationPlan {
+            va,
+            len,
+            removed: vec![(va, ipa)],
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Stage1UnpublicationPlan {
+    va: u64,
+    len: usize,
+    removed: Vec<(u64, u64)>,
+}
+
+impl Stage1UnpublicationPlan {
+    pub(crate) fn finish(
+        self,
+        mut translate: impl FnMut(u64) -> Option<u64>,
+    ) -> Option<Stage1UnpublishedRange> {
+        self.removed
+            .iter()
+            .all(|&(va, ipa)| translate(va) != Some(ipa))
+            .then_some(Stage1UnpublishedRange {
+                va: self.va,
+                len: self.len,
+                removed: self.removed,
+            })
+    }
+}
+
+#[derive(Debug)]
+pub struct Stage1UnpublishedArenas {
+    retired_bases: Vec<u64>,
+}
+
+impl Stage1UnpublishedArenas {
+    pub fn retired_base(&self, ipa: u64) -> bool {
+        self.retired_bases.contains(&ipa)
+    }
+
     /// Retire every detached extension-table arena and bind the receipt to
     /// that exact manager mutation.  Backends cannot mint this proof from an
     /// IPA alone.
-    pub fn retire_extension_arenas(
+    pub(crate) fn retire_extension_arenas(
         manager: &mut PageTableManager,
-    ) -> (Vec<u64>, Stage1UnpublishedRange) {
+    ) -> (Vec<u64>, Stage1UnpublishedArenas) {
         let retired = manager.retire_extension_arenas();
-        (retired, Stage1UnpublishedRange::after_engine_edit(0, 0))
+        let receipt = Stage1UnpublishedArenas {
+            retired_bases: retired.clone(),
+        };
+        (retired, receipt)
+    }
+
+    pub(crate) fn retired_table_capacity(base: Option<u64>) -> Self {
+        Self {
+            retired_bases: base.into_iter().collect(),
+        }
     }
 }
 
@@ -839,7 +920,8 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// Retire and unmap stage-1 extension table arenas belonging to `manager`.
     fn retire_stage1_extension_arenas(
         &mut self,
-        _manager: &mut PageTableManager,
+        _retired_bases: &[u64],
+        _receipt: &Stage1UnpublishedArenas,
     ) -> Result<(), TrapError> {
         Ok(())
     }

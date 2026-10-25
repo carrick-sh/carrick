@@ -271,6 +271,93 @@ pub(crate) struct CowInventorySplit {
     pub(crate) retirement: CowInventoryRetirementDecision,
 }
 
+/// VM-wide proof that the frame inventory no longer publishes any stage-1
+/// mapping backed by these exact stage-2 extents. The fields are private so a
+/// caller cannot substitute a per-MM page-table sample for the Kernel's global
+/// reverse-map count.
+#[derive(::core::fmt::Debug)]
+pub(crate) struct Stage1UnpublishedFrames {
+    extents: std::collections::BTreeSet<(u64, u64)>,
+}
+
+impl Stage1UnpublishedFrames {
+    pub(crate) fn covers(&self, ipa: u64, len: usize) -> bool {
+        self.extents.contains(&(ipa, len as u64))
+    }
+
+    pub(crate) fn after_cow_split(
+        authority: &dyn carrick_hal::FrameCowAuthority,
+        split: &CowInventorySplit,
+    ) -> Result<Option<Self>, TrapError> {
+        let live = authority
+            .frame_mapping_count(split.old.frame)
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+        if live != Some(0) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            extents: [(split.old.stage2_base, split.old.stage2_length)]
+                .into_iter()
+                .collect(),
+        }))
+    }
+
+    pub(crate) fn after_alias_retirement(
+        authority: &dyn carrick_hal::FrameCowAuthority,
+        retirement: &InventoryLeaseRetirement,
+    ) -> Result<Self, TrapError> {
+        for &frame in &retirement.frames {
+            if authority
+                .frame_mapping_count(frame)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?
+                != Some(0)
+            {
+                return Err(TrapError::Hypervisor(format!(
+                    "alias stage-2 retirement retained a live VM-wide mapping for {frame:?}"
+                )));
+            }
+        }
+        let extents = retirement
+            .stage2_leases
+            .iter()
+            .copied()
+            .filter(|lease| {
+                retirement
+                    .mappings
+                    .iter()
+                    .filter(|(_, extent)| (extent.stage2_base, extent.stage2_length) == *lease)
+                    .all(|(_, extent)| retirement.frames.contains(&extent.frame))
+            })
+            .collect();
+        Ok(Self { extents })
+    }
+
+    fn after_declined_retirement(
+        authority: &dyn carrick_hal::FrameCowAuthority,
+        remainder: &DeclinedLeaseRemainder,
+    ) -> Result<Self, TrapError> {
+        for &frame in &remainder.frames {
+            if authority
+                .frame_mapping_count(frame)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?
+                .is_some()
+            {
+                return Err(TrapError::Hypervisor(format!(
+                    "declined stage-2 retirement retained a live VM-wide mapping for {frame:?}"
+                )));
+            }
+        }
+        Ok(Self {
+            extents: [(
+                remainder.projection.physical_ipa,
+                remainder.projection.physical_length,
+            )]
+            .into_iter()
+            .collect(),
+        })
+    }
+}
+
 /// A stage-2 lease as one alias row names it: the physical extent and the
 /// exact global-owner incarnation the row was published under. Inventory
 /// retirement selects only extents of that incarnation. An IPA is recycled to
@@ -1434,14 +1521,20 @@ impl HvfVmState {
     ) -> Result<(), TrapError> {
         let outcome = if let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length)
         {
-            let proof = custody
-                .stage1_unpublished_for_retirement(identity)
-                .or_else(|| custody.stage1_unpublished_from_receipt(identity, stage1_receipt))
-                .ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "stage-2 owner remains reachable from authoritative stage-1".to_owned(),
-                    )
-                })?;
+            let proof = if let Some(proof) = custody.stage1_unpublished_for_retirement(identity) {
+                Stage2RetirementProof::Authorized(proof)
+            } else {
+                Stage2RetirementProof::Unpublished(
+                    custody
+                        .stage1_unpublished_from_receipt(identity, stage1_receipt)
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor(
+                                "stage-2 owner remains reachable from authoritative stage-1"
+                                    .to_owned(),
+                            )
+                        })?,
+                )
+            };
             retire_global_frame_host_owner_in(custody, proof, ipa, length)
         } else {
             GlobalFrameRetirementOutcome::NotFound { ipa, length }
@@ -1617,17 +1710,14 @@ impl HvfVmState {
         length: u64,
     ) -> Result<(), TrapError> {
         let custody = legacy_test_carrier_vm_custody();
-        let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
-            carrick_mem::memory::stage1_hvpatch_page_tables(),
-            crate::memory::LINUX_PAGE_TABLES_BASE,
-            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
-        );
-        let (_, receipt) =
-            carrick_aarch64::vmm::Stage1UnpublishedRange::retire_extension_arenas(&mut manager);
+        let identity = custody
+            .stage2_record_covering(ipa, 1)
+            .expect("test retirement names a registered stage-2 record");
+        let receipt = custody.editor_receipt_after_test_unmap(identity);
         Self::retire_stage2_extent_from_mappings_in(
             custody,
             mappings,
-            Stage1UnpublicationReceipt::Editor(&receipt),
+            Stage1UnpublicationReceipt::EditorRange(&receipt),
             ipa,
             length,
         )
@@ -1640,17 +1730,14 @@ impl HvfVmState {
         ipa: u64,
         length: u64,
     ) -> Result<(), TrapError> {
-        let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
-            carrick_mem::memory::stage1_hvpatch_page_tables(),
-            crate::memory::LINUX_PAGE_TABLES_BASE,
-            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
-        );
-        let (_, receipt) =
-            carrick_aarch64::vmm::Stage1UnpublishedRange::retire_extension_arenas(&mut manager);
+        let identity = custody
+            .stage2_record_covering(ipa, 1)
+            .expect("test retirement names a registered stage-2 record");
+        let receipt = custody.editor_receipt_after_test_unmap(identity);
         Self::retire_stage2_extent_from_mappings_in(
             custody,
             mappings,
-            Stage1UnpublicationReceipt::Editor(&receipt),
+            Stage1UnpublicationReceipt::EditorRange(&receipt),
             ipa,
             length,
         )
@@ -2153,12 +2240,26 @@ impl HvfVmState {
             else {
                 continue;
             };
-            let Some(stage1) = custody.stage1_unpublished_for_retirement(record_identity) else {
-                // Kernel mapping-count retirement alone is not a stage-1
-                // unpublication receipt. The owning MM teardown will provide
-                // the proof and retire this quarantined owner.
-                continue;
-            };
+            let stage1 =
+                if let Some(stage1) = custody.stage1_unpublished_for_retirement(record_identity) {
+                    Stage2RetirementProof::Authorized(stage1)
+                } else {
+                    let absence =
+                        Stage1UnpublishedFrames::after_declined_retirement(authority, &remainder)?;
+                    Stage2RetirementProof::Unpublished(
+                        custody
+                            .stage1_unpublished_from_receipt(
+                                record_identity,
+                                Stage1UnpublicationReceipt::FrameAbsence(&absence),
+                            )
+                            .ok_or_else(|| {
+                                TrapError::Hypervisor(
+                                    "declined stage-2 retirement absence did not cover its record"
+                                        .to_owned(),
+                                )
+                            })?,
+                    )
+                };
             match retire_global_frame_host_owner_if_generation_in(
                 custody,
                 stage1,
@@ -2277,7 +2378,7 @@ impl HvfVmState {
     pub(crate) fn commit_cow_inventory_split(
         inventory: &mut HvpatchFrameInventory,
         split: &CowInventorySplit,
-        retire_stage2: impl FnOnce() -> Result<(), TrapError>,
+        retire_stage2: impl FnOnce() -> Result<bool, TrapError>,
     ) -> Result<bool, TrapError> {
         if split.replacement_is_existing {
             if split.new_extent.frame == split.old.frame
@@ -2362,17 +2463,25 @@ impl HvfVmState {
             (split.old.stage2_base, split.old.stage2_length),
             split.retirement.backend_frame_references_complete,
         );
-        let retire_old_stage2 = split.retirement.backend_frame_references_complete
+        let retire_old_stage2_candidate = split.retirement.backend_frame_references_complete
             && !frames
                 .stage2_references
                 .contains_key(&(split.old.stage2_base, split.old.stage2_length));
-        if retire_old_stage2 {
+        let retire_old_stage2 = if retire_old_stage2_candidate {
             // `stage_mapping` publishes a sibling reference while holding this
             // same registry lock. Keep it through physical-owner removal and
             // allocator release so the old zero-reference decision cannot go
             // stale before another COW reserves the recycled IPA.
-            retire_stage2()?;
-        }
+            let retired = retire_stage2()?;
+            if !retired {
+                frames
+                    .authority_retained_stage2
+                    .insert((split.old.stage2_base, split.old.stage2_length));
+            }
+            retired
+        } else {
+            false
+        };
         drop(frames);
         if !split.replacement_is_existing
             && inventory
@@ -3727,7 +3836,7 @@ impl HvfVmState {
             .retire_table_capacity(
                 None,
                 carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
-                |_| Ok(()),
+                |_, _| Ok(()),
             )
             .map_err(TrapError::Hypervisor)?;
         Ok(None)
@@ -3747,7 +3856,7 @@ impl HvfVmState {
             .retire_table_capacity(
                 None,
                 carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
-                |_| Ok(()),
+                |_, _| Ok(()),
             )
             .map_err(TrapError::Hypervisor)
     }
@@ -3791,10 +3900,11 @@ impl HvfVmState {
         })?;
         match stage1_unpublished {
             Some(stage1_unpublished) => cleanup.retire_after_stage1_unpublished(stage1_unpublished),
-            None if cleanup.shared_projection => cleanup.retire(),
-            None => Err(TrapError::Hypervisor(
-                "exec predecessor stage-2 retirement lacks stage-1 unpublication proof".to_owned(),
-            )),
+            // The delayed candidate may have acquired a new exact reference,
+            // in which case cleanup retires no stage-2 authority.  Keep the
+            // proof requirement at the final retirement closure so the
+            // no-retirement recheck can still consume its cleanup record.
+            None => cleanup.retire(),
         }
     }
 
@@ -3813,10 +3923,7 @@ impl HvfVmState {
                 expected_root_slot,
                 stage1_unpublished,
             ),
-            None if cleanup.shared_projection => cleanup.retire_with_root_proof(expected_root_slot),
-            None => Err(TrapError::Hypervisor(
-                "exec predecessor stage-2 retirement lacks stage-1 unpublication proof".to_owned(),
-            )),
+            None => cleanup.retire_with_root_proof(expected_root_slot),
         }
     }
 

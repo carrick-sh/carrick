@@ -194,11 +194,6 @@ impl PendingExecStage2Cleanup {
             publish(classification);
             return Ok(None);
         }
-        let stage1_unpublished = stage1_unpublished.ok_or_else(|| {
-            TrapError::Hypervisor(
-                "exec predecessor cleanup lacks stage-1 unpublication proof".to_owned(),
-            )
-        })?;
         let mut retired_extents = Vec::new();
         for (&(ipa, size), &owner_identity) in &self.extents {
             let owner_generation = owner_identity.generation;
@@ -215,6 +210,11 @@ impl PendingExecStage2Cleanup {
             }
             let mut exact_owner_retired = false;
             if HvfVmState::retire_stage2_candidate_if_unreferenced(&self.frames, lease, || {
+                let stage1_unpublished = stage1_unpublished.ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "exec predecessor cleanup lacks stage-1 unpublication proof".to_owned(),
+                    )
+                })?;
                 if owner_generation == 0 {
                     HvfVmState::retire_stage2_extent_from_mappings_in(
                         custody,
@@ -279,7 +279,7 @@ impl PendingExecStage2Cleanup {
                 .retire_table_capacity(
                     None,
                     carrick_aarch64::stage1_authority::TableArenaRetirement::ExecHandoff,
-                    |_| Ok(()),
+                    |_, _| Ok(()),
                 )
                 .map_err(TrapError::Hypervisor)?;
         }
@@ -1707,7 +1707,7 @@ pub(crate) fn reapply_global_exec_page_spans(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct GlobalFrameOwnerRollback {
     pub(crate) custody: std::sync::Arc<CarrierVmCustody>,
-    pub(crate) keys: Vec<(u64, u64)>,
+    pub(crate) keys: Vec<((u64, u64), Stage2RollbackReceipt)>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1719,25 +1719,34 @@ impl GlobalFrameOwnerRollback {
         }
     }
 
-    pub(crate) fn record(&mut self, key: (u64, u64)) {
-        self.keys.push(key);
+    pub(crate) fn record(&mut self, key: (u64, u64), receipt: Stage2RollbackReceipt) {
+        self.keys.push((key, receipt));
     }
 
     pub(crate) fn commit(mut self) {
         self.keys.clear();
+    }
+
+    pub(crate) fn take(&mut self, key: (u64, u64)) -> Option<Stage2RollbackReceipt> {
+        let index = self
+            .keys
+            .iter()
+            .position(|(candidate, _)| *candidate == key)?;
+        Some(self.keys.swap_remove(index).1)
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for GlobalFrameOwnerRollback {
     fn drop(&mut self) {
-        for &(ipa, length) in self.keys.iter().rev() {
+        for ((ipa, length), receipt) in self.keys.drain(..).rev() {
             let Some(identity) = global_frame_stage2_identity_in(&self.custody, ipa, length) else {
                 continue;
             };
-            let Some(stage1) = self.custody.stage1_unpublished_for_retirement(identity) else {
-                // No stage-1 proof means this rollback must leave the IPA
-                // quarantined; teardown owns eventual release.
+            let Some(stage1) = self
+                .custody
+                .stage1_unpublished_from_rollback(identity, receipt)
+            else {
                 continue;
             };
             let outcome = retire_global_frame_host_owner_in(&self.custody, stage1, ipa, length);

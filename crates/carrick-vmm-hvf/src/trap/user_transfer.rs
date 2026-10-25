@@ -1,8 +1,13 @@
 //! Physical half of UserTransfer. EL1 selects and authorizes the user VA;
 //! this adapter resolves only its IPA through existing carrier directories.
-use super::*;
+use super::{
+    CarrierForeignMmBinding, CarrierForeignMmTransport, CarrierStage2Pin, CarrierStage2PinError,
+    CarrierVmCustody, GlobalFrameSharedMapping, OwnedCodeContent, PersistentCarrierMappings,
+    TrapError, code_content, sparse_materialization,
+};
 use carrick_aarch64::user_transfer::{TransferCustody, TransferPin, TransferRetention};
 use carrick_el1_abi::{PortalRetainedData, PortalSelectedData, PortalTransferIntent};
+use carrick_fatal::carrick_fatal;
 use core::num::NonZeroU64;
 use std::sync::Arc;
 
@@ -11,6 +16,14 @@ pub struct UserTransferCustody {
     custody: Arc<CarrierVmCustody>,
     transport: Option<Arc<CarrierForeignMmTransport>>,
     metadata: Option<crate::metadata_grant::CarrierMetadataAccess>,
+    stage1_reselects: Arc<parking_lot::Mutex<std::collections::BTreeMap<u64, (u64, u64)>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Stage1SelectionState {
+    Current,
+    Changed { authority: u64, revision: u64 },
+    Unknown,
 }
 
 struct ImmediateStage1Reselect;
@@ -35,12 +48,6 @@ impl carrick_guest_mem::PhysicalMemoryWait for ImmediateStage1Reselect {
 }
 
 impl UserTransferCustody {
-    fn immediate_stage1_reselect() -> TransferRetention<RetainedUserData> {
-        TransferRetention::Physical(carrick_guest_mem::OwnedMemoryWait::new(Arc::new(
-            ImmediateStage1Reselect,
-        )))
-    }
-
     /// Re-read the authoritative host stage-1 image before treating an absent
     /// physical record as an invariant failure. Host COW, exec and teardown
     /// edits do not all pass through the guest Editor word; a changed leaf is
@@ -51,19 +58,52 @@ impl UserTransferCustody {
         &self,
         target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
         selected: PortalSelectedData,
-    ) -> Option<bool> {
-        let (target, va) = target?;
+    ) -> Stage1SelectionState {
+        let Some((target, va)) = target else {
+            return Stage1SelectionState::Unknown;
+        };
         let state = match self.custody.guest_cow_state(target.handle().mm().raw()) {
             Ok(Some(state)) => state,
-            Ok(None) => return Some(true),
-            Err(()) => return None,
+            Ok(None) | Err(()) => return Stage1SelectionState::Unknown,
         };
-        Some(
-            state
-                .page_tables_authority()
-                .with_manager(|manager| manager.translate(va) != Some(selected.ipa))
-                .unwrap_or(true),
-        )
+        let tables = state.page_tables_authority();
+        let observation = tables.host_edit_observation();
+        tables
+            .with_manager(|manager| {
+                if manager.translate(va) == Some(selected.ipa) {
+                    Stage1SelectionState::Current
+                } else {
+                    Stage1SelectionState::Changed {
+                        authority: observation.0,
+                        revision: observation.1,
+                    }
+                }
+            })
+            .unwrap_or(Stage1SelectionState::Unknown)
+    }
+
+    fn changed_stage1_retention(
+        &self,
+        target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
+        selected: PortalSelectedData,
+        retry: Option<carrick_el1_abi::PortalOwnerWait>,
+    ) -> Option<TransferRetention<RetainedUserData>> {
+        let Stage1SelectionState::Changed {
+            authority,
+            revision,
+        } = self.stage1_selection_changed(target, selected)
+        else {
+            return None;
+        };
+        let mm = target?.0.handle().mm().raw();
+        let mut observations = self.stage1_reselects.lock();
+        if observations.get(&mm).copied() != Some((authority, revision)) {
+            observations.insert(mm, (authority, revision));
+            return Some(TransferRetention::Physical(
+                carrick_guest_mem::OwnedMemoryWait::new(Arc::new(ImmediateStage1Reselect)),
+            ));
+        }
+        retry.map(TransferRetention::Editor)
     }
 
     /// Retain an exact external physical source for pre-admission copying.
@@ -145,6 +185,7 @@ impl UserTransferCustody {
             custody: Arc::clone(&transport.custody),
             transport: Some(transport),
             metadata: carrier.and_then(crate::metadata_grant::CarrierMetadataAccess::new),
+            stage1_reselects: Arc::default(),
         }
     }
     #[cfg(test)]
@@ -153,6 +194,7 @@ impl UserTransferCustody {
             custody,
             transport: None,
             metadata: None,
+            stage1_reselects: Arc::default(),
         }
     }
 }
@@ -479,8 +521,8 @@ impl UserTransferCustody {
         if len == 0 || len > 4096 || selected.ipa.checked_add(len as u64).is_none() {
             return Err(error());
         }
-        if self.stage1_selection_changed(target, selected) == Some(true) {
-            return Ok(Self::immediate_stage1_reselect());
+        if let Some(retention) = self.changed_stage1_retention(target, selected, retry) {
+            return Ok(retention);
         }
         // A known physical extent overrun is permanent refusal, even if its
         // owner is concurrently retiring. Check it before selecting a wait.
@@ -563,15 +605,15 @@ impl UserTransferCustody {
                         self.custody.stage2_publication_wait(selected.ipa),
                     ));
                 }
-                if self.stage1_selection_changed(target, selected) == Some(true) {
-                    return Ok(Self::immediate_stage1_reselect());
+                if let Some(retention) = self.changed_stage1_retention(target, selected, retry) {
+                    return Ok(retention);
                 }
                 return retry.map(TransferRetention::Editor).ok_or_else(error);
             }
             Err(CarrierStage2PinError::RetirementRequested) => {
                 carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 5);
-                if self.stage1_selection_changed(target, selected) == Some(true) {
-                    return Ok(Self::immediate_stage1_reselect());
+                if let Some(retention) = self.changed_stage1_retention(target, selected, retry) {
+                    return Ok(retention);
                 }
                 return retry.map(TransferRetention::Editor).ok_or_else(error);
             }
@@ -661,6 +703,12 @@ impl UserTransferCustody {
 
 #[cfg(test)]
 pub(super) mod tests {
+    use super::super::{
+        CarrierStage2RetireOutcome, CowArmedRanges, GlobalFrameHostOwner, GlobalFrameOwnerEntry,
+        GlobalFrameStage2Lease, HvpatchFrameInventory, MemoryProtections, MmAccessState,
+        SparseExtentBacking, Stage1UnpublicationReceipt, register_global_frame_host_owner_in,
+        register_pooled_global_frame_host_owner_in,
+    };
     use super::*;
     use carrick_el1_abi::{PortalByteRange, PortalOperation, PortalTransferSlot, ReservationMm};
     use std::sync::atomic::Ordering;
@@ -710,7 +758,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn host_stage1_unmap_of_selected_leaf_forces_ready_reselect() {
+    fn host_stage1_unmap_allows_one_reselect_per_host_edit_revision() {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = Arc::new(CarrierVmCustody::new_live_fixture());
         let mm = NonZeroU64::new(0x847).unwrap();
@@ -759,7 +807,7 @@ pub(super) mod tests {
         let proof = custody
             .stage1_unpublished_from_receipt(
                 owner.record_identity,
-                Stage1UnpublicationReceipt::Editor(&receipt),
+                Stage1UnpublicationReceipt::EditorRange(&receipt),
             )
             .expect("editor receipt covers retired owner");
         assert!(
@@ -790,24 +838,74 @@ pub(super) mod tests {
             )
         };
         let physical = UserTransferCustody::new(custody);
-        let TransferRetention::Physical(wait) = physical
-            .retain_exact_for(
+        let retain = || {
+            physical
+                .retain_exact_for(
+                    Some((
+                        carrick_aarch64::user_transfer::TransferTarget::from_handle(handle, 0x4000),
+                        va,
+                    )),
+                    selection(ipa),
+                    4,
+                    PortalTransferIntent::UserRead,
+                    Some(retry),
+                )
+                .unwrap()
+        };
+        let TransferRetention::Physical(first) = retain() else {
+            panic!("the changed host image must authorize one fresh selection")
+        };
+        assert!(first.0.is_ready(), "the single reselect is immediate");
+        let TransferRetention::Editor(wait) = retain() else {
+            panic!("the same host edit must not authorize an unbounded reselect")
+        };
+        assert_eq!(
+            wait, retry,
+            "the second refusal reaches the typed invariant"
+        );
+
+        tables
+            .edit(
+                || unreachable!("installed manager"),
+                |editor| {
+                    editor
+                        .map_aliased(
+                            va + 0x1000,
+                            ipa + 0x1000,
+                            4096,
+                            carrick_mmu_core::aarch64::UserLeafAccess::READ_WRITE,
+                        )
+                        .map(|_| ())
+                },
+            )
+            .unwrap();
+        let TransferRetention::Physical(next_revision) = retain() else {
+            panic!("a later host edit gets one new bounded reselect")
+        };
+        assert!(next_revision.0.is_ready());
+    }
+
+    #[test]
+    fn absent_host_stage1_view_is_unknown_not_ready_reselect() {
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                custody.transfer_carrier,
+                ReservationMm::new(0x848).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            )
+        };
+        let physical = UserTransferCustody::new(custody);
+        assert_eq!(
+            physical.stage1_selection_changed(
                 Some((
                     carrick_aarch64::user_transfer::TransferTarget::from_handle(handle, 0x4000),
-                    va,
+                    0x4800_0000,
                 )),
-                selection(ipa),
-                4,
-                PortalTransferIntent::UserRead,
-                Some(retry),
-            )
-            .unwrap()
-        else {
-            panic!("an authoritative host-side unmap must reselect, not reach the invariant")
-        };
-        assert!(
-            wait.0.is_ready(),
-            "changed stage-1 is immediate reselect evidence, never a park"
+                selection(0xa085_31a0_0000),
+            ),
+            Stage1SelectionState::Unknown,
+            "a missing host mirror has no authority to create an always-ready reselect"
         );
     }
 
@@ -1215,7 +1313,7 @@ pub(super) mod tests {
                 let stage1 = custody
                     .stage1_unpublished_from_receipt(
                         owner.record_identity,
-                        Stage1UnpublicationReceipt::Editor(&receipt),
+                        Stage1UnpublicationReceipt::EditorRange(&receipt),
                     )
                     .expect("editor receipt covers retired owner");
                 assert!(
@@ -1525,12 +1623,7 @@ pub(super) mod tests {
             CarrierStage2RetireOutcome::DeferredActivePins
         );
         assert_eq!(unmaps, 0);
-        let TransferRetention::Physical(wait) = physical
-            .retain(selected, 4096, PortalTransferIntent::UserRead)
-            .unwrap()
-        else {
-            panic!("retiring record must return its physical producer");
-        };
+        let wait = custody.stage2_retirement_wait(Some(owner.record_identity));
         assert!(
             !wait.0.is_ready(),
             "the retained pin still blocks retirement"

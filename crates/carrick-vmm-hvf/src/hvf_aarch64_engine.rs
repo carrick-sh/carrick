@@ -449,9 +449,9 @@ use carrick_mem::memory::AddressSpace;
 use crate::syscall_mailbox::{HvfSyscallTransport, MailboxBinding};
 use crate::trap::{
     GuestMappingPlan, HvfInner, HvfTaskState, HvfVmState, HvpatchPreparedCarrierTaskState,
-    HvpatchTaskOnlyBackendState, PersistentExecutorSpec, ProcessSpec, Stage1UnpublicationReceipt,
-    ThreadSpec, VcpuSnapshot, hvf_get_reg, hvf_get_sys_reg, hvf_set_reg, hvf_set_sys_reg,
-    set_simd_fp_reg_v, swap_hvpatch_task_state,
+    HvpatchTaskOnlyBackendState, PersistentExecutorSpec, ProcessSpec, ThreadSpec, VcpuSnapshot,
+    hvf_get_reg, hvf_get_sys_reg, hvf_set_reg, hvf_set_sys_reg, set_simd_fp_reg_v,
+    swap_hvpatch_task_state,
 };
 pub use crate::trap::{
     HvpatchCarrierTaskIdentity, HvpatchCarrierTaskStateDirectory, HvpatchChildKernelBinding,
@@ -2350,7 +2350,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn commit_anonymous_discard(
         &mut self,
-        stage1: &carrick_aarch64::vmm::Stage1UnpublishedRange,
+        _stage1: &carrick_aarch64::vmm::Stage1UnpublishedRange,
         ticket: Self::AnonymousDiscard,
     ) -> Result<(), TrapError> {
         let identity = self
@@ -2368,7 +2368,6 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             identity.linux_tid,
         );
         self.state.commit_process_alias_retirement(
-            Stage1UnpublicationReceipt::Editor(stage1),
             ticket.va,
             ticket.len,
             ticket.prepared,
@@ -2599,9 +2598,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn retire_stage1_extension_arenas(
         &mut self,
-        manager: &mut carrick_mmu_core::aarch64::PageTableManager,
+        retired_bases: &[u64],
+        receipt: &carrick_aarch64::vmm::Stage1UnpublishedArenas,
     ) -> Result<(), TrapError> {
-        self.state.retire_stage1_extension_arenas(manager)
+        self.state
+            .retire_stage1_extension_arenas(retired_bases, receipt)
     }
 
     fn record_stage1_populated_prefix(&mut self, base: u64, prefix: usize) {
@@ -2971,8 +2972,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // The shared engine calls this only after checked stage-1 teardown and
         // TLBI succeed. A failed edit therefore retains this process-shared alias
         // owner; successful teardown removes the high-VA lookup (low VA no-op).
-        self.state
-            .unregister_process_alias(Stage1UnpublicationReceipt::Editor(stage1), va, len)
+        self.state.unregister_process_alias(Some(stage1), va, len)
     }
 
     fn add_alias(

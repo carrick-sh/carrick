@@ -75,10 +75,10 @@ pub(crate) fn provision_guest_cow_grants(
     let stage2_perms = super::hvf_mem_perms(carrick_hal::physical_grants::COW_GRANT_PERMISSIONS);
     let mut published = 0;
     while published < count {
-        let (new_host_ptr, new_physical_ipa, owner_generation) =
-            allocate_grant_compound(custody, stage2_perms)?;
+        let (new_host_ptr, new_physical_ipa, owner_generation, rollback) =
+            allocate_unpublished_grant_compound(custody, stage2_perms)?;
         let mut owner_rollback = GlobalFrameOwnerRollback::new(std::sync::Arc::clone(custody));
-        owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+        owner_rollback.record((new_physical_ipa, CowArmedRanges::COMPOUND_SIZE), rollback);
         let reservation = runtime
             .authority
             .reserve(1, 1, 2)
@@ -237,11 +237,28 @@ pub(crate) fn allocate_grant_compound(
 ) -> Result<(*mut u8, u64, u64), TrapError> {
     allocate_grant_extent(custody, stage2_perms, CowArmedRanges::COMPOUND_SIZE)
 }
+
+fn allocate_unpublished_grant_compound(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    stage2_perms: applevisor::memory::MemPerms,
+) -> Result<(*mut u8, u64, u64, Stage2RollbackReceipt), TrapError> {
+    allocate_unpublished_grant_extent(custody, stage2_perms, CowArmedRanges::COMPOUND_SIZE)
+}
+
 pub(crate) fn allocate_grant_extent(
     custody: &std::sync::Arc<CarrierVmCustody>,
     stage2_perms: applevisor::memory::MemPerms,
     length: u64,
 ) -> Result<(*mut u8, u64, u64), TrapError> {
+    allocate_unpublished_grant_extent(custody, stage2_perms, length)
+        .map(|(host, ipa, generation, _rollback)| (host, ipa, generation))
+}
+
+fn allocate_unpublished_grant_extent(
+    custody: &std::sync::Arc<CarrierVmCustody>,
+    stage2_perms: applevisor::memory::MemPerms,
+    length: u64,
+) -> Result<(*mut u8, u64, u64, Stage2RollbackReceipt), TrapError> {
     if length == 0
         || !length.is_multiple_of(CowArmedRanges::COMPOUND_SIZE)
         || length > carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE + 32768
@@ -255,9 +272,12 @@ pub(crate) fn allocate_grant_extent(
     {
         let host_ptr = handle.as_mut_ptr();
         let physical_ipa = handle.ipa();
-        let generation =
-            register_pooled_global_frame_host_owner_in(custody, handle, u64::from(stage2_perms))?;
-        return Ok((host_ptr, physical_ipa, generation));
+        let (generation, rollback) = register_unpublished_pooled_global_frame_host_owner_in(
+            custody,
+            handle,
+            u64::from(stage2_perms),
+        )?;
+        return Ok((host_ptr, physical_ipa, generation, rollback));
     }
     let new_host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         length as usize,
@@ -289,9 +309,13 @@ pub(crate) fn allocate_grant_extent(
     }
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
     lease.mark_test_mapped_without_backend();
-    let generation =
-        register_global_frame_host_owner_in(custody, lease, new_host, u64::from(stage2_perms))?;
-    Ok((host_ptr, physical_ipa, generation))
+    let (generation, rollback) = register_unpublished_global_frame_host_owner_in(
+        custody,
+        lease,
+        new_host,
+        u64::from(stage2_perms),
+    )?;
+    Ok((host_ptr, physical_ipa, generation, rollback))
 }
 
 /// Settle every guest COW completion of the excluded MM. Returns how many
@@ -550,21 +574,25 @@ pub(crate) fn settle_one(
         .authority
         .apply(reservation.commit(()))
         .map_err(|error| TrapError::Hypervisor(format!("settlement inventory: {error}")))?;
+    let stage1 = crate::trap::frame_inventory::Stage1UnpublishedFrames::after_cow_split(
+        runtime.authority.as_ref(),
+        &split,
+    )?;
     let retired_old_stage2 = HvfVmState::commit_cow_inventory_split(
         &mut state.frame_inventory.ledger.lock(),
         &split,
         || {
+            let Some(stage1) = stage1.as_ref() else {
+                return Ok(false);
+            };
             HvfVmState::retire_stage2_extent_from_mappings_in(
                 custody,
                 &mut TaskMappingIndex::new(),
-                Stage1UnpublicationReceipt::AuthoritativeAbsence {
-                    authority: &tables,
-                    va: span.va,
-                    len: span.len,
-                },
+                Stage1UnpublicationReceipt::FrameAbsence(stage1),
                 split.old.stage2_base,
                 split.old.stage2_length,
-            )
+            )?;
+            Ok(true)
         },
     )?;
     drop(registry);

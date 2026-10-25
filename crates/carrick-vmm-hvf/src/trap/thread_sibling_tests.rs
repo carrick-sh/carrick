@@ -95,9 +95,20 @@ fn shared_mm_task_projection_preserves_structural_owner() {
     );
 
     drop(projected);
+    let custody = legacy_test_carrier_vm_custody();
+    let rollback = owner
+        .take_unpublished_rollback()
+        .expect("unpublished shared-MM projection owns its rollback receipt");
+    let stage1 = custody
+        .stage1_unpublished_from_rollback(identity, rollback)
+        .expect("rollback receipt names the shared-MM projection record");
+    assert_eq!(
+        custody.request_stage2_record_retirement(identity, stage1),
+        CarrierStage2RetireOutcome::DeferredActivePins
+    );
     drop(owner);
     retry_structural_backing_identities_in_using(
-        legacy_test_carrier_vm_custody(),
+        custody,
         &[identity],
         &mut unmap_global_frame_stage2_record,
         &mut release_retired_stage2_ipa,

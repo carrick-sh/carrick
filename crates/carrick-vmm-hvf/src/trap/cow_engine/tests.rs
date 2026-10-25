@@ -538,7 +538,7 @@ fn alias_retirement_commit_takes_the_callers_registry_guard_and_never_locks_the_
             .split_once("\n    pub(crate) fn ")
             .map_or(after, |(head, _)| head);
         assert!(
-            section.contains("commit_process_alias_retirement(") && section.contains("&registry)"),
+            section.contains("commit_process_alias_retirement(") && section.contains("&registry"),
             "{caller} must pass its own registry guard into the retirement commit"
         );
     }
@@ -642,7 +642,10 @@ fn guest_cow_kernel_grant_refusal_releases_backend_inventory_and_owner() {
         0
     );
     lease.mark_mapped();
-    let generation = register_global_frame_host_owner_in(&custody, lease, host, 7).unwrap();
+    let (generation, rollback) =
+        register_unpublished_global_frame_host_owner_in(&custody, lease, host, 7).unwrap();
+    let mut owner = GlobalFrameOwnerRollback::new(custody.clone());
+    owner.record((gpa, length), rollback);
     let nz = |n| std::num::NonZeroU64::new(n).unwrap();
     let reservation = carrick_hal::FrameInventoryReservation::from_kernel_candidates(
         carrick_hal::FrameInventoryProvenance::from_kernel_entropy([72; 32]),
@@ -657,7 +660,7 @@ fn guest_cow_kernel_grant_refusal_releases_backend_inventory_and_owner() {
     let inventory = std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     let authority =
         std::sync::Arc::new(super::super::task_only_carrier_directory_tests::TestCowAuthority);
-    let result = GuestPreparedBacking::prepare(
+    let result = GuestPreparedBacking::prepare_owned(
         custody.clone(),
         authority,
         inventory.clone(),
@@ -679,6 +682,7 @@ fn guest_cow_kernel_grant_refusal_releases_backend_inventory_and_owner() {
                 generation,
             },
         },
+        owner,
     );
     assert!(matches!(result, Err(ref error) if error.to_string().contains("COW grant inventory")));
     let inventory = inventory.lock();

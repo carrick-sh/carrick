@@ -3052,6 +3052,14 @@ impl PageTableManager {
         self.resolver.as_ref()
     }
 
+    /// Release the host resolver after the complete hardware-visible image is
+    /// unpublished. The manager may remain only as empty recycling capacity;
+    /// callers must not translate through it again until `snapshot_into` or
+    /// `make_live` installs a new image and resolver.
+    pub fn retire_live_resolver(&mut self) {
+        self.resolver = None;
+    }
+
     /// Convert this manager to live backing authority. Discard descriptor contents
     /// while retaining empty allocation capacity for owned snapshot recycling.
     ///
