@@ -1272,11 +1272,12 @@ fn regular_text(path: &Path) -> Result<String, ScalerError> {
 
 #[derive(Serialize, Deserialize)]
 struct Receipt {
+    head: String,
+    checkpointed: bool,
     base: String,
     branch: String,
     exit_code: i32,
     expected_tip: String,
-    refused_workflow: bool,
     // The proposal belongs to the same atomic checkpoint as the tree.
     #[serde(default)]
     pr_body: Option<String>,
@@ -1300,7 +1301,9 @@ fn worker_checkpoint(state: &Path, dispatch: &Dispatch) -> Result<Option<Receipt
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .ok_or(ScalerError::Guard("invalid worker checkpoint receipt"))?;
-    if receipt.base != dispatch.base
+    if !sha(&receipt.head)
+        || git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.head
+        || receipt.base != dispatch.base
         || receipt.branch != dispatch.branch
         || (!receipt.expected_tip.is_empty() && !sha(&receipt.expected_tip))
     {
@@ -1685,14 +1688,20 @@ fn prepare_worker_actor(state: &Path, actor: &Path, backend: &str) -> Result<(),
     }
     Ok(())
 }
+struct HarvestedWorker {
+    contract: Contract,
+    checkpointed: bool,
+    diffstat: String,
+    exit_code: i32,
+}
+
 /// Read candidate data only after the caller has verified uid retirement.
 fn harvest_worker(
     actor: &Path,
     work: &Path,
     dispatch: &Dispatch,
     result: Result<i32, ScalerError>,
-    since: &str,
-) -> Result<(Contract, bool, String, i32), ScalerError> {
+) -> Result<HarvestedWorker, ScalerError> {
     if work.exists() {
         std::fs::remove_dir_all(work)?;
     }
@@ -1725,36 +1734,20 @@ fn harvest_worker(
             1
         }
     };
-    if timed_phase("worker.checkpoint", || checkpoint(work, dispatch))? {
+    let checkpointed = timed_phase("worker.checkpoint", || checkpoint(work, dispatch))?;
+    if checkpointed {
         contract.status = ContractStatus::Failed;
         contract
             .risks
             .push("Workflow checkpointed unfinished changes".into());
     }
-    // Validate only commits added by this worker, including any checkpoint.
-    // Earlier accepted checkpoints retain their own admission and ownership.
-    check_commit_closures(work, since, dispatch.issue)?;
-    let refused_workflow = git(
-        work,
-        &[
-            "diff",
-            "--name-only",
-            "--no-renames",
-            "-z",
-            &dispatch.base,
-            "HEAD",
-        ],
-    )?
-    .split('\0')
-    .any(|path| path.starts_with(".github/workflows/"));
-    if refused_workflow {
-        contract.status = ContractStatus::Failed;
-        contract
-            .risks
-            .push("Refused workflow changes: job token cannot publish .github/workflows/*".into());
-    }
     let diffstat = git(work, &["diff", "--stat", &dispatch.base, "HEAD"])?;
-    Ok((contract, refused_workflow, diffstat, code))
+    Ok(HarvestedWorker {
+        contract,
+        checkpointed,
+        diffstat,
+        exit_code: code,
+    })
 }
 
 trait WorkerHost {
@@ -1842,6 +1835,7 @@ fn produce(
         .map(|receipt| receipt.expected_tip.clone())
         .unwrap_or_default();
     let mut candidate = None;
+    let mut checkpointed = false;
     let mut proposed_body = None;
     let mut raw = if package.join("raw.log").is_file() {
         regular_text(&package.join("raw.log"))?
@@ -1849,7 +1843,6 @@ fn produce(
         String::new()
     };
     let mut diffstat = String::new();
-    let mut refused_workflow = setup != "success/success";
     if setup == "success/success" {
         let preparation_commands = dispatch.loop_deadline.map(CommandWindow::until);
         host.initialize()?;
@@ -1876,7 +1869,6 @@ fn produce(
                 "41898282+github-actions[bot]@users.noreply.github.com",
             ],
         )?;
-        let starting_tip = git(&actor_work, &["rev-parse", "HEAD"])?.trim().to_owned();
         drop(preparation_commands);
         let mut agent_dispatch = dispatch.clone();
         if let Some(body) = previous
@@ -1928,15 +1920,13 @@ fn produce(
         let staging = tempfile::Builder::new()
             .prefix("harvest-")
             .tempdir_in(&state)?;
-        (contract, refused_workflow, diffstat, code) = timed_phase("worker.harvest", || {
-            harvest_worker(
-                &actor,
-                &staging.path().join("candidate"),
-                dispatch,
-                result,
-                &starting_tip,
-            )
+        let harvested = timed_phase("worker.harvest", || {
+            harvest_worker(&actor, &staging.path().join("candidate"), dispatch, result)
         })?;
+        contract = harvested.contract;
+        diffstat = harvested.diffstat;
+        code = harvested.exit_code;
+        checkpointed = harvested.checkpointed;
         proposed_body = read_pr_body(&actor)?.or_else(|| {
             previous
                 .as_ref()
@@ -1972,15 +1962,23 @@ fn produce(
     std::fs::write(package.join("diffstat.txt"), diffstat)?;
     // This receipt stays on the disposable runner; it is not uploaded.
     if let Some(candidate) = candidate {
+        let head = git(&candidate.path().join("candidate"), &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+        let checkpointed = checkpointed
+            || previous
+                .as_ref()
+                .is_some_and(|receipt| receipt.head == head && receipt.checkpointed);
         install_worker_checkpoint(
             &state,
             &candidate.path().join("candidate"),
             &Receipt {
+                head,
+                checkpointed,
                 base,
                 branch: dispatch.branch.clone(),
                 exit_code: code,
                 expected_tip,
-                refused_workflow,
                 pr_body: proposed_body,
                 worker: dispatch.worker.clone(),
                 contract: contract.clone(),
@@ -2149,6 +2147,10 @@ enum AppliedBody {
 struct Applied {
     commits: Vec<String>,
     #[serde(default)]
+    new_commits: Vec<String>,
+    #[serde(default)]
+    published_checkpoint: bool,
+    #[serde(default)]
     rebased_onto: Option<String>,
     body: AppliedBody,
     board_changes: Vec<String>,
@@ -2179,13 +2181,20 @@ impl Applied {
     }
     fn report(&self) -> String {
         format!(
-            "- Commits pushed: {}.{}\n- PR body: {}.\n- Board status: {}.",
+            "- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.",
             if self.commits.is_empty() {
                 "none".into()
             } else {
                 self.commits
                     .iter()
-                    .map(|s| s.chars().take(12).collect::<String>())
+                    .map(|s| {
+                        let short = s.chars().take(12).collect::<String>();
+                        if self.new_commits.contains(s) {
+                            format!("{short} (new in this run)")
+                        } else {
+                            short
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             },
@@ -2277,19 +2286,26 @@ fn closing_targets(text: &str) -> Vec<&str> {
 fn closing_reference(text: &str) -> bool {
     !closing_targets(text).is_empty()
 }
-fn check_commit_closures(work: &Path, since: &str, issue: u64) -> Result<(), ScalerError> {
-    let log = git(
-        work,
-        &["log", "--format=%H%x00%B%x00", &format!("{since}..HEAD")],
-    )?;
+fn check_commit_closures(
+    work: &Path,
+    base: &str,
+    published_tip: Option<&str>,
+    issue: u64,
+) -> Result<(), ScalerError> {
+    let range = format!("{base}..HEAD");
+    let mut args = vec!["log", "--format=%H%x00%B%x00", &range];
+    if let Some(tip) = published_tip {
+        args.extend(["--not", tip]);
+    }
+    let log = git(work, &args)?;
     let mut fields = log.split('\0');
     while let Some(commit) = fields.next().map(str::trim).filter(|s| !s.is_empty()) {
         if !sha(commit) {
-            return Err(ScalerError::Guard("invalid harvested commit id"));
+            return Err(ScalerError::Guard("invalid publication commit id"));
         }
         let message = fields
             .next()
-            .ok_or(ScalerError::Guard("missing harvested commit message"))?;
+            .ok_or(ScalerError::Guard("missing publication commit message"))?;
         let allowed = [
             format!("#{issue}"),
             format!("{REPOSITORY}#{issue}"),
@@ -2763,6 +2779,47 @@ fn restore_pr_body(
     Ok(reason)
 }
 
+fn live_publication_main(work: &Path, token: &str) -> Result<String, ScalerError> {
+    let authenticated_git = |args: &[&str]| -> Result<String, ScalerError> {
+        let mut command = git_invocation(work, args);
+        command.env("GH_TOKEN", token);
+        String::from_utf8(output(&mut command)?)
+            .map_err(|_| ScalerError::Guard("non-UTF8 live main response"))
+    };
+    let remote = authenticated_git(&[
+        "-c",
+        "credential.helper=!gh auth git-credential",
+        "ls-remote",
+        "--heads",
+        "https://github.com/carrick-sh/carrick",
+        "refs/heads/main",
+    ])?;
+    let fields: Vec<_> = remote.split_whitespace().collect();
+    let [main, "refs/heads/main"] = fields.as_slice() else {
+        return Err(ScalerError::Guard("live main ref missing or ambiguous"));
+    };
+    if !sha(main) {
+        return Err(ScalerError::Guard("invalid live main SHA"));
+    }
+    authenticated_git(&[
+        "-c",
+        "credential.helper=!gh auth git-credential",
+        "fetch",
+        "--no-tags",
+        "https://github.com/carrick-sh/carrick",
+        main,
+    ])?;
+    Ok((*main).to_owned())
+}
+
+fn publication_body(body: &str, source: &str, issue: u64) -> Result<String, ScalerError> {
+    let closing = format!("\n\nCloses #{issue}\n");
+    let (human, footer) = body.rsplit_once(&closing).ok_or(ScalerError::Guard(
+        "publication body lacks canonical footer",
+    ))?;
+    Ok(format!("{human}\n\n{source}{closing}{footer}"))
+}
+
 fn publish(
     root: &Path,
     dispatch: &Dispatch,
@@ -2798,8 +2855,7 @@ fn publish(
             None
         }
     };
-    if !receipt.refused_workflow
-        && work.is_dir()
+    if work.is_dir()
         && (dispatch.resume || git(&work, &["rev-parse", "HEAD"])?.trim() != receipt.base)
     {
         git(
@@ -2809,6 +2865,28 @@ fn publish(
         .map_err(|_| {
             ScalerError::Guard("worker must rebase onto admitted main before publication")
         })?;
+        let live_main = live_publication_main(&work, token)?;
+        let base = git(&work, &["merge-base", &live_main, "HEAD"])?;
+        let base = base.trim();
+        // Main and the branch tip admitted before this run are trusted history.
+        // A worker may rebase across either without owning their messages.
+        check_commit_closures(
+            &work,
+            base,
+            (!receipt.expected_tip.is_empty()).then_some(receipt.expected_tip.as_str()),
+            dispatch.issue,
+        )?;
+        let refused_workflow = git(
+            &work,
+            &["diff", "--name-only", "--no-renames", "-z", base, "HEAD"],
+        )?
+        .split('\0')
+        .any(|path| path.starts_with(".github/workflows/"));
+        if refused_workflow {
+            return Err(ScalerError::Guard(
+                "Refused workflow changes: job token cannot publish .github/workflows/*",
+            ));
+        }
         let tip = git(
             &work,
             &[
@@ -2830,7 +2908,9 @@ fn publish(
             ),
             token,
         ));
-        let proposal = proposal.map(|body| format!("{source}\n\n{body}"));
+        let proposal = proposal
+            .map(|body| publication_body(&body, &source, dispatch.issue))
+            .transpose()?;
         let existing = tip.split_whitespace().next();
         let retained =
             existing.is_some() && receipt.expected_tip.is_empty() && existing != Some(head.trim());
@@ -2843,31 +2923,67 @@ fn publish(
                 dispatch.branch,
                 pr["number"]
             )?;
-        } else if existing != Some(head.trim()) {
-            // receipt.base is this event's admitted main. The old remote tip
-            // can precede a rebase and would include other people's main work.
-            let base = git(&work, &["merge-base", &receipt.base, "HEAD"])?;
-            let base = base.trim();
-            let rebased_onto = if receipt.expected_tip.is_empty() {
-                None
-            } else {
-                let previous_base =
-                    git(&work, &["merge-base", &receipt.base, &receipt.expected_tip])?;
-                (previous_base.trim() != base).then(|| base.to_owned())
-            };
+        } else {
             let commits: Vec<_> = git(&work, &["rev-list", "--reverse", &format!("{base}..HEAD")])?
                 .lines()
                 .filter(|s| sha(s))
                 .map(str::to_owned)
                 .collect();
-            output(&mut push_command(
-                &work,
-                dispatch,
-                id,
-                &receipt.expected_tip,
-            )?)?;
+            let mut new_commits = Vec::new();
+            let mut rebased_onto = None;
+            if existing != Some(head.trim()) {
+                let prior_base = if receipt.expected_tip.is_empty() {
+                    receipt.base.clone()
+                } else {
+                    git(&work, &["merge-base", &live_main, &receipt.expected_tip])?
+                        .trim()
+                        .to_owned()
+                };
+                // Main must be on the primary history, and a published old tip
+                // must have been rewritten. Merging main retains that old tip.
+                let rewritten = receipt.expected_tip.is_empty()
+                    || git(&work, &["merge-base", &receipt.expected_tip, "HEAD"])?.trim()
+                        != receipt.expected_tip;
+                if prior_base != base
+                    && rewritten
+                    && git(
+                        &work,
+                        &["rev-list", "--first-parent", &format!("{prior_base}..HEAD")],
+                    )?
+                    .lines()
+                    .any(|commit| commit == base)
+                {
+                    rebased_onto = Some(base.to_owned());
+                }
+                new_commits = if let Some(previous) = existing {
+                    git(
+                        &work,
+                        &[
+                            "rev-list",
+                            "--reverse",
+                            &format!("{base}..HEAD"),
+                            "--not",
+                            previous,
+                        ],
+                    )?
+                    .lines()
+                    .filter(|s| sha(s))
+                    .map(str::to_owned)
+                    .collect()
+                } else {
+                    commits.clone()
+                };
+                output(&mut push_command(
+                    &work,
+                    dispatch,
+                    id,
+                    &receipt.expected_tip,
+                )?)?;
+            }
             Applied::record(|a| {
                 a.commits = commits;
+                a.new_commits = new_commits;
+                a.published_checkpoint = receipt.checkpointed;
                 a.rebased_onto = rebased_onto;
             })?;
         }
@@ -2935,10 +3051,11 @@ fn publish(
         } else {
             let body = match proposal {
                 Some(body) => body,
-                None => format!(
-                    "{source}\n\n{}",
-                    template_pr_body(&receipt.contract, dispatch.issue, id, token)?
-                ),
+                None => publication_body(
+                    &template_pr_body(&receipt.contract, dispatch.issue, id, token)?,
+                    &source,
+                    dispatch.issue,
+                )?,
             };
             let path = state.join("pr-body.md");
             std::fs::write(&path, body)?;
@@ -2955,7 +3072,7 @@ fn publish(
                     "--head",
                     &dispatch.branch,
                     "--title",
-                    &draft_pr_title(&work, &receipt.base, dispatch.issue, token)?,
+                    &draft_pr_title(&work, base, dispatch.issue, token)?,
                     "--body-file",
                     path.to_str().ok_or(ScalerError::Guard("body path"))?,
                 ],
@@ -2974,10 +3091,11 @@ fn publish(
                     summary: "The server restored this template because the proposed body's closing references could not be verified.".into(),
                     ..receipt.contract.clone()
                 };
-                let fallback = format!(
-                    "{source}\n\n{}",
-                    template_pr_body(&recovery, dispatch.issue, id, token)?
-                );
+                let fallback = publication_body(
+                    &template_pr_body(&recovery, dispatch.issue, id, token)?,
+                    &source,
+                    dispatch.issue,
+                )?;
                 let reason = restore_pr_body(
                     root,
                     number,
@@ -3269,7 +3387,7 @@ mod tests {
         ] {
             git(temp.path(), &["commit", "--allow-empty", "-m", message]).unwrap();
         }
-        assert!(check_commit_closures(temp.path(), since.trim(), 634).is_ok());
+        assert!(check_commit_closures(temp.path(), since.trim(), None, 634).is_ok());
         let safe_tip = git(temp.path(), &["rev-parse", "HEAD"]).unwrap();
         for message in [
             "Fixes #999",
@@ -3280,7 +3398,7 @@ mod tests {
         ] {
             git(temp.path(), &["commit", "--allow-empty", "-m", message]).unwrap();
             let bad = git(temp.path(), &["rev-parse", "HEAD"]).unwrap();
-            let error = check_commit_closures(temp.path(), safe_tip.trim(), 634)
+            let error = check_commit_closures(temp.path(), safe_tip.trim(), None, 634)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -3299,17 +3417,28 @@ mod tests {
         let state = root.path().join("state");
         std::fs::create_dir_all(state.join("work")).unwrap();
         let candidate = root.path().join("candidate");
-        std::fs::create_dir(&candidate).unwrap();
+        fixture_repository(&state.join("work"));
+        git(
+            &state.join("work"),
+            &["clone", ".", candidate.to_str().unwrap()],
+        )
+        .unwrap();
         std::fs::write(candidate.join("new-tree"), "new").unwrap();
+        git(&candidate, &["add", "new-tree"]).unwrap();
+        git(&candidate, &["commit", "-m", "fix(ci): new candidate"]).unwrap();
         let mut dispatch = validate_event(&event(), "tjfontaine").unwrap();
-        dispatch.base = "a".repeat(40);
+        dispatch.base = git(&state.join("work"), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .into();
         dispatch.branch = "work/dispatch-634-42".into();
         let receipt = Receipt {
+            head: dispatch.base.clone(),
+            checkpointed: false,
             base: dispatch.base.clone(),
             branch: dispatch.branch.clone(),
             exit_code: 0,
             expected_tip: String::new(),
-            refused_workflow: false,
             pr_body: None,
             worker: dispatch.worker.clone(),
             contract: Contract {
@@ -3325,6 +3454,10 @@ mod tests {
             serde_json::to_vec(&receipt).unwrap(),
         )
         .unwrap();
+        assert!(
+            worker_checkpoint(&state, &dispatch).unwrap().is_some(),
+            "old pair was not valid before injection"
+        );
         let error = install_worker_checkpoint_with(
             &state,
             &candidate,
@@ -3340,6 +3473,87 @@ mod tests {
         assert!(
             worker_checkpoint(&state, &dispatch).is_err(),
             "double checkpoint failure left a new tree paired with an old receipt"
+        );
+    }
+    #[test]
+    fn followup_worker_workflow_changes_remain_refused() {
+        publication_fixture("worker-workflow");
+    }
+    #[test]
+    fn followup_live_main_rebase_excludes_upstream_commits() {
+        publication_fixture("live-main-rebase");
+    }
+    #[test]
+    fn followup_live_main_workflows_are_not_worker_edits() {
+        publication_fixture("live-main-workflow");
+    }
+    #[test]
+    fn followup_live_main_closures_are_trusted() {
+        publication_fixture("live-main-closure");
+    }
+    #[test]
+    fn followup_publication_refuses_worker_closing_another_issue() {
+        publication_fixture("worker-closure");
+    }
+    #[test]
+    fn followup_previously_published_closures_are_trusted() {
+        publication_fixture("published-closure");
+    }
+    #[test]
+    fn followup_merge_of_main_is_not_reported_as_rebase() {
+        publication_fixture("merge-evidence");
+    }
+    #[test]
+    fn followup_pr_commits_mark_only_new_commits() {
+        publication_fixture("commit-labels");
+    }
+    #[test]
+    fn followup_proposal_summary_precedes_provenance() {
+        publication_fixture("summary-first");
+    }
+    #[test]
+    fn followup_template_summary_precedes_provenance() {
+        publication_fixture("template-summary-first");
+    }
+    #[test]
+    fn followup_checkpoint_rejects_mismatched_head() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        fixture_repository(&work);
+        let mut dispatch = validate_event(&event(), "tjfontaine").unwrap();
+        dispatch.base = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+        dispatch.branch = "work/dispatch-634-42".into();
+        git(&work, &["checkout", "-b", &dispatch.branch]).unwrap();
+        let receipt = Receipt {
+            head: dispatch.base.clone(),
+            checkpointed: false,
+            base: dispatch.base.clone(),
+            branch: dispatch.branch.clone(),
+            exit_code: 0,
+            expected_tip: String::new(),
+            pr_body: None,
+            worker: Worker::default(),
+            contract: Contract {
+                loop_summary: None,
+                status: ContractStatus::Done,
+                summary: "old tree".into(),
+                tests: vec![],
+                risks: vec![],
+            },
+        };
+        let mut value = serde_json::to_value(&receipt).unwrap();
+        value["head"] = dispatch.base.clone().into();
+        std::fs::write(root.path().join("receipt.json"), value.to_string()).unwrap();
+        assert!(worker_checkpoint(root.path(), &dispatch).unwrap().is_some());
+        git(
+            &work,
+            &["commit", "--allow-empty", "-m", "fix(ci): replace tree"],
+        )
+        .unwrap();
+        assert!(
+            worker_checkpoint(root.path(), &dispatch).is_err(),
+            "checkpoint admitted a tree whose HEAD differs from its receipt"
         );
     }
     #[test]
@@ -3395,9 +3609,24 @@ mod tests {
                 (
                     "git",
                     r#"#!/bin/sh
+authenticated=0
 for arg do
  case "$arg" in
- ls-remote) if test -f "$RUNNER_TEMP/remote-tip"; then cat "$RUNNER_TEMP/remote-tip"; fi; exit 0 ;;
+ 'credential.helper=!gh auth git-credential') authenticated=1 ;;
+ fetch)
+   if test "$authenticated" = 1; then
+     test "$GH_TOKEN" = fixture-token || exit 96
+     for ref do :; done
+     printf '%s\n' "$@" >> "$RUNNER_TEMP/server-fetch.args"
+     exec /usr/bin/git fetch --no-tags "$RUNNER_TEMP/live-main.git" "$ref"
+   fi ;;
+ ls-remote)
+   for ref do :; done
+   if test "$ref" = refs/heads/main; then
+     test "$GH_TOKEN" = fixture-token || exit 96
+     exec /usr/bin/git ls-remote "$RUNNER_TEMP/live-main.git" refs/heads/main
+   fi
+   if test -f "$RUNNER_TEMP/remote-tip"; then cat "$RUNNER_TEMP/remote-tip"; fi; exit 0 ;;
  push) printf '%s\n' "$@" >> "$RUNNER_TEMP/push.args"; /usr/bin/git rev-parse HEAD > "$RUNNER_TEMP/remote-tip"; exit 0 ;;
  esac
 done
@@ -3499,6 +3728,27 @@ fi
         let work = state.join("work");
         std::fs::create_dir_all(&work).unwrap();
         fixture_repository(&work);
+        git(
+            &work,
+            &[
+                "clone",
+                "--bare",
+                ".",
+                outer.join("live-main.git").to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        git(
+            &work,
+            &[
+                "--git-dir",
+                outer.join("live-main.git").to_str().unwrap(),
+                "update-ref",
+                "refs/heads/main",
+                "HEAD",
+            ],
+        )
+        .unwrap();
         let base = git(&work, &["rev-parse", "HEAD"])
             .unwrap()
             .trim()
@@ -3531,11 +3781,12 @@ fi
             risks: vec![],
         };
         let mut receipt = Receipt {
+            checkpointed: false,
+            head: git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into(),
             base,
             branch: dispatch.branch.clone(),
             exit_code: 0,
             expected_tip: String::new(),
-            refused_workflow: false,
             pr_body: None,
             worker: dispatch.worker.clone(),
             contract: contract.clone(),
@@ -3547,6 +3798,29 @@ fi
         }
         let report = state.join("report.md");
         std::fs::write(&report, "").unwrap();
+        if witness == "worker-workflow" {
+            std::fs::create_dir_all(work.join(".github/workflows")).unwrap();
+            std::fs::write(work.join(".github/workflows/worker.yml"), "name: worker\n").unwrap();
+            git(&work, &["add", ".github/workflows/worker.yml"]).unwrap();
+            git(&work, &["commit", "-m", "fix(ci): worker workflow edit"]).unwrap();
+            let result = publish(
+                &work,
+                &dispatch,
+                &receipt,
+                &contract,
+                &report,
+                "fixture-token",
+                &mut agent_loop::RunCache::default(),
+            );
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("Refused workflow changes")),
+                "worker workflow edit was published: {result:?}"
+            );
+            assert!(!outer.join("push.args").exists());
+            return;
+        }
         if matches!(
             witness,
             "lag" | "extra-after-match" | "create-repair" | "timeout" | "transient"
@@ -3672,6 +3946,12 @@ fi
                 "PR body does not identify the harvested worker"
             );
         }
+        if witness == "template-summary-first" {
+            assert!(
+                body.find("implemented").unwrap() < body.find("Published tree:").unwrap(),
+                "template leads with provenance instead of the human summary"
+            );
+        }
         if witness == "closing" {
             assert_eq!(
                 body.lines().filter(|s| s.starts_with("Closes #")).count(),
@@ -3703,19 +3983,65 @@ fi
             .unwrap()
             .trim()
             .to_owned();
-        if witness == "rebase-evidence" {
+        if witness == "published-closure" {
+            git(&work, &["commit", "--allow-empty", "-m", "Closes #999"]).unwrap();
+            receipt.expected_tip = git(&work, &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_owned();
+            std::fs::write(outer.join("remote-tip"), &receipt.expected_tip).unwrap();
+        }
+        if matches!(
+            witness,
+            "rebase-evidence"
+                | "live-main-rebase"
+                | "live-main-workflow"
+                | "merge-evidence"
+                | "live-main-closure"
+        ) {
             git(&work, &["checkout", "-b", "advanced-main", &receipt.base]).unwrap();
             for subject in ["main one", "main two", "main three"] {
                 git(&work, &["commit", "--allow-empty", "-m", subject]).unwrap();
+            }
+            if witness == "live-main-closure" {
+                git(&work, &["commit", "--allow-empty", "-m", "Closes #999"]).unwrap();
+            }
+            if witness == "live-main-workflow" {
+                std::fs::create_dir_all(work.join(".github/workflows")).unwrap();
+                std::fs::write(
+                    work.join(".github/workflows/upstream.yml"),
+                    "name: upstream\n",
+                )
+                .unwrap();
+                git(&work, &["add", ".github/workflows/upstream.yml"]).unwrap();
+                git(&work, &["commit", "-m", "fix(ci): main workflow update"]).unwrap();
             }
             let new_base = git(&work, &["rev-parse", "HEAD"])
                 .unwrap()
                 .trim()
                 .to_owned();
             git(&work, &["checkout", &dispatch.branch]).unwrap();
-            git(&work, &["rebase", "--onto", &new_base, &receipt.base]).unwrap();
-            dispatch.base = new_base.clone();
-            receipt.base = new_base;
+            if witness == "merge-evidence" {
+                git(&work, &["merge", "--no-ff", &new_base, "-m", "merge main"]).unwrap();
+            } else {
+                git(&work, &["rebase", "--onto", &new_base, &receipt.base]).unwrap();
+            }
+            git(
+                &work,
+                &[
+                    "--git-dir",
+                    outer.join("live-main.git").to_str().unwrap(),
+                    "fetch",
+                    work.to_str().unwrap(),
+                    "advanced-main:refs/heads/main",
+                ],
+            )
+            .unwrap();
+            std::fs::write(outer.join("live-base"), &new_base).unwrap();
+            if matches!(witness, "rebase-evidence" | "merge-evidence") {
+                dispatch.base = new_base.clone();
+                receipt.base = new_base;
+            }
         }
         git(
             &work,
@@ -3723,13 +4049,18 @@ fi
                 "commit",
                 "--allow-empty",
                 "-m",
-                "fix(ci): apply owner follow-up",
+                if witness == "worker-closure" {
+                    "Fixes #999"
+                } else {
+                    "fix(ci): apply owner follow-up"
+                },
             ],
         )
         .unwrap();
         if matches!(
             witness,
             "body"
+                | "summary-first"
                 | "edit-failure"
                 | "references"
                 | "footer"
@@ -3750,6 +4081,7 @@ fi
         if matches!(
             witness,
             "body"
+                | "summary-first"
                 | "edit-failure"
                 | "references"
                 | "footer"
@@ -3806,6 +4138,40 @@ fi
         }
         if witness == "refused" {
             receipt.pr_body = Some("Explain the fix.\nFixes #999".into());
+        }
+        if matches!(witness, "live-main-workflow" | "live-main-closure") {
+            let actor = tempfile::tempdir().unwrap();
+            snapshot(&work, &actor.path().join("work"), &dispatch.branch).unwrap();
+            std::fs::write(actor.path().join("result.json"), json!({"structured_output":{"status":"done","summary":"own fix","tests":[],"risks":[]}}).to_string()).unwrap();
+            let harvested = harvest_worker(
+                actor.path(),
+                &actor.path().join("candidate"),
+                &dispatch,
+                Ok(0),
+            );
+            assert!(
+                harvested.is_ok(),
+                "harvest refused a trusted live-main closing reference"
+            );
+        }
+        receipt.head = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+        if witness == "worker-closure" {
+            let result = publish(
+                &work,
+                &dispatch,
+                &receipt,
+                &contract,
+                &report,
+                "fixture-token",
+                &mut agent_loop::RunCache::default(),
+            );
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains(&receipt.head)),
+                "publication accepted the worker's own unrelated closing reference"
+            );
+            return;
         }
         if matches!(witness, "references" | "restore-html") {
             std::fs::write(outer.join("two-references"), "").unwrap();
@@ -3883,9 +4249,56 @@ fi
                 &mut agent_loop::RunCache::default(),
             )
             .unwrap(),
-            Some(800)
+            Some(800),
+            "publication blamed live main workflow changes on the worker"
         );
         let applied = Applied::load().unwrap();
+        if matches!(witness, "live-main-rebase" | "live-main-workflow") {
+            let live = regular_text(&outer.join("live-base")).unwrap();
+            assert_eq!(
+                applied.commits.len(),
+                2,
+                "PR commit list includes commits from live main"
+            );
+            let fetches = regular_text(&outer.join("server-fetch.args")).unwrap();
+            assert!(
+                fetches.lines().any(|line| line == live),
+                "server did not fetch its authenticated live-main snapshot"
+            );
+            assert!(
+                applied
+                    .report()
+                    .contains(&format!("Rebased onto main at {live}")),
+                "rebase report names the admitted base instead of live main"
+            );
+        }
+        if witness == "merge-evidence" {
+            assert!(
+                !applied.report().contains("Rebased onto main at"),
+                "merge of main was reported as a rebase"
+            );
+        }
+        if witness == "commit-labels" {
+            let report = applied.report();
+            let old = &receipt.expected_tip[..12];
+            let head = git(&work, &["rev-parse", "HEAD"]).unwrap();
+            assert!(
+                report.starts_with("- PR commits: "),
+                "outcome still labels the list as pushed commits"
+            );
+            assert!(
+                report.contains(&format!("{} (new in this run)", &head[..12]))
+                    && !report.contains(&format!("{old} (new in this run)")),
+                "PR commit report does not distinguish new commits from prior commits"
+            );
+        }
+        if witness == "summary-first" {
+            let body = regular_text(&outer.join("applied-body.md")).unwrap();
+            assert!(
+                body.starts_with("Explain the implemented fix."),
+                "proposal leads with provenance instead of the human summary"
+            );
+        }
         if witness == "rebase-evidence" {
             let expected = git(
                 &work,
@@ -3918,7 +4331,7 @@ fi
         } else {
             assert_eq!(
                 applied.body == AppliedBody::Updated,
-                matches!(witness, "body" | "footer" | "manual")
+                matches!(witness, "body" | "footer" | "manual" | "summary-first")
             );
         }
         if witness == "footer" {
