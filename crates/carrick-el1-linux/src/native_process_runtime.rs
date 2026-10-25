@@ -320,6 +320,12 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     ) -> Result<NativeExecSuccessor<Self::Mm, C>, NativeProcessError> {
         Err(NativeProcessError::Unsupported)
     }
+    fn cancel_exec_successor(
+        &self,
+        _receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
     /// After graph publication has made the successor authoritative, switch
     /// the physical execution to it and settle the retained predecessor.
     /// Refusal is terminal: the consuming adoption crossing was the point of

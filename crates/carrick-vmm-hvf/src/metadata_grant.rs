@@ -1815,8 +1815,7 @@ fn service_native_exec_adopt(
     // SAFETY: retain_reply pins the complete aligned ring-owned record through
     // this synchronous crossing.
     let manifest = unsafe { manifest.as_ref() };
-    let Some((prepared, successor)) =
-        custody.take_native_exec_preparation(receipt, manifest, execution)
+    let Some(successor) = custody.validate_native_exec_preparation(receipt, manifest, execution)
     else {
         request.refuse();
         return Ok(refused);
@@ -1835,6 +1834,16 @@ fn service_native_exec_adopt(
         .closed_grant(index, successor.successor_mm.raw())
         .is_none_or(|grant| grant.ttbr0 != expected_ttbr || grant.ttbr1 != expected_ttbr)
     {
+        request.refuse();
+        return Ok(refused);
+    }
+    let Some((prepared, consumed_successor)) =
+        custody.take_native_exec_preparation(receipt, manifest, execution)
+    else {
+        request.refuse();
+        return Ok(refused);
+    };
+    if consumed_successor != successor {
         request.refuse();
         return Ok(refused);
     }
@@ -1877,6 +1886,44 @@ fn service_native_exec_adopt(
         ));
     }
     Ok([METADATA_GRANT_SUCCESS, 0, 0, 0])
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn service_native_exec_cancel(
+    custody: &crate::trap::CarrierVmCustody,
+    generation: Option<crate::trap::CarrierVmGeneration>,
+    region: RetainedAbiRegion<'_>,
+    cpu: carrick_guest_arch::CpuId,
+    address: carrick_guest_arch::KernelVa,
+    claimed_cpu: u64,
+    ttbr0: u64,
+) -> [u64; 4] {
+    let refused = [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    if claimed_cpu != u64::from(cpu.raw()) || !request_has_live_vm(custody, generation) {
+        return refused;
+    }
+    let Some(pointer) =
+        abi_stack_ptr::<carrick_el1_abi::NativeExecCancellation>(region, cpu, address)
+    else {
+        return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
+    };
+    // SAFETY: the stopped CPU exclusively retains its aligned crossing record.
+    let request = unsafe { &mut *pointer };
+    let Some(receipt) = request.request() else {
+        return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
+    };
+    let Some(execution) = stopped_execution(region, cpu, ttbr0) else {
+        request.refuse();
+        return refused;
+    };
+    if !custody.cancel_native_exec_preparation(receipt, execution) {
+        request.refuse();
+        return refused;
+    }
+    if !request.accept() {
+        return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
+    }
+    [METADATA_GRANT_SUCCESS, 0, 0, 0]
 }
 
 /// Release the exact predecessor retained by native exec after the ring has
@@ -2070,6 +2117,23 @@ pub(crate) fn handle_metadata_grant_trap(
             .map_err(|e| TrapError::Hypervisor(format!("read exec successor root: {e}")))?;
         if let Some(region) = region {
             service_native_exec_settle(custody, generation, region, cpu, arg1, arg2, arg3, ttbr0)
+        } else {
+            [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
+        }
+    } else if op == carrick_el1_abi::GRANT_OP_EXEC_CANCEL {
+        let ttbr0 = vcpu
+            .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
+            .map_err(|e| TrapError::Hypervisor(format!("read exec cancellation root: {e}")))?;
+        if let Some(region) = region {
+            service_native_exec_cancel(
+                custody,
+                generation,
+                region,
+                cpu,
+                carrick_guest_arch::KernelVa::new(arg1),
+                arg2,
+                ttbr0,
+            )
         } else {
             [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
         }

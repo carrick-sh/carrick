@@ -17,8 +17,8 @@ use core::num::NonZeroU64;
 
 #[allow(unused_imports)]
 pub use crate::{
-    GRANT_OP_CHILD_RETIRE, GRANT_OP_EXEC_ADOPT, GRANT_OP_EXEC_SETTLE, GRANT_OP_FORK_STOCK,
-    GRANT_OP_ROOT_EXIT,
+    GRANT_OP_CHILD_RETIRE, GRANT_OP_EXEC_ADOPT, GRANT_OP_EXEC_CANCEL, GRANT_OP_EXEC_SETTLE,
+    GRANT_OP_FORK_STOCK, GRANT_OP_ROOT_EXIT,
 };
 
 /// x86 synchronous I/O port for physical fork stock loans and settlements.
@@ -111,6 +111,77 @@ impl NativeExecAdoption {
             _ => return None,
         };
         self.words[3] = Self::CONSUMED;
+        Some(result)
+    }
+}
+
+/// One synchronous, consuming cancellation of a prepared native exec. The
+/// carrier authenticates the receipt against the stopped predecessor MM; a
+/// stale or repeated receipt refuses.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct NativeExecCancellation {
+    words: [u64; 8],
+}
+
+impl NativeExecCancellation {
+    const MAGIC: u64 = 0x4352_4558_4341_4e43;
+    const PENDING: u64 = 0;
+    const ACCEPTED: u64 = 1;
+    const REFUSED: u64 = 2;
+    const CONSUMED: u64 = 3;
+
+    pub fn new(receipt: carrick_core_abi::service::ExecAdoptionReceipt) -> Self {
+        Self {
+            words: [
+                Self::MAGIC,
+                receipt.raw().get(),
+                Self::PENDING,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        }
+    }
+
+    pub fn request(&self) -> Option<carrick_core_abi::service::ExecAdoptionReceipt> {
+        if self.words[0] != Self::MAGIC || self.words[2] != Self::PENDING {
+            return None;
+        }
+        carrick_core_abi::service::ExecAdoptionReceipt::checked(NonZeroU64::new(self.words[1])?)
+    }
+
+    pub fn accept(&mut self) -> bool {
+        self.reply(Self::ACCEPTED)
+    }
+
+    pub fn refuse(&mut self) -> bool {
+        self.reply(Self::REFUSED)
+    }
+
+    fn reply(&mut self, status: u64) -> bool {
+        if self.request().is_none() {
+            return false;
+        }
+        self.words[2] = status;
+        true
+    }
+
+    pub fn take(
+        &mut self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+    ) -> Option<Result<(), ()>> {
+        if self.words[0] != Self::MAGIC || self.words[1] != receipt.raw().get() {
+            return None;
+        }
+        let result = match self.words[2] {
+            Self::ACCEPTED => Ok(()),
+            Self::REFUSED => Err(()),
+            _ => return None,
+        };
+        self.words[2] = Self::CONSUMED;
         Some(result)
     }
 }
@@ -1588,6 +1659,19 @@ mod tests {
         assert!(request.accept());
         assert_eq!(request.take(receipt, manifest), Some(Ok(())));
         assert_eq!(request.take(receipt, manifest), None);
+        assert_eq!(request.request(), None);
+    }
+
+    #[test]
+    fn exec_cancellation_receipt_is_consumed_once() {
+        let receipt =
+            carrick_core_abi::service::ExecAdoptionReceipt::checked(NonZeroU64::new(23).unwrap())
+                .unwrap();
+        let mut request = NativeExecCancellation::new(receipt);
+        assert_eq!(request.request(), Some(receipt));
+        assert!(request.accept());
+        assert_eq!(request.take(receipt), Some(Ok(())));
+        assert_eq!(request.take(receipt), None);
         assert_eq!(request.request(), None);
     }
 }

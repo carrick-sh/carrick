@@ -8,10 +8,18 @@ std::thread_local! {
     static SIGNAL_COPIES: std::cell::RefCell<Vec<(UserVa, Vec<u8>)>> = const {
         std::cell::RefCell::new(Vec::new())
     };
+    static EXEC_CANCELLATIONS: std::cell::RefCell<Vec<u64>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
 }
 
 pub fn take_signal_copies() -> Vec<(UserVa, Vec<u8>)> {
     SIGNAL_COPIES.with(|copies| core::mem::take(&mut *copies.borrow_mut()))
+}
+
+#[cfg(test)]
+fn take_exec_cancellations() -> Vec<u64> {
+    EXEC_CANCELLATIONS.with(|receipts| core::mem::take(&mut *receipts.borrow_mut()))
 }
 
 pub struct Physical<'a, C: ProcessContext = ParkedContextWords> {
@@ -30,6 +38,13 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     type Mm = AddressContext<RootGpa>;
     type PreparedMm = AddressContext<RootGpa>;
     type Born = AddressContext<RootGpa>;
+    fn cancel_exec_successor(
+        &self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+    ) -> Result<(), NativeProcessError> {
+        EXEC_CANCELLATIONS.with(|receipts| receipts.borrow_mut().push(receipt.raw().get()));
+        Ok(())
+    }
     fn adopt_exec_successor(
         &self,
         identity: carrick_core_abi::service::ServiceIdentity,
@@ -1314,6 +1329,18 @@ fn publish_test_exec_reply(
     receipt_raw: u64,
     root_raw: u64,
 ) -> carrick_core_abi::ReservationMm {
+    publish_test_exec_reply_with(fixture, control, slot, receipt_raw, root_raw, false)
+}
+
+#[cfg(test)]
+fn publish_test_exec_reply_with(
+    fixture: &NativeSignalFixture,
+    control: &ThreadControlSlot,
+    slot: SlotId,
+    receipt_raw: u64,
+    root_raw: u64,
+    corrupt_after_prepare: bool,
+) -> carrick_core_abi::ReservationMm {
     use carrick_core_abi::service::{
         ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
         ServiceCell,
@@ -1358,6 +1385,9 @@ fn publish_test_exec_reply(
             },
         )
         .unwrap();
+    if corrupt_after_prepare {
+        *manifest = ExecSuccessorManifest::propose(request.identity, successor_mm);
+    }
     assert!(
         ticket
             .publish_exec_prepared(receipt, (), |_, ()| {})
@@ -1369,6 +1399,65 @@ fn publish_test_exec_reply(
     let mut service = fixture.service();
     service.wake_effects(effects);
     successor_mm
+}
+
+#[cfg(test)]
+#[test]
+fn refused_exec_preparation_is_cancelled_exactly_once() {
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    assert!(take_exec_cancellations().is_empty());
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_exec_service(Box::from(&b"/bin/static\0\0\0"[..])),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    let successor_mm = publish_test_exec_reply_with(
+        &fixture,
+        fixture.control,
+        fixture.slot,
+        113,
+        0xc0_0000,
+        true,
+    );
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    // SAFETY: the prepared-service wake selected this exact record.
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(entry.resume_checkpoint().is_err());
+    assert_eq!(take_exec_cancellations(), vec![113]);
+    assert_eq!(fixture.task.mm.key.load(Ordering::Acquire), 1);
+    assert!(fixture.zone.spaces.find(successor_mm.raw()).is_none());
 }
 
 #[cfg(test)]

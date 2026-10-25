@@ -697,6 +697,10 @@ pub trait ForkStockCrossing {
         let _ = (record_gpa, cpu);
         Err(NativeProcessError::Unsupported)
     }
+    fn cross_exec_cancel(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        let _ = (record_gpa, cpu);
+        Err(NativeProcessError::Unsupported)
+    }
     fn cross_exec_settle(
         &self,
         predecessor: ReservationMm,
@@ -731,6 +735,9 @@ impl<T: ForkStockCrossing> ForkStockCrossing for &T {
     }
     fn cross_exec_adopt(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         (**self).cross_exec_adopt(record_gpa, cpu)
+    }
+    fn cross_exec_cancel(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        (**self).cross_exec_cancel(record_gpa, cpu)
     }
     fn cross_exec_settle(
         &self,
@@ -778,6 +785,18 @@ impl ForkStockCrossing for HvcForkStockCrossing {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
             carrick_el1::isa::aarch64::cross_hvc_exec_adopt(record_gpa, cpu)
+                .map_err(|_| NativeProcessError::Stale)
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (record_gpa, cpu);
+            Err(NativeProcessError::Unsupported)
+        }
+    }
+    fn cross_exec_cancel(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            carrick_el1::isa::aarch64::cross_hvc_exec_cancel(record_gpa, cpu)
                 .map_err(|_| NativeProcessError::Stale)
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
@@ -1148,6 +1167,22 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     // paths; by value each move held another copy on the EL1 stack (#705).
     type PreparedMm = Box<Prepared<'a>>;
     type Born = Born;
+    fn cancel_exec_successor(
+        &self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+    ) -> Result<(), NativeProcessError> {
+        let mut cancellation = carrick_el1_abi::NativeExecCancellation::new(receipt);
+        let crossed = self.crossing.cross_exec_cancel(
+            &raw mut cancellation as *mut _ as u64,
+            u64::from(self.worker()),
+        );
+        let accepted = cancellation.take(receipt);
+        if crossed.is_ok() && accepted == Some(Ok(())) {
+            Ok(())
+        } else {
+            Err(NativeProcessError::Stale)
+        }
+    }
     #[inline(never)]
     fn adopt_exec_successor(
         &self,
@@ -1227,7 +1262,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
         let address = AddressContext {
             root: successor.root,
-            mm: MmGeneration::new(NonZeroU64::new(successor.successor_mm.raw()).unwrap()),
+            mm: MmGeneration::new(
+                NonZeroU64::new(successor.successor_mm.raw()).ok_or(NativeProcessError::Stale)?,
+            ),
             generation: ContextGeneration::new(successor.root_generation),
         };
         let mut native = carrick_sched_core::ThreadCtx::ZERO;
