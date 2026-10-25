@@ -1829,7 +1829,12 @@ fn service_native_exec_adopt(
         return Ok(refused);
     };
     let expected_ttbr = (u64::from(successor.asid.raw()) << 48) | successor.root.address().raw();
-    if zone
+    if !zone.spaces.bind_initial_root(
+        index,
+        successor.successor_mm.raw(),
+        expected_ttbr,
+        expected_ttbr,
+    ) || zone
         .spaces
         .closed_grant(index, successor.successor_mm.raw())
         .is_none_or(|grant| grant.ttbr0 != expected_ttbr || grant.ttbr1 != expected_ttbr)

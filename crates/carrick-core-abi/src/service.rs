@@ -606,7 +606,6 @@ pub struct ExecSuccessorEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecSuccessorBacking {
     pub root: carrick_guest_arch::RootGpa,
-    pub root_generation: NonZeroU64,
     pub asid: carrick_guest_arch::Asid,
     pub asid_generation: NonZeroU64,
 }
@@ -660,14 +659,18 @@ impl ExecSuccessorManifest {
         self.digest == crate::integrity_digest(&self.words())
     }
 
-    pub fn propose(identity: ServiceIdentity, successor_mm: ReservationMm) -> Self {
+    pub fn propose(
+        identity: ServiceIdentity,
+        successor_mm: ReservationMm,
+        root_generation: NonZeroU64,
+    ) -> Self {
         let mut manifest = Self {
             revision: EXEC_SUCCESSOR_MANIFEST_REVISION,
             phase: EXEC_SUCCESSOR_PROPOSED,
             identity: identity.manifest_words(),
             successor_mm: successor_mm.raw(),
             root: 0,
-            root_generation: 0,
+            root_generation: root_generation.get(),
             asid: 0,
             asid_generation: 0,
             entry: 0,
@@ -679,19 +682,24 @@ impl ExecSuccessorManifest {
         manifest
     }
 
-    pub fn proposal(&self, identity: ServiceIdentity) -> Option<ReservationMm> {
+    pub fn proposal(&self, identity: ServiceIdentity) -> Option<(ReservationMm, NonZeroU64)> {
         (self.revision == EXEC_SUCCESSOR_MANIFEST_REVISION
             && self.phase == EXEC_SUCCESSOR_PROPOSED
             && self.identity == identity.manifest_words()
             && self.root == 0
-            && self.root_generation == 0
+            && self.root_generation != 0
             && self.asid == 0
             && self.asid_generation == 0
             && self.entry == 0
             && self.stack_pointer == 0
             && self.receipt == 0
             && self.has_valid_digest())
-        .then(|| ReservationMm::new(self.successor_mm))?
+        .then(|| {
+            Some((
+                ReservationMm::new(self.successor_mm)?,
+                NonZeroU64::new(self.root_generation)?,
+            ))
+        })?
     }
 
     pub fn seal(
@@ -704,7 +712,6 @@ impl ExecSuccessorManifest {
         self.proposal(identity)?;
         self.phase = EXEC_SUCCESSOR_SEALED;
         self.root = backing.root.address().raw();
-        self.root_generation = backing.root_generation.get();
         self.asid = u64::from(backing.asid.raw());
         self.asid_generation = backing.asid_generation.get();
         self.entry = image.entry.raw();
@@ -1620,14 +1627,17 @@ mod tests {
             sequence: NonZeroU64::new(31).unwrap(),
         };
         let successor = ReservationMm::new(37).unwrap();
-        let proposal = ExecSuccessorManifest::propose(identity, successor);
-        assert_eq!(proposal.proposal(identity), Some(successor));
+        let root_generation = NonZeroU64::new(43).unwrap();
+        let proposal = ExecSuccessorManifest::propose(identity, successor, root_generation);
+        assert_eq!(
+            proposal.proposal(identity),
+            Some((successor, root_generation))
+        );
 
         let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(41).unwrap()).unwrap();
         let root =
             carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x90_0000))
                 .unwrap();
-        let root_generation = NonZeroU64::new(43).unwrap();
         let asid = carrick_guest_arch::Asid::from_registry_allocation(
             core::num::NonZeroU16::new(47).unwrap(),
         );
@@ -1640,7 +1650,6 @@ mod tests {
                 receipt,
                 ExecSuccessorBacking {
                     root,
-                    root_generation,
                     asid,
                     asid_generation,
                 },

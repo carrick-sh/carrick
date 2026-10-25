@@ -14,8 +14,8 @@ use carrick_core::mm::transaction::{
 };
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, ForkStockExchange, ForkStockLoan, ForkStockRequest,
-    ForkStockSettlement, PortalForkCustody, PortalOperation, ReservationGeneration, ReservationMm,
-    ReservationRange, ThreadControlSlot, ThreadLifecyclePage,
+    ForkStockSettlement, PortalForkCustody, PortalOperation, ReservationMm, ReservationRange,
+    ThreadControlSlot, ThreadLifecyclePage,
 };
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, KernelVa, MmGeneration, RootGpa, SlotId, UserVa,
@@ -25,7 +25,7 @@ use carrick_mmu_core::owner_mmu::Aarch64Mmu;
 use carrick_personality_linux::lifecycle::LinuxWaitStatus;
 use carrick_personality_linux::mm::{LinuxReservationPolicy, MmErrorLinux};
 use carrick_sched_core::{
-    AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext, RecordId, WakeEffects, ZoneTables,
+    AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext, RecordId, SpaceIndex, WakeEffects, ZoneTables,
 };
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
@@ -36,8 +36,9 @@ use super::native_fork_refusal::{NativeForkStage, refused};
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 use super::native_process_runtime::NativeResume;
 use super::native_process_runtime::{
-    FallibleBox, NativeExecSuccessor, NativeForkPreparation, NativeLifecycleResources,
-    NativeProcessError, NativeProcessRegistry, NativeProcessRuntime, NativeProcessService,
+    ExecSuccessorSlot, FallibleBox, NativeExecSuccessor, NativeForkPreparation,
+    NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
+    NativeProcessService,
 };
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use carrick_el1::memory::reservations;
@@ -1023,6 +1024,45 @@ pub struct Aarch64NativeProcessService<'a, X = HvcForkStockCrossing> {
     residency: Option<&'a carrick_el1_abi::FrameGrantResidencyTable>,
 }
 
+struct Aarch64ExecSuccessorSlot<'a> {
+    zone: &'a ZoneTables<Aarch64ParkedContext>,
+    roots: &'a SharedReservations,
+    carrier: NonZeroU64,
+    worker: u32,
+    index: SpaceIndex,
+    mm: ReservationMm,
+    generation: NonZeroU64,
+    armed: bool,
+}
+
+impl ExecSuccessorSlot for Aarch64ExecSuccessorSlot<'_> {
+    fn mm(&self) -> ReservationMm {
+        self.mm
+    }
+
+    fn root_generation(&self) -> NonZeroU64 {
+        self.generation
+    }
+
+    fn commit(mut self: Box<Self>) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Aarch64ExecSuccessorSlot<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let portal: Portal<'_> =
+            carrick_core::mm::transaction::MmPortal::for_zone(self.carrier, self.roots, self.zone);
+        if let Ok(root) = portal.root_any(self.mm, self.worker) {
+            let _ = root.retire();
+        }
+        self.zone.spaces.free(self.index);
+    }
+}
+
 /// ARM mechanics for the shared exact-MM native user-write continuation.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 struct NativeWriteVenue<'a, X> {
@@ -1167,6 +1207,73 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     // paths; by value each move held another copy on the EL1 stack (#705).
     type PreparedMm = Box<Prepared<'a>>;
     type Born = Born;
+    fn prepare_exec_successor_slot(
+        &self,
+        mm: ReservationMm,
+    ) -> Result<Box<dyn ExecSuccessorSlot + 'a>, NativeProcessError> {
+        let heap = ReservationRange::new(
+            carrick_personality_linux::mm::LINUX_HEAP_BASE,
+            carrick_personality_linux::mm::LINUX_HEAP_BASE
+                + carrick_personality_linux::mm::LINUX_HEAP_SIZE,
+        )
+        .ok_or(NativeProcessError::Invalid)?;
+        let arena = ReservationRange::new(
+            carrick_personality_linux::mm::LINUX_MMAP_BASE,
+            carrick_personality_linux::mm::LINUX_MMAP_BASE
+                + carrick_personality_linux::mm::LINUX_MMAP_SIZE_MAX,
+        )
+        .ok_or(NativeProcessError::Invalid)?;
+        let index = self
+            .zone
+            .spaces
+            .publish_closed_with_layout(mm.raw(), 0, 0, heap.start(), arena.start())
+            .ok_or(NativeProcessError::Exhausted)?;
+        if !self.zone.spaces.mark_initial_bindable(index) {
+            self.zone.spaces.free(index);
+            return Err(NativeProcessError::Stale);
+        }
+        if self
+            .roots
+            .publish(
+                index.index(),
+                mm,
+                carrick_el1::memory::reservations::Layout {
+                    heap,
+                    arena,
+                    brk: heap.start(),
+                    address_limit: u64::MAX,
+                    data_limit: u64::MAX,
+                    external_address_bytes: 0,
+                    external_data_bytes: 0,
+                },
+            )
+            .is_err()
+        {
+            self.zone.spaces.free(index);
+            return Err(NativeProcessError::Stale);
+        }
+        let generation = match self.portal()?.root_any(mm, self.worker()) {
+            Ok(root) => NonZeroU64::new(root.incarnation().raw()),
+            Err(_) => None,
+        };
+        let Some(generation) = generation else {
+            if let Ok(root) = self.portal()?.root_any(mm, self.worker()) {
+                let _ = root.retire();
+            }
+            self.zone.spaces.free(index);
+            return Err(NativeProcessError::Stale);
+        };
+        Ok(Box::new(Aarch64ExecSuccessorSlot {
+            zone: self.zone,
+            roots: self.roots,
+            carrier: self.carrier,
+            worker: self.worker(),
+            index,
+            mm,
+            generation,
+            armed: true,
+        }))
+    }
     fn cancel_exec_successor(
         &self,
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
@@ -1193,57 +1300,11 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         let successor = manifest
             .open(identity, receipt)
             .ok_or(NativeProcessError::Stale)?;
-        if self
-            .zone
-            .spaces
-            .find(successor.successor_mm.raw())
-            .is_some()
-        {
-            return Err(NativeProcessError::Stale);
-        }
-        let ttbr = (u64::from(successor.asid.raw()) << 48) | successor.root.address().raw();
-        let heap = ReservationRange::new(
-            carrick_personality_linux::mm::LINUX_HEAP_BASE,
-            carrick_personality_linux::mm::LINUX_HEAP_BASE
-                + carrick_personality_linux::mm::LINUX_HEAP_SIZE,
-        )
-        .ok_or(NativeProcessError::Invalid)?;
-        let arena = ReservationRange::new(
-            carrick_personality_linux::mm::LINUX_MMAP_BASE,
-            carrick_personality_linux::mm::LINUX_MMAP_BASE
-                + carrick_personality_linux::mm::LINUX_MMAP_SIZE_MAX,
-        )
-        .ok_or(NativeProcessError::Invalid)?;
         let index = self
             .zone
             .spaces
-            .publish_closed_with_layout(
-                successor.successor_mm.raw(),
-                ttbr,
-                ttbr,
-                heap.start(),
-                arena.start(),
-            )
-            .ok_or(NativeProcessError::Exhausted)?;
-        let published = self.roots.publish_at_generation(
-            index.index(),
-            successor.successor_mm,
-            carrick_el1::memory::reservations::Layout {
-                heap,
-                arena,
-                brk: heap.start(),
-                address_limit: u64::MAX,
-                data_limit: u64::MAX,
-                external_address_bytes: 0,
-                external_data_bytes: 0,
-            },
-            ReservationGeneration::new(successor.root_generation.get())
-                .ok_or(NativeProcessError::Stale)?,
-        );
-        if published.is_err() {
-            self.zone.spaces.free(index);
-            return Err(NativeProcessError::Stale);
-        }
+            .find(successor.successor_mm.raw())
+            .ok_or(NativeProcessError::Stale)?;
         let manifest_address = KernelVa::new(core::ptr::from_ref(manifest).addr() as u64);
         let mut adoption = carrick_el1_abi::NativeExecAdoption::new(receipt, manifest_address)
             .ok_or(NativeProcessError::Invalid)?;
@@ -1252,12 +1313,16 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .cross_exec_adopt(&raw mut adoption as *mut _ as u64, u64::from(self.worker()));
         let accepted = adoption.take(receipt, manifest_address);
         if crossed.is_err() || accepted != Some(Ok(())) {
-            if let Ok(owner) = self.portal()
-                && let Ok(root) = owner.root_any(successor.successor_mm, self.worker())
-            {
-                let _ = root.retire();
-            }
-            self.zone.spaces.free(index);
+            return Err(NativeProcessError::Stale);
+        }
+        let expected_ttbr =
+            (u64::from(successor.asid.raw()) << 48) | successor.root.address().raw();
+        if self
+            .zone
+            .spaces
+            .closed_root_identity(index, successor.successor_mm.raw())
+            != Some(expected_ttbr)
+        {
             return Err(NativeProcessError::Stale);
         }
         let address = AddressContext {

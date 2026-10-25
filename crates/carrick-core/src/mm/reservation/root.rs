@@ -548,52 +548,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         mm: ReservationMm,
         layout: impl Into<Layout>,
     ) -> Result<(), Refusal> {
-        self.publish_with_generation(index, mm, layout.into(), None)
-    }
-
-    /// Install a closed exec successor with the carrier-authenticated root
-    /// generation. The generation must move this physical root slot forward;
-    /// an old or repeated manifest can never republish it.
-    pub fn publish_at_generation(
-        &self,
-        index: usize,
-        mm: ReservationMm,
-        layout: impl Into<Layout>,
-        generation: ReservationGeneration,
-    ) -> Result<(), Refusal> {
-        self.publish_with_generation(index, mm, layout.into(), Some(generation))
-    }
-
-    /// Observe the incarnation that the next publication in an empty slot
-    /// must use. The caller serializes address-space publication and treats
-    /// this as a proposal: [`Self::publish_at_generation`] remains the
-    /// authority and rejects a slot changed before commit.
-    pub fn next_publication_generation(
-        &self,
-        index: usize,
-    ) -> Result<ReservationGeneration, Refusal> {
-        if self.layout_hash.load(Ordering::Acquire) != Self::LAYOUT_HASH {
-            return Err(Refusal::Stale);
-        }
-        let root = self.roots.get(index).ok_or(Refusal::Invalid)?;
-        if root.locked.load(Ordering::Acquire) != 0 {
-            return Err(Refusal::Busy);
-        }
-        if root.key.load(Ordering::Acquire) != 0 {
-            return Err(Refusal::Collision);
-        }
-        let epoch = root.epoch.load(Ordering::Acquire);
-        ReservationGeneration::new(epoch.checked_add(1).ok_or(Refusal::Stale)?)
-            .ok_or(Refusal::Stale)
-    }
-
-    fn publish_with_generation(
-        &self,
-        index: usize,
-        mm: ReservationMm,
-        layout: Layout,
-        requested: Option<ReservationGeneration>,
-    ) -> Result<(), Refusal> {
+        let layout = layout.into();
         match self.layout_hash.compare_exchange(
             0,
             Self::LAYOUT_HASH,
@@ -622,14 +577,9 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
                 Err(Refusal::Stale)
             } else {
                 let epoch = root.epoch.load(Ordering::Relaxed);
-                let generation = match requested {
-                    Some(generation) if generation.raw() > epoch => generation,
-                    Some(_) => return Err(Refusal::Stale),
-                    None => ReservationGeneration::new(epoch + 1).ok_or(Refusal::Stale)?,
-                };
+                let generation = ReservationGeneration::new(epoch + 1).ok_or(Refusal::Stale)?;
                 // Locks derive the stable incarnation as epoch+1. Advance the
                 // empty slot immediately before publishing its key.
-                root.epoch.store(generation.raw() - 1, Ordering::Relaxed);
                 // SAFETY: exclusive unpublished root; no state reference exists.
                 unsafe {
                     (*root.state.get()).write(State {
@@ -3578,23 +3528,18 @@ mod tests {
         guard.complete(receipt).unwrap()
     }
     #[test]
-    fn exec_manifest_generation_is_the_published_root_incarnation() {
+    fn reused_root_slot_advances_its_ring_owned_incarnation() {
         let table = table();
         let first = ReservationMm::new(71).unwrap();
-        let generation = ReservationGeneration::new(41).unwrap();
-        table
-            .publish_at_generation(0, first, layout(), generation)
-            .unwrap();
+        table.publish(0, first, layout()).unwrap();
         let root = table.lock(0, first).unwrap();
-        assert_eq!(root.incarnation(), generation);
+        let first_generation = root.incarnation();
         root.retire().unwrap();
 
         let second = ReservationMm::new(72).unwrap();
-        assert_eq!(
-            table.publish_at_generation(0, second, layout(), generation),
-            Err(Refusal::Stale),
-            "a stale manifest generation must not republish a retired slot"
-        );
+        table.publish(0, second, layout()).unwrap();
+        let root = table.lock(0, second).unwrap();
+        assert!(root.incarnation().raw() > first_generation.raw());
     }
     #[test]
     fn prepared_copy_owner_layout_receipt_preserves_metadata_node_stride() {
