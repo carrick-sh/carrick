@@ -452,21 +452,6 @@ pub trait Lifecycle {
             .map(|_| ())
             .map_err(GateState::from_raw)
     }
-    /// Exec drain owns the process-closing gate while retaining its caller as
-    /// the successor. Unlike fork quiescence this transition is terminal for
-    /// the predecessor image; a concurrent group exit may upgrade the owner,
-    /// but no birth or service admission can reopen it.
-    fn close_for_exec(&self) -> Result<(), GateState> {
-        self.gate_word()
-            .compare_exchange(
-                GateState::Open as u32,
-                GateState::Closed as u32,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .map(|_| ())
-            .map_err(GateState::from_raw)
-    }
     /// Fork committed: `ForkClosing -> Open`.
     fn reopen_after_fork(&self) -> Result<(), GateState> {
         self.gate_word()
