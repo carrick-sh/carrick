@@ -1122,6 +1122,16 @@ where
         code: i32,
         traps: usize,
     ) -> PersistentThreadExitDisposition {
+        // Thread retirement is a terminal vCPU boundary, including when EL1
+        // served the thread's preceding write and handed its exit directly to
+        // the host.  Consume that slot's completion and owed-work doorbell
+        // before graph retirement can withdraw the producer or its shared
+        // file-table view.  Ordinary forwarded exits already settled on host
+        // syscall entry; taking the boundary again is deliberately idempotent.
+        if let Some(slot) = engine.mailbox_slot() {
+            let _ =
+                carrick_kernel::el1_delegation::settle_el1_boundary_for(slot, &kernel.dispatcher);
+        }
         if !self.thread_exit_withdrawn {
             let _ = self.stash_parked_registers(engine);
             if self.publish_crash_registers_if_requested(engine).is_err() {
@@ -1378,7 +1388,7 @@ mod child_tid_owner_tests {
     use carrick_guest_mem::{GuestMemory, MemoryError, UserMemoryVenue};
     use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
     use std::num::NonZeroU64;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct OwnerClearMemory<'a> {
         portal: &'a MmPortal<'a, NoPin>,
@@ -1625,6 +1635,130 @@ mod child_tid_owner_tests {
             }),
         );
         (wakes, subscription)
+    }
+
+    /// A nonfinal thread can leave immediately after EL1 publishes its last
+    /// pipe byte.  The host-blocked peer is a live process effect: retirement
+    /// must settle the exiting vCPU's owed wake before withdrawing the thread.
+    #[test]
+    fn serial_host_nonfinal_thread_exit_settles_last_el1_pipe_write() {
+        const SLOT: usize = 3;
+
+        struct ResetEl1Region;
+        impl Drop for ResetEl1Region {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(0);
+            }
+        }
+
+        let region_bytes = carrick_test_support::TestEl1Region::zeroed();
+        carrick_el1_abi::record_el1_region_host_ptr(region_bytes.as_ptr() as usize);
+        let _reset = ResetEl1Region;
+        let task = |slot: usize| {
+            let at = region_bytes.as_ptr() as usize
+                + carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+                + slot * std::mem::size_of::<carrick_el1_abi::CurrentTask>();
+            // SAFETY: `TestEl1Region` owns aligned storage for the complete
+            // EL1 ABI region and remains alive for the test.
+            unsafe { &*(at as *const carrick_el1_abi::CurrentTask) }
+        };
+
+        let (kernel, root) = clear_kernel(72_515);
+        let sibling = root
+            .kernel()
+            .reserve_thread_clone(
+                &root,
+                carrick_kernel::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM
+                        | carrick_abi::LinuxCloneFlags::FILES,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(
+                root.thread().key().tid.raw() + 1,
+            ))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .start_thread()
+            .unwrap()
+            .into_context();
+        assert_eq!(
+            root.resources().files().id(),
+            sibling.resources().files().id(),
+            "the retiring partner and reader must share one Linux fd table"
+        );
+
+        let owner = root.kernel().ipc().unwrap();
+        let object = owner.create_pipe(65_536).unwrap();
+        let queue = owner.test_wait_queue(object);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&wakes);
+        let live_at_wake = Arc::new(AtomicBool::new(false));
+        let observed_live = Arc::clone(&live_at_wake);
+        let sibling_at_wake = sibling.retain_exact();
+        let reader = queue.enroll_callback(move |_| {
+            observed_live.store(sibling_at_wake.exact_thread_is_live(), Ordering::SeqCst);
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        {
+            let region = owner.region();
+            let mut pipe = region
+                .lock(
+                    object,
+                    &carrick_kernel::kernel::continuation::ipc::HostIpcWait,
+                )
+                .unwrap();
+            assert!(pipe.provide_ring_from_stock().unwrap());
+            let written = pipe.pipe().unwrap().try_write(b"x");
+            assert_eq!(written.result, Ok(1), "partner must publish its byte");
+            assert!(pipe.publish(written.wake).host_owed);
+        }
+        task(SLOT).linux.mark_pending_host_work();
+        task(SLOT).linux.record_completed_with_work();
+
+        let tid = ThreadId::from_kernel_thread_identity(sibling.thread().key().tid.raw());
+        let registry = Arc::new(ThreadRegistry::new(tid));
+        let mut state = clear_state(&kernel, &sibling, registry, VcpuThreadRegistry::new());
+        let dependency = Arc::new(ClearDependency::default());
+        dependency.0.store(true, Ordering::Release);
+        let mut engine = clear_engine(&sibling, &dependency);
+        engine.mailbox_slot = Some(SLOT);
+
+        assert!(matches!(
+            state.handle_persistent_thread_exit(&kernel, &mut engine, 0, 0),
+            PersistentThreadExitDisposition::Done(VcpuLoopOutcome::ThreadDone)
+        ));
+        assert!(root.exact_thread_is_live(), "the reader remains live");
+        assert!(!sibling.exact_thread_is_live(), "only the partner retires");
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "the exiting partner must wake the host-blocked reader"
+        );
+        assert!(
+            live_at_wake.load(Ordering::SeqCst),
+            "the pipe effect must publish before graph retirement"
+        );
+        assert!(!task(SLOT).linux.has_pending_host_work());
+        let mut byte = [0_u8; 1];
+        let read = owner
+            .region()
+            .lock(
+                object,
+                &carrick_kernel::kernel::continuation::ipc::HostIpcWait,
+            )
+            .unwrap()
+            .pipe()
+            .unwrap()
+            .try_read(&mut byte);
+        assert_eq!(read.result, Ok(1));
+        assert_eq!(byte, *b"x", "retirement must preserve the published byte");
+        drop(reader);
     }
 
     #[test]
