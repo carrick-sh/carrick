@@ -47,6 +47,16 @@ impl<C: ProcessContext> ExecSuccessorSlot for HostExecSlot<'_, C> {
     fn root_generation(&self) -> NonZeroU64 {
         NonZeroU64::MIN
     }
+    fn prepare_adoption(&self) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+        // SAFETY: this VM-free token owns the exact synthetic closed MM.
+        Ok(unsafe {
+            carrick_core_abi::El1MmHandle::from_admitted_owner(
+                NonZeroU64::MIN,
+                self.mm,
+                NonZeroU64::MIN,
+            )
+        })
+    }
     fn commit(mut self: Box<Self>) {
         self.armed = false;
     }

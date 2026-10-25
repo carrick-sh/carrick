@@ -834,6 +834,31 @@ impl ServiceCell {
             .map_err(|_| ServiceError::Busy)?;
         Ok(())
     }
+
+    /// Rebind an idle exact member to its exec successor MM. The process,
+    /// thread, record and monotone operation sequence remain unchanged; no
+    /// request can observe a mixed birth.
+    pub fn rebind_exec_mm(
+        &self,
+        predecessor: ServiceBirth,
+        successor: El1MmHandle,
+    ) -> Result<ServiceBirth, ServiceError> {
+        self.state
+            .compare_exchange(IDLE, WRITING, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| ServiceError::Busy)?;
+        if !self.same_birth(predecessor) {
+            self.state.store(IDLE, Ordering::Release);
+            return Err(ServiceError::Stale);
+        }
+        self.words[6].store(successor.mm().raw(), Ordering::Relaxed);
+        self.words[7].store(successor.incarnation().get(), Ordering::Relaxed);
+        let rebound = ServiceBirth {
+            mm: successor,
+            ..predecessor
+        };
+        self.state.store(IDLE, Ordering::Release);
+        Ok(rebound)
+    }
     pub fn publish(
         &self,
         birth: ServiceBirth,
@@ -1976,6 +2001,31 @@ mod tests {
         assert!(ticket.complete(false).is_ok());
         assert_eq!(cell.consume(old.identity), Err(ServiceError::Stale));
         assert_eq!(cell.consume(new.identity), Ok(ServiceResult::Refused));
+    }
+
+    #[test]
+    fn exec_rebind_changes_only_the_idle_members_mm() {
+        let cell = ServiceCell::new();
+        let old = birth(1, 1);
+        cell.bind(old).unwrap();
+        // SAFETY: this test owns the successor publication identity.
+        let successor = unsafe {
+            El1MmHandle::from_admitted_owner(
+                old.mm.carrier(),
+                ReservationMm::new(old.mm.mm().raw() + 100).unwrap(),
+                NonZeroU64::new(old.mm.incarnation().get() + 1).unwrap(),
+            )
+        };
+        let rebound = cell.rebind_exec_mm(old, successor).unwrap();
+        assert_eq!(rebound.mm, successor);
+        assert_eq!(rebound.process, old.process);
+        assert_eq!(rebound.thread, old.thread);
+        assert_eq!(rebound.record, old.record);
+        assert_eq!(
+            cell.bound_birth(old.process, old.thread, old.record),
+            Ok(rebound)
+        );
+        assert_eq!(cell.rebind_exec_mm(old, old.mm), Err(ServiceError::Stale));
     }
     #[test]
     fn backing_reply_is_bound_to_the_claimed_request_phase() {

@@ -579,7 +579,7 @@ impl CarrierVmCustody {
             || birth.mm.incarnation().get() != execution.context.generation.raw().get()
             || prepared.root() != view.root
             || prepared.entry() != view.entry.raw()
-            || prepared.stack_pointer() != Some(view.stack_pointer.raw())
+            || prepared.stack_pointer() != view.stack_pointer.raw()
         {
             return None;
         }

@@ -518,6 +518,7 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
 pub trait ExecSuccessorSlot: Send {
     fn mm(&self) -> carrick_core_abi::ReservationMm;
     fn root_generation(&self) -> core::num::NonZeroU64;
+    fn prepare_adoption(&self) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError>;
     fn commit(self: Box<Self>);
 }
 

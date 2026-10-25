@@ -1044,6 +1044,27 @@ impl ExecSuccessorSlot for Aarch64ExecSuccessorSlot<'_> {
         self.generation
     }
 
+    fn prepare_adoption(&self) -> Result<carrick_core_abi::El1MmHandle, NativeProcessError> {
+        let portal: Portal<'_> =
+            carrick_core::mm::transaction::MmPortal::for_zone(self.carrier, self.roots, self.zone);
+        let mut root = portal
+            .root_any(self.mm, self.worker)
+            .map_err(|_| NativeProcessError::Stale)?;
+        if root.incarnation().raw() != self.generation.get() {
+            return Err(NativeProcessError::Stale);
+        }
+        root.finish_import()
+            .map_err(|_| NativeProcessError::Stale)?;
+        // SAFETY: this token owns the exact root just admitted above.
+        Ok(unsafe {
+            carrick_core_abi::El1MmHandle::from_admitted_owner(
+                self.carrier,
+                self.mm,
+                self.generation,
+            )
+        })
+    }
+
     fn commit(mut self: Box<Self>) {
         self.armed = false;
     }
