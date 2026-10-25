@@ -275,14 +275,13 @@ impl ForkStockCrossing for TestStockCrossing {
     fn cross_exec_adopt(&self, record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
         // SAFETY: the synchronous fixture owns this aligned stack record.
         let request = unsafe { &mut *(record_gpa as *mut carrick_el1_abi::NativeExecAdoption) };
+        let request = request.claim().ok_or(NativeProcessError::Stale)?;
         if self.exec_adopted.swap(true, Ordering::AcqRel) {
             request.refuse();
             return Err(NativeProcessError::Stale);
         }
-        request
-            .request()
-            .and_then(|_| request.accept().then_some(()))
-            .ok_or(NativeProcessError::Stale)
+        request.accept();
+        Ok(())
     }
 
     fn cross_exec_cancel(&self, record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {

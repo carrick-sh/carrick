@@ -39,6 +39,35 @@ pub struct NativeExecAdoption {
     words: [u64; 8],
 }
 
+/// Host-owned reply authority for one already-validated adoption record.
+///
+/// The stopped CPU retains the underlying record for the whole synchronous
+/// crossing. Claiming it once makes the final accepted/refused publication
+/// infallible: no post-cutover code needs to re-parse guest-owned words.
+pub struct NativeExecAdoptionRequest<'a> {
+    record: &'a mut NativeExecAdoption,
+    receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+    manifest: KernelVa,
+}
+
+impl NativeExecAdoptionRequest<'_> {
+    pub fn receipt(&self) -> carrick_core_abi::service::ExecAdoptionReceipt {
+        self.receipt
+    }
+
+    pub fn manifest(&self) -> KernelVa {
+        self.manifest
+    }
+
+    pub fn accept(self) {
+        self.record.words[3] = NativeExecAdoption::ACCEPTED;
+    }
+
+    pub fn refuse(self) {
+        self.record.words[3] = NativeExecAdoption::REFUSED;
+    }
+}
+
 impl NativeExecAdoption {
     const MAGIC: u64 = 0x4352_4558_4144_4f50;
     const PENDING: u64 = 0;
@@ -78,20 +107,13 @@ impl NativeExecAdoption {
         Some((receipt, KernelVa::new(self.words[2])))
     }
 
-    pub fn accept(&mut self) -> bool {
-        self.reply(Self::ACCEPTED)
-    }
-
-    pub fn refuse(&mut self) -> bool {
-        self.reply(Self::REFUSED)
-    }
-
-    fn reply(&mut self, status: u64) -> bool {
-        if self.request().is_none() {
-            return false;
-        }
-        self.words[3] = status;
-        true
+    pub fn claim(&mut self) -> Option<NativeExecAdoptionRequest<'_>> {
+        let (receipt, manifest) = self.request()?;
+        Some(NativeExecAdoptionRequest {
+            record: self,
+            receipt,
+            manifest,
+        })
     }
 
     pub fn take(
@@ -1655,8 +1677,10 @@ mod tests {
                 .unwrap();
         let manifest = KernelVa::new(0x8000);
         let mut request = NativeExecAdoption::new(receipt, manifest).unwrap();
-        assert_eq!(request.request(), Some((receipt, manifest)));
-        assert!(request.accept());
+        let claimed = request.claim().unwrap();
+        assert_eq!(claimed.receipt(), receipt);
+        assert_eq!(claimed.manifest(), manifest);
+        claimed.accept();
         assert_eq!(request.take(receipt, manifest), Some(Ok(())));
         assert_eq!(request.take(receipt, manifest), None);
         assert_eq!(request.request(), None);
