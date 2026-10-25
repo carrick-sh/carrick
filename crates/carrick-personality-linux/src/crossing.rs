@@ -236,7 +236,6 @@ host_crossings! {
     Fdatasync = nr::FDATASYNC, false, Permanent;
     SyncFileRange = nr::SYNC_FILE_RANGE, false, Permanent;
     Utimensat = nr::UTIMENSAT, false, Permanent;
-    Execve = nr::EXECVE, false, Permanent;
     Msync = nr::MSYNC, false, Permanent;
     Mlock = nr::MLOCK, false, Temporary;
     Munlock = nr::MUNLOCK, false, Temporary;
@@ -295,7 +294,6 @@ host_crossings! {
     EpollPwait2 = nr::EPOLL_PWAIT2, false, Temporary;
     Readahead = nr::READAHEAD, false, Permanent;
     Fadvise64 = nr::FADVISE64, false, Permanent;
-    Execveat = nr::EXECVEAT, false, Permanent;
     Mlockall = nr::MLOCKALL, false, Temporary;
     Munlockall = nr::MUNLOCKALL, false, Temporary;
     Exit = nr::EXIT, true, Terminal;
@@ -434,14 +432,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ring_first_census_host_files_are_admitted_but_signal_return_is_owned() {
-        for ordinal in [213, 223, 281, 230, 231] {
+    fn ring_first_census_host_files_are_admitted_but_exec_and_signal_return_are_owned() {
+        for ordinal in [213, 223, 230, 231] {
             assert!(
                 HostCrossingSet::Aarch64.is_allowed(CanonicalNr::new(ordinal)),
                 "ARM fallback ordinal={ordinal}"
             );
             assert!(!HostCrossingSet::X86.is_allowed(CanonicalNr::new(ordinal)));
         }
+        assert!(!HostCrossingSet::Aarch64.is_allowed(nr::EXECVE));
+        assert!(!HostCrossingSet::Aarch64.is_allowed(nr::EXECVEAT));
         assert!(!HostCrossingSet::Aarch64.is_allowed(nr::RT_SIGRETURN));
     }
 
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 123);
+        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 121);
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
             let nr = crossing.canonical();
             assert!(
@@ -562,9 +562,11 @@ mod tests {
             CanonicalNr(215), // munmap
             CanonicalNr(216), // mremap
             CanonicalNr(220), // clone
+            CanonicalNr(221), // execve
             CanonicalNr(222), // mmap
             CanonicalNr(226), // mprotect
             CanonicalNr(260), // wait4
+            CanonicalNr(281), // execveat
         ] {
             assert!(
                 !AllowedHostCrossing::is_allowed_aarch64(wire_in_ring),
