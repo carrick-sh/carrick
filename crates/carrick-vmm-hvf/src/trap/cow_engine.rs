@@ -4137,6 +4137,7 @@ impl HvfTaskState {
                 }
                 Ok(())
             })()
+            .map(|()| ((), None))
         } else {
             const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
             const AP_MASK: u64 = 0b11 << 6;
@@ -4147,7 +4148,7 @@ impl HvfTaskState {
             let page_tables_authority = self.page_tables_authority();
             let edit_access = std::sync::Arc::clone(&self.mm_access);
             edit_access.with_stage1_edit_license(|license| {
-                page_tables_authority.edit(
+                page_tables_authority.edit_unpublishing(
                     license,
                     || {
                         page_tables_authority.emit_absent_probe(2);
@@ -4155,6 +4156,8 @@ impl HvfTaskState {
                             "HVPatch COW page-table manager is absent".to_owned(),
                         ))
                     },
+                    span.va,
+                    span.len,
                     |manager| -> Result<(), TrapError> {
                         // The transaction can fail after one or more descriptors were
                         // written to both the manager shadow and live backing, so it needs
@@ -4298,50 +4301,54 @@ impl HvfTaskState {
                 )
             })
         };
-        if let Err(error) = page_table_result {
-            if !guest_lane {
-                let _ = self.with_stage1_edit_license(|license| {
-                    self.page_tables_authority().edit(
-                        license,
-                        || Err(TrapError::Hypervisor("page tables disappeared".into())),
-                        |manager| {
-                            let manager_base = manager.base();
-                            let page_table_resolver =
-                                self.page_table_resolver(manager_base, Some(page_table_host));
-                            // SAFETY: the COW quiesce and topology guards remain held;
-                            // no vCPU can walk or edit this mm while the journalled
-                            // pre-images are replayed into its live backing.
-                            let _ = unsafe { manager.rollback_undo(page_table_resolver) };
-                            Ok::<(), TrapError>(())
-                        },
-                    )
-                });
-                if let Err(flush_error) = flush_stage1.flush() {
-                    carrick_fatal!(
-                        "hvpatch::mm_authority",
-                        "HVPatch COW rollback stage-1 TLBI failed: {flush_error}"
-                    );
-                }
-            }
-            if fresh_destination && !guest_lane {
-                if let Some(_identity) = global_frame_stage2_identity_in(
-                    custody,
-                    new_physical_ipa,
-                    CowArmedRanges::COMPOUND_SIZE,
-                ) {
-                    if let Some(stage1) = rollback_receipt.take().map(|receipt| receipt.rollback())
-                    {
-                        let _ = retire_global_frame_host_owner_in(
-                            custody,
-                            stage1,
-                            new_physical_ipa,
-                            CowArmedRanges::COMPOUND_SIZE,
+        let stage1_leaf = match page_table_result {
+            Ok(((), receipt)) => receipt,
+            Err(error) => {
+                if !guest_lane {
+                    let _ = self.with_stage1_edit_license(|license| {
+                        self.page_tables_authority().edit(
+                            license,
+                            || Err(TrapError::Hypervisor("page tables disappeared".into())),
+                            |manager| {
+                                let manager_base = manager.base();
+                                let page_table_resolver =
+                                    self.page_table_resolver(manager_base, Some(page_table_host));
+                                // SAFETY: the COW quiesce and topology guards remain held;
+                                // no vCPU can walk or edit this mm while the journalled
+                                // pre-images are replayed into its live backing.
+                                let _ = unsafe { manager.rollback_undo(page_table_resolver) };
+                                Ok::<(), TrapError>(())
+                            },
+                        )
+                    });
+                    if let Err(flush_error) = flush_stage1.flush() {
+                        carrick_fatal!(
+                            "hvpatch::mm_authority",
+                            "HVPatch COW rollback stage-1 TLBI failed: {flush_error}"
                         );
                     }
                 }
+                if fresh_destination && !guest_lane {
+                    if let Some(_identity) = global_frame_stage2_identity_in(
+                        custody,
+                        new_physical_ipa,
+                        CowArmedRanges::COMPOUND_SIZE,
+                    ) {
+                        if let Some(stage1) =
+                            rollback_receipt.take().map(|receipt| receipt.rollback())
+                        {
+                            let _ = retire_global_frame_host_owner_in(
+                                custody,
+                                stage1,
+                                new_physical_ipa,
+                                CowArmedRanges::COMPOUND_SIZE,
+                            );
+                        }
+                    }
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         // Publication succeeded: the journalled pre-images are no longer needed.
         if !guest_lane {
             let _ = self.with_stage1_edit_license(|license| {
@@ -4378,15 +4385,19 @@ impl HvfTaskState {
             );
         }
         let inventory_ledger = std::sync::Arc::clone(&self.frame_inventory.ledger);
-        let stage1 = crate::trap::frame_inventory::Stage1UnpublishedFrames::after_cow_split(
+        let frame_absence = crate::trap::frame_inventory::Stage1UnpublishedFrames::after_cow_split(
             authority.as_ref(),
             &split,
         );
-        let retired_old_stage2 = stage1
-            .and_then(|stage1| {
+        let retired_old_stage2 = frame_absence
+            .and_then(|frame_absence| {
                 let mut inventory = inventory_ledger.lock();
                 HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-                    let Some(stage1) = stage1.as_ref() else {
+                    let stage1 = if let Some(stage1) = stage1_leaf.as_ref() {
+                        Stage1UnpublicationReceipt::EditorRange(stage1)
+                    } else if let Some(stage1) = frame_absence.as_ref() {
+                        Stage1UnpublicationReceipt::FrameAbsence(stage1)
+                    } else {
                         return Ok(false);
                     };
                     self.retire_stage2_extent_for_cow(
@@ -7688,14 +7699,14 @@ impl HvfTaskState {
     pub(crate) fn retire_stage2_extent_for_cow(
         &mut self,
         custody: &CarrierVmCustody,
-        stage1: &crate::trap::frame_inventory::Stage1UnpublishedFrames,
+        stage1: Stage1UnpublicationReceipt<'_>,
         ipa: u64,
         length: u64,
     ) -> Result<(), TrapError> {
         HvfVmState::retire_stage2_extent_from_mappings_in(
             custody,
             &mut self.mappings,
-            Stage1UnpublicationReceipt::FrameAbsence(stage1),
+            stage1,
             ipa,
             length,
         )
