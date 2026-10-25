@@ -207,7 +207,9 @@ contract, handoff and logs are re-masked and scanned for upload; scan failures
 still disable upload. The loop also stops by job minute 55
 to leave five minutes of the 60-minute job for finalization and upload. There
 are no dispatch tier tables or tier-selected credentials. The loop chooses
-from live capacity and explains its choice in the outcome. No retries or
+from live capacity and explains its choice in the outcome. Capacity snapshots
+expire after two minutes, including before the first worker, and each admitted
+worker consumes its snapshot. No retries or
 budget increases occur on refusals. If the loop exits or times out without
 finishing, the server posts a failed fallback to the admitted issue/PR. Hard
 cancellation or GitHub failure can prevent that network report.
@@ -216,7 +218,11 @@ Provenance is information, never authority. `owner` requires the owner User;
 `dispatch-agent(run N)` requires a bot post with a verified last run footer,
 repository, workflow, owner actors and a completed worker job on an agent
 runner; comment and PR-body provenance survives artifact expiry or failed
-uploads. Issue and comment runs use main; review runs require their workflow
+uploads. Issue and comment footer runs additionally need exactly one successful
+`Dispatch issue N` marker in their successful hosted guard job, matching the
+admitted issue. The marker uses the validated issue number, including for PR
+comments. Earlier runs without that marker have unverified footer text.
+Issue and comment runs use main; review runs require their workflow
 blob to equal the head’s merge-base blob. Available issue/PR mappings must
 match; artifact reads additionally require an issue-scoped uploaded bundle. Commit authors never grant owner or collaborator provenance: commits
 are tagged `commit(author-claimed)`, and their messages are withheld unless
@@ -226,7 +232,10 @@ known run IDs from linked branches and comment footers. An additional census
 of at most 32 completed issue/comment runs of this workflow after issue
 creation checks issue-derived artifact-name prefixes before authenticating
 runs; it never scans the repository-wide artifact inventory. Each server
-authenticates a run once and reuses its artifact listing and downloaded text.
+caches authenticated runs, artifact listings and downloaded text, including
+confirmed predicate refusals. Lookups and downloads get at most three attempts
+per cache key and event; transport failures are never cached as predicate
+refusals.
 Unchanged branch selections reuse history verification while rechecking live
 remote tips and all-state PR ownership before admission or publication. Contracts from verified
 artifacts take precedence over comment previews, and the server’s outcome
