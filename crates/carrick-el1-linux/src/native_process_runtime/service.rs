@@ -173,6 +173,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         payload: Box<[u8]>,
     ) -> Result<NativeResume, NativeProcessError> {
+        let capability = self
+            .runtime
+            .exec_capability()
+            .ok_or(NativeProcessError::Stale)?;
         let descriptor = carrick_core_abi::service::ExecPayloadDescriptor::checked(
             carrick_guest_arch::GuestVa::new(payload.as_ptr().addr() as u64),
             carrick_guest_arch::GuestLen::new(payload.len() as u64),
@@ -180,6 +184,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         .ok_or(NativeProcessError::Exhausted)?;
         self.begin_service_inner(
             ServiceOperation::Exec {
+                capability,
                 payload: descriptor,
             },
             None,
