@@ -229,7 +229,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if matches!(operation, ServiceOperation::Exec { .. }) != exec_payload.is_some() {
             return Err(NativeProcessError::Stale);
         }
-        let (page, control) = {
+        let (page, control, mm) = {
             let graph = self.runtime.graph.lock();
             if graph.has_member_wait(&self.record) {
                 return Err(NativeProcessError::Busy);
@@ -248,12 +248,41 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         && core::ptr::eq(member.control.control(), self.control)
                 })
                 .ok_or(NativeProcessError::Stale)?;
-            (resources.page, member.control.clone())
+            (resources.page, member.control.clone(), resources.mm.clone())
         };
-        let birth = control
-            .service
-            .bound_birth(self.key, self.binding.thread_generation, self.record)
-            .map_err(service_error)?;
+        let birth =
+            match control
+                .service
+                .bound_birth(self.key, self.binding.thread_generation, self.record)
+            {
+                Ok(birth) => birth,
+                Err(ServiceError::Busy) => {
+                    // Fork binds a child's service cell at publication. The root
+                    // has no earlier physical-service venue, so its first exact
+                    // registered operation binds the same retained capability.
+                    let handle = self.service.service_mm_handle(&mm)?;
+                    let wait = ObjectWaitKey::native_service(self.record)
+                        .ok_or(NativeProcessError::Stale)?;
+                    self.source
+                        .zone
+                        .bind_object_wait(wait, &carrick_sched_core::ShortLockSpin)
+                        .map_err(|_| NativeProcessError::Quarantined)?;
+                    control
+                        .service
+                        .bind(carrick_core_abi::service::ServiceBirth {
+                            process: self.key,
+                            thread: self.binding.thread_generation,
+                            record: self.record,
+                            mm: handle,
+                        })
+                        .map_err(service_error)?;
+                    control
+                        .service
+                        .bound_birth(self.key, self.binding.thread_generation, self.record)
+                        .map_err(service_error)?
+                }
+                Err(error) => return Err(service_error(error)),
+            };
         let successor_mm = matches!(operation, ServiceOperation::Exec { .. })
             .then(|| {
                 self.runtime
@@ -1009,8 +1038,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         page.await_exec_binding()
             .map_err(|_| NativeProcessError::Stale)?;
         let result = self.complete_exec_prepared(pending.request, pending.receipt, pending.pending);
-        page.reopen_after_exec_binding()
-            .map_err(|_| NativeProcessError::Stale)?;
+        if !matches!(result, Err(NativeProcessError::Quarantined)) {
+            // Pre-commit refusal keeps the predecessor runnable; success
+            // reopens the same lifecycle page for the successor. A failure
+            // after physical adoption is terminal and must not resurrect the
+            // predecessor gate.
+            page.reopen_after_exec_binding()
+                .map_err(|_| NativeProcessError::Stale)?;
+        }
         result
     }
 

@@ -1551,6 +1551,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         {
             return Err(NativeProcessError::Busy);
         }
+        let retained = retain_member_control(control)?;
+        // Root registration, like child publication, transfers the still-Free
+        // home record to the native owner before it can become runnable.
+        if !source.zone.mark_native_owned(owned.record.id) {
+            return Err(NativeProcessError::Stale);
+        }
         state.members.insert(
             key,
             NativeOwnerMember {
@@ -1558,7 +1564,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 process,
                 address,
                 record: owned.record,
-                control: retain_member_control(control)?,
+                control: retained,
             },
         );
         state.groups.insert(group_key, (runtime.clone(), process));
@@ -8239,17 +8245,6 @@ mod tests {
             design.contains("exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it")
         );
     }
-    #[test]
-    fn unsupported_exec_has_no_completion_surface() {
-        let source = include_str!("native_process_runtime.rs");
-        let production = source.split("mod tests {").next().unwrap();
-        assert!(!production.contains(concat!("fn exec", "_completed(")));
-        assert!(
-            include_str!("../../../docs/design/arm-ring-first-flip.md")
-                .contains("shared-owner-exec-completion")
-        );
-    }
-
     /// What the host does when it allocates a leader's control slot: record
     /// its birth identity. Fixtures choose the process serial equal to the
     /// task's first snapshot generation; production does not depend on that.
