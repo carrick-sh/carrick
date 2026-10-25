@@ -1,15 +1,17 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod support;
 
 use serde_json::{Value, json};
-use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use support::wait_for_pipe_readiness;
 
 struct Remote {
     // Field order is drop order: stop serving before removing the repos.
@@ -461,41 +463,6 @@ impl Drop for HolderGuard {
     }
 }
 
-fn wait_for_pipe_readiness(fd: BorrowedFd<'_>, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "holder readiness timed out after {timeout:?}"
-        );
-        let timeout_ms =
-            libc::c_int::try_from(remaining.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
-        let mut pollfd = libc::pollfd {
-            fd: fd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `pollfd` is a valid single-element local struct, and `fd`
-        // borrows a live pipe descriptor for the duration of `poll`.
-        let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            panic!("poll failed: {err}");
-        }
-        assert!(ret > 0, "holder readiness timed out after {timeout:?}");
-        assert_eq!(
-            pollfd.revents & libc::POLLNVAL,
-            0,
-            "poll reported invalid descriptor"
-        );
-        break;
-    }
-}
-
 #[test]
 fn killed_holder_is_reclaimable_only_after_ttl() {
     let remote = Remote::new();
@@ -519,12 +486,9 @@ fn killed_holder_is_reclaimable_only_after_ttl() {
             .arg(&receipt)
             .stdout(Stdio::piped()),
     );
-    let mut stdout = holder.take_stdout();
-    wait_for_pipe_readiness(stdout.as_fd(), Duration::from_secs(60));
-    let mut buf = [0u8; 1];
-    stdout
-        .read_exact(&mut buf)
-        .expect("holder exited before signaling readiness");
+    let stdout = holder.take_stdout();
+    wait_for_pipe_readiness(stdout.as_fd(), Duration::from_secs(60))
+        .expect("holder failed to signal readiness");
     let bytes = std::fs::read(&receipt).expect("receipt file must exist");
     let value = serde_json::from_slice::<Value>(&bytes).expect("receipt must be valid json");
     let old = value[0]["sha"].as_str().expect("sha in receipt").to_owned();

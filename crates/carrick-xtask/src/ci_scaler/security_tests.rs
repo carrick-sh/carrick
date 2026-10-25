@@ -4,6 +4,10 @@ use super::*;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 
+#[path = "../../tests/support/mod.rs"]
+mod support;
+use support::{PipeReadinessError, wait_for_pipe_readiness};
+
 const SYNTHETIC_SECRET: &str = "synthetic-never-a-real-credential";
 
 #[test]
@@ -591,11 +595,8 @@ fn serial_host_execute_retains_bounded_redacted_stderr_and_strips_library_paths(
     let timeout_err =
         execute_with_readiness(&mut command, &[], Duration::from_millis(50), |_child_pid| {
             readiness_pipe.close_write();
-            wait_for_pipe_outcome(
-                readiness_pipe.read_fd().unwrap(),
-                PipeOutcome::Byte,
-                Duration::from_secs(60),
-            )
+            wait_for_pipe_readiness(readiness_pipe.read_fd().unwrap(), Duration::from_secs(60))
+                .map_err(ScalerError::from)
         })
         .unwrap_err();
     assert!(timeout_err.to_string().contains("sh timed out after 50ms"));
@@ -690,57 +691,17 @@ impl TestPipe {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum PipeOutcome {
-    Byte,
-    Eof,
-}
-
-fn wait_for_pipe_outcome(
-    read_fd: BorrowedFd<'_>,
-    expected: PipeOutcome,
-    limit: Duration,
-) -> Result<(), ScalerError> {
-    let mut pollfd = libc::pollfd {
-        fd: read_fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout_ms = libc::c_int::try_from(limit.as_millis()).unwrap_or(libc::c_int::MAX);
-    let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-    if ret < 0 {
-        return Err(ScalerError::Io(std::io::Error::last_os_error()));
-    }
-    if ret == 0 {
-        return Err(ScalerError::External(match expected {
-            PipeOutcome::Byte => "readiness signal timed out",
-            PipeOutcome::Eof => "process group pipe EOF timed out",
-        }));
-    }
-    let mut buf = [0u8; 1];
-    let n = unsafe {
-        libc::read(
-            read_fd.as_raw_fd(),
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len(),
-        )
-    };
-    if n < 0 {
-        return Err(ScalerError::Io(std::io::Error::last_os_error()));
-    }
-    match expected {
-        PipeOutcome::Byte => {
-            if n == 0 {
-                return Err(ScalerError::External("child exited before readiness"));
+impl From<PipeReadinessError> for ScalerError {
+    fn from(err: PipeReadinessError) -> Self {
+        match err {
+            PipeReadinessError::TimedOut => Self::External("readiness signal timed out"),
+            PipeReadinessError::ChildExited => Self::External("child exited before readiness"),
+            PipeReadinessError::InvalidDescriptor => {
+                Self::External("poll reported invalid descriptor")
             }
-        }
-        PipeOutcome::Eof => {
-            if n != 0 {
-                return Err(ScalerError::External("expected EOF, read bytes from pipe"));
-            }
+            PipeReadinessError::Io(errno) => Self::Io(std::io::Error::from_raw_os_error(errno)),
         }
     }
-    Ok(())
 }
 
 #[test]
@@ -791,11 +752,8 @@ fn serial_host_execute_timeout_retains_stderr_when_child_is_descheduled_before_f
             unsafe {
                 assert_eq!(libc::kill(pid, libc::SIGCONT), 0);
             }
-            wait_for_pipe_outcome(
-                readiness_pipe.read_fd().unwrap(),
-                PipeOutcome::Byte,
-                Duration::from_secs(60),
-            )
+            wait_for_pipe_readiness(readiness_pipe.read_fd().unwrap(), Duration::from_secs(60))
+                .map_err(ScalerError::from)
         })
         .unwrap_err();
     assert!(timeout_err.to_string().contains("sh timed out after 50ms"));
@@ -838,11 +796,7 @@ fn serial_host_execute_readiness_panic_kills_and_reaps_child() {
             observed_pid_clone.store(child_pid, std::sync::atomic::Ordering::SeqCst);
             readiness_pipe.close_write();
             lifecycle_pipe.close_write();
-            wait_for_pipe_outcome(
-                readiness_pipe.read_fd().unwrap(),
-                PipeOutcome::Byte,
-                Duration::from_secs(60),
-            )?;
+            wait_for_pipe_readiness(readiness_pipe.read_fd().unwrap(), Duration::from_secs(60))?;
             panic!("intentional readiness panic for test witness");
         });
     }));
@@ -878,13 +832,11 @@ fn serial_host_execute_readiness_panic_kills_and_reaps_child() {
     let mut cleanup_guard = KillOnDrop::new(pid);
 
     lifecycle_pipe.close_write();
-    let eof_status = wait_for_pipe_outcome(
-        lifecycle_pipe.read_fd().unwrap(),
-        PipeOutcome::Eof,
-        Duration::from_secs(60),
-    );
-    assert!(
-        eof_status.is_ok(),
+    let eof_status =
+        wait_for_pipe_readiness(lifecycle_pipe.read_fd().unwrap(), Duration::from_secs(60));
+    assert_eq!(
+        eof_status,
+        Err(PipeReadinessError::ChildExited),
         "process group members were still alive after readiness hook panic: {eof_status:?}"
     );
 
