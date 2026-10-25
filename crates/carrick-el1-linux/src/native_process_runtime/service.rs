@@ -303,7 +303,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         );
         drop(owner_queue);
         if let Some(wait) = owner_wait {
-            return self.park_owner_wait(request, wait);
+            return self.park_owner_wait(&request, wait);
         }
         if let Err(error) = self
             .current
@@ -338,13 +338,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(error);
             }
         }
-        self.park_service(request)
+        self.park_service(&request)
     }
 
+    // The caller retains the request snapshot through nested completion. Borrow
+    // its full birth/MM identity instead of retaining another aggregate copy.
     #[inline(never)]
     fn park_service(
         &mut self,
-        request: ServiceRequest,
+        request: &ServiceRequest,
     ) -> Result<NativeResume, NativeProcessError> {
         use carrick_sched_core::object_wait::ObjectWaitError;
         let zone = self.source.zone;
@@ -454,16 +456,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .service_wait(&self.record)
             .and_then(|pending| pending.wait);
         Some(if wait.is_some() {
-            self.finish_owner_wait(request)
+            self.finish_owner_wait(&request)
         } else {
-            self.park_service(request)
+            self.park_service(&request)
         })
     }
 
     #[inline(never)]
     fn park_owner_wait(
         &mut self,
-        request: ServiceRequest,
+        request: &ServiceRequest,
         wait: carrick_core_abi::PortalOwnerWait,
     ) -> Result<NativeResume, NativeProcessError> {
         use carrick_sched_core::object_wait::ObjectWaitError;
@@ -526,7 +528,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
     fn finish_owner_wait(
         &mut self,
-        request: ServiceRequest,
+        request: &ServiceRequest,
     ) -> Result<NativeResume, NativeProcessError> {
         let key = ObjectWaitKey::native_service(self.record).ok_or(NativeProcessError::Stale)?;
         let queue = self
@@ -553,11 +555,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     #[inline(never)]
     fn finish_service(
         &mut self,
-        request: ServiceRequest,
+        request: &ServiceRequest,
         mut result: ServiceResult,
         mut pending: Box<PendingService<'a>>,
     ) -> Result<NativeResume, NativeProcessError> {
-        if pending.request != request {
+        if pending.request != *request {
             return Err(NativeProcessError::Quarantined);
         }
         if self.runtime.graph.lock().pending.has_exit(&self.key) {
@@ -610,7 +612,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .lock()
                         .insert_member_wait(self.record, MemberWait::Service(pending));
                     drop(queue);
-                    return self.park_owner_wait(next, wait);
+                    return self.park_owner_wait(&next, wait);
                 }
                 Err(_) => result = ServiceResult::Refused,
             }

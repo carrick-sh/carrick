@@ -1167,12 +1167,13 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         };
         let reply_address =
             carrick_guest_arch::KernelVa::new(core::ptr::from_ref(slot).addr() as u64);
-        let mut settlement = carrick_el1_abi::NativeDescriptorSettlement::new(
-            owner_handle,
-            window.operation.sequence,
-            reply_address,
-        )
-        .ok_or(MmError::Stale)?;
+        // Keep the aligned wire record in one caller-owned slot. Returning it
+        // through Option and moving it through error adapters retains several
+        // aggregate buffers beneath the backing-reply descriptor path.
+        let mut settlement = carrick_el1_abi::NativeDescriptorSettlement::EMPTY;
+        settlement
+            .initialize(owner_handle, window.operation.sequence, reply_address)
+            .ok_or(MmError::Stale)?;
         let crossed = self.crossing.cross_fork_stock(
             &raw mut settlement as *mut _ as u64,
             u64::from(self.worker()),
