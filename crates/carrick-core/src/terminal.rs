@@ -268,6 +268,12 @@ pub struct Terminal;
 pub struct Closing;
 pub struct Settled;
 
+/// Process-wide exec drain using the same exact-member receipt vocabulary as
+/// terminal Closing while retaining the caller as the successor owner.
+pub struct ExecDrainCustody {
+    identity: ProcessTerminalIdentity,
+}
+
 /// Raw task membership supplied by the graph that owns its registry. Core
 /// decides whether an absent task makes a terminal retry already retired.
 pub trait TaskMembership {
@@ -669,6 +675,114 @@ impl TerminalCustody<Process, Live> {
     }
 }
 
+impl ExecDrainCustody {
+    pub fn begin(
+        page: &impl Lifecycle,
+        task: TaskKey,
+        address: AddressContext<RootGpa>,
+    ) -> Result<Self, crate::lifecycle::GateState> {
+        page.close_for_exec()?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(Self {
+            identity: ProcessTerminalIdentity::from_exit(task, address, TerminationStatus::SUCCESS),
+        })
+    }
+
+    pub fn cancel_members(&self, pool: Vec<EntryRef>, host: Vec<ThreadBirthIdentity>) -> MemberSet {
+        MemberSet::new(self.identity, pool, host)
+    }
+
+    pub fn observe_members_verdict(
+        &self,
+        page: &impl Lifecycle,
+        members: &MemberSet,
+        pool: &[PoolMemberObservation<'_>],
+        host: &[HostMemberObservation<'_>],
+    ) -> Result<CompletedMemberReceipts, ReadinessFailure> {
+        observe_members_verdict(self.identity, page, members, pool, host)
+    }
+
+    pub fn can_adopt(&self, page: &impl Lifecycle, receipts: &CompletedMemberReceipts) -> bool {
+        // The exec caller's own prepared service remains admitted until the
+        // successor is consumed. Every other service, birth and topology
+        // claim must have drained.
+        self.identity == receipts.process && page.live() == 1 && page.claimed_count() == 1
+    }
+}
+
+fn observe_members_verdict(
+    identity: ProcessTerminalIdentity,
+    page: &impl Lifecycle,
+    members: &MemberSet,
+    pool: &[PoolMemberObservation<'_>],
+    host: &[HostMemberObservation<'_>],
+) -> Result<CompletedMemberReceipts, ReadinessFailure> {
+    let mut completed_pool = Vec::with_capacity(pool.len());
+    for observation in pool {
+        let kind = crate::lifecycle::recorded_member_exit_kind(
+            observation.member,
+            Some(observation.entry),
+        );
+        let observed = observation.member.host_retirement();
+        let returned = match kind {
+            MemberExitKind::InZone => true,
+            MemberExitKind::HostRetiring => {
+                observed.is_some_and(|receipt| receipt.acknowledges(observation.expected_host))
+            }
+            MemberExitKind::Active | MemberExitKind::Stale => false,
+        };
+        if !returned {
+            return Err(ReadinessFailure::Pool {
+                entry: observation.entry,
+                kind,
+                observed,
+                expected: observation.expected_host,
+            });
+        }
+        completed_pool.push(observation.entry);
+    }
+    let mut completed_host = Vec::with_capacity(host.len());
+    for (index, observation) in host.iter().enumerate() {
+        let member = match observation {
+            HostMemberObservation::Adopted { birth, member } => {
+                let kind =
+                    crate::lifecycle::recorded_member_exit_kind(*member, member.member_entry());
+                let observed = member.host_retirement();
+                if kind == MemberExitKind::InZone
+                    || !observed.is_some_and(|receipt| receipt.acknowledges(*birth))
+                {
+                    return Err(ReadinessFailure::Adopted {
+                        position: index,
+                        kind,
+                        observed,
+                        expected: *birth,
+                    });
+                }
+                *birth
+            }
+            HostMemberObservation::HostBorn { identity, index } => {
+                if !page.host_birth_receipt_returned_exact(*index, *identity) {
+                    return Err(ReadinessFailure::HostBorn {
+                        index: *index,
+                        expected: *identity,
+                    });
+                }
+                *identity
+            }
+        };
+        completed_host.push(member);
+    }
+    (members.process == identity)
+        .then(|| members.completed(&completed_pool, &completed_host))
+        .flatten()
+        .ok_or(ReadinessFailure::MemberSet {
+            observed_pool: completed_pool.len(),
+            observed_host: completed_host.len(),
+            expected_pool: members.pool.len(),
+            expected_host: members.host.len(),
+        })
+}
+
 impl TerminalCustody<Process, Closing> {
     pub fn cancel_members(
         &self,
@@ -680,16 +794,6 @@ impl TerminalCustody<Process, Closing> {
             process: self.identity,
             members,
         }
-    }
-    fn complete_members(
-        &self,
-        members: &MemberSet,
-        pool: &[EntryRef],
-        host: &[ThreadBirthIdentity],
-    ) -> Option<CompletedMemberReceipts> {
-        (members.process == self.identity)
-            .then(|| members.completed(pool, host))
-            .flatten()
     }
     pub fn observe_members(
         &self,
@@ -711,68 +815,7 @@ impl TerminalCustody<Process, Closing> {
         pool: &[PoolMemberObservation<'_>],
         host: &[HostMemberObservation<'_>],
     ) -> Result<CompletedMemberReceipts, ReadinessFailure> {
-        let mut completed_pool = Vec::with_capacity(pool.len());
-        for observation in pool {
-            let kind = crate::lifecycle::recorded_member_exit_kind(
-                observation.member,
-                Some(observation.entry),
-            );
-            let observed = observation.member.host_retirement();
-            let returned = match kind {
-                MemberExitKind::InZone => true,
-                MemberExitKind::HostRetiring => {
-                    observed.is_some_and(|receipt| receipt.acknowledges(observation.expected_host))
-                }
-                MemberExitKind::Active | MemberExitKind::Stale => false,
-            };
-            if !returned {
-                return Err(ReadinessFailure::Pool {
-                    entry: observation.entry,
-                    kind,
-                    observed,
-                    expected: observation.expected_host,
-                });
-            }
-            completed_pool.push(observation.entry);
-        }
-        let mut completed_host = Vec::with_capacity(host.len());
-        for (index, observation) in host.iter().enumerate() {
-            let identity = match observation {
-                HostMemberObservation::Adopted { birth, member } => {
-                    let kind =
-                        crate::lifecycle::recorded_member_exit_kind(*member, member.member_entry());
-                    let observed = member.host_retirement();
-                    if kind == MemberExitKind::InZone
-                        || !observed.is_some_and(|receipt| receipt.acknowledges(*birth))
-                    {
-                        return Err(ReadinessFailure::Adopted {
-                            position: index,
-                            kind,
-                            observed,
-                            expected: *birth,
-                        });
-                    }
-                    *birth
-                }
-                HostMemberObservation::HostBorn { identity, index } => {
-                    if !page.host_birth_receipt_returned_exact(*index, *identity) {
-                        return Err(ReadinessFailure::HostBorn {
-                            index: *index,
-                            expected: *identity,
-                        });
-                    }
-                    *identity
-                }
-            };
-            completed_host.push(identity);
-        }
-        self.complete_members(members, &completed_pool, &completed_host)
-            .ok_or(ReadinessFailure::MemberSet {
-                observed_pool: completed_pool.len(),
-                observed_host: completed_host.len(),
-                expected_pool: members.pool.len(),
-                expected_host: members.host.len(),
-            })
+        observe_members_verdict(self.identity, page, members, pool, host)
     }
     pub fn can_settle(&self, page: &impl Lifecycle, receipts: &CompletedMemberReceipts) -> bool {
         self.identity == receipts.process && page.live() == 0 && page.claimed_count() == 0
