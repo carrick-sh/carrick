@@ -212,6 +212,34 @@ the Linux clippy closure measures 11,071 bytes for backing reply; its broad
 maximum is the separate 11,327-byte signal-terminal-exit envelope. The
 ordinary test closure measures 10,735 bytes for backing reply.
 
+### Lane B after composition with main (2026-10-25)
+
+The rebased slice 4 Linux clippy closure at `6da2a514be` rejected native
+backing reply at 11,422 bytes against the unchanged 11,311-byte ceiling.
+Disassembly showed the 64-byte-aligned `NativeDescriptorSettlement` moving
+through a 128-byte `Option` return and intermediate error-adapter buffers.
+The nested service functions also passed the 120-byte `ServiceRequest` by
+value despite already retaining the pending service in a box.
+
+Settlement now initializes one caller-owned wire slot in place and returns
+only success/failure. Private park/completion functions borrow the request
+snapshot retained by their caller. The exact pending-request comparison,
+owner/MM/sequence checks, one-shot settlement and terminal claim remain in
+place. Wire size, alignment and layout are unchanged. This adds no allocation,
+unsafe code or new execution path, and changes no stack or frame budget.
+
+| Linux clippy measurement | Before | After |
+|---|---:|---:|
+| Native backing reply | 11,422 | 11,070 |
+| `apply_fault_reply` frame | 1,279 | 1,023 |
+| `resume_checkpoint` frame | 544 | 448 |
+
+The corrected closure recovers 352 bytes, leaving 241 bytes under the stricter
+backing-reply ceiling. All its other registered envelopes remain below their
+12,288-byte ceiling. These are compiled-image measurements; the other portable
+feature closures must also pass before handoff. They do not establish signed
+HVF execution or a complete whole-program stack proof.
+
 A tighter limit is mechanically possible by replacing `stack_size * 3 / 4`
 in `Frames::check` with a lower ceiling. An 11 KiB ceiling (11,264 bytes)
 leaves 289 bytes above the standalone maximum but would reject the Linux

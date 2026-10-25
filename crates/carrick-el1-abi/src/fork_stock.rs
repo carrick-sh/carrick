@@ -70,12 +70,21 @@ pub struct NativeDescriptorSettlement {
 }
 
 impl NativeDescriptorSettlement {
+    /// Inert caller-owned storage, not a published descriptor request.
+    pub const EMPTY: Self = Self { words: [0; 8] };
+
     const PENDING: u64 = 0;
     const ACCEPTED: u64 = 1;
     const REFUSED: u64 = 2;
     const CONSUMED: u64 = 3;
 
-    pub fn new(owner: crate::El1MmHandle, generation: NonZeroU64, reply: KernelVa) -> Option<Self> {
+    /// Fill the retained crossing record without an aligned aggregate return.
+    pub fn initialize(
+        &mut self,
+        owner: crate::El1MmHandle,
+        generation: NonZeroU64,
+        reply: KernelVa,
+    ) -> Option<()> {
         if reply.raw() == 0
             || !reply
                 .raw()
@@ -83,18 +92,17 @@ impl NativeDescriptorSettlement {
         {
             return None;
         }
-        Some(Self {
-            words: [
-                ForkStockKind::Descriptor.word(),
-                owner.carrier().get(),
-                owner.mm().raw(),
-                owner.incarnation().get(),
-                generation.get(),
-                reply.raw(),
-                Self::PENDING,
-                0,
-            ],
-        })
+        self.words = [
+            ForkStockKind::Descriptor.word(),
+            owner.carrier().get(),
+            owner.mm().raw(),
+            owner.incarnation().get(),
+            generation.get(),
+            reply.raw(),
+            Self::PENDING,
+            0,
+        ];
+        Some(())
     }
 
     pub fn request(&self) -> Option<(crate::El1MmHandle, NonZeroU64, KernelVa)> {
@@ -901,9 +909,19 @@ mod tests {
         };
         let generation = NonZeroU64::new(13).unwrap();
         let reply = KernelVa::new(0xffff_8000_0001_0000);
-        let mut settlement = NativeDescriptorSettlement::new(owner, generation, reply).unwrap();
+        let mut settlement = NativeDescriptorSettlement::EMPTY;
+        assert_eq!(settlement.request(), None);
+        for invalid in [KernelVa::new(0), KernelVa::new(reply.raw() + 1)] {
+            assert_eq!(settlement.initialize(owner, generation, invalid), None);
+            assert_eq!(settlement.request(), None);
+        }
+        settlement.initialize(owner, generation, reply).unwrap();
         assert_eq!(settlement.request(), Some((owner, generation, reply)));
         assert!(settlement.accept());
+        assert_eq!(
+            settlement.take(owner, NonZeroU64::new(14).unwrap(), reply),
+            None
+        );
         assert_eq!(settlement.take(owner, generation, reply), Some(Ok(())));
         assert_eq!(settlement.take(owner, generation, reply), None);
     }
