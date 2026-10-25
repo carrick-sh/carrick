@@ -733,6 +733,18 @@ impl ThreadControlSlot {
                 .is_ok()
     }
 
+    /// Publish the leader identity after the exec owner validated this exact
+    /// predecessor under the closed thread-group transaction.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the sole surviving member, must have observed a
+    /// nonzero predecessor identity for this slot, and must keep thread births
+    /// and retirement closed until the successor publication completes.
+    pub unsafe fn promote_exec_identity_owned(&self, leader: u32) {
+        self.visible_tid.store(leader, Ordering::Release);
+    }
+
     pub fn visible_tid(&self) -> Option<u32> {
         let tid = self.visible_tid.load(Ordering::Acquire);
         (tid != 0).then_some(tid)

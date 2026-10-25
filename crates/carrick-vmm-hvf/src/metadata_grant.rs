@@ -1847,12 +1847,16 @@ fn service_native_exec_adopt(
         request.refuse();
         return Ok(refused);
     }
-    let (physical, asid) = crate::trap::install_native_exec_successor(prepared)?;
-    if asid.asid() != successor.asid || asid.generation() != successor.asid_generation.get() {
-        return Err(TrapError::Hypervisor(
-            "native exec retained ASID disagrees with sealed manifest".into(),
-        ));
-    }
+    let (physical, asid) = match crate::trap::install_native_exec_successor(prepared) {
+        Ok(installed) => installed,
+        Err(_) => {
+            // The receipt has been consumed, so this process cannot retry or
+            // return to the predecessor image. Refuse the adoption crossing;
+            // the ring maps that terminal refusal to process-group death.
+            request.refuse();
+            return Ok(refused);
+        }
+    };
     // SAFETY: the ring published this exact closed reservation owner before
     // crossing; the sealed manifest binds its incarnation to this receipt.
     let successor_handle = unsafe {
