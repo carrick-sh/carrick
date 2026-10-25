@@ -2181,6 +2181,17 @@ impl Task {
             .any(|(_, thread)| Arc::ptr_eq(thread.resources().files_ref(), files))
     }
 
+    pub(crate) fn file_tables(&self) -> Vec<Arc<FileTable>> {
+        let mut tables = Vec::new();
+        for (_, thread) in self.threads.lock().values() {
+            let files = thread.resources().files();
+            if !tables.iter().any(|seen| Arc::ptr_eq(seen, &files)) {
+                tables.push(files);
+            }
+        }
+        tables
+    }
+
     pub(in crate::kernel) fn thread_keys(&self) -> Vec<ThreadKey> {
         self.threads.lock().values().map(|(key, _)| *key).collect()
     }

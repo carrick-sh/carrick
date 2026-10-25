@@ -2100,6 +2100,12 @@ impl NativeFileWitness {
         crate::el1_delegation::registered_opens(self.inode)
     }
 
+    pub fn require_close_effects(&self, effects: carrick_el1_abi::ipc::fd::CloseEffects) {
+        if let Some(description) = &self.parent {
+            description.require_close_effects(effects);
+        }
+    }
+
     /// The serial fixture opens no other file between final close and this
     /// probe, so the retired numeric fd cannot be reused by another test.
     pub fn physical_fd_errno(&self) -> Option<i32> {

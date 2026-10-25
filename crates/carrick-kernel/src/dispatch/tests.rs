@@ -5923,7 +5923,6 @@ mod hvpatch_in_process_fork_tests {
         let epoll_description = parent.open_file(epfd).expect("parent epoll fd").description;
         // A pipe read end is a zone item: the epoll's record holds it.
         assert!(epoll_holds_item_fd(&epoll_description, read_fd));
-
         let (child, _) = fork_dispatcher(
             &parent,
             crate::thread::ThreadId::synthetic_for_tests(5401),
@@ -5958,6 +5957,106 @@ mod hvpatch_in_process_fork_tests {
             panic!("epoll fd changed description kind");
         };
         interest.contains_key(&fd) || zone.as_ref().is_some_and(|zone| zone.has_item_fd(fd))
+    }
+
+    #[test]
+    fn host_owned_epoll_target_marks_close_for_ring_replay() {
+        const MEM_BASE: u64 = 0x5220_0000;
+        let dispatcher = SyscallDispatcher::new();
+        let reporter = crate::compat::CompatReporter::default();
+        let registry =
+            crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(5410));
+        let futex = crate::thread::FutexTable::new();
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0; 0x1000]);
+        let tid = crate::thread::ThreadId::synthetic_for_tests(5411);
+        let call = |memory: &mut LinearMemory, number: u64, args: [u64; 6]| {
+            dispatcher
+                .dispatch_threaded(
+                    &dispatcher.capture_one_task_context().unwrap(),
+                    SyscallRequest::new(number, SyscallArgs::from(args)),
+                    memory,
+                    &reporter,
+                    ThreadCtx::new(tid, &registry, &futex),
+                )
+                .expect("dispatch")
+        };
+        let returned = |outcome| match outcome {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("expected returned outcome, got {other:?}"),
+        };
+        let epfd = returned(call(&mut memory, 20, [0; 6])) as i32;
+        let pair_addr = MEM_BASE + 0x100;
+        assert_eq!(
+            returned(call(
+                &mut memory,
+                199,
+                [
+                    LINUX_AF_UNIX as u64,
+                    LINUX_SOCK_STREAM as u64,
+                    0,
+                    pair_addr,
+                    0,
+                    0,
+                ],
+            )),
+            0,
+        );
+        let pair = memory.read_bytes(pair_addr, 8).unwrap();
+        let target = i32::from_le_bytes(pair[0..4].try_into().unwrap());
+        let event_addr = MEM_BASE + 0x120;
+        let mut event = [0_u8; 16];
+        event[0..4].copy_from_slice(&LINUX_EPOLLIN.to_le_bytes());
+        memory.write_bytes(event_addr, &event).unwrap();
+        assert_eq!(
+            returned(call(
+                &mut memory,
+                21,
+                [
+                    epfd as u64,
+                    LINUX_EPOLL_CTL_ADD,
+                    target as u64,
+                    event_addr,
+                    0,
+                    0,
+                ],
+            )),
+            0,
+        );
+
+        let slot = dispatcher
+            .captured_file_table()
+            .read_open_files()
+            .get(&target)
+            .cloned()
+            .expect("epoll target slot");
+        assert_eq!(
+            slot.description.close_effects(),
+            carrick_el1_abi::ipc::fd::CloseEffects::EPOLL_DETACH,
+        );
+        let ipc = Arc::new(crate::el1_ipc::HostIpc::new(1 << 16).unwrap());
+        let table = crate::el1_ipc::HostTable::create(Arc::clone(&ipc), 64, 8).unwrap();
+        table
+            .replace_slot(carrick_el1_abi::ipc::fd::Fd(target), &slot)
+            .unwrap();
+        assert_eq!(
+            ipc.region()
+                .fd(crate::el1_zone::HostLockWait)
+                .close_effects(table.id(), carrick_el1_abi::ipc::fd::Fd(target))
+                .unwrap(),
+            carrick_el1_abi::ipc::fd::CloseEffects::EPOLL_DETACH,
+            "an in-ring close must replay the canonical host epoll detach",
+        );
+
+        assert_eq!(
+            returned(call(
+                &mut memory,
+                57,
+                [target as u64, 0, 0, 0, 0, 0],
+            )),
+            0,
+        );
+        let epoll = dispatcher.open_file(epfd).expect("epoll description");
+        assert!(!epoll_holds_item_fd(&epoll.description, target));
     }
 
     #[test]

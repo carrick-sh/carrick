@@ -299,7 +299,7 @@ impl HostDescriptionFlags {
         }
     }
 
-    pub(crate) fn set_linux_flags(&self, value: u64) {
+    pub(crate) fn set_linux_flags(&self, value: Option<u64>, effects: fd::CloseEffects) {
         let state = self.state.lock();
         let HostDescriptionState::Live(pin) = &*state else {
             // A retired host observation has no mutation authority.
@@ -307,18 +307,29 @@ impl HostDescriptionFlags {
         };
         let region = self.owner.region();
         let authority = region.fd(HostLockWait);
-        let mut flags = authority
-            .pinned(pin)
-            .unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("ipc::description", "invalid flag mutation")
-            })
-            .flags;
-        flags.append = value & carrick_abi::LINUX_O_APPEND != 0;
-        flags.nonblock = value & carrick_abi::LINUX_O_NONBLOCK != 0;
-        flags.asynchronous = value & carrick_abi::LINUX_O_ASYNC != 0;
-        authority.set_pinned_flags(pin, flags).unwrap_or_else(|_| {
-            carrick_fatal::carrick_fatal!("ipc::description", "shared flag mutation rejected")
+        let result = (|| {
+            if let Some(value) = value {
+                let mut flags = authority.pinned(pin)?.flags;
+                flags.append = value & carrick_abi::LINUX_O_APPEND != 0;
+                flags.nonblock = value & carrick_abi::LINUX_O_NONBLOCK != 0;
+                flags.asynchronous = value & carrick_abi::LINUX_O_ASYNC != 0;
+                authority.set_pinned_flags(pin, flags)?;
+            }
+            authority.require_pinned_close_effects(pin, effects)
+        })();
+        result.unwrap_or_else(|_| {
+            carrick_fatal::carrick_fatal!(
+                "ipc::description",
+                "shared description mutation rejected"
+            )
         });
+    }
+
+    pub(crate) fn require_close_effects(&self, effects: fd::CloseEffects) {
+        if effects.is_empty() {
+            return;
+        }
+        self.set_linux_flags(None, effects);
     }
 }
 
