@@ -384,6 +384,9 @@ pub enum ServiceResult {
 #[repr(transparent)]
 pub struct ServiceFailureCode(NonZeroU32);
 impl ServiceFailureCode {
+    /// Smallest representable personality failure. This is a fail-closed
+    /// fallback for a violated producer-side positive-number invariant.
+    pub const MINIMUM: Self = Self(NonZeroU32::MIN);
     pub const fn new(raw: u32) -> Option<Self> {
         match NonZeroU32::new(raw) {
             Some(raw) => Some(Self(raw)),
