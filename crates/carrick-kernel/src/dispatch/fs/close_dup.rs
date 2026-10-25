@@ -282,6 +282,17 @@ impl<'a> FsView<'a> {
             let files = this.captured_file_table();
             let (open_file, epoll_reservation) = {
                 let mut table = files.write_open_files();
+                let epoll_reservation = if table
+                    .get(&fd.0)
+                    .is_some_and(|open_file| open_file.description.has_epoll_registrations())
+                {
+                    match files.reserve_slot_for_epoll_detach(fd.0) {
+                        Ok(reservation) => Some(reservation),
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    }
+                } else {
+                    None
+                };
                 let Some(open_file) = table.remove(&fd.0) else {
                     // Release the table guard first: the stdio path below
                     // re-reads the table (`discard_splice_pushback_if_final`).
@@ -303,12 +314,7 @@ impl<'a> FsView<'a> {
                         DispatchOutcome::errno(LINUX_EBADF)
                     });
                 };
-                let reservation = if open_file.description.has_epoll_registrations() {
-                    Some(files.reserve_slot_for_epoll_detach(fd.0))
-                } else {
-                    None
-                };
-                (open_file, reservation)
+                (open_file, epoll_reservation)
             };
             Self::discard_splice_pushback_for_description(&open_file.description);
             this.dnotify_close_fd(fd.0);
