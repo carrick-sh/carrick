@@ -374,6 +374,12 @@ enum TerminalExecBackingFailure {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum ExecBackingTransactionError {
+    RolledBack(TrapError),
+    Terminal(TerminalExecBackingFailure),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl core::fmt::Display for TerminalExecBackingFailure {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -669,7 +675,7 @@ fn rollback_after_install_failure(
 fn install_prepared_exec_backing(
     prepared: PreparedExecBacking,
     successor_root_slot: (u64, u64),
-) -> Result<PublishedExecBacking, TrapError> {
+) -> Result<PublishedExecBacking, ExecBackingTransactionError> {
     let fail_after = exec_stage2_fail_after_maps();
     let mut maps_completed = 0usize;
     let installed = prepared.install_using(
@@ -727,23 +733,15 @@ fn install_prepared_exec_backing(
         },
     );
     let published = match installed {
-        Ok(installed) => installed
-            .publish(successor_root_slot)
-            .unwrap_or_else(|failure| {
-                carrick_fatal!(
-                    "hvpatch::exec_commit",
-                    "{}",
-                    TerminalExecBackingFailure::Publish(failure)
-                );
-            }),
+        Ok(installed) => installed.publish(successor_root_slot).map_err(|failure| {
+            ExecBackingTransactionError::Terminal(TerminalExecBackingFailure::Publish(failure))
+        })?,
         Err(failure) if failure.retained.is_some() => {
-            carrick_fatal!(
-                "hvpatch::exec_commit",
-                "{}",
-                TerminalExecBackingFailure::Install(failure)
-            );
+            return Err(ExecBackingTransactionError::Terminal(
+                TerminalExecBackingFailure::Install(failure),
+            ));
         }
-        Err(failure) => return Err(failure.error),
+        Err(failure) => return Err(ExecBackingTransactionError::RolledBack(failure.error)),
     };
     Ok(published)
 }
@@ -1655,20 +1653,22 @@ impl HvfVmState {
             })?;
             let published = match install_prepared_exec_backing(prepared, replacement_mm_root_slot)
             {
-                Ok(published) => published,
-                Err(error) => {
+                Ok(published) => Ok(published),
+                Err(ExecBackingTransactionError::Terminal(failure)) => Err(failure),
+                Err(ExecBackingTransactionError::RolledBack(error)) => {
                     let authority_after = self.exec_authority_fingerprint();
-                    verify_exec_authority_rollback(&authority_before, &authority_after)
-                        .unwrap_or_else(|rollback_error| {
-                            carrick_fatal!(
-                                "hvpatch::exec_commit",
-                                "{}",
-                                TerminalExecBackingFailure::Rollback(rollback_error)
-                            );
-                        });
-                    return Err(error);
+                    if let Err(rollback_error) =
+                        verify_exec_authority_rollback(&authority_before, &authority_after)
+                    {
+                        Err(TerminalExecBackingFailure::Rollback(rollback_error))
+                    } else {
+                        return Err(error);
+                    }
                 }
-            };
+            }
+            .unwrap_or_else(|failure| {
+                carrick_fatal!("hvpatch::exec_commit", "{failure}");
+            });
             published_exec_plan = Some(published.plan);
             published_exec_regions = published.regions;
             if let Some((Some(retired), _)) = inventory_reservations.as_mut() {
