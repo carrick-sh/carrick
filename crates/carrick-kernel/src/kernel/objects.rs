@@ -2816,17 +2816,23 @@ impl FileTable {
         }
     }
 
-    pub(crate) fn reserve_slot_for_epoll_detach(&self, fd: i32) -> EpollDetachReservation<'_> {
+    pub(crate) fn reserve_slot_for_epoll_detach(
+        &self,
+        fd: i32,
+    ) -> Result<EpollDetachReservation<'_>, crate::linux_abi::LinuxErrno> {
         let mut reserved = self.lock_reserved_slots();
+        if reserved.contains_key(&fd) {
+            return Err(crate::linux_abi::LINUX_EBUSY);
+        }
         let res_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = self.reserve_ipc_exact(fd, res_id);
+        self.reserve_ipc_exact(fd, res_id)?;
         reserved.insert(fd, res_id);
-        EpollDetachReservation {
+        Ok(EpollDetachReservation {
             table: self,
             fd,
             reservation_id: res_id,
             active: true,
-        }
+        })
     }
 
     fn commit_reserved_slot<const N: usize>(
@@ -2839,9 +2845,6 @@ impl FileTable {
             .ok_or(crate::linux_abi::LINUX_EBADF)?;
         let mut open_files = self.write_open_files_borrowing(&_mutation);
         let mut reserved = self.lock_reserved_slots();
-        let ipc = self.ipc.lock();
-        let ipc_bound = matches!(*ipc, Some(Ok(_)));
-        drop(ipc);
 
         // All authentication and occupancy checks precede publication. The
         // cursor was advanced at admission; cancellation, not commit, rewinds it.
@@ -2851,18 +2854,18 @@ impl FileTable {
             {
                 return Err(crate::linux_abi::LINUX_EBADF);
             }
-            if !ipc_bound && open_files.contains_key(fd) {
+            if open_files.contains_key(fd) {
                 return Err(crate::linux_abi::LINUX_EBUSY);
             }
         }
         for (fd, reservation_id, slot) in claims {
             slot.description.retain_fd_ref();
             reserved.remove(&fd);
-            let displaced = open_files.insert_committed(fd, slot);
-            if let Some(stale) = displaced
-                && stale.description.fd_ref_count() != 0
-            {
-                stale.description.release_fd_ref();
+            if open_files.insert_committed(fd, slot).is_some() {
+                carrick_fatal!(
+                    "kernel::file_table_reservation",
+                    "occupied descriptor passed reservation commit checks"
+                );
             }
             if let Some(installed) = open_files.get(&fd) {
                 self.commit_ipc_reservation(fd, reservation_id, installed);
