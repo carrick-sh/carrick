@@ -428,6 +428,13 @@ pub(crate) fn settle_one(
         })
         .filter(|live| *live)
         .ok_or_else(|| TrapError::Hypervisor("live leaves do not name the grant".to_owned()))?;
+    let stage1 = tables
+        .completed_guest_cow_unpublication(completion)
+        .ok_or_else(|| {
+            TrapError::Hypervisor(
+                "guest COW completion did not retire its exact old stage-1 leaves".to_owned(),
+            )
+        })?;
 
     let retired = completion.purpose == carrick_el1_abi::CowGrantPurpose::RetiredBacking;
     let executable = if retired {
@@ -574,21 +581,14 @@ pub(crate) fn settle_one(
         .authority
         .apply(reservation.commit(()))
         .map_err(|error| TrapError::Hypervisor(format!("settlement inventory: {error}")))?;
-    let stage1 = crate::trap::frame_inventory::Stage1UnpublishedFrames::after_cow_split(
-        runtime.authority.as_ref(),
-        &split,
-    )?;
     let retired_old_stage2 = HvfVmState::commit_cow_inventory_split(
         &mut state.frame_inventory.ledger.lock(),
         &split,
         || {
-            let Some(stage1) = stage1.as_ref() else {
-                return Ok(false);
-            };
             HvfVmState::retire_stage2_extent_from_mappings_in(
                 custody,
                 &mut TaskMappingIndex::new(),
-                Stage1UnpublicationReceipt::FrameAbsence(stage1),
+                Stage1UnpublicationReceipt::EditorRange(&stage1),
                 split.old.stage2_base,
                 split.old.stage2_length,
             )?;

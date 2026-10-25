@@ -398,6 +398,45 @@ impl Stage1Authority {
         })
     }
 
+    /// Authenticate one EL1 grant completion against the live page tables and
+    /// bind its exact old outputs to a retirement receipt. The completion is
+    /// consumed only after the grant venue and MM identity were authenticated
+    /// by its caller; this method independently requires every current leaf to
+    /// name the reported replacement.
+    pub fn completed_guest_cow_unpublication(
+        &self,
+        completion: &carrick_core_abi::CowGrantCompletion,
+    ) -> Option<Stage1LeafRetired> {
+        if !completion.is_well_formed() {
+            return None;
+        }
+        let len = usize::try_from(completion.span_len).ok()?;
+        let inner = self.inner.lock();
+        let image_generation = inner.manager.generation?;
+        let manager = inner.manager.as_ref()?;
+        let end = completion.span_va.checked_add(completion.span_len)?;
+        let mut cursor = completion.span_va;
+        let mut retired = Vec::new();
+        while cursor < end {
+            let offset = cursor.checked_sub(completion.span_va)?;
+            let old = completion.old_ipa.checked_add(offset)?;
+            let new = completion.new_ipa.checked_add(offset)?;
+            if manager.translate(cursor) != Some(new) {
+                return None;
+            }
+            retired.push((cursor, old));
+            cursor = cursor.checked_add(4096)?;
+        }
+        (!retired.is_empty()).then_some(Stage1LeafRetired {
+            authority: self.authority_id(),
+            image_generation,
+            va: completion.span_va,
+            len,
+            retired,
+            _tlbi: TlbiComplete,
+        })
+    }
+
     /// Create a new, unpopulated stage-1 authority in the `Exclusive` state.
     pub fn new() -> Self {
         Self::new_with_manager(None)
