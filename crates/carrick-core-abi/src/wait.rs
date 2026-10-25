@@ -144,18 +144,23 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
         self.source.key(self.cause)
     }
 
-    pub fn park_host(
+    /// Link the host operation, then recheck the exact resource predicate as
+    /// well as the source lifetime and producer revision. A receipt identifies
+    /// the release stream; it does not prove that a producer still holds the
+    /// resource at enrollment time.
+    pub fn park_host_rechecked(
         self,
         record: RecordId,
         operation: OperationToken,
         completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+        still_blocked: impl FnOnce() -> bool,
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
         self.source.reserve(self.cause).park_host_rechecked(
             self.source.observed_revision(self.cause, self.revision),
             record,
             operation,
             completion,
-            || self.source.is_live(),
+            || self.source.is_live() && still_blocked(),
         )
     }
 }

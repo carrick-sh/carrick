@@ -3905,13 +3905,15 @@ fn owner_wait_enrollment_follows_only_its_real_release(
     if before {
         release(&mut editor, &mut root);
         let (error, returned) = enrollment
-            .park_host(record, operation, &complete)
+            .park_host_rechecked(record, operation, &complete, || true)
             .unwrap_err();
         assert_eq!(error, ObjectWaitError::Changed);
         assert_eq!(returned.index(), 701);
         assert!(!zone.record(record).has_object_operation());
     } else {
-        enrollment.park_host(record, operation, &complete).unwrap();
+        enrollment
+            .park_host_rechecked(record, operation, &complete, || true)
+            .unwrap();
         // A real, unrelated root/editor release must neither consume nor reschedule this operation.
         if cause != PortalWaitCause::Reservations {
             drop(portal.root(mm, 2).unwrap());
@@ -4073,7 +4075,12 @@ fn owner_wait_queue_admission_busy_retains_owned_handback_until_unlock() {
             control_slot: 0,
         })
         .unwrap();
-    let result = enrollment.park_host(record, OperationToken::new(701, 11).unwrap(), &complete);
+    let result = enrollment.park_host_rechecked(
+        record,
+        OperationToken::new(701, 11).unwrap(),
+        &complete,
+        || true,
+    );
     assert!(
         delivered.borrow().is_empty(),
         "queue release is the admission producer"
@@ -4131,6 +4138,78 @@ fn selected_data_retains_exact_pre_selection_reservation_observation() {
         source.observe(SpaceWaitCause::Reservations).revision(),
         revision
     );
+}
+
+/// A selected physical leaf can disappear after SELECT drops its editor even
+/// when no reservation holder remains. The production host-park consumer must
+/// recheck that exact producer after linking: a current revision by itself is
+/// not evidence that a free root will ever publish another release.
+#[test]
+fn free_reservation_root_refuses_a_current_revision_host_park() {
+    use carrick_el1_abi::{PortalOwnerWait, PortalWaitCause};
+    use carrick_sched_core::object_wait::{
+        ObjectWaitError, OperationToken, OwnedObjectWakeEffects,
+    };
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+    use carrick_sched_core::{AffinitySource, ThreadIdentity};
+
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(
+        NonZeroU64::new(1).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(zone)
+    .unwrap();
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let entry = zone
+        .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+        .unwrap();
+    let source = entry.notifications(handle.incarnation()).unwrap();
+    let revision = source.observe(SpaceWaitCause::Reservations).revision();
+    let lock = region
+        .table()
+        .root_lock_census(entry.index().index())
+        .unwrap();
+    assert_eq!(lock.mm, mm.raw());
+    assert_eq!(lock.holder, None, "witness requires an already-free root");
+    let receipt =
+        unsafe { PortalOwnerWait::from_owner(handle, PortalWaitCause::Reservations, revision) };
+    let slots = region.portal_slots();
+    assert!(slots.bind_carrier(handle.carrier()));
+    let enrollment = slots.authenticate_wait(zone, receipt).unwrap();
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            tid: 101,
+            serial: 1001,
+            mm: mm.raw(),
+            file_table: 1,
+            generation: 1,
+            affinity_source: AffinitySource::UNBOUND,
+            affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    let operation = OperationToken::new(701, 11).unwrap();
+    let complete = |owned: OwnedObjectWakeEffects<'_, carrick_el1_abi::Aarch64ParkedContext>| {
+        let _ = owned.defer_handbacks();
+    };
+    let (error, operation) = enrollment
+        .park_host_rechecked(record, operation, &complete, || {
+            region
+                .table()
+                .root_has_release_producer(entry.index().index(), mm)
+        })
+        .expect_err("a free reservation root has no future release producer");
+    assert_eq!(error, ObjectWaitError::Changed);
+    assert_eq!(operation.index(), 701);
+    assert!(!zone.record(record).has_object_operation());
+    zone.free_record(record);
 }
 
 #[test]

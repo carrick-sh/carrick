@@ -743,6 +743,23 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         })
     }
 
+    /// Whether the exact live root currently has a holder that owes a release.
+    ///
+    /// A waiter calls this only after linking its operation to the matching
+    /// Reservations queue. Root unlock precedes revision publication, and the
+    /// queue rechecks that revision after this predicate, closing both sides of
+    /// the release race. A free notification-marked root has no producer.
+    pub fn root_has_release_producer(&self, index: usize, mm: ReservationMm) -> bool {
+        if self.layout_hash.load(Ordering::Acquire) != Self::LAYOUT_HASH {
+            return false;
+        }
+        let Some(root) = self.roots.get(index) else {
+            return false;
+        };
+        root.key.load(Ordering::Acquire) == mm.raw()
+            && root.locked.load(Ordering::Acquire) & !ROOT_NOTIFICATION_REQUIRED != 0
+    }
+
     /// Snapshot one live root's lock state without acquiring it. Values are
     /// diagnostic and may change immediately after they are read.
     pub fn root_lock_census(&self, index: usize) -> Option<RootLockCensus> {

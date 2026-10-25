@@ -37,6 +37,74 @@ pub(super) enum OwnerMemoryAction {
     Retained,
 }
 
+/// A Reservations receipt names the root-release stream, but selection can
+/// outlive the holder that justified sampling it. Only a currently held root
+/// has a future release producer. Region identity is checked before consulting
+/// the root so another carrier's global view cannot authorize this park.
+fn reservation_root_is_held(zone: &ZoneTables, mm: carrick_el1_abi::ReservationMm) -> bool {
+    let Some(roots) = carrick_el1::memory::reservations::shared_host() else {
+        return false;
+    };
+    reservation_root_is_held_in(roots, zone, mm)
+}
+
+fn reservation_root_is_held_in(
+    roots: &carrick_el1::memory::reservations::SharedReservations,
+    zone: &ZoneTables,
+    mm: carrick_el1_abi::ReservationMm,
+) -> bool {
+    let roots_region =
+        (roots as *const _ as usize).checked_sub(carrick_el1_abi::EL1_RESERVATIONS_OFFSET as usize);
+    let zone_region =
+        (zone as *const _ as usize).checked_sub(carrick_el1_abi::EL1_ZONE_OFFSET as usize);
+    if roots_region.is_none() || roots_region != zone_region {
+        return false;
+    }
+    let Some(index) = zone.spaces.find(mm.raw()) else {
+        return false;
+    };
+    roots.root_has_release_producer(index.index(), mm)
+}
+
+#[cfg(test)]
+mod reservation_root_wait_tests {
+    use super::reservation_root_is_held_in;
+    use carrick_el1_linux::mm_portal::test_support::{ROOT, Region, admit_notified};
+
+    #[test]
+    fn a_free_exact_root_has_no_release_producer() {
+        let region = Region::new();
+        let mm = admit_notified(&region, 77, ROOT, 1, 0);
+        assert!(!reservation_root_is_held_in(
+            region.table(),
+            region.zone(),
+            mm
+        ));
+        let index = region.zone().spaces.find(mm.raw()).unwrap();
+        let access = carrick_el1::substrate::sched::object_wait::space_access(
+            region.zone(),
+            carrick_sched_core::SlotId::new(0),
+        );
+        let venue = carrick_el1::memory::reservations::RootReleaseVenue::new(
+            region.table(),
+            access.venue().unwrap(),
+        )
+        .unwrap();
+        let _held = venue
+            .lock(
+                index.index(),
+                mm,
+                &carrick_el1::memory::reservations::NoRootWait,
+            )
+            .unwrap();
+        assert!(reservation_root_is_held_in(
+            region.table(),
+            region.zone(),
+            mm
+        ));
+    }
+}
+
 enum ZoneWaitPolicy {
     Ordinary(Option<std::time::Duration>),
     KillableOwnerMemory,
@@ -745,6 +813,7 @@ where
         wait: carrick_el1_abi::PortalOwnerWait,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
+        let wait_mm = wait.handle().mm();
         let Some((zone, mm)) = zone_for(self.state.zone_mm) else {
             return Err(RuntimeError::Configuration(
                 "owner memory wait has no exact carrier zone".to_owned(),
@@ -819,7 +888,11 @@ where
         >| {
             carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects)
         };
-        match enrollment.park_host(record, token, &complete) {
+        let cause = enrollment.cause();
+        match enrollment.park_host_rechecked(record, token, &complete, || {
+            cause != carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations
+                || reservation_root_is_held(zone, wait_mm)
+        }) {
             Ok(()) => {
                 zone.counters
                     .host_parks
