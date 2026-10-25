@@ -30,6 +30,84 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
     type Mm = AddressContext<RootGpa>;
     type PreparedMm = AddressContext<RootGpa>;
     type Born = AddressContext<RootGpa>;
+    fn adopt_exec_successor(
+        &self,
+        identity: carrick_core_abi::service::ServiceIdentity,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+        manifest: &carrick_core_abi::service::ExecSuccessorManifest,
+    ) -> Result<NativeExecSuccessor<Self::Mm, C>, NativeProcessError> {
+        let sealed = manifest
+            .open(identity, receipt)
+            .ok_or(NativeProcessError::Stale)?;
+        let address = AddressContext {
+            root: sealed.root,
+            mm: MmGeneration::new(NonZeroU64::new(sealed.successor_mm.raw()).unwrap()),
+            generation: ContextGeneration::new(sealed.root_generation),
+        };
+        let ttbr = (u64::from(sealed.asid.raw()) << 48) | sealed.root.address().raw();
+        self.zone
+            .spaces
+            .publish_closed(sealed.successor_mm.raw(), ttbr, ttbr)
+            .ok_or(NativeProcessError::Stale)?;
+        let words = <C as zerocopy::FromZeros>::new_zeroed().fork_child(address);
+        Ok(NativeExecSuccessor {
+            mm: address,
+            address,
+            words: Box::new(words),
+        })
+    }
+    fn finish_exec_successor(
+        &self,
+        predecessor: AddressContext<RootGpa>,
+        successor: AddressContext<RootGpa>,
+    ) -> Result<(), NativeProcessError> {
+        let old = self
+            .zone
+            .spaces
+            .find(predecessor.mm.raw().get())
+            .ok_or(NativeProcessError::Stale)?;
+        let new = self
+            .zone
+            .spaces
+            .find(successor.mm.raw().get())
+            .ok_or(NativeProcessError::Stale)?;
+        let slot = (0..carrick_sched_core::ZONE_SLOTS)
+            .filter_map(SlotId::from_index)
+            .find(|slot| self.zone.installed_space(*slot) == predecessor.mm.raw().get())
+            .ok_or(NativeProcessError::Stale)?;
+        self.zone.spaces.close(old);
+        self.zone.release_space(slot);
+        self.zone.spaces.free(old);
+        self.zone.spaces.open(new);
+        self.zone
+            .install_space(slot, successor.mm.raw().get())
+            .ok_or(NativeProcessError::Stale)?;
+        Ok(())
+    }
+    fn exec_fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
+        static MAP: std::sync::OnceLock<&'static [carrick_el1_abi::FdMapSlot]> =
+            std::sync::OnceLock::new();
+        MAP.get_or_init(|| {
+            Box::leak(
+                (0..carrick_el1_abi::FD_MAP_CAPACITY)
+                    .map(|_| carrick_el1_abi::FdMapSlot::default())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        })
+    }
+    fn exec_open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
+        static TABLE: std::sync::OnceLock<&'static [carrick_el1_abi::DelegatedOpenFile]> =
+            std::sync::OnceLock::new();
+        TABLE.get_or_init(|| {
+            Box::leak(
+                (0..16)
+                    .map(|_| carrick_el1_abi::DelegatedOpenFile::new())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        })
+    }
     fn service_mm_handle(
         &self,
         mm: &Self::Mm,
@@ -1208,4 +1286,149 @@ impl NativeServiceCapacityFixture {
             ));
         }
     }
+}
+
+#[test]
+fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
+    use carrick_core_abi::service::{
+        ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
+        ServiceCell,
+    };
+    use carrick_guest_arch::{Asid, UserVa};
+    use carrick_sched_core::object_wait::ObjectWaitKey;
+    use core::num::NonZeroU16;
+
+    let fixture = NativeSignalFixture::new(
+        ExecutionBinding {
+            task: carrick_core_abi::EntryTaskKey::from_raw(41),
+            generation: carrick_core_abi::SnapshotGeneration::from_raw(11),
+            mm: carrick_core_abi::EntryMmKey::from_raw(1),
+            thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(101),
+        },
+        carrick_core_abi::EntryTaskKey::from_raw(41),
+        carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(11).unwrap()),
+    );
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let graph = fixture.runtime.graph.lock();
+        let page = graph
+            .owner
+            .task(graph.root_key)
+            .unwrap()
+            .native()
+            .resources()
+            .page;
+        assert!(
+            page.gate().serves_ring(),
+            "exec fixture gate: {:?}",
+            page.gate()
+        );
+        assert!(!graph.has_member_wait(&fixture.record));
+    }
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let result = entry.begin_exec_service(Box::from(&b"/bin/static\0\0\0"[..]));
+        match result {
+            Ok(NativeResume::Left(None)) => {}
+            Ok(_) => panic!("exec intake returned the wrong continuation"),
+            Err(error) => panic!("exec intake failed: {error:?}"),
+        }
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+
+    let selector = fixture.task.service_notice.take().unwrap().unwrap();
+    let key = ObjectWaitKey::native_service(selector.record).unwrap();
+    let queue = fixture
+        .zone
+        .object_wait(key, &carrick_sched_core::ShortLockSpin)
+        .unwrap();
+    let member = queue.native_service_member(selector.record).unwrap();
+    // SAFETY: this test owns the announced exact service member and consumes
+    // its ticket once before releasing the queue.
+    let ticket = unsafe {
+        ServiceCell::claim_notice(&fixture.control.service, selector, NonZeroU64::MIN, member)
+    }
+    .unwrap();
+    let request = ticket.request();
+    let manifest_address = ticket.reply_address().unwrap();
+    // SAFETY: the ring retains this aligned reply record until acknowledgment.
+    let manifest = unsafe { &mut *(manifest_address.raw() as *mut ExecSuccessorManifest) };
+    let successor_mm = manifest.proposal(request.identity).unwrap();
+    let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(47).unwrap()).unwrap();
+    *manifest = manifest
+        .seal(
+            request.identity,
+            receipt,
+            ExecSuccessorBacking {
+                root: RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap(),
+                root_generation: NonZeroU64::new(53).unwrap(),
+                asid: Asid::from_registry_allocation(NonZeroU16::new(59).unwrap()),
+                asid_generation: NonZeroU64::new(61).unwrap(),
+            },
+            ExecSuccessorEntry {
+                entry: UserVa::new(0x40_0000),
+                stack_pointer: UserVa::new(0x7fff_f000),
+            },
+        )
+        .unwrap();
+    assert!(
+        ticket
+            .publish_exec_prepared(receipt, (), |_, ()| {})
+            .is_ok()
+    );
+    let mut effects = WakeEffects::default();
+    queue.notify_object(fixture.slot, &mut effects).unwrap();
+    drop(queue);
+    service.wake_effects(effects);
+
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    // SAFETY: `switch_in_full` handed this exact selected record to the test
+    // lane, which retains it until the entry below consumes the continuation.
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(),
+        Ok(NativeResume::NoPending)
+    ));
+    assert_eq!(
+        entry.calling_tid(),
+        41,
+        "successor's first syscall keeps leader tid"
+    );
+    assert_eq!(
+        fixture.task.mm.key.load(Ordering::Acquire),
+        successor_mm.raw()
+    );
+    assert_eq!(
+        fixture.zone.installed_space(fixture.slot),
+        successor_mm.raw()
+    );
+    assert!(fixture.zone.spaces.find(1).is_none());
 }
