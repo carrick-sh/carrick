@@ -48,7 +48,10 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
       - name: Build lean xtask
         run: just ci-prebuild-xtask
       - uses: actions/upload-artifact@v4
@@ -56,6 +59,7 @@ jobs:
           name: xtask-linux-x64
           path: target/debug/carrick-xtask
           retention-days: 1
+          overwrite: true
 
   # Trusted default-branch publishers only; PR and queue jobs never save.
   cache-warm:
@@ -66,12 +70,18 @@ jobs:
         include:
           - family: linux-x64
             runner: ubuntu-latest
+            cache-size: 1G
           - family: darwin-hosted
             runner: macos-15
+            cache-size: 1G
           - family: linux-arm64
             runner: ubuntu-24.04-arm
+            cache-size: 512M
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    env:
+      # Reserve quota for the two retained target caches and package/sysroot caches.
+      SCCACHE_CACHE_SIZE: ${{ matrix.cache-size }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -87,7 +97,10 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ matrix.family }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-${{ matrix.family }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-${{ matrix.family }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-${{ matrix.family }}-
       - name: Identify runner image for warm cross toolchains
         id: warm-runner-image
         if: matrix.family == 'linux-x64'
@@ -126,16 +139,16 @@ jobs:
           just ci-prebuild-xtask
           case "$FAMILY" in
             darwin-hosted)
-              just check
               just build
               just doc
+              # Debug PR checks/tests run last to survive bounded-cache eviction.
+              just check
               just clippy
               just xtask test-batch --no-run test
               just xtask test-batch --no-run test-integration
               just test-xtask --no-run
               ;;
             linux-x64)
-              just check
               just check-kernel-portable
               just ci-freebsd-sysroot
               just ci-netbsd-sysroot
@@ -144,8 +157,11 @@ jobs:
               just check-netbsd
               just cross-check-macos
               just check-fuzz
-              just clippy-linux
               just doc
+              # Cross/release/doc entries yield to the debug PR-critical set.
+              just check
+              just clippy
+              just clippy-linux
               just xtask test-batch --no-run test
               just xtask test-batch --no-run test-integration
               just test-xtask --no-run
@@ -164,7 +180,7 @@ jobs:
         uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ matrix.family }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-${{ matrix.family }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
 
   changes:
     name: changes
@@ -201,10 +217,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
@@ -301,13 +320,6 @@ jobs:
         run: |
           chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
           echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        if: github.event_name == 'pull_request'
-        with:
-          shared-key: gate-xtask-release
-          cache-workspace-crates: "true"
-          cache-targets: false
-          save-if: false
       - name: Enforce Co-Authored-By trailers
         if: github.event_name == 'pull_request'
         env:
@@ -339,13 +351,16 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: true
-          save-if: false
+          save-if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -419,10 +434,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
@@ -472,10 +490,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
@@ -563,10 +584,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
@@ -613,10 +637,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           workspaces: |
@@ -674,13 +701,16 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-darwin-hosted-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: true
-          save-if: false
+          save-if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -718,10 +748,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-darwin-hosted-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
@@ -764,10 +797,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-darwin-hosted-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
@@ -805,10 +841,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-darwin-hosted-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
@@ -846,10 +885,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-darwin-hosted-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
@@ -887,10 +929,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
@@ -967,10 +1012,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-linux-arm64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-linux-arm64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-arm64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-arm64-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
@@ -1013,10 +1061,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
@@ -1123,10 +1174,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false
@@ -1224,10 +1278,13 @@ jobs:
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            sccache-linux-x64-
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: ${{ github.job }}-debug
+          shared-key: ${{ github.job }}-debug-v2
           cache-workspace-crates: "true"
           cache-targets: false
           save-if: false

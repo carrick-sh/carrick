@@ -618,10 +618,11 @@ a signed gate, nine hours of merge queue and a red `main` (#753).
   Workflow: [`.agents/skills/carrick-stacked-prs`](.agents/skills/carrick-stacked-prs/SKILL.md).
 - **Lanes:** hosted Linux/macOS jobs in `ci.yml`. Heavy pull requests run the
   full macOS suite; same-repo PRs run it on the self-hosted `carrick-macos-ci`
-  runners (a non-admin `ci` user on carrick-m4), forks on hosted `macos-15`.
+  runners (a non-admin `ci` user on carrick-m4; #650), forks on hosted
+  `macos-15`.
   Merge groups run only `macos-build` and `macos-clippy` as a skew check;
   the nightly schedule reruns the full suite on hosted macOS. Since 137a177a22
-  (2026-10-11), `ci.yml` has no push trigger (#650). `kernel-runtime.yml` adds
+  (2026-10-11), `ci.yml` has no push trigger. `kernel-runtime.yml` adds
   the self-hosted HVF lane (cloudmac, push to main and owner dispatch) and the
   KVM lane
   (self-hosted JIT clones on the Contabo host, `docs/ci/contabo-kvm.md`). The
