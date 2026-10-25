@@ -433,45 +433,6 @@ enum RetainedMemoryWaitAttempt {
     Retry { action: RetainedMemoryAction },
 }
 
-struct OwnerRedriveProgress {
-    consecutive_stalled_passes: usize,
-    committed_bytes: u64,
-}
-
-// Keep the construction explicit: the authority-dialect gate rejects a
-// derived constructor for progress state in this ownership boundary.
-#[allow(clippy::derivable_impls)]
-impl Default for OwnerRedriveProgress {
-    fn default() -> Self {
-        Self {
-            consecutive_stalled_passes: 0,
-            committed_bytes: 0,
-        }
-    }
-}
-
-impl OwnerRedriveProgress {
-    fn observe(&mut self, committed: u64) -> bool {
-        if committed != 0 {
-            self.committed_bytes = self.committed_bytes.saturating_add(committed);
-            self.consecutive_stalled_passes = 0;
-            return true;
-        }
-        self.consecutive_stalled_passes = self.consecutive_stalled_passes.saturating_add(1);
-        self.consecutive_stalled_passes <= OWNER_REDRIVE_MAX_STALLED_PASSES
-    }
-
-    #[cfg(test)]
-    fn committed_bytes(&self) -> u64 {
-        self.committed_bytes
-    }
-
-    #[cfg(test)]
-    fn consecutive_stalled_passes(&self) -> usize {
-        self.consecutive_stalled_passes
-    }
-}
-
 enum OwnerResumeWork {
     Syscall {
         frame: carrick_hal::RawSyscall,
@@ -486,28 +447,10 @@ enum OwnerResumeWork {
     },
 }
 
-impl OwnerResumeWork {
-    /// `None` is a terminal/ordinary dispatch result, which is allowed to
-    /// leave the redrive loop without consuming another no-progress pass.
-    fn redrive_committed_progress(&self) -> Option<u64> {
-        match self {
-            Self::Syscall { outcome, .. } => match outcome {
-                DispatchOutcome::OwnerMemoryWait { committed, .. }
-                | DispatchOutcome::OwnerPhysicalWait { committed, .. }
-                | DispatchOutcome::OwnerMemorySupply { committed, .. } => Some(*committed),
-                _ => None,
-            },
-            Self::RetainedWait { .. } | Self::RetainedAction(_) => None,
-        }
-    }
-}
-
 enum OwnerResumeStep {
     Exit(executor::ExecutorExit),
     Continue(OwnerResumeWork),
 }
-
-const OWNER_REDRIVE_MAX_STALLED_PASSES: usize = 4096;
 
 impl RetainedMemoryAction {
     fn is_drain_owner(&self) -> bool {
@@ -3706,25 +3649,7 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         mut work: OwnerResumeWork,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        let mut progress = OwnerRedriveProgress::default();
         loop {
-            if let Some(committed) = work.redrive_committed_progress()
-                && !progress.observe(committed)
-            {
-                debug_assert!(
-                    progress.consecutive_stalled_passes <= OWNER_REDRIVE_MAX_STALLED_PASSES,
-                    "typed owner waits must park or terminate before the no-progress bound"
-                );
-                let OwnerResumeWork::Syscall { frame, .. } = work else {
-                    unreachable!("only syscall owner work participates in the progress bound")
-                };
-                return self.service_outcome(
-                    engine,
-                    control,
-                    frame,
-                    DispatchOutcome::errno(carrick_abi::LINUX_EFAULT),
-                );
-            }
             let step = match work {
                 OwnerResumeWork::Syscall {
                     frame,
@@ -7497,27 +7422,6 @@ mod tests {
     use carrick_guest_mem::GuestMemory;
     use std::num::NonZeroU64;
     use std::time::{Duration, Instant};
-
-    #[test]
-    fn owner_redrive_progress_allows_a_large_page_windowed_host_copy() {
-        const PAGE_BYTES: u64 = 4096;
-        const COPY_BYTES: u64 = 16 * 1024 * 1024 + PAGE_BYTES;
-        let mut progress = OwnerRedriveProgress::default();
-
-        for _ in 0..COPY_BYTES / PAGE_BYTES {
-            assert!(
-                progress.observe(PAGE_BYTES),
-                "each committed host-copy page resets the stall bound"
-            );
-            assert!(
-                progress.observe(0),
-                "one supply redrive after progress remains bounded"
-            );
-        }
-
-        assert_eq!(progress.committed_bytes(), COPY_BYTES);
-        assert_eq!(progress.consecutive_stalled_passes(), 1);
-    }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]

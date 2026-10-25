@@ -221,7 +221,6 @@ struct Stage1AuthorityInner {
     /// Monotonic host-edit generation. A transfer may use one changed host
     /// image to request one fresh EL1 SELECT, but cannot spin by treating the
     /// same image as new progress on every SELECT.
-    host_edit_revision: u64,
     /// The guest lane was admitted for this MM before its live backing was
     /// bound; `bind_live_backing` completes the selection.
     guest_lane_pending: bool,
@@ -391,7 +390,6 @@ impl Stage1Authority {
                 image_pool,
                 live_owner: LiveDescriptorOwner::Host,
                 txn_generation: 0,
-                host_edit_revision: 0,
                 guest_lane_pending: false,
             })),
         }
@@ -625,11 +623,6 @@ impl Stage1Authority {
 
     /// Exact authority identity and monotonic host-edit revision used to
     /// bound stale-selection revalidation to one SELECT per changed image.
-    pub fn host_edit_observation(&self) -> (u64, u64) {
-        let inner = self.inner.lock();
-        (self.authority_id(), inner.host_edit_revision)
-    }
-
     /// Build one guest descriptor transaction for `mm_key` on the guest-owned
     /// lane: a fresh nonzero generation for this authority, the live root,
     /// and exactly the primary-arena table grants the operation needs. No
@@ -1391,10 +1384,6 @@ impl Stage1Authority {
                 };
                 f(&mut editor)?
             };
-            // This is a change detector, not a durable identity. A stale
-            // observation can compare equal after wrap only if one host copy
-            // overlaps 2^64 completed, lock-serialized edits of this MM.
-            inner.host_edit_revision = inner.host_edit_revision.wrapping_add(1);
             Ok(result)
         }
     }

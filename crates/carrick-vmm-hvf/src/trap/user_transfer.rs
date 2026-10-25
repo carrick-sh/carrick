@@ -16,96 +16,9 @@ pub struct UserTransferCustody {
     custody: Arc<CarrierVmCustody>,
     transport: Option<Arc<CarrierForeignMmTransport>>,
     metadata: Option<crate::metadata_grant::CarrierMetadataAccess>,
-    stage1_reselects: Arc<parking_lot::Mutex<std::collections::BTreeMap<u64, (u64, u64)>>>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Stage1SelectionState {
-    Current,
-    Changed { authority: u64, revision: u64 },
-    Unknown,
-}
-
-struct ImmediateStage1Reselect;
-
-impl std::fmt::Debug for ImmediateStage1Reselect {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ImmediateStage1Reselect")
-    }
-}
-
-impl carrick_guest_mem::PhysicalMemoryWait for ImmediateStage1Reselect {
-    fn is_ready(&self) -> bool {
-        true
-    }
-
-    fn enroll(
-        &self,
-        _wake: Arc<dyn Fn() + Send + Sync>,
-    ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
-        (Box::new(()), true)
-    }
 }
 
 impl UserTransferCustody {
-    /// Re-read the authoritative host stage-1 image before treating an absent
-    /// physical record as an invariant failure. Host COW, exec and teardown
-    /// edits do not all pass through the guest Editor word; a changed leaf is
-    /// therefore immediate reselection evidence, never evidence against the
-    /// MM. `None` means this pre-admission/physical-only caller has no MM to
-    /// authenticate and retains the existing physical-only contract.
-    fn stage1_selection_changed(
-        &self,
-        target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
-        selected: PortalSelectedData,
-    ) -> Stage1SelectionState {
-        let Some((target, va)) = target else {
-            return Stage1SelectionState::Unknown;
-        };
-        let state = match self.custody.guest_cow_state(target.handle().mm().raw()) {
-            Ok(Some(state)) => state,
-            Ok(None) | Err(()) => return Stage1SelectionState::Unknown,
-        };
-        let tables = state.page_tables_authority();
-        let observation = tables.host_edit_observation();
-        tables
-            .with_manager(|manager| {
-                if manager.translate(va) == Some(selected.ipa) {
-                    Stage1SelectionState::Current
-                } else {
-                    Stage1SelectionState::Changed {
-                        authority: observation.0,
-                        revision: observation.1,
-                    }
-                }
-            })
-            .unwrap_or(Stage1SelectionState::Unknown)
-    }
-
-    fn changed_stage1_retention(
-        &self,
-        target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
-        selected: PortalSelectedData,
-        retry: Option<carrick_el1_abi::PortalOwnerWait>,
-    ) -> Option<TransferRetention<RetainedUserData>> {
-        let Stage1SelectionState::Changed {
-            authority,
-            revision,
-        } = self.stage1_selection_changed(target, selected)
-        else {
-            return None;
-        };
-        let mm = target?.0.handle().mm().raw();
-        let mut observations = self.stage1_reselects.lock();
-        if observations.get(&mm).copied() != Some((authority, revision)) {
-            observations.insert(mm, (authority, revision));
-            return Some(TransferRetention::Physical(
-                carrick_guest_mem::OwnedMemoryWait::new(Arc::new(ImmediateStage1Reselect)),
-            ));
-        }
-        retry.map(TransferRetention::Editor)
-    }
-
     /// Retain an exact external physical source for pre-admission copying.
     /// This never transfers its source frame or directory into the target.
     pub fn retain_import_source(
@@ -185,7 +98,6 @@ impl UserTransferCustody {
             custody: Arc::clone(&transport.custody),
             transport: Some(transport),
             metadata: carrier.and_then(crate::metadata_grant::CarrierMetadataAccess::new),
-            stage1_reselects: Arc::default(),
         }
     }
     #[cfg(test)]
@@ -194,7 +106,6 @@ impl UserTransferCustody {
             custody,
             transport: None,
             metadata: None,
-            stage1_reselects: Arc::default(),
         }
     }
 }
@@ -510,7 +421,7 @@ impl UserTransferCustody {
 
     fn retain_exact_for(
         &self,
-        target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
+        _target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
         selected: PortalSelectedData,
         len: usize,
         intent: PortalTransferIntent,
@@ -520,9 +431,6 @@ impl UserTransferCustody {
             || TrapError::Hypervisor("UserTransfer physical custody invariant refused".to_owned());
         if len == 0 || len > 4096 || selected.ipa.checked_add(len as u64).is_none() {
             return Err(error());
-        }
-        if let Some(retention) = self.changed_stage1_retention(target, selected, retry) {
-            return Ok(retention);
         }
         // A known physical extent overrun is permanent refusal, even if its
         // owner is concurrently retiring. Check it before selecting a wait.
@@ -605,16 +513,10 @@ impl UserTransferCustody {
                         self.custody.stage2_publication_wait(selected.ipa),
                     ));
                 }
-                if let Some(retention) = self.changed_stage1_retention(target, selected, retry) {
-                    return Ok(retention);
-                }
                 return retry.map(TransferRetention::Editor).ok_or_else(error);
             }
             Err(CarrierStage2PinError::RetirementRequested) => {
                 carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 5);
-                if let Some(retention) = self.changed_stage1_retention(target, selected, retry) {
-                    return Ok(retention);
-                }
                 return retry.map(TransferRetention::Editor).ok_or_else(error);
             }
             Err(reason) => {
@@ -704,10 +606,9 @@ impl UserTransferCustody {
 #[cfg(test)]
 pub(super) mod tests {
     use super::super::{
-        CarrierStage2RetireOutcome, CowArmedRanges, GlobalFrameHostOwner, GlobalFrameOwnerEntry,
-        GlobalFrameStage2Lease, HvpatchFrameInventory, MemoryProtections, MmAccessState,
-        SparseExtentBacking, Stage1UnpublicationReceipt, register_global_frame_host_owner_in,
-        register_pooled_global_frame_host_owner_in,
+        CarrierStage2RetireOutcome, GlobalFrameHostOwner, GlobalFrameOwnerEntry,
+        GlobalFrameStage2Lease, SparseExtentBacking, Stage1UnpublicationReceipt,
+        register_global_frame_host_owner_in, register_pooled_global_frame_host_owner_in,
     };
     use super::*;
     use carrick_el1_abi::{PortalByteRange, PortalOperation, PortalTransferSlot, ReservationMm};
@@ -755,160 +656,6 @@ pub(super) mod tests {
             root_generation: NonZeroU64::new(1).unwrap(),
             offset: 0,
         }
-    }
-
-    #[test]
-    fn host_stage1_unmap_allows_one_reselect_per_host_edit_revision() {
-        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
-        let mm = NonZeroU64::new(0x847).unwrap();
-        let va = 0x4800_0000;
-        let ipa = 0xa085_31a0_0000;
-        let owner = backing(&custody, ipa);
-        let tables = carrick_aarch64::Stage1Authority::new();
-        let mut manager = carrick_mmu_core::aarch64::PageTableManager::new(
-            carrick_mem::memory::stage1_hvpatch_page_tables(),
-            crate::memory::LINUX_PAGE_TABLES_BASE,
-            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
-        );
-        manager
-            .map_aliased(
-                va,
-                ipa,
-                4096,
-                carrick_mmu_core::aarch64::UserLeafAccess {
-                    writable: true,
-                    executable: false,
-                },
-                None,
-            )
-            .unwrap();
-        tables.set_manager(manager);
-        let state = MmAccessState::new_unbound(
-            tables.clone(),
-            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
-                MemoryProtections::default(),
-            )),
-            Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
-            Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
-            Arc::new(parking_lot::Mutex::new(Vec::new())),
-            crate::hvf_aarch64_engine::HostCowStats::default(),
-        );
-        custody.register_guest_cow_state(mm.get(), &state);
-        let (_, receipt) = tables
-            .edit_unpublishing(
-                crate::trap::test_stage1_edit_license(),
-                || unreachable!("installed manager"),
-                va,
-                4096,
-                |editor| editor.invalidate(va, 4096).map(|_| ()),
-            )
-            .unwrap();
-        let receipt = receipt.expect("host edit unpublished the selected leaf");
-        let proof = custody
-            .stage1_unpublished_from_receipt(
-                owner.record_identity,
-                Stage1UnpublicationReceipt::EditorRange(&receipt),
-            )
-            .expect("editor receipt covers retired owner");
-        assert!(
-            crate::trap::global_frame::retire_global_frame_host_owner_if_generation_in_using(
-                &custody,
-                proof,
-                ipa,
-                16384,
-                owner.generation(),
-                &mut |_, _| Ok(()),
-            )
-            .is_retired(),
-            "the production retirement must follow the host-side stage-1 edit"
-        );
-
-        let handle = unsafe {
-            carrick_el1_abi::El1MmHandle::from_admitted_owner(
-                custody.transfer_carrier,
-                ReservationMm::new(mm.get()).unwrap(),
-                NonZeroU64::new(1).unwrap(),
-            )
-        };
-        let retry = unsafe {
-            carrick_el1_abi::PortalOwnerWait::from_owner(
-                handle,
-                carrick_el1_abi::PortalWaitCause::Editor,
-                17,
-            )
-        };
-        let physical = UserTransferCustody::new(custody);
-        let retain = || {
-            physical
-                .retain_exact_for(
-                    Some((
-                        carrick_aarch64::user_transfer::TransferTarget::from_handle(handle, 0x4000),
-                        va,
-                    )),
-                    selection(ipa),
-                    4,
-                    PortalTransferIntent::UserRead,
-                    Some(retry),
-                )
-                .unwrap()
-        };
-        let TransferRetention::Physical(first) = retain() else {
-            panic!("the changed host image must authorize one fresh selection")
-        };
-        assert!(first.0.is_ready(), "the single reselect is immediate");
-        let TransferRetention::Editor(wait) = retain() else {
-            panic!("the same host edit must not authorize an unbounded reselect")
-        };
-        assert_eq!(
-            wait, retry,
-            "the second refusal reaches the typed invariant"
-        );
-
-        tables
-            .edit(
-                crate::trap::test_stage1_edit_license(),
-                || unreachable!("installed manager"),
-                |editor| {
-                    editor
-                        .map_aliased(
-                            va + 0x1000,
-                            ipa + 0x1000,
-                            4096,
-                            carrick_mmu_core::aarch64::UserLeafAccess::READ_WRITE,
-                        )
-                        .map(|_| ())
-                },
-            )
-            .unwrap();
-        let TransferRetention::Physical(next_revision) = retain() else {
-            panic!("a later host edit gets one new bounded reselect")
-        };
-        assert!(next_revision.0.is_ready());
-    }
-
-    #[test]
-    fn absent_host_stage1_view_is_unknown_not_ready_reselect() {
-        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
-        let handle = unsafe {
-            carrick_el1_abi::El1MmHandle::from_admitted_owner(
-                custody.transfer_carrier,
-                ReservationMm::new(0x848).unwrap(),
-                NonZeroU64::new(1).unwrap(),
-            )
-        };
-        let physical = UserTransferCustody::new(custody);
-        assert_eq!(
-            physical.stage1_selection_changed(
-                Some((
-                    carrick_aarch64::user_transfer::TransferTarget::from_handle(handle, 0x4000),
-                    0x4800_0000,
-                )),
-                selection(0xa085_31a0_0000),
-            ),
-            Stage1SelectionState::Unknown,
-            "a missing host mirror has no authority to create an always-ready reselect"
-        );
     }
 
     #[test]
