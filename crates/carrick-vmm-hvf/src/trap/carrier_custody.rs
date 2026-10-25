@@ -397,6 +397,14 @@ impl CarrierVmCustodyState {
     }
 }
 
+/// One prepared image retained by its exact carrier-issued adoption receipt.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type RetainedNativeExecPreparation = (
+    carrick_core_abi::service::ExecAdoptionReceipt,
+    carrick_core_abi::service::ServiceIdentity,
+    Box<dyn crate::metadata_grant::NativeExecPreparation>,
+);
+
 /// Carrier-owned VM lifecycle authority.
 ///
 /// The state is intentionally neither static nor process-global. A failed
@@ -460,13 +468,7 @@ pub struct CarrierVmCustody {
             std::sync::Arc<dyn crate::metadata_grant::NativeExecHostService>,
         )>,
     >,
-    pub(crate) native_exec_preparations: parking_lot::Mutex<
-        Vec<(
-            carrick_core_abi::service::ExecAdoptionReceipt,
-            carrick_core_abi::service::ServiceIdentity,
-            Box<dyn crate::metadata_grant::NativeExecPreparation>,
-        )>,
-    >,
+    pub(crate) native_exec_preparations: parking_lot::Mutex<Vec<RetainedNativeExecPreparation>>,
     pub(crate) native_exec_receipt_sequence: std::sync::atomic::AtomicU64,
 }
 
@@ -523,20 +525,6 @@ impl CarrierVmCustody {
         self.native_exec_preparations
             .lock()
             .push((receipt, identity, prepared));
-    }
-
-    pub(crate) fn take_native_exec_preparation(
-        &self,
-        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
-        identity: carrick_core_abi::service::ServiceIdentity,
-    ) -> Option<Box<dyn crate::metadata_grant::NativeExecPreparation>> {
-        let mut preparations = self.native_exec_preparations.lock();
-        let index = preparations
-            .iter()
-            .position(|(stored_receipt, stored_identity, _)| {
-                *stored_receipt == receipt && *stored_identity == identity
-            })?;
-        Some(preparations.swap_remove(index).2)
     }
 }
 
