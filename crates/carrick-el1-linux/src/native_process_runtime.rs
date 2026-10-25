@@ -910,11 +910,12 @@ struct PendingSignalWait {
     deadline: Option<carrick_guest_arch::Deadline>,
 }
 // One member cannot suspend on a signal and on external service at once.
-// Keep both in the same owner table, with one out-of-line continuation
-// allocation per waiting member. Tree nodes only move small custody handles.
+// Keep both in the same owner table. Service custody has its own box inside the
+// out-of-line tree node so removal never moves its large retained record across
+// the EL1 completion frames; tree operations move only small custody handles.
 enum MemberWait<'a> {
     Signal(PendingSignalWait),
-    Service(service::PendingService<'a>),
+    Service(Box<service::PendingService<'a>>),
 }
 
 #[derive(Default)]
@@ -1097,19 +1098,22 @@ impl<'a, M: Clone, C: ProcessContext> Graph<'a, M, C> {
 
     fn service_wait(&self, record: &RecordRef) -> Option<&service::PendingService<'a>> {
         match self.pending.member(record)?.wait.as_ref()? {
-            MemberWait::Service(pending) => Some(pending),
+            MemberWait::Service(pending) => Some(pending.as_ref()),
             MemberWait::Signal(_) => None,
         }
     }
 
     fn service_wait_mut(&mut self, record: &RecordRef) -> Option<&mut service::PendingService<'a>> {
         match self.pending.member_mut(record)?.wait.as_mut()? {
-            MemberWait::Service(pending) => Some(pending),
+            MemberWait::Service(pending) => Some(pending.as_mut()),
             MemberWait::Signal(_) => None,
         }
     }
 
-    fn remove_service_wait(&mut self, record: &RecordRef) -> Option<service::PendingService<'a>> {
+    fn remove_service_wait(
+        &mut self,
+        record: &RecordRef,
+    ) -> Option<Box<service::PendingService<'a>>> {
         self.service_wait(record)?;
         match self.take_member_wait(record)? {
             MemberWait::Service(pending) => Some(pending),

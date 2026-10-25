@@ -28,6 +28,16 @@ fn immediate(operands: &str) -> Result<usize, String> {
     })
 }
 
+fn retained_chain_limit(name: &str, broad_limit: usize) -> usize {
+    if name == "native backing reply" {
+        // Slice 3b plus boxed exit custody established this compiled-clippy
+        // ceiling. Exec service growth must not spend that recovered headroom.
+        broad_limit.min(11_311)
+    } else {
+        broad_limit
+    }
+}
+
 impl Frames {
     pub(crate) fn parse(disassembly: &str) -> Result<Self, String> {
         let mut frames = BTreeMap::new();
@@ -452,10 +462,11 @@ impl Frames {
         let mut report = Vec::new();
         let mut failures = Vec::new();
         for (name, bytes) in chains {
+            let chain_limit = retained_chain_limit(name, limit);
             let line = format!(
-                "EL1 stack {name}: {bytes} / {limit} bytes (stack {stack_size}, vector included)"
+                "EL1 stack {name}: {bytes} / {chain_limit} bytes (stack {stack_size}, vector included)"
             );
-            if bytes > limit {
+            if bytes > chain_limit {
                 failures.push(line.clone());
             }
             report.push(line);
@@ -480,6 +491,12 @@ impl Frames {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_backing_reply_keeps_imported_headroom() {
+        assert_eq!(retained_chain_limit("native backing reply", 12_288), 11_311);
+        assert_eq!(retained_chain_limit("native wait copy", 12_288), 12_288);
+    }
 
     #[test]
     fn counts_long_probe_prologue_and_does_not_borrow_next_frame() {
