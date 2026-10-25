@@ -2973,12 +2973,14 @@ pub(crate) fn perform_foreign_cow_transaction(
     let page_table_result = carrick_hal::el1_editor_exclusion::with_held_exclusion(
         requested.mm.raw_for_probe(),
         |license| {
-            page_tables_authority.try_edit_until(
+            page_tables_authority.try_edit_unpublishing_until(
                 license.ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?,
                 deadline,
                 carrick_hal::ForeignMmTransportError::TimedOut,
                 carrick_hal::ForeignMmTransportError::AuthorityUnavailable,
                 || Err(carrick_hal::ForeignMmTransportError::AuthorityUnavailable),
+                span.va,
+                span.len,
                 |tables| {
                     rollback = Some(
                         HvfVmState::rollback_pre_image(&mut recycled, tables.manager)
@@ -3066,28 +3068,34 @@ pub(crate) fn perform_foreign_cow_transaction(
         requested.binding.asid,
         requested.binding.stage1_root,
     );
-    if let Err(error) = page_table_result {
-        if rollback.is_some() {
-            let restored = restore_stage1(&mut rollback, 8);
-            let recycled_manager =
-                lease
-                    .state
-                    .finish_foreign_cow_restore(restored, &mut rollback, 8);
-            *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
-            if invalidator
-                .invalidate_exact_asid(binding, deadline)
-                .is_err()
-            {
-                carrick_fatal!(
-                    "hvpatch::mm_authority",
-                    "stage-1 TLB invalidation failed during foreign COW page-table error rollback"
-                );
-            }
-        } else {
-            *lease.state.cow_rollback_scratch.lock() = recycled;
+    let stage1 = match page_table_result {
+        Ok(((), Some(stage1))) => stage1,
+        Ok(((), None)) => {
+            return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
         }
-        return Err(error);
-    }
+        Err(error) => {
+            if rollback.is_some() {
+                let restored = restore_stage1(&mut rollback, 8);
+                let recycled_manager =
+                    lease
+                        .state
+                        .finish_foreign_cow_restore(restored, &mut rollback, 8);
+                *lease.state.cow_rollback_scratch.lock() = recycled_manager.or(recycled);
+                if invalidator
+                    .invalidate_exact_asid(binding, deadline)
+                    .is_err()
+                {
+                    carrick_fatal!(
+                        "hvpatch::mm_authority",
+                        "stage-1 TLB invalidation failed during foreign COW page-table error rollback"
+                    );
+                }
+            } else {
+                *lease.state.cow_rollback_scratch.lock() = recycled;
+            }
+            return Err(error);
+        }
+    };
     if rollback.is_none() {
         carrick_fatal!(
             "hvpatch::mm_authority",
@@ -3273,6 +3281,7 @@ pub(crate) fn perform_foreign_cow_transaction(
             committed_mapping_ids,
             kernel_proof,
             authenticated_owner_generation,
+            stage1,
         },
     ))
 }
@@ -3485,6 +3494,14 @@ fn perform_foreign_guest_cow(
             "guest foreign COW receipt names another transaction"
         );
     }
+    let stage1 = tables
+        .verified_guest_cow_unpublication(&verified)
+        .unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::foreign_cow",
+                "verified guest foreign COW did not retire its exact old leaves"
+            )
+        });
     // The borrowed-TTBR0 window is closed: settle the target ASID admission
     // (resident) before the commit, so the target's retirement is not held.
     drop(publisher);
@@ -3587,6 +3604,7 @@ fn perform_foreign_guest_cow(
             committed_mapping_ids,
             kernel_proof,
             authenticated_owner_generation,
+            stage1,
         },
     ))
 }
@@ -3615,6 +3633,7 @@ struct ForeignCowPublished<'a> {
     committed_mapping_ids: Vec<carrick_hal::MappingId>,
     kernel_proof: carrick_hal::ForeignCowKernelProof,
     authenticated_owner_generation: carrick_hal::ForeignOwnerGeneration,
+    stage1: carrick_aarch64::stage1_authority::Stage1LeafRetired,
 }
 
 /// Commit the backend inventory split, retire the old stage-2 extent, publish
@@ -3645,29 +3664,22 @@ fn finish_foreign_cow_publication(
         committed_mapping_ids,
         kernel_proof,
         authenticated_owner_generation,
+        stage1,
     } = published;
     let host_resolved = owner_rollback.is_some();
-    let stage1 = crate::trap::frame_inventory::Stage1UnpublishedFrames::after_cow_split(
-        runtime.authority.as_ref(),
-        &split,
-    );
-    let retired_old_stage2 = stage1
-        .and_then(|stage1| {
-            let mut inventory = lease.state.frame_inventory.ledger.lock();
-            HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-                let Some(stage1) = stage1.as_ref() else {
-                    return Ok(false);
-                };
-                HvfVmState::retire_stage2_extent_from_mappings_in(
-                    &lease.custody,
-                    &mut TaskMappingIndex::new(),
-                    Stage1UnpublicationReceipt::FrameAbsence(stage1),
-                    split.old.stage2_base,
-                    split.old.stage2_length,
-                )?;
-                Ok(true)
-            })
+    let retired_old_stage2 = {
+        let mut inventory = lease.state.frame_inventory.ledger.lock();
+        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
+            HvfVmState::retire_stage2_extent_from_mappings_in(
+                &lease.custody,
+                &mut TaskMappingIndex::new(),
+                Stage1UnpublicationReceipt::EditorRange(&stage1),
+                split.old.stage2_base,
+                split.old.stage2_length,
+            )?;
+            Ok(true)
         })
+    }
         .unwrap_or_else(|error| {
             carrick_fatal!(
                 "hvpatch::frame_inventory",

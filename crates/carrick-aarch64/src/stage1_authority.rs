@@ -1169,6 +1169,52 @@ impl Stage1Authority {
         f(&mut editor)
     }
 
+    /// The bounded-lock counterpart of [`Self::edit_unpublishing`].
+    ///
+    /// The retirement plan is captured under the same authority lock as the
+    /// mutation, so a foreign-MM editor cannot replace it with a later table
+    /// sample after dropping its exclusion.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_edit_unpublishing_until<B, F, R, E>(
+        &self,
+        license: &impl Stage1EditLicense,
+        deadline: std::time::Instant,
+        on_timeout: E,
+        on_absent: E,
+        builder: B,
+        va: u64,
+        len: usize,
+        f: F,
+    ) -> Result<(R, Option<Stage1LeafRetired>), E>
+    where
+        B: FnOnce() -> Result<PageTableManager, E>,
+        F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
+    {
+        self.try_edit_until(
+            license,
+            deadline,
+            on_timeout,
+            on_absent,
+            builder,
+            |editor| {
+                let plan = editor.image_generation.and_then(|generation| {
+                    Stage1LeafRetirementPlan::capture(
+                        self.authority_id(),
+                        generation,
+                        va,
+                        len,
+                        |address| editor.translate(address),
+                    )
+                });
+                let result = f(editor)?;
+                Ok((
+                    result,
+                    plan.and_then(|plan| plan.finish(|address| editor.translate(address))),
+                ))
+            },
+        )
+    }
+
     /// Publish a bootstrap image into maintenance-accessible physical custody.
     /// The caller must still hold the task before its first execution. `switch`
     /// updates only its staged CPU roots and must leave them unchanged on error.

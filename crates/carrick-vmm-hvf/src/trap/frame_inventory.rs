@@ -285,23 +285,6 @@ impl Stage1UnpublishedFrames {
         self.extents.contains(&(ipa, len as u64))
     }
 
-    pub(crate) fn after_cow_split(
-        authority: &dyn carrick_hal::FrameCowAuthority,
-        split: &CowInventorySplit,
-    ) -> Result<Option<Self>, TrapError> {
-        let live = authority
-            .frame_mapping_count(split.old.frame)
-            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
-        if live != Some(0) {
-            return Ok(None);
-        }
-        Ok(Some(Self {
-            extents: [(split.old.stage2_base, split.old.stage2_length)]
-                .into_iter()
-                .collect(),
-        }))
-    }
-
     pub(crate) fn after_alias_retirement(
         authority: &dyn carrick_hal::FrameCowAuthority,
         retirement: &InventoryLeaseRetirement,
