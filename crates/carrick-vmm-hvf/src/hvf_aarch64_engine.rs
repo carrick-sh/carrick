@@ -2973,7 +2973,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         // The shared engine calls this only after checked stage-1 teardown and
         // TLBI succeed. A failed edit therefore retains this process-shared alias
         // owner; successful teardown removes the high-VA lookup (low VA no-op).
-        self.state.unregister_process_alias(stage1, va, len)
+        self.state.unregister_process_alias(
+            stage1.map(crate::trap::Stage1UnpublicationReceipt::EditorRange),
+            va,
+            len,
+        )
     }
 
     fn add_alias(

@@ -736,6 +736,7 @@ fn replacement(base: u64, generation: u64) -> super::PendingEl1GrantPublication 
             shared_key_offset: 0,
             owner_generation: generation,
         },
+        rollback: None,
     }
 }
 

@@ -296,7 +296,7 @@ fn is_exactly_el1_frame_grant(
 /// alias therefore stays unregistered until then: the registry holds exactly
 /// one owner per span, and retiring the predecessor by span must not take the
 /// replacement with it.
-#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct PendingEl1GrantPublication {
     /// The exact grant, as settlement names it to completion or rollback.
     pub(crate) grant: carrick_hal::threaded::El1FrameGrantRollback,
@@ -305,7 +305,21 @@ pub(crate) struct PendingEl1GrantPublication {
     pub(crate) predecessor_leases: std::collections::BTreeSet<(u64, u64)>,
     /// The grant's own alias, registered only after the predecessor retires.
     pub(crate) alias: AliasBacking,
+    /// The record was inserted before EL1 could publish a leaf. Completion
+    /// drops this authority after the verified leaf exists; rollback consumes
+    /// it into the only proof which may retire a never-published record.
+    pub(crate) rollback: Option<Stage2PublicationAuthority>,
 }
+
+impl PartialEq for PendingEl1GrantPublication {
+    fn eq(&self, other: &Self) -> bool {
+        self.grant == other.grant
+            && self.predecessor_leases == other.predecessor_leases
+            && self.alias == other.alias
+    }
+}
+
+impl Eq for PendingEl1GrantPublication {}
 
 /// MM-owned ledger of [`PendingEl1GrantPublication`]s. The sole producer is
 /// inserted during preparation and removed by completion or rollback before
@@ -1552,7 +1566,7 @@ impl HvfVmState {
             identity.linux_pid,
             identity.linux_tid,
         );
-        let published = sparse_materialization::publish_frame_grant(
+        let mut published = sparse_materialization::publish_frame_grant(
             &publication,
             request,
             retirement
@@ -1591,6 +1605,7 @@ impl HvfVmState {
             },
             predecessor_leases: predecessor_leases.unwrap_or_default(),
             alias: published.alias,
+            rollback: published.rollback.take(),
         };
         let recorded = self.el1_grant_publications.lock().insert(pending);
         if !recorded {
@@ -1664,11 +1679,21 @@ impl HvfVmState {
             )));
         }
         let len = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
-        let pending = self.el1_grant_publications.lock().take(&grant);
-        if let Some(pending) = pending
+        let mut pending = self.el1_grant_publications.lock().take(&grant);
+        if pending
             .as_ref()
-            .filter(|pending| !pending.predecessor_leases.is_empty())
+            .is_some_and(|pending| !pending.predecessor_leases.is_empty())
         {
+            let pending = pending.as_mut().expect("pending replacement exists");
+            let never_published = pending
+                .rollback
+                .take()
+                .ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "EL1 frame-grant rollback lost its publication authority".to_owned(),
+                    )
+                })?
+                .rollback();
             // A replacement EL1 never exposed: its predecessor was never
             // touched and stays exactly as it was. Retire only the grant's
             // own (unregistered) publication.
@@ -1682,6 +1707,7 @@ impl HvfVmState {
                 len,
                 pending.alias,
                 &registry,
+                &never_published,
             )?;
             drop(registry);
             let deferred = self.deferred_anonymous_state().ok_or_else(|| {
@@ -1705,7 +1731,20 @@ impl HvfVmState {
         if !is_exactly_el1_frame_grant(&aliases, grant) {
             return Ok(false);
         }
-        self.unregister_process_alias(None, grant.semantic_base, len)?;
+        let never_published = pending
+            .as_mut()
+            .and_then(|pending| pending.rollback.take())
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "EL1 frame-grant rollback lost its publication authority".to_owned(),
+                )
+            })?
+            .rollback();
+        self.unregister_process_alias(
+            Some(Stage1UnpublicationReceipt::NeverPublished(&never_published)),
+            grant.semantic_base,
+            len,
+        )?;
         let deferred = self.deferred_anonymous_state().ok_or_else(|| {
             TrapError::Hypervisor("EL1 frame-grant rollback has no deferred state".to_owned())
         })?;
@@ -1781,6 +1820,7 @@ impl HvfVmState {
         len: usize,
         alias: AliasBacking,
         registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
+        never_published: &NeverPublishedRecord,
     ) -> Result<(), TrapError> {
         let authority = self.cow_authority.as_ref().ok_or_else(|| {
             TrapError::Hypervisor(
@@ -1824,7 +1864,7 @@ impl HvfVmState {
             Some(registry),
             AliasRetirementAuthorityState::Pending,
             AliasRetirementRows::NeverRegistered,
-            None,
+            Some(Stage1UnpublicationReceipt::NeverPublished(never_published)),
         )
     }
 
@@ -6100,7 +6140,7 @@ impl HvfVmState {
 
     pub(crate) fn unregister_process_alias(
         &mut self,
-        stage1: Option<&carrick_aarch64::stage1_authority::Stage1LeafRetired>,
+        stage1: Option<Stage1UnpublicationReceipt<'_>>,
         va: u64,
         len: usize,
     ) -> Result<(), TrapError> {
@@ -6298,7 +6338,7 @@ impl HvfVmState {
         len: usize,
         prepared: PreparedProcessAliasRetirement,
         registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
-        stage1: Option<&carrick_aarch64::stage1_authority::Stage1LeafRetired>,
+        stage1: Option<Stage1UnpublicationReceipt<'_>>,
     ) -> Result<(), TrapError> {
         self.commit_process_alias_retirement_inner(
             va,
@@ -6351,7 +6391,7 @@ impl HvfVmState {
         registry: Option<&crate::fork_quiesce::FrameRegistryGuard<'_>>,
         authority_state: AliasRetirementAuthorityState,
         rows: AliasRetirementRows,
-        stage1: Option<&carrick_aarch64::stage1_authority::Stage1LeafRetired>,
+        stage1: Option<Stage1UnpublicationReceipt<'_>>,
     ) -> Result<(), TrapError> {
         let mut prepared = prepared;
         loop {
@@ -6393,7 +6433,7 @@ impl HvfVmState {
         registry: Option<&crate::fork_quiesce::FrameRegistryGuard<'_>>,
         authority_state: AliasRetirementAuthorityState,
         rows: AliasRetirementRows,
-        stage1: Option<&carrick_aarch64::stage1_authority::Stage1LeafRetired>,
+        stage1: Option<Stage1UnpublicationReceipt<'_>>,
     ) -> Result<Option<StaleAliasRetirement>, TrapError> {
         if prepared.inventory.is_some() && registry.is_none() {
             return Err(TrapError::Hypervisor(
@@ -6624,7 +6664,7 @@ impl HvfVmState {
                     ))
             })?;
             let receipt = if let Some(stage1) = stage1 {
-                Stage1UnpublicationReceipt::EditorRange(stage1)
+                stage1
             } else {
                 let absence = frame_absence.as_ref().ok_or_else(|| {
                     TrapError::Hypervisor(
