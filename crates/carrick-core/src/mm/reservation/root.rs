@@ -564,6 +564,29 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.publish_with_generation(index, mm, layout.into(), Some(generation))
     }
 
+    /// Observe the incarnation that the next publication in an empty slot
+    /// must use. The caller serializes address-space publication and treats
+    /// this as a proposal: [`Self::publish_at_generation`] remains the
+    /// authority and rejects a slot changed before commit.
+    pub fn next_publication_generation(
+        &self,
+        index: usize,
+    ) -> Result<ReservationGeneration, Refusal> {
+        if self.layout_hash.load(Ordering::Acquire) != Self::LAYOUT_HASH {
+            return Err(Refusal::Stale);
+        }
+        let root = self.roots.get(index).ok_or(Refusal::Invalid)?;
+        if root.locked.load(Ordering::Acquire) != 0 {
+            return Err(Refusal::Busy);
+        }
+        if root.key.load(Ordering::Acquire) != 0 {
+            return Err(Refusal::Collision);
+        }
+        let epoch = root.epoch.load(Ordering::Acquire);
+        ReservationGeneration::new(epoch.checked_add(1).ok_or(Refusal::Stale)?)
+            .ok_or(Refusal::Stale)
+    }
+
     fn publish_with_generation(
         &self,
         index: usize,
