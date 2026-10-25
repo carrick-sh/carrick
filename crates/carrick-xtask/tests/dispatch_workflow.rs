@@ -128,6 +128,7 @@ fn only_dispatch_workflow_references_dispatch_secrets() {
         "CODEX_AUTH_JSON",
         "AGY_OAUTH_TOKEN",
         "DISPATCH_BOARD_TOKEN",
+        "DISPATCH_PUBLISH_TOKEN",
     ];
     let mut saw_dispatch = false;
     let mut other_workflows = 0;
@@ -181,6 +182,35 @@ fn board_token_is_scoped_to_the_loop_step_and_explicitly_masked() {
             );
         } else {
             assert!(step["env"]["DISPATCH_BOARD_TOKEN"].is_badvalue());
+        }
+    }
+    assert!(saw_loop);
+}
+
+#[test]
+fn publish_token_is_scoped_to_the_loop_step_and_explicitly_masked() {
+    let docs = YamlLoader::load_from_str(include_str!(
+        "../../../.github/workflows/dispatch-worker.yml"
+    ))
+    .unwrap();
+    let worker = &docs[0]["jobs"]["worker"];
+    assert!(worker["env"]["DISPATCH_PUBLISH_TOKEN"].is_badvalue());
+    let mut saw_loop = false;
+    for step in worker["steps"].as_vec().unwrap() {
+        if step["id"].as_str() == Some("loop") {
+            saw_loop = true;
+            assert_eq!(
+                step["env"]["DISPATCH_PUBLISH_TOKEN"].as_str(),
+                Some("${{ secrets.DISPATCH_PUBLISH_TOKEN }}")
+            );
+            assert!(
+                step["run"]
+                    .as_str()
+                    .unwrap()
+                    .contains("::add-mask::$DISPATCH_PUBLISH_TOKEN")
+            );
+        } else {
+            assert!(step["env"]["DISPATCH_PUBLISH_TOKEN"].is_badvalue());
         }
     }
     assert!(saw_loop);

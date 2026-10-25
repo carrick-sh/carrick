@@ -56,6 +56,7 @@ impl DiagnosticSecrets {
             "GITHUB_TOKEN",
             "AGENT_DIRECTOR_TOKEN",
             "DISPATCH_BOARD_TOKEN",
+            "DISPATCH_PUBLISH_TOKEN",
         ] {
             if let Ok(value) = std::env::var(key) {
                 gate.add(&value);

@@ -67,7 +67,8 @@ head ref. The expected-tip push lease closes cross-key races.
 
 The runner holds the job-scoped `GITHUB_TOKEN` with exactly `contents: write`,
 `pull-requests: write`, `issues: write` and `actions: read`. The tool server
-alone uses it for GitHub and publication.
+alone uses it for GitHub reads, comments, closing-reference checks and run
+lookups. Publication also uses it when the publish credential is unavailable.
 
 `DISPATCH_BOARD_TOKEN` is a separate one-hour `carrick-workers` App installation
 token, down-scoped at mint to `{"organization_projects":"write"}`. Only the
@@ -77,6 +78,25 @@ the loop starts; diagnostic redaction and the complete artifact scan also cover
 its exact bytes. No App private key enters GitHub Actions. The director adds
 the Mac minter after landing; until the secret exists, reads and status updates
 report `unavailable` with the missing-token reason and the run continues.
+
+`DISPATCH_PUBLISH_TOKEN` is a separate one-hour `carrick-workers` App
+installation token, down-scoped at mint to
+`{"repositories":["carrick"],"permissions":{"contents":"write","pull_requests":"write"}}`.
+Only the loop step receives it. The runner-uid tool server uses it only for the
+fixed-refspec branch push and PR creation or body PATCH, including restoration.
+Git and GitHub subprocesses receive it as `GH_TOKEN` only for those writes;
+reads, comments, closing-reference checks and run lookups keep the job token.
+The director adds the Mac minter after landing; no App private key enters the job.
+Both model accounts receive cleared environments, and the publish token is
+masked and included in diagnostic redaction and the complete artifact scan.
+The App has no workflow permission, so dispatch continues to refuse workflow
+file changes and reports an App push refusal explicitly.
+
+App-created PRs are authored by `carrick-workers[bot]`. They retain the same
+run, branch, draft and issue ownership checks as job-token PRs. If the publish
+secret is absent or empty, publication falls back to the job token and the
+outcome says that CI won't start automatically and asks a person to mark the
+PR ready. That fallback does not fail the run.
 
 The dedicated nologin accounts `carrick-dispatch-loop` and
 `carrick-dispatch-agent` have distinct uids and groups, no sudo rights and no
@@ -343,6 +363,9 @@ ownership, publication, socket/environment isolation and workflow wiring. They
 cannot establish deployed acceptance. The director must push from the Mac
 (App tokens cannot push workflow edits), deploy the new controller and verify
 agent-template accounts/tools and the pinned launcher roster/capacity APIs.
+For #833 rollout, add the Mac publish-token minter with the repository and
+permissions above. Verify that both a new dispatch PR and a continuation push
+start CI for their current head without an owner push or ready event.
 For #811/#842 rollout, add the Mac board-token minter, then verify a trial
 reads both board items and changes only those items through the scoped tool.
 Continue an owned PR with a worker-proposed body and check the live body,
