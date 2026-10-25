@@ -1123,7 +1123,7 @@ impl NativeServiceCapacityFixture {
         assert!(matches!(
             entry.wait4(
                 ProcessWaitPid::from_syscall_argument(u64::MAX),
-                UserVa::new(0),
+                UserVa::new(0x1000),
                 LinuxWaitOptions::empty(),
                 UserVa::new(0),
             ),
@@ -1309,6 +1309,8 @@ fn native_exec_fixture() -> NativeSignalFixture {
 #[cfg(test)]
 fn publish_test_exec_reply(
     fixture: &NativeSignalFixture,
+    control: &ThreadControlSlot,
+    slot: SlotId,
     receipt_raw: u64,
     root_raw: u64,
 ) -> carrick_core_abi::ReservationMm {
@@ -1329,10 +1331,9 @@ fn publish_test_exec_reply(
     let member = queue.native_service_member(selector.record).unwrap();
     // SAFETY: this test owns the announced exact service member and consumes
     // its ticket once before releasing the queue.
-    let ticket = unsafe {
-        ServiceCell::claim_notice(&fixture.control.service, selector, NonZeroU64::MIN, member)
-    }
-    .unwrap();
+    let ticket =
+        unsafe { ServiceCell::claim_notice(&control.service, selector, NonZeroU64::MIN, member) }
+            .unwrap();
     let request = ticket.request();
     let manifest_address = ticket.reply_address().unwrap();
     // SAFETY: the ring retains this aligned reply record until acknowledgment.
@@ -1363,7 +1364,7 @@ fn publish_test_exec_reply(
             .is_ok()
     );
     let mut effects = WakeEffects::default();
-    queue.notify_object(fixture.slot, &mut effects).unwrap();
+    queue.notify_object(slot, &mut effects).unwrap();
     drop(queue);
     let mut service = fixture.service();
     service.wake_effects(effects);
@@ -1556,7 +1557,8 @@ fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
         assert!(entry.take_handoff_receipt().is_some());
     }
 
-    let successor_mm = publish_test_exec_reply(&fixture, 47, 0x90_0000);
+    let successor_mm =
+        publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 47, 0x90_0000);
 
     let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
     assert_eq!(selected.record, fixture.record.id);
@@ -1621,7 +1623,8 @@ fn exec_after_sibling_drain(parked_read: bool) {
         ));
         assert!(entry.take_handoff_receipt().is_some());
     }
-    let successor_mm = publish_test_exec_reply(&fixture, 71, 0xa0_0000);
+    let successor_mm =
+        publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 71, 0xa0_0000);
 
     let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
     assert_eq!(selected.record, fixture.record.id);
@@ -1755,4 +1758,103 @@ fn native_exec_drains_a_spinning_sibling_without_reentering_el0() {
 #[test]
 fn native_exec_drains_a_sibling_parked_in_an_owned_read() {
     exec_after_sibling_drain(true);
+}
+
+#[test]
+fn native_parent_observes_exec_child_exit_after_successor_first_syscall() {
+    let capacity = NativeServiceCapacityFixture::new(1);
+    let fixture = &capacity.fixture;
+    let (child_record, child_address, child_words) = capacity.select().unwrap();
+    let child_identity = fixture.zone.record(child_record.id).identity();
+    // SAFETY: the selected child's exact identity retains this control slot
+    // until its process exit settles below.
+    let child_control = unsafe { &*(child_identity.control_slot as *const ThreadControlSlot) };
+    let child_pid = fixture.task.visible_pid().unwrap();
+    assert_ne!(child_pid, 7001);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let mut child = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                child_address,
+                &child_words,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child.resume_checkpoint(),
+            Ok(NativeResume::NoPending)
+        ));
+        assert!(matches!(
+            child.begin_exec_service(Box::from(&b"/bin/static\0\0\0"[..])),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(child.take_handoff_receipt().is_some());
+    }
+    let successor_mm = publish_test_exec_reply(fixture, child_control, fixture.slot, 91, 0xb0_0000);
+
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, child_record.id);
+    // SAFETY: the prepared-service wake selected this exact child record.
+    let saved = unsafe { fixture.runtime.record_binding(child_record) }
+        .unwrap()
+        .words;
+    let mut child = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            child_address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        child.resume_checkpoint(),
+        Ok(NativeResume::NoPending)
+    ));
+    assert_eq!(child.calling_tid(), child_pid);
+    assert_eq!(
+        fixture.task.mm.key.load(Ordering::Acquire),
+        successor_mm.raw()
+    );
+    // This is the successor's first completed syscall boundary. It then exits
+    // with status 7, which must wake the already-parked parent wait4 owner.
+    assert!(matches!(
+        child.exit_group(7),
+        LifecycleOutcome::Transferred { .. }
+    ));
+    drop(child);
+
+    let (parent_record, parent_address, parent_words) = capacity.select().unwrap();
+    assert_eq!(fixture.task.visible_pid(), Some(7001));
+    let mut parent_service = fixture.service();
+    let mut parent = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            parent_address,
+            &parent_words,
+            &mut parent_service,
+        )
+        .unwrap();
+    match parent.resume_checkpoint() {
+        Ok(NativeResume::Returned(result)) => {
+            assert_eq!(result.raw(), i64::from(child_pid));
+        }
+        _ => panic!("parent wait4 did not return the exec child's pid"),
+    }
+    drop(parent);
+    assert_eq!(parent_service.copies, vec![LinuxWaitStatus::exited(7)]);
+    assert_ne!(parent_record, child_record);
 }
