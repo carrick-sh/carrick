@@ -1242,15 +1242,59 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         successor_root: RootGpa,
         successor_physical: C,
     ) -> Result<ExecPredecessorReceipt<T::Tag>, (ForkStockServiceError, C)> {
+        let Some(successor_tag) = self.tags.allocate() else {
+            return Err((
+                ForkStockServiceError::Asid(AsidError::Exhausted),
+                successor_physical,
+            ));
+        };
+        self.replace_child_for_exec_with_tag(
+            execution,
+            successor,
+            successor_root,
+            successor_tag,
+            successor_physical,
+        )
+    }
+
+    /// Move one exact live fork child to a prepared exec successor using the
+    /// address-space tag already authenticated by the successor preparation.
+    /// This method consumes the unpublished tag on every path: refusal returns
+    /// the physical custody but releases the tag through this stock's one tag
+    /// owner, while success binds it to the successor MM.
+    pub fn replace_child_for_exec_with_tag(
+        &mut self,
+        execution: GrantExecution,
+        successor: carrick_el1_abi::El1MmHandle,
+        successor_root: RootGpa,
+        successor_tag: T::Tag,
+        successor_physical: C,
+    ) -> Result<ExecPredecessorReceipt<T::Tag>, (ForkStockServiceError, C)> {
+        let refuse = |tags: &mut T, error, physical| {
+            let released = tags.release_unpublished(successor_tag);
+            Err((released.err().unwrap_or(error), physical))
+        };
         let Some(predecessor_mm) = ReservationMm::new(execution.binding.mm.raw()) else {
-            return Err((ForkStockServiceError::StaleExecution, successor_physical));
+            return refuse(
+                &mut self.tags,
+                ForkStockServiceError::StaleExecution,
+                successor_physical,
+            );
         };
         let Some(predecessor_key) = MmKey::of(predecessor_mm) else {
-            return Err((ForkStockServiceError::StaleExecution, successor_physical));
+            return refuse(
+                &mut self.tags,
+                ForkStockServiceError::StaleExecution,
+                successor_physical,
+            );
         };
         let successor_mm = successor.mm();
         let Some(successor_key) = MmKey::of(successor_mm) else {
-            return Err((ForkStockServiceError::InvalidRecord, successor_physical));
+            return refuse(
+                &mut self.tags,
+                ForkStockServiceError::InvalidRecord,
+                successor_physical,
+            );
         };
         let exact_predecessor = self.children.get(&predecessor_key).is_some_and(|child| {
             child.owner.carrier() == self.carrier
@@ -1270,25 +1314,29 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 .values()
                 .any(|pending| pending.predecessor == predecessor_mm)
         {
-            return Err((ForkStockServiceError::StaleExecution, successor_physical));
-        }
-        let Some(successor_tag) = self.tags.allocate() else {
-            return Err((
-                ForkStockServiceError::Asid(AsidError::Exhausted),
+            return refuse(
+                &mut self.tags,
+                ForkStockServiceError::StaleExecution,
                 successor_physical,
-            ));
-        };
+            );
+        }
         let sequence = self.next_exec_predecessor;
         let Some(next) = sequence.get().checked_add(1).and_then(NonZeroU64::new) else {
-            let _ = self.tags.release_unpublished(successor_tag);
-            return Err((ForkStockServiceError::InvalidRecord, successor_physical));
+            return refuse(
+                &mut self.tags,
+                ForkStockServiceError::InvalidRecord,
+                successor_physical,
+            );
         };
 
         // All validation and fallible allocation completed. These removals
         // are exact by the checks above and the mutable owner excludes drift.
         let Some(predecessor) = self.children.remove(&predecessor_key) else {
-            let _ = self.tags.release_unpublished(successor_tag);
-            return Err((ForkStockServiceError::StaleExecution, successor_physical));
+            return refuse(
+                &mut self.tags,
+                ForkStockServiceError::StaleExecution,
+                successor_physical,
+            );
         };
         let mut tables = self
             .committed_tables

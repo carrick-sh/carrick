@@ -213,6 +213,32 @@ pub fn cross_hvc_child_reclaim(mm: u64, cpu: u64) -> Result<(), ()> {
     }
 }
 
+/// Consume the prepared native exec selected by the caller-owned adoption
+/// record while this CPU and its predecessor execution are synchronously
+/// stopped at the owner crossing.
+#[allow(clippy::result_unit_err)]
+pub fn cross_hvc_exec_adopt(record_gpa: u64, cpu: u64) -> Result<(), ()> {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let mut status = carrick_el1_abi::GRANT_OP_EXEC_ADOPT;
+        // SAFETY: the HVC retains this aligned stack record until its typed
+        // accepted/refused reply has been published.
+        unsafe {
+            core::arch::asm!("hvc #6", inout("x0") status,
+                inlateout("x1") record_gpa => _, inlateout("x2") cpu => _,
+                inlateout("x3") 0u64 => _, options(nostack));
+        }
+        (status == carrick_el1_abi::METADATA_GRANT_SUCCESS)
+            .then_some(())
+            .ok_or(())
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = (record_gpa, cpu);
+        Err(())
+    }
+}
+
 /// Ask the stopped carrier to supply the COW page selected in this slot's
 /// portal record. The host authenticates that record against the live root.
 // `Err(())` is the carrier's single refusal; callers own its meaning.

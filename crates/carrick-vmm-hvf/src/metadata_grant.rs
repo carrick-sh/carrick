@@ -1762,6 +1762,114 @@ fn service_native_cow_supply(
     Ok([METADATA_GRANT_SUCCESS, 0, 0, 0])
 }
 
+/// Consume one exact prepared exec receipt for the stopped predecessor. The
+/// ring has already published the successor as a closed address space; this
+/// crossing authenticates that manifest, installs its physical backing, and
+/// transfers fork-stock ownership without reconstructing a host task.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn service_native_exec_adopt(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    generation: Option<crate::trap::CarrierVmGeneration>,
+    region: RetainedAbiRegion<'_>,
+    cpu: carrick_guest_arch::CpuId,
+    address: carrick_guest_arch::KernelVa,
+    claimed_cpu: u64,
+    ttbr0: u64,
+) -> Result<[u64; 4], TrapError> {
+    let refused = [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    if claimed_cpu != u64::from(cpu.raw()) || !request_has_live_vm(custody, generation) {
+        return Ok(refused);
+    }
+    let Some(pointer) = abi_stack_ptr::<carrick_el1_abi::NativeExecAdoption>(region, cpu, address)
+    else {
+        return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+    };
+    // SAFETY: the stopped CPU exclusively retains its aligned crossing record.
+    let request = unsafe { &mut *pointer };
+    let Some((receipt, manifest_address)) = request.request() else {
+        return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+    };
+    let Some(execution) = stopped_execution(region, cpu, ttbr0) else {
+        request.refuse();
+        return Ok(refused);
+    };
+    let (manifest, _manifest_pin) = match native_service::retain_reply::<
+        carrick_core_abi::service::ExecSuccessorManifest,
+    >(custody, region, manifest_address)
+    {
+        Ok(retained) => retained,
+        Err(_) => {
+            request.refuse();
+            return Ok(refused);
+        }
+    };
+    // SAFETY: retain_reply pins the complete aligned ring-owned record through
+    // this synchronous crossing.
+    let manifest = unsafe { manifest.as_ref() };
+    let Some((prepared, successor)) =
+        custody.take_native_exec_preparation(receipt, manifest, execution)
+    else {
+        request.refuse();
+        return Ok(refused);
+    };
+    let Some((_, zone)) = stopped_records(region, cpu) else {
+        request.refuse();
+        return Ok(refused);
+    };
+    let Some(index) = zone.spaces.find(successor.successor_mm.raw()) else {
+        request.refuse();
+        return Ok(refused);
+    };
+    let expected_ttbr = (u64::from(successor.asid.raw()) << 48) | successor.root.address().raw();
+    if zone
+        .spaces
+        .closed_grant(index, successor.successor_mm.raw())
+        .is_none_or(|grant| grant.ttbr0 != expected_ttbr || grant.ttbr1 != expected_ttbr)
+    {
+        request.refuse();
+        return Ok(refused);
+    }
+    let (physical, asid) = crate::trap::install_native_exec_successor(prepared)?;
+    if asid.asid() != successor.asid || asid.generation() != successor.asid_generation.get() {
+        return Err(TrapError::Hypervisor(
+            "native exec retained ASID disagrees with sealed manifest".into(),
+        ));
+    }
+    // SAFETY: the ring published this exact closed reservation owner before
+    // crossing; the sealed manifest binds its incarnation to this receipt.
+    let successor_handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(
+            custody.transfer_carrier,
+            successor.successor_mm,
+            successor.root_generation,
+        )
+    };
+    let predecessor = {
+        let mut stock = custody.fork_stock.lock();
+        match stock.owner.replace_child_for_exec_with_tag(
+            execution,
+            successor_handle,
+            successor.root,
+            asid,
+            physical,
+        ) {
+            Ok(receipt) => receipt,
+            Err((error, _physical)) => {
+                return Err(TrapError::Hypervisor(format!(
+                    "native exec stock replacement after backing publication: {error:?}"
+                )));
+            }
+        }
+    };
+    custody.native_exec_predecessors.lock().push(predecessor);
+    if !request.accept() {
+        return Err(TrapError::Hypervisor(
+            "native exec adoption reply lost after stock replacement".into(),
+        ));
+    }
+    Ok([METADATA_GRANT_SUCCESS, 0, 0, 0])
+}
+
 /// Physical process crossings use HVC #6. Metadata allocation uses its mailbox.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn handle_metadata_grant_trap(
@@ -1835,6 +1943,23 @@ pub(crate) fn handle_metadata_grant_trap(
                 arg2,
                 ttbr0,
                 region,
+            )?
+        } else {
+            [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
+        }
+    } else if op == carrick_el1_abi::GRANT_OP_EXEC_ADOPT {
+        let ttbr0 = vcpu
+            .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
+            .map_err(|e| TrapError::Hypervisor(format!("read exec predecessor root: {e}")))?;
+        if let Some(region) = region {
+            service_native_exec_adopt(
+                custody,
+                generation,
+                region,
+                cpu,
+                carrick_guest_arch::KernelVa::new(arg1),
+                arg2,
+                ttbr0,
             )?
         } else {
             [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
