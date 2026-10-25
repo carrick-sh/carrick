@@ -501,3 +501,75 @@ fn artifact_serves_admission_and_direct_xtask_calls_without_cargo_bootstrap() {
         3
     );
 }
+
+#[test]
+fn real_artifact_admission_uses_the_shared_package_environment_scrub() {
+    let build = Build::new();
+    let git = find("git");
+    assert!(
+        Command::new(&git)
+            .args(["init", "--quiet"])
+            .current_dir(build.root.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&git)
+            .args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@invalid",
+                "commit",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-qm",
+                "fixture root",
+            ])
+            .current_dir(build.root.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    symlink(git, build.root.path().join("bin/git")).unwrap();
+    let artifact = build.root.path().join("real xtask artifact");
+    fs::copy(env!("CARGO_BIN_EXE_carrick-xtask"), &artifact).unwrap();
+    let justfile = build.root.path().join("justfile");
+    let mut recipes = fs::read_to_string(&justfile).unwrap();
+    recipes.push_str(r#"
+artifact-package-env-witness:
+    {{_admit}} sh -c 'if [ "${CARGO_MANIFEST_DIR+x}" = x ] || [ "${CARGO_PKG_FUTURE+x}" = x ]; then echo leaked-package-metadata; exit 73; fi; test "$CARGO_TARGET_DIR" = "$EXPECTED_TARGET"'
+"#);
+    fs::write(justfile, recipes).unwrap();
+    let run = |bypass: bool| {
+        let mut command = if bypass {
+            let mut command = build.command("--set");
+            command.args(["_admit", "", "artifact-package-env-witness"]);
+            command
+        } else {
+            build.command("artifact-package-env-witness")
+        };
+        command
+            .env("CARRICK_XTASK_BIN", &artifact)
+            .env("CARGO_MANIFEST_DIR", "/injected/xtask")
+            .env("CARGO_PKG_FUTURE", "sentinel")
+            .env(
+                "CARGO_TARGET_DIR",
+                build.root.path().join("preserved-target"),
+            )
+            .env(
+                "EXPECTED_TARGET",
+                build.root.path().join("preserved-target"),
+            )
+            .output()
+            .unwrap()
+    };
+    let bypassed = run(true);
+    assert!(!bypassed.status.success());
+    assert_eq!(
+        String::from_utf8(bypassed.stdout).unwrap().trim(),
+        "leaked-package-metadata"
+    );
+    passed(run(false));
+}
