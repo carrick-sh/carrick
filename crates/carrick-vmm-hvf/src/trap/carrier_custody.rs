@@ -453,7 +453,7 @@ pub struct CarrierVmCustody {
     /// retirement. Request and last-pin-drop only arm this queue; backend
     /// unmap runs at the persistent executor's carrier-safe boundary.
     pending_carrier_stage2_retirements: parking_lot::Mutex<
-        std::collections::BTreeMap<CarrierStage2RecordId, (CarrierStage2RecordIdentity, bool, u8)>,
+        std::collections::BTreeMap<CarrierStage2RecordId, (CarrierStage2RecordIdentity, bool)>,
     >,
     /// Exact retirements whose backend operation failed at a carrier-safe
     /// boundary. Their waiters wake and reselect/fault instead of parking on a
@@ -1576,7 +1576,7 @@ impl CarrierVmCustody {
         self.pending_carrier_stage2_retirements
             .lock()
             .entry(identity.record_id)
-            .or_insert((identity, false, 0));
+            .or_insert((identity, false));
     }
 
     pub(crate) fn cancel_carrier_stage2_retirement(&self, identity: CarrierStage2RecordIdentity) {
@@ -1591,7 +1591,7 @@ impl CarrierVmCustody {
         identity: CarrierStage2RecordIdentity,
     ) -> bool {
         let mut pending = self.pending_carrier_stage2_retirements.lock();
-        let Some((expected, in_flight, _failures)) = pending.get_mut(&identity.record_id) else {
+        let Some((expected, in_flight)) = pending.get_mut(&identity.record_id) else {
             return false;
         };
         if *expected != identity || *in_flight {
@@ -1615,29 +1615,9 @@ impl CarrierVmCustody {
             self.terminal_carrier_stage2_retirements
                 .lock()
                 .remove(&identity.record_id);
-        } else if let Some((_, in_flight, _failures)) = pending.get_mut(&identity.record_id) {
+        } else if let Some((_, in_flight)) = pending.get_mut(&identity.record_id) {
             *in_flight = false;
         }
-    }
-
-    /// Record one backend refusal from a distinct carrier-safe turn. A small
-    /// finite budget admits a transient concurrent teardown without letting a
-    /// permanently impossible unmap strand its exact waiter forever.
-    pub(crate) fn note_carrier_stage2_retirement_failure(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-    ) -> bool {
-        const MAX_BACKEND_FAILURES: u8 = 3;
-        let mut pending = self.pending_carrier_stage2_retirements.lock();
-        let Some((expected, in_flight, failures)) = pending.get_mut(&identity.record_id) else {
-            return true;
-        };
-        if *expected != identity {
-            return true;
-        }
-        *in_flight = false;
-        *failures = failures.saturating_add(1);
-        *failures >= MAX_BACKEND_FAILURES
     }
 
     pub(crate) fn terminalize_carrier_stage2_retirement(
@@ -1670,7 +1650,7 @@ impl CarrierVmCustody {
         self.pending_carrier_stage2_retirements
             .lock()
             .values()
-            .filter_map(|(identity, in_flight, _failures)| (!*in_flight).then_some(*identity))
+            .filter_map(|(identity, in_flight)| (!*in_flight).then_some(*identity))
             .take(limit)
             .collect()
     }
@@ -4896,22 +4876,17 @@ mod carrier_vm_custody_tests {
 
         let wait = custody.stage2_retirement_wait(Some(identity));
         custody.request_global_frame_retirement_retry();
-        for turn in 1..=3 {
-            let report = super::retry_pending_global_frame_retirements_at_idle_in_and_release_using(
-                &custody,
-                &mut |_, _| {
-                    attempts.set(attempts.get() + 1);
-                    Err(super::CarrierStage2BackendError::HvReturn(0xfae9_4001))
-                },
-                &mut |_, _| Ok(()),
-            );
-            assert_eq!(report.inspected_carrier, 1);
-            assert_eq!(attempts.get(), turn, "one safe-point turn gets one attempt");
-            if turn < 3 {
-                assert!(!wait.0.is_ready(), "a bounded retry still owns a producer");
-            }
-        }
+        let report = super::retry_pending_global_frame_retirements_at_idle_in_and_release_using(
+            &custody,
+            &mut |_, _| {
+                attempts.set(attempts.get() + 1);
+                Err(super::CarrierStage2BackendError::HvReturn(0xfae9_4001))
+            },
+            &mut |_, _| Ok(()),
+        );
 
+        assert_eq!(report.inspected_carrier, 1);
+        assert_eq!(attempts.get(), 1, "a safe-point refusal is not polled");
         assert!(custody.carrier_stage2_retirement_is_terminal(identity));
         assert!(
             wait.0.is_ready(),

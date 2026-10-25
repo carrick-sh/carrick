@@ -3869,12 +3869,11 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_and_release_usin
         );
         if retired.is_ok() {
             custody.settle_carrier_stage2_retirement(identity, true);
-        } else if custody.note_carrier_stage2_retirement_failure(identity) {
-            // The bounded safe-point budget is exhausted: no retry-until-green
-            // loop and no producer remain for this exact physical wait.
-            custody.terminalize_carrier_stage2_retirement(identity);
         } else {
-            custody.request_global_frame_retirement_retry();
+            // A refusal at the carrier-safe boundary has no named backend
+            // completion event. Fail closed after this one attempt: publish a
+            // terminal exact identity instead of polling future boundaries.
+            custody.terminalize_carrier_stage2_retirement(identity);
         }
     }
 
