@@ -726,6 +726,14 @@ impl SpaceTables {
             self.spaces.lower(index);
         }
     }
+    fn lower_after_edit(&self, index: SpaceIndex) {
+        if let Some(venue) = self.release_venue() {
+            carrick_sched_core::spaces::notification::SpaceAccess::notified(venue)
+                .lower_after_edit(index);
+        } else {
+            self.spaces.lower(index);
+        }
+    }
     fn open(&self, index: SpaceIndex) {
         if let Some(venue) = self.release_venue() {
             carrick_sched_core::spaces::notification::SpaceAccess::notified(venue).open(index);
@@ -864,7 +872,7 @@ impl Drop for El1EditorExclusion {
     fn drop(&mut self) {
         drop(self.held.take());
         if self.tables.live() {
-            self.tables.lower(self.index);
+            self.tables.lower_after_edit(self.index);
         }
     }
 }

@@ -587,7 +587,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> SpaceExclusion<'_, C> {
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceExclusion<'_, C> {
     fn drop(&mut self) {
         self.access
-            .release_gate_with_custody(self.index, false, self.release.take());
+            .release_gate_with_custody(self.index, false, true, self.release.take());
     }
 }
 
@@ -649,12 +649,18 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
     /// Preserve the nested host pause count; the release revision precedes
     /// the atomic decrement, and delivery follows it.
     pub fn lower(self, index: SpaceIndex) {
-        self.release_gate(index, false);
+        self.release_gate(index, false, false);
+    }
+    /// Release a host edit exclusion. The Editor revision advances before the
+    /// gate is lowered, so a copy holding the old selection receipt cannot
+    /// miss a completed host-side stage-1 mutation.
+    pub fn lower_after_edit(self, index: SpaceIndex) {
+        self.release_gate(index, false, true);
     }
     pub fn open(self, index: SpaceIndex) {
-        self.release_gate(index, true);
+        self.release_gate(index, true, false);
     }
-    fn release_gate(self, index: SpaceIndex, opening: bool) {
+    fn release_gate(self, index: SpaceIndex, opening: bool, editor_changed: bool) {
         let entry = self.spaces.entry(index);
         let release = if entry.notifications.attached() {
             let Some(venue) = self.venue else {
@@ -670,12 +676,13 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
         } else {
             None
         };
-        self.release_gate_with_custody(index, opening, release);
+        self.release_gate_with_custody(index, opening, editor_changed, release);
     }
     fn release_gate_with_custody(
         self,
         index: SpaceIndex,
         opening: bool,
+        editor_changed: bool,
         release: Option<(SpaceReleaseVenue<'a, C>, SpaceNotificationLease<'a, C>)>,
     ) {
         let entry = self.spaces.entry(index);
@@ -683,9 +690,14 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
             let completion = |effects: OwnedObjectWakeEffects<'_, C>| {
                 venue.deliver.invoke(venue.zone, venue.waker, effects)
             };
-            let publication = lease
+            let gate_publication = lease
                 .reserve(SpaceWaitCause::Gate)
                 .advance_revision(venue.waker, &completion);
+            let editor_publication = editor_changed.then(|| {
+                lease
+                    .reserve(SpaceWaitCause::Editor)
+                    .advance_revision(venue.waker, &completion)
+            });
             if opening {
                 entry.gate.fetch_and(
                     !(super::GATE_CLOSED | super::GATE_INITIAL_BIND),
@@ -694,7 +706,10 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
             } else {
                 entry.gate.fetch_sub(1, Ordering::SeqCst);
             }
-            publication.publish();
+            gate_publication.publish();
+            if let Some(publication) = editor_publication {
+                publication.publish();
+            }
         } else if opening {
             self.spaces.open(index);
         } else {
@@ -981,6 +996,24 @@ mod tests {
         entry
             .close_notifications(NonZeroU64::new(1).unwrap(), access(&zone).venue().unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn host_edit_release_advances_editor_before_lowering_gate() {
+        let zone = zone();
+        let entry = admitted(&zone);
+        let spaces = access(&zone);
+        spaces.open(entry.index());
+        let lease = entry.notifications(NonZeroU64::new(1).unwrap()).unwrap();
+        let editor_before = lease.observe(SpaceWaitCause::Editor);
+        spaces.raise(entry.index());
+
+        spaces.lower_after_edit(entry.index());
+
+        assert_eq!(spaces.gate(entry.index()), 0);
+        assert_ne!(lease.observe(SpaceWaitCause::Editor), editor_before);
+        zone.spaces.close(entry.index());
+        entry.retire_entry(access(&zone).venue().unwrap());
     }
     #[test]
     fn close_with_live_borrow_defers_entry_reuse_until_last_release() {
