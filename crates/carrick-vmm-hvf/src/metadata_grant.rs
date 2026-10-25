@@ -1854,9 +1854,11 @@ fn service_native_exec_adopt(
     };
     // SAFETY: the stopped CPU exclusively retains its aligned crossing record.
     let request = unsafe { &mut *pointer };
-    let Some((receipt, manifest_address)) = request.request() else {
+    let Some(request) = request.claim() else {
         return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
     };
+    let receipt = request.receipt();
+    let manifest_address = request.manifest();
     let Some(execution) = stopped_execution(region, cpu, ttbr0) else {
         request.refuse();
         return Ok(refused);
@@ -1946,19 +1948,14 @@ fn service_native_exec_adopt(
         };
         match replaced {
             Ok(receipt) => receipt,
-            Err((error, _physical)) => {
-                return Err(TrapError::Hypervisor(format!(
-                    "native exec stock replacement after backing publication: {error:?}"
-                )));
+            Err((_error, _physical)) => {
+                request.refuse();
+                return Ok(refused);
             }
         }
     };
     custody.native_exec_predecessors.lock().push(predecessor);
-    if !request.accept() {
-        return Err(TrapError::Hypervisor(
-            "native exec adoption reply lost after stock replacement".into(),
-        ));
-    }
+    request.accept();
     Ok([METADATA_GRANT_SUCCESS, 0, 0, 0])
 }
 
