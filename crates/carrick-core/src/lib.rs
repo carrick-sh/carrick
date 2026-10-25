@@ -6,6 +6,7 @@ pub use carrick_core_abi::Served;
 pub use carrick_sched_core::process::{TaskRusage, TerminationStatus};
 pub mod cancellation;
 pub mod entry;
+pub mod exec;
 pub mod file;
 pub mod ipc_permissions;
 pub mod lifecycle;
