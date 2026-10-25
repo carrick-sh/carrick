@@ -286,6 +286,8 @@ pub struct NativeSignalFixture {
     runtime: Arc<NativeProcessRuntime<'static, AddressContext<RootGpa>, ParkedContextWords>>,
     task: &'static CurrentTask,
     control: &'static ThreadControlSlot,
+    #[cfg(test)]
+    page: &'static ThreadLifecyclePage,
     child_page: &'static ThreadLifecyclePage,
     child_controls: &'static [ThreadControlSlot; 9],
     address: AddressContext<RootGpa>,
@@ -406,6 +408,8 @@ impl NativeSignalFixture {
             runtime,
             task,
             control,
+            #[cfg(test)]
+            page,
             child_page,
             child_controls,
             address,
@@ -1288,17 +1292,9 @@ impl NativeServiceCapacityFixture {
     }
 }
 
-#[test]
-fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
-    use carrick_core_abi::service::{
-        ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
-        ServiceCell,
-    };
-    use carrick_guest_arch::{Asid, UserVa};
-    use carrick_sched_core::object_wait::ObjectWaitKey;
-    use core::num::NonZeroU16;
-
-    let fixture = NativeSignalFixture::new(
+#[cfg(test)]
+fn native_exec_fixture() -> NativeSignalFixture {
+    NativeSignalFixture::new(
         ExecutionBinding {
             task: carrick_core_abi::EntryTaskKey::from_raw(41),
             generation: carrick_core_abi::SnapshotGeneration::from_raw(11),
@@ -1307,7 +1303,217 @@ fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
         },
         carrick_core_abi::EntryTaskKey::from_raw(41),
         carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(11).unwrap()),
+    )
+}
+
+#[cfg(test)]
+fn publish_test_exec_reply(
+    fixture: &NativeSignalFixture,
+    receipt_raw: u64,
+    root_raw: u64,
+) -> carrick_core_abi::ReservationMm {
+    use carrick_core_abi::service::{
+        ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
+        ServiceCell,
+    };
+    use carrick_guest_arch::{Asid, UserVa};
+    use carrick_sched_core::object_wait::ObjectWaitKey;
+    use core::num::NonZeroU16;
+
+    let selector = fixture.task.service_notice.take().unwrap().unwrap();
+    let key = ObjectWaitKey::native_service(selector.record).unwrap();
+    let queue = fixture
+        .zone
+        .object_wait(key, &carrick_sched_core::ShortLockSpin)
+        .unwrap();
+    let member = queue.native_service_member(selector.record).unwrap();
+    // SAFETY: this test owns the announced exact service member and consumes
+    // its ticket once before releasing the queue.
+    let ticket = unsafe {
+        ServiceCell::claim_notice(&fixture.control.service, selector, NonZeroU64::MIN, member)
+    }
+    .unwrap();
+    let request = ticket.request();
+    let manifest_address = ticket.reply_address().unwrap();
+    // SAFETY: the ring retains this aligned reply record until acknowledgment.
+    let manifest = unsafe { &mut *(manifest_address.raw() as *mut ExecSuccessorManifest) };
+    let successor_mm = manifest.proposal(request.identity).unwrap();
+    let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(receipt_raw).unwrap()).unwrap();
+    *manifest = manifest
+        .seal(
+            request.identity,
+            receipt,
+            ExecSuccessorBacking {
+                root: RootGpa::page_aligned(FrameGpa::new(root_raw)).unwrap(),
+                root_generation: NonZeroU64::new(receipt_raw + 6).unwrap(),
+                asid: Asid::from_registry_allocation(
+                    NonZeroU16::new(u16::try_from(receipt_raw + 12).unwrap()).unwrap(),
+                ),
+                asid_generation: NonZeroU64::new(receipt_raw + 14).unwrap(),
+            },
+            ExecSuccessorEntry {
+                entry: UserVa::new(0x40_0000),
+                stack_pointer: UserVa::new(0x7fff_f000),
+            },
+        )
+        .unwrap();
+    assert!(
+        ticket
+            .publish_exec_prepared(receipt, (), |_, ()| {})
+            .is_ok()
     );
+    let mut effects = WakeEffects::default();
+    queue.notify_object(fixture.slot, &mut effects).unwrap();
+    drop(queue);
+    let mut service = fixture.service();
+    service.wake_effects(effects);
+    successor_mm
+}
+
+#[cfg(test)]
+struct ExecSibling {
+    task: &'static CurrentTask,
+    control: &'static ThreadControlSlot,
+    slot: SlotId,
+    record: RecordRef,
+    _wait: Option<Arc<WaitChannel>>,
+}
+
+#[cfg(test)]
+fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSibling {
+    let binding = ExecutionBinding {
+        task: carrick_core_abi::EntryTaskKey::from_raw(42),
+        generation: carrick_core_abi::SnapshotGeneration::from_raw(12),
+        mm: carrick_core_abi::EntryMmKey::from_raw(1),
+        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(102),
+    };
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    control
+        .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+        .unwrap();
+    assert!(control.publish_visible_tid(42));
+    control.publish_host_birth_identity(
+        carrick_core::terminal::ThreadBirthIdentity::from_parts(
+            binding.task,
+            carrick_core_abi::BirthSerial::of_task(TaskSerial::from_raw_u64(12).unwrap()),
+            binding.thread_generation,
+        )
+        .unwrap(),
+    );
+    let birth = fixture.page.reserve_host_birth().unwrap();
+    carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
+    assert!(
+        fixture
+            .page
+            .publish_host_birth(birth, control.host_birth_identity().unwrap())
+    );
+
+    let task = Box::leak(Box::new(CurrentTask::new()));
+    task.set(
+        carrick_el1_abi::El1TaskId::from_linux_tid(42),
+        binding.generation,
+        5,
+    );
+    task.mm.key.store(1, Ordering::Release);
+    task.mm.thread_generation.store(102, Ordering::Release);
+    task.publish_visible_pid(41);
+    task.publish_root_generation(fixture.address.generation);
+    task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    let slot = SlotId::new(1);
+    fixture.zone.drive(slot, 2);
+    fixture.zone.publish_slot(slot, 1, Some(1), 1);
+    fixture.zone.enter_guest(slot);
+    fixture.zone.install_space(slot, 1).unwrap();
+    let record = fixture
+        .zone
+        .current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 42,
+                serial: 102,
+                mm: 1,
+                file_table: 5,
+                generation: 12,
+                affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
+                affinity: 1,
+                lifecycle_page: fixture.page as *const _ as u64,
+                control_slot: control as *const _ as u64,
+            },
+        )
+        .unwrap();
+    let record = fixture.zone.record_ref(record);
+    control.bind_zone_record(record);
+    fixture
+        .registry
+        .register_thread(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            task,
+            fixture.address,
+            fixture.page,
+            control,
+        )
+        .unwrap();
+
+    let wait = parked_read.then(|| {
+        let wait = Arc::new(WaitChannel {
+            generation: ProcessWake::new(),
+            mm: 1,
+        });
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot,
+        };
+        let start = carrick_core::entry::prepare_handoff(binding, source, record.id).unwrap();
+        let address = WaitChannel::address(&wait);
+        let guard = fixture.zone.short_lock(
+            ZoneTables::<ParkedContextWords>::bucket_of_with_context(1, address),
+            &NativeBucketWait {
+                lifetime: core::marker::PhantomData,
+                probe: None,
+            },
+        );
+        let sequence = fixture.zone.next_seq(record.id);
+        fixture
+            .zone
+            .enqueue(&guard, record.id, sequence, 1, address, u32::MAX, 0)
+            .unwrap();
+        // SAFETY: this fixture owns the sibling's selected record until the
+        // owned read continuation below publishes its handoff.
+        unsafe {
+            *fixture.zone.record(record.id).ctx_mut() = words(fixture.address);
+            fixture
+                .zone
+                .record(record.id)
+                .publish_owner_continuation(OwnerEntry::Syscall);
+        }
+        assert!(
+            carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(sequence),
+            )
+            .is_some()
+        );
+        drop(guard);
+        fixture.zone.clear_current(slot);
+        wait
+    });
+
+    ExecSibling {
+        task,
+        control,
+        slot,
+        record,
+        _wait: wait,
+    }
+}
+
+#[test]
+fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
+    let fixture = native_exec_fixture();
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -1350,50 +1556,7 @@ fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
         assert!(entry.take_handoff_receipt().is_some());
     }
 
-    let selector = fixture.task.service_notice.take().unwrap().unwrap();
-    let key = ObjectWaitKey::native_service(selector.record).unwrap();
-    let queue = fixture
-        .zone
-        .object_wait(key, &carrick_sched_core::ShortLockSpin)
-        .unwrap();
-    let member = queue.native_service_member(selector.record).unwrap();
-    // SAFETY: this test owns the announced exact service member and consumes
-    // its ticket once before releasing the queue.
-    let ticket = unsafe {
-        ServiceCell::claim_notice(&fixture.control.service, selector, NonZeroU64::MIN, member)
-    }
-    .unwrap();
-    let request = ticket.request();
-    let manifest_address = ticket.reply_address().unwrap();
-    // SAFETY: the ring retains this aligned reply record until acknowledgment.
-    let manifest = unsafe { &mut *(manifest_address.raw() as *mut ExecSuccessorManifest) };
-    let successor_mm = manifest.proposal(request.identity).unwrap();
-    let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(47).unwrap()).unwrap();
-    *manifest = manifest
-        .seal(
-            request.identity,
-            receipt,
-            ExecSuccessorBacking {
-                root: RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap(),
-                root_generation: NonZeroU64::new(53).unwrap(),
-                asid: Asid::from_registry_allocation(NonZeroU16::new(59).unwrap()),
-                asid_generation: NonZeroU64::new(61).unwrap(),
-            },
-            ExecSuccessorEntry {
-                entry: UserVa::new(0x40_0000),
-                stack_pointer: UserVa::new(0x7fff_f000),
-            },
-        )
-        .unwrap();
-    assert!(
-        ticket
-            .publish_exec_prepared(receipt, (), |_, ()| {})
-            .is_ok()
-    );
-    let mut effects = WakeEffects::default();
-    queue.notify_object(fixture.slot, &mut effects).unwrap();
-    drop(queue);
-    service.wake_effects(effects);
+    let successor_mm = publish_test_exec_reply(&fixture, 47, 0x90_0000);
 
     let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
     assert_eq!(selected.record, fixture.record.id);
@@ -1413,10 +1576,8 @@ fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
             &mut service,
         )
         .unwrap();
-    assert!(matches!(
-        entry.resume_checkpoint(),
-        Ok(NativeResume::NoPending)
-    ));
+    let resumed = entry.resume_checkpoint();
+    assert!(matches!(resumed, Ok(NativeResume::NoPending)));
     assert_eq!(
         entry.calling_tid(),
         41,
@@ -1431,4 +1592,167 @@ fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
         successor_mm.raw()
     );
     assert!(fixture.zone.spaces.find(1).is_none());
+}
+
+#[cfg(test)]
+fn exec_after_sibling_drain(parked_read: bool) {
+    let fixture = native_exec_fixture();
+    let sibling = add_exec_sibling(&fixture, parked_read);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_exec_service(Box::from(&b"/bin/static\0\0\0"[..])),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    let successor_mm = publish_test_exec_reply(&fixture, 71, 0xa0_0000);
+
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    // SAFETY: the root record was selected by this lane and remains retained
+    // until `resume_checkpoint` publishes the owned exec-drain continuation.
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.resume_checkpoint(),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_none());
+    }
+    assert!(sibling.control.host_exit_requested());
+    assert!(fixture.zone.slot(fixture.slot).current().is_none());
+
+    // The host withdraws the exact sibling before publishing its receipt.
+    // A running sibling reaches this boundary from its next EL0 exit; an
+    // owned blocking-read continuation is cancelled without reacquiring a
+    // guest execution lane.
+    if !parked_read {
+        fixture
+            .zone
+            .leave_guest(sibling.slot, &carrick_sched_core::ShortLockSpin);
+    }
+    let _ = fixture.zone.claim_for_host(
+        sibling.record,
+        None,
+        carrick_el1_abi::Handback::Cancelled,
+        &carrick_sched_core::ShortLockSpin,
+    );
+    fixture
+        .page
+        .reserve_cancelled_member_exit()
+        .unwrap()
+        .publish();
+    fixture.page.publish_exact_host_retirement(
+        sibling.control,
+        sibling.control.host_birth_identity().unwrap().retirement(),
+    );
+
+    let (mm, address) = fixture.page.exit_wait().unwrap();
+    let guard = fixture
+        .zone
+        .lock(
+            ZoneTables::<ParkedContextWords>::bucket_of_with_context(mm.raw(), address),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap();
+    let mut transfers = Vec::new();
+    let woken = fixture.zone.wake_host(
+        &guard,
+        mm.raw(),
+        address,
+        u32::MAX,
+        u32::MAX,
+        true,
+        &mut |transfer| transfers.push(transfer),
+        &mut |_| {},
+    );
+    drop(guard);
+    assert_eq!(woken, 1);
+    assert!(transfers.is_empty());
+
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let resumed_runtime = fixture
+        .registry
+        .for_entry(source, fixture.task, fixture.address)
+        .unwrap();
+    assert!(Arc::ptr_eq(&resumed_runtime, &fixture.runtime));
+    // SAFETY: the exit wait selected the retained root continuation exactly
+    // once; the entry consumes it below.
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    let resumed = entry.resume_checkpoint();
+    assert!(matches!(resumed, Ok(NativeResume::NoPending)));
+    assert_eq!(entry.calling_tid(), 41);
+    assert_eq!(
+        fixture.task.mm.key.load(Ordering::Acquire),
+        successor_mm.raw()
+    );
+    assert!(fixture.zone.slot(sibling.slot).current().is_none());
+    assert!(
+        fixture
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(entry.key)
+            .unwrap()
+            .native()
+            .resources()
+            .members
+            .len()
+            == 1
+    );
+    assert_eq!(sibling.task.mm.key.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn native_exec_drains_a_spinning_sibling_without_reentering_el0() {
+    exec_after_sibling_drain(false);
+}
+
+#[test]
+fn native_exec_drains_a_sibling_parked_in_an_owned_read() {
+    exec_after_sibling_drain(true);
 }
