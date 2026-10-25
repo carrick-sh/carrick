@@ -1,7 +1,9 @@
 //! Native-member service continuations. Slot custody ends at park; semantic
 //! process/MM custody ends only after the exact external acknowledgment.
 use super::*;
-use carrick_core_abi::service::{ServiceError, ServiceOperation, ServiceRequest, ServiceResult};
+use carrick_core_abi::service::{
+    ExecSuccessorManifest, ServiceError, ServiceOperation, ServiceRequest, ServiceResult,
+};
 use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
 
 fn native_exception_signal(
@@ -32,8 +34,22 @@ fn native_exception_signal(
     }
 }
 
+enum PendingServiceReply {
+    Fault(Box<carrick_el1_abi::PortalGrantSlot>),
+    Exec(Box<ExecSuccessorManifest>),
+}
+impl PendingServiceReply {
+    fn address(&self) -> carrick_guest_arch::KernelVa {
+        let address = match self {
+            Self::Fault(reply) => core::ptr::from_ref(&**reply).addr(),
+            Self::Exec(reply) => core::ptr::from_ref(&**reply).addr(),
+        };
+        carrick_guest_arch::KernelVa::new(address as u64)
+    }
+}
+
 pub(super) struct PendingService<'a> {
-    reply: Option<Box<carrick_el1_abi::PortalGrantSlot>>,
+    reply: Option<PendingServiceReply>,
     /// Exec input is ring-owned guest memory. Its virtual address is published
     /// in the request and cannot be recycled until completion/cancellation ACK.
     _exec_payload: Option<Box<[u8]>>,
@@ -237,12 +253,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .service
             .bound_birth(self.key, self.binding.thread_generation, self.record)
             .map_err(service_error)?;
-        let reply = if matches!(operation, ServiceOperation::Fault(fault) if !fault.present)
-            && fault_sequence.is_some()
-        {
-            Some(FallibleBox::<carrick_el1_abi::PortalGrantSlot>::try_reserve()?.zeroed())
-        } else {
-            None
+        let successor_mm = matches!(operation, ServiceOperation::Exec { .. })
+            .then(|| {
+                self.runtime
+                    .zone
+                    .mm_issuer()
+                    .allocate()
+                    .and_then(|mm| carrick_core_abi::ReservationMm::new(mm.raw().get()))
+                    .ok_or(NativeProcessError::Exhausted)
+            })
+            .transpose()?;
+        let mut reply = match operation {
+            ServiceOperation::Fault(fault) if !fault.present && fault_sequence.is_some() => {
+                Some(PendingServiceReply::Fault(
+                    FallibleBox::<carrick_el1_abi::PortalGrantSlot>::try_reserve()?.zeroed(),
+                ))
+            }
+            ServiceOperation::Exec { .. } => Some(PendingServiceReply::Exec(
+                FallibleBox::<ExecSuccessorManifest>::try_reserve()?.zeroed(),
+            )),
+            _ => None,
         };
         let owner_queue = owner_wait
             .map(|_| {
@@ -273,11 +303,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         self.binding.generation,
                         operation,
                         fault_sequence,
-                        reply.as_ref().map(|slot| {
-                            carrick_guest_arch::KernelVa::new(
-                                core::ptr::from_ref(&**slot).addr() as u64
-                            )
-                        }),
+                        reply.as_ref().map(PendingServiceReply::address),
                     )
                     .map_err(service_error)
             }
@@ -290,6 +316,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(error);
             }
         };
+        if let Some(PendingServiceReply::Exec(manifest)) = reply.as_mut() {
+            **manifest = ExecSuccessorManifest::propose(
+                request.identity,
+                successor_mm.ok_or(NativeProcessError::Stale)?,
+            );
+        }
         self.runtime.graph.lock().insert_member_wait(
             self.record,
             MemberWait::Service(Box::new(PendingService {
@@ -583,7 +615,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Ok(NativeResume::NoPending);
         }
         if result == ServiceResult::Supplied
-            && let Some(reply) = &pending.reply
+            && let Some(PendingServiceReply::Fault(reply)) = &pending.reply
         {
             match self.service.apply_fault_reply(reply) {
                 Ok(()) => {}

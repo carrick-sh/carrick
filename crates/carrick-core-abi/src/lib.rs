@@ -37,3 +37,17 @@ mod open_lifetime;
 pub use open_lifetime::*;
 
 pub mod service;
+
+/// Integrity digest shared by fixed ABI records. This detects torn or
+/// mis-sized records; consumers must still authenticate every decoded field
+/// against their retained owner ledger.
+pub(crate) fn integrity_digest(words: &[u64]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for word in words {
+        for byte in word.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
