@@ -588,9 +588,9 @@ const AARCH64_VECTOR_CUR_EL_SPX_IRQ_OFFSET: usize = 0x280;
 const AARCH64_VECTOR_CUR_EL_SP0_SYNC_OFFSET: usize = 0x000;
 const AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET: usize = 0x200;
 
-pub const LINUX_HEAP_BASE: u64 = 0x40_0000_0000; // 256 GiB
-pub const LINUX_HEAP_SIZE: u64 = 128 * 1024 * 1024; // 128 MiB
-pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000; // 384 GiB
+pub use carrick_personality_linux::mm::{
+    LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE, LINUX_MMAP_SIZE_MAX,
+};
 // 32 GiB runtime mmap arena. The region is lazily backed (HVF demand-zeroes
 // touched pages; PROT_NONE reservations are never touched and cost nothing), so
 // the size is virtual-address-space, not RAM. A multithreaded Go program
@@ -600,7 +600,6 @@ pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000; // 384 GiB
 // as "pthread_create failed: Resource temporarily unavailable"). 32 GiB fits
 // below the interpreter base (512 GiB) and within the L1A page tables. Munmap'd
 // anonymous/private arena ranges are tracked in the dispatcher and reused.
-pub const LINUX_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
 /// ELF interpreter (ld.so) load base. Above the PIE main-image base
 /// (`crate::elf::LINUX_PIE_DEFAULT_BASE`, 544 GiB) — Linux also loads the
 /// interpreter above the main image — and below the shared aperture
@@ -613,7 +612,7 @@ pub const LINUX_INTERPRETER_BASE: u64 = 0x8C_0000_0000; // 560 GiB
 /// Largest the mmap arena may grow to before colliding with the PIE
 /// main-image base (544 GiB) — the whole VA gap above `LINUX_MMAP_BASE`
 /// (160 GiB).
-pub const LINUX_MMAP_SIZE_MAX: u64 = crate::elf::LINUX_PIE_DEFAULT_BASE - LINUX_MMAP_BASE;
+const _: () = assert!(LINUX_MMAP_SIZE_MAX == crate::elf::LINUX_PIE_DEFAULT_BASE - LINUX_MMAP_BASE);
 
 /// Resolve the arena size (bytes) from a requested GiB count, clamped to
 /// `[LINUX_MMAP_SIZE, LINUX_MMAP_SIZE_MAX]` — never below the 32 GiB Go-multithread

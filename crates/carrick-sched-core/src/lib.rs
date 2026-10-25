@@ -971,6 +971,21 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         self.control_slot.store(id.control_slot, Ordering::Relaxed);
     }
 
+    /// Replace the identity of the exact record held `OnCpu` by the caller.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own this record through the claim protocol and must
+    /// have excluded every scheduler publication for it. `expected` prevents
+    /// an old exec continuation from rebinding a recycled record.
+    pub unsafe fn rebind_owned(&self, expected: ThreadIdentity, successor: ThreadIdentity) -> bool {
+        if !matches!(self.claim(), Claim::OnCpu { .. }) || self.identity() != expected {
+            return false;
+        }
+        self.set_identity(successor);
+        true
+    }
+
     /// Whether the thread may run on a slot bound to guest CPU `cpu_plus_one`
     /// (0: the slot's CPU is unknown, which allows any thread).
     fn allows_cpu(&self, cpu_plus_one: u32) -> bool {

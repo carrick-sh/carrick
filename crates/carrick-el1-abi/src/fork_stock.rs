@@ -17,7 +17,8 @@ use core::num::NonZeroU64;
 
 #[allow(unused_imports)]
 pub use crate::{
-    GRANT_OP_CHILD_RETIRE, GRANT_OP_EXEC_ADOPT, GRANT_OP_FORK_STOCK, GRANT_OP_ROOT_EXIT,
+    GRANT_OP_CHILD_RETIRE, GRANT_OP_EXEC_ADOPT, GRANT_OP_EXEC_SETTLE, GRANT_OP_FORK_STOCK,
+    GRANT_OP_ROOT_EXIT,
 };
 
 /// x86 synchronous I/O port for physical fork stock loans and settlements.
