@@ -4859,7 +4859,7 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
     let stage2_retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed = std::sync::Arc::clone(&stage2_retired);
 
-    let retired = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, move || {
+    let retired = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, move |_| {
         observed.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(true)
     })
@@ -5361,7 +5361,7 @@ fn cow_collision_is_rejected_before_backend_inventory_mutation() {
         },
     };
 
-    let error = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(true))
+    let error = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, |_| Ok(true))
         .expect_err("colliding COW extent must fail closed");
     assert!(error.to_string().contains("before backend mutation"));
     assert_eq!(
@@ -5449,7 +5449,10 @@ fn cow_split_commit_preserves_old_owner_and_publishes_replacement_owner() {
         },
     };
 
-    assert!(!HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(true)).unwrap());
+    assert!(
+        !HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, |_| Ok(true))
+            .unwrap()
+    );
     assert_eq!(
         inventory
             .extents
@@ -5521,7 +5524,7 @@ fn cow_stage2_recycle_holds_the_publication_lock() {
     let frames = std::sync::Arc::clone(&inventory.frames);
 
     assert!(
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
+        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, |_| {
             assert!(
                 frames.try_lock().is_none(),
                 "COW must retain the shared registry lock through old-IPA recycle",
@@ -5667,7 +5670,7 @@ fn cow_reuse_commit_keeps_destination_mapping_and_reference_counts() {
     assert_eq!(reservation.commit(()).batch().events().len(), 2);
     split.new_extent.stage2_owner.generation += 1;
     assert!(
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || panic!(
+        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, |_| panic!(
             "stale destination must fail before retirement"
         ))
         .is_err()
@@ -5675,7 +5678,9 @@ fn cow_reuse_commit_keeps_destination_mapping_and_reference_counts() {
     assert_eq!(inventory.extents[&old_key], old);
     assert_eq!(inventory.extents[&new_key], new);
     split.new_extent = new;
-    assert!(HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || Ok(true)).unwrap());
+    assert!(
+        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, |_| Ok(true)).unwrap()
+    );
     assert_eq!(inventory.extents.len(), 1);
     assert_eq!(inventory.extents[&new_key].mapping, new.mapping);
     let frames = inventory.frames.lock();
@@ -6064,7 +6069,7 @@ fn cow_then_fork_distant_alias_keeps_inventory_for_live_owner() {
         },
         retirement: shape.retirement,
     };
-    let retired = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
+    let retired = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, |_| {
         panic!("a live distant projection must prevent physical retirement")
     })
     .expect("commit COW while preserving old inventory authority");

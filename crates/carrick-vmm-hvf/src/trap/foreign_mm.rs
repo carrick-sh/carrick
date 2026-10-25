@@ -3669,16 +3669,26 @@ fn finish_foreign_cow_publication(
     let host_resolved = owner_rollback.is_some();
     let retired_old_stage2 = {
         let mut inventory = lease.state.frame_inventory.ledger.lock();
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-            HvfVmState::retire_stage2_extent_from_mappings_in(
-                &lease.custody,
-                &mut TaskMappingIndex::new(),
+        HvfVmState::commit_cow_inventory_split(
+            &mut inventory,
+            &split,
+            Some((
+                global_frame_stage2_identity_in(
+                    &lease.custody,
+                    split.old.stage2_base,
+                    split.old.stage2_length,
+                ),
                 Stage1UnpublicationReceipt::EditorRange(&stage1),
+            )),
+            |stage1| {
+                retire_released_cow_stage2_owner(
+                &lease.custody,
+                stage1,
                 split.old.stage2_base,
                 split.old.stage2_length,
-            )?;
-            Ok(true)
-        })
+                )
+            },
+        )
     }
         .unwrap_or_else(|error| {
             carrick_fatal!(

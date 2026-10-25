@@ -556,6 +556,32 @@ impl Stage1Unpublished {
     }
 }
 
+/// Retire the old physical owner of a COW split using the one-shot proof
+/// emitted by the reverse-map zero crossing. COW data extents are global
+/// frame owners; accepting any fallback mapping kind here would reopen a
+/// stage-2-first path outside the reference ledger.
+pub(crate) fn retire_released_cow_stage2_owner(
+    custody: &CarrierVmCustody,
+    stage1: Option<Stage1Unpublished>,
+    ipa: u64,
+    length: u64,
+) -> Result<bool, TrapError> {
+    let stage1 = stage1.ok_or_else(|| {
+        TrapError::Hypervisor(format!(
+            "COW stage-2 owner ({ipa:#x}, {length:#x}) reached retirement without a zero-reference proof"
+        ))
+    })?;
+    match retire_global_frame_host_owner_in(custody, stage1, ipa, length) {
+        GlobalFrameRetirementOutcome::RetiredUnmapped { .. }
+        | GlobalFrameRetirementOutcome::TerminalizedByVmDestroy { .. }
+        | GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+        | GlobalFrameRetirementOutcome::RetryPending { .. } => Ok(true),
+        outcome => Err(TrapError::Hypervisor(format!(
+            "COW stage-2 owner ({ipa:#x}, {length:#x}) retirement refused: {outcome:?}"
+        ))),
+    }
+}
+
 #[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) enum Stage2ReferenceReleaseError {
     Missing((u64, u64)),
@@ -2459,7 +2485,11 @@ impl HvfVmState {
     pub(crate) fn commit_cow_inventory_split(
         inventory: &mut HvpatchFrameInventory,
         split: &CowInventorySplit,
-        retire_stage2: impl FnOnce() -> Result<bool, TrapError>,
+        stage1: Option<(
+            Option<CarrierStage2RecordIdentity>,
+            Stage1UnpublicationReceipt<'_>,
+        )>,
+        retire_stage2: impl FnOnce(Option<Stage1Unpublished>) -> Result<bool, TrapError>,
     ) -> Result<bool, TrapError> {
         if split.replacement_is_existing {
             if split.new_extent.frame == split.old.frame
@@ -2497,10 +2527,6 @@ impl HvfVmState {
             &mut frames.extent_references,
             (split.old.frame, split.old_key.0, split.old_key.1),
         )?;
-        decrement_inventory_reference(
-            &mut frames.stage2_references,
-            (split.old.stage2_base, split.old.stage2_length),
-        )?;
         for fragment in &split.fragments {
             increment_inventory_reference(&mut frames.references, split.old.frame)?;
             increment_inventory_reference(
@@ -2534,6 +2560,23 @@ impl HvfVmState {
                 (split.new_extent.stage2_base, split.new_extent.stage2_length),
             )?;
         }
+        let old_lease = (split.old.stage2_base, split.old.stage2_length);
+        let stage1 = match stage1 {
+            Some((identity, receipt)) => frames
+                .release_stage2_reference(old_lease, identity, receipt)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "release COW stage-2 reference {old_lease:?}: {error:?}"
+                    ))
+                })?,
+            None => {
+                // VM-free ledger-shape tests which exercise no physical
+                // retirement retain the old arithmetic entry point. Every
+                // production caller supplies the exact stage-1 receipt.
+                decrement_inventory_reference(&mut frames.stage2_references, old_lease)?;
+                None
+            }
+        };
         if split.retirement.retire_old_frame && frames.references.contains_key(&split.old.frame) {
             return Err(TrapError::Hypervisor(
                 "HVPatch COW retired old frame retains backend mappings".to_owned(),
@@ -2553,7 +2596,7 @@ impl HvfVmState {
             // same registry lock. Keep it through physical-owner removal and
             // allocator release so the old zero-reference decision cannot go
             // stale before another COW reserves the recycled IPA.
-            let retired = retire_stage2()?;
+            let retired = retire_stage2(stage1)?;
             if !retired {
                 frames
                     .authority_retained_stage2

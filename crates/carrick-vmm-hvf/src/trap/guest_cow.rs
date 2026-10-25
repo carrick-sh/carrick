@@ -584,15 +584,21 @@ pub(crate) fn settle_one(
     let retired_old_stage2 = HvfVmState::commit_cow_inventory_split(
         &mut state.frame_inventory.ledger.lock(),
         &split,
-        || {
-            HvfVmState::retire_stage2_extent_from_mappings_in(
+        Some((
+            global_frame_stage2_identity_in(
                 custody,
-                &mut TaskMappingIndex::new(),
-                Stage1UnpublicationReceipt::EditorRange(&stage1),
                 split.old.stage2_base,
                 split.old.stage2_length,
-            )?;
-            Ok(true)
+            ),
+            Stage1UnpublicationReceipt::EditorRange(&stage1),
+        )),
+        |stage1| {
+            retire_released_cow_stage2_owner(
+                custody,
+                stage1,
+                split.old.stage2_base,
+                split.old.stage2_length,
+            )
         },
     )?;
     drop(registry);

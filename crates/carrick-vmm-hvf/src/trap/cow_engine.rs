@@ -4401,19 +4401,32 @@ impl HvfTaskState {
         }
         let inventory_ledger = std::sync::Arc::clone(&self.frame_inventory.ledger);
         let retired_old_stage2 = (|| {
+            let stage1 = stage1_leaf.as_ref().ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "host COW repoint did not produce an old-leaf retirement receipt".to_owned(),
+                )
+            })?;
             let mut inventory = inventory_ledger.lock();
-            HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-                let Some(stage1) = stage1_leaf.as_ref() else {
-                    return Ok(false);
-                };
-                self.retire_stage2_extent_for_cow(
-                    custody,
+            HvfVmState::commit_cow_inventory_split(
+                &mut inventory,
+                &split,
+                Some((
+                    global_frame_stage2_identity_in(
+                        custody,
+                        split.old.stage2_base,
+                        split.old.stage2_length,
+                    ),
                     Stage1UnpublicationReceipt::EditorRange(stage1),
-                    split.old.stage2_base,
-                    split.old.stage2_length,
-                )?;
-                Ok(true)
-            })
+                )),
+                |released| {
+                    retire_released_cow_stage2_owner(
+                        custody,
+                        released,
+                        split.old.stage2_base,
+                        split.old.stage2_length,
+                    )
+                },
+            )
         })()
         .unwrap_or_else(|error| {
             carrick_fatal!(
@@ -7718,22 +7731,6 @@ impl HvfTaskState {
 
     pub(crate) fn supersede_cow_receipts_for_cow(&self, va: u64, len: u64) {
         supersede_cow_receipts_in(&self.cow_deferred_publications, va, len);
-    }
-
-    pub(crate) fn retire_stage2_extent_for_cow(
-        &mut self,
-        custody: &CarrierVmCustody,
-        stage1: Stage1UnpublicationReceipt<'_>,
-        ipa: u64,
-        length: u64,
-    ) -> Result<(), TrapError> {
-        HvfVmState::retire_stage2_extent_from_mappings_in(
-            custody,
-            &mut self.mappings,
-            stage1,
-            ipa,
-            length,
-        )
     }
 }
 
