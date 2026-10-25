@@ -1280,6 +1280,8 @@ struct Receipt {
     // The proposal belongs to the same atomic checkpoint as the tree.
     #[serde(default)]
     pr_body: Option<String>,
+    worker: Worker,
+    contract: Contract,
 }
 
 /// One predicate for continuation and publication: a scoped receipt and tree.
@@ -1314,6 +1316,21 @@ fn install_worker_checkpoint(
     candidate: &Path,
     receipt: &Receipt,
 ) -> Result<(), ScalerError> {
+    install_worker_checkpoint_with(
+        state,
+        candidate,
+        receipt,
+        |file, path| file.persist(path).map(|_| ()).map_err(|error| error.error),
+        |path| std::fs::remove_dir_all(path),
+    )
+}
+fn install_worker_checkpoint_with(
+    state: &Path,
+    candidate: &Path,
+    receipt: &Receipt,
+    persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> Result<(), std::io::Error>,
+    remove_tree: impl FnOnce(&Path) -> Result<(), std::io::Error>,
+) -> Result<(), ScalerError> {
     use std::io::Write;
     let mut next_receipt = tempfile::NamedTempFile::new_in(state)?;
     next_receipt.write_all(&serde_json::to_vec(receipt)?)?;
@@ -1325,20 +1342,33 @@ fn install_worker_checkpoint(
     }
     let commit = (|| -> Result<(), ScalerError> {
         std::fs::rename(candidate, &work)?;
-        next_receipt
-            .persist(state.join("receipt.json"))
-            .map_err(|error| error.error)?;
+        persist(next_receipt, &state.join("receipt.json"))?;
         Ok(())
     })();
-    if commit.is_err() {
-        if work.exists() {
-            std::fs::remove_dir_all(&work)?;
+    if let Err(error) = commit {
+        let rollback = (|| -> Result<(), std::io::Error> {
+            if work.exists() {
+                remove_tree(&work)?;
+            }
+            if had_work {
+                std::fs::rename(&backup, &work)?;
+            }
+            Ok(())
+        })();
+        if let Err(rollback) = rollback {
+            // A surviving new tree must never inherit the old receipt.
+            match std::fs::remove_file(state.join("receipt.json")) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            return Err(ScalerError::Usage(format!(
+                "{error}; checkpoint rollback failed: {rollback}; receipt invalidated"
+            )));
         }
-        if had_work {
-            std::fs::rename(&backup, &work)?;
-        }
+        return Err(error);
     }
-    commit
+    Ok(())
 }
 
 fn admitted_base(resolved_main: bool) -> Result<String, ScalerError> {
@@ -1952,6 +1982,8 @@ fn produce(
                 expected_tip,
                 refused_workflow,
                 pr_body: proposed_body,
+                worker: dispatch.worker.clone(),
+                contract: contract.clone(),
             },
         )?;
     }
@@ -2735,7 +2767,7 @@ fn publish(
     root: &Path,
     dispatch: &Dispatch,
     receipt: &Receipt,
-    contract: &Contract,
+    _contract: &Contract,
     report_path: &Path,
     token: &str,
     runs: &mut agent_loop::RunCache,
@@ -2789,6 +2821,16 @@ fn publish(
             ],
         )?;
         let head = git(&work, &["rev-parse", "HEAD"])?;
+        let source = neutralize_mentions(&agent_loop::masked(
+            &format!(
+                "Published tree: worker `{}/{}` at `{}` (last successfully harvested checkpoint).",
+                receipt.worker.backend,
+                receipt.worker.model,
+                head.trim()
+            ),
+            token,
+        ));
+        let proposal = proposal.map(|body| format!("{source}\n\n{body}"));
         let existing = tip.split_whitespace().next();
         let retained =
             existing.is_some() && receipt.expected_tip.is_empty() && existing != Some(head.trim());
@@ -2893,7 +2935,10 @@ fn publish(
         } else {
             let body = match proposal {
                 Some(body) => body,
-                None => template_pr_body(contract, dispatch.issue, id, token)?,
+                None => format!(
+                    "{source}\n\n{}",
+                    template_pr_body(&receipt.contract, dispatch.issue, id, token)?
+                ),
             };
             let path = state.join("pr-body.md");
             std::fs::write(&path, body)?;
@@ -2927,9 +2972,12 @@ fn publish(
                 // Recovery prose is server-owned, independent of worker claims.
                 let recovery = Contract {
                     summary: "The server restored this template because the proposed body's closing references could not be verified.".into(),
-                    ..contract.clone()
+                    ..receipt.contract.clone()
                 };
-                let fallback = template_pr_body(&recovery, dispatch.issue, id, token)?;
+                let fallback = format!(
+                    "{source}\n\n{}",
+                    template_pr_body(&recovery, dispatch.issue, id, token)?
+                );
                 let reason = restore_pr_body(
                     root,
                     number,
@@ -3242,6 +3290,59 @@ mod tests {
         }
     }
     #[test]
+    fn p823_failed_harvest_body_describes_published_checkpoint() {
+        publication_fixture("failed-harvest-body");
+    }
+    #[test]
+    fn p823_double_checkpoint_failure_invalidates_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        std::fs::create_dir_all(state.join("work")).unwrap();
+        let candidate = root.path().join("candidate");
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::write(candidate.join("new-tree"), "new").unwrap();
+        let mut dispatch = validate_event(&event(), "tjfontaine").unwrap();
+        dispatch.base = "a".repeat(40);
+        dispatch.branch = "work/dispatch-634-42".into();
+        let receipt = Receipt {
+            base: dispatch.base.clone(),
+            branch: dispatch.branch.clone(),
+            exit_code: 0,
+            expected_tip: String::new(),
+            refused_workflow: false,
+            pr_body: None,
+            worker: dispatch.worker.clone(),
+            contract: Contract {
+                loop_summary: None,
+                status: ContractStatus::Done,
+                summary: "old checkpoint".into(),
+                tests: vec![],
+                risks: vec![],
+            },
+        };
+        std::fs::write(
+            state.join("receipt.json"),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        let error = install_worker_checkpoint_with(
+            &state,
+            &candidate,
+            &receipt,
+            |_, _| Err(std::io::Error::other("fixture receipt commit failed")),
+            |_| Err(std::io::Error::other("fixture rollback removal failed")),
+        );
+        assert!(error.is_err());
+        assert!(
+            state.join("work/new-tree").is_file(),
+            "double failure was not reached"
+        );
+        assert!(
+            worker_checkpoint(&state, &dispatch).is_err(),
+            "double checkpoint failure left a new tree paired with an old receipt"
+        );
+    }
+    #[test]
     fn p849_rebase_reports_only_pr_commits_and_names_main_base() {
         publication_fixture("rebase-evidence");
     }
@@ -3422,7 +3523,7 @@ fi
         run["status"] = "completed".into();
         std::fs::write(outer.join("original.json"), run.to_string()).unwrap();
         std::fs::write(outer.join("pr.json"), json!([pr.clone()]).to_string()).unwrap();
-        let contract = Contract {
+        let mut contract = Contract {
             loop_summary: None,
             status: ContractStatus::Done,
             summary: "implemented".into(),
@@ -3436,7 +3537,14 @@ fi
             expected_tip: String::new(),
             refused_workflow: false,
             pr_body: None,
+            worker: dispatch.worker.clone(),
+            contract: contract.clone(),
         };
+        if witness == "failed-harvest-body" {
+            contract.summary =
+                "Worker production/harvest failed: latest candidate discarded".into();
+            contract.status = ContractStatus::Failed;
+        }
         let report = state.join("report.md");
         std::fs::write(&report, "").unwrap();
         if matches!(
@@ -3554,6 +3662,16 @@ fi
         }
         let body = regular_text(&state.join("pr-body.md")).unwrap();
         assert!(body.contains("Closes #634") && body.contains("Dispatch run:"));
+        if witness == "failed-harvest-body" {
+            assert!(
+                body.contains("implemented") && !body.contains("latest candidate discarded"),
+                "PR body describes the failed harvest instead of the published tree"
+            );
+            assert!(
+                body.contains("Published tree: worker"),
+                "PR body does not identify the harvested worker"
+            );
+        }
         if witness == "closing" {
             assert_eq!(
                 body.lines().filter(|s| s.starts_with("Closes #")).count(),

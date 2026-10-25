@@ -189,7 +189,11 @@ worker deadline. Retirement, permission hand-back, snapshot, checkpoint and
 result collection use the reserved window. A timed-out worker retains partial
 work and logs with a failed timeout contract. Harvest failures name the original
 error and discard the failed candidate. The last successfully harvested tree
-and its receipt stay available for continuation and publication; without that
+and its receipt stay available for continuation and publication. The receipt
+retains that worker's model and contract; the PR body identifies the published
+checkpoint and uses its claims, even after a later harvest fails. A failed
+checkpoint install restores the previous pair, or invalidates the receipt if
+rollback also fails. Without a valid
 pair, publication is refused with a named reason. Production is never rerun as
 a setup failure.
 The reserve is deducted from worker and wall time, rather than added after
@@ -198,7 +202,9 @@ loop step for retirement and reporting. The workflow stamps
 `CARRICK_DISPATCH_STEP_STARTED_AT` before acquiring the host lease; the working
 window is capped at step start + 47 minutes - the five-minute final reserve,
 so lease waits consume working time. Post-loop capture has its own 90-second
-window within that reserve. The loop also stops by job minute 55
+window within that reserve. If final capture fails after finish, the existing
+contract, handoff and logs are re-masked and scanned for upload; scan failures
+still disable upload. The loop also stops by job minute 55
 to leave five minutes of the 60-minute job for finalization and upload. There
 are no dispatch tier tables or tier-selected credentials. The loop chooses
 from live capacity and explains its choice in the outcome. No retries or
