@@ -1,6 +1,7 @@
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 
 const SYNTHETIC_SECRET: &str = "synthetic-never-a-real-credential";
@@ -569,7 +570,7 @@ fn serial_host_execute_retains_bounded_redacted_stderr_and_strips_library_paths(
     assert!(!format!("{sig_err:?}").contains(absent_secret));
 
     let mut readiness_pipe = TestPipe::new().unwrap();
-    let readiness_write_fd = readiness_pipe.write_fd;
+    let readiness_write_fd = readiness_pipe.write_fd().unwrap().as_raw_fd();
 
     let mut command = Command::new("/bin/sh");
     command.args([
@@ -590,7 +591,11 @@ fn serial_host_execute_retains_bounded_redacted_stderr_and_strips_library_paths(
     let timeout_err =
         execute_with_readiness(&mut command, &[], Duration::from_millis(50), |_child_pid| {
             readiness_pipe.close_write();
-            wait_for_pipe_readiness(readiness_pipe.read_fd, Duration::from_secs(60))
+            wait_for_pipe_outcome(
+                readiness_pipe.read_fd().unwrap(),
+                PipeOutcome::Byte,
+                Duration::from_secs(60),
+            )
         })
         .unwrap_err();
     assert!(timeout_err.to_string().contains("sh timed out after 50ms"));
@@ -641,8 +646,8 @@ fn serial_host_execute_retains_bounded_redacted_stderr_and_strips_library_paths(
 }
 
 struct TestPipe {
-    read_fd: libc::c_int,
-    write_fd: libc::c_int,
+    read_fd: Option<OwnedFd>,
+    write_fd: Option<OwnedFd>,
 }
 
 impl TestPipe {
@@ -651,47 +656,53 @@ impl TestPipe {
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(ScalerError::Io(std::io::Error::last_os_error()));
         }
-        let make_fd = |raw_fd: libc::c_int| -> Result<libc::c_int, ScalerError> {
-            let high_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD, 10) };
+        let (pipe_read, pipe_write) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let make_high_fd = |fd: &OwnedFd| -> Result<OwnedFd, ScalerError> {
+            let high_fd = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
             if high_fd < 0 {
                 return Err(ScalerError::Io(std::io::Error::last_os_error()));
             }
-            unsafe {
-                libc::fcntl(high_fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                libc::close(raw_fd);
-            }
-            Ok(high_fd)
+            Ok(unsafe { OwnedFd::from_raw_fd(high_fd) })
         };
-        let read_fd = make_fd(fds[0])?;
-        let write_fd = make_fd(fds[1])?;
-        Ok(Self { read_fd, write_fd })
+        let read_fd = make_high_fd(&pipe_read)?;
+        let write_fd = make_high_fd(&pipe_write)?;
+        Ok(Self {
+            read_fd: Some(read_fd),
+            write_fd: Some(write_fd),
+        })
+    }
+
+    fn read_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.read_fd.as_ref().map(OwnedFd::as_fd)
+    }
+
+    fn write_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.write_fd.as_ref().map(OwnedFd::as_fd)
     }
 
     fn close_write(&mut self) {
-        if self.write_fd >= 0 {
-            unsafe { libc::close(self.write_fd) };
-            self.write_fd = -1;
-        }
+        self.write_fd = None;
     }
 
     fn close_read(&mut self) {
-        if self.read_fd >= 0 {
-            unsafe { libc::close(self.read_fd) };
-            self.read_fd = -1;
-        }
+        self.read_fd = None;
     }
 }
 
-impl Drop for TestPipe {
-    fn drop(&mut self) {
-        self.close_read();
-        self.close_write();
-    }
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PipeOutcome {
+    Byte,
+    Eof,
 }
 
-fn wait_for_pipe_readiness(read_fd: libc::c_int, limit: Duration) -> Result<(), ScalerError> {
+fn wait_for_pipe_outcome(
+    read_fd: BorrowedFd<'_>,
+    expected: PipeOutcome,
+    limit: Duration,
+) -> Result<(), ScalerError> {
     let mut pollfd = libc::pollfd {
-        fd: read_fd,
+        fd: read_fd.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
@@ -701,15 +712,33 @@ fn wait_for_pipe_readiness(read_fd: libc::c_int, limit: Duration) -> Result<(), 
         return Err(ScalerError::Io(std::io::Error::last_os_error()));
     }
     if ret == 0 {
-        return Err(ScalerError::External("readiness signal timed out"));
+        return Err(ScalerError::External(match expected {
+            PipeOutcome::Byte => "readiness signal timed out",
+            PipeOutcome::Eof => "process group pipe EOF timed out",
+        }));
     }
     let mut buf = [0u8; 1];
-    let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    let n = unsafe {
+        libc::read(
+            read_fd.as_raw_fd(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
     if n < 0 {
         return Err(ScalerError::Io(std::io::Error::last_os_error()));
     }
-    if n == 0 {
-        return Err(ScalerError::External("child exited before readiness"));
+    match expected {
+        PipeOutcome::Byte => {
+            if n == 0 {
+                return Err(ScalerError::External("child exited before readiness"));
+            }
+        }
+        PipeOutcome::Eof => {
+            if n != 0 {
+                return Err(ScalerError::External("expected EOF, read bytes from pipe"));
+            }
+        }
     }
     Ok(())
 }
@@ -719,8 +748,8 @@ fn serial_host_execute_timeout_retains_stderr_when_child_is_descheduled_before_f
     let absent_secret = "absent-from-input-secret";
     let mut readiness_pipe = TestPipe::new().unwrap();
     let mut gate_pipe = TestPipe::new().unwrap();
-    let readiness_write_fd = readiness_pipe.write_fd;
-    let gate_read_fd = gate_pipe.read_fd;
+    let readiness_write_fd = readiness_pipe.write_fd().unwrap().as_raw_fd();
+    let gate_read_fd = gate_pipe.read_fd().unwrap().as_raw_fd();
 
     // Hold the child behind an event-driven gate before its first write, so
     // that descheduling the child (SIGSTOP) and keeping it stopped for longer
@@ -762,12 +791,116 @@ fn serial_host_execute_timeout_retains_stderr_when_child_is_descheduled_before_f
             unsafe {
                 assert_eq!(libc::kill(pid, libc::SIGCONT), 0);
             }
-            wait_for_pipe_readiness(readiness_pipe.read_fd, Duration::from_secs(60))
+            wait_for_pipe_outcome(
+                readiness_pipe.read_fd().unwrap(),
+                PipeOutcome::Byte,
+                Duration::from_secs(60),
+            )
         })
         .unwrap_err();
     assert!(timeout_err.to_string().contains("sh timed out after 50ms"));
     assert!(timeout_err.to_string().contains("waiting for runner"));
     assert!(!format!("{timeout_err:?}").contains(absent_secret));
+}
+
+#[test]
+fn serial_host_execute_readiness_panic_kills_and_reaps_child() {
+    let mut readiness_pipe = TestPipe::new().unwrap();
+    let mut lifecycle_pipe = TestPipe::new().unwrap();
+    let block_pipe = TestPipe::new().unwrap();
+    let readiness_write_fd = readiness_pipe.write_fd().unwrap().as_raw_fd();
+    let lifecycle_write_fd = lifecycle_pipe.write_fd().unwrap().as_raw_fd();
+    let block_read_fd = block_pipe.read_fd().unwrap().as_raw_fd();
+
+    // Redirect the external grandchild's output so reader-thread joins cannot wait on it.
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "cat <&4 >/dev/null 2>&1 & printf ready >&3; wait"]);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(readiness_write_fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(block_read_fd, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(lifecycle_write_fd, 5) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let observed_pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let observed_pid_clone = observed_pid.clone();
+
+    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = execute_with_readiness(&mut command, &[], Duration::from_millis(50), |child_pid| {
+            observed_pid_clone.store(child_pid, std::sync::atomic::Ordering::SeqCst);
+            readiness_pipe.close_write();
+            lifecycle_pipe.close_write();
+            wait_for_pipe_outcome(
+                readiness_pipe.read_fd().unwrap(),
+                PipeOutcome::Byte,
+                Duration::from_secs(60),
+            )?;
+            panic!("intentional readiness panic for test witness");
+        });
+    }));
+
+    assert!(panic_result.is_err(), "expected readiness hook to panic");
+    let child_pid = observed_pid.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(child_pid > 0, "child pid was never observed");
+
+    let pid = i32::try_from(child_pid).unwrap();
+    struct KillOnDrop {
+        pgid: i32,
+        armed: bool,
+    }
+    impl KillOnDrop {
+        fn new(pgid: i32) -> Self {
+            Self { pgid, armed: true }
+        }
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if self.armed {
+                unsafe {
+                    libc::kill(-self.pgid, libc::SIGKILL);
+                    let mut status = 0;
+                    libc::waitpid(self.pgid, &mut status, libc::WNOHANG);
+                }
+            }
+        }
+    }
+    let mut cleanup_guard = KillOnDrop::new(pid);
+
+    lifecycle_pipe.close_write();
+    let eof_status = wait_for_pipe_outcome(
+        lifecycle_pipe.read_fd().unwrap(),
+        PipeOutcome::Eof,
+        Duration::from_secs(60),
+    );
+    assert!(
+        eof_status.is_ok(),
+        "process group members were still alive after readiness hook panic: {eof_status:?}"
+    );
+
+    let ret = unsafe { libc::kill(pid, 0) };
+    let err = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!(
+        ret, -1,
+        "child pid {pid} was still alive after readiness hook panic"
+    );
+    assert_eq!(
+        err,
+        Some(libc::ESRCH),
+        "expected ESRCH indicating child {pid} was reaped, got {err:?}"
+    );
+
+    cleanup_guard.disarm();
 }
 
 fn startup_fixture(agents: bool, pooled: bool, rights: Value) -> Result<(), ScalerError> {
