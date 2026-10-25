@@ -460,6 +460,25 @@ impl AddressSpaces {
             .fetch_and(!(GATE_CLOSED | GATE_INITIAL_BIND), Ordering::SeqCst);
     }
 
+    /// Host observation of an exact still-closed publication. This grants no
+    /// install permission; it only authenticates the roots a consuming owner
+    /// is about to bind before opening the entry.
+    pub fn closed_grant(&self, index: SpaceIndex, key: u64) -> Option<SpaceGrant> {
+        let entry = self.entry(index);
+        let gate = entry.gate.load(Ordering::SeqCst);
+        let ttbr0 = entry.ttbr0.load(Ordering::Acquire);
+        let ttbr1 = entry.ttbr1.load(Ordering::Acquire);
+        if gate & GATE_CLOSED == 0 || entry.key.load(Ordering::SeqCst) != key || ttbr0 == 0 {
+            return None;
+        }
+        Some(SpaceGrant {
+            index,
+            ttbr0,
+            ttbr1,
+            cow_owed: None,
+        })
+    }
+
     /// Mark one never-opened initial publication as eligible for the exact
     /// host BIND service. Fork children use a different closed constructor
     /// and never receive this bit.

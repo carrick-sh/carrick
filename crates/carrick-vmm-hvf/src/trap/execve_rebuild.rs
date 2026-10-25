@@ -367,6 +367,38 @@ impl PreparedNativeExecSuccessor {
             ),
         }
     }
+
+    pub(crate) fn entry(&self) -> u64 {
+        self.global.as_ref().map_or(0, |global| global.plan.entry)
+    }
+
+    pub(crate) fn stack_pointer(&self) -> Option<u64> {
+        self.global
+            .as_ref()
+            .and_then(|global| global.plan.initial_stack_pointer)
+    }
+
+    fn take_install_parts(
+        &mut self,
+    ) -> (
+        GlobalExecPlan,
+        (u64, u64),
+        carrick_hal::asid::AsidGeneration,
+    ) {
+        let global = self.global.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvf::exec_preparation",
+                "prepared native exec plan consumed twice"
+            )
+        });
+        let asid = self.asid.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvf::exec_preparation",
+                "prepared native exec ASID consumed twice"
+            )
+        });
+        (global, self.root_slot, asid)
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -836,6 +868,49 @@ fn install_prepared_exec_backing(
         Err(failure) => return Err(ExecBackingTransactionError::RolledBack(failure.error)),
     };
     Ok(published)
+}
+
+/// Consume the carrier-retained native successor at the same physical
+/// installation transaction used by host-graph exec. The returned custody is
+/// sendable process-stock ownership; no host task or `KernelContext` is
+/// reconstructed.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn install_native_exec_successor(
+    mut successor: PreparedNativeExecSuccessor,
+) -> Result<
+    (
+        crate::fork_stock::NativeChildPhysical,
+        carrick_hal::asid::AsidGeneration,
+    ),
+    TrapError,
+> {
+    let custody = std::sync::Arc::clone(&successor.custody);
+    let (global, root_slot, asid) = successor.take_install_parts();
+    let prepared = PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), global)?;
+    let published = install_prepared_exec_backing(prepared, root_slot).map_err(|failure| {
+        let message = match failure {
+            ExecBackingTransactionError::RolledBack(error) => error.to_string(),
+            ExecBackingTransactionError::Terminal(error) => error.to_string(),
+        };
+        TrapError::Hypervisor(format!("install native exec successor: {message}"))
+    })?;
+    let retainer =
+        super::owner_fork::ForkPhysicalCustody::new(custody, std::sync::Arc::new(|_, _| None));
+    let mut inherited = Vec::with_capacity(published.regions.len());
+    for region in &published.regions {
+        let retained = retainer
+            .retain_published_exec_mapping(
+                region.start,
+                region.physical_ipa,
+                region.physical_size as u64,
+            )?
+            .ok_or_else(|| {
+                TrapError::Hypervisor("published native exec mapping lost physical custody".into())
+            })?;
+        inherited.push(retained);
+    }
+    let physical = crate::fork_stock::NativeChildPhysical::new(inherited);
+    Ok((physical, asid))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
