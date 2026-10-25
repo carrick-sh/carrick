@@ -464,7 +464,7 @@ pub(super) enum StdioField {
 
 pub struct FileTableStdioGuard<'a> {
     guard: MutexGuard<'a, [bool; 3]>,
-    _mutation: FileTableMutationLease,
+    _mutation: FileTableMutationCustody<'a>,
     table: &'a FileTable,
     field: StdioField,
     before: [bool; 3],
@@ -510,6 +510,22 @@ impl Drop for FileTableStdioGuard<'_> {
 impl FileTable {
     pub(super) fn stdio_guard(&self, field: StdioField) -> FileTableStdioGuard<'_> {
         let mutation = self.mutation_lease();
+        self.stdio_guard_with_custody(field, FileTableMutationCustody::Owned(mutation))
+    }
+
+    pub(super) fn stdio_guard_borrowing<'a>(
+        &'a self,
+        field: StdioField,
+        mutation: &'a FileTableMutationLease,
+    ) -> FileTableStdioGuard<'a> {
+        self.stdio_guard_with_custody(field, FileTableMutationCustody::Borrowed(mutation))
+    }
+
+    fn stdio_guard_with_custody<'a>(
+        &'a self,
+        field: StdioField,
+        mutation: FileTableMutationCustody<'a>,
+    ) -> FileTableStdioGuard<'a> {
         let mut guard = match field {
             StdioField::Closed => self.closed_stdio.lock(),
             StdioField::Cloexec => self.stdio_cloexec.lock(),
