@@ -4196,9 +4196,9 @@ fn grant_gate_closed_after_selection_preserves_exact_owner_wait() {
 }
 
 #[test]
-fn grant_resume_reselects_mapping_range_protection_and_source_changed_while_parked() {
+fn grant_resume_reselects_exact_mapping_after_owner_edits_while_parked() {
     use carrick_el1::memory::reservations::{Decision, Placement};
-    for change in ["generation", "range", "protection", "source"] {
+    for change in ["unrelated", "range", "protection", "source"] {
         let region = Region::new();
         let zone = region.zone();
         let mm = admit_notified(&region, 77, ROOT, 1, 0);
@@ -4260,7 +4260,7 @@ fn grant_resume_reselects_mapping_range_protection_and_source_changed_while_park
                     .unwrap();
             } else {
                 let decision = match change {
-                    "generation" => owner
+                    "unrelated" => owner
                         .mmap(
                             Placement::Fixed(VA + 8192),
                             4096,
@@ -4309,10 +4309,17 @@ fn grant_resume_reselects_mapping_range_protection_and_source_changed_while_park
             let Ok(TransferStep::Supply(fresh)) = current else {
                 panic!("{change}: {current:?}");
             };
-            assert_ne!(
-                fresh.mapping_incarnation, window.mapping_incarnation,
-                "{change}"
-            );
+            if change == "source" {
+                assert_ne!(
+                    fresh.mapping_incarnation, window.mapping_incarnation,
+                    "replacing the selected mapping must change its incarnation"
+                );
+            } else {
+                assert_eq!(
+                    fresh.mapping_incarnation, window.mapping_incarnation,
+                    "an unrelated owner edit must retain this mapping's incarnation"
+                );
+            }
             assert_eq!(fresh.operation.incarnation, window.operation.incarnation);
             assert_eq!(fresh.host_backing, (change == "source").then_some(source));
         }

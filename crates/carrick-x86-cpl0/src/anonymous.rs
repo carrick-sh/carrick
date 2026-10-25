@@ -201,6 +201,7 @@ impl carrick_el1::memory::AnonymousPermissionEditor for X86AnonymousEditor {
 impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
     fn retire_and_invalidate(
         &mut self,
+        mm: carrick_el1_abi::ReservationMm,
         root: carrick_guest_arch::AddressSpaceRegister,
         va: carrick_guest_arch::UserVa,
         len: carrick_guest_arch::GuestLen,
@@ -208,6 +209,11 @@ impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
         let root = root.raw();
         let va = va.raw();
         let len = len.raw();
+        let Some(residency) = carrick_el1::isa::frame_grant_residency_guest()
+            .begin_retire_overlapping(mm.raw(), va, len)
+        else {
+            return Err(carrick_mmu_core::aarch64::GuestRetirementError::ResidencyBusy);
+        };
         self.edit(
             RootGpa::page_aligned(FrameGpa::new(root))
                 .ok_or(carrick_mmu_core::aarch64::GuestRetirementError::NotPrivateAnonymous)?,
@@ -215,7 +221,11 @@ impl carrick_el1::memory::AnonymousRetirementEditor for X86AnonymousEditor {
                 .ok_or(carrick_mmu_core::aarch64::GuestRetirementError::NotPrivateAnonymous)?,
             carrick_guest_arch::EditOperation::Unmap,
         )
-        .map_err(|_| carrick_mmu_core::aarch64::GuestRetirementError::NotPrivateAnonymous)
+        .map_err(|_| carrick_mmu_core::aarch64::GuestRetirementError::NotPrivateAnonymous)?;
+        if !residency.commit() {
+            return Err(carrick_mmu_core::aarch64::GuestRetirementError::RollbackFailed);
+        }
+        Ok(())
     }
 }
 
