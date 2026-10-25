@@ -37,6 +37,45 @@ impl Channel {
         );
         u64::from_ne_bytes(bytes)
     }
+    fn receive_bounded(&self, label: &str) -> Result<u64, String> {
+        let mut pollfd = libc::pollfd {
+            fd: self.read,
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 5_000) };
+        if ready < 0 {
+            return Err(format!(
+                "{label}: poll failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if ready == 0 {
+            return Err(format!("{label}: poll timed out after 5s"));
+        }
+        let mut bytes = [0u8; 8];
+        let read = unsafe { libc::read(self.read, bytes.as_mut_ptr().cast(), bytes.len()) };
+        if read != bytes.len() as isize {
+            return Err(format!(
+                "{label}: read returned {read}, revents={:#x}, errno={}",
+                pollfd.revents,
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(u64::from_ne_bytes(bytes))
+    }
+    fn close_read_end(&mut self) {
+        if self.read != self.write {
+            assert_eq!(unsafe { libc::close(self.read) }, 0, "close reader");
+            self.read = -1;
+        }
+    }
+    fn close_write_end(&mut self) {
+        if self.write != self.read {
+            assert_eq!(unsafe { libc::close(self.write) }, 0, "close writer");
+            self.write = -1;
+        }
+    }
     fn send_vector(&self, value: u64) {
         let mut bytes = value.to_ne_bytes();
         let iov = libc::iovec {
@@ -129,33 +168,59 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
     let workers: Vec<_> = channels
         .into_iter()
         .enumerate()
-        .map(|(pair, (request, response))| {
+        .map(|(pair, (mut request, mut response))| {
             std::thread::spawn(move || {
+                if child {
+                    request.close_write_end();
+                    response.close_read_end();
+                } else {
+                    request.close_read_end();
+                    response.close_write_end();
+                }
                 for round in 0..rounds {
                     let value = ((pair as u64 + 1) << 32) | (round as u64 + 1);
                     if child {
-                        assert_eq!(request.receive(), value, "inherited request identity");
+                        let received = request.receive_bounded("inherited request")?;
+                        if received != value {
+                            return Err(format!(
+                                "inherited request identity: got {received:#x}, expected {value:#x}"
+                            ));
+                        }
                         response.send(value ^ 0x1000_0000);
                     } else {
                         request.send(value);
-                        assert_eq!(
-                            response.receive(),
-                            value ^ 0x1000_0000,
-                            "inherited response identity"
-                        );
+                        let received = response.receive_bounded("inherited response")?;
+                        let expected = value ^ 0x1000_0000;
+                        if received != expected {
+                            return Err(format!(
+                                "inherited response identity: got {received:#x}, expected {expected:#x}"
+                            ));
+                        }
                     }
                 }
-                rounds
+                Ok::<usize, String>(rounds)
             })
         })
         .collect();
-    let completed: usize = workers
-        .into_iter()
-        .map(|worker| worker.join().expect("cross-process IPC worker"))
-        .sum();
-    assert_eq!(completed, pairs * rounds);
+    let mut completed = 0usize;
+    let mut worker_failure = None;
+    for worker in workers {
+        match worker.join() {
+            Ok(Ok(rounds)) => completed += rounds,
+            Ok(Err(error)) => {
+                worker_failure.get_or_insert(error);
+            }
+            Err(_) => {
+                worker_failure.get_or_insert_with(|| "worker panicked".to_owned());
+            }
+        };
+    }
     if child {
-        unsafe { libc::_exit(0) }
+        if let Some(error) = worker_failure {
+            eprintln!("child IPC worker failed: {error}");
+            unsafe { libc::_exit(101) }
+        }
+        unsafe { libc::_exit(i32::from(completed != pairs * rounds)) }
     }
     let mut status = 0;
     assert_eq!(
@@ -163,8 +228,22 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
         pid,
         "wait child"
     );
-    assert!(libc::WIFEXITED(status), "child status {status}");
-    assert_eq!(libc::WEXITSTATUS(status), 0, "child status {status}");
+    assert!(
+        libc::WIFEXITED(status),
+        "child status={status} signal={} parent_worker={worker_failure:?}",
+        libc::WTERMSIG(status)
+    );
+    assert_eq!(
+        libc::WEXITSTATUS(status),
+        0,
+        "child status={status} exit={} parent_worker={worker_failure:?}",
+        libc::WEXITSTATUS(status)
+    );
+    assert!(
+        worker_failure.is_none(),
+        "parent IPC worker failed: {worker_failure:?}"
+    );
+    assert_eq!(completed, pairs * rounds);
     println!("ipc-processes kind={kind} pairs={pairs} rounds={rounds} completed={completed}");
     0
 }
