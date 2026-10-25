@@ -194,9 +194,14 @@ The server's observed result governs the outcome status. A failed, timed-out
 or incomplete last worker, or a published HEAD created by the server as a
 checkpoint, forces a failed outcome even when the loop requests done. A later
 worker returning done does not validate an unchanged checkpoint. The server
+records a failed result and its reason for every admitted worker whose setup,
+fetch, review read, harvest, contract parsing or retirement fails.
+Only the last admitted worker governs this floor; an earlier failed attempt
+does not invalidate a later successful worker. The server
 verdict and evidence appear first; the loop's claimed status and summary are
-quoted below them. A successful worker that replaces the checkpoint with its
-own commit can recover the outcome.
+quoted below them. A successful worker that adds a normal commit on top of a
+checkpoint clears the floor. The checkpoint commit remains in the published
+history.
 
 Fallback outcome contracts come only from authenticated server outcome comments,
 never from PR bodies. `Outcome contract:` is reserved for those reports; body

@@ -1401,6 +1401,7 @@ struct Server<'a> {
     setup: &'a str,
     launcher: Box<dyn WorkerLauncher>,
     capacity: Option<(Instant, Value)>,
+    resume_fetched: bool,
 }
 impl Server<'_> {
     fn post(&self, body: &str) -> Result<(), ScalerError> {
@@ -1453,11 +1454,10 @@ impl Server<'_> {
         let manual_repair = applied.manual_repair.clone();
         let mut observations = Vec::new();
         if self.used.workers > 0
-            && (u32::try_from(self.history.len()).ok() != Some(self.used.workers)
-                || self
-                    .history
-                    .last()
-                    .is_none_or(|worker| worker.status == ContractStatus::Failed))
+            && self
+                .history
+                .last()
+                .is_none_or(|worker| worker.status == ContractStatus::Failed)
         {
             observations
                 .push("the last worker failed, timed out, or did not produce complete output");
@@ -1985,6 +1985,7 @@ impl Server<'_> {
                     return Err(error);
                 }
                 let started = Instant::now();
+                let worker_index = self.history.len();
                 let result = (|| -> Result<Value, ScalerError> {
                     let remaining = self.policy.worker_minutes * 60_000 - self.used.worker_millis;
                     let worker_deadline =
@@ -2022,7 +2023,7 @@ impl Server<'_> {
                     self.write_handoff()?;
                     self.dispatch.loop_deadline = Some(agent_deadline);
                     self.dispatch.harvest_deadline = Some(worker_deadline);
-                    if self.dispatch.resume && self.history.is_empty() {
+                    if self.dispatch.resume && !self.resume_fetched {
                         git(
                             self.root,
                             &[
@@ -2034,6 +2035,7 @@ impl Server<'_> {
                                 &format!("refs/heads/{0}:refs/heads/{0}", self.dispatch.branch),
                             ],
                         )?;
+                        self.resume_fetched = true;
                     }
                     timed_phase("worker.produce", || {
                         self.launcher.produce(self.root, &self.dispatch, self.setup)
@@ -2053,6 +2055,21 @@ impl Server<'_> {
                 self.used.worker_millis = self.used.worker_millis.saturating_add(
                     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 );
+                if let Err(error) = &result {
+                    // One result per admission, even if setup/harvest failed
+                    // before a worker contract existed, or its handoff failed.
+                    self.history.truncate(worker_index);
+                    self.history.push(Contract {
+                        loop_summary: None,
+                        status: ContractStatus::Failed,
+                        summary: format!(
+                            "Worker failed after admission: {}",
+                            masked(&error.to_string(), &self.token)
+                        ),
+                        tests: vec![],
+                        risks: vec![],
+                    });
+                }
                 result
             }
             Request::Publish(_) => {
@@ -2399,6 +2416,7 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
         setup,
         launcher: Box::new(NativeLauncher::default()),
         capacity: None,
+        resume_fetched: false,
     };
     let result = (|| -> Result<(), ScalerError> {
         let commands = CommandWindow::until(server.deadline);
@@ -2572,6 +2590,7 @@ mod tests {
             setup: "success/success",
             launcher: Box::new(NativeLauncher::default()),
             capacity: None,
+            resume_fetched: false,
         }
     }
     #[test]
@@ -3356,6 +3375,208 @@ mod tests {
         }
     }
     #[test]
+    fn admitted_worker_inline_read_error_is_recorded() {
+        prelaunch_error_fixture(true);
+    }
+    #[test]
+    fn admitted_worker_prelaunch_error_then_done_recovers_outcome() {
+        prelaunch_error_fixture(false);
+    }
+    fn prelaunch_error_fixture(check_history: bool) {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let mut dispatch = native_dispatch(&base);
+            dispatch.review = true;
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            let (native, calls) = native_fixture(vec![FixtureTurn::Good]);
+            server.launcher = Box::new(ObservedNativeLauncher(native));
+            std::fs::write(root.join("fail-next-endpoint"), "reviews/77/comments").unwrap();
+            let error = server.execute(worker_request()).unwrap_err();
+            assert_eq!(server.used.workers, 1);
+            assert_eq!(calls.get(), 0, "first worker unexpectedly launched");
+            if check_history {
+                assert_eq!(server.history.len(), 1, "admitted error has no result");
+                assert_eq!(server.history[0].status, ContractStatus::Failed);
+                assert!(server.history[0].summary.contains(&error.to_string()));
+            }
+            server.execute(worker_request()).unwrap();
+            assert_eq!(calls.get(), 1);
+            std::fs::write(root.join("remote-tip"), "").unwrap();
+            server.execute(Request::Publish(Empty {})).unwrap();
+            server
+                .execute(Request::Finish(Outcome {
+                    status: ContractStatus::Done,
+                    summary: "Recovered successfully".into(),
+                }))
+                .unwrap();
+            let outcome: Contract = serde_json::from_str(
+                &regular_text(&root.join("dispatch-output/contract.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                outcome.status,
+                ContractStatus::Done,
+                "earlier prelaunch error incorrectly floors recovered outcome"
+            );
+        });
+    }
+    struct ErrorLauncher {
+        native: NativeLauncher,
+        phase: &'static str,
+    }
+    impl WorkerLauncher for ErrorLauncher {
+        fn capacity(&mut self, _: Instant) -> Result<Value, ScalerError> {
+            Ok(live_capacity())
+        }
+        fn produce(
+            &mut self,
+            root: &Path,
+            dispatch: &Dispatch,
+            setup: &str,
+        ) -> Result<(), ScalerError> {
+            self.native.produce(root, dispatch, setup)?;
+            let package =
+                PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap()).join("dispatch-output");
+            match self.phase {
+                "mask" => std::fs::write(package.join("unexpected"), "unsafe artifact")?,
+                "contract" => std::fs::write(package.join("contract.json"), "invalid JSON")?,
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+    struct ErrorHost {
+        record_failure: bool,
+    }
+    impl WorkerHost for ErrorHost {
+        fn initialize(&mut self) -> Result<(), ScalerError> {
+            if self.record_failure {
+                let package =
+                    PathBuf::from(std::env::var_os("RUNNER_TEMP").unwrap()).join("dispatch-output");
+                std::fs::create_dir(package.join("contract.json"))?;
+            }
+            Err(ScalerError::Guard("fixture initialization error"))
+        }
+        fn prepare(&mut self, _: &Path, _: &Path, _: &str) -> Result<(), ScalerError> {
+            Ok(())
+        }
+        fn agent(&mut self, _: &Path, _: &Dispatch) -> Result<i32, ScalerError> {
+            Err(ScalerError::Guard("unexpected worker launch"))
+        }
+        fn retire(&mut self) -> Result<(), ScalerError> {
+            if self.record_failure {
+                Ok(())
+            } else {
+                Err(ScalerError::Guard("fixture retirement error"))
+            }
+        }
+        fn hand_back(&mut self, _: &Path) -> Result<(), ScalerError> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn admitted_worker_mask_error_is_recorded() {
+        admitted_error_fixture("mask");
+    }
+    #[test]
+    fn admitted_worker_contract_error_is_recorded() {
+        admitted_error_fixture("contract");
+    }
+    #[test]
+    fn admitted_worker_retirement_error_is_recorded() {
+        admitted_error_fixture("retire");
+    }
+    #[test]
+    fn admitted_worker_failure_recording_error_is_recorded() {
+        admitted_error_fixture("record");
+    }
+    fn admitted_error_fixture(phase: &'static str) {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            let native = if matches!(phase, "retire" | "record") {
+                NativeLauncher {
+                    host: Box::new(ErrorHost {
+                        record_failure: phase == "record",
+                    }),
+                }
+            } else {
+                native_fixture(vec![FixtureTurn::Good]).0
+            };
+            server.launcher = Box::new(ErrorLauncher { native, phase });
+            let error = server.execute(worker_request()).unwrap_err();
+            assert_eq!(server.used.workers, 1);
+            assert_eq!(
+                server.history.len(),
+                1,
+                "admitted {phase} error has no result"
+            );
+            assert_eq!(server.history[0].status, ContractStatus::Failed);
+            assert!(
+                server.history[0].summary.contains(&error.to_string()),
+                "error reason lost"
+            );
+        });
+    }
+    #[test]
+    fn admitted_worker_resume_fetch_error_is_recorded_and_fetch_retried() {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let mut dispatch = native_dispatch(&base);
+            dispatch.resume = true;
+            dispatch.selected_tip = Some(dispatch.base.clone());
+            git(&base, &["branch", &dispatch.branch]).unwrap();
+            std::fs::write(root.join("remote-tip"), &dispatch.base).unwrap();
+            let script = root.join("bin/git");
+            let source = regular_text(&script).unwrap();
+            let needle = "fetch)\n  if test";
+            assert!(source.contains(needle));
+            std::fs::write(
+                &script,
+                source.replace(
+                    needle,
+                    r#"fetch)
+  for ref do :; done
+  case "$ref" in refs/heads/work/dispatch-*)
+   printf 'attempt\n' >> "$RUNNER_TEMP/resume-fetch-attempts"
+   if test ! -f "$RUNNER_TEMP/resume-fetch-failed"; then
+    touch "$RUNNER_TEMP/resume-fetch-failed"; echo 'fixture resume fetch error' >&2; exit 93
+   fi ;;
+  esac
+  if test"#,
+                ),
+            )
+            .unwrap();
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            let (native, calls) = native_fixture(vec![FixtureTurn::Good]);
+            server.launcher = Box::new(ObservedNativeLauncher(native));
+            let error = server.execute(worker_request()).unwrap_err();
+            assert_eq!(calls.get(), 0);
+            assert_eq!(
+                server.history.len(),
+                1,
+                "admitted resume fetch error has no result"
+            );
+            assert_eq!(server.history[0].status, ContractStatus::Failed);
+            assert!(server.history[0].summary.contains(&error.to_string()));
+            server.execute(worker_request()).unwrap();
+            assert_eq!(server.history.len(), 2);
+            assert_eq!(server.history[1].status, ContractStatus::Done);
+            assert_eq!(
+                regular_text(&root.join("resume-fetch-attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2,
+                "recording the failure incorrectly prevented the next resume fetch"
+            );
+        });
+    }
+    #[test]
     fn followup_missing_worker_output_floors_finish_done() {
         outcome_floor_fixture(vec![FixtureTurn::MissingResult], false);
     }
@@ -3388,8 +3609,23 @@ mod tests {
             let count = turns.len();
             let (native, _) = native_fixture(turns.clone());
             server.launcher = Box::new(ObservedNativeLauncher(native));
+            let mut checkpoint_head = None;
             for _ in 0..count {
                 server.execute(worker_request()).unwrap();
+                let state = crate::agent_runner::state().unwrap();
+                let receipt = worker_checkpoint(&state, &server.dispatch)
+                    .unwrap()
+                    .unwrap();
+                if receipt.checkpointed {
+                    checkpoint_head = Some(receipt.head);
+                } else if let Some(checkpoint) = &checkpoint_head {
+                    assert_ne!(&receipt.head, checkpoint);
+                    git(
+                        &state.join("work"),
+                        &["merge-base", "--is-ancestor", checkpoint, &receipt.head],
+                    )
+                    .expect("normal recovery commit must retain checkpoint history");
+                }
             }
             if publish_tree {
                 assert_eq!(
