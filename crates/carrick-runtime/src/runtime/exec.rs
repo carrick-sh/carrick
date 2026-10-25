@@ -103,7 +103,7 @@ fn prepare_native_exec_image(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct NativePreparedExecImage {
     _request: carrick_core_abi::service::ServiceIdentity,
-    loaded: LoadedExecImage,
+    plan: carrick_vmm_hvf::trap::GuestMappingPlan,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -112,8 +112,15 @@ impl core::fmt::Debug for NativePreparedExecImage {
         formatter
             .debug_struct("NativePreparedExecImage")
             .field("request", &self._request)
-            .field("entry", &self.loaded.image.entry())
+            .field("entry", &self.plan.entry)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_vmm_hvf::metadata_grant::NativeExecPreparation for NativePreparedExecImage {
+    fn into_mapping_plan(self: Box<Self>) -> carrick_vmm_hvf::trap::GuestMappingPlan {
+        self.plan
     }
 }
 
@@ -134,9 +141,11 @@ impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapabi
             None => carrick_fatal!("runtime::native_exec", "zero Linux errno"),
         };
         let loaded = prepare_native_exec_image(self, payload).map_err(fail)?;
+        let plan = carrick_vmm_hvf::trap::GuestMappingPlan::from_address_space(&loaded.image)
+            .map_err(|_| fail(crate::linux_abi::LINUX_ENOMEM))?;
         Ok(Box::new(NativePreparedExecImage {
             _request: request.identity,
-            loaded,
+            plan,
         }))
     }
 }

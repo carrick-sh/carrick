@@ -462,10 +462,12 @@ pub struct CarrierVmCustody {
     >,
     pub(crate) native_exec_preparations: parking_lot::Mutex<
         Vec<(
+            carrick_core_abi::service::ExecAdoptionReceipt,
             carrick_core_abi::service::ServiceIdentity,
             Box<dyn crate::metadata_grant::NativeExecPreparation>,
         )>,
     >,
+    pub(crate) native_exec_receipt_sequence: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -494,14 +496,47 @@ impl CarrierVmCustody {
             .map(|(_, service)| std::sync::Arc::clone(service))
     }
 
+    pub(crate) fn reserve_native_exec_receipt(
+        &self,
+    ) -> Result<carrick_core_abi::service::ExecAdoptionReceipt, ()> {
+        let raw = self
+            .native_exec_receipt_sequence
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |current| current.checked_add(1),
+            )
+            .map_err(|_| ())?
+            .checked_add(1)
+            .and_then(core::num::NonZeroU64::new)
+            .and_then(carrick_core_abi::service::ExecAdoptionReceipt::checked)
+            .ok_or(())?;
+        Ok(raw)
+    }
+
     pub(crate) fn retain_native_exec_preparation(
         &self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
         identity: carrick_core_abi::service::ServiceIdentity,
         prepared: Box<dyn crate::metadata_grant::NativeExecPreparation>,
     ) {
         self.native_exec_preparations
             .lock()
-            .push((identity, prepared));
+            .push((receipt, identity, prepared));
+    }
+
+    pub(crate) fn take_native_exec_preparation(
+        &self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+        identity: carrick_core_abi::service::ServiceIdentity,
+    ) -> Option<Box<dyn crate::metadata_grant::NativeExecPreparation>> {
+        let mut preparations = self.native_exec_preparations.lock();
+        let index = preparations
+            .iter()
+            .position(|(stored_receipt, stored_identity, _)| {
+                *stored_receipt == receipt && *stored_identity == identity
+            })?;
+        Some(preparations.swap_remove(index).2)
     }
 }
 
@@ -721,6 +756,7 @@ impl CarrierVmCustody {
             guest_cow_states: parking_lot::Mutex::new(std::collections::HashMap::new()),
             native_exec_services: parking_lot::Mutex::new(Vec::new()),
             native_exec_preparations: parking_lot::Mutex::new(Vec::new()),
+            native_exec_receipt_sequence: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
