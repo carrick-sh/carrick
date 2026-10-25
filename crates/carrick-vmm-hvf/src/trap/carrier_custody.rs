@@ -402,7 +402,7 @@ impl CarrierVmCustodyState {
 type RetainedNativeExecPreparation = (
     carrick_core_abi::service::ExecAdoptionReceipt,
     carrick_core_abi::service::ServiceIdentity,
-    Box<dyn crate::metadata_grant::NativeExecPreparation>,
+    crate::trap::PreparedNativeExecSuccessor,
 );
 
 /// Carrier-owned VM lifecycle authority.
@@ -520,7 +520,7 @@ impl CarrierVmCustody {
         &self,
         receipt: carrick_core_abi::service::ExecAdoptionReceipt,
         identity: carrick_core_abi::service::ServiceIdentity,
-        prepared: Box<dyn crate::metadata_grant::NativeExecPreparation>,
+        prepared: crate::trap::PreparedNativeExecSuccessor,
     ) {
         self.native_exec_preparations
             .lock()
