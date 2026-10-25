@@ -1345,6 +1345,15 @@ alternating supplies across two live children and the exact exhaustion edge.
 keep a second process live while proving unfinished grants clear through
 quarantine rather than causing a terminal refusal or premature reuse.
 
+The HAL exec replacement component transfers the same unfinished descriptor
+supplies into predecessor retirement custody before withdrawing its live child
+identity. `exec_replacement_absorbs_pending_descriptor_tables_with_peer_live`
+was red when replacement left those grants stranded. It covers a live peer,
+failed-clear retry without repeated physical release, and exact stock recovery.
+`exec_replacement_rejects_stale_predecessor_incarnation` was red when a matching
+root/MM admitted a stale context generation. These component bindings do not
+claim production native exec adoption or signed execution.
+
 ARM routing keeps root and native fork-child ownership distinct. Admitting the
 root for its first fork does not move the root's own `execve` into the native
 child owner: the root continues through the host exec boundary. Until native

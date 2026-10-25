@@ -91,6 +91,273 @@ fn committed_child_retains_physical_custody_through_quarantine() {
 }
 
 #[test]
+fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct PhysicalPin {
+        id: u8,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for PhysicalPin {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut stock: ForkStock<UntaggedRoots, PhysicalPin> = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::exclusive(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(
+            (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            lifecycles(1),
+        )
+        .unwrap();
+    let parent = parent();
+    let mut exchange = ForkStockExchange::new(request(parent, 302, 2, 1)).unwrap();
+    let loan = stock
+        .loan(&mut NoTableLedger, parent, &mut exchange, |_| true)
+        .unwrap();
+    let completion = PortalForkCompletion {
+        request: loan.request,
+        // SAFETY: exact admitted child fixture.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, loan.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_tables_used: 4096,
+        parent_tables_used: 0,
+    };
+    let mut reserve =
+        ForkStockSettlement::reserve(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+            .unwrap();
+    stock
+        .reserve_custody(
+            parent,
+            &mut reserve,
+            |_| true,
+            |_| true,
+            |_, _, _| {
+                Ok(PhysicalPin {
+                    id: 1,
+                    drops: Arc::clone(&drops),
+                })
+            },
+        )
+        .unwrap();
+    let mut settlement = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
+    stock
+        .settle(
+            &mut NoTableLedger,
+            parent,
+            &mut settlement,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+
+    let child = child_of(loan, 43);
+    let successor_mm = mm(303);
+    // SAFETY: this fixture owns the closed successor root and incarnation.
+    let successor = unsafe {
+        El1MmHandle::from_admitted_owner(CARRIER, successor_mm, NonZeroU64::new(9).unwrap())
+    };
+    let receipt = stock
+        .replace_child_for_exec(
+            child,
+            successor,
+            page(0x90_0000),
+            PhysicalPin {
+                id: 2,
+                drops: Arc::clone(&drops),
+            },
+        )
+        .unwrap();
+    assert_eq!(receipt.predecessor(), loan.request.child_mm);
+    assert_eq!(receipt.successor(), successor_mm);
+    assert_eq!(stock.live_children(), 1);
+    assert_eq!(stock.child_root(successor_mm), Some(page(0x90_0000)));
+    assert_eq!(stock.child_owner(successor_mm), Some(successor));
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+    let wrong = absent(mm(304)).unwrap();
+    assert_eq!(
+        stock.settle_exec_predecessor(
+            &mut NoTableLedger,
+            receipt,
+            wrong,
+            |_| true,
+            |physical, absence| physical.id == 1 && absence.mm() == loan.request.child_mm,
+        ),
+        Err(ForkStockServiceError::StaleExecution)
+    );
+    let predecessor_absent = absent(loan.request.child_mm).unwrap();
+    stock
+        .settle_exec_predecessor(
+            &mut NoTableLedger,
+            receipt,
+            predecessor_absent,
+            |_| true,
+            |physical, absence| physical.id == 1 && absence.mm() == loan.request.child_mm,
+        )
+        .unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        stock.settle_exec_predecessor(
+            &mut NoTableLedger,
+            receipt,
+            absent(loan.request.child_mm).unwrap(),
+            |_| true,
+            |_, _| true,
+        ),
+        Err(ForkStockServiceError::StaleExecution),
+        "the consuming predecessor receipt must reject duplicates"
+    );
+
+    let successor_execution = execution(43, 1, 303, 0x90_0000);
+    retire(&mut stock, successor_execution).unwrap();
+    assert_eq!(reclaim(&mut stock, |_| true, &RefCell::new(Vec::new())), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn exec_replacement_absorbs_pending_descriptor_tables_with_peer_live() {
+    use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
+
+    let mut stock = stock(UntaggedRoots, 40, 2);
+    let first = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), first, 1, 0).unwrap();
+    let second = loan(&mut stock, parent(), 303, 1, 1).unwrap();
+    commit(&mut stock, parent(), second, 1, 0).unwrap();
+    let first_child = child_of(first, 44);
+    let second_child = child_of(second, 45);
+    let owner = stock.child_owner(first.request.child_mm).unwrap();
+    let peer_owner = stock.child_owner(second.request.child_mm).unwrap();
+    let reservation = stock
+        .reserve_native_descriptor_tables(
+            &mut NoTableLedger,
+            owner,
+            first_child.context.root,
+            MAX_TABLE_GRANTS,
+        )
+        .unwrap();
+    let pending_pages = reservation.pages().to_vec();
+    let txn = backing_txn(
+        owner,
+        first_child.context.root,
+        1,
+        reservation.descriptor_tables(),
+    );
+    stock
+        .track_native_descriptor_tables(&mut NoTableLedger, reservation, txn)
+        .unwrap();
+    let successor_mm = mm(304);
+    // SAFETY: this fixture owns the closed successor root and incarnation.
+    let successor = unsafe {
+        El1MmHandle::from_admitted_owner(CARRIER, successor_mm, NonZeroU64::new(9).unwrap())
+    };
+    let receipt = stock
+        .replace_child_for_exec(first_child, successor, page(0x90_0000), ())
+        .unwrap();
+    assert_eq!(stock.child_owner(second.request.child_mm), Some(peer_owner));
+    assert_eq!(stock.live_children(), 2);
+    let mut releases = 0;
+    let mut cleared = Vec::new();
+    assert_eq!(
+        stock.settle_exec_predecessor(
+            &mut NoTableLedger,
+            receipt,
+            absent(first.request.child_mm).unwrap(),
+            |_| false,
+            |_, _| {
+                releases += 1;
+                true
+            },
+        ),
+        Err(ForkStockServiceError::ExposedDirtyTable)
+    );
+    stock
+        .settle_exec_predecessor(
+            &mut NoTableLedger,
+            receipt,
+            absent(first.request.child_mm).unwrap(),
+            |pages| {
+                cleared.extend_from_slice(pages);
+                true
+            },
+            |_, _| {
+                releases += 1;
+                true
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        releases, 1,
+        "failed clear must retain physical release progress"
+    );
+    assert!(
+        pending_pages.iter().all(|page| cleared.contains(page)),
+        "exec predecessor settlement must clear every possibly linked descriptor grant"
+    );
+    assert_eq!(
+        stock.table_stock().len(),
+        39,
+        "only the live peer retains table stock"
+    );
+    assert!(
+        stock.pending_descriptor_tables.is_empty(),
+        "exec cannot strand predecessor transactions"
+    );
+    assert_eq!(
+        stock.child_root(second.request.child_mm),
+        Some(second_child.context.root)
+    );
+    let mut successor_execution = execution(44, 1, 304, 0x90_0000);
+    successor_execution.context.generation = ContextGeneration::new(successor.incarnation());
+    retire(&mut stock, successor_execution).unwrap();
+    let clear = RefCell::new(Vec::new());
+    assert_eq!(reclaim(&mut stock, |_| true, &clear), 1);
+    retire(&mut stock, second_child).unwrap();
+    assert_eq!(reclaim(&mut stock, |_| true, &clear), 1);
+    assert_eq!(stock.table_stock().len(), 40);
+}
+
+#[test]
+fn exec_replacement_rejects_stale_predecessor_incarnation() {
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    let child = child_of(granted, 44);
+    let owner = stock.child_owner(granted.request.child_mm).unwrap();
+    let before = stock.table_stock().to_vec();
+    let mut stale = child;
+    stale.context.generation = ContextGeneration::new(NonZeroU64::new(2).unwrap());
+    // SAFETY: this fixture owns a closed, distinct successor incarnation.
+    let successor =
+        unsafe { El1MmHandle::from_admitted_owner(CARRIER, mm(303), NonZeroU64::new(9).unwrap()) };
+    assert!(
+        matches!(
+            stock.replace_child_for_exec(stale, successor, page(0x90_0000), ()),
+            Err((ForkStockServiceError::StaleExecution, ()))
+        ),
+        "exec replacement must reject the predecessor's stale context incarnation"
+    );
+    assert_eq!(stock.child_owner(granted.request.child_mm), Some(owner));
+    assert_eq!(
+        stock.child_root(granted.request.child_mm),
+        Some(child.context.root)
+    );
+    assert_eq!(stock.table_stock(), before);
+    assert!(stock.exec_predecessors.is_empty());
+}
+
+#[test]
 fn committed_child_weak_pin_venue_drops_carrier_without_reclaim_and_releases_on_drain() {
     use std::sync::{
         Arc, Mutex, Weak,
@@ -343,8 +610,8 @@ fn child_of(loan: ForkStockLoan, task: u64) -> GrantExecution {
     )
 }
 
-fn retire<T: ChildAddressTags>(
-    stock: &mut ForkStock<T>,
+fn retire<T: ChildAddressTags, C>(
+    stock: &mut ForkStock<T, C>,
     child: GrantExecution,
 ) -> Result<(), ForkStockServiceError> {
     let mut record = NativeChildRetire::new(child.binding, child.context).unwrap();
@@ -366,8 +633,8 @@ fn absent(mm: ReservationMm) -> Option<SlotAbsence> {
     SlotAbsence::scan(mm, [])
 }
 
-fn reclaim<T: ChildAddressTags>(
-    stock: &mut ForkStock<T>,
+fn reclaim<T: ChildAddressTags, C>(
+    stock: &mut ForkStock<T, C>,
     safe: impl Fn(ReservationMm) -> bool,
     cleared: &RefCell<Vec<RootGpa>>,
 ) -> usize {
