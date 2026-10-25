@@ -90,3 +90,27 @@ where
         stderr,
     })
 }
+
+// `cargo run` injects the runner's package identity into its environment.
+// Forwarding it to Cargo makes build scripts watching CARGO_MANIFEST_DIR
+// (notably ring) alternate fingerprints between admitted and direct builds.
+// Drop package metadata, retaining caller configuration such as jobs,
+// target directories, wrappers and the host-lease environment.
+pub(crate) fn sanitize_cargo_package_env(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(|name| {
+            name.starts_with("CARGO_PKG_")
+                || matches!(
+                    name,
+                    "CARGO_MANIFEST_DIR"
+                        | "CARGO_MANIFEST_PATH"
+                        | "CARGO_MANIFEST_LINKS"
+                        | "CARGO_BIN_NAME"
+                        | "CARGO_CRATE_NAME"
+                        | "CARGO_PRIMARY_PACKAGE"
+                )
+        }) {
+            command.env_remove(name);
+        }
+    }
+}

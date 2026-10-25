@@ -1527,6 +1527,7 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
             artifact: None,
             fixture_validation: Some(crate::fixtures::ValidationReceipt {
                 validation_method: crate::fixtures::ValidationMethod::InputIdentity,
+                elf_hash_verification: crate::fixtures::ElfHashVerification::Recomputed,
                 checkout_head: "0123456789abcdef0123456789abcdef01234567"
                     .to_string()
                     .try_into()

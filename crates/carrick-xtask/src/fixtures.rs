@@ -273,6 +273,8 @@ struct Installed {
 #[serde(deny_unknown_fields)]
 pub struct ValidationReceipt {
     pub validation_method: ValidationMethod,
+    #[serde(default)]
+    pub elf_hash_verification: ElfHashVerification,
     pub checkout_head: CommitSha,
     pub checkout_tree: GitTreeId,
     pub bundle_source_head: CommitSha,
@@ -288,9 +290,25 @@ pub enum ValidationMethod {
     InputIdentity,
 }
 
-fn validation_receipt(root: &Path, manifest: &Manifest) -> Result<ValidationReceipt> {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElfHashVerification {
+    /// Historical evidence did not record hash work; fresh verifiers never
+    /// emit this value or infer hash work from its absence.
+    #[default]
+    NotRecorded,
+    Recomputed,
+    ReusedStamp,
+}
+
+fn validation_receipt(
+    root: &Path,
+    manifest: &Manifest,
+    elf_hash_verification: ElfHashVerification,
+) -> Result<ValidationReceipt> {
     Ok(ValidationReceipt {
         validation_method: ValidationMethod::InputIdentity,
+        elf_hash_verification,
         checkout_head: expected_head(root, None)?,
         checkout_tree: working_tree(root)?,
         bundle_source_head: manifest.source_head.clone(),
@@ -337,9 +355,11 @@ fn working_tree(root: &Path) -> Result<GitTreeId> {
     GitTreeId::try_from(run(&["write-tree"])?.trim().to_owned())
 }
 
-/// Revalidate all installed bytes before generating evidence for this invocation.
+/// Revalidate fixture inputs and report whether installed ELF hashes were
+/// recomputed or admitted by a fresh stat stamp for this invocation.
 pub fn verify_installed_receipt(root: &Path) -> Result<ValidationReceipt> {
-    validation_receipt(root, &verify_installed(root)?)
+    let (manifest, hashes) = verify_installed_with_hashes(root)?;
+    validation_receipt(root, &manifest, hashes)
 }
 
 fn hash_bytes(bytes: &[u8]) -> ContentHash {
@@ -718,6 +738,10 @@ pub fn resolve_bundle(root: &Path, sha: &str, explicit: Option<&Path>) -> Result
 }
 
 pub fn verify_installed(root: &Path) -> Result<Manifest> {
+    verify_installed_with_hashes(root).map(|(manifest, _)| manifest)
+}
+
+fn verify_installed_with_hashes(root: &Path) -> Result<(Manifest, ElfHashVerification)> {
     let installed: Installed =
         serde_json::from_slice(&fs::read(safe_path(root, INSTALLED_MANIFEST)?)?)?;
     if hash_bytes(&manifest_bytes(&installed.manifest)?) != installed.manifest_sha256 {
@@ -733,11 +757,13 @@ pub fn verify_installed(root: &Path) -> Result<Manifest> {
         .ok()
         .and_then(|t| t.elapsed().ok())
         .is_some_and(|age| age < std::time::Duration::from_secs(24 * 60 * 60));
-    if !fresh || fs::read(&stamp_path).ok().as_deref() != Some(signature.as_slice()) {
+    let hashes = if !fresh || fs::read(&stamp_path).ok().as_deref() != Some(signature.as_slice()) {
         // Remove old evidence first: interrupted or failed verification cannot
         // leave a usable stamp. Detect mutation during the full verification.
-        if stamp_path.exists() {
-            fs::remove_file(&stamp_path)?;
+        match fs::remove_file(&stamp_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         for executable in &installed.manifest.executables {
             validate_executable(&safe_path(root, &executable.path)?, executable)?;
@@ -746,8 +772,11 @@ pub fn verify_installed(root: &Path) -> Result<Manifest> {
             return Err(fail("fixture tree changed during verification"));
         }
         crate::atomic_file::write(&stamp_path, &signature)?;
-    }
-    Ok(installed.manifest)
+        ElfHashVerification::Recomputed
+    } else {
+        ElfHashVerification::ReusedStamp
+    };
+    Ok((installed.manifest, hashes))
 }
 
 fn installed_stat_signature(root: &Path, manifest: &Manifest) -> Result<Vec<u8>> {
@@ -845,7 +874,7 @@ pub fn restore(root: &Path, path: &Path, sha: Option<&str>) -> Result<RestoreWor
         work.executable_publications += 1;
     }
     let installed = Installed {
-        validation: validation_receipt(root, &manifest)?,
+        validation: validation_receipt(root, &manifest, ElfHashVerification::Recomputed)?,
         manifest_sha256: hash_bytes(&manifest_bytes(&manifest)?),
         manifest,
     };
@@ -1116,7 +1145,7 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
             receipt,
         } => {
             let expected = expected_head(root, sha.as_deref())?;
-            let manifest = if let Some(bundle_path) = bundle {
+            let (manifest, hashes) = if let Some(bundle_path) = bundle {
                 let (manifest, identity) = archive::verify(root, &bundle_path, &expected.0)?;
                 let archive_sha256 = provision::compute_sha256(&bundle_path)?;
                 writeln!(
@@ -1127,17 +1156,20 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
                     identity,
                     archive_sha256,
                 )?;
-                manifest
+                (manifest, ElfHashVerification::Recomputed)
             } else {
                 match manifest {
-                    Some(path) => verify_bundle(root, &path, sha.as_deref())?,
-                    None => verify_installed(root)?,
+                    Some(path) => (
+                        verify_bundle(root, &path, sha.as_deref())?,
+                        ElfHashVerification::Recomputed,
+                    ),
+                    None => verify_installed_with_hashes(root)?,
                 }
             };
             if let Some(path) = receipt {
                 crate::atomic_file::write(
                     &path,
-                    &serde_json::to_vec_pretty(&validation_receipt(root, &manifest)?)?,
+                    &serde_json::to_vec_pretty(&validation_receipt(root, &manifest, hashes)?)?,
                 )?;
             }
             writeln!(

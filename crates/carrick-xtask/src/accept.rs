@@ -1207,6 +1207,8 @@ fn run_command_redirect(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    // A focused local build override must never narrow an acceptance gate.
+    cmd.env_remove("CARRICK_TEST_TARGET");
 
     let start = Instant::now();
     let mut child = cmd.spawn()?;
@@ -2180,6 +2182,23 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acceptance_child_cannot_inherit_a_target_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease =
+            HostLease::acquire_path(&dir.path().join("host.lock"), HostLeaseMode::Gate).unwrap();
+        let (status, _) = run_command_redirect(
+            &lease,
+            "sh",
+            &["-c", "test \"${CARRICK_TEST_TARGET+x}\" != x"],
+            &[("CARRICK_TEST_TARGET", "one_target")],
+            dir.path(),
+            &dir.path().join("log"),
+        )
+        .unwrap();
+        assert_eq!(status, Some(0));
+    }
 
     #[test]
     fn linux_exceptions_are_named_and_do_not_hide_unexpected_failures() {

@@ -182,7 +182,7 @@ fn admitted(head: &str) -> AcceptReceipt {
     let mut value = serde_json::to_value(base()).unwrap();
     value["head"] = json!(head);
     value["artifact"] = json!({"path":"target/release/carrick","sha256":"1".repeat(64),"cdhash":"2".repeat(40),"lc_uuid":"some-uuid","hypervisor_entitlement":true,"dof_present":true});
-    value["fixture_validation"] = json!({"validation_method":"input_identity","checkout_head":head,"checkout_tree":"3".repeat(40),"bundle_source_head":"a".repeat(40),"checkout_dirty":false,"manifest_sha256":"4".repeat(64),"inputs_sha256":"5".repeat(64)});
+    value["fixture_validation"] = json!({"validation_method":"input_identity","elf_hash_verification":"recomputed","checkout_head":head,"checkout_tree":"3".repeat(40),"bundle_source_head":"a".repeat(40),"checkout_dirty":false,"manifest_sha256":"4".repeat(64),"inputs_sha256":"5".repeat(64)});
     let names = [
         "fixtures",
         "build",
@@ -748,4 +748,18 @@ fn negative_controls_changed_errno_location_diagnostic_test_or_malformed_header_
         assert_eq!(diff.new.len(), 1);
         assert_eq!(diff.fixed.len(), 1);
     }
+}
+
+#[test]
+fn historical_fixture_evidence_does_not_invent_hash_work_status() {
+    let mut value = serde_json::to_value(admitted(&"b".repeat(40))).unwrap();
+    value["fixture_validation"]
+        .as_object_mut()
+        .unwrap()
+        .remove("elf_hash_verification");
+    let receipt: AcceptReceipt = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        serde_json::to_value(receipt).unwrap()["fixture_validation"]["elf_hash_verification"],
+        "not_recorded"
+    );
 }

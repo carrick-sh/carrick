@@ -253,6 +253,7 @@ lint-domains-source:
 
 [private]
 _lint-domains-source:
+    ./scripts/lib/test-signed-selection-test.sh
     # Libtest filters are a union; integration targets run without filters.
     {{_cargo}} test --locked -p carrick-xtask --lib -- terminal_custody copyout_debt
     {{_cargo}} test --locked -p carrick-xtask --test probe_coverage --test authority_debt
@@ -472,7 +473,7 @@ test-shard-b *ARGS: _test-stdio
 
 # Run carrick-xtask unit and CI gate tests on Linux so ci-xtask changes are verified even when macos=false.
 test-xtask *ARGS:
-    {{_admit}} {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test test_batch --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
+    {{_admit}} {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test build_cache --test host_lease --test fixtures --test test_batch --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
 
 # Fail on missing, duplicate or changed selections or per-binary features, plus missing workflow jobs.
 check-test-shards:
@@ -948,10 +949,10 @@ conformance-probes: build
         # The deterministic arm64 rows run in-process against committed Docker
         # oracles. Only live-oracle and process-poisoning exceptions retain the
         # old signed-binary harness while their embed blockers remain open.
-        ./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture
+        env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture
         cp target/test-results/carrick-conformance-next-signed-artifacts.jsonl \
           target/test-results/conformance-probes-generic-signed-artifacts.jsonl
-        ./scripts/test-signed.sh carrick-conformance-next case_ --nocapture
+        env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next case_ --nocapture
         cp target/test-results/carrick-conformance-next-signed-artifacts.jsonl \
           target/test-results/conformance-probes-dedicated-signed-artifacts.jsonl
         {{_admit}} {{_cargo}} test -p carrick-cli --test conformance_cli_contract \
@@ -1013,11 +1014,11 @@ gate-containers: build
 # image, so it is an opt-in guest lane like conformance-quick — deliberately
 # NOT part of `just ci`.
 test-embed *ARGS: build
-    ./scripts/test-signed.sh carrick-embed {{ARGS}}
+    env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-embed {{ARGS}}
 
 # Guest-running tests of carrick-vmm-hvf from SIGNED cargo test executables.
 test-hvf *ARGS:
-    ./scripts/test-signed.sh carrick-vmm-hvf {{ARGS}}
+    env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-vmm-hvf {{ARGS}}
 
 # HVF trap-engine tests (`crates/carrick-vmm-hvf/tests/trap_engine_hvf.rs`):
 # bring up a real VM via `new_hvf_trap_engine`, load the staged root onto a
@@ -1031,11 +1032,11 @@ test-hvf *ARGS:
 # fresh process: one VM per process), then runs the package's UNENTITLED
 # negative control (`unsigned_executable_maps_hv_denied_to_entitlement`).
 test-hvf-trap-engine:
-    ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_ --ignored --nocapture
+    env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_ --ignored --nocapture
 
 # Guest-running tests of carrick-conformance-next from SIGNED cargo test executables.
 test-conformance-next *ARGS: build
-    ./scripts/test-signed.sh carrick-conformance-next {{ARGS}}
+    env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next {{ARGS}}
 
 # Re-sign an already-built release binary (rarely needed on its own).
 sign:
