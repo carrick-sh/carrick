@@ -268,12 +268,6 @@ pub struct Terminal;
 pub struct Closing;
 pub struct Settled;
 
-/// Process-wide exec drain using the same exact-member receipt vocabulary as
-/// terminal Closing while retaining the caller as the successor owner.
-pub struct ExecDrainCustody {
-    identity: ProcessTerminalIdentity,
-}
-
 /// Raw task membership supplied by the graph that owns its registry. Core
 /// decides whether an absent task makes a terminal retry already retired.
 pub trait TaskMembership {
@@ -307,6 +301,7 @@ pub struct ProcessTerminalIdentity {
     task: TaskKey,
     address: AddressContext<RootGpa>,
     status: TerminationStatus,
+    exec: bool,
 }
 
 impl ProcessTerminalIdentity {
@@ -319,6 +314,16 @@ impl ProcessTerminalIdentity {
             task,
             address,
             status,
+            exec: false,
+        }
+    }
+
+    fn from_exec(task: TaskKey, address: AddressContext<RootGpa>) -> Self {
+        Self {
+            task,
+            address,
+            status: TerminationStatus::SUCCESS,
+            exec: true,
         }
     }
 
@@ -673,40 +678,18 @@ impl TerminalCustody<Process, Live> {
             phase: PhantomData,
         })
     }
-}
 
-impl ExecDrainCustody {
-    pub fn begin(
+    pub fn begin_exec(
         page: &impl Lifecycle,
         task: TaskKey,
         address: AddressContext<RootGpa>,
-    ) -> Result<Self, crate::lifecycle::GateState> {
+    ) -> Result<TerminalCustody<Process, Closing>, crate::lifecycle::GateState> {
         page.close_for_exec()?;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        Ok(Self {
-            identity: ProcessTerminalIdentity::from_exit(task, address, TerminationStatus::SUCCESS),
+        Ok(TerminalCustody {
+            identity: ProcessTerminalIdentity::from_exec(task, address),
+            phase: PhantomData,
         })
-    }
-
-    pub fn cancel_members(&self, pool: Vec<EntryRef>, host: Vec<ThreadBirthIdentity>) -> MemberSet {
-        MemberSet::new(self.identity, pool, host)
-    }
-
-    pub fn observe_members_verdict(
-        &self,
-        page: &impl Lifecycle,
-        members: &MemberSet,
-        pool: &[PoolMemberObservation<'_>],
-        host: &[HostMemberObservation<'_>],
-    ) -> Result<CompletedMemberReceipts, ReadinessFailure> {
-        observe_members_verdict(self.identity, page, members, pool, host)
-    }
-
-    pub fn can_adopt(&self, page: &impl Lifecycle, receipts: &CompletedMemberReceipts) -> bool {
-        // The exec caller's own prepared service remains admitted until the
-        // successor is consumed. Every other service, birth and topology
-        // claim must have drained.
-        self.identity == receipts.process && page.live() == 1 && page.claimed_count() == 1
     }
 }
 
@@ -818,7 +801,13 @@ impl TerminalCustody<Process, Closing> {
         observe_members_verdict(self.identity, page, members, pool, host)
     }
     pub fn can_settle(&self, page: &impl Lifecycle, receipts: &CompletedMemberReceipts) -> bool {
-        self.identity == receipts.process && page.live() == 0 && page.claimed_count() == 0
+        self.identity == receipts.process
+            && if self.identity.exec {
+                // Exec retains its caller and prepared service through adopt.
+                page.live() == 1 && page.claimed_count() == 1
+            } else {
+                page.live() == 0 && page.claimed_count() == 0
+            }
     }
 
     pub fn settle(
@@ -1023,6 +1012,35 @@ mod tests {
         assert!(members.completed(&[], &[]).is_none());
         let receipt = members.completed(&[entry], &[]).unwrap();
         assert!(closing.settle(&page, receipt).is_ok());
+    }
+
+    #[test]
+    fn exec_uses_process_closing_while_retaining_its_caller_and_service() {
+        let page = Page {
+            terminal: crate::terminal::ProcessExitCustody::new(),
+            gate: AtomicU32::new(0),
+            live: AtomicU32::new(1),
+        };
+        let task = TaskKey {
+            id: TaskId::from_registry_allocation(NonZeroI32::new(43).unwrap()),
+            serial: TaskSerial::from_raw_u64(13).unwrap(),
+        };
+        let address = AddressContext {
+            root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x12000)).unwrap(),
+            mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(2).unwrap()),
+            generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(3).unwrap()),
+        };
+        let service = NativeServiceClaim::acquire(&page).unwrap();
+        let closing = TerminalCustody::<Process, Live>::begin_exec(&page, task, address).unwrap();
+        let RetirementVerdict::CancelMembers { members, .. } =
+            closing.cancel_members(Vec::new(), Vec::new())
+        else {
+            panic!("process closing must own cancellation");
+        };
+        let receipts = closing.observe_members(&page, &members, &[], &[]).unwrap();
+        assert!(closing.can_settle(&page, &receipts));
+        service.acknowledge(|_| ());
+        assert!(!closing.can_settle(&page, &receipts));
     }
 
     #[test]
