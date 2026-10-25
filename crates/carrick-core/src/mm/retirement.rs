@@ -528,7 +528,11 @@ pub fn request_record_retirement(
 #[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub enum RecordRetirement {
     Complete(CarrierStage2RetireOutcome),
-    Unmap { ipa: u64, len: usize },
+    Unmap {
+        ipa: u64,
+        len: usize,
+        backend_map_installed: bool,
+    },
 }
 pub fn prepare_record_retirement(
     record: &mut CarrierStage2Record,
@@ -555,17 +559,12 @@ pub fn prepare_record_retirement(
             CarrierStage2BackendError::ConcurrentRetirement,
         ));
     }
-    if !record.snapshot.backend_map_installed {
-        record.snapshot.mapped = false;
-        record.snapshot.retry_eligible = false;
-        record.snapshot.retry_pending = None;
-        return RecordRetirement::Complete(CarrierStage2RetireOutcome::RetiredUnmapped);
-    }
     record.unmap_in_flight = true;
     record.snapshot.retry_eligible = false;
     RecordRetirement::Unmap {
         ipa: record.snapshot.ipa,
         len: record.snapshot.len,
+        backend_map_installed: record.snapshot.backend_map_installed,
     }
 }
 pub fn settle_record_retirement(

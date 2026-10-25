@@ -310,7 +310,8 @@ impl PhysicalStock {
             outcome,
             RecordRetirement::Unmap {
                 ipa: 0x20_0000,
-                len: 606208
+                len: 606208,
+                backend_map_installed: true,
             },
             "child retained a structural pin after exit; no subsequent loan may be required"
         );

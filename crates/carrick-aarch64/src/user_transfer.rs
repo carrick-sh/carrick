@@ -257,6 +257,16 @@ pub trait TransferCustody {
         len: usize,
         intent: PortalTransferIntent,
     ) -> Result<TransferRetention<Self::Pin>, TrapError>;
+    fn retain_for(
+        &self,
+        _target: TransferTarget,
+        _va: u64,
+        selected: PortalSelectedData,
+        len: usize,
+        intent: PortalTransferIntent,
+    ) -> Result<TransferRetention<Self::Pin>, TrapError> {
+        self.retain(selected, len, intent)
+    }
 }
 
 pub type ErasedPhysicalCustody = dyn TransferCustody<Pin = Box<dyn TransferPin>>;
@@ -699,6 +709,24 @@ where
     ) -> Result<TransferRetention<Self::Pin>, TrapError> {
         self.0
             .retain(selected, len, intent)
+            .map(|retention| match retention {
+                TransferRetention::Retained(pin) => {
+                    TransferRetention::Retained(Box::new(pin) as Box<dyn TransferPin>)
+                }
+                TransferRetention::Physical(wait) => TransferRetention::Physical(wait),
+                TransferRetention::StaleSelection => TransferRetention::StaleSelection,
+            })
+    }
+    fn retain_for(
+        &self,
+        target: TransferTarget,
+        va: u64,
+        selected: PortalSelectedData,
+        len: usize,
+        intent: PortalTransferIntent,
+    ) -> Result<TransferRetention<Self::Pin>, TrapError> {
+        self.0
+            .retain_for(target, va, selected, len, intent)
             .map(|retention| match retention {
                 TransferRetention::Retained(pin) => {
                     TransferRetention::Retained(Box::new(pin) as Box<dyn TransferPin>)

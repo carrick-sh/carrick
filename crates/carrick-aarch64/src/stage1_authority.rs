@@ -71,6 +71,14 @@ pub trait TableArenaPublisher: Send + Sync {
     }
 }
 
+/// Backend notification that one stage-1 editor release made its descriptor
+/// writes authoritative.  The callback runs after the authority lock is
+/// released, so it may re-read the live image to settle exact backend
+/// obligations without inverting the page-table lock order.
+pub trait Stage1PublicationObserver: Send + Sync {
+    fn editor_released(&self);
+}
+
 pub use carrick_core::mm::retirement::TableArenaRetirement;
 
 struct Stage1AuthorityInner {
@@ -78,6 +86,7 @@ struct Stage1AuthorityInner {
     arena_source: Option<Box<dyn TableArenaSource>>,
     /// Publishes extension arenas a guest descriptor transaction grows into.
     arena_publisher: Option<Arc<dyn TableArenaPublisher>>,
+    publication_observer: Option<Arc<dyn Stage1PublicationObserver>>,
     /// Extension arenas the publisher accepted. An arena the image holds
     /// but this set lacks (its publication was refused) is published again
     /// before any guest transaction is returned.
@@ -255,6 +264,7 @@ impl Stage1Authority {
                 },
                 arena_source: None,
                 arena_publisher: None,
+                publication_observer: None,
                 published_arenas: Vec::new(),
                 host_resolver: None,
                 vfork_shares: 0,
@@ -488,6 +498,11 @@ impl Stage1Authority {
         self.inner.lock().arena_publisher = Some(publisher);
     }
 
+    /// Install the backend observer for committed editor releases.
+    pub fn set_publication_observer(&self, observer: Arc<dyn Stage1PublicationObserver>) {
+        self.inner.lock().publication_observer = Some(observer);
+    }
+
     /// The venue that owns this address space's live descriptor stores.
     pub fn live_descriptor_owner(&self) -> LiveDescriptorOwner {
         self.inner.lock().live_owner
@@ -637,12 +652,24 @@ impl Stage1Authority {
         txn: &DescriptorTxn,
         receipt: &DescriptorReceipt,
     ) -> Result<VerifiedDescriptorReceipt, GuestTxnSettleError> {
-        let mut inner = self.inner.lock();
-        let manager = inner
-            .manager
-            .as_mut()
-            .ok_or(GuestTxnSettleError::Manager(PageTableError::BadAddress))?;
-        manager.settle_guest_descriptor_receipt(txn, receipt)
+        let (settled, observer) = {
+            let mut inner = self.inner.lock();
+            let observer = inner.publication_observer.clone();
+            let manager = inner
+                .manager
+                .as_mut()
+                .ok_or(GuestTxnSettleError::Manager(PageTableError::BadAddress))?;
+            (
+                manager.settle_guest_descriptor_receipt(txn, receipt),
+                observer,
+            )
+        };
+        if settled.is_ok()
+            && let Some(observer) = observer
+        {
+            observer.editor_released();
+        }
+        settled
     }
 
     /// Return every grant of a submission withdrawn before EL1 claimed it.
@@ -1181,37 +1208,44 @@ impl Stage1Authority {
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
     {
         let authority = self.authority_id();
-        let mut inner = self.inner.lock();
-        if inner.manager.is_none() {
-            let mut manager = builder()?;
-            if let Some(ref resolver) = inner.host_resolver {
-                unsafe { manager.make_live(Arc::clone(resolver)) };
+        let (result, observer) = {
+            let mut inner = self.inner.lock();
+            if inner.manager.is_none() {
+                let mut manager = builder()?;
+                if let Some(ref resolver) = inner.host_resolver {
+                    unsafe { manager.make_live(Arc::clone(resolver)) };
+                }
+                let had_source = inner.arena_source.is_some();
+                carrick_observability::probes::stage1_arena_install(
+                    4,
+                    u32::from(had_source),
+                    0,
+                    authority,
+                );
+                *inner.manager = Some(manager);
             }
-            let had_source = inner.arena_source.is_some();
-            carrick_observability::probes::stage1_arena_install(
-                4,
-                u32::from(had_source),
-                0,
-                authority,
-            );
-            *inner.manager = Some(manager);
-        }
-        let Stage1AuthorityInner {
-            ref mut manager,
-            ref mut arena_source,
-            live_owner,
-            ..
-        } = *inner;
-        let manager = manager
-            .as_mut()
-            .expect("manager must be present after lazy initialization");
-        manager.declare_live_hardware_image();
-        manager.set_live_descriptor_owner(live_owner);
-        let mut editor = Stage1Editor {
-            manager,
-            arena_source,
+            let observer = inner.publication_observer.clone();
+            let Stage1AuthorityInner {
+                ref mut manager,
+                ref mut arena_source,
+                live_owner,
+                ..
+            } = *inner;
+            let manager = manager
+                .as_mut()
+                .expect("manager must be present after lazy initialization");
+            manager.declare_live_hardware_image();
+            manager.set_live_descriptor_owner(live_owner);
+            let mut editor = Stage1Editor {
+                manager,
+                arena_source,
+            };
+            (f(&mut editor), observer)
         };
-        f(&mut editor)
+        if let Some(observer) = observer {
+            observer.editor_released();
+        }
+        result
     }
 
     /// Restore a previous manager image (e.g. during rollback).

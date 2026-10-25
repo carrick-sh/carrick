@@ -1642,6 +1642,35 @@ impl CarrierVmCustody {
         }
     }
 
+    fn begin_owed_stage1_rewrites(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        ipa: u64,
+        len: u64,
+    ) {
+        let states = self
+            .guest_cow_states
+            .lock()
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect::<Vec<_>>();
+        for state in states {
+            state.owe_stage1_rewrite(identity, ipa, len);
+        }
+    }
+
+    fn cancel_owed_stage1_rewrites(&self, identity: CarrierStage2RecordIdentity) {
+        let states = self
+            .guest_cow_states
+            .lock()
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect::<Vec<_>>();
+        for state in states {
+            state.cancel_owed_stage1_rewrite(identity);
+        }
+    }
+
     pub(crate) fn claim_carrier_stage2_retirement(
         &self,
         identity: CarrierStage2RecordIdentity,
@@ -1680,6 +1709,12 @@ impl CarrierVmCustody {
         &self,
         identity: CarrierStage2RecordIdentity,
     ) {
+        if let Some(snapshot) = self.stage2_record_snapshot(identity.record_id)
+            && snapshot.vm_generation == identity.vm_generation
+            && snapshot.logical_owner == identity.logical_owner
+        {
+            self.begin_owed_stage1_rewrites(identity, snapshot.ipa, snapshot.len as u64);
+        }
         self.pending_carrier_stage2_retirements
             .lock()
             .remove(&identity.record_id);
@@ -1736,7 +1771,7 @@ impl CarrierVmCustody {
         identity: CarrierStage2RecordIdentity,
         unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
     ) -> CarrierStage2RetireOutcome {
-        let (ipa, len) = {
+        let (ipa, len, backend_map_installed) = {
             let mut state = self.state.lock();
             let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
                 return CarrierStage2RetireOutcome::NotFound;
@@ -1754,13 +1789,24 @@ impl CarrierVmCustody {
                     }
                     return outcome;
                 }
-                carrick_core::mm::retirement::RecordRetirement::Unmap { ipa, len } => (ipa, len),
+                carrick_core::mm::retirement::RecordRetirement::Unmap {
+                    ipa,
+                    len,
+                    backend_map_installed,
+                } => (ipa, len, backend_map_installed),
             }
         };
 
-        let backend_result = unmap(ipa, len);
+        self.begin_owed_stage1_rewrites(identity, ipa, len as u64);
+        let backend_result = if backend_map_installed {
+            unmap(ipa, len)
+        } else {
+            Ok(())
+        };
         let mut state = self.state.lock();
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
+            drop(state);
+            self.cancel_owed_stage1_rewrites(identity);
             return CarrierStage2RetireOutcome::NotFound;
         };
         let outcome = carrick_core::mm::retirement::settle_record_retirement(
@@ -1769,6 +1815,13 @@ impl CarrierVmCustody {
             backend_result,
         );
         drop(state);
+        if !matches!(
+            outcome,
+            CarrierStage2RetireOutcome::RetiredUnmapped
+                | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
+        ) {
+            self.cancel_owed_stage1_rewrites(identity);
+        }
         if matches!(
             outcome,
             CarrierStage2RetireOutcome::RetiredUnmapped

@@ -216,3 +216,46 @@ The runner wrote the post-mortem to
 `target/embed-post-mortem/847-final-two-process-01-b1`; the worker preserved a
 copy at `/tmp/847-final-two-process-01-b1.post-mortem` together with full run
 logs, cleanup receipts, and the two failed signed executables.
+
+## Structural owed stage-1 rewrite producer
+
+Review of `c7b097f36` found that the runtime's inferred
+`PendingStage1Rewrite` wait still depended on a comment-only promise. Two
+producer-free Editor passes could park on a free Editor word even when no
+retirement transaction owed a later stage-1 publication, recreating the
+original lost-wake shape.
+
+The stage-2 retirement crossing now creates a typed, generation-bearing
+`OwedStage1Rewrite` entry before it removes backend authority. The entry is
+scoped to the retired IPA range and the exact carrier-record incarnation.
+Host retention can obtain a physical wait only from an entry that covers its
+selected IPA. The wait subscribes before probing. A successful stage-1 editor
+release re-reads the authoritative translation and completes only waits whose
+old VA-to-IPA selection was rewritten or unmapped. Failed retirement rolls
+the entry back, while terminal retirement retains it until MM teardown; entry
+drop publishes every remaining waiter. The runtime's coarse two-pass
+inference and forced-true Editor predicate are removed.
+
+VM-free production witnesses:
+
+- `production_retirement_waits_for_owed_stage1_rewrite_commit` drives the
+  shared stage-2 backend-retirement crossing, retains through the production
+  transfer consumer at a sub-16-KiB VA offset, parks on the exact obligation,
+  and observes one wake when a real stage-1 unmap commits.
+- `terminal_retirement_owed_rewrite_wakes_at_mm_teardown` drives terminal
+  retirement, parks the production transfer consumer on the retained
+  obligation, and observes its exact teardown publication.
+
+Portable verification on this follow-up:
+
+- focused production retirement/rewrite and terminal teardown witnesses:
+  1 passed each;
+- serialized `carrick-vmm-hvf` library: 793 passed, 3 ignored;
+- serialized `carrick-runtime` library: 818 passed, 9 ignored;
+- `just fmt-check`, `just clippy`, `just clippy-linux`,
+  `just lint-domains`, and `just test-kernel`: passed;
+- EL1 clippy image: 1,077,712 bytes loaded; maximum checked stack 11,951 of
+  12,288 bytes (`signal terminal exit`).
+
+No signed test was run because this correction changes source. The exact
+candidate bundle is required before the requested signed 20/20 proof.

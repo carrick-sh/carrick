@@ -351,8 +351,31 @@ impl TransferCustody for UserTransferCustody {
     ) -> Result<TransferRetention<Self::Pin>, TrapError> {
         self.retain_exact(selected, len, intent)
     }
+    fn retain_for(
+        &self,
+        target: carrick_aarch64::user_transfer::TransferTarget,
+        va: u64,
+        selected: PortalSelectedData,
+        len: usize,
+        intent: PortalTransferIntent,
+    ) -> Result<TransferRetention<Self::Pin>, TrapError> {
+        self.retain_exact_for(Some((target, va)), selected, len, intent)
+    }
 }
 impl UserTransferCustody {
+    fn owed_stage1_rewrite_wait(
+        &self,
+        target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
+        ipa: u64,
+    ) -> Option<carrick_guest_mem::OwnedMemoryWait> {
+        let (target, va) = target?;
+        self.custody
+            .guest_cow_state(target.handle().mm().raw())
+            .ok()
+            .flatten()?
+            .owed_stage1_rewrite_wait(va, ipa)
+    }
+
     fn publish_claimed_executable(
         &self,
         carrier: NonZeroU64,
@@ -399,6 +422,16 @@ impl UserTransferCustody {
         len: usize,
         intent: PortalTransferIntent,
     ) -> Result<TransferRetention<RetainedUserData>, TrapError> {
+        self.retain_exact_for(None, selected, len, intent)
+    }
+
+    fn retain_exact_for(
+        &self,
+        target: Option<(carrick_aarch64::user_transfer::TransferTarget, u64)>,
+        selected: PortalSelectedData,
+        len: usize,
+        intent: PortalTransferIntent,
+    ) -> Result<TransferRetention<RetainedUserData>, TrapError> {
         let error =
             || TrapError::Hypervisor("UserTransfer physical custody invariant refused".to_owned());
         if len == 0 || len > 4096 || selected.ipa.checked_add(len as u64).is_none() {
@@ -435,6 +468,9 @@ impl UserTransferCustody {
                 return Ok(TransferRetention::Physical(
                     self.custody.stage2_publication_wait(selected.ipa),
                 ));
+            }
+            if let Some(wait) = self.owed_stage1_rewrite_wait(target, selected.ipa) {
+                return Ok(TransferRetention::Physical(wait));
             }
             return Ok(TransferRetention::StaleSelection);
         };
@@ -485,11 +521,17 @@ impl UserTransferCustody {
                         self.custody.stage2_publication_wait(selected.ipa),
                     ));
                 }
+                if let Some(wait) = self.owed_stage1_rewrite_wait(target, selected.ipa) {
+                    return Ok(TransferRetention::Physical(wait));
+                }
                 return Ok(TransferRetention::StaleSelection);
             }
             Err(CarrierStage2PinError::RetirementRequested) => {
                 carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 5);
                 if self.custody.carrier_stage2_retirement_is_terminal(identity) {
+                    if let Some(wait) = self.owed_stage1_rewrite_wait(target, selected.ipa) {
+                        return Ok(TransferRetention::Physical(wait));
+                    }
                     return Ok(TransferRetention::StaleSelection);
                 }
                 return Ok(TransferRetention::Physical(
@@ -623,6 +665,165 @@ pub(super) mod tests {
             root_generation: NonZeroU64::new(1).unwrap(),
             offset: 0,
         }
+    }
+
+    fn owed_rewrite_mm(
+        custody: &Arc<CarrierVmCustody>,
+        mm: u64,
+        va: u64,
+        ipa: u64,
+    ) -> (
+        Arc<MmAccessState>,
+        carrick_aarch64::user_transfer::TransferTarget,
+    ) {
+        let mut tables = carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        );
+        let root = 0x9a08_6000_0000 + mm * 0x20_0000;
+        tables.rebase(root, None).unwrap();
+        tables
+            .map_private_aliased(
+                va,
+                ipa,
+                4096,
+                carrick_mmu_core::aarch64::UserLeafAccess::READ_WRITE,
+                None,
+            )
+            .unwrap();
+        let state = MmAccessState::new_unbound(
+            carrick_aarch64::Stage1Authority::new_with_manager(Some(tables)),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
+            Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
+        );
+        custody.register_guest_cow_state(mm, &state);
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                custody.transfer_carrier,
+                ReservationMm::new(mm).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            )
+        };
+        (
+            state,
+            carrick_aarch64::user_transfer::TransferTarget::from_handle(handle, root),
+        )
+    }
+
+    #[test]
+    fn production_retirement_waits_for_owed_stage1_rewrite_commit() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let va = 0x6000_2800_1000;
+        let ipa = 0xa085_3200_0000;
+        let owner = backing(&custody, ipa);
+        let (state, target) = owed_rewrite_mm(&custody, 811, va, ipa);
+        custody.enqueue_carrier_stage2_retirement(owner.record_identity);
+        assert_eq!(
+            custody.request_stage2_record_retirement(owner.record_identity),
+            CarrierStage2RetireOutcome::DeferredActivePins
+        );
+        assert_eq!(
+            custody.retire_stage2_record_using(owner.record_identity, |_, _| Ok(())),
+            CarrierStage2RetireOutcome::RetiredUnmapped
+        );
+        let removed = custody.remove_global_frame_host_owner_if((ipa, 16384), |entry| {
+            entry.owner().record_identity == owner.record_identity
+        });
+        assert!(removed.is_some());
+
+        let physical = UserTransferCustody::new(custody);
+        let TransferRetention::Physical(wait) = physical
+            .retain_for(
+                target,
+                va,
+                selection(ipa),
+                4,
+                PortalTransferIntent::UserRead,
+            )
+            .unwrap()
+        else {
+            panic!("retirement must expose its exact owed-rewrite producer")
+        };
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let (_enrollment, ready) = wait.0.enroll(Arc::new(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(!ready);
+
+        state
+            .page_tables_authority()
+            .edit(
+                || Err::<carrick_mmu_core::aarch64::PageTableManager, ()>(()),
+                |editor| editor.unmap_aliased(va, 4096).map(|_| ()).map_err(|_| ()),
+            )
+            .unwrap();
+        assert!(wait.0.is_ready());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+
+        let TransferRetention::Physical(late_wait) = physical
+            .retain_for(
+                target,
+                va,
+                selection(ipa),
+                4,
+                PortalTransferIntent::UserRead,
+            )
+            .unwrap()
+        else {
+            panic!("the completed obligation must remain a ready reselect receipt")
+        };
+        let (_late_enrollment, late_ready) = late_wait.0.enroll(Arc::new(|| {}));
+        assert!(
+            late_ready,
+            "a post-publication enrollment must not miss the wake"
+        );
+    }
+
+    #[test]
+    fn terminal_retirement_owed_rewrite_wakes_at_mm_teardown() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let va = 0x6000_2840_1000;
+        let ipa = 0xa085_3240_0000;
+        let owner = backing(&custody, ipa);
+        let (state, target) = owed_rewrite_mm(&custody, 812, va, ipa);
+        custody.enqueue_carrier_stage2_retirement(owner.record_identity);
+        assert_eq!(
+            custody.request_stage2_record_retirement(owner.record_identity),
+            CarrierStage2RetireOutcome::DeferredActivePins
+        );
+        custody.terminalize_carrier_stage2_retirement(owner.record_identity);
+
+        let physical = UserTransferCustody::new(custody);
+        let TransferRetention::Physical(wait) = physical
+            .retain_for(
+                target,
+                va,
+                selection(ipa),
+                4,
+                PortalTransferIntent::UserRead,
+            )
+            .unwrap()
+        else {
+            panic!("terminal retirement must retain the MM teardown producer")
+        };
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let (_enrollment, ready) = wait.0.enroll(Arc::new(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(!ready);
+        drop(state);
+        assert!(wait.0.is_ready());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
     }
     #[test]
     fn user_write_retention_releases_executor_while_code_reader_is_active() {

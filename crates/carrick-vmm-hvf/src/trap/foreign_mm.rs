@@ -368,6 +368,94 @@ pub(crate) struct RetiredMmRootStage2 {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
+struct OwedStage1RewriteKey {
+    record_id: carrick_core_abi::mm::CarrierStage2RecordId,
+    vm_generation: u64,
+    generation: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(::core::fmt::Debug)]
+struct OwedStage1RewriteWait {
+    complete: std::sync::atomic::AtomicBool,
+    changed: carrick_thread::completion::CompletionCallbacks,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl OwedStage1RewriteWait {
+    fn complete(&self) {
+        if !self
+            .complete
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.changed.publish(0);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_guest_mem::PhysicalMemoryWait for OwedStage1RewriteWait {
+    fn is_ready(&self) -> bool {
+        self.complete.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn enroll(
+        &self,
+        wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+        let enrollment = self.changed.enroll(move |_| wake());
+        (Box::new(enrollment), self.is_ready())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(::core::fmt::Debug)]
+struct OwedStage1Rewrite {
+    ipa: u64,
+    len: u64,
+    waits: std::collections::BTreeMap<(u64, u64), std::sync::Arc<OwedStage1RewriteWait>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for OwedStage1Rewrite {
+    fn drop(&mut self) {
+        for wait in self.waits.values() {
+            wait.complete();
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
+struct OwedStage1Rewrites {
+    next_generation: u64,
+    by_key: std::collections::BTreeMap<OwedStage1RewriteKey, OwedStage1Rewrite>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct MmStage1PublicationObserver {
+    state: std::sync::Weak<MmAccessState>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_aarch64::stage1_authority::Stage1PublicationObserver for MmStage1PublicationObserver {
+    fn editor_released(&self) {
+        if let Some(state) = self.state.upgrade() {
+            state.settle_owed_stage1_rewrites();
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct MmAccessState {
     pub(crate) host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
@@ -400,6 +488,11 @@ pub(crate) struct MmAccessState {
     >,
     pub(crate) mm_root_stage2: parking_lot::Mutex<Option<MmRootStage2Authority>>,
     pub(crate) mutation_coordinator: parking_lot::Mutex<()>,
+    /// Exact stage-2 retirements which removed physical authority before a
+    /// still-live stage-1 leaf was rewritten.  A transfer can wait only on an
+    /// entry covering its selected IPA; editor release, rollback and teardown
+    /// are the only completion producers.
+    owed_stage1_rewrites: parking_lot::Mutex<OwedStage1Rewrites>,
     /// First-touch producers held only through synchronous descriptor
     /// publication and completion (see `PendingEl1GrantPublication`).
     pub(crate) el1_grant_publications: parking_lot::Mutex<PendingEl1GrantPublications>,
@@ -877,7 +970,7 @@ impl MmAccessState {
         host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
         backing_binding: LiveBackingBinding,
     ) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self {
+        let state = std::sync::Arc::new(Self {
             backing_binding,
             host_cow_stats,
             #[cfg(any(test, feature = "foreign-cow-test-support"))]
@@ -895,6 +988,7 @@ impl MmAccessState {
             structural_owners: parking_lot::RwLock::new(std::collections::BTreeMap::new()),
             mm_root_stage2: parking_lot::Mutex::new(None),
             mutation_coordinator: parking_lot::Mutex::new(()),
+            owed_stage1_rewrites: parking_lot::Mutex::new(OwedStage1Rewrites::default()),
             el1_grant_publications: parking_lot::Mutex::new(PendingEl1GrantPublications::default()),
             cow_runtime: parking_lot::RwLock::new(None),
             deferred_anonymous: parking_lot::RwLock::new(None),
@@ -907,7 +1001,126 @@ impl MmAccessState {
             foreign_cow_failpoint: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
             test_descriptor_slots: parking_lot::Mutex::new(None),
-        })
+        });
+        state
+            .page_tables
+            .read()
+            .set_publication_observer(std::sync::Arc::new(MmStage1PublicationObserver {
+                state: std::sync::Arc::downgrade(&state),
+            }));
+        state
+    }
+
+    pub(crate) fn owe_stage1_rewrite(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        ipa: u64,
+        len: u64,
+    ) {
+        if len == 0 || ipa.checked_add(len).is_none() {
+            return;
+        }
+        let mut owed = self.owed_stage1_rewrites.lock();
+        if owed.by_key.keys().any(|key| {
+            key.record_id == identity.record_id && key.vm_generation == identity.vm_generation.0
+        }) {
+            return;
+        }
+        owed.next_generation = owed.next_generation.saturating_add(1);
+        let key = OwedStage1RewriteKey {
+            record_id: identity.record_id,
+            vm_generation: identity.vm_generation.0,
+            generation: owed.next_generation,
+        };
+        owed.by_key.insert(
+            key,
+            OwedStage1Rewrite {
+                ipa,
+                len,
+                waits: std::collections::BTreeMap::new(),
+            },
+        );
+    }
+
+    pub(crate) fn cancel_owed_stage1_rewrite(&self, identity: CarrierStage2RecordIdentity) {
+        let removed = {
+            let mut owed = self.owed_stage1_rewrites.lock();
+            let keys = owed
+                .by_key
+                .keys()
+                .copied()
+                .filter(|key| {
+                    key.record_id == identity.record_id
+                        && key.vm_generation == identity.vm_generation.0
+                })
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| owed.by_key.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        drop(removed);
+    }
+
+    pub(crate) fn owed_stage1_rewrite_wait(
+        &self,
+        va: u64,
+        ipa: u64,
+    ) -> Option<carrick_guest_mem::OwnedMemoryWait> {
+        let wait = {
+            let mut owed = self.owed_stage1_rewrites.lock();
+            let (_, rewrite) = owed.by_key.iter_mut().rev().find(|(_, rewrite)| {
+                rewrite.ipa <= ipa && ipa < rewrite.ipa.saturating_add(rewrite.len)
+            })?;
+            std::sync::Arc::clone(rewrite.waits.entry((va, ipa)).or_insert_with(|| {
+                std::sync::Arc::new(OwedStage1RewriteWait {
+                    complete: std::sync::atomic::AtomicBool::new(false),
+                    changed: carrick_thread::completion::CompletionCallbacks::default(),
+                })
+            }))
+        };
+        let still_selected = self
+            .page_tables_authority()
+            .with_manager(|manager| manager.translate(va) == Some(ipa))
+            .unwrap_or(false);
+        if !still_selected {
+            wait.complete();
+        }
+        Some(carrick_guest_mem::OwnedMemoryWait::new(wait))
+    }
+
+    fn settle_owed_stage1_rewrites(&self) {
+        let candidates = {
+            let owed = self.owed_stage1_rewrites.lock();
+            owed.by_key
+                .values()
+                .flat_map(|rewrite| {
+                    rewrite
+                        .waits
+                        .iter()
+                        .map(|(&(va, ipa), wait)| (va, ipa, std::sync::Arc::clone(wait)))
+                })
+                .collect::<Vec<_>>()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let translations = self.page_tables_authority().with_manager(|manager| {
+            candidates
+                .iter()
+                .map(|(va, _, _)| manager.translate(*va))
+                .collect::<Vec<_>>()
+        });
+        let Some(translations) = translations else {
+            for (_, _, wait) in candidates {
+                wait.complete();
+            }
+            return;
+        };
+        for ((_, selected_ipa, wait), translated) in candidates.into_iter().zip(translations) {
+            if translated != Some(selected_ipa) {
+                wait.complete();
+            }
+        }
     }
 
     /// The EL1 region's descriptor-transaction slots this MM's guest
@@ -1131,7 +1344,13 @@ impl MmAccessState {
         Ok(())
     }
 
-    pub(crate) fn bind_page_tables_authority(&self, page_tables: carrick_aarch64::Stage1Authority) {
+    pub(crate) fn bind_page_tables_authority(
+        self: &std::sync::Arc<Self>,
+        page_tables: carrick_aarch64::Stage1Authority,
+    ) {
+        page_tables.set_publication_observer(std::sync::Arc::new(MmStage1PublicationObserver {
+            state: std::sync::Arc::downgrade(self),
+        }));
         let previous = {
             let mut slot = self.page_tables.write();
             std::mem::replace(&mut *slot, page_tables.clone())
@@ -1148,13 +1367,14 @@ impl MmAccessState {
             let old_root = previous.root_base();
             let new_root = page_tables.root_base();
             record_cow_diagnostic_event(CowDiagnosticEvent::PageTableBind {
-                mm_access: self as *const Self as usize,
+                mm_access: std::sync::Arc::as_ptr(self) as usize,
                 old_authority: previous.authority_id() as usize,
                 new_authority: page_tables.authority_id() as usize,
                 old_root,
                 new_root,
             });
         }
+        self.settle_owed_stage1_rewrites();
     }
 
     pub(crate) fn bind_cow_runtime(&self, binding: MmCowRuntimeBinding) {

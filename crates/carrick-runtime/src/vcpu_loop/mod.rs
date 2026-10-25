@@ -3626,7 +3626,6 @@ pub(crate) mod tests {
         pub(crate) prepared_cancels: usize,
         pub(crate) prepared_commits: usize,
         pub(crate) copyout_owner_probe: Option<CopyoutOwnerProbe>,
-        pub(crate) forced_owner_wait: Option<carrick_el1_abi::PortalOwnerWait>,
         // Frame result, result already completed when injected, restart flag.
         pub(crate) injected_signals: Vec<(Option<i64>, Option<i64>, bool)>,
         pub(crate) injected_fault_siginfo: Vec<Option<(i32, u64)>>,
@@ -3701,9 +3700,6 @@ pub(crate) mod tests {
             Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
             carrick_guest_mem::MemoryPrepareError,
         > {
-            if let Some(wait) = self.forced_owner_wait {
-                return Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(wait));
-            }
             if let Some(wait) = &self.prepare_dependency
                 && !wait.0.is_ready()
             {
@@ -4519,7 +4515,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn serial_host_stale_selection_without_editor_parks_on_pending_stage1_rewrite() {
+    fn serial_host_stale_selection_without_editor_reselects_and_parks_on_physical_producer() {
         exercise_owner_wait_schedule_at(
             carrick_abi::syscall::nr::FSTAT,
             None,
@@ -5007,7 +5003,8 @@ pub(crate) mod tests {
                             wait,
                             zone: zone as *const _ as usize,
                         });
-                        engine.forced_owner_wait = Some(wait);
+                        engine.prepare_dependency =
+                            Some(carrick_guest_mem::OwnedMemoryWait::new(retirement.clone()));
                     }
                     if physical {
                         assert!(matches!(first, DispatchOutcome::OwnerPhysicalWait { .. }));
@@ -5108,7 +5105,8 @@ pub(crate) mod tests {
                         carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::clone(
                             &scheduler,
                         ));
-                    let physical_park = physical || free_reservation_redrive;
+                    let physical_park =
+                        physical || free_reservation_redrive || stale_selection_without_editor;
                     if physical {
                         let binding::OwnedSyscallResume::Ipc(pending) = resume else {
                             panic!("retained pipe read")
@@ -5132,7 +5130,7 @@ pub(crate) mod tests {
                         let parked = job
                             .owner_memory_park(&mut engine, &mut control, frame, wait, resume)
                             .unwrap();
-                        if free_reservation_redrive {
+                        if free_reservation_redrive || stale_selection_without_editor {
                             assert!(matches!(parked, executor::ExecutorExit::Blocked(_)));
                             running
                                 .restore_lease(submission.take_execution_lease().unwrap())
@@ -5269,25 +5267,11 @@ pub(crate) mod tests {
                             "a persistently refused physical pin must park without polling"
                         );
                         if stale_selection_without_editor {
-                            engine.forced_owner_wait = None;
+                            engine.prepare_dependency = None;
                             engine.copyout_owner_probe = None;
                             engine.copyout_prepare = Some(Box::new(|| None));
-                            let access = carrick_el1_linux::sched::object_wait::space_access(
-                                zone,
-                                carrick_sched_core::SlotId::new(1),
-                            );
-                            let editor = access
-                                .try_begin_edit(
-                                    zone.spaces.find(mm.raw()).unwrap(),
-                                    mm.raw(),
-                                    NonZeroU64::new(4).unwrap(),
-                                )
-                                .unwrap();
-                            drop(editor);
-                            carrick_kernel::el1_zone::hand_back_completions();
-                        } else {
-                            retirement.complete();
                         }
+                        retirement.complete();
                     }
                     if !killing && !stale_selection_without_editor {
                         release_tx.send(()).unwrap();

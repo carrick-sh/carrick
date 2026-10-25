@@ -254,7 +254,7 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
     let retry = unsafe {
         carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, retry_cause, frame.x[17])
     };
-    let pin = retain_selected(custody.retain(selected, len, intent), retry)?;
+    let pin = retain_selected(custody.retain_for(target, va, selected, len, intent), retry)?;
     if let Some(wait) = pin.pending() {
         return Err(MemoryPrepareError::Physical(wait));
     }
