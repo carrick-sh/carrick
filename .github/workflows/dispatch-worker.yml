@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   guard:
-    if: github.actor == 'tjfontaine' && (github.event_name == 'issues' || (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/agent')) || (github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-')))
+    if: github.actor == 'tjfontaine' && ((github.event_name == 'issues' && (github.event.label.name == 'dispatch' || startsWith(github.event.label.name, 'dispatch:'))) || (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/agent')) || (github.event.review.state == 'changes_requested' && startsWith(github.event.pull_request.head.ref, 'work/dispatch-')))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
