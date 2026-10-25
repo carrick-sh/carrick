@@ -3,6 +3,17 @@
 # Configure Cargo itself: exporting an automatic RUSTC_WRAPPER would also
 # inject it into fixture admission and test processes. Their environment
 # policy deliberately rejects ambient compiler wrappers.
+# cargo run injects package metadata; host-lease can re-enter this script
+# before worktree-run sanitizes it. Build scripts (ring) watch these values.
+# Normalize every entry so nested Cargo builds see the same environment.
+unset CARGO_PKG_AUTHORS CARGO_PKG_DESCRIPTION CARGO_PKG_HOMEPAGE
+unset CARGO_PKG_LICENSE CARGO_PKG_LICENSE_FILE CARGO_PKG_NAME CARGO_PKG_README
+unset CARGO_PKG_REPOSITORY CARGO_PKG_RUST_VERSION CARGO_PKG_VERSION
+unset CARGO_PKG_VERSION_MAJOR CARGO_PKG_VERSION_MINOR CARGO_PKG_VERSION_PATCH
+unset CARGO_PKG_VERSION_PRE
+unset CARGO_MANIFEST_DIR CARGO_MANIFEST_PATH CARGO_MANIFEST_LINKS
+unset CARGO_BIN_NAME CARGO_CRATE_NAME CARGO_PRIMARY_PACKAGE
+
 carrick_cache_bin=${CARRICK_SCCACHE_BIN:-sccache}
 if [ "${CARRICK_SCCACHE:-1}" = 0 ]; then
     # Disable only our automatic Cargo option. Ambient wrapper variables must

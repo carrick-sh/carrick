@@ -724,10 +724,62 @@ pub fn verify_installed(root: &Path) -> Result<Manifest> {
         return Err(fail("installed manifest hash mismatch"));
     }
     validate_manifest(root, &installed.manifest)?;
-    for executable in &installed.manifest.executables {
-        validate_executable(&safe_path(root, &executable.path)?, executable)?;
+    // Always admit current source inputs above. Only the expensive installed
+    // ELF byte verification is cached, never checkout validation evidence.
+    let stamp_path = root.join("target/fixtures/verified-stat-v1.json");
+    let signature = installed_stat_signature(root, &installed.manifest)?;
+    let fresh = fs::metadata(&stamp_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < std::time::Duration::from_secs(24 * 60 * 60));
+    if !fresh || fs::read(&stamp_path).ok().as_deref() != Some(signature.as_slice()) {
+        // Remove old evidence first: interrupted or failed verification cannot
+        // leave a usable stamp. Detect mutation during the full verification.
+        if stamp_path.exists() {
+            fs::remove_file(&stamp_path)?;
+        }
+        for executable in &installed.manifest.executables {
+            validate_executable(&safe_path(root, &executable.path)?, executable)?;
+        }
+        if installed_stat_signature(root, &installed.manifest)? != signature {
+            return Err(fail("fixture tree changed during verification"));
+        }
+        crate::atomic_file::write(&stamp_path, &signature)?;
     }
     Ok(installed.manifest)
+}
+
+fn installed_stat_signature(root: &Path, manifest: &Manifest) -> Result<Vec<u8>> {
+    let mut signature = manifest_bytes(manifest)?;
+    for executable in &manifest.executables {
+        let path = safe_path(root, &executable.path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() {
+            return Err(fail(format!("not a regular fixture: {}", path.display())));
+        }
+        signature.extend_from_slice(executable.path.as_bytes());
+        signature.extend_from_slice(&metadata.len().to_be_bytes());
+        signature.extend_from_slice(format!("{:?}", metadata.modified()?).as_bytes());
+        // ctime and inode also invalidate same-size writes with a restored
+        // mtime, replacement files, and permission changes on macOS/Linux.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            signature.extend_from_slice(
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                    metadata.mode()
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    Ok(signature)
 }
 
 #[derive(Debug, Default)]

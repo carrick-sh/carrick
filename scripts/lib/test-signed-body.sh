@@ -367,7 +367,7 @@ cleanup() {
         elif test_signed_publish_receipt \
             "$receipt_tmp" \
             "$receipt_path" \
-            "test-signed: OK ($pkg: ${#run_exes[@]} invoked signed executable(s) passed, ${#exes[@]} signed, negative control passed)"
+            "test-signed: OK ($pkg: ${#run_exes[@]} invoked signed executable(s) passed, ${#sign_exes[@]} signed, negative control passed)"
         then
             receipt_tmp=""
         else
@@ -454,7 +454,17 @@ fi
 #    script (a process substitution's exit status would not).
 json_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-build.XXXXXX")"
 scratch+=("$json_log")
-cargo test -p "$pkg" ${cargo_feature_flags[@]+"${cargo_feature_flags[@]}"} --release --no-run --message-format=json >"$json_log"
+# CARRICK_TEST_TARGET names one Cargo integration-test target. Always build
+# the existing negative control too; it must remain present in narrow runs.
+cargo_target_flags=()
+if [ -n "${CARRICK_TEST_TARGET:-}" ]; then
+    cargo_target_flags=(--test "$CARRICK_TEST_TARGET")
+    case "$pkg" in
+        carrick-vmm-hvf) cargo_target_flags+=(--lib) ;;
+        *) cargo_target_flags+=(--test entitlement_negative) ;;
+    esac
+fi
+cargo test -p "$pkg" ${cargo_target_flags[@]+"${cargo_target_flags[@]}"} ${cargo_feature_flags[@]+"${cargo_feature_flags[@]}"} --release --no-run --message-format=json >"$json_log"
 exes=()
 while IFS= read -r exe; do
     [ -n "$exe" ] && exes+=("$exe")
@@ -464,19 +474,7 @@ if [ "${#exes[@]}" -eq 0 ]; then
     exit 1
 fi
 
-# 2. Sign each executable in place through the shared post-link path, and
-#    PROVE the entitlement is on the file before trusting it.
-for exe in "${exes[@]}"; do
-    scratch+=("$exe.raw.$$" "$exe.tmp.$$")
-    carrick_post_link_sign "$exe" "$exe" "$entitlements"
-    if ! test_signed_has_entitlement "$exe"; then
-        echo "test-signed: $exe does not carry com.apple.security.hypervisor after signing" >&2
-        exit 1
-    fi
-    echo "test-signed: signed $exe"
-done
-
-# 3. Enumerate every test before execution, including the ignored subset, then
+# 2. Enumerate every test before execution, including the ignored subset, then
 #    resolve the invocation's exact/non-exact filter fail-closed.
 census="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-census.XXXXXX")"
 ignored_census="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-ignored.XXXXXX")"
@@ -544,6 +542,42 @@ run_exes=()
 while IFS= read -r exe; do
     [ -n "$exe" ] && run_exes+=("$exe")
 done < <(awk -F '\t' '!seen[$1]++ { print $1 }' "$selected")
+
+# Select on unsigned libtest listings: listing never boots a VM. Preserve
+# unfiltered signing, while filtered runs sign only matching binaries and
+# the negative-control carrier. Reuse the census instead of listing again.
+carrier=""
+negative_test_name=""
+negative_matches=0
+while IFS="$(printf '\t')" read -r exe name; do
+    if [ "$name" = "$negative_test" ] || [[ "$name" == *"::$negative_test" ]]; then
+        carrier="$exe"
+        negative_test_name="$name"
+        negative_matches=$((negative_matches + 1))
+    fi
+done <"$census"
+if [ "$negative_matches" -ne 1 ]; then
+    echo "test-signed: $negative_test matched $negative_matches tests; expected exactly one" >&2
+    exit 1
+fi
+sign_exes=()
+for exe in "${exes[@]}"; do
+    if [ -z "$requested_filter" ] || [ "$exe" = "$carrier" ] ||
+        awk -F '\t' -v exe="$exe" '$1 == exe { found=1 } END { exit !found }' "$selected"; then
+        sign_exes+=("$exe")
+    fi
+done
+# 3. Sign each executable in place through the shared post-link path, and
+#    PROVE the entitlement is on the file before trusting it.
+for exe in "${sign_exes[@]}"; do
+    scratch+=("$exe.raw.$$" "$exe.tmp.$$")
+    carrick_post_link_sign "$exe" "$exe" "$entitlements"
+    if ! test_signed_has_entitlement "$exe"; then
+        echo "test-signed: $exe does not carry com.apple.security.hypervisor after signing" >&2
+        exit 1
+    fi
+    echo "test-signed: signed $exe"
+done
 
 if [ "$has_exact" -eq 1 ]; then
     rebuilt_args=()
@@ -684,23 +718,6 @@ done
 #    and re-signed ad-hoc WITHOUT the entitlement — byte-for-byte the state
 #    of a bare `cargo test` binary — and must classify HV_DENIED as
 #    EmbedError::Entitlement. The test is #[ignore] so step 4 skips it.
-carrier=""
-negative_test_name=""
-negative_matches=0
-for exe in "${exes[@]}"; do
-    while IFS= read -r listed; do
-        name="${listed%: test}"
-        if [ "$name" = "$negative_test" ] || [[ "$name" == *"::$negative_test" ]]; then
-            carrier="$exe"
-            negative_test_name="$name"
-            negative_matches=$((negative_matches + 1))
-        fi
-    done < <("$exe" --list 2>/dev/null)
-done
-if [ "$negative_matches" -ne 1 ]; then
-    echo "test-signed: $negative_test matched $negative_matches tests in $pkg; expected exactly one for the negative control" >&2
-    exit 1
-fi
 noent="$carrier.noent.$$"
 scratch+=("$noent")
 cp -f "$carrier" "$noent"
