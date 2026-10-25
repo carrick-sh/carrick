@@ -281,7 +281,7 @@ impl<'a> FsView<'a> {
             }
             let files = this.captured_file_table();
             let (open_file, epoll_reservation) = {
-                let mut table = files.write_open_files();
+                let mut table = files.write_open_files(None);
                 let epoll_reservation = if table
                     .get(&fd.0)
                     .is_some_and(|open_file| open_file.description.has_epoll_registrations())
@@ -374,7 +374,7 @@ impl<'a> FsView<'a> {
                     .collect();
                 if cloexec_only {
                     let files = this.captured_file_table();
-                    let mut table = files.write_open_files();
+                    let mut table = files.write_open_files(None);
                     for fd in fds {
                         if let Some(open_file) = table.get_mut(&fd) {
                             open_file.fd_flags |= LINUX_FD_CLOEXEC;
@@ -391,7 +391,7 @@ impl<'a> FsView<'a> {
                         this.discard_splice_pushback_if_final(fd);
                         this.detach_fd_from_epolls(fd);
                         let files = this.captured_file_table();
-                        let removed = files.write_open_files().remove(&fd);
+                        let removed = files.write_open_files(None).remove(&fd);
                         if let Some(open_file) = removed {
                             this.mqueue_owner_alias_closed(&files, &open_file);
                             this.record_fd_close_owner(fd, cx.tid().raw(), &open_file);

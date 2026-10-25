@@ -521,14 +521,17 @@ mod serial_host {
                 writable: false,
             }));
         std::mem::forget(std::sync::Arc::clone(&dead_description));
-        dispatcher.captured_file_table().write_open_files().insert(
-            34,
-            OpenFile::from_open_description_with_status_flags(
-                dead_description,
-                crate::linux_abi::LINUX_O_RDONLY,
-                0,
-            ),
-        );
+        dispatcher
+            .captured_file_table()
+            .write_open_files(None)
+            .insert(
+                34,
+                OpenFile::from_open_description_with_status_flags(
+                    dead_description,
+                    crate::linux_abi::LINUX_O_RDONLY,
+                    0,
+                ),
+            );
         let registry =
             crate::thread::ThreadRegistry::new(crate::thread::ThreadId::synthetic_for_tests(1340));
         let reporter = CompatReporter::default();

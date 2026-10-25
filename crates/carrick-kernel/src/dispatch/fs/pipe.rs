@@ -998,7 +998,7 @@ impl<'a> FsView<'a> {
             if out.commit(&pair).is_err() {
                 let removed = {
                     let files = this.captured_file_table();
-                    let mut table = files.write_open_files();
+                    let mut table = files.write_open_files(None);
                     [table.remove(&read_fd), table.remove(&write_fd)]
                 };
                 for open_file in removed.into_iter().flatten() {

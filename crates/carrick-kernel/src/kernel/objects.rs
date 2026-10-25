@@ -2216,7 +2216,7 @@ impl Drop for FileTableFunctionalLease {
     }
 }
 
-struct FileTableMutationLease {
+pub(crate) struct FileTableMutationLease {
     gate: Arc<FileTableFunctionalGate>,
 }
 
@@ -2681,7 +2681,7 @@ impl FileTable {
         // reserved_slots) and publish_ipc (open_files.read -> reserved_slots)
         // never invert or race with admission.
         let open_files = self.read_open_files();
-        let mut next_fd = self.lock_next_fd_borrowing(&_mutation);
+        let mut next_fd = self.mutex_write(&self.next_fd, Some(&_mutation));
         let mut reserved = self.lock_reserved_slots();
         let reservation_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(selected) = self.reserve_ipc_min(min_fd, limit, reservation_id) {
@@ -2701,7 +2701,7 @@ impl FileTable {
             });
         }
 
-        let closed_stdio = self.stdio_guard_borrowing(ipc::StdioField::Closed, &_mutation);
+        let closed_stdio = self.stdio_guard(ipc::StdioField::Closed, Some(&_mutation));
 
         let mut fd = None;
 
@@ -2839,11 +2839,11 @@ impl FileTable {
         &self,
         claims: [(i32, u64, FileSlot); N],
     ) -> Result<(), crate::linux_abi::LinuxErrno> {
-        let _mutation = self
+        let mutation = self
             .functional_gate
             .acquire_mutation()
             .ok_or(crate::linux_abi::LINUX_EBADF)?;
-        let mut open_files = self.write_open_files_borrowing(&_mutation);
+        let mut open_files = self.write_open_files(Some(&mutation));
         let mut reserved = self.lock_reserved_slots();
 
         // All authentication and occupancy checks precede publication. The
@@ -2859,20 +2859,18 @@ impl FileTable {
             }
         }
         for (fd, reservation_id, slot) in claims {
-            slot.description.retain_fd_ref();
             reserved.remove(&fd);
-            if open_files.insert_committed(fd, slot).is_some() {
-                carrick_fatal!(
-                    "kernel::file_table_reservation",
-                    "occupied descriptor passed reservation commit checks"
-                );
+            if let Some(displaced) = open_files.insert_committed(fd, slot) {
+                let rejected = open_files.insert_committed(fd, displaced);
+                debug_assert!(rejected.is_some());
+                return Err(crate::linux_abi::LINUX_EBUSY);
             }
             if let Some(installed) = open_files.get(&fd) {
+                installed.description.retain_fd_ref();
                 self.commit_ipc_reservation(fd, reservation_id, installed);
             }
             if (0..3).contains(&fd) {
-                self.stdio_guard_borrowing(ipc::StdioField::Closed, &_mutation)[fd as usize] =
-                    false;
+                self.stdio_guard(ipc::StdioField::Closed, Some(&mutation))[fd as usize] = false;
             }
         }
         Ok(())
@@ -2884,12 +2882,11 @@ impl FileTable {
         reservation_id: u64,
         slot: FileSlot,
     ) -> Result<Option<FileSlot>, crate::linux_abi::LinuxErrno> {
-        let _mutation = self
+        let mutation = self
             .functional_gate
             .acquire_mutation()
             .ok_or(crate::linux_abi::LINUX_EBADF)?;
-        let mut open_files = self.write_open_files_borrowing(&_mutation);
-        let mut next_fd = self.lock_next_fd_borrowing(&_mutation);
+        let mut open_files = self.write_open_files(Some(&mutation));
         let mut reserved = self.lock_reserved_slots();
 
         if reserved.get(&fd).copied() != Some(reservation_id) {
@@ -2902,16 +2899,18 @@ impl FileTable {
             self.commit_ipc_reservation(fd, reservation_id, installed);
         }
 
+        let mut next_fd = self.mutex_write(&self.next_fd, Some(&mutation));
+
         if (0..3).contains(&fd) {
-            self.stdio_guard_borrowing(ipc::StdioField::Closed, &_mutation)[fd as usize] = false;
+            self.stdio_guard(ipc::StdioField::Closed, Some(&mutation))[fd as usize] = false;
         }
 
         if fd >= 3 && fd == *next_fd {
             let mut candidate = fd.saturating_add(1);
-            let closed = self.stdio_guard_borrowing(ipc::StdioField::Closed, &_mutation);
+            let closed = self.stdio_guard(ipc::StdioField::Closed, Some(&mutation));
             loop {
                 let reserved_stdio = (0..3).contains(&candidate) && !closed[candidate as usize];
-                if !open_files.contains_key(&candidate)
+                if !open_files.guard.contains_key(&candidate)
                     && !reserved.contains_key(&candidate)
                     && !reserved_stdio
                 {
@@ -2934,7 +2933,7 @@ impl FileTable {
         description: Arc<FileDescription>,
         close_on_exec: bool,
     ) -> Option<FileSlot> {
-        let mut open_files = self.write_open_files();
+        let mut open_files = self.write_open_files(None);
         open_files.insert(
             number.raw(),
             FileSlot::new(
@@ -3155,32 +3154,20 @@ impl FileTable {
         self.open_files.read()
     }
 
-    pub(crate) fn write_open_files(&self) -> FileTableWriteGuard<'_> {
-        #[cfg(test)]
-        crate::dispatch::budget_meter::record_table_write_lock();
-        let mutation = self.mutation_lease();
-        let guard = self.open_files.write();
-        FileTableWriteGuard {
-            guard,
-            mutation: FileTableMutationCustody::Owned(mutation),
-            fd_ceiling: &self.fd_ceiling,
-            revision: &self.revision,
-            table: self.id,
-            subscriptions: &self.slot_subscriptions,
-            touched: TouchedSlots::new(),
-            owner: self,
-        }
-    }
-
-    fn write_open_files_borrowing<'a>(
+    pub(crate) fn write_open_files<'a>(
         &'a self,
-        mutation: &'a FileTableMutationLease,
+        mutation: Option<&'a FileTableMutationLease>,
     ) -> FileTableWriteGuard<'a> {
         #[cfg(test)]
         crate::dispatch::budget_meter::record_table_write_lock();
+        let mutation = mutation.map_or_else(
+            || FileTableMutationCustody::Owned(self.mutation_lease()),
+            FileTableMutationCustody::Borrowed,
+        );
+        let guard = self.open_files.write();
         FileTableWriteGuard {
-            guard: self.open_files.write(),
-            mutation: FileTableMutationCustody::Borrowed(mutation),
+            guard,
+            mutation,
             fd_ceiling: &self.fd_ceiling,
             revision: &self.revision,
             table: self.id,
@@ -3195,22 +3182,15 @@ impl FileTable {
     }
 
     pub(crate) fn lock_next_fd(&self) -> FileTableMutexGuard<'_, i32> {
-        self.mutex_write(&self.next_fd)
-    }
-
-    fn lock_next_fd_borrowing<'a>(
-        &'a self,
-        mutation: &'a FileTableMutationLease,
-    ) -> FileTableMutexGuard<'a, i32> {
-        self.mutex_write_borrowing(&self.next_fd, mutation)
+        self.mutex_write(&self.next_fd, None)
     }
 
     pub(crate) fn lock_stdio_cloexec(&self) -> FileTableStdioGuard<'_> {
-        self.stdio_guard(ipc::StdioField::Cloexec)
+        self.stdio_guard(ipc::StdioField::Cloexec, None)
     }
 
     pub(crate) fn lock_closed_stdio(&self) -> FileTableStdioGuard<'_> {
-        self.stdio_guard(ipc::StdioField::Closed)
+        self.stdio_guard(ipc::StdioField::Closed, None)
     }
 
     pub(crate) fn lock_reserved_slots(&self) -> MutexGuard<'_, HashMap<i32, u64>> {
@@ -3315,23 +3295,18 @@ impl FileTable {
         })
     }
 
-    fn mutex_write<'a, T>(&'a self, lock: &'a Mutex<T>) -> FileTableMutexGuard<'a, T> {
-        let mutation = self.mutation_lease();
-        FileTableMutexGuard {
-            guard: lock.lock(),
-            _mutation: FileTableMutationCustody::Owned(mutation),
-            revision: &self.revision,
-        }
-    }
-
-    fn mutex_write_borrowing<'a, T>(
+    fn mutex_write<'a, T>(
         &'a self,
         lock: &'a Mutex<T>,
-        mutation: &'a FileTableMutationLease,
+        mutation: Option<&'a FileTableMutationLease>,
     ) -> FileTableMutexGuard<'a, T> {
+        let mutation = mutation.map_or_else(
+            || FileTableMutationCustody::Owned(self.mutation_lease()),
+            FileTableMutationCustody::Borrowed,
+        );
         FileTableMutexGuard {
             guard: lock.lock(),
-            _mutation: FileTableMutationCustody::Borrowed(mutation),
+            _mutation: mutation,
             revision: &self.revision,
         }
     }
@@ -3530,7 +3505,7 @@ impl FileTableWriteGuard<'_> {
         // stdin/stdout/stderr between removal and projection publication.
         if (0..3).contains(number) {
             self.owner
-                .stdio_guard_borrowing(ipc::StdioField::Closed, self.mutation.lease())
+                .stdio_guard(ipc::StdioField::Closed, Some(self.mutation.lease()))
                 [*number as usize] = true;
         }
         removed
@@ -4056,7 +4031,7 @@ mod tests {
         let table = FileTable::with_fd_ceiling(ids.file_table_id().expect("table ID"), authority);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             table
-                .write_open_files()
+                .write_open_files(None)
                 .insert(12, FileSlot::new(regular_description(&ids), 0));
         }));
         assert!(result.is_err());
@@ -4381,7 +4356,7 @@ mod tests {
         let (closed_tx, closed_rx) = std::sync::mpsc::channel();
         let closing_files = Arc::clone(&files);
         let closer = std::thread::spawn(move || {
-            let mut slots = closing_files.write_open_files();
+            let mut slots = closing_files.write_open_files(None);
             guard_tx.send(()).expect("close holds mutation");
             close_rx.recv().expect("race exec freeze");
             assert!(slots.remove(&2).is_none(), "stderr starts implicit");
@@ -4421,7 +4396,7 @@ mod tests {
     fn admitted_stdio_close_borrows_its_mutation_when_retirement_starts() {
         let ids = ObjectIdRegistry::new();
         let table = Arc::new(FileTable::new(ids.file_table_id().expect("table ID")));
-        let mut slots = table.write_open_files();
+        let mut slots = table.write_open_files(None);
         let (retired_tx, retired_rx) = std::sync::mpsc::channel();
         let retiring = Arc::clone(&table);
         let retire = std::thread::spawn(move || {
@@ -4630,7 +4605,7 @@ mod tests {
         let writer = std::thread::spawn(move || {
             writer_started_tx.send(()).expect("writer started");
             writer_table
-                .write_open_files()
+                .write_open_files(None)
                 .insert(number.raw(), FileSlot::new(replacement, 0));
             writer_done_tx.send(()).expect("writer done");
         });
@@ -4751,7 +4726,7 @@ mod tests {
             ids.file_description_id().expect("inserted desc"),
         ));
         {
-            let mut guard = table.write_open_files();
+            let mut guard = table.write_open_files(None);
             guard.get_mut(&4).expect("fd 4").fd_flags = carrick_abi::LinuxFdFlags::CLOEXEC.bits();
             guard.get_mut(&5).expect("fd 5").description = Arc::clone(&swapped);
             assert!(guard.insert(6, FileSlot::new(inserted, 0)).is_none());
@@ -4792,7 +4767,7 @@ mod tests {
         );
 
         {
-            let mut guard = table.write_open_files();
+            let mut guard = table.write_open_files(None);
             assert!(guard.remove(&3).is_some());
             assert!(guard.remove(&7).is_none());
         }
