@@ -2109,6 +2109,10 @@ struct Applied {
     board_changes: Vec<String>,
     #[serde(default)]
     board_left: Vec<String>,
+    #[serde(default)]
+    publication_pr: Option<u64>,
+    #[serde(default)]
+    manual_repair: Option<String>,
 }
 impl Applied {
     fn load() -> Result<Self, ScalerError> {
@@ -2207,6 +2211,7 @@ fn closing_reference(text: &str) -> bool {
                 || reference
                     .to_ascii_lowercase()
                     .contains("https://github.com/")
+                || reference.to_ascii_lowercase().contains("www.github.com/")
                 || ["github.com", "http://", "gh-"]
                     .iter()
                     .any(|prefix| reference.to_ascii_lowercase().starts_with(prefix))
@@ -2233,6 +2238,11 @@ fn proposed_pr_body(
     };
     if text.len() > 8192 {
         return Err(ScalerError::Guard("PR body exceeds 8 KiB"));
+    }
+    if text.contains("Outcome contract:") {
+        return Err(ScalerError::Guard(
+            "PR body contains a reserved Outcome contract: marker",
+        ));
     }
     let canonical = format!("Closes #{issue}");
     let mut closing = false;
@@ -2261,100 +2271,69 @@ fn proposed_pr_body(
 fn markdown_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
-/// Preserve fenced code too: mentions there already render as code.
-fn neutralize_mentions(text: &str) -> String {
-    let text = markdown_newlines(text);
+/// Decode only the HTML references for @, including numeric forms with leading
+/// zeroes or omitted semicolons. Other entities keep their original spelling.
+fn decode_mention_entities(text: &str) -> String {
     let mut result = String::new();
-    let mut fence = None;
-    for line in text.split_inclusive('\n') {
-        let indent = line.bytes().take_while(|b| *b == b' ').count();
-        let rest = &line[indent..];
-        let marker = rest.as_bytes().first().copied().unwrap_or_default();
-        let count = rest.bytes().take_while(|b| *b == marker).count();
-        if indent < 4 && matches!(marker, b'`' | b'~') && count >= 3 {
-            if let Some((open, length)) = fence {
-                if marker == open && count >= length && rest[count..].trim().is_empty() {
-                    fence = None;
-                }
-            } else if marker == b'~' || !rest[count..].contains('`') {
-                fence = Some((marker, count));
-            } else {
-                result.push_str(&neutralize_inline_mentions(line));
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        result.push_str(&rest[..at]);
+        rest = &rest[at..];
+        if rest.starts_with("&commat;") {
+            result.push('@');
+            rest = &rest[8..];
+            continue;
+        }
+        if let Some(numeric) = rest.strip_prefix("&#") {
+            let hex = numeric.starts_with(['x', 'X']);
+            let digits = if hex { &numeric[1..] } else { numeric };
+            let count = digits
+                .bytes()
+                .take_while(|b| {
+                    if hex {
+                        b.is_ascii_hexdigit()
+                    } else {
+                        b.is_ascii_digit()
+                    }
+                })
+                .count();
+            if count > 0
+                && digits[..count]
+                    .trim_start_matches('0')
+                    .eq_ignore_ascii_case(if hex { "40" } else { "64" })
+            {
+                let consumed =
+                    2 + usize::from(hex) + count + usize::from(digits[count..].starts_with(';'));
+                result.push('@');
+                rest = &rest[consumed..];
                 continue;
             }
-            result.push_str(line);
-        } else if fence.is_some() {
-            result.push_str(line);
-        } else {
-            result.push_str(&neutralize_inline_mentions(line));
         }
+        result.push('&');
+        rest = &rest[1..];
     }
+    result.push_str(rest);
     result
 }
-/// Keep mentions visible without notifications. Preserve existing code spans;
-/// escape unmatched backticks so they cannot capture a new mention wrapper.
-fn neutralize_inline_mentions(text: &str) -> String {
+/// A word joiner breaks mentions even in raw HTML and code, where Markdown
+/// backticks are not reliable. Alphanumeric prefixes identify addresses instead.
+fn neutralize_mentions(text: &str) -> String {
+    let text = decode_mention_entities(&markdown_newlines(text));
     let mut result = String::new();
-    let mut at = 0;
-    while let Some(offset) = text[at..].find(['@', '`']) {
-        let start = at + offset;
-        result.push_str(&text[at..start]);
-        if text.as_bytes()[start] == b'`' {
-            // An escaped tick outside code is literal Markdown text.
-            if text[..start]
-                .bytes()
-                .rev()
-                .take_while(|b| *b == b'\\')
-                .count()
-                % 2
-                == 1
-            {
-                result.push('`');
-                at = start + 1;
-                continue;
-            }
-            let ticks = text[start..].bytes().take_while(|b| *b == b'`').count();
-            let mut closing = start + ticks;
-            let mut matched = None;
-            while let Some(offset) = text[closing..].find('`') {
-                let next = closing + offset;
-                let count = text[next..].bytes().take_while(|b| *b == b'`').count();
-                closing = next + count;
-                if count == ticks {
-                    matched = Some(closing);
-                    break;
-                }
-            }
-            if let Some(end) = matched {
-                result.push_str(&text[start..end]);
-                at = end;
-            } else {
-                for _ in 0..ticks {
-                    result.push_str("\\`");
-                }
-                at = start + ticks;
-            }
-        } else {
-            let end = start
-                + 1
-                + text[start + 1..]
-                    .bytes()
-                    .take_while(|b| b.is_ascii_alphanumeric() || b"-_/".contains(b))
-                    .count();
-            if end > start + 1 {
-                if result.bytes().rev().take_while(|b| *b == b'\\').count() % 2 == 1 {
-                    result.pop();
-                }
-                result.push('`');
-            }
-            result.push_str(&text[start..end]);
-            if end > start + 1 {
-                result.push('`');
-            }
-            at = end;
+    let mut previous = None;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        result.push(c);
+        if c == '@'
+            && previous.is_none_or(|p: char| !p.is_alphanumeric())
+            && chars
+                .peek()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || "-_/".contains(*c))
+        {
+            result.push('\u{2060}');
         }
+        previous = Some(c);
     }
-    result.push_str(&text[at..]);
     result
 }
 fn final_pr_body(text: &str, issue: u64, id: &str, token: &str) -> String {
@@ -2369,12 +2348,14 @@ fn template_pr_body(
     id: &str,
     token: &str,
 ) -> Result<String, ScalerError> {
-    let summary =
-        if closing_reference(&contract.summary) || contract.summary.contains("Dispatch run:") {
-            "Worker claims are available in the dispatch outcome.".to_owned()
-        } else {
-            contract.summary.chars().take(4_000).collect::<String>()
-        };
+    let summary = if closing_reference(&contract.summary)
+        || contract.summary.contains("Dispatch run:")
+        || contract.summary.contains("Outcome contract:")
+    {
+        "Worker claims are available in the dispatch outcome.".to_owned()
+    } else {
+        contract.summary.chars().take(4_000).collect::<String>()
+    };
     let template = include_str!("../../../.github/pull_request_template.md")
         .replace("Closes #\n", "")
         .replace(
@@ -2393,7 +2374,9 @@ fn template_pr_body(
     Ok(final_pr_body(&text, issue, id, token))
 }
 
-fn patch_pr_body(root: &Path, number: u64, body: &str) -> Result<(), ScalerError> {
+fn patch_pr_body(root: &Path, number: u64, body: &str, token: &str) -> Result<(), ScalerError> {
+    // Recovery may restore text written before mention protection was installed.
+    let body = neutralize_mentions(&agent_loop::masked(body, token));
     let path = crate::agent_runner::state()?.join("pr-body.md");
     std::fs::write(&path, body)?;
     gh(
@@ -2410,27 +2393,164 @@ fn patch_pr_body(root: &Path, number: u64, body: &str) -> Result<(), ScalerError
     Ok(())
 }
 
-/// GitHub, rather than our local syntax filter, decides actual closing links.
-/// Use the job credential here; the projects-only credential has no repo access.
-fn verify_closing_references(root: &Path, number: u64, issue: u64) -> Result<(), ScalerError> {
-    let response = gh(root, &["api", "graphql", "-f", "query=query($number:Int!){repository(owner:\"carrick-sh\",name:\"carrick\"){pullRequest(number:$number){closingIssuesReferences(first:100){nodes{number repository{nameWithOwner}} pageInfo{hasNextPage}}}}}", "-F", &format!("number={number}")])
-        .map_err(|error| ScalerError::Usage(format!("PR closing references could not be verified: {error}")))?;
-    let value: Value = serde_json::from_str(&response)
-        .map_err(|_| ScalerError::Guard("invalid PR closing references response"))?;
-    let references = &value["data"]["repository"]["pullRequest"]["closingIssuesReferences"];
-    if value.get("errors").is_some()
-        || references["pageInfo"]["hasNextPage"] != false
-        || references["nodes"].as_array().is_none_or(|nodes| {
-            nodes.len() != 1
-                || nodes[0]["number"] != issue
-                || nodes[0]["repository"]["nameWithOwner"] != REPOSITORY
-        })
-    {
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ClosingIssue {
+    repository: String,
+    number: u64,
+}
+type ClosingIssues = std::collections::BTreeSet<ClosingIssue>;
+struct ClosingReferences {
+    all: ClosingIssues,
+    body: ClosingIssues,
+}
+fn issue_reference(issue: u64) -> ClosingIssue {
+    ClosingIssue {
+        repository: REPOSITORY.into(),
+        number: issue,
+    }
+}
+/// GitHub supplies the body-derived view, so manual sidebar links do not depend
+/// on our approximation of GitHub's Markdown closing-keyword parser.
+fn read_closing_references(root: &Path, number: u64) -> Result<ClosingReferences, ScalerError> {
+    let response = gh(
+        root,
+        &[
+            "api",
+            "graphql",
+            "-f",
+            r#"query=query($number:Int!){repository(owner:"carrick-sh",name:"carrick"){pullRequest(number:$number){closingIssuesReferences(first:100){nodes{number repository{nameWithOwner}} pageInfo{hasNextPage}} bodyReferences:closingIssuesReferences(first:100,excludeUserLinked:true){nodes{number repository{nameWithOwner}} pageInfo{hasNextPage}}}}}"#,
+            "-F",
+            &format!("number={number}"),
+        ],
+    )?;
+    if response.len() > 64 * 1024 {
         return Err(ScalerError::Guard(
-            "PR closing references must contain exactly this issue in this repository",
+            "closing-reference response exceeds 64 KiB",
         ));
     }
+    let value: Value = serde_json::from_str(&response)?;
+    if value.get("errors").is_some() {
+        return Err(ScalerError::Guard(
+            "closing-reference query returned errors",
+        ));
+    }
+    let pr = &value["data"]["repository"]["pullRequest"];
+    let parse = |connection: &Value| -> Result<ClosingIssues, ScalerError> {
+        if connection["pageInfo"]["hasNextPage"] != false {
+            return Err(ScalerError::Guard(
+                "closing-reference connection unavailable or truncated",
+            ));
+        }
+        connection["nodes"]
+            .as_array()
+            .ok_or(ScalerError::Guard("closing-reference nodes unavailable"))?
+            .iter()
+            .map(|node| {
+                Ok(ClosingIssue {
+                    number: node["number"]
+                        .as_u64()
+                        .filter(|n| *n > 0)
+                        .ok_or(ScalerError::Guard("invalid closing issue number"))?,
+                    repository: node["repository"]["nameWithOwner"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .ok_or(ScalerError::Guard("invalid closing issue repository"))?
+                        .into(),
+                })
+            })
+            .collect()
+    };
+    let references = ClosingReferences {
+        all: parse(&pr["closingIssuesReferences"])?,
+        body: parse(&pr["bodyReferences"])?,
+    };
+    if !references.body.is_subset(&references.all) {
+        return Err(ScalerError::Guard("closing-reference views disagree"));
+    }
+    Ok(references)
+}
+fn closing_delay(
+    delay: std::time::Duration,
+    deadline: std::time::Instant,
+) -> Result<(), ScalerError> {
+    if deadline.saturating_duration_since(std::time::Instant::now()) <= delay {
+        return Err(ScalerError::Guard(
+            "closing references unverified: index did not settle within the publish command window",
+        ));
+    }
+    std::thread::sleep(delay);
     Ok(())
+}
+/// The derived reference index lags writes. Delay the first read and require two
+/// matching reads two seconds apart, within both twenty seconds and caller time.
+fn verify_closing_references(
+    root: &Path,
+    number: u64,
+    expected: &ClosingIssues,
+) -> Result<(), ScalerError> {
+    let deadline = COMMAND_DEADLINE
+        .with(|slot| slot.get())
+        .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(20))
+        .min(std::time::Instant::now() + std::time::Duration::from_secs(20));
+    let _window = CommandWindow::until(deadline);
+    closing_delay(std::time::Duration::from_secs(3), deadline)?;
+    let mut matched = false;
+    loop {
+        let current = read_closing_references(root, number)
+            .map_err(|e| ScalerError::Usage(format!("closing references unverified: {e}")))?;
+        if std::time::Instant::now() >= deadline {
+            return Err(ScalerError::Guard(
+                "closing references unverified: publish command window exhausted",
+            ));
+        }
+        if !current.all.is_subset(expected) {
+            return Err(ScalerError::Guard(
+                "closing references unverified: unexpected extra reference",
+            ));
+        }
+        if current.all == *expected {
+            if matched {
+                return Ok(());
+            }
+            matched = true;
+        } else {
+            matched = false;
+        }
+        closing_delay(std::time::Duration::from_secs(2), deadline)?;
+    }
+}
+/// Recovery is a body write too: verify it with the same consistency protocol.
+/// Keep byte restoration and reference verification distinct in the report.
+fn restore_pr_body(
+    root: &Path,
+    number: u64,
+    replacement: (&str, &str),
+    expected: &ClosingIssues,
+    failure: &str,
+    token: &str,
+) -> Result<String, ScalerError> {
+    let (body, label) = replacement;
+    let (reason, manual) = match patch_pr_body(root, number, body, token) {
+        Err(error) => (
+            format!("{failure}; {label} was not restored: {error}"),
+            true,
+        ),
+        Ok(()) => match verify_closing_references(root, number, expected) {
+            Ok(()) => (format!("{failure}; {label} restored and verified"), false),
+            Err(error) => (
+                format!(
+                    "{failure}; {label} restored, but closing references remain unverified: {error}"
+                ),
+                true,
+            ),
+        },
+    };
+    let reason = agent_loop::masked(&reason, token);
+    Applied::record(|a| {
+        a.body = AppliedBody::Failed(reason.clone());
+        a.manual_repair = manual.then(|| reason.clone());
+    })?;
+    Ok(reason)
 }
 
 fn publish(
@@ -2536,20 +2656,23 @@ fn publish(
                         body.trim_end()
                     )
                 };
-                patch_pr_body(root, number, &body)?;
-                if let Err(error) = verify_closing_references(root, number, dispatch.issue) {
-                    let reason = agent_loop::masked(&error.to_string(), token);
-                    let restored =
-                        patch_pr_body(root, number, pr["body"].as_str().unwrap_or_default())
-                            .and_then(|()| verify_closing_references(root, number, dispatch.issue));
-                    let reason = match restored {
-                        Ok(()) => format!("{reason}; previous body restored"),
-                        Err(error) => format!(
-                            "{reason}; restoration unconfirmed: {}",
-                            agent_loop::masked(&error.to_string(), token)
-                        ),
-                    };
-                    Applied::record(|a| a.body = AppliedBody::Failed(reason.clone()))?;
+                Applied::record(|a| a.publication_pr = Some(number))?;
+                let previous = read_closing_references(root, number).map_err(|e| {
+                    ScalerError::Usage(format!("closing references unverified before edit: {e}"))
+                })?;
+                let mut expected: ClosingIssues =
+                    previous.all.difference(&previous.body).cloned().collect();
+                expected.insert(issue_reference(dispatch.issue));
+                patch_pr_body(root, number, &body, token)?;
+                if let Err(error) = verify_closing_references(root, number, &expected) {
+                    let reason = restore_pr_body(
+                        root,
+                        number,
+                        (pr["body"].as_str().unwrap_or_default(), "previous body"),
+                        &expected,
+                        &error.to_string(),
+                        token,
+                    )?;
                     return Err(ScalerError::Usage(reason));
                 }
                 Applied::record(|a| a.body = AppliedBody::Updated)?;
@@ -2587,9 +2710,23 @@ fn publish(
             let number = require_owned_pr(root, dispatch)?["number"]
                 .as_u64()
                 .ok_or(ScalerError::Guard("invalid PR number"))?;
-            if let Err(error) = verify_closing_references(root, number, dispatch.issue) {
-                let reason = agent_loop::masked(&error.to_string(), token);
-                Applied::record(|a| a.body = AppliedBody::Failed(reason.clone()))?;
+            Applied::record(|a| a.publication_pr = Some(number))?;
+            let expected = ClosingIssues::from([issue_reference(dispatch.issue)]);
+            if let Err(error) = verify_closing_references(root, number, &expected) {
+                // Recovery prose is server-owned, independent of worker claims.
+                let recovery = Contract {
+                    summary: "The server restored this template because the proposed body's closing references could not be verified.".into(),
+                    ..contract.clone()
+                };
+                let fallback = template_pr_body(&recovery, dispatch.issue, id, token)?;
+                let reason = restore_pr_body(
+                    root,
+                    number,
+                    (&fallback, "default template"),
+                    &expected,
+                    &error.to_string(),
+                    token,
+                )?;
                 return Err(ScalerError::Usage(reason));
             }
             Applied::record(|a| {
@@ -2735,32 +2872,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            body.contains("`@alice`") && body.contains("`@org/team`"),
+            body.contains("@\u{2060}alice") && body.contains("@\u{2060}org/team"),
             "proposed body mentions can notify people"
         );
     }
     #[test]
     fn p2_mentions_inside_code_stay_safe() {
-        for (proposal, expected) in [
-            (
-                "Use `echo @alice` and @org/team.",
-                "Use `echo @alice` and `@org/team`.",
-            ),
-            ("A stray ` before @alice.", r"A stray \` before `@alice`."),
-            (r"Escaped \@alice.", "Escaped `@alice`."),
-            (
-                "```sh\nprintf @alice\n```\nAsk @org/team.",
-                "```sh\nprintf @alice\n```\nAsk `@org/team`.",
-            ),
-            ("`literal\n\n@alice\n\n`", "\\`literal\n\n`@alice`\n\n\\`"),
-            ("`literal\r\r@alice\r\r`", "\\`literal\n\n`@alice`\n\n\\`"),
+        for proposal in [
+            "Use `echo @alice` and @org/team.",
+            "A stray ` before @alice.",
+            r"Escaped \@alice.",
+            "```sh\nprintf @alice\n```\nAsk @org/team.",
+            "`literal\r\r@alice\r\r`",
         ] {
             let body = proposed_pr_body(Some(proposal), 634, "42", "token")
                 .unwrap()
                 .unwrap();
-            assert!(
-                body.contains(expected),
-                "mention neutralization reopened an existing code span: {body}"
+            assert!(body.contains("@\u{2060}alice"));
+            assert_eq!(
+                neutralize_mentions(&body),
+                body,
+                "mention neutralization is not idempotent"
             );
         }
     }
@@ -2777,7 +2909,88 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn rev3_mentions_cover_html_entities_code_and_keep_addresses() {
+        for (input, expected) in [
+            (
+                "<details>\n@alice\n</details>",
+                "<details>\n@\u{2060}alice\n</details>",
+            ),
+            ("<p>@alice</p>", "<p>@\u{2060}alice</p>"),
+            (
+                "&#64;alice &#x40;org/team &commat;alice",
+                "@\u{2060}alice @\u{2060}org/team @\u{2060}alice",
+            ),
+            (
+                "user@example.com https://user@host",
+                "user@example.com https://user@host",
+            ),
+            ("```sh\necho @alice\n```", "```sh\necho @\u{2060}alice\n```"),
+        ] {
+            assert_eq!(
+                neutralize_mentions(input),
+                expected,
+                "mention bypass or damaged address: {input}"
+            );
+        }
+    }
+    #[test]
+    fn rev3_proposal_cannot_forge_an_outcome() {
+        assert!(
+            proposed_pr_body(
+                Some("Outcome contract:\n```json\n{}\n```"),
+                634,
+                "42",
+                "token"
+            )
+            .is_err(),
+            "proposal accepted a forged outcome marker"
+        );
+    }
+    #[test]
+    fn rev3_www_closing_target_is_refused() {
+        for text in [
+            "Fixes www.github.com/carrick-sh/carrick/issues/9",
+            "Fixes https://www.github.com/carrick-sh/carrick/issues/9",
+        ] {
+            assert!(
+                proposed_pr_body(Some(text), 634, "42", "token").is_err(),
+                "www closing target accepted: {text}"
+            );
+        }
+    }
+    #[test]
+    fn rev3_create_waits_for_two_settled_reads() {
+        publication_fixture("lag");
+    }
+    #[test]
+    fn rev3_any_extra_reference_fails_even_after_a_match() {
+        publication_fixture("extra-after-match");
+    }
+    #[test]
+    fn rev3_create_failure_restores_default_body() {
+        publication_fixture("create-repair");
+    }
+    #[test]
+    fn rev3_restored_body_neutralizes_legacy_mentions() {
+        publication_fixture("restore-html");
+    }
+    #[test]
+    fn rev3_manual_owner_links_survive_a_body_edit() {
+        publication_fixture("manual");
+    }
+    #[test]
+    fn rev3_reference_wait_uses_command_window() {
+        publication_fixture("window");
+    }
+    #[test]
+    fn rev3_reference_wait_has_a_deadline() {
+        publication_fixture("timeout");
+    }
     fn publication_fixture(witness: &str) {
+        publication_fixture_outcome(witness, |_, _| {});
+    }
+    pub(super) fn publication_fixture_outcome(witness: &str, outcome: impl Fn(&Path, &Dispatch)) {
         const CHILD: &str = "CARRICK_TEST_DISPATCH_PUBLICATION";
         if std::env::var_os(CHILD).is_none() {
             let temp = tempfile::tempdir().unwrap();
@@ -2805,19 +3018,39 @@ if test "$1" = api; then
  -X)
  test "$3" = PATCH || exit 96
  test ! -f "$RUNNER_TEMP/fail-edit" || exit 94
+ if test -f "$RUNNER_TEMP/reference-mode" && test "$(cat "$RUNNER_TEMP/reference-mode")" = restore-fail && test "$(cat "$RUNNER_TEMP/body-writes")" = 2; then exit 98; fi
  cp "${6#body=@}" "$RUNNER_TEMP/applied-body.md"
+ /usr/bin/python3 -c 'import pathlib,sys;r=pathlib.Path(sys.argv[1]);p=r/"body-writes";p.write_text(str(int(p.read_text())+1));(r/"phase-reads").unlink(missing_ok=True)' "$RUNNER_TEMP"
  ;;
  graphql)
  test "$GH_TOKEN" = fixture-token || exit 97
- if test -f "$RUNNER_TEMP/two-references"; then
- echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[{"number":634,"repository":{"nameWithOwner":"carrick-sh/carrick"}},{"number":999,"repository":{"nameWithOwner":"carrick-sh/carrick"}}],"pageInfo":{"hasNextPage":false}}}}}}'
- else echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[{"number":634,"repository":{"nameWithOwner":"carrick-sh/carrick"}}],"pageInfo":{"hasNextPage":false}}}}}}'; fi
+ /usr/bin/python3 - "$RUNNER_TEMP" <<'REFS'
+import json,pathlib,sys,time
+r=pathlib.Path(sys.argv[1]); m=(r/"reference-mode").read_text() if (r/"reference-mode").exists() else ""
+w=int((r/"body-writes").read_text()) if (r/"body-writes").exists() else 0
+p=r/"phase-reads"; n=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(n))
+with (r/"reference-reads.jsonl").open("a") as f:f.write(json.dumps({"time":time.monotonic(),"write":w,"read":n})+"\n")
+all_refs=body_refs=[634]
+if (r/"two-references").exists(): all_refs=body_refs=[634,999]
+if m=="lag" and w==1 and n<=2: all_refs=body_refs=[]
+if m=="extra-after-match" and w==1 and n>=2: all_refs=body_refs=[634,999]
+if m=="create-repair" and w==1: all_refs=body_refs=[634,999]
+if m=="timeout" and w==1: all_refs=body_refs=[]
+if m=="manual": all_refs=[634,999]; body_refs=[634]
+if m=="restore-fail" and w==2: all_refs=body_refs=[634,999]
+def conn(ns):return {"nodes":[{"number":n,"repository":{"nameWithOwner":"carrick-sh/carrick"}} for n in ns],"pageInfo":{"hasNextPage":False}}
+print(json.dumps({"data":{"repository":{"pullRequest":{"closingIssuesReferences":conn(all_refs),"bodyReferences":conn(body_refs)}}}}))
+REFS
  ;;
  */actions/runs/42) cat "$RUNNER_TEMP/original.json" ;;
  */actions/runs/42/jobs*) echo '{"jobs":[{"name":"worker","status":"completed","runner_name":"carrick-agent-123","steps":[{"name":"Run actions/upload-artifact@v4","status":"completed","conclusion":"success"}]}]}' ;;
  *'/pulls?'*) if test -f "$RUNNER_TEMP/created"; then cat "$RUNNER_TEMP/pr.json"; else echo '[]'; fi ;;
  *) exit 91 ;;
  esac
+elif test "$1 $2" = 'issue comment'; then
+ printf '%s' "$3" > "$RUNNER_TEMP/posted-on"
+ while test "$1" != --body-file; do shift; done
+ cp "$2" "$RUNNER_TEMP/posted.md"
 elif test "$1 $2" = 'pr edit'; then
  test ! -f "$RUNNER_TEMP/fail-edit" || exit 94
  while test "$1" != --body-file; do shift; done
@@ -2825,6 +3058,11 @@ elif test "$1 $2" = 'pr edit'; then
 elif test "$1 $2" = 'pr create'; then
  test ! -f "$RUNNER_TEMP/created" || exit 92
  touch "$RUNNER_TEMP/created"
+ /usr/bin/python3 -c 'import time,pathlib,sys;pathlib.Path(sys.argv[1]).write_text(str(time.monotonic()))' "$RUNNER_TEMP/body-written-at"
+ echo 1 > "$RUNNER_TEMP/body-writes"
+ rm -f "$RUNNER_TEMP/phase-reads"
+ while test "$1" != --body-file; do shift; done
+ cp "$2" "$RUNNER_TEMP/created-body.md"
  echo 'https://github.com/carrick-sh/carrick/pull/800'
 else exit 93
 fi
@@ -2881,7 +3119,10 @@ fi
         git(&work, &["checkout", "-b", &dispatch.branch]).unwrap();
         let subject = "fix(ci): implement the owner issue";
         git(&work, &["commit", "--allow-empty", "-m", subject]).unwrap();
-        let pr = json!({"state":"open","number":800,"user":{"login":"github-actions[bot]","type":"Bot"},"head":{"ref":dispatch.branch,"repo":{"full_name":REPOSITORY}},"base":{"ref":"main"},"draft":true,"body":format!("Closes #634\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
+        let mut pr = json!({"state":"open","number":800,"user":{"login":"github-actions[bot]","type":"Bot"},"head":{"ref":dispatch.branch,"repo":{"full_name":REPOSITORY}},"base":{"ref":"main"},"draft":true,"body":format!("Closes #634\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42")});
+        if witness == "restore-html" {
+            pr["body"] = format!("Legacy <p>@alice</p>\nCloses #634\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42").into();
+        }
         let mut run = review_event()["dispatch_run"].clone();
         run["status"] = "completed".into();
         std::fs::write(outer.join("original.json"), run.to_string()).unwrap();
@@ -2903,6 +3144,83 @@ fi
         };
         let report = state.join("report.md");
         std::fs::write(&report, "").unwrap();
+        if matches!(
+            witness,
+            "lag" | "extra-after-match" | "create-repair" | "timeout"
+        ) {
+            std::fs::write(outer.join("reference-mode"), witness).unwrap();
+            receipt.pr_body = Some("Proposed explanation.".into());
+            let started = std::time::Instant::now();
+            let result = publish(
+                &work,
+                &dispatch,
+                &receipt,
+                &contract,
+                &report,
+                "fixture-token",
+                &mut agent_loop::RunCache::default(),
+            );
+            if witness == "lag" {
+                assert!(
+                    result.is_ok(),
+                    "created PR rejected a lagging reference index: {result:?}"
+                );
+                let rows: Vec<Value> = regular_text(&outer.join("reference-reads.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .map(|s| serde_json::from_str(s).unwrap())
+                    .collect();
+                assert!(
+                    rows.len() >= 4,
+                    "publication did not require two settled reads"
+                );
+                assert!(started.elapsed().as_secs_f64() >= 9.0);
+                let written_at: f64 = regular_text(&outer.join("body-written-at"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(
+                    rows[0]["time"].as_f64().unwrap() - written_at >= 3.0,
+                    "closing-reference index was read before the initial three-second delay"
+                );
+                assert!(
+                    rows.windows(2).all(|r| r[1]["time"].as_f64().unwrap()
+                        - r[0]["time"].as_f64().unwrap()
+                        >= 2.0),
+                    "closing reads were less than two seconds apart"
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "create accepted an index that later exposed an extra reference"
+                );
+                outcome(&work, &dispatch);
+                let fallback = regular_text(&outer.join("applied-body.md"))
+                    .expect("new PR kept the rejected body instead of the default template");
+                assert!(
+                    fallback.contains("## Why") && !fallback.contains("Proposed explanation."),
+                    "create did not restore the default template"
+                );
+                assert!(
+                    Applied::load().unwrap().report().contains("restored"),
+                    "outcome did not say whether the body was restored"
+                );
+                if witness == "timeout" {
+                    assert!(
+                        Applied::load()
+                            .unwrap()
+                            .report()
+                            .contains("closing references unverified"),
+                        "unsettled index was not reported as unverified"
+                    );
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(30),
+                        "reference wait exceeded its bounded recovery window"
+                    );
+                }
+            }
+            return;
+        }
         assert_eq!(
             publish(
                 &work,
@@ -2916,6 +3234,16 @@ fi
             .unwrap(),
             Some(800)
         );
+        if witness == "window" {
+            let _window =
+                CommandWindow::until(std::time::Instant::now() + std::time::Duration::from_secs(1));
+            assert!(
+                verify_closing_references(&work, 800, &ClosingIssues::from([issue_reference(634)]))
+                    .is_err(),
+                "closing-reference wait escaped the command window"
+            );
+            return;
+        }
         let body = regular_text(&state.join("pr-body.md")).unwrap();
         assert!(body.contains("Closes #634") && body.contains("Dispatch run:"));
         if witness == "closing" {
@@ -2961,7 +3289,14 @@ fi
         .unwrap();
         if matches!(
             witness,
-            "body" | "edit-failure" | "references" | "footer" | "refused"
+            "body"
+                | "edit-failure"
+                | "references"
+                | "footer"
+                | "refused"
+                | "manual"
+                | "restore-fail"
+                | "restore-html"
         ) {
             let package = outer.join("dispatch-output");
             std::fs::create_dir_all(&package).unwrap();
@@ -2973,14 +3308,38 @@ fi
         }
         if matches!(
             witness,
-            "body" | "edit-failure" | "references" | "footer" | "refused"
+            "body"
+                | "edit-failure"
+                | "references"
+                | "footer"
+                | "refused"
+                | "manual"
+                | "restore-fail"
+                | "restore-html"
         ) {
             receipt.pr_body = read_pr_body(&outer.join("dispatch-output")).unwrap();
+        }
+        if matches!(witness, "manual" | "restore-fail" | "restore-html") {
+            std::fs::write(outer.join("reference-mode"), witness).unwrap();
+        }
+        if witness == "restore-fail" {
+            let result = publish(
+                &work,
+                &dispatch,
+                &receipt,
+                &contract,
+                &report,
+                "fixture-token",
+                &mut agent_loop::RunCache::default(),
+            );
+            assert!(result.is_err());
+            outcome(&work, &dispatch);
+            return;
         }
         if witness == "refused" {
             receipt.pr_body = Some("Explain the fix.\nFixes #999".into());
         }
-        if witness == "references" {
+        if matches!(witness, "references" | "restore-html") {
             std::fs::write(outer.join("two-references"), "").unwrap();
             let result = publish(
                 &work,
@@ -3004,10 +3363,17 @@ fi
                     .contains("closing references")
             );
             let restored = regular_text(&outer.join("applied-body.md")).unwrap();
-            assert!(
-                restored.starts_with("Closes #634"),
-                "previous body was not restored"
-            );
+            if witness == "restore-html" {
+                assert!(
+                    restored.contains("<p>@\u{2060}alice</p>"),
+                    "restoration reintroduced an HTML mention"
+                );
+            } else {
+                assert!(
+                    restored.starts_with("Closes #634"),
+                    "previous body was not restored"
+                );
+            }
             return;
         }
         if witness == "edit-failure" {
@@ -3060,7 +3426,7 @@ fi
         } else {
             assert_eq!(
                 applied.body == AppliedBody::Updated,
-                matches!(witness, "body" | "footer")
+                matches!(witness, "body" | "footer" | "manual")
             );
         }
         if witness == "footer" {
