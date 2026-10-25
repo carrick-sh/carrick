@@ -640,6 +640,44 @@ struct CommittedChild<T, C> {
     physical: C,
 }
 
+/// Exact predecessor custody retained after an exec owner atomically moves a
+/// child to its successor MM.  The old tables, address tag, and physical pins
+/// remain unavailable until the execution venue proves that no CPU still has
+/// the predecessor installed.
+#[derive(Debug)]
+struct ExecPredecessor<T, C> {
+    predecessor: ReservationMm,
+    successor: ReservationMm,
+    tag: ChildTag<T>,
+    tables: Vec<RootGpa>,
+    physical: C,
+    released: bool,
+}
+
+/// One-shot identity for settling an exec predecessor after the ring has
+/// switched translation and invalidated the old address tag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecPredecessorReceipt<T> {
+    sequence: NonZeroU64,
+    predecessor: ReservationMm,
+    successor: ReservationMm,
+    successor_tag: T,
+}
+
+impl<T: Copy> ExecPredecessorReceipt<T> {
+    pub const fn predecessor(self) -> ReservationMm {
+        self.predecessor
+    }
+
+    pub const fn successor(self) -> ReservationMm {
+        self.successor
+    }
+
+    pub const fn successor_tag(self) -> T {
+        self.successor_tag
+    }
+}
+
 /// Monotonic counters for diagnostics and the counted-`EAGAIN` contract.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ForkStockCounters {
@@ -810,7 +848,9 @@ pub struct ForkStock<T: ChildAddressTags, C = ()> {
     lifecycles: Vec<ForkLifecycleLoan>,
     pending: Vec<Option<PendingForkLoan<T::Tag, C>>>,
     next_loan: NonZeroU64,
+    next_exec_predecessor: NonZeroU64,
     children: BTreeMap<MmKey, CommittedChild<T::Tag, C>>,
+    exec_predecessors: BTreeMap<NonZeroU64, ExecPredecessor<T::Tag, C>>,
     /// Table pages each live MM consumed, as a child or as a fork parent.
     committed_tables: BTreeMap<MmKey, Vec<RootGpa>>,
     /// Submitted native backing transactions awaiting their exact EL1 receipt.
@@ -837,7 +877,9 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             lifecycles: Vec::new(),
             pending: Vec::new(),
             next_loan: NonZeroU64::MIN,
+            next_exec_predecessor: NonZeroU64::MIN,
             children: BTreeMap::new(),
+            exec_predecessors: BTreeMap::new(),
             committed_tables: BTreeMap::new(),
             pending_descriptor_tables: BTreeMap::new(),
             quarantine: BTreeMap::new(),
@@ -894,6 +936,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             || !self.tables.is_empty()
             || !self.lifecycles.is_empty()
             || !self.children.is_empty()
+            || !self.exec_predecessors.is_empty()
             || !self.committed_tables.is_empty()
             || !self.pending_descriptor_tables.is_empty()
             || self.pending.iter().any(Option::is_some)
@@ -1167,6 +1210,167 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             ledger.give_back(*page, reservation.mm);
         }
         self.tables.extend(reservation.pages);
+    }
+
+    /// An unfinished descriptor supply may already have linked any of its
+    /// grants. Transfer all of them to terminal MM custody before withdrawing
+    /// the live child identity that authenticated receipt settlement.
+    fn take_pending_descriptor_tables(&mut self, key: MmKey) -> Vec<RootGpa> {
+        let pending: Vec<_> = self
+            .pending_descriptor_tables
+            .keys()
+            .filter(|(pending, _)| *pending == key)
+            .copied()
+            .collect();
+        let mut pending_pages = Vec::new();
+        for pending_key in pending {
+            if let Some(pending) = self.pending_descriptor_tables.remove(&pending_key) {
+                pending_pages.extend(pending.pages);
+            }
+        }
+        pending_pages
+    }
+
+    /// Move one exact live fork child to a prepared exec successor. Every
+    /// refusing check precedes mutation. The lifecycle/control allocation is
+    /// process custody and therefore follows the successor; predecessor table,
+    /// tag, and physical custody move to a one-shot settlement receipt.
+    pub fn replace_child_for_exec(
+        &mut self,
+        execution: GrantExecution,
+        successor: carrick_el1_abi::El1MmHandle,
+        successor_root: RootGpa,
+        successor_physical: C,
+    ) -> Result<ExecPredecessorReceipt<T::Tag>, (ForkStockServiceError, C)> {
+        let Some(predecessor_mm) = ReservationMm::new(execution.binding.mm.raw()) else {
+            return Err((ForkStockServiceError::StaleExecution, successor_physical));
+        };
+        let Some(predecessor_key) = MmKey::of(predecessor_mm) else {
+            return Err((ForkStockServiceError::StaleExecution, successor_physical));
+        };
+        let successor_mm = successor.mm();
+        let Some(successor_key) = MmKey::of(successor_mm) else {
+            return Err((ForkStockServiceError::InvalidRecord, successor_physical));
+        };
+        let exact_predecessor = self.children.get(&predecessor_key).is_some_and(|child| {
+            child.owner.carrier() == self.carrier
+                && child.owner.mm() == predecessor_mm
+                && child.root == execution.context.root
+                && child.owner.incarnation() == execution.context.generation.raw()
+                && execution.context.mm.raw().get() == predecessor_mm.raw()
+        });
+        if !exact_predecessor
+            || successor.carrier() != self.carrier
+            || successor_mm == predecessor_mm
+            || self.children.contains_key(&successor_key)
+            || self.quarantine.contains_key(&predecessor_key)
+            || self.quarantine.contains_key(&successor_key)
+            || self
+                .exec_predecessors
+                .values()
+                .any(|pending| pending.predecessor == predecessor_mm)
+        {
+            return Err((ForkStockServiceError::StaleExecution, successor_physical));
+        }
+        let Some(successor_tag) = self.tags.allocate() else {
+            return Err((
+                ForkStockServiceError::Asid(AsidError::Exhausted),
+                successor_physical,
+            ));
+        };
+        let sequence = self.next_exec_predecessor;
+        let Some(next) = sequence.get().checked_add(1).and_then(NonZeroU64::new) else {
+            let _ = self.tags.release_unpublished(successor_tag);
+            return Err((ForkStockServiceError::InvalidRecord, successor_physical));
+        };
+
+        // All validation and fallible allocation completed. These removals
+        // are exact by the checks above and the mutable owner excludes drift.
+        let Some(predecessor) = self.children.remove(&predecessor_key) else {
+            let _ = self.tags.release_unpublished(successor_tag);
+            return Err((ForkStockServiceError::StaleExecution, successor_physical));
+        };
+        let mut tables = self
+            .committed_tables
+            .remove(&predecessor_key)
+            .unwrap_or_default();
+        tables.extend(self.take_pending_descriptor_tables(predecessor_key));
+        let successor_child = CommittedChild {
+            owner: successor,
+            root: successor_root,
+            lifecycle: predecessor.lifecycle,
+            control: predecessor.control,
+            tag: ChildTag::bind(successor_tag, successor_mm),
+            physical: successor_physical,
+        };
+        let replaced = self.children.insert(successor_key, successor_child);
+        debug_assert!(replaced.is_none());
+        let pending = ExecPredecessor {
+            predecessor: predecessor_mm,
+            successor: successor_mm,
+            tag: predecessor.tag,
+            tables,
+            physical: predecessor.physical,
+            released: false,
+        };
+        let replaced = self.exec_predecessors.insert(sequence, pending);
+        debug_assert!(replaced.is_none());
+        self.next_exec_predecessor = next;
+        Ok(ExecPredecessorReceipt {
+            sequence,
+            predecessor: predecessor_mm,
+            successor: successor_mm,
+            successor_tag,
+        })
+    }
+
+    /// Consume an exact exec predecessor receipt after translation switch.
+    /// Carrier release runs once; table clearing and tag retirement must both
+    /// succeed before stock is reusable. A stale or duplicate receipt cannot
+    /// act on a later MM that recycled either numeric identity.
+    pub fn settle_exec_predecessor(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        receipt: ExecPredecessorReceipt<T::Tag>,
+        absence: SlotAbsence,
+        mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
+        mut release: impl FnMut(&C, &SlotAbsence) -> bool,
+    ) -> Result<(), ForkStockServiceError> {
+        let Some(mut pending) = self.exec_predecessors.remove(&receipt.sequence) else {
+            return Err(ForkStockServiceError::StaleExecution);
+        };
+        let exact = pending.predecessor == receipt.predecessor
+            && pending.successor == receipt.successor
+            && absence.mm() == receipt.predecessor
+            && self
+                .children
+                .get(&MmKey::of(receipt.successor).ok_or(ForkStockServiceError::InvalidRecord)?)
+                .is_some_and(|child| child.tag.tag() == receipt.successor_tag);
+        if !exact {
+            self.exec_predecessors.insert(receipt.sequence, pending);
+            return Err(ForkStockServiceError::StaleExecution);
+        }
+        if !pending.released {
+            if !release(&pending.physical, &absence) {
+                self.exec_predecessors.insert(receipt.sequence, pending);
+                return Err(ForkStockServiceError::MemoryAccessFailed);
+            }
+            pending.released = true;
+        }
+        if !clear_tables(&pending.tables) {
+            self.exec_predecessors.insert(receipt.sequence, pending);
+            return Err(ForkStockServiceError::ExposedDirtyTable);
+        }
+        if let Err(error) = self.tags.retire(pending.tag, absence) {
+            self.exec_predecessors.insert(receipt.sequence, pending);
+            return Err(error);
+        }
+        for page in &pending.tables {
+            ledger.give_back(*page, pending.predecessor);
+        }
+        self.tables.extend(pending.tables);
+        drop(pending.physical);
+        Ok(())
     }
 
     /// True when some retired child is waiting for reclaim.
@@ -1799,18 +2003,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         if !retire.accept() {
             return Err(ForkStockServiceError::InvalidRecord);
         }
-        let pending: Vec<_> = self
-            .pending_descriptor_tables
-            .keys()
-            .filter(|(pending, _)| *pending == key)
-            .copied()
-            .collect();
-        let mut pending_pages = Vec::new();
-        for pending_key in pending {
-            if let Some(pending) = self.pending_descriptor_tables.remove(&pending_key) {
-                pending_pages.extend(pending.pages);
-            }
-        }
+        let pending_pages = self.take_pending_descriptor_tables(key);
         if !pending_pages.is_empty() {
             self.committed_tables
                 .entry(key)
