@@ -2460,7 +2460,6 @@ mod carrier_vm_custody_tests {
         assert_eq!(unmap_calls, 0);
 
         backing.extents.clear();
-        custody.request_global_frame_retirement_retry();
         assert!(backing.extents.is_empty());
         assert_eq!(unmap_calls, 0, "pin release/Drop must not call the backend");
         assert!(custody.global_frame_host_owners.lock()[&key].is_pending());

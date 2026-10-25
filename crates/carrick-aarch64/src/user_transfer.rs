@@ -204,12 +204,16 @@ pub enum TransferPreparation {
 pub enum TransferRetention<P> {
     Retained(P),
     Physical(carrick_guest_mem::OwnedMemoryWait),
+    /// The selected stage-1 leaf no longer has retainable stage-2 backing.
+    /// Retry only after the exact MM editor advances; without an editor this
+    /// is a terminal guest mapping fault, not a physical-retirement wait.
+    StaleSelection,
 }
 impl<P> TransferRetention<P> {
     pub fn into_retained(self) -> Option<P> {
         match self {
             Self::Retained(pin) => Some(pin),
-            Self::Physical(_) => None,
+            Self::Physical(_) | Self::StaleSelection => None,
         }
     }
 }
@@ -700,6 +704,7 @@ where
                     TransferRetention::Retained(Box::new(pin) as Box<dyn TransferPin>)
                 }
                 TransferRetention::Physical(wait) => TransferRetention::Physical(wait),
+                TransferRetention::StaleSelection => TransferRetention::StaleSelection,
             })
     }
 }

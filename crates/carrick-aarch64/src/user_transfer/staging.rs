@@ -244,7 +244,17 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
         root_generation: nz(frame.x[9]),
         offset: offset as u64,
     };
-    let pin = retain_selected(custody.retain(selected, len, intent))?;
+    let Some(retry_cause) = carrick_el1_abi::PortalWaitCause::decode(frame.x[16]) else {
+        return Err(MemoryPrepareError::Fault(
+            carrick_guest_mem::MemoryError::HostMap(
+                "selected data omitted its editor receipt".to_owned(),
+            ),
+        ));
+    };
+    let retry = unsafe {
+        carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, retry_cause, frame.x[17])
+    };
+    let pin = retain_selected(custody.retain(selected, len, intent), retry)?;
     if let Some(wait) = pin.pending() {
         return Err(MemoryPrepareError::Physical(wait));
     }
@@ -280,18 +290,36 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
 
 fn retain_selected<P>(
     result: Result<TransferRetention<P>, TrapError>,
+    retry: carrick_el1_abi::PortalOwnerWait,
 ) -> Result<P, MemoryPrepareError> {
     match result.map_err(|error| {
         MemoryPrepareError::Fault(carrick_guest_mem::MemoryError::HostMap(error.to_string()))
     })? {
         TransferRetention::Retained(pin) => Ok(pin),
         TransferRetention::Physical(wait) => Err(MemoryPrepareError::Physical(wait)),
+        TransferRetention::StaleSelection => Err(MemoryPrepareError::OwnerWait(retry)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn editor_retry() -> carrick_el1_abi::PortalOwnerWait {
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                carrick_el1_abi::ReservationMm::new(1).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            )
+        };
+        unsafe {
+            carrick_el1_abi::PortalOwnerWait::from_owner(
+                handle,
+                carrick_el1_abi::PortalWaitCause::Editor,
+                1,
+            )
+        }
+    }
     #[test]
     fn stale_physical_selection_returns_physical_producer() {
         #[derive(Debug)]
@@ -309,14 +337,29 @@ mod tests {
         }
         let wait = carrick_guest_mem::OwnedMemoryWait(std::sync::Arc::new(Pending));
         assert!(matches!(
-            retain_selected::<()>(Ok(TransferRetention::Physical(wait.clone()))),
+            retain_selected::<()>(
+                Ok(TransferRetention::Physical(wait.clone())),
+                editor_retry(),
+            ),
             Err(MemoryPrepareError::Physical(found)) if found == wait
         ));
         assert!(matches!(
-            retain_selected::<()>(Err(TrapError::Hypervisor("physical failure".into()))),
+            retain_selected::<()>(
+                Err(TrapError::Hypervisor("physical failure".into())),
+                editor_retry(),
+            ),
             Err(MemoryPrepareError::Fault(
                 carrick_guest_mem::MemoryError::HostMap(_)
             ))
+        ));
+    }
+
+    #[test]
+    fn stale_stage1_selection_returns_exact_editor_producer() {
+        let retry = editor_retry();
+        assert!(matches!(
+            retain_selected::<()>(Ok(TransferRetention::StaleSelection), retry),
+            Err(MemoryPrepareError::OwnerWait(found)) if found == retry
         ));
     }
 }

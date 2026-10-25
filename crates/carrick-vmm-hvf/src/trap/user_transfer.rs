@@ -428,9 +428,7 @@ impl UserTransferCustody {
         // end cannot be mistaken for absent backing (and endlessly reselected).
         let Some(identity) = self.custody.stage2_record_covering(selected.ipa, 1) else {
             carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 1);
-            return Ok(TransferRetention::Physical(
-                self.custody.stage2_retirement_wait(None),
-            ));
+            return Ok(TransferRetention::StaleSelection);
         };
         let extent = self
             .custody
@@ -456,19 +454,19 @@ impl UserTransferCustody {
         };
         let pin = match self.custody.pin_stage2_record(identity) {
             Ok(pin) => pin,
-            Err(
-                reason @ (CarrierStage2PinError::NotFound
-                | CarrierStage2PinError::NotMapped
-                | CarrierStage2PinError::RetirementRequested),
-            ) => {
+            Err(reason @ (CarrierStage2PinError::NotFound | CarrierStage2PinError::NotMapped)) => {
                 carrick_observability::probes::hvpatch_el1_host_read_retention(
                     selected.ipa,
                     match reason {
                         CarrierStage2PinError::NotFound => 3,
                         CarrierStage2PinError::NotMapped => 4,
-                        _ => 5,
+                        _ => unreachable!(),
                     },
                 );
+                return Ok(TransferRetention::StaleSelection);
+            }
+            Err(CarrierStage2PinError::RetirementRequested) => {
+                carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 5);
                 return Ok(TransferRetention::Physical(
                     self.custody.stage2_retirement_wait(Some(identity)),
                 ));
@@ -738,17 +736,19 @@ pub(super) mod tests {
                 .is_err(),
             "known backing range overflow must not become a recheck wait"
         );
-        let TransferRetention::Physical(wait) = physical
-            .retain(
-                selection(0xa085_3100_0000 + 32768),
-                4,
-                PortalTransferIntent::UserRead,
-            )
-            .unwrap()
-        else {
-            panic!("absent stage-2 selection must name physical retirement");
-        };
-        assert!(wait.0.is_ready(), "an already-absent record has completed");
+        assert!(
+            matches!(
+                physical
+                    .retain(
+                        selection(0xa085_3100_0000 + 32768),
+                        4,
+                        PortalTransferIntent::UserRead,
+                    )
+                    .unwrap(),
+                TransferRetention::StaleSelection
+            ),
+            "an absent stage-2 record is a stale selection, not an already-ready physical wait"
+        );
     }
 
     #[test]
@@ -1079,6 +1079,15 @@ pub(super) mod tests {
             wakes.load(Ordering::Relaxed),
             1,
             "backend retirement completion owns the physical wake"
+        );
+        assert!(
+            matches!(
+                physical
+                    .retain(selected, 4096, PortalTransferIntent::UserRead)
+                    .unwrap(),
+                TransferRetention::StaleSelection
+            ),
+            "an unmapped stage-2 record is a stale selection, not an already-ready physical wait"
         );
     }
     #[test]

@@ -37,9 +37,10 @@ pub(super) enum OwnerMemoryAction {
     Retained,
 }
 
-enum OwnerMemoryPark {
+pub(super) enum OwnerMemoryPark {
     Parked(executor::ExecutorExit),
     Recheck(OwnerMemoryAction),
+    NoProducer(OwnerMemoryAction),
 }
 
 /// A Reservations receipt names the root-release stream, but selection can
@@ -51,6 +52,12 @@ fn reservation_root_is_held(zone: &ZoneTables, mm: carrick_el1_abi::ReservationM
         return false;
     };
     reservation_root_is_held_in(roots, zone, mm)
+}
+
+fn editor_is_held(zone: &ZoneTables, mm: carrick_el1_abi::ReservationMm) -> bool {
+    zone.spaces
+        .find(mm.raw())
+        .is_some_and(|index| zone.spaces.active_editor(index).is_some())
 }
 
 fn reservation_root_is_held_in(
@@ -785,6 +792,7 @@ where
     /// Enroll an exact EL1 owner release before surrendering the executor.
     /// The portal checks the producer revision after linking the record, so a
     /// release racing enrollment returns `Changed` and redispatches here.
+    #[cfg(test)]
     pub(super) fn owner_memory_park(
         &mut self,
         engine: &mut E,
@@ -793,85 +801,16 @@ where
         wait: carrick_el1_abi::PortalOwnerWait,
         resume: OwnedSyscallResume,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        let mut wait = wait;
-        let mut resume = resume;
-        loop {
-            match self.park_owner_memory_action(
-                engine,
-                control,
-                OwnerMemoryAction::Syscall { frame, resume },
-                wait,
-            )? {
-                OwnerMemoryPark::Parked(exit) => return Ok(exit),
-                OwnerMemoryPark::Recheck(OwnerMemoryAction::Syscall {
-                    frame: retry_frame,
-                    resume: retry,
-                }) => {
-                    debug_assert_eq!(retry_frame, frame);
-                    let outcome =
-                        match self.resume_owner_ready_step(engine, control, retry_frame, retry)? {
-                            super::binding::OwnerReadyStep::Outcome(outcome) => outcome,
-                            super::binding::OwnerReadyStep::Exit(exit) => return Ok(exit),
-                        };
-                    if let Some(park) = self.state.pending_ipc_park.take() {
-                        return self.ipc_park(engine, control, frame, park);
-                    }
-                    let (outcome, next_resume) = super::binding::owner_copyin_route(outcome);
-                    let next_resume = next_resume.or_else(|| {
-                        self.state
-                            .pending_ipc_owner
-                            .take()
-                            .map(OwnedSyscallResume::Ipc)
-                    });
-                    if let DispatchOutcome::OwnerMemoryWait {
-                        wait: next_wait,
-                        committed,
-                    } = outcome
-                    {
-                        self.state.owner_read_progress = self
-                            .state
-                            .owner_read_progress
-                            .checked_add(committed)
-                            .ok_or_else(|| {
-                                RuntimeError::Configuration(
-                                    "owner read progress overflow".to_owned(),
-                                )
-                            })?;
-                        wait = next_wait;
-                        resume = next_resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch);
-                        continue;
-                    }
-                    return self.service_outcome(engine, control, frame, outcome, next_resume);
-                }
-                OwnerMemoryPark::Recheck(OwnerMemoryAction::Retained) => {
-                    return Err(RuntimeError::Configuration(
-                        "syscall owner park changed action".to_owned(),
-                    )
-                    .into());
-                }
-            }
-        }
+        self.drive_service_outcome(
+            engine,
+            control,
+            frame,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            Some(resume),
+        )
     }
 
-    pub(super) fn park_retained_memory_owner(
-        &mut self,
-        engine: &mut E,
-        control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        wait: carrick_el1_abi::PortalOwnerWait,
-    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        match self.park_owner_memory_action(engine, control, OwnerMemoryAction::Retained, wait)? {
-            OwnerMemoryPark::Parked(exit) => Ok(exit),
-            OwnerMemoryPark::Recheck(OwnerMemoryAction::Retained) => {
-                let action = self.take_retained_memory_action()?;
-                self.drive_retained_memory(engine, control, action)
-            }
-            OwnerMemoryPark::Recheck(OwnerMemoryAction::Syscall { .. }) => Err(
-                RuntimeError::Configuration("retained owner park changed action".to_owned()).into(),
-            ),
-        }
-    }
-
-    fn park_owner_memory_action(
+    pub(super) fn park_owner_memory_action(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
@@ -955,9 +894,21 @@ where
             carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects)
         };
         let cause = enrollment.cause();
-        match enrollment.park_host_rechecked(record, token, &complete, || {
-            cause != carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations
-                || reservation_root_is_held(zone, wait_mm)
+        if enrollment.current_revision() == enrollment.revision()
+            && cause == carrick_sched_core::spaces::notification::SpaceWaitCause::Editor
+            && !editor_is_held(zone, wait_mm)
+        {
+            zone.free_record(record);
+            return Ok(OwnerMemoryPark::NoProducer(action));
+        }
+        match enrollment.park_host_rechecked(record, token, &complete, || match cause {
+            carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations => {
+                reservation_root_is_held(zone, wait_mm)
+            }
+            carrick_sched_core::spaces::notification::SpaceWaitCause::Editor => {
+                editor_is_held(zone, wait_mm)
+            }
+            _ => true,
         }) {
             Ok(()) => {
                 zone.counters

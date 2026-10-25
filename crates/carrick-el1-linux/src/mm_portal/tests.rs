@@ -4105,7 +4105,7 @@ fn owner_wait_queue_admission_busy_retains_owned_handback_until_unlock() {
 }
 
 #[test]
-fn selected_data_retains_exact_pre_selection_reservation_observation() {
+fn selected_data_retains_exact_post_selection_editor_observation() {
     use carrick_sched_core::spaces::notification::SpaceWaitCause;
     let region = Region::new();
     let zone = region.zone();
@@ -4127,16 +4127,21 @@ fn selected_data_retains_exact_pre_selection_reservation_observation() {
         .space_entry(NonZeroU64::new(mm.raw()).unwrap())
         .unwrap();
     let source = entry.notifications(handle.incarnation()).unwrap();
-    let revision = source.observe(SpaceWaitCause::Reservations).revision();
+    let revision = source.observe(SpaceWaitCause::Editor).revision();
     let tables = Tables::new(ROOT, IPA, 1);
     let chosen = selected(select(&portal, &transfer, &tables));
     let wait = chosen.retry().unwrap();
     assert_eq!(wait.handle(), handle);
-    assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Reservations);
-    assert_eq!(wait.revision(), revision);
+    assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Editor);
     assert_ne!(
-        source.observe(SpaceWaitCause::Reservations).revision(),
-        revision
+        wait.revision(),
+        revision,
+        "the selection's own editor release must precede the retry observation"
+    );
+    assert_eq!(
+        wait.revision(),
+        source.observe(SpaceWaitCause::Editor).revision(),
+        "the stale-leaf receipt must begin after SELECT releases its editor"
     );
 }
 

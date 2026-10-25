@@ -77,6 +77,12 @@ impl PartialEq for OwnedMemoryWait {
     }
 }
 impl Eq for OwnedMemoryWait {}
+impl OwnedMemoryWait {
+    /// Stable identity of this exact producer without retaining its custody.
+    pub fn producer_identity(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.0) as *const () as usize
+    }
+}
 
 /// One-shot owned read progress. Clones share custody rather than clone the
 /// operation's completed prefix. Only the producing backend can recover its

@@ -99,6 +99,13 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
         self.revision
     }
 
+    /// Current revision of the exact notification source named by this
+    /// enrollment. Consumers use this to distinguish completed producer work
+    /// from a current receipt that has no live producer.
+    pub fn current_revision(&self) -> u64 {
+        self.source.observe(self.cause).revision()
+    }
+
     /// Authenticate a ring-owned continuation against its retained birth MM.
     pub fn for_owner(
         zone: &'a ZoneTables<C>,

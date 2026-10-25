@@ -419,6 +419,57 @@ pub(super) enum RetainedMemoryAction {
     },
 }
 
+enum RetainedMemoryAttempt {
+    Exit(executor::ExecutorExit),
+    Wait {
+        action: RetainedMemoryAction,
+        error: carrick_guest_mem::MemoryPrepareError,
+    },
+}
+
+enum RetainedMemoryWaitAttempt {
+    Exit(executor::ExecutorExit),
+    Retry {
+        action: RetainedMemoryAction,
+        producer: Option<OwnerRedriveProducer>,
+    },
+}
+
+enum OwnerRedriveProducer {
+    Owner(carrick_el1_abi::PortalOwnerWait),
+    Physical(usize),
+}
+impl PartialEq for OwnerRedriveProducer {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Owner(left), Self::Owner(right)) => left == right,
+            (Self::Physical(left), Self::Physical(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+impl Eq for OwnerRedriveProducer {}
+
+enum OwnerResumeWork {
+    Syscall {
+        frame: carrick_hal::RawSyscall,
+        outcome: DispatchOutcome,
+        resume: Option<OwnedSyscallResume>,
+    },
+    RetainedAction(RetainedMemoryAction),
+    RetainedWait {
+        action: RetainedMemoryAction,
+        error: carrick_guest_mem::MemoryPrepareError,
+    },
+}
+
+enum OwnerResumeStep {
+    Exit(executor::ExecutorExit),
+    Continue(OwnerResumeWork),
+}
+
+const OWNER_REDRIVE_MAX_PASSES: usize = 4096;
+
 impl RetainedMemoryAction {
     fn is_drain_owner(&self) -> bool {
         matches!(self, Self::ExecDrain { .. } | Self::ProcessFinish { .. })
@@ -1065,10 +1116,10 @@ where
     fn finalize_persistent_process_terminal(
         &mut self,
         engine: &mut E,
-        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        _control: &mut executor::HvpatchQuantumControl<'_, '_>,
         terminal_context: carrick_kernel::kernel::KernelContext,
         mut terminal: PersistentTerminal,
-    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+    ) -> Result<RetainedMemoryAttempt, ProductionHvpatchPollError> {
         let process = self.kernel.hvpatch_process.as_ref().unwrap_or_else(|| {
             carrick_fatal!(
                 "kernel::terminal_settlement",
@@ -1220,12 +1271,12 @@ where
                                     _subscription: subscription,
                                 },
                             };
-                            return Ok(self.suspend(
+                            return Ok(RetainedMemoryAttempt::Exit(self.suspend(
                                 HvpatchLoopSuspension::TerminalSiblingDrain,
                                 executor::ExecutorExit::Blocked(
                                     carrick_kernel::kernel::objects::BlockedReason::HostWait,
                                 ),
-                            ));
+                            )));
                         }
                     }
                 }
@@ -1282,13 +1333,13 @@ where
                     context: terminal_context.retain_exact(),
                     terminal,
                 };
-                return Ok(self.park_thread_exit_retry(
+                return Ok(RetainedMemoryAttempt::Exit(self.park_thread_exit_retry(
                     &terminal_context,
                     epoch,
                     HvpatchProductionPhase::RetainedMemoryRetry {
                         action: Box::new(action),
                     },
-                ));
+                )));
             }
             Err(error) => {
                 return Err(RuntimeError::Configuration(format!(
@@ -1312,15 +1363,13 @@ where
                     // before parking. Keep only exact clear/terminal custody.
                     drop(topology);
                     drop(owner_set_edit);
-                    return self.wait_for_retained_memory(
-                        engine,
-                        control,
-                        RetainedMemoryAction::ProcessFinish {
+                    return Ok(RetainedMemoryAttempt::Wait {
+                        action: RetainedMemoryAction::ProcessFinish {
                             context: terminal_context,
                             terminal,
                         },
                         error,
-                    );
+                    });
                 }
             };
         let publish_result = publish_result.and_then(|publication| publication.publish());
@@ -1469,7 +1518,9 @@ where
         drop(owner_set_edit);
         drop(topology);
         self.kernel.publish_process_terminal(terminal_publication);
-        Ok(self.finish(terminal.into_result()))
+        Ok(RetainedMemoryAttempt::Exit(
+            self.finish(terminal.into_result()),
+        ))
     }
 
     pub(super) fn drive_thread_exit(
@@ -1478,6 +1529,15 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         code: i32,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        self.drive_retained_memory(engine, control, RetainedMemoryAction::ThreadExit { code })
+    }
+
+    fn attempt_thread_exit(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        code: i32,
+    ) -> Result<RetainedMemoryAttempt, ProductionHvpatchPollError> {
         let context = self
             .state
             .service_kernel_context
@@ -1512,8 +1572,19 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         action: RetainedMemoryAction,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let result =
+            self.drive_owner_resume(engine, control, OwnerResumeWork::RetainedAction(action));
+        self.route_poll_result(result)
+    }
+
+    fn drive_retained_memory_attempt(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        action: RetainedMemoryAction,
+    ) -> Result<RetainedMemoryAttempt, ProductionHvpatchPollError> {
         if let RetainedMemoryAction::ThreadExit { code } = action {
-            return self.drive_thread_exit(engine, control, code);
+            return self.attempt_thread_exit(engine, control, code);
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let RetainedMemoryAction::ChildTid {
@@ -1536,34 +1607,31 @@ where
             if let Some(error) =
                 bootstrap_hvpatch_process_child_tid(context.task(), engine, address.raw(), tid)?
             {
-                return self.wait_for_retained_memory(
-                    engine,
-                    control,
-                    RetainedMemoryAction::ChildTid {
+                return Ok(RetainedMemoryAttempt::Wait {
+                    action: RetainedMemoryAction::ChildTid {
                         context,
                         address,
                         tid,
                     },
                     error,
-                );
+                });
             }
             self.state
                 .complete_precompleted_child(&self.kernel.reporter, 0)?;
             self.phase = HvpatchProductionPhase::Resident;
-            return Ok(executor::ExecutorExit::Syscall);
+            return Ok(RetainedMemoryAttempt::Exit(executor::ExecutorExit::Syscall));
         }
         self.phase = HvpatchProductionPhase::RetainedMemoryRetry {
             action: Box::new(action),
         };
-        let result = self.drive_owned_memory_action(engine, control);
-        self.route_poll_result(result)
+        self.drive_owned_memory_action(engine, control)
     }
 
     fn drive_owned_memory_action(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
-    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+    ) -> Result<RetainedMemoryAttempt, ProductionHvpatchPollError> {
         let HvpatchProductionPhase::RetainedMemoryRetry { action } = &self.phase else {
             return Err(RuntimeError::Configuration(
                 "terminal memory driver lost action".to_owned(),
@@ -1603,18 +1671,18 @@ where
             return match disposition {
                 threads::PersistentThreadExitDisposition::Memory(error) => {
                     let action = self.take_retained_memory_action()?;
-                    self.wait_for_retained_memory(engine, control, action, error)
+                    Ok(RetainedMemoryAttempt::Wait { action, error })
                 }
                 threads::PersistentThreadExitDisposition::Busy { observed_epoch } => {
                     let context = current.retain_exact();
                     let action = self.take_retained_memory_action()?;
-                    Ok(self.park_thread_exit_retry(
+                    Ok(RetainedMemoryAttempt::Exit(self.park_thread_exit_retry(
                         &context,
                         observed_epoch,
                         HvpatchProductionPhase::RetainedMemoryRetry {
                             action: Box::new(action),
                         },
-                    ))
+                    )))
                 }
                 threads::PersistentThreadExitDisposition::Failed(error) => Err(error.into()),
                 threads::PersistentThreadExitDisposition::Done(_) => Err(
@@ -1631,6 +1699,7 @@ where
                     .map_err(ProductionHvpatchPollError::from_exec_failure)?;
                 self.state.finish_child_tid_drain();
                 self.finish_exec_suffix(engine, control, finished)
+                    .map(RetainedMemoryAttempt::Exit)
             }
             RetainedMemoryAction::ProcessFinish { context, terminal } => self
                 .finalize_persistent_process_terminal(engine, control, context, terminal)
@@ -1649,76 +1718,110 @@ where
         }
     }
 
-    fn wait_for_retained_memory(
-        &mut self,
-        engine: &mut E,
-        control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        action: RetainedMemoryAction,
-        error: carrick_guest_mem::MemoryPrepareError,
-    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        self.phase = HvpatchProductionPhase::RetainedMemoryRetry {
-            action: Box::new(action),
-        };
-        let result = self.wait_for_owned_memory_action(engine, control, error);
-        self.route_poll_result(result)
-    }
-
     fn wait_for_owned_memory_action(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        error: carrick_guest_mem::MemoryPrepareError,
-    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        action: RetainedMemoryAction,
+        mut error: carrick_guest_mem::MemoryPrepareError,
+    ) -> Result<RetainedMemoryWaitAttempt, ProductionHvpatchPollError> {
+        self.phase = HvpatchProductionPhase::RetainedMemoryRetry {
+            action: Box::new(action),
+        };
         use carrick_guest_mem::MemoryPrepareError;
-        match error {
-            MemoryPrepareError::OwnerWait(wait) => {
-                self.park_retained_memory_owner(engine, control, wait)
-            }
-            MemoryPrepareError::Supply(request) => {
-                if let Some(wait) = self.supply_owner_memory(engine, request)? {
-                    let wait = match wait {
-                        OwnerSupplyWait::Owner(wait) => MemoryPrepareError::OwnerWait(wait),
-                        OwnerSupplyWait::Physical(wait) => MemoryPrepareError::Physical(wait),
+        loop {
+            match error {
+                MemoryPrepareError::OwnerWait(wait) => {
+                    match self.park_owner_memory_action(
+                        engine,
+                        control,
+                        super::zone::OwnerMemoryAction::Retained,
+                        wait,
+                    )? {
+                        super::zone::OwnerMemoryPark::Parked(exit) => {
+                            return Ok(RetainedMemoryWaitAttempt::Exit(exit));
+                        }
+                        super::zone::OwnerMemoryPark::Recheck(
+                            super::zone::OwnerMemoryAction::Retained,
+                        ) => {
+                            let action = self.take_retained_memory_action()?;
+                            return Ok(RetainedMemoryWaitAttempt::Retry {
+                                action,
+                                producer: Some(OwnerRedriveProducer::Owner(wait)),
+                            });
+                        }
+                        super::zone::OwnerMemoryPark::NoProducer(
+                            super::zone::OwnerMemoryAction::Retained,
+                        ) => {
+                            return Err(RuntimeError::Configuration(
+                                "retained memory wait has no live producer".to_owned(),
+                            )
+                            .into());
+                        }
+                        _ => {
+                            return Err(RuntimeError::Configuration(
+                                "retained owner park changed action".to_owned(),
+                            )
+                            .into());
+                        }
+                    }
+                }
+                MemoryPrepareError::Supply(request) => {
+                    if let Some(wait) = self.supply_owner_memory(engine, request)? {
+                        error = match wait {
+                            OwnerSupplyWait::Owner(wait) => MemoryPrepareError::OwnerWait(wait),
+                            OwnerSupplyWait::Physical(wait) => MemoryPrepareError::Physical(wait),
+                        };
+                        continue;
+                    }
+                    let action = self.take_retained_memory_action()?;
+                    return Ok(RetainedMemoryWaitAttempt::Retry {
+                        action,
+                        producer: None,
+                    });
+                }
+                MemoryPrepareError::Physical(wait) => {
+                    let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                        RuntimeError::Configuration("clear wait lost context".to_owned())
+                    })?;
+                    let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+                        RuntimeError::Configuration("clear wait lost runtime".to_owned())
+                    })?;
+                    let scheduler = runtime.continuation_services(context.kernel()).0;
+                    let (subscription, ready) = wait.0.enroll(registration_wake_callback(
+                        scheduler,
+                        context.thread().key(),
+                        false,
+                    ));
+                    let action = self.take_retained_memory_action()?;
+                    if ready || wait.0.is_ready() {
+                        drop(subscription);
+                        return Ok(RetainedMemoryWaitAttempt::Retry {
+                            action,
+                            producer: Some(OwnerRedriveProducer::Physical(
+                                wait.producer_identity(),
+                            )),
+                        });
+                    }
+                    self.phase = HvpatchProductionPhase::ResumeRetainedPhysical {
+                        action: Box::new(action),
+                        wait,
+                        _subscription: subscription,
                     };
-                    return self.wait_for_owned_memory_action(engine, control, wait);
+                    return Ok(RetainedMemoryWaitAttempt::Exit(self.suspend(
+                        HvpatchLoopSuspension::BlockedContinuation,
+                        executor::ExecutorExit::Blocked(
+                            carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                        ),
+                    )));
                 }
-                let action = self.take_retained_memory_action()?;
-                self.drive_retained_memory(engine, control, action)
-            }
-            MemoryPrepareError::Physical(wait) => {
-                let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
-                    RuntimeError::Configuration("clear wait lost context".to_owned())
-                })?;
-                let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
-                    RuntimeError::Configuration("clear wait lost runtime".to_owned())
-                })?;
-                let scheduler = runtime.continuation_services(context.kernel()).0;
-                let (subscription, ready) = wait.0.enroll(registration_wake_callback(
-                    scheduler,
-                    context.thread().key(),
-                    false,
-                ));
-                let action = self.take_retained_memory_action()?;
-                if ready || wait.0.is_ready() {
-                    drop(subscription);
-                    return self.drive_retained_memory(engine, control, action);
+                other => {
+                    return Err(RuntimeError::Configuration(format!(
+                        "prepare clear-child-tid: {other:?}"
+                    ))
+                    .into());
                 }
-                self.phase = HvpatchProductionPhase::ResumeRetainedPhysical {
-                    action: Box::new(action),
-                    wait,
-                    _subscription: subscription,
-                };
-                Ok(self.suspend(
-                    HvpatchLoopSuspension::BlockedContinuation,
-                    executor::ExecutorExit::Blocked(
-                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
-                    ),
-                ))
             }
-            other => Err(RuntimeError::Configuration(format!(
-                "prepare clear-child-tid: {other:?}"
-            ))
-            .into()),
         }
     }
 
@@ -1731,20 +1834,18 @@ where
     fn settle_persistent_thread_exit(
         &mut self,
         engine: &mut E,
-        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        _control: &mut executor::HvpatchQuantumControl<'_, '_>,
         code: i32,
         context: carrick_kernel::kernel::KernelContext,
         disposition: threads::PersistentThreadExitDisposition,
-    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        Ok(match disposition {
+    ) -> Result<RetainedMemoryAttempt, ProductionHvpatchPollError> {
+        Ok(RetainedMemoryAttempt::Exit(match disposition {
             threads::PersistentThreadExitDisposition::Failed(error) => return Err(error.into()),
             threads::PersistentThreadExitDisposition::Memory(error) => {
-                return self.wait_for_retained_memory(
-                    engine,
-                    control,
-                    RetainedMemoryAction::ThreadExit { code },
+                return Ok(RetainedMemoryAttempt::Wait {
+                    action: RetainedMemoryAction::ThreadExit { code },
                     error,
-                );
+                });
             }
             threads::PersistentThreadExitDisposition::Done(VcpuLoopOutcome::ThreadDone) => {
                 self.publish_host_thread_retirement(&context);
@@ -1788,7 +1889,9 @@ where
                         self.state.thread_exit_withdrawn = true;
                     }
                     self.state.handoff_child_tid_clear();
-                    return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
+                    return Ok(RetainedMemoryAttempt::Exit(
+                        self.finish(Ok(VcpuLoopOutcome::ThreadDone)),
+                    ));
                 }
                 self.park_thread_exit_retry(
                     &context,
@@ -1796,7 +1899,7 @@ where
                     HvpatchProductionPhase::RetryThreadExit { code },
                 )
             }
-        })
+        }))
     }
 
     fn publish_host_thread_retirement(&self, context: &carrick_kernel::kernel::KernelContext) {
@@ -3353,19 +3456,6 @@ where
         }
     }
 
-    pub(super) fn resume_owner_ready(
-        &mut self,
-        engine: &mut E,
-        control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        frame: carrick_hal::RawSyscall,
-        resume: OwnedSyscallResume,
-    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        match self.resume_owner_ready_step(engine, control, frame, resume)? {
-            OwnerReadyStep::Outcome(outcome) => self.route_outcome(engine, control, frame, outcome),
-            OwnerReadyStep::Exit(exit) => Ok(exit),
-        }
-    }
-
     pub(super) fn resume_owner_ready_step(
         &mut self,
         engine: &mut E,
@@ -3400,13 +3490,13 @@ where
         }
     }
 
-    fn resume_owner_physical(
+    fn resume_owner_physical_step(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         pending: OwnerPhysicalResume,
         ready_at_enrollment: bool,
-    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+    ) -> Result<OwnerReadyStep, ProductionHvpatchPollError> {
         use super::owner_wait::Settlement;
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("physical owner resume lost context".to_owned())
@@ -3420,21 +3510,21 @@ where
             || carrick_kernel::kernel::continuation::owner_wait_cancellation(context),
             |(wait, _)| ready_at_enrollment || wait.0.is_ready(),
         ) {
-            Settlement::Cancelled(cancellation) => {
-                self.finish_owner_cancellation(engine, control, frame, cancellation, origin)
-            }
+            Settlement::Cancelled(cancellation) => self
+                .finish_owner_cancellation(engine, control, frame, cancellation, origin)
+                .map(OwnerReadyStep::Exit),
             Settlement::Waiting(wait) => {
                 self.phase = HvpatchProductionPhase::ResumeOwnerPhysical(OwnerPhysicalResume {
                     origin,
                     frame,
                     wait,
                 });
-                Ok(self.suspend(
+                Ok(OwnerReadyStep::Exit(self.suspend(
                     HvpatchLoopSuspension::BlockedContinuation,
                     executor::ExecutorExit::Blocked(
                         carrick_kernel::kernel::objects::BlockedReason::HostWait,
                     ),
-                ))
+                )))
             }
             Settlement::Resume(resume) => {
                 let outcome = self.state.resume_owned_syscall(
@@ -3443,8 +3533,22 @@ where
                     resume,
                     control.submission.host_wait_context(),
                 )?;
-                self.route_outcome(engine, control, frame, outcome)
+                Ok(OwnerReadyStep::Outcome(outcome))
             }
+        }
+    }
+
+    fn resume_owner_physical(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        pending: OwnerPhysicalResume,
+        ready_at_enrollment: bool,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let frame = pending.frame;
+        match self.resume_owner_physical_step(engine, control, pending, ready_at_enrollment)? {
+            OwnerReadyStep::Exit(exit) => Ok(exit),
+            OwnerReadyStep::Outcome(outcome) => self.route_outcome(engine, control, frame, outcome),
         }
     }
 
@@ -3465,10 +3569,10 @@ where
                 .take()
                 .map(OwnedSyscallResume::Ipc)
         });
-        self.service_outcome(engine, control, frame, outcome, resume)
+        self.drive_service_outcome(engine, control, frame, outcome, resume)
     }
 
-    pub(super) fn service_outcome(
+    pub(super) fn drive_service_outcome(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
@@ -3476,6 +3580,107 @@ where
         outcome: DispatchOutcome,
         resume: Option<OwnedSyscallResume>,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        self.drive_owner_resume(
+            engine,
+            control,
+            OwnerResumeWork::Syscall {
+                frame,
+                outcome,
+                resume,
+            },
+        )
+    }
+
+    fn drive_owner_resume(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        mut work: OwnerResumeWork,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let mut passes = 0usize;
+        let mut last_producer = None;
+        loop {
+            passes = passes.checked_add(1).ok_or_else(|| {
+                RuntimeError::Configuration("owner resume pass overflow".to_owned())
+            })?;
+            if passes > OWNER_REDRIVE_MAX_PASSES {
+                return Err(RuntimeError::Configuration(
+                    "owner resume exceeded its structural pass bound".to_owned(),
+                )
+                .into());
+            }
+            let step = match work {
+                OwnerResumeWork::Syscall {
+                    frame,
+                    outcome,
+                    resume,
+                } => {
+                    let producer = match &outcome {
+                        DispatchOutcome::OwnerMemoryWait { wait, .. } => {
+                            Some(OwnerRedriveProducer::Owner(*wait))
+                        }
+                        DispatchOutcome::OwnerPhysicalWait { wait, .. } => {
+                            Some(OwnerRedriveProducer::Physical(wait.producer_identity()))
+                        }
+                        DispatchOutcome::OwnerMemorySupply { .. } => {
+                            last_producer = None;
+                            None
+                        }
+                        _ => None,
+                    };
+                    if producer.is_some() && producer == last_producer {
+                        return Err(RuntimeError::Configuration(
+                            "owner syscall redrive made no producer progress".to_owned(),
+                        )
+                        .into());
+                    }
+                    if producer.is_some() {
+                        last_producer = producer;
+                    }
+                    self.service_owner_step(engine, control, frame, outcome, resume)?
+                }
+                OwnerResumeWork::RetainedAction(action) => {
+                    match self.drive_retained_memory_attempt(engine, control, action)? {
+                        RetainedMemoryAttempt::Exit(exit) => OwnerResumeStep::Exit(exit),
+                        RetainedMemoryAttempt::Wait { action, error } => {
+                            OwnerResumeStep::Continue(OwnerResumeWork::RetainedWait {
+                                action,
+                                error,
+                            })
+                        }
+                    }
+                }
+                OwnerResumeWork::RetainedWait { action, error } => {
+                    match self.wait_for_owned_memory_action(engine, control, action, error)? {
+                        RetainedMemoryWaitAttempt::Exit(exit) => OwnerResumeStep::Exit(exit),
+                        RetainedMemoryWaitAttempt::Retry { action, producer } => {
+                            if producer.is_some() && producer == last_producer {
+                                return Err(RuntimeError::Configuration(
+                                    "retained owner redrive made no producer progress".to_owned(),
+                                )
+                                .into());
+                            }
+                            last_producer = producer;
+                            OwnerResumeStep::Continue(OwnerResumeWork::RetainedAction(action))
+                        }
+                    }
+                }
+            };
+            match step {
+                OwnerResumeStep::Exit(exit) => return Ok(exit),
+                OwnerResumeStep::Continue(next) => work = next,
+            }
+        }
+    }
+
+    fn service_owner_step(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        outcome: DispatchOutcome,
+        mut resume: Option<OwnedSyscallResume>,
+    ) -> Result<OwnerResumeStep, ProductionHvpatchPollError> {
         if let DispatchOutcome::OwnerMemorySupply { request, committed } = outcome {
             self.state.owner_read_progress = self
                 .state
@@ -3486,7 +3691,7 @@ where
                 })?;
             let result = self.supply_owner_memory(engine, request);
             if let Some(wait) = result? {
-                let outcome = match wait {
+                let next_outcome = match wait {
                     OwnerSupplyWait::Owner(wait) => {
                         DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
                     }
@@ -3494,14 +3699,35 @@ where
                         DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
                     }
                 };
-                return self.service_outcome(engine, control, frame, outcome, resume);
+                return Ok(OwnerResumeStep::Continue(OwnerResumeWork::Syscall {
+                    frame,
+                    outcome: next_outcome,
+                    resume,
+                }));
             }
-            return self.resume_owner_ready(
+            let outcome = match self.resume_owner_ready_step(
                 engine,
                 control,
                 frame,
-                resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
-            );
+                resume
+                    .take()
+                    .unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
+            )? {
+                OwnerReadyStep::Exit(exit) => return Ok(OwnerResumeStep::Exit(exit)),
+                OwnerReadyStep::Outcome(outcome) => outcome,
+            };
+            let (outcome, next_resume) = owner_copyin_route(outcome);
+            resume = next_resume.or_else(|| {
+                self.state
+                    .pending_ipc_owner
+                    .take()
+                    .map(OwnedSyscallResume::Ipc)
+            });
+            return Ok(OwnerResumeStep::Continue(OwnerResumeWork::Syscall {
+                frame,
+                outcome,
+                resume,
+            }));
         }
         if let DispatchOutcome::OwnerMemoryWait { wait, committed } = outcome {
             self.state.owner_read_progress = self
@@ -3511,13 +3737,68 @@ where
                 .ok_or_else(|| {
                     RuntimeError::Configuration("owner read progress overflow".to_owned())
                 })?;
-            return self.owner_memory_park(
+            match self.park_owner_memory_action(
                 engine,
                 control,
-                frame,
+                super::zone::OwnerMemoryAction::Syscall {
+                    frame,
+                    resume: resume
+                        .take()
+                        .unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
+                },
                 wait,
-                resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
-            );
+            )? {
+                super::zone::OwnerMemoryPark::Parked(exit) => {
+                    return Ok(OwnerResumeStep::Exit(exit));
+                }
+                super::zone::OwnerMemoryPark::NoProducer(
+                    super::zone::OwnerMemoryAction::Syscall { .. },
+                ) => {
+                    return Ok(OwnerResumeStep::Continue(OwnerResumeWork::Syscall {
+                        frame,
+                        outcome: DispatchOutcome::Errno {
+                            errno: carrick_abi::LINUX_EFAULT,
+                        },
+                        resume: None,
+                    }));
+                }
+                super::zone::OwnerMemoryPark::Recheck(
+                    super::zone::OwnerMemoryAction::Syscall {
+                        frame: retry_frame,
+                        resume: retry,
+                    },
+                ) => {
+                    debug_assert_eq!(retry_frame, frame);
+                    let outcome =
+                        match self.resume_owner_ready_step(engine, control, retry_frame, retry)? {
+                            OwnerReadyStep::Exit(exit) => return Ok(OwnerResumeStep::Exit(exit)),
+                            OwnerReadyStep::Outcome(outcome) => outcome,
+                        };
+                    if let Some(park) = self.state.pending_ipc_park.take() {
+                        return self
+                            .ipc_park(engine, control, frame, park)
+                            .map(OwnerResumeStep::Exit);
+                    }
+                    let (outcome, next_resume) = owner_copyin_route(outcome);
+                    resume = next_resume.or_else(|| {
+                        self.state
+                            .pending_ipc_owner
+                            .take()
+                            .map(OwnedSyscallResume::Ipc)
+                    });
+                    return Ok(OwnerResumeStep::Continue(OwnerResumeWork::Syscall {
+                        frame,
+                        outcome,
+                        resume,
+                    }));
+                }
+                _ => {
+                    return Err(RuntimeError::Configuration(
+                        "syscall owner park changed action".to_owned(),
+                    )
+                    .into());
+                }
+            }
         }
         if let DispatchOutcome::OwnerPhysicalWait { wait, committed } = outcome {
             self.state.owner_read_progress = self
@@ -3559,7 +3840,7 @@ where
             let (subscription, ready) = wait.0.enroll(Arc::clone(&wake));
             // Both immediate readiness and a later scheduler wake must pass
             // the same cancellation-first gate before the syscall can retry.
-            return self.resume_owner_physical(
+            match self.resume_owner_physical_step(
                 engine,
                 control,
                 OwnerPhysicalResume {
@@ -3574,9 +3855,36 @@ where
                     ),
                 },
                 ready,
-            );
+            )? {
+                OwnerReadyStep::Exit(exit) => return Ok(OwnerResumeStep::Exit(exit)),
+                OwnerReadyStep::Outcome(next) => {
+                    let (outcome, next_resume) = owner_copyin_route(next);
+                    resume = next_resume.or_else(|| {
+                        self.state
+                            .pending_ipc_owner
+                            .take()
+                            .map(OwnedSyscallResume::Ipc)
+                    });
+                    return Ok(OwnerResumeStep::Continue(OwnerResumeWork::Syscall {
+                        frame,
+                        outcome,
+                        resume,
+                    }));
+                }
+            }
         }
 
+        self.service_outcome(engine, control, frame, outcome)
+            .map(OwnerResumeStep::Exit)
+    }
+
+    fn service_outcome(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        outcome: DispatchOutcome,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         if carrick_kernel::kernel::continuation::is_blocking_dispatch_outcome(&outcome) {
             let _ = self.state.stash_parked_registers(engine);
             let request = self

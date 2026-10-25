@@ -189,6 +189,7 @@ pub struct SpaceEditor<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadC
     venue: Option<SpaceReleaseVenue<'a, C>>,
     index: SpaceIndex,
     key: u64,
+    released: bool,
 }
 
 /// Exclusive initialization of a published, closed fork child. This guard
@@ -297,9 +298,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'_, C> {
         );
         assert_eq!(released, Ok(self.owner.get()));
     }
-}
-impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceEditor<'_, C> {
-    fn drop(&mut self) {
+
+    fn finish_release(&mut self) -> Option<u64> {
+        if self.released {
+            return None;
+        }
         let needs_late_release = self.release.is_none() && self.entry.notifications.attached();
         let late_release = needs_late_release
             .then(|| {
@@ -322,11 +325,28 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceEditor<'_, C> {
             let receipt = lease
                 .reserve(SpaceWaitCause::Editor)
                 .advance_revision(venue.waker, &completion);
+            let revision = lease.observe(SpaceWaitCause::Editor).revision();
             self.release_editor();
+            self.released = true;
             receipt.publish();
+            Some(revision)
         } else {
             self.release_editor();
+            self.released = true;
+            None
         }
+    }
+
+    /// Release this exact editor and return the revision advanced by that
+    /// release. Sampling is completed while the editor word is still held, so
+    /// a following editor cannot be hidden between release and observation.
+    pub fn release_with_revision(mut self) -> Option<u64> {
+        self.finish_release()
+    }
+}
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceEditor<'_, C> {
+    fn drop(&mut self) {
+        let _ = self.finish_release();
     }
 }
 
@@ -798,6 +818,7 @@ impl AddressSpaces {
             venue,
             index,
             key,
+            released: false,
         };
         #[cfg(test)]
         editor_test_hook::run();
@@ -860,6 +881,7 @@ impl AddressSpaces {
             venue,
             index,
             key,
+            released: false,
         };
         if key == 0
             || entry.key.load(Ordering::SeqCst) != key
@@ -1371,11 +1393,23 @@ mod tests {
                 .try_begin_edit_with_venue(index, 13, NonZeroU64::new(2).unwrap(), Some(venue))
                 .is_none()
         );
-        drop(editor);
-        assert!(
-            zone.object_queue_census(key.index()).unwrap().epoch > before,
+        let released = editor.release_with_revision().unwrap();
+        assert_eq!(
+            zone.object_queue_census(key.index()).unwrap().epoch,
+            released,
             "actual editor release must publish the failed probe's producer edge"
         );
+        assert!(released > before);
+        let next = zone
+            .spaces
+            .try_begin_edit_with_venue(index, 13, NonZeroU64::new(2).unwrap(), Some(venue))
+            .unwrap();
+        assert_eq!(
+            zone.object_queue_census(key.index()).unwrap().epoch,
+            released,
+            "the receipt names the completed release, not a later editor"
+        );
+        drop(next);
         zone.spaces.close(index);
         zone.close_space_notifications(index, identity, venue)
             .unwrap();

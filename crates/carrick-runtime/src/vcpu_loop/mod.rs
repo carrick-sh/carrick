@@ -4208,6 +4208,7 @@ pub(crate) mod tests {
             false,
             false,
             false,
+            false,
         );
     }
 
@@ -4220,6 +4221,7 @@ pub(crate) mod tests {
             false,
             true,
             false,
+            false,
         );
     }
 
@@ -4229,6 +4231,7 @@ pub(crate) mod tests {
             carrick_abi::syscall::nr::READ,
             Some(carrick_abi::LINUX_SIGKILL),
             true,
+            false,
             false,
             false,
             false,
@@ -4243,6 +4246,7 @@ pub(crate) mod tests {
             true,
             false,
             true,
+            false,
             false,
         );
     }
@@ -4499,6 +4503,20 @@ pub(crate) mod tests {
             false,
             false,
             true,
+            false,
+        );
+    }
+
+    #[test]
+    fn serial_host_stale_selection_without_editor_fails_closed() {
+        exercise_owner_wait_schedule_at(
+            carrick_abi::syscall::nr::FSTAT,
+            None,
+            false,
+            false,
+            false,
+            false,
+            true,
         );
     }
 
@@ -4512,7 +4530,7 @@ pub(crate) mod tests {
         native: bool,
         release_wins: bool,
     ) {
-        exercise_owner_wait_schedule_at(nr, signum, native, release_wins, false, false);
+        exercise_owner_wait_schedule_at(nr, signum, native, release_wins, false, false, false);
     }
 
     fn exercise_owner_wait_schedule_at(
@@ -4522,6 +4540,7 @@ pub(crate) mod tests {
         release_wins: bool,
         physical: bool,
         free_reservation_redrive: bool,
+        stale_selection_without_editor: bool,
     ) {
         #[derive(Debug)]
         struct RetirementRequestedBacking {
@@ -4835,7 +4854,7 @@ pub(crate) mod tests {
                         }
                     }
                     let _release_on_failure = ReleaseOnDrop(&release_tx);
-                    let peer = scope.spawn(move || {
+                    let mut peer = Some(scope.spawn(move || {
                         let access = carrick_el1_linux::sched::object_wait::space_access(
                             zone,
                             carrick_sched_core::SlotId::new(1),
@@ -4869,7 +4888,7 @@ pub(crate) mod tests {
                         } else {
                             drop(editor);
                         }
-                    });
+                    }));
                     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                     let mut wait = portal
                         .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
@@ -4965,14 +4984,29 @@ pub(crate) mod tests {
                         engine.prepare_dependency =
                             Some(carrick_guest_mem::OwnedMemoryWait(retirement.clone()));
                     }
+                    if stale_selection_without_editor {
+                        release_tx.send(()).unwrap();
+                        peer.take().unwrap().join().unwrap();
+                        carrick_kernel::el1_zone::hand_back_completions();
+                        wait = portal
+                            .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
+                            .unwrap()
+                            .unwrap();
+                        engine.copyout_owner_probe = Some(CopyoutOwnerProbe {
+                            wait,
+                            zone: zone as *const _ as usize,
+                        });
+                    }
                     if physical {
                         assert!(matches!(first, DispatchOutcome::OwnerPhysicalWait { .. }));
-                    } else if !free_reservation_redrive {
+                    } else if !free_reservation_redrive && !stale_selection_without_editor {
                         assert_eq!(
                             first,
                             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
                             "the production service must park on the sibling's editor, never return EFAULT",
                         );
+                    } else if stale_selection_without_editor {
+                        assert!(matches!(first, DispatchOutcome::OwnerMemoryWait { .. }));
                     }
                     assert_eq!(engine.prepared_commits, 0);
                     assert_eq!(root.resources().files().slot_count(), 0);
@@ -5086,6 +5120,15 @@ pub(crate) mod tests {
                         let parked = job
                             .owner_memory_park(&mut engine, &mut control, frame, wait, resume)
                             .unwrap();
+                        if stale_selection_without_editor {
+                            assert!(matches!(parked, executor::ExecutorExit::Syscall));
+                            assert_eq!(
+                                engine.completed_syscalls,
+                                [carrick_abi::LINUX_EFAULT.guest_retval()]
+                            );
+                            assert_eq!(scheduler.queued_len(), 0);
+                            return;
+                        }
                         if free_reservation_redrive {
                             assert!(matches!(parked, executor::ExecutorExit::Blocked(_)));
                             running
@@ -5226,7 +5269,7 @@ pub(crate) mod tests {
                     }
                     if !killing {
                         release_tx.send(()).unwrap();
-                        peer.join().unwrap();
+                        peer.take().unwrap().join().unwrap();
                     }
                     carrick_kernel::el1_zone::hand_back_completions();
                     assert_ne!(

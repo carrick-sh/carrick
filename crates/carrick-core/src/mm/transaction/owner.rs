@@ -538,13 +538,9 @@ impl<
         if continuation.is_complete() {
             return Ok(TransferStep::Complete);
         }
-        let retry = self.observe_wait(
-            continuation.handle,
-            carrick_core_abi::PortalWaitCause::Reservations,
-        )?;
         let mm = continuation.handle.mm().raw();
         let index = self.spaces.find(mm).ok_or(MmError::Stale)?;
-        let _editor = match self.editor_for(continuation.handle, slot) {
+        let editor = match self.editor_for(continuation.handle, slot) {
             Err(MmError::Busy) => return Ok(TransferStep::Suspended),
             result => result?,
         };
@@ -669,16 +665,32 @@ impl<
         };
         // SAFETY: the exact editor, admitted MM, reservation and translation
         // license this selection. Copy still requires physical custody and revalidation.
+        let selected = PortalSelectedData {
+            root_generation: NonZeroU64::new(generation).ok_or(MmError::Stale)?,
+            offset: continuation.offset(),
+            ipa,
+            executable: continuation.intent.is_write() && executable,
+        };
+        let release_revision = editor.release_with_revision();
+        let retry = if let Some(revision) = release_revision {
+            Some(unsafe {
+                carrick_core_abi::PortalOwnerWait::from_owner(
+                    continuation.handle,
+                    carrick_core_abi::PortalWaitCause::Editor,
+                    revision,
+                )
+            })
+        } else {
+            self.observe_wait(
+                continuation.handle,
+                carrick_core_abi::PortalWaitCause::Editor,
+            )?
+        };
         Ok(TransferStep::Selected(unsafe {
             SelectedChunk::from_owner_selection(
                 continuation.handle,
                 continuation.sequence(),
-                PortalSelectedData {
-                    root_generation: NonZeroU64::new(generation).ok_or(MmError::Stale)?,
-                    offset: continuation.offset(),
-                    ipa,
-                    executable: continuation.intent.is_write() && executable,
-                },
+                selected,
                 PortalByteRange::new(va, len).ok_or(MmError::Invalid)?,
                 continuation.fork_sequence(),
                 retry,
