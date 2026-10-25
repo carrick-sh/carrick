@@ -592,8 +592,8 @@ impl InventoryFrameRegistry {
                 receipt.covers(lease.0, lease.1 as usize)
             }
             Stage1UnpublicationReceipt::Inventory(_) => true,
-            Stage1UnpublicationReceipt::InventoryRollback(receipt) => {
-                identity.is_some_and(|identity| receipt.names(identity))
+            Stage1UnpublicationReceipt::NeverPublished(receipt) => {
+                identity == Some(receipt.identity())
             }
             Stage1UnpublicationReceipt::El1Metadata(receipt) => {
                 identity.is_some_and(|identity| receipt.matches(identity))

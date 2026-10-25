@@ -3865,6 +3865,65 @@ fn request_carrier_stage2_record_retirements(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn request_never_published_carrier_stage2_record_retirements(
+    stage2_logical_leases: &mut Vec<CarrierStage2LogicalLease>,
+    custody: &std::sync::Weak<CarrierVmCustody>,
+    frames: &std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+    unpublished: &UnpublishedTaskStage1,
+) {
+    let Some(custody) = custody.upgrade() else {
+        stage2_logical_leases.clear();
+        return;
+    };
+    let retirements = {
+        let mut frames = frames.lock();
+        std::mem::take(stage2_logical_leases)
+            .into_iter()
+            .filter_map(|logical_lease| {
+                let identity = custody
+                    .carrier_stage2_records
+                    .lock()
+                    .get(&logical_lease.key)
+                    .copied()
+                    .filter(|identity| identity.logical_owner == logical_lease.logical_owner)?;
+                let snapshot = custody.stage2_record_snapshot(identity.record_id)?;
+                let key = (snapshot.ipa, snapshot.len as u64);
+                let authority_retained = frames.authority_retained_stage2.remove(&key);
+                (!frames.stage2_references.contains_key(&key) && !authority_retained)
+                    .then_some(identity)
+            })
+            .collect::<Vec<_>>()
+    };
+    for identity in retirements {
+        let Some(never_published) = unpublished.consume(identity) else {
+            debug_assert!(
+                false,
+                "unpublished carrier MM lost stage-2 publication authority: {identity:?}"
+            );
+            continue;
+        };
+        let Some(stage1) = custody.stage1_unpublished_from_rollback(identity, never_published)
+        else {
+            debug_assert!(
+                false,
+                "rollback authority names another record: {identity:?}"
+            );
+            continue;
+        };
+        custody.enqueue_carrier_stage2_retirement(identity);
+        if custody.request_stage2_record_retirement(identity, stage1)
+            != CarrierStage2RetireOutcome::DeferredActivePins
+        {
+            custody.cancel_carrier_stage2_retirement(identity);
+            continue;
+        }
+        if custody.carrier_stage2_retirement_is_ready(identity) {
+            custody.request_global_frame_retirement_retry();
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for HvpatchCarrierMmAuthority {
     fn drop(&mut self) {
         match self {
@@ -3879,12 +3938,22 @@ impl Drop for HvpatchCarrierMmAuthority {
                     return;
                 }
                 let lifecycle = stage1_lifecycle.get_mut();
-                let receipt = match lifecycle {
+                match lifecycle {
                     CarrierMmStage1Lifecycle::Unpublished(receipt) => {
-                        carrier_custody::Stage1UnpublicationReceipt::InventoryRollback(receipt)
+                        request_never_published_carrier_stage2_record_retirements(
+                            stage2_logical_leases,
+                            custody,
+                            frames,
+                            receipt,
+                        );
                     }
                     CarrierMmStage1Lifecycle::Retired(receipt) => {
-                        carrier_custody::Stage1UnpublicationReceipt::Inventory(receipt)
+                        request_carrier_stage2_record_retirements(
+                            stage2_logical_leases,
+                            custody,
+                            frames,
+                            carrier_custody::Stage1UnpublicationReceipt::Inventory(receipt),
+                        );
                     }
                     CarrierMmStage1Lifecycle::Published => {
                         // A live MM may never lose its last carrier authority.
@@ -3894,13 +3963,7 @@ impl Drop for HvpatchCarrierMmAuthority {
                         debug_assert!(false, "live carrier MM dropped before stage-1 retirement");
                         return;
                     }
-                };
-                request_carrier_stage2_record_retirements(
-                    stage2_logical_leases,
-                    custody,
-                    frames,
-                    receipt,
-                );
+                }
             }
             #[cfg(test)]
             Self::Test { order } => {
@@ -4122,19 +4185,15 @@ impl UnpublishedTaskStage1 {
         receipts.push((identity, receipt));
     }
 
-    fn consume(&self, identity: CarrierStage2RecordIdentity) -> Option<Stage2PublicationAuthority> {
+    fn consume(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Option<carrier_custody::NeverPublishedRecord> {
         let mut receipts = self.rollback_receipts.lock();
         let index = receipts
             .iter()
             .position(|(candidate, _)| *candidate == identity)?;
-        Some(receipts.swap_remove(index).1)
-    }
-
-    fn names(&self, identity: CarrierStage2RecordIdentity) -> bool {
-        self.rollback_receipts
-            .lock()
-            .iter()
-            .any(|(candidate, _)| *candidate == identity)
+        Some(receipts.swap_remove(index).1.rollback())
     }
 }
 
@@ -4900,13 +4959,13 @@ fn abort_prepared_task_and_carrier(
             )
         })?;
         for &identity in &task.unpublished_structural_identities {
-            let stage1 = custody
-                .stage1_unpublished_from_receipt(
-                    identity,
-                    carrier_custody::Stage1UnpublicationReceipt::InventoryRollback(
-                        rollback_receipt,
-                    ),
+            let never_published = rollback_receipt.consume(identity).ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "unpublished inventory lost structural publication authority".to_owned(),
                 )
+            })?;
+            let stage1 = custody
+                .stage1_unpublished_from_rollback(identity, never_published)
                 .ok_or_else(|| {
                     TrapError::Hypervisor(
                         "unpublished inventory receipt did not cover prepared structural record"
@@ -4938,18 +4997,17 @@ fn abort_prepared_task_and_carrier(
                         "prepared task rollback lost global record identity".to_owned(),
                     )
                 })?;
+                let never_published = task
+                    .unpublished_stage1
+                    .as_ref()
+                    .and_then(|receipt| receipt.consume(identity))
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "prepared task rollback lost global publication authority".to_owned(),
+                        )
+                    })?;
                 let stage1 = custody
-                    .stage1_unpublished_from_receipt(
-                        identity,
-                        carrier_custody::Stage1UnpublicationReceipt::InventoryRollback(
-                            task.unpublished_stage1.as_ref().ok_or_else(|| {
-                                TrapError::Hypervisor(
-                                    "prepared task rollback has no unpublished inventory receipt"
-                                        .to_owned(),
-                                )
-                            })?,
-                        ),
-                    )
+                    .stage1_unpublished_from_rollback(identity, never_published)
                     .ok_or_else(|| {
                         TrapError::Hypervisor(
                             "unpublished inventory receipt did not cover prepared global record"

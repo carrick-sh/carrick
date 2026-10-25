@@ -453,6 +453,12 @@ pub(crate) struct NeverPublishedRecord {
     identity: CarrierStage2RecordIdentity,
 }
 
+impl NeverPublishedRecord {
+    pub(crate) fn identity(&self) -> CarrierStage2RecordIdentity {
+        self.identity
+    }
+}
+
 pub(crate) enum Stage2RetirementProof {
     Unpublished(Stage1Unpublished),
     Released(super::frame_inventory::Stage1Unpublished),
@@ -486,7 +492,8 @@ pub(crate) enum Stage1UnpublicationReceipt<'a> {
     EditorArenas(&'a carrick_aarch64::vmm::Stage1UnpublishedArenas),
     FrameAbsence(&'a super::frame_inventory::Stage1UnpublishedFrames),
     Inventory(&'a carrick_core::mm::retirement::Stage1UnpublishedMm),
-    InventoryRollback(&'a super::UnpublishedTaskStage1),
+    #[allow(dead_code)] // consumed by the frame-ledger path as callers migrate
+    NeverPublished(&'a NeverPublishedRecord),
     El1Metadata(&'a crate::metadata_grant::El1MetadataRetirement),
 }
 
@@ -501,7 +508,7 @@ enum Stage1UnpublishedSource {
     EditorRelease,
     FrameInventoryCommit,
     InventoryCommit,
-    UnpublishedInventoryRollback,
+    NeverPublished,
     El1MetadataRetirement,
 }
 
@@ -847,9 +854,13 @@ impl CarrierVmCustody {
             Stage1UnpublicationReceipt::Inventory(receipt) => {
                 Some(self.stage1_unpublished_by_inventory_commit(identity, receipt))
             }
-            Stage1UnpublicationReceipt::InventoryRollback(receipt) => {
-                self.stage1_unpublished_by_unpublished_inventory_rollback(identity, receipt)
-            }
+            Stage1UnpublicationReceipt::NeverPublished(receipt) => self
+                .stage1_unpublished_from_rollback(
+                    identity,
+                    NeverPublishedRecord {
+                        identity: receipt.identity(),
+                    },
+                ),
             Stage1UnpublicationReceipt::El1Metadata(receipt) => {
                 receipt.matches(identity).then_some(Stage1Unpublished {
                     identity,
@@ -873,7 +884,7 @@ impl CarrierVmCustody {
     ) -> Option<Stage1Unpublished> {
         (receipt.identity == identity).then_some(Stage1Unpublished {
             identity,
-            source: Stage1UnpublishedSource::UnpublishedInventoryRollback,
+            source: Stage1UnpublishedSource::NeverPublished,
         })
     }
 
@@ -918,14 +929,6 @@ impl CarrierVmCustody {
             identity,
             source: Stage1UnpublishedSource::InventoryCommit,
         }
-    }
-
-    fn stage1_unpublished_by_unpublished_inventory_rollback(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-        receipt: &super::UnpublishedTaskStage1,
-    ) -> Option<Stage1Unpublished> {
-        self.stage1_unpublished_from_rollback(identity, receipt.consume(identity)?.rollback())
     }
 
     /// Test support that obtains the same non-forgeable editor receipt as a

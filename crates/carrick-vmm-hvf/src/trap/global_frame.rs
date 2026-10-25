@@ -2757,14 +2757,18 @@ pub(crate) fn rollback_partial_process_stage2_authorities(
             });
             continue;
         };
-        let Some(stage1) = custody.stage1_unpublished_from_receipt(
-            identity,
-            Stage1UnpublicationReceipt::InventoryRollback(unpublished_stage1),
-        ) else {
+        let Some(never_published) = unpublished_stage1.consume(identity) else {
             rollback_error.get_or_insert_with(|| {
                 TrapError::Hypervisor(
-                    "unpublished inventory rollback did not cover registered owner".to_owned(),
+                    "unpublished inventory rollback lost registered owner authority".to_owned(),
                 )
+            });
+            continue;
+        };
+        let Some(stage1) = custody.stage1_unpublished_from_rollback(identity, never_published)
+        else {
+            rollback_error.get_or_insert_with(|| {
+                TrapError::Hypervisor("unpublished owner authority named another record".to_owned())
             });
             continue;
         };
@@ -2786,13 +2790,19 @@ pub(crate) fn rollback_partial_process_stage2_authorities(
     drop(structural_owners);
     for &identity in structural_identities {
         if custody.stage2_retirement_authorization(identity).is_none() {
-            let Some(stage1) = custody.stage1_unpublished_from_receipt(
-                identity,
-                Stage1UnpublicationReceipt::InventoryRollback(unpublished_stage1),
-            ) else {
+            let Some(never_published) = unpublished_stage1.consume(identity) else {
                 rollback_error.get_or_insert_with(|| {
                     TrapError::Hypervisor(
-                        "unpublished inventory rollback did not cover structural record".to_owned(),
+                        "unpublished inventory rollback lost structural authority".to_owned(),
+                    )
+                });
+                continue;
+            };
+            let Some(stage1) = custody.stage1_unpublished_from_rollback(identity, never_published)
+            else {
+                rollback_error.get_or_insert_with(|| {
+                    TrapError::Hypervisor(
+                        "unpublished structural authority named another record".to_owned(),
                     )
                 });
                 continue;
