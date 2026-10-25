@@ -1670,10 +1670,7 @@ pub(crate) fn retire_carrier_stage2_record_at_safe_point_using(
         CarrierStage2RetireOutcome::RetiredUnmapped
         | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
             finalize_terminal_stage2_record_using(custody, identity, &mut release)?;
-            let mut records = custody.carrier_stage2_records.lock();
-            if records.get(&key) == Some(&identity) {
-                records.remove(&key);
-            }
+            custody.remove_carrier_stage2_record_if(key, |found| found == identity);
             Ok(())
         }
         CarrierStage2RetireOutcome::DeferredActivePins => Ok(()),
@@ -2598,10 +2595,7 @@ pub(crate) fn finalize_terminal_stage2_record_using(
         }
         custody.commit_terminal_stage2_release(identity);
     }
-    custody
-        .structural_backings
-        .lock()
-        .remove(&identity.record_id);
+    custody.remove_structural_backing_if(identity.record_id, |_| true);
     Ok(())
 }
 
@@ -2835,7 +2829,7 @@ pub(crate) fn finalize_carrier_exit_global_frame_owners_in_using(
             )));
         }
         finalize_terminal_stage2_record_using(custody, identity, release_ipa)?;
-        custody.carrier_stage2_records.lock().remove(&key);
+        custody.remove_carrier_stage2_record_if(key, |found| found == identity);
     }
     for identity in custody.stage2_record_identities() {
         let snapshot = custody
@@ -2991,13 +2985,9 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             continue;
         }
         finalize_global_frame_owner_record_using(custody, &owner, release_ipa)?;
-        let mut owners = custody.global_frame_host_owners.lock();
-        if owners
-            .get(&key)
-            .is_some_and(|entry| std::sync::Arc::ptr_eq(entry.owner(), &owner))
-        {
-            owners.remove(&key);
-        }
+        custody.remove_global_frame_host_owner_if(key, |entry| {
+            std::sync::Arc::ptr_eq(entry.owner(), &owner)
+        });
         report.retired += 1;
     }
 
@@ -3095,10 +3085,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             ));
         }
         finalize_terminal_stage2_record_using(custody, old_identity, release_ipa)?;
-        let mut records = custody.carrier_stage2_records.lock();
-        if records.get(&key) == Some(&old_identity) {
-            records.remove(&key);
-        }
+        custody.remove_carrier_stage2_record_if(key, |found| found == old_identity);
         report.retired += 1;
     }
 
@@ -3169,11 +3156,17 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     ))
                 })?;
             *retained.record_identity.lock() = new_identity;
-            let mut retained_by_record = custody.structural_backings.lock();
-            retained_by_record.remove(&old_identity.record_id);
-            retained_by_record.insert(new_identity.record_id, std::sync::Arc::clone(&retained));
-            drop(retained_by_record);
-            custody.publish_stage2_availability_change();
+            if !custody.replace_structural_backing_if(
+                old_identity.record_id,
+                new_identity.record_id,
+                std::sync::Arc::clone(&retained),
+                |entry| std::ptr::eq(entry, retained.as_ref()),
+            ) {
+                *retained.record_identity.lock() = old_identity;
+                return Err(TrapError::Hypervisor(
+                    "structural stage-2 owner changed during replay rebind".to_owned(),
+                ));
+            }
             let _ = custody.remove_terminal_stage2_record(old_identity);
             report.rebound += 1;
             continue;
@@ -3370,15 +3363,30 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
                 let terminalized =
                     matches!(outcome, CarrierStage2RetireOutcome::TerminalizedByVmDestroy);
+                drop(owners);
                 if let Err(error) = finalize_global_frame_owner_record(custody, &owner) {
-                    owners.insert(
-                        (ipa, length),
-                        GlobalFrameOwnerEntry::RetirementPending {
-                            owner,
-                            error: Some(error.to_string()),
-                            in_flight: false,
-                        },
+                    let mut owners = custody.global_frame_host_owners.lock();
+                    let still_claimed = matches!(
+                        owners.get(&key),
+                        Some(GlobalFrameOwnerEntry::RetirementPending {
+                            owner: pending,
+                            in_flight: true,
+                            ..
+                        }) if std::sync::Arc::ptr_eq(pending, &owner)
                     );
+                    if still_claimed {
+                        owners.insert(
+                            key,
+                            GlobalFrameOwnerEntry::RetirementPending {
+                                owner: std::sync::Arc::clone(&owner),
+                                error: Some(error.to_string()),
+                                in_flight: false,
+                            },
+                        );
+                    } else {
+                        drop(owners);
+                        retain_pending_global_frame_owner(custody, std::sync::Arc::clone(&owner));
+                    }
                     return GlobalFrameRetirementOutcome::RetryPending {
                         ipa,
                         length,
@@ -3386,7 +3394,16 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
                         error: error.to_string(),
                     };
                 }
-                owners.remove(&key);
+                custody.remove_global_frame_host_owner_if(key, |entry| {
+                    matches!(
+                        entry,
+                        GlobalFrameOwnerEntry::RetirementPending {
+                            owner: pending,
+                            in_flight: true,
+                            ..
+                        } if std::sync::Arc::ptr_eq(pending, &owner)
+                    )
+                });
                 if terminalized {
                     GlobalFrameRetirementOutcome::TerminalizedByVmDestroy {
                         ipa,

@@ -12050,7 +12050,9 @@ fn live_resolver_records_extension_prefix_before_pool_reuse() {
         &mut release_retired_stage2_ipa,
     )
     .expect("retire extension backing");
-    installed.state.release_structural_owner_at(base, len);
+    installed
+        .state
+        .release_structural_owner_at(&transport.custody, base, len);
     let reissued = pool
         .allocate_slot_at(base)
         .expect("reissued extension slot");
@@ -14621,10 +14623,7 @@ fn exercise_retained_import(journal_case: u8) {
         source_custody.retire_stage2_record_using(identity, |_, _| Ok(())),
         CarrierStage2RetireOutcome::DeferredActivePins
     );
-    source_custody
-        .global_frame_host_owners
-        .lock()
-        .remove(&(source_ipa, 16384));
+    source_custody.remove_global_frame_host_owner_if((source_ipa, 16384), |_| true);
     assert!(
         source
             .retain_import_source(Gpa::new(source_ipa), 4096, receipt)

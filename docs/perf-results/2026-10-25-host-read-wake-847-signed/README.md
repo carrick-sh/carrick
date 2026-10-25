@@ -48,8 +48,8 @@ authoritative redispatch. EL1 selection now decides whether the guest address
 is actually unmapped; a still-mapped address either completes against its
 current leaf or returns an exact owner/physical producer. The witness then
 parks without polling, wakes on physical-retirement completion, and commits
-the copyout. A repeated identical producer-free receipt is a carrier invariant
-error, never a guest `EFAULT` and never an unbounded redrive.
+the copyout. The later publication-producer correction below replaces the
+temporary repeated-receipt invariant error with a named producer.
 
 Portable verification on the correction:
 
@@ -107,6 +107,53 @@ Portable verification on this follow-up:
 
 No signed test was run because the source changed. The exact-candidate fixture
 bundle is required before the requested signed 20/20 proof.
+
+## Removal publication and pending stage-1 rewrite correction
+
+Review of `2efa83419` found two remaining producer gaps. First, readiness can
+change when a global owner, structural backing, per-MM structural owner, or
+carrier record is removed, but several removal sites did not publish the
+stage-2 availability stream. This included cleanup of a dangling owner that
+named an already missing record: readiness became true without waking an
+enrolled waiter. All directory removals now go through shared helpers that
+publish only after their directory lock drops. Terminal record removal uses a
+scoped removal owner whose drop releases the record lock before publishing, so
+the pin-release and terminal-release paths cannot omit the wake.
+
+Second, a valid stage-1 leaf may outlive retirement of its stage-2 authority
+until the promised stage-1 rewrite publishes. An authoritative reselect can
+therefore observe the same producer-free Editor cause while the editor word is
+momentarily free. The first such observation still performs the authoritative
+reselect. A second observation for the same MM and cause now names the pending
+stage-1 rewrite and parks on that exact MM's Editor publication stream. It no
+longer returns a carrier error, and receipt churn still does not count as
+forward progress.
+
+Red-first evidence:
+
+- `removing_dangling_stage2_authority_wakes_publication_wait` observed the
+  waiter become ready after direct removal but received zero callbacks; it now
+  receives exactly one wake through the shared removal helper.
+- `serial_host_stale_selection_without_editor_parks_on_pending_stage1_rewrite`
+  reached
+  `Runtime(Configuration("authoritative owner reselect repeated without a producer"))`;
+  it now parks the production continuation, wakes when a real editor publishes,
+  and completes the saved copyout.
+- `owner_redrive_receipt_churn_names_the_pending_stage1_rewrite` proves a new
+  Editor receipt for the same MM cannot disguise the owed rewrite producer or
+  reset the stalled-pass accounting.
+
+Portable verification on the final tree:
+
+- focused production park/wake, receipt-churn, and authority-removal
+  witnesses: 1 passed each;
+- serialized `carrick-vmm-hvf` library: 791 passed, 3 ignored;
+- serialized `carrick-runtime` library: 819 passed, 9 ignored;
+- `just fmt-check`, `just clippy`, `just clippy-linux`,
+  `just lint-domains`, and `just test-kernel`: passed.
+
+No signed test was run because this correction changes source. The requested
+20/20 hardware proof remains gated on its exact-candidate fixture bundle.
 
 The first companion `el1_ipc_two_processes_blocking` repetition,
 `847-final-two-process-01`, hit its 60-second watchdog. Per the director's

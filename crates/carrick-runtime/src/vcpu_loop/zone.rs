@@ -46,6 +46,15 @@ pub(super) enum OwnerMemoryPark {
     },
 }
 
+pub(super) enum OwnerWaitProducer {
+    CurrentHolder,
+    /// An authoritative reselect found the same valid stage-1 leaf after its
+    /// stage-2 authority retired. The retirement transition owes the editor
+    /// publication that rewrites that leaf, even if the editor word is free
+    /// between those two publications.
+    PendingStage1Rewrite,
+}
+
 /// A Reservations receipt names the root-release stream, but selection can
 /// outlive the holder that justified sampling it. Only a currently held root
 /// has a future release producer. Region identity is checked before consulting
@@ -819,6 +828,7 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         action: OwnerMemoryAction,
         wait: carrick_el1_abi::PortalOwnerWait,
+        producer: &OwnerWaitProducer,
     ) -> Result<OwnerMemoryPark, ProductionHvpatchPollError> {
         use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
         let wait_mm = wait.handle().mm();
@@ -897,9 +907,16 @@ where
             carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects)
         };
         let cause = enrollment.cause();
+        let pending_stage1_rewrite = matches!(producer, &OwnerWaitProducer::PendingStage1Rewrite)
+            && cause == carrick_sched_core::spaces::notification::SpaceWaitCause::Editor;
+        debug_assert!(
+            matches!(producer, &OwnerWaitProducer::CurrentHolder) || pending_stage1_rewrite,
+            "a pending stage-1 rewrite must wait on the exact editor stream"
+        );
         if enrollment.current_revision() == enrollment.revision()
             && cause == carrick_sched_core::spaces::notification::SpaceWaitCause::Editor
             && !editor_is_held(zone, wait_mm)
+            && !pending_stage1_rewrite
         {
             zone.free_record(record);
             return Ok(OwnerMemoryPark::NoProducer { action, wait });
@@ -909,7 +926,7 @@ where
                 reservation_root_is_held(zone, wait_mm)
             }
             carrick_sched_core::spaces::notification::SpaceWaitCause::Editor => {
-                editor_is_held(zone, wait_mm)
+                pending_stage1_rewrite || editor_is_held(zone, wait_mm)
             }
             _ => true,
         }) {

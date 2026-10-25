@@ -434,7 +434,10 @@ enum RetainedMemoryWaitAttempt {
 }
 
 struct OwnerRedriveProgress {
-    unproduced_reselect_used: bool,
+    unproduced_reselect: Option<(
+        carrick_el1_abi::El1MmHandle,
+        carrick_el1_abi::PortalWaitCause,
+    )>,
     consecutive_stalled_passes: usize,
     committed_bytes: u64,
 }
@@ -445,7 +448,7 @@ struct OwnerRedriveProgress {
 impl Default for OwnerRedriveProgress {
     fn default() -> Self {
         Self {
-            unproduced_reselect_used: false,
+            unproduced_reselect: None,
             consecutive_stalled_passes: 0,
             committed_bytes: 0,
         }
@@ -460,7 +463,7 @@ impl OwnerRedriveProgress {
                     RuntimeError::Configuration("owner redrive byte progress overflow".to_owned())
                 })?;
             self.consecutive_stalled_passes = 0;
-            self.unproduced_reselect_used = false;
+            self.unproduced_reselect = None;
             return Ok(());
         }
         self.consecutive_stalled_passes = self
@@ -477,14 +480,19 @@ impl OwnerRedriveProgress {
         Ok(())
     }
 
-    fn authorize_unproduced_reselect(&mut self) -> Result<(), RuntimeError> {
-        if self.unproduced_reselect_used {
-            return Err(RuntimeError::Configuration(
-                "authoritative owner reselect repeated without a producer".to_owned(),
-            ));
+    fn producer_for(
+        &self,
+        wait: carrick_el1_abi::PortalOwnerWait,
+    ) -> super::zone::OwnerWaitProducer {
+        if self.unproduced_reselect == Some((wait.handle(), wait.cause())) {
+            super::zone::OwnerWaitProducer::PendingStage1Rewrite
+        } else {
+            super::zone::OwnerWaitProducer::CurrentHolder
         }
-        self.unproduced_reselect_used = true;
-        Ok(())
+    }
+
+    fn record_unproduced_reselect(&mut self, wait: carrick_el1_abi::PortalOwnerWait) {
+        self.unproduced_reselect = Some((wait.handle(), wait.cause()));
     }
 
     #[cfg(test)]
@@ -1820,6 +1828,7 @@ where
                         control,
                         super::zone::OwnerMemoryAction::Retained,
                         wait,
+                        &super::zone::OwnerWaitProducer::CurrentHolder,
                     )? {
                         super::zone::OwnerMemoryPark::Parked(exit) => {
                             return Ok(RetainedMemoryWaitAttempt::Exit(exit));
@@ -3809,6 +3818,7 @@ where
                 .ok_or_else(|| {
                     RuntimeError::Configuration("owner read progress overflow".to_owned())
                 })?;
+            let producer = progress.producer_for(wait);
             match self.park_owner_memory_action(
                 engine,
                 control,
@@ -3819,6 +3829,7 @@ where
                         .unwrap_or(OwnedSyscallResume::CopyoutRedispatch),
                 },
                 wait,
+                &producer,
             )? {
                 super::zone::OwnerMemoryPark::Parked(exit) => {
                     return Ok(OwnerResumeStep::Exit(exit));
@@ -3832,8 +3843,11 @@ where
                     wait,
                 } => {
                     debug_assert_eq!(retry_frame, frame);
-                    let _ = wait;
-                    progress.authorize_unproduced_reselect()?;
+                    debug_assert!(matches!(
+                        producer,
+                        super::zone::OwnerWaitProducer::CurrentHolder
+                    ));
+                    progress.record_unproduced_reselect(wait);
                     let outcome =
                         match self.resume_owner_ready_step(engine, control, retry_frame, retry)? {
                             OwnerReadyStep::Exit(exit) => {
@@ -7503,14 +7517,31 @@ mod tests {
     }
 
     #[test]
-    fn owner_redrive_receipt_churn_is_not_progress() {
+    fn owner_redrive_receipt_churn_names_the_pending_stage1_rewrite() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        let handle = unsafe {
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(2).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            )
+        };
+        let first = unsafe { PortalOwnerWait::from_owner(handle, PortalWaitCause::Editor, 4) };
+        let next = unsafe { PortalOwnerWait::from_owner(handle, PortalWaitCause::Editor, 5) };
         let mut progress = OwnerRedriveProgress::default();
         progress.observe(0).unwrap();
-        progress.authorize_unproduced_reselect().unwrap();
+        assert!(matches!(
+            progress.producer_for(first),
+            super::zone::OwnerWaitProducer::CurrentHolder
+        ));
+        progress.record_unproduced_reselect(first);
         progress.observe(0).unwrap();
         assert!(
-            progress.authorize_unproduced_reselect().is_err(),
-            "a fresh SELECT receipt cannot authorize another producer-free pass"
+            matches!(
+                progress.producer_for(next),
+                super::zone::OwnerWaitProducer::PendingStage1Rewrite
+            ),
+            "SELECT receipt churn cannot erase the physical transition's editor producer"
         );
         assert_eq!(progress.consecutive_stalled_passes(), 2);
     }

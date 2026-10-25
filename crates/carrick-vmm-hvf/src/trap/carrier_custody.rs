@@ -382,7 +382,10 @@ impl CarrierVmCustodyState {
             .insert(id);
     }
 
-    fn remove_record(&mut self, id: CarrierStage2RecordId) -> Option<CarrierStage2Record> {
+    fn remove_unpublished_record(
+        &mut self,
+        id: CarrierStage2RecordId,
+    ) -> Option<CarrierStage2Record> {
         let removed = self.stage2_records.remove(&id);
         if let Some(record) = &removed {
             let key = (record.snapshot.ipa, record.snapshot.len as u64);
@@ -404,6 +407,41 @@ type RetainedNativeExecPreparation = (
     carrick_core_abi::service::ServiceIdentity,
     crate::trap::PreparedNativeExecSuccessor,
 );
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct Stage2RecordRemoval<'a> {
+    custody: &'a CarrierVmCustody,
+    state: std::mem::ManuallyDrop<parking_lot::MutexGuard<'a, CarrierVmCustodyState>>,
+    removed: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Stage2RecordRemoval<'_> {
+    fn state(&self) -> &CarrierVmCustodyState {
+        &self.state
+    }
+
+    fn state_mut(&mut self) -> &mut CarrierVmCustodyState {
+        &mut self.state
+    }
+
+    fn remove_record(&mut self, id: CarrierStage2RecordId) -> Option<CarrierStage2Record> {
+        let removed = self.state_mut().remove_unpublished_record(id);
+        self.removed |= removed.is_some();
+        removed
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for Stage2RecordRemoval<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `state` is wrapped only so this owner can release the lock
+        // before publishing. This is its sole explicit drop.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.state) };
+        if self.removed {
+            self.custody.publish_stage2_availability_change();
+        }
+    }
+}
 
 /// Carrier-owned VM lifecycle authority.
 ///
@@ -626,6 +664,14 @@ enum ExecutableBacking {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierVmCustody {
+    fn stage2_record_removal(&self) -> Stage2RecordRemoval<'_> {
+        Stage2RecordRemoval {
+            custody: self,
+            state: std::mem::ManuallyDrop::new(self.state.lock()),
+            removed: false,
+        }
+    }
+
     /// The backing that owns physical `ipa`: a global frame or a structural
     /// backing (tracked: its `CodeContent` carries per-page instruction-cache
     /// state), else any other carrier stage-2 extent (untracked).
@@ -1032,7 +1078,7 @@ impl CarrierVmCustody {
                         pool.forget_backend_mapping();
                     }
                     metadata.release_destroyed_vm(generation.0, |identity| {
-                        let _ = state.remove_record(identity.record_id);
+                        let _ = state.remove_unpublished_record(identity.record_id);
                     });
                     state.lifecycle = CarrierVmLifecycle::Vacant;
                     std::mem::replace(
@@ -1232,15 +1278,15 @@ impl CarrierVmCustody {
         &self,
         identity: CarrierStage2RecordIdentity,
     ) -> Option<CarrierStage2RecordSnapshot> {
-        let mut state = self.state.lock();
-        let record = state.stage2_records.get(&identity.record_id)?;
+        let mut removal = self.stage2_record_removal();
+        let record = removal.state().stage2_records.get(&identity.record_id)?;
         if Self::stage2_identity_mismatch(record, identity).is_some()
             || record.snapshot.pin_count != 0
             || (record.snapshot.mapped && !record.snapshot.terminalized_by_vm_destroy)
         {
             return None;
         }
-        state
+        removal
             .remove_record(identity.record_id)
             .map(|record| record.snapshot)
     }
@@ -1249,8 +1295,9 @@ impl CarrierVmCustody {
         &self,
         identity: CarrierStage2RecordIdentity,
     ) -> Result<Option<(u64, u64)>, CarrierStage2RecordError> {
-        let mut state = self.state.lock();
-        let record = state
+        let mut removal = self.stage2_record_removal();
+        let record = removal
+            .state_mut()
             .stage2_records
             .get_mut(&identity.record_id)
             .ok_or(CarrierStage2RecordError::RecordNotFound)?;
@@ -1266,7 +1313,7 @@ impl CarrierVmCustody {
             return Err(CarrierStage2RecordError::ReleaseInFlight);
         }
         if !record.snapshot.release_ipa {
-            let _ = state.remove_record(identity.record_id);
+            let _ = removal.remove_record(identity.record_id);
             return Ok(None);
         }
         record.snapshot.release_in_flight = true;
@@ -1275,8 +1322,9 @@ impl CarrierVmCustody {
     }
 
     pub(crate) fn commit_terminal_stage2_release(&self, identity: CarrierStage2RecordIdentity) {
-        let mut state = self.state.lock();
-        let removable = state
+        let mut removal = self.stage2_record_removal();
+        let removable = removal
+            .state()
             .stage2_records
             .get(&identity.record_id)
             .is_some_and(|record| {
@@ -1289,7 +1337,7 @@ impl CarrierVmCustody {
             "claimed terminal release identity must remain stable"
         );
         if removable {
-            let _ = state.remove_record(identity.record_id);
+            let _ = removal.remove_record(identity.record_id);
         }
     }
 
@@ -1344,7 +1392,7 @@ impl CarrierVmCustody {
         })?;
         let rc = map(identity);
         if rc != 0 {
-            let _ = state.remove_record(identity.record_id);
+            let _ = state.remove_unpublished_record(identity.record_id);
             return Err(TrapError::Hypervisor(format!(
                 "stage-2 map failed: {rc:#x}"
             )));
@@ -1941,6 +1989,90 @@ impl CarrierVmCustody {
         self.stage2_publication_changed.publish(0);
     }
 
+    pub(crate) fn remove_global_frame_host_owner_if(
+        &self,
+        key: (u64, u64),
+        remove: impl FnOnce(&GlobalFrameOwnerEntry) -> bool,
+    ) -> Option<GlobalFrameOwnerEntry> {
+        let removed = {
+            let mut owners = self.global_frame_host_owners.lock();
+            owners
+                .get(&key)
+                .is_some_and(remove)
+                .then(|| owners.remove(&key))
+                .flatten()
+        };
+        if removed.is_some() {
+            self.publish_stage2_availability_change();
+        }
+        removed
+    }
+
+    pub(crate) fn remove_structural_backing_if(
+        &self,
+        record: CarrierStage2RecordId,
+        remove: impl FnOnce(&StructuralBackingCustodyEntry) -> bool,
+    ) -> Option<std::sync::Arc<StructuralBackingCustodyEntry>> {
+        let removed = {
+            let mut backings = self.structural_backings.lock();
+            backings
+                .get(&record)
+                .is_some_and(|entry| remove(entry))
+                .then(|| backings.remove(&record))
+                .flatten()
+        };
+        if removed.is_some() {
+            self.publish_stage2_availability_change();
+        }
+        removed
+    }
+
+    pub(crate) fn replace_structural_backing_if(
+        &self,
+        old_record: CarrierStage2RecordId,
+        new_record: CarrierStage2RecordId,
+        replacement: std::sync::Arc<StructuralBackingCustodyEntry>,
+        replace: impl FnOnce(&StructuralBackingCustodyEntry) -> bool,
+    ) -> bool {
+        let replaced = {
+            let mut backings = self.structural_backings.lock();
+            if backings
+                .get(&old_record)
+                .is_some_and(|entry| replace(entry))
+            {
+                backings.remove(&old_record);
+                backings.insert(new_record, replacement);
+                true
+            } else {
+                false
+            }
+        };
+        if replaced {
+            self.publish_stage2_availability_change();
+        }
+        replaced
+    }
+
+    pub(crate) fn remove_carrier_stage2_record_if(
+        &self,
+        key: (u64, u64),
+        remove: impl FnOnce(CarrierStage2RecordIdentity) -> bool,
+    ) -> Option<CarrierStage2RecordIdentity> {
+        let removed = {
+            let mut records = self.carrier_stage2_records.lock();
+            records
+                .get(&key)
+                .copied()
+                .is_some_and(remove)
+                .then(|| records.remove(&key))
+                .flatten()
+        };
+        if removed.is_some() {
+            self.publish_stage2_availability_change();
+        }
+        removed
+    }
+
     pub(crate) fn stage2_publication_wait(
         self: &std::sync::Arc<Self>,
         ipa: u64,
@@ -1975,17 +2107,21 @@ impl CarrierVmCustody {
         schedule_safe_point: impl FnOnce(&Self),
     ) {
         use carrick_core::mm::retirement::{RecordPinRelease, release_record_pin_outcome};
+        let mut removal = self.stage2_record_removal();
         let outcome = {
-            let mut state = self.state.lock();
-            let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
+            let Some(record) = removal
+                .state_mut()
+                .stage2_records
+                .get_mut(&identity.record_id)
+            else {
                 return;
             };
-            let outcome = release_record_pin_outcome(record, identity);
-            if outcome == RecordPinRelease::RemovePredecessor {
-                let _ = state.remove_record(identity.record_id);
-            }
-            outcome
+            release_record_pin_outcome(record, identity)
         };
+        if outcome == RecordPinRelease::RemovePredecessor {
+            let _ = removal.remove_record(identity.record_id);
+        }
+        drop(removal);
         if self.carrier_stage2_retirement_is_ready(identity) {
             schedule_safe_point(self);
             return;
@@ -3031,7 +3167,7 @@ mod carrier_vm_custody_tests {
                 key.1,
                 generation,
                 &mut |_, _| {
-                    custody.global_frame_host_owners.lock().remove(&key);
+                    custody.remove_global_frame_host_owner_if(key, |_| true);
                     Err(injected)
                 },
             ),

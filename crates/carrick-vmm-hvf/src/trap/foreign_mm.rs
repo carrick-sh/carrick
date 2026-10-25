@@ -474,7 +474,7 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
         {
             return Err("raw table capacity retirement is still pinned".to_owned());
         }
-        state.release_structural_owner_at(base, 2 * 1024 * 1024);
+        state.release_structural_owner_at(&self.custody, base, 2 * 1024 * 1024);
         Ok(())
     }
     fn publish_extension_arenas(
@@ -1221,14 +1221,37 @@ impl MmAccessState {
     /// when it was served by the carrier's root-slot pool, hand the slot back.
     /// The runtime's stage-1 slot allocator reissues a retired extension arena
     /// immediately, so the pool must not still consider it in use.
-    pub(crate) fn release_structural_owner_at(&self, physical_ipa: u64, physical_size: usize) {
-        let removed = self
-            .structural_owners
-            .write()
-            .remove(&(physical_ipa, physical_size));
+    pub(crate) fn release_structural_owner_at(
+        &self,
+        custody: &CarrierVmCustody,
+        physical_ipa: u64,
+        physical_size: usize,
+    ) {
+        let removed =
+            self.remove_structural_owner_if(custody, (physical_ipa, physical_size), |_| true);
         if let Some(owner) = removed {
             owner.release_pooled_root_slot();
         }
+    }
+
+    fn remove_structural_owner_if(
+        &self,
+        custody: &CarrierVmCustody,
+        key: (u64, usize),
+        remove: impl FnOnce(&std::sync::Arc<StructuralBackingOwner>) -> bool,
+    ) -> Option<std::sync::Arc<StructuralBackingOwner>> {
+        let removed = {
+            let mut owners = self.structural_owners.write();
+            owners
+                .get(&key)
+                .is_some_and(remove)
+                .then(|| owners.remove(&key))
+                .flatten()
+        };
+        if removed.is_some() {
+            custody.publish_stage2_availability_change();
+        }
+        removed
     }
 
     pub(crate) fn install_structural_owner(&self, owner: std::sync::Arc<StructuralBackingOwner>) {
@@ -1404,13 +1427,9 @@ impl MmAccessState {
                 host_addr: authority.owner.ptr() as usize,
                 generation: authority.owner.epoch().raw(),
             };
-            let mut structural_owners = self.structural_owners.write();
-            if structural_owners
-                .get(&key)
-                .is_some_and(|owner| std::sync::Arc::ptr_eq(owner, &authority.owner))
-            {
-                structural_owners.remove(&key);
-            }
+            self.remove_structural_owner_if(custody, key, |owner| {
+                std::sync::Arc::ptr_eq(owner, &authority.owner)
+            });
             Ok(RetiredMmRootStage2 {
                 proof: HvpatchMmRootRetirementProof {
                     root_slot: expected_root_slot,

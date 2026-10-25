@@ -8025,7 +8025,9 @@ fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
     if custody.stage2_record_snapshot(record.record_id).is_some() {
         retire_carrier_stage2_record_at_safe_point(custody, record).unwrap();
     }
-    first.mm_access.release_structural_owner_at(base, 0x20_0000);
+    first
+        .mm_access
+        .release_structural_owner_at(custody, base, 0x20_0000);
     retire_global_frame_host_owner_if_generation_in(custody, key.0, key.1, generation);
     HvfVmState::retire_task_state_process_mappings(&mut second).unwrap();
     assert!(

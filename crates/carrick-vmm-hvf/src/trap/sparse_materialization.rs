@@ -1918,7 +1918,7 @@ impl MmAccessState {
                     "rollback arena backing remained nonterminal".to_owned(),
                 ));
             }
-            self.structural_owners.write().remove(&key);
+            self.release_structural_owner_at(custody, key.0, key.1);
         }
         Ok(())
     }

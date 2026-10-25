@@ -668,10 +668,11 @@ impl carrick_aarch64::fork::PhysicalForkBuilder<ProcessSpec> for OwnerPhysicalFo
                 let identity = *owner.retained.record_identity.lock();
                 retire_carrier_stage2_record_at_safe_point(&self.physical.custody, identity)?;
             }
-            self.state
-                .structural_owners
-                .write()
-                .remove(&(owner.physical_ipa, owner.physical_size));
+            self.state.release_structural_owner_at(
+                &self.physical.custody,
+                owner.physical_ipa,
+                owner.physical_size,
+            );
         }
         self.settled = true;
         Ok(())
@@ -693,8 +694,11 @@ impl Drop for OwnerPhysicalForkBuilder {
                     "unpublished owner Fork capacity retirement failed: {error}"
                 );
             });
-            self.state
-                .release_structural_owner_at(owner.physical_ipa, owner.physical_size);
+            self.state.release_structural_owner_at(
+                &self.physical.custody,
+                owner.physical_ipa,
+                owner.physical_size,
+            );
         }
     }
 }
@@ -748,7 +752,11 @@ impl HvfVmState {
                 if let Some(owner) = &region.structural_owner {
                     retire_carrier_stage2_record_at_safe_point(&custody, owner.record_identity())?;
                 }
-                state.release_structural_owner_at(region.physical_ipa, region.physical_size);
+                state.release_structural_owner_at(
+                    &custody,
+                    region.physical_ipa,
+                    region.physical_size,
+                );
             }
             source.return_arena(carrick_mmu_core::aarch64::SubstrateGpa(control));
             return Err(error);
@@ -762,7 +770,11 @@ impl HvfVmState {
                 if let Some(owner) = &region.structural_owner {
                     retire_carrier_stage2_record_at_safe_point(&custody, owner.record_identity())?;
                 }
-                state.release_structural_owner_at(region.physical_ipa, region.physical_size);
+                state.release_structural_owner_at(
+                    &custody,
+                    region.physical_ipa,
+                    region.physical_size,
+                );
             }
             source.return_arena(carrick_mmu_core::aarch64::SubstrateGpa(control));
             return Err(TrapError::Hypervisor(

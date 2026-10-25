@@ -836,6 +836,45 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn removing_dangling_stage2_authority_wakes_publication_wait() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let ipa = 0xa085_3160_0000;
+        let owner = backing(&custody, ipa);
+        let physical = UserTransferCustody::new(Arc::clone(&custody));
+        let old = custody
+            .stage2_record_snapshot(owner.record_identity.record_id)
+            .unwrap();
+        custody.begin_destroy(old.vm_generation).unwrap();
+        custody.commit_destroy(old.vm_generation).unwrap();
+
+        let TransferRetention::Physical(wait) = physical
+            .retain(selection(ipa), 4, PortalTransferIntent::UserRead)
+            .unwrap()
+        else {
+            panic!("the dangling owner must keep publication authority live")
+        };
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_count = Arc::clone(&wakes);
+        let (_subscription, ready) = wait.0.enroll(Arc::new(move || {
+            wake_count.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert!(!ready);
+
+        let removed = custody
+            .remove_global_frame_host_owner_if((old.ipa, old.len as u64), |entry| {
+                entry.owner().record_identity == owner.record_identity
+            });
+        assert!(removed.is_some());
+        assert!(wait.0.is_ready());
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            1,
+            "removing the final authority must wake the enrolled consumer"
+        );
+    }
+
+    #[test]
     fn terminal_stage2_retirement_refusal_reselects_instead_of_reparking() {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = Arc::new(CarrierVmCustody::new_live_fixture());
