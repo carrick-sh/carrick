@@ -6645,6 +6645,24 @@ where
             }
         };
 
+        let native_exec_capability = match kernel.native_exec_capability() {
+            Ok(capability) => capability,
+            Err(error) => {
+                prepared.fail_exact();
+                return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(format!(
+                    "capture native exec capability: {error:?}"
+                ))));
+            }
+        };
+        if let Err(error) = authority.install_native_exec_service(
+            native_exec_capability.id(),
+            native_exec_capability
+                as Arc<dyn carrick_vmm_hvf::metadata_grant::NativeExecHostService>,
+        ) {
+            prepared.fail_exact();
+            return VcpuLoopLaunch::Direct(Err(RuntimeError::Trap(error)));
+        }
+
         // No guest has entered: its start gate remains held. The extracted
         // factory now owns the shared control backing, so register existing
         // file slots and restrictive policy before workers can run this root.

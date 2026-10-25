@@ -632,6 +632,11 @@ pub(super) fn finish_native_service(
         let doorbell = carrick_el1_abi::take_host_work_doorbell(usize::from(service.slot().raw()));
         carrick_kernel::el1_delegation::settle_host_work_boundary(kernel, true, doorbell);
         service.acknowledge_work()?
+    } else if matches!(
+        service.request().operation,
+        carrick_core_abi::service::ServiceOperation::Exec { .. }
+    ) {
+        service.prepare_exec()?
     } else {
         service.supply(|zone, _waker, effects| {
             carrick_sched_core::LockWait::complete_object_wake(

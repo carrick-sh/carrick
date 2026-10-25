@@ -523,8 +523,9 @@ pub(crate) struct KernelState {
     control_exec: Mutex<Option<carrick_kernel::kernel::control::ExecRuntime>>,
     external_exec: Mutex<Option<carrick_kernel::kernel::control::ExecWork>>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    _native_exec_capability:
-        Option<Result<crate::runtime::exec::NativeExecCapability, crate::linux_abi::LinuxErrno>>,
+    native_exec_capability: Option<
+        Result<Arc<crate::runtime::exec::NativeExecCapability>, crate::linux_abi::LinuxErrno>,
+    >,
 }
 
 impl KernelState {
@@ -549,9 +550,9 @@ impl KernelState {
             }
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let native_exec_capability = hvpatch_process
-            .as_ref()
-            .map(|_| crate::runtime::exec::capture_native_exec_capability(&dispatcher));
+        let native_exec_capability = hvpatch_process.as_ref().map(|_| {
+            crate::runtime::exec::capture_native_exec_capability(&dispatcher).map(Arc::new)
+        });
         Self {
             dispatcher,
             reporter: CompatReporter::default(),
@@ -571,8 +572,20 @@ impl KernelState {
             control_exec: Mutex::new(None),
             external_exec: Mutex::new(None),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            _native_exec_capability: native_exec_capability,
+            native_exec_capability,
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn native_exec_capability(
+        &self,
+    ) -> Result<Arc<crate::runtime::exec::NativeExecCapability>, crate::linux_abi::LinuxErrno> {
+        self.native_exec_capability
+            .as_ref()
+            .ok_or(crate::linux_abi::LINUX_ESRCH)?
+            .as_ref()
+            .map(Arc::clone)
+            .map_err(|error| *error)
     }
 
     pub(crate) fn pt_quiesce(&self) -> Arc<carrick_thread::fork_quiesce::PtQuiesce> {

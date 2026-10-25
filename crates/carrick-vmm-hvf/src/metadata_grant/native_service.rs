@@ -1,10 +1,25 @@
 //! Backing custody for a ring-owned request; no host task or process adoption.
 use super::*;
 use carrick_core_abi::service::{
-    ServiceCell, ServiceError, ServiceRequest, ServiceSelector, ServiceTicket,
+    ServiceCell, ServiceError, ServiceFailureCode, ServiceRequest, ServiceSelector, ServiceTicket,
 };
 use carrick_sched_core::object_wait::ObjectWaitKey;
 use core::ops::Deref;
+
+/// Carrier-retained file/loader service. It owns no task lookup; the service
+/// cell has already authenticated `request` against the stopped ring member.
+pub trait NativeExecHostService: core::fmt::Debug + Send + Sync + 'static {
+    fn prepare(
+        &self,
+        request: ServiceRequest,
+        payload: &[u8],
+    ) -> Result<Box<dyn NativeExecPreparation>, ServiceFailureCode>;
+}
+
+/// Opaque fallibly prepared image. Exact carrier custody retains this result
+/// until the ring consumes successor adoption or terminal cleanup drops it.
+pub trait NativeExecPreparation: core::fmt::Debug + Send + 'static {}
+impl<T: core::fmt::Debug + Send + 'static> NativeExecPreparation for T {}
 
 struct ServicePin {
     cell: core::ptr::NonNull<ServiceCell>,
@@ -95,6 +110,77 @@ impl NativeService {
     /// The single contiguous ring-owned input for a typed exec request.
     pub fn exec_payload(&self) -> Option<&[u8]> {
         self.exec_payload.as_ref().map(RetainedExecPayload::bytes)
+    }
+
+    /// Resolve and run the retained exec service selected by the authenticated
+    /// request. Preparation performs all fallible file and loader work before
+    /// publishing `Supplied`; the result remains carrier-owned by exact
+    /// birth/MM/execution/sequence.
+    pub fn prepare_exec(self) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let (capability, payload) = match self.request().operation {
+            carrick_core_abi::service::ServiceOperation::Exec {
+                capability,
+                payload: _,
+            } => (capability, self.exec_payload().ok_or_else(stale)?),
+            _ => return self.refuse(),
+        };
+        let service = self
+            .custody
+            .native_exec_service(capability)
+            .ok_or_else(stale)?;
+        match service.prepare(self.request(), payload) {
+            Ok(prepared) => self.publish_exec_prepared(prepared),
+            Err(failure) => self.finish_exec_failure(failure),
+        }
+    }
+
+    fn publish_exec_prepared(
+        self,
+        prepared: Box<dyn NativeExecPreparation>,
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let identity = self.request().identity;
+        let custody = Arc::clone(&self.custody);
+        self.finish_exec_ticket(|ticket| {
+            match ticket.publish_prepared(prepared, |prepared| {
+                custody.retain_native_exec_preparation(identity, prepared);
+            }) {
+                Ok(()) => Ok(()),
+                Err((_, ticket, prepared)) => {
+                    drop(prepared);
+                    ticket.complete(false).map_err(|_| stale())
+                }
+            }
+        })
+    }
+
+    fn finish_exec_failure(
+        self,
+        failure: ServiceFailureCode,
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        self.finish_exec_ticket(|ticket| ticket.complete_failure(failure).map_err(|_| stale()))
+    }
+
+    fn finish_exec_ticket(
+        self,
+        complete: impl FnOnce(ServiceTicket<ServicePin>) -> Result<(), TrapError>,
+    ) -> Result<carrick_sched_core::WakeEffects, TrapError> {
+        let region = retained_abi_region(&self.custody).ok_or_else(stale)?;
+        let (_, zone) = stopped_records(
+            region,
+            carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
+        )
+        .ok_or_else(stale)?;
+        let key = ObjectWaitKey::native_service(self.request().identity.birth.record)
+            .ok_or_else(stale)?;
+        let queue = zone
+            .object_wait(key, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| stale())?;
+        complete(self.ticket)?;
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        queue
+            .notify_object(self.slot, &mut effects)
+            .map_err(|_| stale())?;
+        Ok(effects)
     }
 
     /// Supply exact-MM physical COW stock; the ring owns fault policy and retry.
