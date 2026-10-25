@@ -802,6 +802,24 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
         arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
         assert!((frame.x[0] as i64) > 0, "actual native fork must succeed");
     }
+    if matches!(witness, ServiceWitness::ExecRefusal) {
+        use super::super::dispatch::{arm_owner_must_serve, arm_thread_group_owner};
+        use super::super::native_process_runtime::NativeThreadGroupOwner;
+
+        assert_eq!(
+            arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
+            NativeThreadGroupOwner::Root
+        );
+        assert!(
+            !arm_owner_must_serve(
+                221,
+                0x6000_0010,
+                || arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
+                carrick_el1_abi::Lifecycle::live(fixture.page),
+            ),
+            "the root continues through host exec after two native forks"
+        );
+    }
     fixture.zone.publish_slot(fixture.slot, 0, None, 0);
     fixture.task.mm.key.store(0, Ordering::Release);
     let counters = carrick_el1_abi::Counters::new();
@@ -861,14 +879,28 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
                 carrick_el1_abi::Action::ServedWithWork
             }
             ServiceWitness::ExecRefusal => {
+                use super::super::dispatch::{arm_owner_must_serve, arm_thread_group_owner};
+                use super::super::native_process_runtime::NativeThreadGroupOwner;
+
                 frame.x[8] = 221;
                 frame.x[0] = 0x6000_0010;
+                assert_eq!(
+                    arm_thread_group_owner(fixture.zone, &fixture.task, page),
+                    NativeThreadGroupOwner::ForkChild
+                );
                 let action = super::super::dispatch::resolve_arm_process_route(
                     carrick_personality_linux::dispatch::CompletionRoute::Forward,
-                    page,
                     &mut frame,
                     &counters,
                     core::slice::from_ref(&fixture.task),
+                    || {
+                        arm_owner_must_serve(
+                            221,
+                            0x6000_0010,
+                            || arm_thread_group_owner(fixture.zone, &fixture.task, page),
+                            carrick_el1_abi::Lifecycle::live(page),
+                        )
+                    },
                 );
                 assert_eq!(action, carrick_el1_abi::Action::ServedWithWork);
                 assert_eq!(frame.x[0] as i64, -38);

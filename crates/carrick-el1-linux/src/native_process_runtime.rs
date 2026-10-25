@@ -1250,6 +1250,14 @@ struct NativeRegistryState<'a, M: Clone, C: ProcessContext> {
     by_process: BTreeMap<(usize, TaskKey), (NativeGroupKey, Vec<NativeExecutionKey>)>,
 }
 
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NativeThreadGroupOwner {
+    Unowned,
+    Root,
+    ForkChild,
+}
+
 /// Shared owner registry. Each admitted root owns an independent process
 /// graph; children retain their parent's graph through exact member indices.
 pub struct NativeProcessRegistry<'a, M: Clone, C: ProcessContext> {
@@ -1997,21 +2005,34 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         runtime.task_binding(process).map(|binding| binding.address)
     }
 
-    /// Whether any admitted owner retains the thread group of `page` and
-    /// `visible_pid` in this carrier, at whatever address incarnation.
-    pub fn owns_thread_group(
+    /// Classify the admitted thread group at whatever address incarnation.
+    /// Root and fork-child groups have distinct exec authority until native
+    /// child exec is implemented.
+    #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+    pub(super) fn thread_group_owner(
         &self,
         zone: &ZoneTables<C>,
         page: &ThreadLifecyclePage,
         visible_pid: u32,
-    ) -> bool {
+    ) -> NativeThreadGroupOwner {
         let carrier = core::ptr::from_ref(zone).addr();
         let page = core::ptr::from_ref(page).addr();
-        self.state
+        let owner = self
+            .state
             .lock()
             .groups
             .range((carrier, 0, 0, 0, 0)..=(carrier, u64::MAX, u64::MAX, usize::MAX, u32::MAX))
-            .any(|(&(_, _, _, group_page, pid), _)| group_page == page && pid == visible_pid)
+            .find_map(|(&(_, _, _, group_page, pid), (runtime, process))| {
+                (group_page == page && pid == visible_pid).then(|| (runtime.clone(), *process))
+            });
+        let Some((runtime, process)) = owner else {
+            return NativeThreadGroupOwner::Unowned;
+        };
+        if runtime.graph.lock().root_key == process {
+            NativeThreadGroupOwner::Root
+        } else {
+            NativeThreadGroupOwner::ForkChild
+        }
     }
 
     fn register_child(

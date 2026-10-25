@@ -1773,7 +1773,10 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
 
     /// The executing child has left the shared owner graph: quarantine its
     /// stock. The record must name the executing binding and its exact root.
-    /// The typed reply is written into the record either way.
+    /// Submitted descriptor grants without a final receipt may already be
+    /// linked, so retirement absorbs every one into the child's committed
+    /// table custody. Reclaim clears them before reuse. The typed reply is
+    /// written into the record either way.
     pub fn retire_child(
         &mut self,
         execution: GrantExecution,
@@ -1787,10 +1790,6 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                     .get(key)
                     .is_some_and(|child| child.root == execution.context.root)
                 && !self.quarantine.contains_key(key)
-                && !self
-                    .pending_descriptor_tables
-                    .keys()
-                    .any(|(pending, _)| pending == key)
         });
         let Some(key) = admitted else {
             retire.refuse(ChildRetireRefusal::Stale);
@@ -1799,6 +1798,24 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         };
         if !retire.accept() {
             return Err(ForkStockServiceError::InvalidRecord);
+        }
+        let pending: Vec<_> = self
+            .pending_descriptor_tables
+            .keys()
+            .filter(|(pending, _)| *pending == key)
+            .copied()
+            .collect();
+        let mut pending_pages = Vec::new();
+        for pending_key in pending {
+            if let Some(pending) = self.pending_descriptor_tables.remove(&pending_key) {
+                pending_pages.extend(pending.pages);
+            }
+        }
+        if !pending_pages.is_empty() {
+            self.committed_tables
+                .entry(key)
+                .or_default()
+                .extend(pending_pages);
         }
         self.quarantine.insert(key, QuarantinedChild::default());
         self.counters.quarantined_children = self.counters.quarantined_children.saturating_add(1);

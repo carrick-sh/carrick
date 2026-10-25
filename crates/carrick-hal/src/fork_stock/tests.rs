@@ -1919,6 +1919,115 @@ fn native_backing_table_exhaustion_is_counted_without_losing_stock() {
     assert_eq!(stock.counters().descriptor_capacity_refusals, 1);
 }
 
+#[test]
+fn child_exit_racing_native_supply_quarantines_pending_pages_with_peer_live() {
+    use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
+
+    let mut stock = stock(UntaggedRoots, 40, 2);
+    let first = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), first, 1, 0).unwrap();
+    let second = loan(&mut stock, parent(), 303, 1, 1).unwrap();
+    commit(&mut stock, parent(), second, 1, 0).unwrap();
+    let first_child = child_of(first, 44);
+    let second_child = child_of(second, 45);
+    let owner = stock.child_owner(first.request.child_mm).unwrap();
+    let before = stock.table_stock().len();
+    let reservation = stock
+        .reserve_native_descriptor_tables(
+            &mut NoTableLedger,
+            owner,
+            first_child.context.root,
+            MAX_TABLE_GRANTS,
+        )
+        .unwrap();
+    let pending_pages = reservation.pages().to_vec();
+    let txn = backing_txn(
+        owner,
+        first_child.context.root,
+        1,
+        reservation.descriptor_tables(),
+    );
+    stock
+        .track_native_descriptor_tables(&mut NoTableLedger, reservation, txn)
+        .unwrap();
+
+    // The exit checkpoint can win after the host submitted the supply but
+    // before the child applies its reply. Retirement owns that unfinished
+    // transaction; it must not turn the child's exit into a carrier failure.
+    retire(&mut stock, first_child).unwrap();
+    assert_eq!(stock.live_children(), 2, "the peer remains live");
+    assert_eq!(stock.table_stock().len(), before - MAX_TABLE_GRANTS);
+    let cleared = RefCell::new(Vec::new());
+    assert_eq!(reclaim(&mut stock, |_| true, &cleared), 1);
+    assert!(
+        pending_pages
+            .iter()
+            .all(|page| cleared.borrow().contains(page)),
+        "possibly linked grants clear only through quarantine"
+    );
+    assert_eq!(stock.live_children(), 1);
+
+    retire(&mut stock, second_child).unwrap();
+    assert_eq!(reclaim(&mut stock, |_| true, &cleared), 1);
+    assert_eq!(stock.table_stock().len(), 40);
+}
+
+#[test]
+fn early_fault_reply_return_quarantines_every_pending_supply_with_peer_live() {
+    use carrick_mmu_core::aarch64::descriptor_txn::MAX_TABLE_GRANTS;
+
+    let mut stock = stock(UntaggedRoots, 40, 2);
+    let first = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), first, 1, 0).unwrap();
+    let second = loan(&mut stock, parent(), 303, 1, 1).unwrap();
+    commit(&mut stock, parent(), second, 1, 0).unwrap();
+    let first_child = child_of(first, 44);
+    let second_child = child_of(second, 45);
+    let owner = stock.child_owner(first.request.child_mm).unwrap();
+    let before = stock.table_stock().len();
+    let mut pending_pages = Vec::new();
+    for generation in 1..=2 {
+        let reservation = stock
+            .reserve_native_descriptor_tables(
+                &mut NoTableLedger,
+                owner,
+                first_child.context.root,
+                MAX_TABLE_GRANTS,
+            )
+            .unwrap();
+        pending_pages.extend_from_slice(reservation.pages());
+        let txn = backing_txn(
+            owner,
+            first_child.context.root,
+            generation,
+            reservation.descriptor_tables(),
+        );
+        stock
+            .track_native_descriptor_tables(&mut NoTableLedger, reservation, txn)
+            .unwrap();
+    }
+
+    // Stale target/current-word checks can return before the guest settlement
+    // crossing. Every pending supply for the exiting child must move into the
+    // same terminal quarantine while the unrelated child remains live.
+    retire(&mut stock, first_child).unwrap();
+    assert_eq!(stock.live_children(), 2, "the peer remains live");
+    assert_eq!(stock.table_stock().len(), before - 2 * MAX_TABLE_GRANTS);
+    let cleared = RefCell::new(Vec::new());
+    assert_eq!(reclaim(&mut stock, |_| true, &cleared), 1);
+    assert!(
+        pending_pages
+            .iter()
+            .all(|page| cleared.borrow().contains(page)),
+        "all possibly linked grants clear before reuse"
+    );
+    assert_eq!(stock.live_children(), 1);
+
+    retire(&mut stock, second_child).unwrap();
+    assert_eq!(reclaim(&mut stock, |_| true, &cleared), 1);
+    assert_eq!(stock.table_stock().len(), 40);
+}
+
 #[derive(Debug)]
 struct TestTableReservation(Vec<RootGpa>);
 

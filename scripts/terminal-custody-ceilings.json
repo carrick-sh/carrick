@@ -11,7 +11,7 @@
     },
     {
       "crate_name": "carrick-el1-linux",
-      "ceiling": 20
+      "ceiling": 19
     },
     {
       "crate_name": "carrick-kernel",
