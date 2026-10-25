@@ -285,7 +285,7 @@ const TABLE_GUARD_BOUNDARIES: &[(&str, &str)] = &[
     ),
     (
         "carrick_kernel::kernel::objects::FileTable::write_open_files",
-        "pub(crate) fn write_open_files(&self) -> FileTableWriteGuard<'_>",
+        "pub(crate) fn write_open_files<'a>(&'a self, mutation: Option<&'a FileTableMutationLease>) -> FileTableWriteGuard<'a>",
     ),
     (
         "carrick_kernel::kernel::objects::FileTable::lock_next_fd",
@@ -333,7 +333,7 @@ const TABLE_GUARD_BOUNDARIES: &[(&str, &str)] = &[
     ),
     (
         "carrick_kernel::kernel::objects::FileTable::mutex_write",
-        "fn mutex_write<'a, T>(&'a self, lock: &'a Mutex<T>) -> FileTableMutexGuard<'a, T>",
+        "fn mutex_write<'a, T>(&'a self, lock: &'a Mutex<T>, mutation: Option<&'a FileTableMutationLease>) -> FileTableMutexGuard<'a, T>",
     ),
     (
         "carrick_kernel::kernel::objects::FileTable::rw_write",
@@ -341,7 +341,7 @@ const TABLE_GUARD_BOUNDARIES: &[(&str, &str)] = &[
     ),
     (
         "carrick_kernel::kernel::objects::ipc::FileTable::stdio_guard",
-        "pub(super) fn stdio_guard(&self, field: StdioField) -> FileTableStdioGuard<'_>",
+        "pub(super) fn stdio_guard<'a>(&'a self, field: StdioField, mutation: Option<&'a FileTableMutationLease>) -> FileTableStdioGuard<'a>",
     ),
 ];
 

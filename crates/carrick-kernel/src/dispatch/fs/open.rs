@@ -310,7 +310,10 @@ impl<'a> FsView<'a> {
                     None
                 };
                 if let Some(errno) = directory_errno {
-                    let removed = self.captured_file_table().write_open_files().remove(&fd);
+                    let removed = self
+                        .captured_file_table()
+                        .write_open_files(None)
+                        .remove(&fd);
                     self.captured_file_table().write_fd_open_paths().remove(&fd);
                     if let Some(open_file) = removed {
                         self.release_hvpatch_classic_record_locks(context.task().key(), &open_file);

@@ -1146,7 +1146,7 @@ impl SyscallDispatcher {
                 });
                 self.detach_fd_from_epolls(sqe.fd);
                 let files = self.captured_file_table();
-                let removed = files.write_open_files().remove(&sqe.fd);
+                let removed = files.write_open_files(None).remove(&sqe.fd);
                 match removed {
                     Some(open_file) => {
                         self.mqueue_owner_alias_closed(&files, &open_file);
