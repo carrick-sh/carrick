@@ -685,17 +685,16 @@ impl TerminalCustody<Process, Live> {
         })
     }
 
-    pub fn begin_exec(
-        page: &impl Lifecycle,
+    pub fn begin_exec<L: Lifecycle>(
+        admission: ProcessExitAdmission<'_, L>,
         task: TaskKey,
         address: AddressContext<RootGpa>,
-    ) -> Result<TerminalCustody<Process, Closing>, crate::lifecycle::GateState> {
-        page.close_for_exec()?;
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        Ok(TerminalCustody {
+    ) -> TerminalCustody<Process, Closing> {
+        let _page = admission.page;
+        TerminalCustody {
             identity: ProcessTerminalIdentity::from_exec(task, address),
             phase: PhantomData,
-        })
+        }
     }
 }
 
@@ -1037,7 +1036,11 @@ mod tests {
             generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(3).unwrap()),
         };
         let service = NativeServiceClaim::acquire(&page).unwrap();
-        let closing = TerminalCustody::<Process, Live>::begin_exec(&page, task, address).unwrap();
+        let closing = TerminalCustody::<Process, Live>::begin_exec(
+            TerminalCustody::<Process, Live>::close_admission(&page),
+            task,
+            address,
+        );
         let RetirementVerdict::CancelMembers { members, .. } =
             closing.cancel_members(Vec::new(), Vec::new())
         else {

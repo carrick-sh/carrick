@@ -1864,6 +1864,136 @@ fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
 }
 
 #[cfg(test)]
+#[test]
+fn sole_member_exec_closes_admission_before_adopting_successor() {
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_exec_service(test_exec_payload(b"/bin/static")),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    let host_birth = fixture.page.reserve_host_birth().unwrap();
+    let successor_mm =
+        publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 59, 0x98_0000);
+
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(),
+        Ok(NativeResume::Left(None))
+    ));
+    assert_eq!(fixture.task.mm.key.load(Ordering::Acquire), 1);
+    assert!(fixture.zone.spaces.find(successor_mm.raw()).is_some());
+    assert!(fixture.page.exit_wait().is_some());
+    assert!(fixture.page.cancel_host_birth_claim(host_birth).is_some());
+}
+
+#[cfg(test)]
+fn exec_closes_over_predecessor_gate(gate: carrick_el1_abi::GateState) {
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    {
+        let mut entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            entry.begin_exec_service(test_exec_payload(b"/bin/static")),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(entry.take_handoff_receipt().is_some());
+    }
+    match gate {
+        carrick_el1_abi::GateState::ForkClosing => fixture.page.close_for_fork().unwrap(),
+        carrick_el1_abi::GateState::HostOnly => fixture.page.decline_to_host(),
+        _ => panic!("unsupported predecessor gate"),
+    }
+    let successor_mm =
+        publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 61, 0x99_0000);
+
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    assert!(matches!(
+        entry.resume_checkpoint(),
+        Ok(NativeResume::NoPending)
+    ));
+    assert!(entry.take_run_failure().is_none());
+    assert_eq!(
+        fixture.task.mm.key.load(Ordering::Acquire),
+        successor_mm.raw()
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn native_exec_closes_over_fork_closing_gate() {
+    exec_closes_over_predecessor_gate(carrick_el1_abi::GateState::ForkClosing);
+}
+
+#[cfg(test)]
+#[test]
+fn native_exec_closes_over_host_only_gate() {
+    exec_closes_over_predecessor_gate(carrick_el1_abi::GateState::HostOnly);
+}
+
+#[cfg(test)]
 fn exec_after_sibling_drain(parked_read: bool) {
     let fixture = native_exec_fixture();
     let mut sibling = add_exec_sibling(&fixture, parked_read);
@@ -1973,7 +2103,8 @@ fn exec_after_sibling_drain(parked_read: bool) {
         assert!(sibling_entry.take_run_failure().is_none());
     } else {
         // A spinning member observes the host-exit request at its next trap
-        // and takes the ordinary raw-thread-exit transaction.
+        // and enters the production lifecycle checkpoint before any EL0
+        // instruction can execute again.
         let sibling_source = BornInZoneSource {
             zone: fixture.zone,
             slot: sibling.slot,
@@ -1990,50 +2121,19 @@ fn exec_after_sibling_drain(parked_read: bool) {
                 &mut sibling_service,
             )
             .unwrap();
-        let entry = sibling.control.entry().unwrap();
-        let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
-            sibling_entry.binding(),
-            Some(entry),
-            carrick_sched_core::process::TerminationStatus::signaled(9, false),
-        )
-        .unwrap();
-        let custody = carrick_core::terminal::TerminalCustody::<
-            carrick_core::terminal::Thread,
-            carrick_core::terminal::Live,
-        >::admitted(identity)
-        .begin();
-        let (custody, membership) = custody
-            .reserve_nonfinal(fixture.page)
-            .unwrap_or_else(|_| panic!("exec-killed sibling must remain nonfinal"));
-        assert!(
-            carrick_core::entry::retire_current(
-                sibling_entry.binding(),
-                sibling_source,
-                sibling.record.id,
-            )
-            .is_some()
-        );
-        carrick_core::lifecycle::retire_cancelled_pool_member(
-            fixture.page,
-            entry,
-            sibling.control,
-            membership,
-        )
-        .unwrap();
-        sibling_entry.retire_thread_verdict(custody.into_verdict(fixture.page));
-        {
-            let graph = fixture.runtime.graph.lock();
-            let pending = graph.pending.exit(&sibling_entry.key).unwrap();
-            let readiness = pending.readiness(fixture.page);
-            match readiness {
-                Some(Ok(_)) => {}
-                Some(Err(error)) => {
-                    panic!("exec close remained blocked after pool sibling retirement: {error:?}")
-                }
-                None => panic!("exec close lost its readiness custody"),
-            }
+        // SAFETY: the execution lane selected this exact record and the
+        // host-exit checkpoint publishes the owned continuation before
+        // dispatching `resume_pending_lifecycle`.
+        unsafe {
+            fixture
+                .zone
+                .record(sibling.record.id)
+                .publish_owner_continuation(OwnerEntry::Syscall);
         }
-        sibling_entry.lifecycle_admission_settled().unwrap();
+        assert!(matches!(
+            sibling_entry.resume_pending_lifecycle(),
+            Some(LifecycleOutcome::Transferred { .. })
+        ));
         assert!(sibling_entry.take_run_failure().is_none());
     }
 
