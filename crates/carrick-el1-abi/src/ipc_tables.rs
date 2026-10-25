@@ -241,42 +241,40 @@ impl IpcTableMap {
     }
 
     /// EL1 or host: the active directory-owned namespace for `file_table`.
-    /// Unlike the ordinary fail-forward lookup, an in-progress directory
-    /// update is retried: a native child must not escape its sole authority
-    /// merely because its publication sequence was transiently odd.
+    /// Unlike the ordinary fail-forward lookup, an unrelated in-progress
+    /// directory update does not hide a later owned entry on the probe chain.
+    /// The scan stays bounded: the owned entry is published before its native
+    /// child can run and remains immutable until that same process retires it,
+    /// so an unstable target entry means that custody is already changing.
     pub fn lookup_owned(&self, file_table: u64) -> Option<RawTableId> {
         if file_table == EMPTY || file_table == TOMBSTONE {
             return None;
         }
-        loop {
-            let mut retry = false;
-            for i in Self::probe(file_table) {
-                let entry = &self.entries[i];
-                let seq = entry.seq.load(Ordering::Acquire);
-                let key = entry.file_table.load(Ordering::Relaxed);
-                let table = RawTableId {
-                    authority: entry.authority.load(Ordering::Relaxed),
-                    index: entry.index.load(Ordering::Relaxed),
-                    generation: entry.generation.load(Ordering::Relaxed),
-                };
-                let retirement = entry.retirement.load(Ordering::Relaxed);
-                core::sync::atomic::fence(Ordering::Acquire);
-                if seq & 1 != 0 || entry.seq.load(Ordering::Relaxed) != seq {
-                    retry = true;
-                    break;
-                }
-                if key == file_table {
-                    return (retirement == RetirementOwner::Directory as u32).then_some(table);
-                }
-                if key == EMPTY {
-                    return None;
-                }
+        for i in Self::probe(file_table) {
+            let entry = &self.entries[i];
+            let seq = entry.seq.load(Ordering::Acquire);
+            if seq & 1 != 0 {
+                continue;
             }
-            if !retry {
+            let key = entry.file_table.load(Ordering::Relaxed);
+            let table = RawTableId {
+                authority: entry.authority.load(Ordering::Relaxed),
+                index: entry.index.load(Ordering::Relaxed),
+                generation: entry.generation.load(Ordering::Relaxed),
+            };
+            let retirement = entry.retirement.load(Ordering::Relaxed);
+            core::sync::atomic::fence(Ordering::Acquire);
+            if entry.seq.load(Ordering::Relaxed) != seq {
+                continue;
+            }
+            if key == file_table {
+                return (retirement == RetirementOwner::Directory as u32).then_some(table);
+            }
+            if key == EMPTY {
                 return None;
             }
-            core::hint::spin_loop();
         }
+        None
     }
 
     /// EL1 or host: authoritative lookup serialized against concurrent table
@@ -368,6 +366,32 @@ mod tests {
         assert_eq!(m.withdraw_table(5), Some(raw(1)));
         assert_eq!(m.take_owned(0), None);
         assert_eq!(m.take_owned(u64::MAX), None);
+    }
+
+    #[test]
+    fn owned_lookup_does_not_spin_behind_unrelated_preempted_publication() {
+        let m: &'static IpcTableMap = Box::leak(map());
+        let keys: std::vec::Vec<u64> = (1..u64::MAX)
+            .filter(|key| home(*key) == home(1))
+            .take(2)
+            .collect();
+        let blocker = keys[0];
+        let child = keys[1];
+        m.publish_owned(blocker, raw(1)).unwrap();
+        m.publish_owned(child, raw(2)).unwrap();
+
+        let blocker_index = home(blocker);
+        m.entries[blocker_index].seq.fetch_add(1, Ordering::Release);
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || sent.send(m.lookup_owned(child)).unwrap());
+            let observed = received.recv_timeout(std::time::Duration::from_secs(5));
+            m.entries[blocker_index].seq.fetch_add(1, Ordering::Release);
+            assert_eq!(
+                observed.expect("owned lookup spun behind an unrelated preempted writer"),
+                Some(raw(2))
+            );
+        });
     }
 
     #[test]
