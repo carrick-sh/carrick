@@ -7182,6 +7182,90 @@ fn serial_host_native_fork_two_children_inherit_the_complete_ipc_namespace() {
 }
 
 #[test]
+fn serial_host_native_child_exit_never_spins_on_a_host_owned_pipe() {
+    use carrick_el1_abi::ipc::{IpcBacking, fd, pipe::End};
+    use carrick_kernel::el1_ipc::{HostIpc, HostTable};
+    use carrick_kernel::el1_zone::HostLockWait;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+    let parent = HostTable::create(Arc::clone(&owner), 64, 64).unwrap();
+    let object = owner.create_pipe(65536).unwrap();
+    let reader = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Reader,
+            }
+            .encode(),
+            fd::AccessMode::ReadOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    let writer = owner
+        .admit_description(fd::Description::new(
+            IpcBacking::Pipe {
+                object,
+                end: End::Writer,
+            }
+            .encode(),
+            fd::AccessMode::WriteOnly,
+            fd::StatusFlags::default(),
+        ))
+        .unwrap();
+    reader.install(parent.id(), fd::Fd(3), false).unwrap();
+    writer.install(parent.id(), fd::Fd(4), false).unwrap();
+    drop(reader);
+    drop(writer);
+
+    let child = parent.fork().unwrap();
+    let child_table = child.id();
+    parent.close(fd::Fd(3)).unwrap();
+    child.close(fd::Fd(4)).unwrap();
+    // `retire_namespace` consumes this table's lifecycle custody. Do not let
+    // the host wrapper independently destroy it at scope exit.
+    core::mem::forget(child);
+
+    let region = owner.region();
+    let host_guard = region.lock(object, &HostLockWait).unwrap();
+    let task = CurrentTask::new();
+    let (sent, received) = std::sync::mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            started_tx.send(()).unwrap();
+            let result = super::ipc::retire_namespace(&region, child_table, &task);
+            sent.send(result).unwrap();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("native child exit witness did not start");
+        let completed = received.recv_timeout(Duration::from_secs(1));
+        drop(host_guard);
+        let result = match completed {
+            Ok(result) => result,
+            Err(_) => received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("native child exit did not finish after the host released the pipe"),
+        };
+        result.unwrap();
+        assert!(
+            completed.is_ok(),
+            "native child exit spun on a host-owned pipe instead of deferring physical release"
+        );
+    });
+
+    assert_eq!(owner.drain_retired_tables().unwrap(), 1);
+    let mut guard = region.lock(object, &HostLockWait).unwrap();
+    let pipe = guard.pipe().unwrap();
+    assert_eq!(pipe.references(End::Reader), 0);
+    assert_eq!(pipe.references(End::Writer), 1);
+    drop(guard);
+    parent.close(fd::Fd(4)).unwrap();
+}
+
+#[test]
 fn serial_host_native_fork_restored_view_mapping_outlives_children() {
     native_child_resources(Some(true));
 }
@@ -7428,6 +7512,11 @@ fn native_child_resources(mapping_last: Option<bool>) {
     service.retire_fd_table(children[1]);
     assert!(map.lookup(children[1]).is_none());
     assert_eq!(
+        owner.drain_retired_tables().unwrap(),
+        1,
+        "the exit boundary must settle the revoked namespace before its parent observes EOF"
+    );
+    assert_eq!(
         ipc.lock(object, &ShortLockSpin)
             .unwrap()
             .pipe()
@@ -7451,7 +7540,6 @@ fn native_child_resources(mapping_last: Option<bool>) {
         ipc.lock(object, &ShortLockSpin).is_err(),
         "final pipe release leaked the object"
     );
-    assert_eq!(owner.drain_retired_tables().unwrap(), 1);
     assert_eq!(owner.retained_host_resources(), 0);
     if mapping_last == Some(true) {
         assert_eq!(host_file.registered_opens(), 1);
