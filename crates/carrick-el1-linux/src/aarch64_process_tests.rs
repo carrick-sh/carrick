@@ -3502,10 +3502,10 @@ fn arm_route_action(
     let counters = Box::new(carrick_el1_abi::Counters::new());
     super::dispatch::resolve_arm_process_route(
         route,
-        fixture.page,
         frame,
         &counters,
         core::slice::from_ref(&fixture.task),
+        || false,
     )
 }
 
@@ -5769,7 +5769,8 @@ fn resume_closing_root(
 
 #[test]
 fn arm_unadmitted_thread_runs_ordinary_calls_and_refuses_owner_calls() {
-    use super::dispatch::{arm_owner_must_serve, arm_thread_group_owned};
+    use super::dispatch::{arm_owner_must_serve, arm_thread_group_owner};
+    use super::native_process_runtime::NativeThreadGroupOwner;
     // A non-last thread's raw exit is the host's; the last thread's and the
     // process-family calls stay with a retained owner.
     assert!(!arm_owner_must_serve(
@@ -5778,20 +5779,52 @@ fn arm_unadmitted_thread_runs_ordinary_calls_and_refuses_owner_calls() {
         || panic!("not a process call"),
         1
     ));
-    assert!(!arm_owner_must_serve(93, 0, || true, 2));
-    assert!(arm_owner_must_serve(93, 0, || true, 1));
-    assert!(arm_owner_must_serve(94, 0, || true, 2));
-    assert!(arm_owner_must_serve(260, 0, || true, 2));
-    assert!(!arm_owner_must_serve(260, 0, || false, 2));
-    assert!(!arm_owner_must_serve(94, 0, || false, 2));
-    assert!(arm_owner_must_serve(220, 17, || false, 1), "fork");
+    assert!(!arm_owner_must_serve(
+        93,
+        0,
+        || NativeThreadGroupOwner::Root,
+        2
+    ));
+    assert!(arm_owner_must_serve(
+        93,
+        0,
+        || NativeThreadGroupOwner::Root,
+        1
+    ));
+    assert!(arm_owner_must_serve(
+        94,
+        0,
+        || NativeThreadGroupOwner::Root,
+        2
+    ));
+    assert!(arm_owner_must_serve(
+        260,
+        0,
+        || NativeThreadGroupOwner::Root,
+        2
+    ));
+    assert!(!arm_owner_must_serve(
+        260,
+        0,
+        || NativeThreadGroupOwner::Unowned,
+        2
+    ));
+    assert!(!arm_owner_must_serve(
+        94,
+        0,
+        || NativeThreadGroupOwner::Unowned,
+        2
+    ));
+    assert!(
+        arm_owner_must_serve(220, 17, || NativeThreadGroupOwner::Unowned, 1),
+        "fork"
+    );
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let foreign_page = Box::leak(Box::new(ThreadLifecyclePage::new()));
-    assert!(!arm_thread_group_owned(
-        fixture.zone,
-        &fixture.task,
-        fixture.page
-    ));
+    assert_eq!(
+        arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
+        NativeThreadGroupOwner::Unowned
+    );
     let mut service = fixture.process_service();
     fixture
         .enter(
@@ -5801,16 +5834,23 @@ fn arm_unadmitted_thread_runs_ordinary_calls_and_refuses_owner_calls() {
             |_| (),
         )
         .unwrap();
-    assert!(arm_thread_group_owned(
-        fixture.zone,
-        &fixture.task,
-        fixture.page
-    ));
-    assert!(!arm_thread_group_owned(
-        fixture.zone,
-        &fixture.task,
-        foreign_page
-    ));
+    assert_eq!(
+        arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
+        NativeThreadGroupOwner::Root
+    );
+    assert!(
+        !arm_owner_must_serve(
+            221,
+            0,
+            || arm_thread_group_owner(fixture.zone, &fixture.task, fixture.page),
+            1,
+        ),
+        "the admitted root still forwards its own exec after its first fork"
+    );
+    assert_eq!(
+        arm_thread_group_owner(fixture.zone, &fixture.task, foreign_page),
+        NativeThreadGroupOwner::Unowned
+    );
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
     let fallback = |frame: &mut carrick_el1_abi::TrapFrame, refused| {

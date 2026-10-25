@@ -1316,12 +1316,29 @@ Native lazy backing uses the same fixed table stock. Each descriptor supply
 may preclaim the bounded eight-page grant record, but only the prefix named by
 the authenticated EL1 receipt becomes live child custody. The unused suffix,
 and every grant from a refused, rolled-back or unclaimed transaction, returns
-before the service continuation releases. Capacity exhaustion is a counted
-`descriptor_capacity_refusal`; it refuses the fault service without a carrier
-fatal and without changing stock. The VM-free bindings
+before the service continuation releases. If child exit wins the service race,
+reply application returns before settlement, or receipt settlement fails after
+consumption, the neutral retirement owner absorbs every remaining grant for
+that child into terminal table custody. Quarantine clears those possibly linked
+pages before reclaim; retirement never refuses this ordinary race. Capacity
+exhaustion is a counted `descriptor_capacity_refusal`; it refuses the fault
+service without a carrier fatal and without changing stock. The VM-free bindings
 `many_native_backing_supplies_return_unused_tables_across_two_children` and
 `native_backing_table_exhaustion_is_counted_without_losing_stock` drive 512
 alternating supplies across two live children and the exact exhaustion edge.
+`child_exit_racing_native_supply_quarantines_pending_pages_with_peer_live` and
+`early_fault_reply_return_quarantines_every_pending_supply_with_peer_live`
+keep a second process live while proving unfinished grants clear through
+quarantine rather than causing a terminal refusal or premature reuse.
+
+ARM routing keeps root and native fork-child ownership distinct. Admitting the
+root for its first fork does not move the root's own `execve` into the native
+child owner: the root continues through the host exec boundary. Until native
+child exec is implemented, only a fork child's `execve` is refused with
+`ENOSYS`. `arm_unadmitted_thread_runs_ordinary_calls_and_refuses_owner_calls`
+binds the owned-root case, while
+`native_child_exec_refusal_parks_once_and_resumes_with_enosys` binds a real
+registered child and the single park/resume boundary.
 
 KVM binding:
 `native_runtime_wait_wakes_once_only_after_real_mm_retirement` holds the

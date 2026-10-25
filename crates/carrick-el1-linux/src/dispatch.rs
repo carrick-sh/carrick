@@ -249,9 +249,11 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         let slot = SlotId::from_index(frame.slot as usize);
         #[cfg(target_arch = "aarch64")]
         {
+            use super::native_process_runtime::NativeThreadGroupOwner;
+
             let (nr, flags) = (frame.x[8], frame.x[0]);
             // Without a published lifecycle no owner can retain this thread.
-            let unowned = arm_process_call_claimed(nr, flags, || false);
+            let unowned = arm_process_call_claimed(nr, flags, || NativeThreadGroupOwner::Unowned);
             let (Some(slot), Some(task)) = (slot, current_tasks.get(frame.slot as usize)) else {
                 return refuse_owner_process_call(frame, counters, current_tasks);
             };
@@ -279,7 +281,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 arm_owner_must_serve(
                     nr,
                     flags,
-                    || arm_thread_group_owned(zone, task, page),
+                    || arm_thread_group_owner(zone, task, page),
                     carrick_el1_abi::Lifecycle::live(page),
                 )
             };
@@ -334,7 +336,9 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
             );
             match route {
-                Ok(route) => resolve_arm_process_route(route, page, frame, counters, current_tasks),
+                Ok(route) => {
+                    resolve_arm_process_route(route, frame, counters, current_tasks, refused)
+                }
                 Err(_) => fallback_or_refuse_arm_process_call(
                     frame,
                     counters,
@@ -484,11 +488,17 @@ where
 pub(super) fn arm_process_call_claimed(
     nr: u64,
     flags: u64,
-    registered: impl FnOnce() -> bool,
+    owner: impl FnOnce() -> super::native_process_runtime::NativeThreadGroupOwner,
 ) -> bool {
+    use super::native_process_runtime::NativeThreadGroupOwner;
+
     nr == 435
         || (nr == 220 && flags & 0x0001_0000 == 0)
-        || (matches!(nr, 221 | 260 | 93 | 94 | 95 | 58 | 139) && registered())
+        || match nr {
+            221 => owner() == NativeThreadGroupOwner::ForkChild,
+            260 | 93 | 94 | 95 | 58 | 139 => owner() != NativeThreadGroupOwner::Unowned,
+            _ => false,
+        }
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -503,20 +513,20 @@ fn arm_process_refusal_must_abort(nr: u64) -> bool {
 pub(super) fn arm_owner_must_serve(
     nr: u64,
     flags: u64,
-    owned: impl FnOnce() -> bool,
+    owner: impl FnOnce() -> super::native_process_runtime::NativeThreadGroupOwner,
     live: u32,
 ) -> bool {
     !(nr == carrick_personality_linux::lifecycle::SYS_EXIT as u64 && live > 1)
-        && arm_process_call_claimed(nr, flags, owned)
+        && arm_process_call_claimed(nr, flags, owner)
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(super) fn resolve_arm_process_route(
     route: carrick_personality_linux::dispatch::CompletionRoute,
-    page: &carrick_el1_abi::ThreadLifecyclePage,
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
+    refuse_forward: impl FnOnce() -> bool,
 ) -> Action {
     match route {
         carrick_personality_linux::dispatch::CompletionRoute::HostCustody => Action::HostCustody,
@@ -524,8 +534,7 @@ pub(super) fn resolve_arm_process_route(
         carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
         carrick_personality_linux::dispatch::CompletionRoute::Forward => {
-            let live = carrick_el1_abi::Lifecycle::live(page);
-            if arm_owner_must_serve(frame.x[8], frame.x[0], || true, live) {
+            if refuse_forward() {
                 refuse_owner_process_call(frame, counters, current_tasks)
             } else {
                 Action::Forward
@@ -537,15 +546,17 @@ pub(super) fn resolve_arm_process_route(
     }
 }
 
-/// Whether an admitted owner retains this thread's group at any address.
+/// The exact admitted owner kind for this thread's group at any address.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-pub(super) fn arm_thread_group_owned(
+pub(super) fn arm_thread_group_owner(
     zone: &ZoneTables,
     task: &CurrentTask,
     page: &carrick_el1_abi::ThreadLifecyclePage,
-) -> bool {
-    task.visible_pid()
-        .is_some_and(|pid| super::aarch64_process::registry().owns_thread_group(zone, page, pid))
+) -> super::native_process_runtime::NativeThreadGroupOwner {
+    task.visible_pid().map_or(
+        super::native_process_runtime::NativeThreadGroupOwner::Unowned,
+        |pid| super::aarch64_process::registry().thread_group_owner(zone, page, pid),
+    )
 }
 
 /// A thread the process venue could not admit still runs every call the
@@ -2441,21 +2452,34 @@ pub unsafe fn serve_locked_file_op(
 
 #[cfg(test)]
 mod tests {
+    use super::super::native_process_runtime::NativeThreadGroupOwner;
     use super::*;
     use core::sync::atomic::Ordering;
 
     #[test]
     fn host_loaded_arm_task_keeps_terminal_calls_on_legacy_route() {
-        assert!(!arm_process_call_claimed(94, 0, || false), "exit_group");
-        assert!(!arm_process_call_claimed(93, 0, || false), "exit");
-        assert!(!arm_process_call_claimed(95, 0, || false), "waitid");
-        assert!(arm_process_call_claimed(220, 0, || false), "first fork");
         assert!(
-            arm_process_call_claimed(94, 0, || true),
+            !arm_process_call_claimed(94, 0, || NativeThreadGroupOwner::Unowned),
+            "exit_group"
+        );
+        assert!(
+            !arm_process_call_claimed(93, 0, || NativeThreadGroupOwner::Unowned),
+            "exit"
+        );
+        assert!(
+            !arm_process_call_claimed(95, 0, || NativeThreadGroupOwner::Unowned),
+            "waitid"
+        );
+        assert!(
+            arm_process_call_claimed(220, 0, || NativeThreadGroupOwner::Unowned),
+            "first fork"
+        );
+        assert!(
+            arm_process_call_claimed(94, 0, || NativeThreadGroupOwner::ForkChild),
             "native child exit"
         );
         assert!(
-            arm_process_call_claimed(93, 0, || true),
+            arm_process_call_claimed(93, 0, || NativeThreadGroupOwner::ForkChild),
             "native thread exit"
         );
         assert!(!arm_process_call_claimed(62, 0, || panic!(
