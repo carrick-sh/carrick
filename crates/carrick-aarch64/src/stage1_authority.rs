@@ -358,6 +358,46 @@ fn stage1_primary_in_pool(base: u64) -> bool {
 }
 
 impl Stage1Authority {
+    /// Convert EL1's verified COW transaction into the same exact old-leaf
+    /// retirement capability as a host `edit_unpublishing`. The descriptor
+    /// receipt authenticates the transaction and completed TLBI; the live
+    /// manager check proves none of the named old leaves survived it.
+    pub fn verified_guest_cow_unpublication(
+        &self,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+    ) -> Option<Stage1LeafRetired> {
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp;
+        let DescriptorOp::CowRepoint {
+            va, len, old_ipa, ..
+        } = receipt.txn().op
+        else {
+            return None;
+        };
+        let len = usize::try_from(len).ok()?;
+        let inner = self.inner.lock();
+        let image_generation = inner.manager.generation?;
+        let manager = inner.manager.as_ref()?;
+        let end = va.checked_add(len as u64)?;
+        let mut cursor = va & !0xfff;
+        let mut retired = Vec::new();
+        while cursor < end {
+            let old = old_ipa.raw().checked_add(cursor.checked_sub(va)?)?;
+            if manager.translate(cursor) == Some(old) {
+                return None;
+            }
+            retired.push((cursor, old));
+            cursor = cursor.checked_add(4096)?;
+        }
+        (!retired.is_empty()).then_some(Stage1LeafRetired {
+            authority: self.authority_id(),
+            image_generation,
+            va,
+            len,
+            retired,
+            _tlbi: TlbiComplete,
+        })
+    }
+
     /// Create a new, unpopulated stage-1 authority in the `Exclusive` state.
     pub fn new() -> Self {
         Self::new_with_manager(None)

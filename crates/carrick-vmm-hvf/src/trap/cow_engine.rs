@@ -4047,7 +4047,7 @@ impl HvfTaskState {
         // cloning the whole 1.75 MiB table region (see `begin_undo`).
         let mut preserved_protection_receipt = None;
         let page_table_result = if let Some(backing) = guest_identity {
-            (|| -> Result<(), TrapError> {
+            (|| -> Result<carrick_aarch64::stage1_authority::Stage1LeafRetired, TrapError> {
                 use carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess;
                 let access = if span.kernel_only {
                     CowRepointAccess::Kernel
@@ -4135,9 +4135,16 @@ impl HvfTaskState {
                         Some((receipt_va, leaf, expected_ipa, leaf & (0b11 << 6)));
                     crate::probes::pt_alias_walk(receipt_va, live, 1 << 3);
                 }
-                Ok(())
+                Ok(tables
+                    .verified_guest_cow_unpublication(&verified)
+                    .unwrap_or_else(|| {
+                        carrick_fatal!(
+                            "hvpatch::cow",
+                            "verified guest COW did not retire its exact old stage-1 leaves"
+                        )
+                    }))
             })()
-            .map(|()| ((), None))
+            .map(|receipt| ((), Some(receipt)))
         } else {
             const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
             const AP_MASK: u64 = 0b11 << 6;
@@ -4385,36 +4392,27 @@ impl HvfTaskState {
             );
         }
         let inventory_ledger = std::sync::Arc::clone(&self.frame_inventory.ledger);
-        let frame_absence = crate::trap::frame_inventory::Stage1UnpublishedFrames::after_cow_split(
-            authority.as_ref(),
-            &split,
-        );
-        let retired_old_stage2 = frame_absence
-            .and_then(|frame_absence| {
-                let mut inventory = inventory_ledger.lock();
-                HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
-                    let stage1 = if let Some(stage1) = stage1_leaf.as_ref() {
-                        Stage1UnpublicationReceipt::EditorRange(stage1)
-                    } else if let Some(stage1) = frame_absence.as_ref() {
-                        Stage1UnpublicationReceipt::FrameAbsence(stage1)
-                    } else {
-                        return Ok(false);
-                    };
-                    self.retire_stage2_extent_for_cow(
-                        custody,
-                        stage1,
-                        split.old.stage2_base,
-                        split.old.stage2_length,
-                    )?;
-                    Ok(true)
-                })
+        let retired_old_stage2 = (|| {
+            let mut inventory = inventory_ledger.lock();
+            HvfVmState::commit_cow_inventory_split(&mut inventory, &split, || {
+                let Some(stage1) = stage1_leaf.as_ref() else {
+                    return Ok(false);
+                };
+                self.retire_stage2_extent_for_cow(
+                    custody,
+                    Stage1UnpublicationReceipt::EditorRange(stage1),
+                    split.old.stage2_base,
+                    split.old.stage2_length,
+                )?;
+                Ok(true)
             })
-            .unwrap_or_else(|error| {
-                carrick_fatal!(
-                    "hvpatch::frame_inventory",
-                    "commit HVPatch backend COW inventory after kernel commit: {error}"
-                );
-            });
+        })()
+        .unwrap_or_else(|error| {
+            carrick_fatal!(
+                "hvpatch::frame_inventory",
+                "commit HVPatch backend COW inventory after kernel commit: {error}"
+            );
+        });
         drop(registry);
         let scope = CowInventoryLifecycleScope {
             custody,
