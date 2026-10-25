@@ -2066,6 +2066,13 @@ enum NativeDupTarget {
     Exact(carrick_el1_abi::ipc::fd::Fd),
 }
 
+#[derive(Clone, Copy)]
+struct NativeDupRequest {
+    old: carrick_el1_abi::ipc::fd::Fd,
+    target: NativeDupTarget,
+    cloexec: bool,
+}
+
 #[inline(never)]
 fn raise_native_sigpipe<'p, Context: DispatchContext>(
     process: Option<&mut (dyn lifecycle::ProcessNative<Context> + 'p)>,
@@ -2154,46 +2161,45 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
         task: &CurrentTask,
         table: carrick_el1_abi::ipc::fd::TableId,
         file_table: u64,
-        old: carrick_el1_abi::ipc::fd::Fd,
-        target: NativeDupTarget,
-        cloexec: bool,
+        request: NativeDupRequest,
         zone: Option<(&ZoneTables, SlotId)>,
     ) -> Result<carrick_el1_abi::ipc::fd::Fd, FamilyCompletion> {
         use super::file_table::HostBindingDupError;
         use carrick_el1_abi::ipc::fd::Error;
 
         let authority = venue.region.fd(NativeFdWait);
-        let (pin, _) = authority.pin(table, old).map_err(map_fd_error)?;
-        let reservation = match run_with_table_growth(&venue.region, table, |auth| match target {
-            NativeDupTarget::Lowest(min) => auth.reserve_min(table, min),
-            NativeDupTarget::FcntlMin(min) => auth.reserve_dup_min(table, min),
-            NativeDupTarget::Exact(fd) => auth.reserve_exact(table, fd),
-        }) {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                let release = authority
-                    .unpin_filtered(pin, ipc::is_zone_releasable_backing)
-                    .map_err(map_fd_error)?;
-                ipc::settle_native_release(&venue.region, release, zone, task)
-                    .map_err(map_ipc_error)?;
-                return Err(error);
-            }
-        };
+        let (pin, _) = authority.pin(table, request.old).map_err(map_fd_error)?;
+        let reservation =
+            match run_with_table_growth(&venue.region, table, |auth| match request.target {
+                NativeDupTarget::Lowest(min) => auth.reserve_min(table, min),
+                NativeDupTarget::FcntlMin(min) => auth.reserve_dup_min(table, min),
+                NativeDupTarget::Exact(fd) => auth.reserve_exact(table, fd),
+            }) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    let release = authority
+                        .unpin_filtered(pin, ipc::is_zone_releasable_backing)
+                        .map_err(map_fd_error)?;
+                    ipc::settle_native_release(&venue.region, release, zone, task)
+                        .map_err(map_ipc_error)?;
+                    return Err(error);
+                }
+            };
         let new_fd = reservation.fd();
         let mut reservation = Some(reservation);
         let projected = super::file_table::with_host_binding_dup(
             self.fd_map,
             self.open_table,
             file_table,
-            old.0,
+            request.old.0,
             new_fd.0,
-            cloexec,
+            request.cloexec,
             || {
                 let claim = reservation.take().ok_or(Error::InvalidArgument)?;
                 match authority.commit_reservation_filtered(
                     claim,
                     &pin,
-                    cloexec,
+                    request.cloexec,
                     ipc::is_zone_releasable_backing,
                 ) {
                     Ok(release) => Ok(release),
@@ -2258,9 +2264,11 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     task,
                     table,
                     file_table,
-                    old,
-                    NativeDupTarget::Lowest(Fd(0)),
-                    false,
+                    NativeDupRequest {
+                        old,
+                        target: NativeDupTarget::Lowest(Fd(0)),
+                        cloexec: false,
+                    },
                     zone,
                 ) {
                     Ok(fd) => fd,
@@ -2282,9 +2290,11 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     task,
                     table,
                     file_table,
-                    old,
-                    NativeDupTarget::Exact(new),
-                    cloexec,
+                    NativeDupRequest {
+                        old,
+                        target: NativeDupTarget::Exact(new),
+                        cloexec,
+                    },
                     zone,
                 ) {
                     Ok(fd) => fd,
@@ -2305,9 +2315,11 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                     task,
                     table,
                     file_table,
-                    old,
-                    NativeDupTarget::Exact(new),
-                    false,
+                    NativeDupRequest {
+                        old,
+                        target: NativeDupTarget::Exact(new),
+                        cloexec: false,
+                    },
                     zone,
                 ) {
                     Ok(fd) => FamilyCompletion::Complete(i64::from(fd.0)),
@@ -2354,9 +2366,11 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame, Context:
                             task,
                             table,
                             file_table,
-                            old,
-                            NativeDupTarget::FcntlMin(min),
-                            cloexec,
+                            NativeDupRequest {
+                                old,
+                                target: NativeDupTarget::FcntlMin(min),
+                                cloexec,
+                            },
                             zone,
                         ) {
                             Ok(fd) => fd,
