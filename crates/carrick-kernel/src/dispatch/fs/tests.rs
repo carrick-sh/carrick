@@ -11002,6 +11002,115 @@ fn fs_view_direct_construction_and_operations() {
 }
 
 #[test]
+fn close_borrows_sibling_exact_claim_instead_of_returning_ebusy() {
+    let dispatcher = Arc::new(SyscallDispatcher::new());
+    let context = dispatcher
+        .capture_one_task_context()
+        .expect("root task context");
+    let old = Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+        base: OpenDescriptionBase::new(LINUX_O_RDONLY),
+        path: "/close-race-old".to_owned(),
+        contents: Vec::new(),
+        offset: 0,
+    }));
+    let old = OpenFile::from_open_description_with_status_flags(old, LINUX_O_RDONLY, 0);
+    let fd = dispatcher
+        .install_fd_at_or_above(5, old)
+        .expect("install close target");
+    assert_eq!(fd, 5);
+
+    // Force close through its epoll-detach reservation path. The owner need
+    // not contain a live interest for this race: the target's reverse edge is
+    // the fact that makes close protect the descriptor number while detaching.
+    let old_description = dispatcher.open_file(fd).unwrap().description;
+    let epoll_owner = Arc::new(crate::kernel::FileDescription::epoll(
+        context
+            .kernel()
+            .object_ids()
+            .file_description_id()
+            .expect("epoll description ID"),
+    ));
+    old_description.register_epoll_owner(&epoll_owner, fd);
+    let replacement = Arc::new(crate::kernel::FileDescription::regular(
+        context
+            .kernel()
+            .object_ids()
+            .file_description_id()
+            .expect("replacement description ID"),
+    ));
+    drop(context);
+
+    let files = dispatcher.captured_file_table();
+    let (claim_held_tx, claim_held_rx) = std::sync::mpsc::sync_channel(1);
+    let (commit_tx, commit_rx) = std::sync::mpsc::sync_channel(1);
+    let (commit_done_tx, commit_done_rx) = std::sync::mpsc::sync_channel(1);
+    let claiming_files = Arc::clone(&files);
+    let claimant = std::thread::spawn(move || {
+        let claim = claiming_files
+            .reserve_exact_target(fd, 64)
+            .expect("sibling dup2 exact claim");
+        claim_held_tx.send(()).expect("publish held claim");
+        commit_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("close must finish while claim remains held");
+        let result = claim.commit(crate::kernel::FileSlot::new(replacement, 0));
+        commit_done_tx.send(result).expect("publish dup2 commit");
+    });
+    claim_held_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("sibling claimed fd 5");
+
+    let (close_done_tx, close_done_rx) = std::sync::mpsc::sync_channel(1);
+    let closing_dispatcher = Arc::clone(&dispatcher);
+    let closer = std::thread::spawn(move || {
+        let context = closing_dispatcher
+            .capture_one_task_context()
+            .expect("close task context");
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0, vec![0; 64]);
+        let view = closing_dispatcher.fs_view();
+        let mut request = SyscallCtx {
+            host_wait: None,
+            kernel: &context,
+            request: SyscallRequest::new(57, SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0])),
+            memory: &mut memory,
+            reporter: &reporter,
+            thread: None,
+            execution_lease: None,
+            mm_executor: None,
+        };
+        let outcome = resources::with_captured_resources(&context, || {
+            view.close(&mut request).expect("close handler")
+        });
+        close_done_tx.send(outcome).expect("publish close outcome");
+    });
+
+    let close_outcome = close_done_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("close must not wait for the sibling exact claim");
+    let claim_survived_close = files.is_slot_reserved(fd);
+    let fd_closed_before_dup2_commit = !dispatcher.fd_is_valid(fd);
+    commit_tx.send(()).expect("allow sibling dup2 commit");
+    let dup2_commit = commit_done_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("sibling dup2 commit must complete");
+    closer.join().expect("close thread");
+    claimant.join().expect("dup2 claimant thread");
+
+    assert_eq!(close_outcome, DispatchOutcome::Returned { value: 0 });
+    assert!(claim_survived_close, "close must borrow the exact claim");
+    assert!(
+        fd_closed_before_dup2_commit,
+        "close must remove the old slot"
+    );
+    assert!(
+        dup2_commit.expect("dup2 claim remains authentic").is_none(),
+        "close linearizes before the sibling dup2 install"
+    );
+    assert!(dispatcher.fd_is_valid(fd));
+}
+
+#[test]
 fn fcntl_f_created_query_semantics() {
     let mut rig = SpliceTestRig::new(0x10000);
 
