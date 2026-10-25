@@ -21,7 +21,8 @@ export CARRICK_SCCACHE_SEARCH_PATH := replace_regex(_build_env, _build_env_field
 
 # Shared checkout admission spans foreground commands or complete recipes.
 _cargo := "cargo --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
-_admit := _cargo + " run --locked -p carrick-xtask -- worktree-run --"
+_xtask := if env("CARRICK_XTASK_BIN", "") != "" { quote(env("CARRICK_XTASK_BIN")) } else { _cargo + " run --locked -p carrick-xtask --" }
+_admit := _xtask + " worktree-run --"
 
 # Only the command-capture coverage gate may select another host's test recipes.
 # Test execution always uses the actual host; captured Cargo test calls never run.
@@ -111,7 +112,7 @@ carrier-topology-gate *ARGS: build
 # Reclaim clean landed idle managed worktrees; keep unmanaged/busy checkouts.
 # Guards cover repo entry points; arbitrary launches are outside admission.
 worktree-gc *ARGS:
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- worktree-gc {{ARGS}}
+    {{_admit}} {{_xtask}} worktree-gc {{ARGS}}
 
 # Hold checkout admission for a foreground worker or command.
 worktree-run +CMD:
@@ -123,7 +124,12 @@ build-cache:
 
 # Run the Carrick xtask maintenance tool.
 xtask *ARGS:
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask {{if ARGS =~ "^impact( |$)" { "--features impact" } else { "" } }} -- {{ARGS}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ {{quote(ARGS)}} =~ ^impact($|\ ) ]]; then
+        exec {{_admit}} {{_cargo}} run --locked -p carrick-xtask --features impact -- {{ARGS}}
+    fi
+    exec {{_admit}} {{_xtask}} {{ARGS}}
 
 # Physical-host lease (site SSH broker when configured, otherwise local flock).
 # Cancels on runner death or TERM/INT/HUP; cleanup failure releases with error.
@@ -135,27 +141,27 @@ lease MODE +CMD:
     set -euo pipefail
     lease_mode="$1"
     shift
-    exec {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- host-lease --mode "$lease_mode" -- "$@"
+    exec {{_admit}} {{_xtask}} host-lease --mode "$lease_mode" -- "$@"
 
 # Run the host and/or signed landing gate under an exclusive host lease (no Docker).
 accept *ARGS:
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- accept --profile no-docker {{ARGS}}
+    {{_admit}} {{_xtask}} accept --profile no-docker {{ARGS}}
 
 # Run `just accept` (no Docker) on the remote gate Mac and fetch the receipt.
 remote-accept *ARGS:
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- remote-accept {{ARGS}}
+    {{_admit}} {{_xtask}} remote-accept {{ARGS}}
 
 # Linux publisher: exact-SHA build plus immutable, mode-preserving .tar.gz artifact.
 fixtures-publish SHA:
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- fixtures publish --sha {{quote(SHA)}}
+    {{_admit}} {{_xtask}} fixtures publish --sha {{quote(SHA)}}
 
 # Restore the transferred artifact after checkout cleanup; signed jobs hold gate admission.
 fixtures-restore BUNDLE:
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- fixtures restore --bundle {{quote(BUNDLE)}}
+    {{_admit}} {{_xtask}} fixtures restore --bundle {{quote(BUNDLE)}}
 
 # Verify a fixture archive by input identity before restoration on the gate host.
 fixtures-verify BUNDLE:
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- fixtures verify --bundle {{quote(BUNDLE)}}
+    {{_admit}} {{_xtask}} fixtures verify --bundle {{quote(BUNDLE)}}
 
 # Provision fresh-worktree guest artifacts before signed execution.
 land-provision *ARGS:
@@ -236,7 +242,7 @@ actionlint *ARGS:
 # checks this host's product profiles and reports all other required profiles
 # pending; a partial local pass is not matrix completeness.
 lint-domains: lint-domains-source
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- authority-debt
+    {{_admit}} {{_xtask}} authority-debt
 
 # Emit exact compiler diagnostics for the selected native host profiles.
 # Output is transient; accepted authority identity uses symbolic cohorts only.
@@ -245,7 +251,7 @@ authority-discover OUTPUT:
 
 # Run the same ceiling gate with an explicit BSD compiler target and C sysroot.
 authority-check-cross TARGET CC CFLAGS AR:
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- authority-debt --cross-target {{quote(TARGET)}} --cross-cc {{quote(CC)}} --cross-cflags={{quote(CFLAGS)}} --cross-ar {{quote(AR)}}
+    {{_admit}} {{_xtask}} authority-debt --cross-target {{quote(TARGET)}} --cross-cc {{quote(CC)}} --cross-cflags={{quote(CFLAGS)}} --cross-ar {{quote(AR)}}
 
 # Host-independent domain checks; live compiler capture runs separately.
 lint-domains-source:
@@ -298,7 +304,7 @@ _lint-domains-source:
     python3 scripts/migrate/check-host-authority-transitions.py --static
     # Keep scanner self-tests before production checks. All six Rust ratchets
     # share the standalone dispatch and run even if an earlier ratchet fails.
-    {{_cargo}} run --locked -p carrick-xtask -- lint-source
+    {{_xtask}} lint-source
     python3 scripts/migrate/check-serial-host-tests.py
     python3 scripts/migrate/check-pipe-core-boundary.py
 
@@ -396,13 +402,13 @@ test-kernel *ARGS:
 # CI runs it in the Linux `loom` job (PRs and merge groups); `just ci` runs
 # it locally. Runtime takes the host's platform features (Linux has no HVF).
 # Pipe venue lock/wake model waits for N1; see the M2 handoff.
-test-loom:
-    {{_admit}} {{_cargo}} test --locked -p carrick-sched-core --features loom --lib loom_models
-    {{_admit}} {{_cargo}} test --locked -p carrick-fd-core --features loom --lib loom_models
-    {{_admit}} {{_cargo}} test --locked -p carrick-kernel --features loom --lib loom_models
-    {{_admit}} {{_cargo}} test --locked -p carrick-runtime {{_platform_features}} --features loom --lib terminal_clear_loom
-    {{_admit}} {{_cargo}} test --locked -p carrick-runtime {{_platform_features}} --features loom --lib owner_wait_loom
-    {{_admit}} {{_cargo}} test --locked -p carrick-core --features loom --lib loom_models
+test-loom *ARGS:
+    {{_admit}} {{_cargo}} test --locked -p carrick-sched-core --features loom --lib loom_models {{ARGS}}
+    {{_admit}} {{_cargo}} test --locked -p carrick-fd-core --features loom --lib loom_models {{ARGS}}
+    {{_admit}} {{_cargo}} test --locked -p carrick-kernel --features loom --lib loom_models {{ARGS}}
+    {{_admit}} {{_cargo}} test --locked -p carrick-runtime {{_platform_features}} --features loom --lib terminal_clear_loom {{ARGS}}
+    {{_admit}} {{_cargo}} test --locked -p carrick-runtime {{_platform_features}} --features loom --lib owner_wait_loom {{ARGS}}
+    {{_admit}} {{_cargo}} test --locked -p carrick-core --features loom --lib loom_models {{ARGS}}
 
 # The scripted kernel-semantics suites alone (crates/carrick-kernel-example):
 # two-process Linux semantics against the public kernel API with no VMM, no
@@ -428,13 +434,13 @@ test *ARGS: _test-stdio
     #!/usr/bin/env bash
     set -euo pipefail
     just --justfile {{justfile()}} _test-unit-mm-owner {{ARGS}}
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-workspace -- {{ARGS}}
+    {{_admit}} {{_xtask}} test-batch _test-unit-workspace -- {{ARGS}}
     if [ "{{_test_host}}" = "macos" ]; then
         # Integration targets (`tests/*.rs`) are invisible to `--lib --bins`;
         # a test moved out of `src/` used to leave every gate silently. The
         # host-lane selection is DERIVED from Cargo metadata (`test-lanes args --lane host`
         # via `_test-unit-lanes`), and `lint-domains-source` runs `test-lanes check`.
-        {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1-linux {{ARGS}}
+        {{_admit}} {{_xtask}} test-batch _test-unit-lanes -- --exclude-package=carrick-el1-linux {{ARGS}}
         just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1-linux {{ARGS}}
         just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
         just --justfile {{justfile()}} _test-unit-host {{ARGS}}
@@ -447,20 +453,20 @@ test *ARGS: _test-stdio
         just --justfile {{justfile()}} _test-unit-host {{ARGS}}
         just --justfile {{justfile()}} _test-unit-kernel {{ARGS}}
         just --justfile {{justfile()}} _test-unit-runtime {{ARGS}}
-        {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1-linux {{ARGS}}
+        {{_admit}} {{_xtask}} test-batch _test-unit-lanes -- --exclude-package=carrick-el1-linux {{ARGS}}
         just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1-linux {{ARGS}}
     fi
 
 # Unit groups are whole Cargo selections: newly added tests stay selected.
 test-shard-a *ARGS: _test-stdio
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1-linux {{ARGS}}
+    {{_admit}} {{_xtask}} test-batch _test-unit-lanes -- --exclude-package=carrick-el1-linux {{ARGS}}
 
 # Consolidates workspace, mm-owner, CLI, host, VFS, kernel, runtime, HVF and
 # EL1 unit selections into one shard so hosted macOS runs fit within the
 # 5-runner concurrency cap while keeping each package's compile-time feature set.
 test-shard-b *ARGS: _test-stdio
     just --justfile {{justfile()}} _test-unit-mm-owner {{ARGS}}
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-workspace -- {{ARGS}}
+    {{_admit}} {{_xtask}} test-batch _test-unit-workspace -- {{ARGS}}
     just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
     just --justfile {{justfile()}} _test-unit-host {{ARGS}}
     just --justfile {{justfile()}} _test-unit-vfs {{ARGS}}
@@ -478,7 +484,7 @@ test-xtask *ARGS:
 # Fail on missing, duplicate or changed selections or per-binary features, plus missing workflow jobs.
 check-test-shards:
     cargo test --locked -p carrick-xtask --test test_shards
-    cargo run --locked -p carrick-xtask -- check-test-shards
+    {{_xtask}} check-test-shards
 
 [private]
 _test-stdio:
@@ -546,7 +552,7 @@ _test-unit-lanes FILTER="" *ARGS:
         # not declared in another lane under `[package.metadata.carrick.test-lanes]`
         # (carrick-xtask `test_lanes.rs`) runs here, and `lint-domains-source`
         # runs `test-lanes check`, which fails on any target no gate runs.
-        selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host {{FILTER}})"
+        selections="$({{_admit}} {{_xtask}} test-lanes args --lane host {{FILTER}})"
         # Every selection runs; the recipe fails after the last one, naming each red.
         red=()
         while IFS= read -r selection; do
@@ -561,7 +567,7 @@ _test-unit-lanes FILTER="" *ARGS:
     else
         # Derived host-lane integration targets, as on macOS; packages whose
         # default features select platform-macos get this host's backend features.
-        selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host {{FILTER}} --platform-features "{{_platform_features}}")"
+        selections="$({{_admit}} {{_xtask}} test-lanes args --lane host {{FILTER}} --platform-features "{{_platform_features}}")"
         # Every selection runs; the recipe fails after the last one, naming each red.
         red=()
         while IFS= read -r selection; do
@@ -721,7 +727,7 @@ test-kvm *ARGS:
     # modules are x86_64-only, so its VM-free lib tests run here, not in macOS
     # `just test` where the crate compiles empty (`test-lanes check` enforces it).
     {{_admit}} {{_cargo}} test --locked -p carrick-x86-cpl0-host --lib {{ARGS}}
-    selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane kvm --platform-features "{{_platform_features}}")"
+    selections="$({{_admit}} {{_xtask}} test-lanes args --lane kvm --platform-features "{{_platform_features}}")"
     red=()
     while IFS= read -r selection; do
         [ -n "$selection" ] || continue
@@ -757,7 +763,7 @@ test-integration:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ -z "${CARRICK_TEST_CAPTURE-}" ]; then
-        exec {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch test-integration
+        exec {{_admit}} {{_xtask}} test-batch test-integration
     fi
     if [ "{{os()}}" = "macos" ]; then
         {{_admit}} {{_cargo}} test -p carrick-runtime --test integration
@@ -937,7 +943,7 @@ check-kernel-portable:
 # the probe gate, the LTP file/inotify set and the inotify09 screen, with no
 # rebuild or re-sign in between (re-signing changes the artifact).
 el1-gate: build
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- accept --phase signed --profile full
+    {{_admit}} {{_xtask}} accept --phase signed --profile full
 
 conformance-probes: build
     #!/usr/bin/env bash
@@ -1231,7 +1237,13 @@ ci-probe-coverage-base:
 # Bootstrap before foreground recipes need the admission helper. Cargo checks
 # source freshness even when the workspace artifacts came from a CI cache.
 ci-prebuild-xtask:
-    {{_cargo}} build --locked -p carrick-xtask
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -n "${CARRICK_XTASK_BIN:-}" ]]; then
+        test -x "$CARRICK_XTASK_BIN"
+    else
+        {{_cargo}} build --locked -p carrick-xtask
+    fi
 
 ci-toolchain:
     rustup show active-toolchain
@@ -1328,7 +1340,7 @@ ci-changes:
     elif [[ -x target/debug/carrick-xtask ]]; then
         exec target/debug/carrick-xtask --root . ci-changes
     else
-        exec {{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- --root . ci-changes
+        exec {{_admit}} {{_xtask}} --root . ci-changes
     fi
 
 # Fail closed: GitHub considers skipped required jobs successful on their own.
@@ -1338,33 +1350,34 @@ ci-results:
     set -euo pipefail
     jq -e --arg event "${CI_EVENT:?}" --arg draft "${CI_DRAFT:-false}" --arg lower "${CI_LOWER_LAYER:-false}" '
       .changes.result == "success" and
+      (.["xtask-build"].result == "success") and
       (length > 1) and
       (. as $root |
        (($root.changes.outputs.lower_layer // $lower) == "true") as $is_lower |
        if $event == "pull_request" then
-         (del(.changes) | with_entries(select(.key | startswith("macos-")))
+         (del(.changes, .["xtask-build"]) | with_entries(select(.key | startswith("macos-")))
            | if ($root.changes.outputs.heavy // "true") == "true" and ($root.changes.outputs.macos // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
-         (del(.changes).lint
+         (del(.changes, .["xtask-build"]).lint
            | if ($root.changes.outputs.heavy // "true") == "true" then .result == "success"
              else .result == "skipped" end) and
-         (del(.changes)["lint-domains"]
+         (del(.changes, .["xtask-build"])["lint-domains"]
            | if ($root.changes.outputs.heavy // "true") == "true" then .result == "success"
              else .result == "skipped" end) and
-         (del(.changes) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "lint" and .key != "lint-domains"))
+         (del(.changes, .["xtask-build"]) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "lint" and .key != "lint-domains"))
            | if ($root.changes.outputs.heavy // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
          (.["linked-issue"].result == "success") and
          (.["commit-trailers"].result == "success") and
-         (del(.changes).actionlint
+         (del(.changes, .["xtask-build"]).actionlint
            | if ($root.changes.outputs.workflows // "false") == "true" then .result == "success"
              else .result == "skipped" end)
        elif $root.changes.outputs.heavy == "true" and $root.changes.outputs.macos == "true" and ($is_lower | not) then
          # Merge groups run macos-build and macos-clippy only (a skew check);
-         # the unit and integration suites ran on the PR and run again on push.
+         # the unit and integration suites ran on the PR and run nightly.
          ["macos-unit-a", "macos-unit-b", "macos-integration"] as $pr_only |
-         (del(.changes) | with_entries(select(.key as $k | $pr_only | index($k) | not)) | all(.[]; .result == "success")) and
-         (del(.changes) | with_entries(select(.key as $k | $pr_only | index($k)))
+         (del(.changes, .["xtask-build"]) | with_entries(select(.key as $k | $pr_only | index($k) | not)) | all(.[]; .result == "success")) and
+         (del(.changes, .["xtask-build"]) | with_entries(select(.key as $k | $pr_only | index($k)))
            | if $event == "merge_group" then all(.[]; .result == "skipped") else all(.[]; .result == "success") end)
        else false end)
     ' <<< "${CI_NEEDS:?}"

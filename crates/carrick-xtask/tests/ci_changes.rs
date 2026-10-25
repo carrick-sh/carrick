@@ -480,6 +480,7 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
     );
 
     let draft_needs = r#"{
+      "xtask-build": { "result": "success" },
       "changes": {
         "result": "success",
         "outputs": { "heavy": "true", "macos": "false", "workflows": "false", "hardware": "true", "lower_layer": "false" }
@@ -704,6 +705,7 @@ fn stack_layer_detection_and_ci_results_gating() {
     // 3. ci-results check: lower layer passes with skipped heavy jobs and writes reason to summary;
     // top layer does not.
     let lower_layer_needs = r#"{
+      "xtask-build": { "result": "success" },
       "changes": {
         "result": "success",
         "outputs": {
@@ -778,6 +780,7 @@ fn stack_layer_detection_and_ci_results_gating() {
 #[test]
 fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
     let full_needs = r#"{
+      "xtask-build": { "result": "success" },
       "changes": {
         "result": "success",
         "outputs": { "heavy": "true", "macos": "true", "workflows": "true", "hardware": "true", "lower_layer": "false" }
@@ -893,6 +896,7 @@ fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
 #[test]
 fn heavy_same_repo_pr_requires_the_full_macos_suite() {
     let pr_needs = r#"{
+      "xtask-build": { "result": "success" },
       "changes": {
         "result": "success",
         "outputs": { "heavy": "true", "macos": "true", "workflows": "false", "hardware": "true", "lower_layer": "false" }
