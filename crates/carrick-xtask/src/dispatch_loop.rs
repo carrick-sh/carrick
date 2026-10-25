@@ -570,6 +570,10 @@ fn bounded_state(
         }
         let removable = items.iter().position(|v| v["kind"] != "trigger");
         let Some(index) = removable else {
+            if sources.pop().is_some() {
+                sources_omitted += 1;
+                continue;
+            }
             return Err(ScalerError::Guard("trigger exceeds state budget"));
         };
         items.remove(index);
@@ -2182,16 +2186,31 @@ fn post_loop_capture(
     retire: impl FnOnce() -> Result<(), ScalerError>,
     hand_back: impl FnOnce() -> Result<(), ScalerError>,
     final_deadline: Instant,
+    finished: bool,
+    token: &str,
 ) -> Result<(), ScalerError> {
     let _capture =
         CommandWindow::until((Instant::now() + Duration::from_secs(90)).min(final_deadline));
     // finish may have sealed an earlier population. Revoke readiness before
     // any capture/retirement work can fail or append diagnostics.
     artifacts_ready(false)?;
-    retire()?;
-    hand_back()?;
-    capture_loop_foreground(actor)?;
-    loop_transcript()
+    let capture = (|| {
+        retire()?;
+        hand_back()?;
+        capture_loop_foreground(actor)?;
+        loop_transcript()
+    })();
+    // A completed finish already wrote the contract and handoff. Even if
+    // capture failed, re-mask and scan the population that actually exists.
+    if finished {
+        let package = PathBuf::from(
+            std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?,
+        )
+        .join("dispatch-output");
+        mask_artifacts(&package, token)?;
+        artifacts_ready(true)?;
+    }
+    capture
 }
 fn loop_completion(code: Result<i32, std::io::Error>, finished: bool) -> Result<(), ScalerError> {
     match (code?, finished) {
@@ -2375,18 +2394,9 @@ pub(super) fn run(root: &Path, event_path: &Path, setup: &str) -> Result<(), Sca
                 )
             },
             final_deadline,
+            server.finished,
+            &server.token,
         )?;
-        loop_transcript()?;
-        if server.finished {
-            mask_artifacts(
-                &PathBuf::from(
-                    std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?,
-                )
-                .join("dispatch-output"),
-                &server.token,
-            )?;
-            artifacts_ready(true)?;
-        }
         loop_completion(code, server.finished)
     })();
     let _final_commands = CommandWindow::until(final_deadline);
@@ -2961,6 +2971,14 @@ mod tests {
                     expected_tip,
                     refused_workflow: false,
                     pr_body: None,
+                    worker: dispatch.worker.clone(),
+                    contract: Contract {
+                        loop_summary: None,
+                        status: ContractStatus::Done,
+                        summary: "first implementation".into(),
+                        tests: vec!["cargo test passed".into()],
+                        risks: vec!["needs review".into()],
+                    },
                 })?,
             )?;
             let package =
@@ -3933,6 +3951,8 @@ esac
                 || Ok(()),
                 || output(&mut Command::new("/usr/bin/true")).map(|_| ()),
                 Instant::now() + Duration::from_secs(60),
+                false,
+                "fixture-token",
             )
             .expect("expired serve window blocked final capture");
             let text = regular_text(&root.join("dispatch-output/loop-transcript.log")).unwrap();
@@ -3992,6 +4012,30 @@ esac
             ),
             (0, 0, 1)
         );
+    }
+    #[test]
+    fn p823_sources_yield_to_large_trigger() {
+        let mut items: Vec<_> = (0..20)
+            .map(|i| {
+                unavailable(
+                    &format!("source {i}"),
+                    &ScalerError::Usage("x".repeat(2400)),
+                )
+            })
+            .collect();
+        items.push(state_item(
+            "trigger",
+            "owner",
+            json!({"id":1,"body":"t".repeat(40_000)}),
+        ));
+        let state = bounded_state(items, 64 * 1024, Some(1))
+            .expect("source overflow refused an otherwise admissible trigger");
+        assert!(state["sources_omitted"].as_u64().unwrap() > 0);
+        assert_eq!(
+            state["state"][0]["data"]["body"].as_str().unwrap().len(),
+            40_000
+        );
+        assert!(serde_json::to_vec(&state).unwrap().len() < 64 * 1024);
     }
     #[test]
     fn review_sources_survive_state_clipping() {
@@ -4072,7 +4116,7 @@ esac
         });
     }
     #[test]
-    fn review_failed_final_capture_revokes_upload_readiness() {
+    fn p823_failed_final_capture_reseals_existing_artifacts() {
         shared_fixture(|root| {
             server(root)
                 .outcome(ContractStatus::Done, "finished")
@@ -4082,16 +4126,34 @@ esac
                 || Ok(()),
                 || Err(ScalerError::Guard("fixture hand-back failed")),
                 Instant::now() + Duration::from_secs(60),
+                true,
+                "fixture-token",
             )
             .unwrap_err();
             assert!(error.to_string().contains("hand-back failed"));
+            let package = root.join("dispatch-output");
+            for name in ["contract.json", "handoff.json", "raw.log"] {
+                assert!(package.join(name).is_file(), "missing {name}");
+            }
+            LAST_SCANNED_ARTIFACTS.with(|scanned| {
+                for entry in std::fs::read_dir(&package).unwrap() {
+                    let entry = entry.unwrap();
+                    assert_eq!(
+                        scanned
+                            .borrow()
+                            .get(entry.file_name().to_str().unwrap())
+                            .unwrap(),
+                        &std::fs::read(entry.path()).unwrap()
+                    );
+                }
+            });
             let output = regular_text(&root.join("outputs")).unwrap();
             assert_eq!(
                 output
                     .lines()
                     .rfind(|line| line.starts_with("artifacts_ready=")),
-                Some("artifacts_ready=false"),
-                "failed final capture left unscanned upload enabled"
+                Some("artifacts_ready=true"),
+                "failed final capture lost the finished contract and handoff"
             );
         });
     }
