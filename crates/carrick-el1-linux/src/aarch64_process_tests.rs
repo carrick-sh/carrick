@@ -279,6 +279,15 @@ impl ForkStockCrossing for TestStockCrossing {
             .ok_or(NativeProcessError::Stale)
     }
 
+    fn cross_exec_cancel(&self, record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
+        // SAFETY: the synchronous fixture owns this aligned stack record.
+        let request = unsafe { &mut *(record_gpa as *mut carrick_el1_abi::NativeExecCancellation) };
+        request
+            .request()
+            .and_then(|_| request.accept().then_some(()))
+            .ok_or(NativeProcessError::Stale)
+    }
+
     fn open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
         &self.open_table
     }

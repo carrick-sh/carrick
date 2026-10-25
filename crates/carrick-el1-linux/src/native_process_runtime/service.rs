@@ -862,17 +862,40 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<NativeResume, NativeProcessError> {
         let manifest = match pending.reply.as_ref() {
             Some(PendingServiceReply::Exec(manifest)) => &**manifest,
-            _ => return Err(NativeProcessError::Stale),
+            _ => {
+                let cancelled = self.service.cancel_exec_successor(receipt);
+                let released = self.release_service_claim(pending.claim);
+                cancelled?;
+                released?;
+                return Err(NativeProcessError::Stale);
+            }
         };
-        let sealed = manifest
-            .open(request.identity, receipt)
-            .ok_or(NativeProcessError::Stale)?;
+        let Some(sealed) = manifest.open(request.identity, receipt) else {
+            let cancelled = self.service.cancel_exec_successor(receipt);
+            let released = self.release_service_claim(pending.claim);
+            cancelled?;
+            released?;
+            return Err(NativeProcessError::Stale);
+        };
+        let Some(mm) = NonZeroU64::new(sealed.successor_mm.raw()) else {
+            let cancelled = self.service.cancel_exec_successor(receipt);
+            let released = self.release_service_claim(pending.claim);
+            cancelled?;
+            released?;
+            return Err(NativeProcessError::Stale);
+        };
         let expected_address = AddressContext {
             root: sealed.root,
-            mm: MmGeneration::new(NonZeroU64::new(sealed.successor_mm.raw()).unwrap()),
+            mm: MmGeneration::new(mm),
             generation: carrick_guest_arch::ContextGeneration::new(sealed.root_generation),
         };
-        self.validate_exec_successor(expected_address)?;
+        if let Err(error) = self.validate_exec_successor(expected_address) {
+            let cancelled = self.service.cancel_exec_successor(receipt);
+            let released = self.release_service_claim(pending.claim);
+            cancelled?;
+            released?;
+            return Err(error);
+        }
         let prepared_fds = {
             let graph = self.runtime.graph.lock();
             let resources = graph
@@ -882,19 +905,44 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .native()
                 .resources();
             if resources.members.len() != 1 {
+                drop(graph);
+                let cancelled = self.service.cancel_exec_successor(receipt);
+                let released = self.release_service_claim(pending.claim);
+                cancelled?;
+                released?;
                 return Err(NativeProcessError::Busy);
             }
-            resources
-                .prepare_close_on_exec(
-                    self.key,
-                    self.service.exec_fd_map(),
-                    self.service.exec_open_table(),
-                )
-                .map_err(|_| NativeProcessError::Stale)?
+            let result = resources.prepare_close_on_exec(
+                self.key,
+                self.service.exec_fd_map(),
+                self.service.exec_open_table(),
+            );
+            if result.is_err() {
+                drop(result);
+                let cancelled = self.service.cancel_exec_successor(receipt);
+                let released = self.release_service_claim(pending.claim);
+                cancelled?;
+                released?;
+                return Err(NativeProcessError::Stale);
+            }
+            match result {
+                Ok(prepared) => prepared,
+                Err(_) => return Err(NativeProcessError::Quarantined),
+            }
         };
-        let successor = self
+        let successor = match self
             .service
-            .adopt_exec_successor(request.identity, receipt, manifest)?;
+            .adopt_exec_successor(request.identity, receipt, manifest)
+        {
+            Ok(successor) => successor,
+            Err(error) => {
+                drop(prepared_fds);
+                let cancelled = self.service.cancel_exec_successor(receipt);
+                self.release_service_claim(pending.claim)?;
+                cancelled?;
+                return Err(error);
+            }
+        };
         if successor.address != expected_address {
             return Err(NativeProcessError::Quarantined);
         }
@@ -1272,15 +1320,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // before this ordinary syscall-return mapping is reachable.
                 Err(NativeProcessError::Quarantined)
             }
-            (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(_)) => unreachable!(),
+            (ServiceOperation::Exec { .. }, ServiceResult::ExecPrepared(_)) => {
+                Err(NativeProcessError::Quarantined)
+            }
             (_, ServiceResult::ExecPrepared(_)) => Err(NativeProcessError::Quarantined),
             (ServiceOperation::Exec { .. }, ServiceResult::Refused) => Ok(NativeResume::Returned(
                 SyscallResult::new(carrick_syscall_abi::LINUX_ENOSYS.guest_retval()),
             )),
             (ServiceOperation::Exec { .. }, ServiceResult::Cancelled) => {
-                Ok(NativeResume::Returned(SyscallResult::new(
-                    carrick_syscall_abi::LINUX_EINTR.guest_retval(),
-                )))
+                // An exec cancellation is published only by process closing.
+                // The caller is being retired and must never observe EINTR.
+                Ok(NativeResume::NoPending)
             }
         })();
         // Mapping/signal completion still needs the exact member/MM. Release

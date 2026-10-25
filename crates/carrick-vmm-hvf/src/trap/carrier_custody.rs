@@ -558,6 +558,53 @@ impl CarrierVmCustody {
         let (_, _, prepared) = retained.swap_remove(index);
         Some((prepared, view))
     }
+
+    pub(crate) fn validate_native_exec_preparation(
+        &self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+        manifest: &carrick_core_abi::service::ExecSuccessorManifest,
+        execution: carrick_hal::fork_stock::GrantExecution,
+    ) -> Option<carrick_core_abi::service::ExecSuccessorManifestView> {
+        let retained = self.native_exec_preparations.lock();
+        let (_, identity, prepared) = retained
+            .iter()
+            .find(|(candidate, _, _)| *candidate == receipt)?;
+        let view = manifest.open(*identity, receipt)?;
+        let birth = identity.birth;
+        if birth.process.id.raw() as u64 != execution.binding.task.raw()
+            || identity.execution != execution.binding.generation
+            || birth.thread != execution.binding.thread_generation
+            || birth.mm.carrier() != self.transfer_carrier
+            || birth.mm.mm().raw() != execution.binding.mm.raw()
+            || birth.mm.incarnation().get() != execution.context.generation.raw().get()
+            || prepared.root() != view.root
+            || prepared.entry() != view.entry.raw()
+            || prepared.stack_pointer() != Some(view.stack_pointer.raw())
+        {
+            return None;
+        }
+        Some(view)
+    }
+
+    pub(crate) fn cancel_native_exec_preparation(
+        &self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+        execution: carrick_hal::fork_stock::GrantExecution,
+    ) -> bool {
+        let mut retained = self.native_exec_preparations.lock();
+        let Some(index) = retained.iter().position(|(candidate, identity, _)| {
+            *candidate == receipt
+                && identity.birth.mm.carrier() == self.transfer_carrier
+                && identity.birth.mm.mm().raw() == execution.binding.mm.raw()
+                && identity.birth.mm.incarnation().get() == execution.context.generation.raw().get()
+        }) else {
+            return false;
+        };
+        let (_, _, prepared) = retained.swap_remove(index);
+        drop(retained);
+        drop(prepared);
+        true
+    }
 }
 
 /// Who owns an executable output's bytes, for the instruction-cache

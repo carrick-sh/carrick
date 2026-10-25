@@ -265,6 +265,31 @@ pub fn cross_hvc_exec_settle(predecessor: u64, successor: u64, cpu: u64) -> Resu
     }
 }
 
+/// Return an unadopted successor preparation to the carrier. The stopped
+/// predecessor execution plus the one-shot receipt authenticate the owner.
+#[allow(clippy::result_unit_err)]
+pub fn cross_hvc_exec_cancel(record_gpa: u64, cpu: u64) -> Result<(), ()> {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let mut status = carrick_el1_abi::GRANT_OP_EXEC_CANCEL;
+        // SAFETY: synchronous crossing; the record remains on this stopped
+        // CPU's EL1 stack until the carrier replies.
+        unsafe {
+            core::arch::asm!("hvc #6", inout("x0") status,
+                inlateout("x1") record_gpa => _, inlateout("x2") cpu => _,
+                options(nostack));
+        }
+        (status == carrick_el1_abi::METADATA_GRANT_SUCCESS)
+            .then_some(())
+            .ok_or(())
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = (record_gpa, cpu);
+        Err(())
+    }
+}
+
 /// Ask the stopped carrier to supply the COW page selected in this slot's
 /// portal record. The host authenticates that record against the live root.
 // `Err(())` is the carrier's single refusal; callers own its meaning.
