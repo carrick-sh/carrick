@@ -1183,12 +1183,41 @@ pub(crate) fn execute(
     execute_with_failure(command, input, limit, |_| None)
 }
 
+#[cfg(test)]
+pub(crate) fn execute_with_readiness(
+    command: &mut Command,
+    input: &[u8],
+    limit: Duration,
+    on_ready: impl FnOnce(u32) -> Result<(), ScalerError>,
+) -> Result<Vec<u8>, ScalerError> {
+    execute_with_failure_internal(command, input, limit, Some(on_ready), |_| None)
+}
+
 fn execute_with_failure(
     command: &mut Command,
     input: &[u8],
     limit: Duration,
     classify: impl FnOnce(&[u8]) -> Option<ScalerError>,
 ) -> Result<Vec<u8>, ScalerError> {
+    execute_with_failure_internal(
+        command,
+        input,
+        limit,
+        None::<fn(u32) -> Result<(), ScalerError>>,
+        classify,
+    )
+}
+
+fn execute_with_failure_internal<F>(
+    command: &mut Command,
+    input: &[u8],
+    limit: Duration,
+    on_ready: Option<F>,
+    classify: impl FnOnce(&[u8]) -> Option<ScalerError>,
+) -> Result<Vec<u8>, ScalerError>
+where
+    F: FnOnce(u32) -> Result<(), ScalerError>,
+{
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     let program = Path::new(command.get_program())
         .file_name()
@@ -1206,7 +1235,11 @@ fn execute_with_failure(
     ] {
         command.env_remove(var);
     }
-    let deadline = Instant::now() + limit;
+    let deadline = if on_ready.is_none() {
+        Some(Instant::now() + limit)
+    } else {
+        None
+    };
     let has_input = !input.is_empty();
     let mut child = command
         .process_group(0)
@@ -1218,7 +1251,8 @@ fn execute_with_failure(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let pgid = i32::try_from(child.id()).map_err(|_| ScalerError::External("process group ID"))?;
+    let child_pid = child.id();
+    let pgid = i32::try_from(child_pid).map_err(|_| ScalerError::External("process group ID"))?;
     let input_thread = if has_input {
         let mut stdin = child.stdin.take().ok_or(ScalerError::External("stdin"))?;
         let data = input.to_vec();
@@ -1272,6 +1306,21 @@ fn execute_with_failure(
     let wait_thread = std::thread::spawn(move || {
         let _ = wait_tx.send(child.wait());
     });
+    if let Some(hook) = on_ready
+        && let Err(err) = hook(child_pid)
+    {
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+        if let Some(thread) = input_thread {
+            let _ = thread.join();
+        }
+        let _ = wait_thread.join();
+        let _ = output_thread.join();
+        let _ = stderr_thread.join();
+        return Err(err);
+    }
+    let deadline = deadline.unwrap_or_else(|| Instant::now() + limit);
     let status = wait_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     let output = output_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     let mut stderr = stderr_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));

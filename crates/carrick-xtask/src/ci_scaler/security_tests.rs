@@ -1,6 +1,7 @@
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
+use std::os::unix::process::CommandExt;
 
 const SYNTHETIC_SECRET: &str = "synthetic-never-a-real-credential";
 
@@ -567,15 +568,31 @@ fn serial_host_execute_retains_bounded_redacted_stderr_and_strips_library_paths(
     assert!(sig_err.to_string().contains("runner stopped"));
     assert!(!format!("{sig_err:?}").contains(absent_secret));
 
-    let timeout_err = execute(
-        Command::new("/bin/sh").args([
-            "-c",
-            &format!("printf 'waiting for runner\\nAuthorization: Bearer {absent_secret}\\n' >&2; exec sleep 5"),
-        ]),
-        &[],
-        Duration::from_millis(50),
-    )
-    .unwrap_err();
+    let mut readiness_pipe = TestPipe::new().unwrap();
+    let readiness_write_fd = readiness_pipe.write_fd;
+
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        &format!(
+            "printf 'waiting for runner\\nAuthorization: Bearer {absent_secret}\\n' >&2; printf ready >&3; exec sleep 5"
+        ),
+    ]);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(readiness_write_fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let timeout_err =
+        execute_with_readiness(&mut command, &[], Duration::from_millis(50), |_child_pid| {
+            readiness_pipe.close_write();
+            wait_for_pipe_readiness(readiness_pipe.read_fd, Duration::from_secs(60))
+        })
+        .unwrap_err();
     assert!(timeout_err.to_string().contains("sh timed out after 50ms"));
     assert!(timeout_err.to_string().contains("waiting for runner"));
     assert!(!format!("{timeout_err:?}").contains(absent_secret));
@@ -621,6 +638,136 @@ fn serial_host_execute_retains_bounded_redacted_stderr_and_strips_library_paths(
         out.is_empty(),
         "execute must strip ambient LD/DYLD library paths for external binaries"
     );
+}
+
+struct TestPipe {
+    read_fd: libc::c_int,
+    write_fd: libc::c_int,
+}
+
+impl TestPipe {
+    fn new() -> Result<Self, ScalerError> {
+        let mut fds = [0 as libc::c_int; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(ScalerError::Io(std::io::Error::last_os_error()));
+        }
+        let make_fd = |raw_fd: libc::c_int| -> Result<libc::c_int, ScalerError> {
+            let high_fd = unsafe { libc::fcntl(raw_fd, libc::F_DUPFD, 10) };
+            if high_fd < 0 {
+                return Err(ScalerError::Io(std::io::Error::last_os_error()));
+            }
+            unsafe {
+                libc::fcntl(high_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::close(raw_fd);
+            }
+            Ok(high_fd)
+        };
+        let read_fd = make_fd(fds[0])?;
+        let write_fd = make_fd(fds[1])?;
+        Ok(Self { read_fd, write_fd })
+    }
+
+    fn close_write(&mut self) {
+        if self.write_fd >= 0 {
+            unsafe { libc::close(self.write_fd) };
+            self.write_fd = -1;
+        }
+    }
+
+    fn close_read(&mut self) {
+        if self.read_fd >= 0 {
+            unsafe { libc::close(self.read_fd) };
+            self.read_fd = -1;
+        }
+    }
+}
+
+impl Drop for TestPipe {
+    fn drop(&mut self) {
+        self.close_read();
+        self.close_write();
+    }
+}
+
+fn wait_for_pipe_readiness(read_fd: libc::c_int, limit: Duration) -> Result<(), ScalerError> {
+    let mut pollfd = libc::pollfd {
+        fd: read_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = libc::c_int::try_from(limit.as_millis()).unwrap_or(libc::c_int::MAX);
+    let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+    if ret < 0 {
+        return Err(ScalerError::Io(std::io::Error::last_os_error()));
+    }
+    if ret == 0 {
+        return Err(ScalerError::External("readiness signal timed out"));
+    }
+    let mut buf = [0u8; 1];
+    let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n < 0 {
+        return Err(ScalerError::Io(std::io::Error::last_os_error()));
+    }
+    if n == 0 {
+        return Err(ScalerError::External("child exited before readiness"));
+    }
+    Ok(())
+}
+
+#[test]
+fn serial_host_execute_timeout_retains_stderr_when_child_is_descheduled_before_first_write() {
+    let absent_secret = "absent-from-input-secret";
+    let mut readiness_pipe = TestPipe::new().unwrap();
+    let mut gate_pipe = TestPipe::new().unwrap();
+    let readiness_write_fd = readiness_pipe.write_fd;
+    let gate_read_fd = gate_pipe.read_fd;
+
+    // Hold the child behind an event-driven gate before its first write, so
+    // that descheduling the child (SIGSTOP) and keeping it stopped for longer
+    // than the timeout limit proves that deadline execution is synchronized
+    // on readiness rather than racing against host scheduling delays.
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        &format!(
+            "read dummy <&4 || true; printf 'waiting for runner\\nAuthorization: Bearer {absent_secret}\\n' >&2; printf ready >&3; exec sleep 5"
+        ),
+    ]);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(readiness_write_fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(gate_read_fd, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let timeout_err =
+        execute_with_readiness(&mut command, &[], Duration::from_millis(50), |child_pid| {
+            readiness_pipe.close_write();
+            gate_pipe.close_read();
+            let pid = i32::try_from(child_pid).unwrap();
+            unsafe {
+                assert_eq!(libc::kill(pid, libc::SIGSTOP), 0);
+            }
+            // Open the gate while the child is stopped. The child cannot
+            // proceed until SIGCONT is delivered.
+            gate_pipe.close_write();
+            // Keep the child stopped longer than the 50ms command limit to
+            // prove no timeout fires prematurely.
+            std::thread::sleep(Duration::from_millis(150));
+            unsafe {
+                assert_eq!(libc::kill(pid, libc::SIGCONT), 0);
+            }
+            wait_for_pipe_readiness(readiness_pipe.read_fd, Duration::from_secs(60))
+        })
+        .unwrap_err();
+    assert!(timeout_err.to_string().contains("sh timed out after 50ms"));
+    assert!(timeout_err.to_string().contains("waiting for runner"));
+    assert!(!format!("{timeout_err:?}").contains(absent_secret));
 }
 
 fn startup_fixture(agents: bool, pooled: bool, rights: Value) -> Result<(), ScalerError> {
