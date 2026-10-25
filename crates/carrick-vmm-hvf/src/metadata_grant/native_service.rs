@@ -175,7 +175,7 @@ impl NativeService {
         let receipt = custody.reserve_native_exec_receipt().map_err(|()| {
             TrapError::Hypervisor("native exec receipt space exhausted".to_owned())
         })?;
-        let asid = prepared.asid();
+        let asid = prepared.prepared_asid().ok_or_else(stale)?;
         let sealed = unsafe { manifest.as_ref() }
             .seal(
                 identity,
