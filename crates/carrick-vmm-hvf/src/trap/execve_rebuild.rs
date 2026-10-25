@@ -341,52 +341,7 @@ pub(crate) struct PreparedNativeExecSuccessor {
 struct PreparedNativeExecParts {
     backing: PreparedExecBacking,
     root_slot: (u64, u64),
-    asid: UnpublishedExecAsid,
-}
-
-/// RAII owner for an allocated ASID until physical publication succeeds.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-struct UnpublishedExecAsid {
-    allocator: carrick_hal::asid::AsidAllocator,
-    generation: carrick_hal::asid::AsidGeneration,
-    armed: bool,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl UnpublishedExecAsid {
-    fn new(
-        allocator: carrick_hal::asid::AsidAllocator,
-        generation: carrick_hal::asid::AsidGeneration,
-    ) -> Self {
-        Self {
-            allocator,
-            generation,
-            armed: true,
-        }
-    }
-
-    fn generation(&self) -> carrick_hal::asid::AsidGeneration {
-        self.generation
-    }
-
-    fn publish(mut self) -> carrick_hal::asid::AsidGeneration {
-        self.armed = false;
-        self.generation
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for UnpublishedExecAsid {
-    fn drop(&mut self) {
-        if self.armed
-            && let Err(error) = self.allocator.release_unpublished(self.generation)
-        {
-            carrick_fatal!(
-                "hvpatch::exec_prepare",
-                "release unpublished exec ASID failed: {error}"
-            );
-        }
-    }
+    asid: carrick_hal::asid::UnpublishedAsid,
 }
 
 // SAFETY: this is deliberately a movable, unpublished transaction.  Every raw
@@ -469,9 +424,8 @@ pub(crate) fn prepare_native_exec_successor(
         })?;
     let allocator = custody.asid_allocator().clone();
     let asid = allocator
-        .allocate()
+        .allocate_unpublished()
         .map_err(|error| TrapError::Hypervisor(format!("allocate native exec ASID: {error}")))?;
-    let asid = UnpublishedExecAsid::new(allocator, asid);
     let backing = PreparedExecBacking::prepare(std::sync::Arc::clone(&custody), global)?;
     Ok(PreparedNativeExecSuccessor {
         parts: Some(PreparedNativeExecParts {
