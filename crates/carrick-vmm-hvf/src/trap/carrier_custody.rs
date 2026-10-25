@@ -437,7 +437,7 @@ struct Stage2RecordRemoval<'a> {
 /// The fields are private to this module so adding a retirement caller without
 /// choosing one of the two ordering boundaries is a compile error.
 #[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
-pub(crate) struct Stage1Unpublished {
+pub(crate) struct DirectStage1RetirementProof {
     identity: CarrierStage2RecordIdentity,
 }
 
@@ -458,13 +458,13 @@ impl NeverPublishedRecord {
 }
 
 pub(crate) enum Stage2RetirementProof {
-    Unpublished(Stage1Unpublished),
+    Unpublished(DirectStage1RetirementProof),
     Released(super::frame_inventory::Stage1Unpublished),
     Authorized(std::sync::Arc<Stage2RetirementAuthorization>),
 }
 
-impl From<Stage1Unpublished> for Stage2RetirementProof {
-    fn from(value: Stage1Unpublished) -> Self {
+impl From<DirectStage1RetirementProof> for Stage2RetirementProof {
+    fn from(value: DirectStage1RetirementProof) -> Self {
         Self::Unpublished(value)
     }
 }
@@ -495,7 +495,7 @@ pub(crate) enum Stage1UnpublicationReceipt<'a> {
     El1Metadata(&'a crate::metadata_grant::El1MetadataRetirement),
 }
 
-impl Stage1Unpublished {
+impl DirectStage1RetirementProof {
     pub(super) fn matches(&self, identity: CarrierStage2RecordIdentity) -> bool {
         self.identity == identity
     }
@@ -817,7 +817,7 @@ impl CarrierVmCustody {
         &self,
         identity: CarrierStage2RecordIdentity,
         receipt: Stage1UnpublicationReceipt<'_>,
-    ) -> Option<Stage1Unpublished> {
+    ) -> Option<DirectStage1RetirementProof> {
         match receipt {
             Stage1UnpublicationReceipt::EditorRange(receipt) => {
                 self.stage1_unpublished_by_editor(identity, receipt)
@@ -829,7 +829,7 @@ impl CarrierVmCustody {
                 let snapshot = self.stage2_record_snapshot(identity.record_id)?;
                 receipt
                     .covers(snapshot.ipa, snapshot.len)
-                    .then_some(Stage1Unpublished {
+                    .then_some(DirectStage1RetirementProof {
                         identity,
                     })
             }
@@ -844,7 +844,7 @@ impl CarrierVmCustody {
                     },
                 ),
             Stage1UnpublicationReceipt::El1Metadata(receipt) => {
-                receipt.matches(identity).then_some(Stage1Unpublished {
+                receipt.matches(identity).then_some(DirectStage1RetirementProof {
                     identity,
                 })
             }
@@ -862,8 +862,8 @@ impl CarrierVmCustody {
         &self,
         identity: CarrierStage2RecordIdentity,
         receipt: NeverPublishedRecord,
-    ) -> Option<Stage1Unpublished> {
-        (receipt.identity == identity).then_some(Stage1Unpublished {
+    ) -> Option<DirectStage1RetirementProof> {
+        (receipt.identity == identity).then_some(DirectStage1RetirementProof {
             identity,
         })
     }
@@ -874,11 +874,11 @@ impl CarrierVmCustody {
         &self,
         identity: CarrierStage2RecordIdentity,
         receipt: &carrick_aarch64::stage1_authority::Stage1LeafRetired,
-    ) -> Option<Stage1Unpublished> {
+    ) -> Option<DirectStage1RetirementProof> {
         let snapshot = self.stage2_record_snapshot(identity.record_id)?;
         receipt
             .names(snapshot.ipa, snapshot.len)
-            .then_some(Stage1Unpublished {
+            .then_some(DirectStage1RetirementProof {
                 identity,
             })
     }
@@ -887,11 +887,11 @@ impl CarrierVmCustody {
         &self,
         identity: CarrierStage2RecordIdentity,
         receipt: &carrick_aarch64::vmm::Stage1UnpublishedArenas,
-    ) -> Option<Stage1Unpublished> {
+    ) -> Option<DirectStage1RetirementProof> {
         let snapshot = self.stage2_record_snapshot(identity.record_id)?;
         receipt
             .retired_base(snapshot.ipa)
-            .then_some(Stage1Unpublished {
+            .then_some(DirectStage1RetirementProof {
                 identity,
             })
     }
@@ -902,8 +902,8 @@ impl CarrierVmCustody {
         &self,
         identity: CarrierStage2RecordIdentity,
         _inventory: &carrick_core::mm::retirement::Stage1UnpublishedMm,
-    ) -> Stage1Unpublished {
-        Stage1Unpublished {
+    ) -> DirectStage1RetirementProof {
+        DirectStage1RetirementProof {
             identity,
         }
     }
@@ -960,7 +960,7 @@ impl CarrierVmCustody {
     pub(crate) fn stage1_unpublished_after_editor_unmap(
         &self,
         identity: CarrierStage2RecordIdentity,
-    ) -> Stage1Unpublished {
+    ) -> DirectStage1RetirementProof {
         let receipt = self.editor_receipt_after_test_unmap(identity);
         self.stage1_unpublished_by_editor(identity, &receipt)
             .expect("editor receipt covers the retired test record")
@@ -1990,7 +1990,7 @@ impl CarrierVmCustody {
     pub(crate) fn request_stage2_record_retirement(
         &self,
         identity: CarrierStage2RecordIdentity,
-        stage1: Stage1Unpublished,
+        stage1: DirectStage1RetirementProof,
     ) -> CarrierStage2RetireOutcome {
         if !stage1.matches(identity) {
             return CarrierStage2RetireOutcome::NotFound;
@@ -2039,7 +2039,7 @@ impl CarrierVmCustody {
         }
         self.request_stage2_record_retirement(
             identity,
-            Stage1Unpublished {
+            DirectStage1RetirementProof {
                 identity,
             },
         )
@@ -2739,7 +2739,7 @@ mod carrier_vm_custody_tests {
         CarrierLogicalOwner, CarrierStage2BackendError, CarrierStage2PinError,
         CarrierStage2RecordIdentity, CarrierStage2RecordSpec, CarrierStage2RetireOutcome,
         CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, Stage1UnpublicationReceipt,
-        Stage1Unpublished, create_vm_with_custody_using, destroy_vm_with_custody_using,
+        DirectStage1RetirementProof, create_vm_with_custody_using, destroy_vm_with_custody_using,
     };
     use crate::trap::frame_inventory::{InventoryFrameRegistry, Stage2ReferenceReleaseError};
 
@@ -2748,7 +2748,7 @@ mod carrier_vm_custody_tests {
         let request: fn(
             &CarrierVmCustody,
             CarrierStage2RecordIdentity,
-            Stage1Unpublished,
+            DirectStage1RetirementProof,
         ) -> CarrierStage2RetireOutcome = CarrierVmCustody::request_stage2_record_retirement;
         let _ = request;
     }
