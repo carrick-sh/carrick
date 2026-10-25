@@ -272,6 +272,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         if effects.queued_own {
             self.tid_wakes += 1;
         }
+        crate::sched::object_wait::deliver_wake_effects(self.zone, SlotId::new(0), effects);
     }
     fn request_ingress_producer_boundary(&mut self) {}
 }
@@ -1466,7 +1467,9 @@ struct ExecSibling {
     control: &'static ThreadControlSlot,
     slot: SlotId,
     record: RecordRef,
-    _wait: Option<Arc<WaitChannel>>,
+    service_ticket: Option<
+        carrick_core_abi::service::ServiceTicket<&'static carrick_core_abi::service::ServiceCell>,
+    >,
 }
 
 #[cfg(test)]
@@ -1478,8 +1481,27 @@ fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSib
         thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(102),
     };
     let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let entry = fixture
+        .page
+        .stock(
+            0,
+            carrick_el1_abi::EntryIdentity {
+                tid: 42,
+                visible_tid: 42,
+                thread_serial: 102,
+                birth: carrick_core_abi::entry::BirthSerial::of_task(
+                    TaskSerial::from_raw_u64(12).unwrap(),
+                ),
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+    fixture
+        .page
+        .bind_control_address(entry, control as *const _ as u64)
+        .unwrap();
     control
-        .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+        .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
         .unwrap();
     assert!(control.publish_visible_tid(42));
     control.publish_host_birth_identity(
@@ -1490,13 +1512,22 @@ fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSib
         )
         .unwrap(),
     );
-    let birth = fixture.page.reserve_host_birth().unwrap();
+    let claim = fixture.page.claim(entry).unwrap();
+    fixture
+        .page
+        .record_born(
+            claim,
+            carrick_el1_abi::BornRecord {
+                caller_task: 41,
+                caller_serial: 101,
+                clone_flags: 0x0001_0000,
+                clear_child_tid: 0,
+                blocked: carrick_el1_abi::BlockedMask(0),
+            },
+        )
+        .unwrap();
     carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
-    assert!(
-        fixture
-            .page
-            .publish_host_birth(birth, control.host_birth_identity().unwrap())
-    );
+    fixture.page.publish(entry).unwrap();
 
     let task = Box::leak(Box::new(CurrentTask::new()));
     task.set(
@@ -1547,57 +1578,65 @@ fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSib
         )
         .unwrap();
 
-    let wait = parked_read.then(|| {
-        let wait = Arc::new(WaitChannel {
-            generation: ProcessWake::new(),
-            mm: 1,
-        });
+    let service_ticket = if parked_read {
         let source = BornInZoneSource {
             zone: fixture.zone,
             slot,
         };
-        let start = carrick_core::entry::prepare_handoff(binding, source, record.id).unwrap();
-        let address = WaitChannel::address(&wait);
-        let guard = fixture.zone.short_lock(
-            ZoneTables::<ParkedContextWords>::bucket_of_with_context(1, address),
-            &NativeBucketWait {
-                lifetime: core::marker::PhantomData,
-                probe: None,
-            },
-        );
-        let sequence = fixture.zone.next_seq(record.id);
-        fixture
-            .zone
-            .enqueue(&guard, record.id, sequence, 1, address, u32::MAX, 0)
-            .unwrap();
-        // SAFETY: this fixture owns the sibling's selected record until the
-        // owned read continuation below publishes its handoff.
-        unsafe {
-            *fixture.zone.record(record.id).ctx_mut() = words(fixture.address);
-            fixture
-                .zone
-                .record(record.id)
-                .publish_owner_continuation(OwnerEntry::Syscall);
-        }
-        assert!(
-            carrick_core::entry::publish_handoff_park(
-                start,
-                &guard,
-                carrick_el1_abi::EntryRecordGeneration(sequence),
+        let mut service = fixture.service();
+        let mut sibling = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                source,
+                task,
+                fixture.address,
+                &words(fixture.address),
+                &mut service,
             )
-            .is_some()
+            .unwrap();
+        assert!(
+            matches!(
+                sibling.begin_service(
+                    carrick_core_abi::service::ServiceOperation::CarrierWork {
+                        entry: OwnerEntry::Syscall,
+                    },
+                    None,
+                ),
+                Ok(NativeResume::Left(None))
+            ),
+            "real native service wait must release its execution slot"
         );
-        drop(guard);
-        fixture.zone.clear_current(slot);
-        wait
-    });
+        assert!(sibling.take_handoff_receipt().is_some());
+        let notice = task.service_notice.take().unwrap().unwrap();
+        let queue = fixture
+            .zone
+            .object_wait(
+                carrick_sched_core::object_wait::ObjectWaitKey::native_service(record).unwrap(),
+                &carrick_sched_core::ShortLockSpin,
+            )
+            .unwrap();
+        let ticket = unsafe {
+            carrick_core_abi::service::ServiceCell::claim_notice(
+                &control.service,
+                notice,
+                NonZeroU64::MIN,
+                fixture.zone.record(record.id).identity(),
+            )
+        }
+        .unwrap();
+        drop(queue);
+        Some(ticket)
+    } else {
+        None
+    };
 
     ExecSibling {
         task,
         control,
         slot,
         record,
-        _wait: wait,
+        service_ticket,
     }
 }
 
@@ -1669,6 +1708,9 @@ fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
         )
         .unwrap();
     let resumed = entry.resume_checkpoint();
+    if let Err(reason) = &resumed {
+        panic!("exec owner caused run failure after sibling drain: {reason:?}");
+    }
     assert!(matches!(resumed, Ok(NativeResume::NoPending)));
     assert_eq!(
         entry.calling_tid(),
@@ -1689,7 +1731,7 @@ fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
 #[cfg(test)]
 fn exec_after_sibling_drain(parked_read: bool) {
     let fixture = native_exec_fixture();
-    let sibling = add_exec_sibling(&fixture, parked_read);
+    let mut sibling = add_exec_sibling(&fixture, parked_read);
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -1744,59 +1786,135 @@ fn exec_after_sibling_drain(parked_read: bool) {
     assert!(sibling.control.host_exit_requested());
     assert!(fixture.zone.slot(fixture.slot).current().is_none());
 
-    // The host withdraws the exact sibling before publishing its receipt.
-    // A running sibling reaches this boundary from its next EL0 exit; an
-    // owned blocking-read continuation is cancelled without reacquiring a
-    // guest execution lane.
-    if !parked_read {
-        fixture
-            .zone
-            .leave_guest(sibling.slot, &carrick_sched_core::ShortLockSpin);
-    }
-    let _ = fixture.zone.claim_for_host(
-        sibling.record,
-        None,
-        carrick_el1_abi::Handback::Cancelled,
-        &carrick_sched_core::ShortLockSpin,
-    );
-    fixture
-        .page
-        .reserve_cancelled_member_exit()
-        .unwrap()
-        .publish();
-    fixture.page.publish_exact_host_retirement(
-        sibling.control,
-        sibling.control.host_birth_identity().unwrap().retirement(),
-    );
-
-    let (mm, address) = fixture.page.exit_wait().unwrap();
-    let guard = fixture
-        .zone
-        .lock(
-            ZoneTables::<ParkedContextWords>::bucket_of_with_context(mm.raw(), address),
-            &carrick_sched_core::ShortLockSpin,
+    if parked_read {
+        sibling
+            .service_ticket
+            .take()
+            .unwrap()
+            .complete(true)
+            .unwrap_or_else(|_| panic!("cancelled native service ticket must settle"));
+        // Exec cancellation wakes the real retained service continuation.
+        // Its production checkpoint consumes the cancelled operation and
+        // publishes the non-owner lifecycle retirement without returning to
+        // EL0.
+        let sibling_resume_slot = [fixture.slot, sibling.slot]
+            .into_iter()
+            .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+            .unwrap();
+        let selected = fixture.zone.switch_in_full(sibling_resume_slot).unwrap();
+        assert_eq!(selected.record, sibling.record.id);
+        let sibling_source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: sibling_resume_slot,
+        };
+        let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+            .unwrap()
+            .words;
+        let mut sibling_service = fixture.service();
+        let mut sibling_entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                sibling_source,
+                sibling.task,
+                fixture.address,
+                &saved,
+                &mut sibling_service,
+            )
+            .unwrap();
+        let service_resumed = sibling_entry.resume_service().unwrap();
+        if let Err(error) = &service_resumed {
+            panic!("cancelled native service failed before lifecycle resume: {error:?}");
+        }
+        assert!(matches!(service_resumed, Ok(NativeResume::NoPending)));
+        let lifecycle_resumed = sibling_entry.resume_pending_lifecycle();
+        assert!(
+            matches!(
+                lifecycle_resumed,
+                Some(LifecycleOutcome::Transferred { .. })
+            ),
+            "cancelled native service returned toward EL0"
+        );
+        assert!(sibling_entry.take_run_failure().is_none());
+    } else {
+        // A spinning member observes the host-exit request at its next trap
+        // and takes the ordinary raw-thread-exit transaction.
+        let sibling_source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: sibling.slot,
+        };
+        let mut sibling_service = fixture.service();
+        let mut sibling_entry = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                sibling_source,
+                sibling.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut sibling_service,
+            )
+            .unwrap();
+        let entry = sibling.control.entry().unwrap();
+        let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+            sibling_entry.binding(),
+            Some(entry),
+            carrick_sched_core::process::TerminationStatus::signaled(9, false),
         )
         .unwrap();
-    let mut transfers = Vec::new();
-    let woken = fixture.zone.wake_host(
-        &guard,
-        mm.raw(),
-        address,
-        u32::MAX,
-        u32::MAX,
-        true,
-        &mut |transfer| transfers.push(transfer),
-        &mut |_| {},
-    );
-    drop(guard);
-    assert_eq!(woken, 1);
-    assert!(transfers.is_empty());
+        let custody = carrick_core::terminal::TerminalCustody::<
+            carrick_core::terminal::Thread,
+            carrick_core::terminal::Live,
+        >::admitted(identity)
+        .begin();
+        let (custody, membership) = custody
+            .reserve_nonfinal(fixture.page)
+            .unwrap_or_else(|_| panic!("exec-killed sibling must remain nonfinal"));
+        assert!(
+            carrick_core::entry::retire_current(
+                sibling_entry.binding(),
+                sibling_source,
+                sibling.record.id,
+            )
+            .is_some()
+        );
+        carrick_core::lifecycle::retire_cancelled_pool_member(
+            fixture.page,
+            entry,
+            sibling.control,
+            membership,
+        )
+        .unwrap();
+        sibling_entry.retire_thread_verdict(custody.into_verdict(fixture.page));
+        {
+            let graph = fixture.runtime.graph.lock();
+            let pending = graph.pending.exit(&sibling_entry.key).unwrap();
+            let readiness = pending.readiness(fixture.page);
+            match readiness {
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    panic!("exec close remained blocked after pool sibling retirement: {error:?}")
+                }
+                None => panic!("exec close lost its readiness custody"),
+            }
+        }
+        sibling_entry.lifecycle_admission_settled().unwrap();
+        assert!(sibling_entry.take_run_failure().is_none());
+    }
 
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let resume_slot = [fixture.slot, sibling.slot]
+        .into_iter()
+        .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+        .unwrap();
+    let selected = fixture.zone.switch_in_full(resume_slot).unwrap();
     assert_eq!(selected.record, fixture.record.id);
+    let resumed_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: resume_slot,
+    };
     let resumed_runtime = fixture
         .registry
-        .for_entry(source, fixture.task, fixture.address)
+        .for_entry(resumed_source, fixture.task, fixture.address)
         .unwrap();
     assert!(Arc::ptr_eq(&resumed_runtime, &fixture.runtime));
     // SAFETY: the exit wait selected the retained root continuation exactly
@@ -1808,7 +1926,7 @@ fn exec_after_sibling_drain(parked_read: bool) {
         .runtime
         .enter_registered(
             fixture.registry,
-            source,
+            resumed_source,
             fixture.task,
             fixture.address,
             &saved,
@@ -1816,7 +1934,17 @@ fn exec_after_sibling_drain(parked_read: bool) {
         )
         .unwrap();
     let resumed = entry.resume_checkpoint();
-    assert!(matches!(resumed, Ok(NativeResume::NoPending)));
+    let resumed_kind = match &resumed {
+        Ok(NativeResume::NoPending) => "no-pending",
+        Ok(NativeResume::Left(_)) => "left",
+        Ok(NativeResume::Returned(_)) => "returned",
+        Ok(NativeResume::Invalid) => "invalid",
+        Err(_) => "run-failure",
+    };
+    assert!(
+        matches!(resumed, Ok(NativeResume::NoPending)),
+        "exec owner resumed as {resumed_kind}"
+    );
     assert_eq!(entry.calling_tid(), 41);
     assert_eq!(
         fixture.task.mm.key.load(Ordering::Acquire),

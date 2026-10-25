@@ -365,6 +365,36 @@ pub fn retire_host_member(
     Ok(())
 }
 
+/// Publish an exec/group-close cancellation for one exact pool member. The
+/// caller has already reserved its nonfinal live unit; this operation binds
+/// that unit to the member's in-zone receipt before making the entry reaped.
+pub fn retire_cancelled_pool_member(
+    page: &dyn Lifecycle,
+    entry: EntryRef,
+    member: &dyn MemberControl,
+    membership: NonfinalExitMembership<'_>,
+) -> Result<(), TransitionError> {
+    let _pin = MemberControlCustody::retain(member)?;
+    if !core::ptr::addr_eq(page, membership.page) || member.member_entry() != Some(entry) {
+        return Err(TransitionError::StaleGeneration);
+    }
+    member
+        .exit_custody()
+        .word
+        .fetch_or(IN_ZONE_COMMITTED, Ordering::SeqCst);
+    if let Err(error) = page.retire_closing_caller(entry) {
+        if member.member_entry() == Some(entry) {
+            member
+                .exit_custody()
+                .word
+                .fetch_and(!IN_ZONE_COMMITTED, Ordering::SeqCst);
+        }
+        return Err(error);
+    }
+    membership.publish();
+    Ok(())
+}
+
 /// The exact page owns the storage and retains its ledger notification authority.
 /// Linux payload initialization happens between reserve and release publication.
 pub trait Lifecycle {
@@ -422,6 +452,21 @@ pub trait Lifecycle {
             .map(|_| ())
             .map_err(GateState::from_raw)
     }
+    /// Exec drain owns the process-closing gate while retaining its caller as
+    /// the successor. Unlike fork quiescence this transition is terminal for
+    /// the predecessor image; a concurrent group exit may upgrade the owner,
+    /// but no birth or service admission can reopen it.
+    fn close_for_exec(&self) -> Result<(), GateState> {
+        self.gate_word()
+            .compare_exchange(
+                GateState::Open as u32,
+                GateState::Closed as u32,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map(|_| ())
+            .map_err(GateState::from_raw)
+    }
     /// Fork committed: `ForkClosing -> Open`.
     fn reopen_after_fork(&self) -> Result<(), GateState> {
         self.gate_word()
@@ -441,6 +486,12 @@ pub trait Lifecycle {
     /// Release host authority without admitting births into an unbound image.
     fn await_exec_binding(&self) -> Result<(), GateState> {
         self.transition_gate(GateState::ForkClosing, GateState::AwaitingExecBinding)
+    }
+    /// Exec drain closed the predecessor as a process transition, rather than
+    /// as fork quiescence. Preserve closed admission while the successor's
+    /// authenticated binding is installed.
+    fn await_exec_binding_after_close(&self) -> Result<(), GateState> {
+        self.transition_gate(GateState::Closed, GateState::AwaitingExecBinding)
     }
     /// The new image's executable capacity is installed. This cannot release
     /// a fork's temporary close or a tracer's terminal close.
