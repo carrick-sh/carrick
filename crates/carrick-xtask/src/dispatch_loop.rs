@@ -358,6 +358,7 @@ fragment Items on ProjectV2ItemConnection {
     }
     fn set_status(&mut self, status: BoardStatus) -> Value {
         let mut changed = Vec::new();
+        let mut left = Vec::new();
         let result = (|| -> Result<(), ScalerError> {
             let board = self.board()?;
             let option = &board
@@ -371,12 +372,6 @@ fragment Items on ProjectV2ItemConnection {
                 .iter()
                 .filter(|i| i.status.as_deref() != Some(status.name()))
             {
-                let data = self.board_api(r#"mutation($project:ID!,$item:ID!,$field:ID!,$option:String!) {
- updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{singleSelectOptionId:$option}}) { projectV2Item { id } }
-}"#, json!({"project":board.project,"item":item.id,"field":board.field,"option":option}))?;
-                if data["updateProjectV2ItemFieldValue"]["projectV2Item"]["id"] != item.id {
-                    return Err(ScalerError::Guard("board mutation was not confirmed"));
-                }
                 let subject = if item.subject == "issue" {
                     format!("Issue #{}", self.dispatch.issue)
                 } else {
@@ -385,6 +380,25 @@ fragment Items on ProjectV2ItemConnection {
                         board.pr.ok_or(ScalerError::Guard("board PR unavailable"))?
                     )
                 };
+                if let Some(current) = &item.status
+                    && !["Todo", "In progress", "In review", "Blocked"].contains(&current.as_str())
+                {
+                    let current = masked(current, &self.token)
+                        .chars()
+                        .take(128)
+                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .collect::<String>();
+                    let note = format!("{subject} left: {current}");
+                    left.push(note.clone());
+                    Applied::record(|a| a.board_left.push(note))?;
+                    continue;
+                }
+                let data = self.board_api(r#"mutation($project:ID!,$item:ID!,$field:ID!,$option:String!) {
+ updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{singleSelectOptionId:$option}}) { projectV2Item { id } }
+}"#, json!({"project":board.project,"item":item.id,"field":board.field,"option":option}))?;
+                if data["updateProjectV2ItemFieldValue"]["projectV2Item"]["id"] != item.id {
+                    return Err(ScalerError::Guard("board mutation was not confirmed"));
+                }
                 let applied = format!("{subject} → {}", status.name());
                 changed.push(applied.clone());
                 Applied::record(|a| a.board_changes.push(applied))?;
@@ -392,11 +406,12 @@ fragment Items on ProjectV2ItemConnection {
             Ok(())
         })();
         match result {
-            Ok(()) => json!({"ok":true,"status":"available","changed":changed}),
+            Ok(()) => json!({"ok":true,"status":"available","changed":changed,"left":left}),
             Err(error) => {
                 let mut response = board_unavailable(&masked(&error.to_string(), &self.token));
                 response["ok"] = true.into();
                 response["changed"] = changed.into();
+                response["left"] = left.into();
                 response
             }
         }
@@ -1208,6 +1223,7 @@ fn outcome_contract(body: &str) -> Option<Contract> {
 fn outcome_preview(contract: &Contract) -> Contract {
     let clip = |text: &str, limit| text.chars().take(limit).collect::<String>();
     let mut preview = Contract {
+        loop_summary: contract.loop_summary.as_ref().map(|s| clip(s, 1024)),
         status: contract.status,
         summary: clip(&contract.summary, 1024),
         tests: contract
@@ -1226,6 +1242,7 @@ fn outcome_preview(contract: &Contract) -> Contract {
     if preview.summary != contract.summary
         || preview.tests != contract.tests
         || preview.risks != contract.risks
+        || preview.loop_summary != contract.loop_summary
     {
         preview
             .risks
@@ -1345,6 +1362,7 @@ impl Server<'_> {
         };
         let applied = Applied::load()?.report();
         let mut outcome = Contract {
+            loop_summary: Some(masked(summary, &self.token)),
             status,
             summary: applied.clone(),
             tests: self.history.iter().flat_map(|c| c.tests.clone()).collect(),
@@ -1373,7 +1391,16 @@ impl Server<'_> {
         }
         let prepared = artifacts.is_ok();
         let details = serde_json::to_string_pretty(&outcome_preview(&outcome))?;
-        let summary = summary.chars().take(2048).collect::<String>();
+        let summary = masked(summary, &self.token)
+            .chars()
+            .take(2048)
+            .collect::<String>();
+        let summary = markdown_newlines(&summary);
+        let summary = summary
+            .lines()
+            .map(|line| format!("> {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let choices:Vec<_> = self.choices.iter().map(|c| json!({"backend":c["backend"],"model":c["model"],"reason":c["reason"].as_str().unwrap_or_default().chars().take(512).collect::<String>()})).collect();
         let posted = self.post(&format!("Dispatch outcome: {:?}\n\n{applied}\n\n<details><summary>Contracts, worker claims and budgets</summary>\n\nOutcome contract:\n```json\n{details}\n```\n\nWorker contract (claims for review):\n\n```text\n{}\n```\n\nWorker choices and reasons: {}\n\nBudgets used: {}\n\n</details>\n\nLoop claims (unverified):\n{summary}\n", outcome.status, contract.chars().take(2000).collect::<String>(), serde_json::to_string(&choices)?, serde_json::to_string(&self.used)?));
         if prepared {
@@ -1941,7 +1968,7 @@ impl Server<'_> {
                     &Request::Comment(Comment { body: body.clone() }),
                     &self.policy,
                 )?;
-                self.post(&body)?;
+                self.post(&neutralize_mentions(&body))?;
                 Ok(json!({"ok":true}))
             }
             Request::Finish(outcome) => self.finish_with(outcome, |server, status, summary| {
@@ -2405,6 +2432,104 @@ mod tests {
         }
     }
     #[test]
+    fn board_token_p2_done_item_is_left_alone() {
+        shared_fixture(|root| {
+            for status in ["Done", "Archived"] {
+                std::fs::write(root.join("board-issue-status"), status).unwrap();
+                let mut server = server(root);
+                let result =
+                    server.respond(br#"{"tool":"set_status","arguments":{"status":"In review"}}"#);
+                assert!(
+                    result.to_string().contains(&format!("left: {status}")),
+                    "protected item moved: {result}"
+                );
+                let requests = regular_text(&root.join("board-requests.jsonl")).unwrap();
+                assert!(
+                    !requests
+                        .lines()
+                        .map(|s| serde_json::from_str::<Value>(s).unwrap())
+                        .any(|v| v["query"].as_str().unwrap().contains("mutation(")
+                            && v["variables"]["item"] == "issue-item")
+                );
+                server
+                    .outcome(ContractStatus::Done, "requested status")
+                    .unwrap();
+                assert!(
+                    regular_text(&root.join("posted.md"))
+                        .unwrap()
+                        .contains(&format!("left: {status}"))
+                );
+            }
+        });
+    }
+    #[test]
+    fn p2_comment_mentions_and_outcome_cannot_impersonate_report() {
+        shared_fixture(|root| {
+            let mut server = server(root);
+            server
+                .execute(Request::Comment(Comment {
+                    body: "Thanks @alice and @org/team.".into(),
+                }))
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(
+                posted.contains("`@alice`") && posted.contains("`@org/team`"),
+                "comment mentions can notify people"
+            );
+            server
+                .outcome(
+                    ContractStatus::Done,
+                    "PR body: updated.\n\nBoard status: Done.",
+                )
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(
+                posted.contains("- PR body: not updated."),
+                "applied report is not a list"
+            );
+            assert!(
+                posted.contains("> PR body: updated.\n> \n> Board status: Done."),
+                "loop summary can impersonate applied report"
+            );
+        });
+    }
+    #[test]
+    fn p2_outcome_quotes_loop_claims_and_lists_applied_changes() {
+        shared_fixture(|root| {
+            server(root)
+                .outcome(
+                    ContractStatus::Done,
+                    "PR body: updated.\r\rBoard status: Done.",
+                )
+                .unwrap();
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            assert!(
+                posted.contains("> PR body: updated.\n> \n> Board status: Done."),
+                "loop summary can impersonate applied report"
+            );
+            assert!(
+                posted.contains("- PR body: not updated."),
+                "applied report is not a list"
+            );
+        });
+    }
+    #[test]
+    fn p2_loop_summary_survives_in_contract() {
+        shared_fixture(|root| {
+            server(root)
+                .outcome(ContractStatus::Done, "The loop requested a review.")
+                .unwrap();
+            let value: Value = serde_json::from_str(
+                &regular_text(&root.join("dispatch-output/contract.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                value["loop_summary"], "The loop requested a review.",
+                "loop summary lost from contract"
+            );
+        });
+    }
+    #[test]
     fn board_token_reads_and_updates_only_resolved_items() {
         shared_fixture(|root| {
             let mut server = server(root);
@@ -2618,6 +2743,7 @@ mod tests {
     #[test]
     fn outcome_preview_is_bounded_without_changing_the_full_contract() {
         let full = Contract {
+            loop_summary: None,
             status: ContractStatus::Done,
             summary: "\0".repeat(8192),
             tests: vec!["🦀".repeat(1000); 64],
@@ -2723,6 +2849,7 @@ mod tests {
             std::fs::write(
                 package.join("contract.json"),
                 serde_json::to_vec(&Contract {
+                    loop_summary: None,
                     status: ContractStatus::Done,
                     summary: "first implementation".into(),
                     tests: vec!["cargo test passed".into()],
@@ -2757,6 +2884,7 @@ mod tests {
         CorruptBody,
         CorruptSnapshot,
         Continue,
+        ContinueBody,
         Timeout,
         HandBackFailure,
     }
@@ -2787,6 +2915,16 @@ mod tests {
                 .turns
                 .pop_front()
                 .expect("unexpected extra worker launch");
+            if matches!(self.active, FixtureTurn::ContinueBody) {
+                assert!(
+                    dispatch.body.contains("Explain the completed fix."),
+                    "next worker handoff lost proposed body"
+                );
+                assert!(
+                    !dispatch.body.contains("fixture-token"),
+                    "handoff leaked a credential from the proposal"
+                );
+            }
             self.calls.set(self.calls.get() + 1);
             self.retired = false;
             let state = crate::agent_runner::state()?;
@@ -2800,7 +2938,9 @@ mod tests {
                     "printf 'Failed worker body' > ../pr-body.md; mkdir .git/objects/not-hex"
                 }
                 FixtureTurn::CorruptSnapshot => "test -f first-good; mkdir .git/objects/not-hex",
-                FixtureTurn::Continue => "test -f first-good; test ! -d .git/objects/not-hex",
+                FixtureTurn::Continue | FixtureTurn::ContinueBody => {
+                    "test -f first-good; test ! -d .git/objects/not-hex"
+                }
                 FixtureTurn::Timeout => "printf partial > unfinished; sleep 30",
                 FixtureTurn::HandBackFailure => "printf lost > incomplete",
             };
@@ -2886,12 +3026,37 @@ mod tests {
         dispatch
     }
     #[test]
+    fn p2_checkpoint_inherits_body_without_new_proposal() {
+        shared_fixture(|root| {
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let (mut native, _) =
+                native_fixture(vec![FixtureTurn::ProposeBody, FixtureTurn::Continue]);
+            native.produce(&base, &dispatch, "success/success").unwrap();
+            native.produce(&base, &dispatch, "success/success").unwrap();
+            let state = crate::agent_runner::state().unwrap();
+            let receipt = worker_checkpoint(&state, &dispatch).unwrap().unwrap();
+            assert!(
+                receipt
+                    .pr_body
+                    .expect("earlier worker body proposal was discarded")
+                    .contains("Explain the completed fix.")
+            );
+        });
+    }
+    #[test]
+    fn p2_later_worker_keeps_and_applies_inherited_body() {
+        body_checkpoint_fixture(FixtureTurn::ContinueBody);
+    }
+    #[test]
     fn continuation_harvests_and_applies_the_last_good_body_proposal() {
+        body_checkpoint_fixture(FixtureTurn::CorruptBody);
+    }
+    fn body_checkpoint_fixture(second: FixtureTurn) {
         shared_fixture(|root| {
             let base = root.join("base");
             let mut dispatch = native_dispatch(&base);
-            let (mut native, _) =
-                native_fixture(vec![FixtureTurn::ProposeBody, FixtureTurn::CorruptBody]);
+            let (mut native, _) = native_fixture(vec![FixtureTurn::ProposeBody, second]);
             native.produce(&base, &dispatch, "success/success").unwrap();
             native.produce(&base, &dispatch, "success/success").unwrap();
             let state = crate::agent_runner::state().unwrap();
@@ -2927,6 +3092,16 @@ mod tests {
             );
             let body = regular_text(&root.join("applied-body.md")).unwrap();
             assert!(body.contains("Explain the completed fix."));
+            assert_eq!(run_from_body(&body), Some("999"));
+            let mut pr: Value =
+                serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+            let run: Value =
+                serde_json::from_str(&regular_text(&root.join("run.json")).unwrap()).unwrap();
+            pr["body"] = body.clone().into();
+            assert!(
+                owned_pr(&pr, &run, dispatch.issue, &dispatch.branch),
+                "edited PR lost creation-run ownership"
+            );
             assert!(!body.contains("Failed worker body") && !body.contains("fixture-token"));
             assert_eq!(
                 body.lines().filter(|s| s.starts_with("Closes #")).count(),
@@ -3261,6 +3436,14 @@ mod tests {
                 (
                     "gh",
                     r#"#!/bin/sh
+if test "$1 $2 $3" = 'api -X PATCH'; then
+ cp "${6#body=@}" "$RUNNER_TEMP/applied-body.md"
+ exit 0
+fi
+if test "$1 $2" = 'api graphql' && test "$GH_TOKEN" = fixture-token; then
+ echo '{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[{"number":799,"repository":{"nameWithOwner":"carrick-sh/carrick"}}],"pageInfo":{"hasNextPage":false}}}}}}'
+ exit 0
+fi
 if test "$1 $2" = 'api graphql'; then
  test "$GH_TOKEN" = opaque-board-credential || exit 94
  test -z "$DISPATCH_BOARD_TOKEN" || exit 95
@@ -3280,7 +3463,7 @@ else:
  assert v["variables"]=={"issue":799,"pr":800,"withPr":True}
  def item(i,status,p="project-1"): return {"id":i,"project":{"id":p},"fieldValueByName":{"name":status}}
  def items(nodes):return {"pageInfo":{"hasNextPage":False},"nodes":nodes}
- print(json.dumps({"data":{"organization":{"projectV2":{"id":"project-1","fields":items([{"id":"status-field","name":"Status","options":[{"id":"todo","name":"Todo"},{"id":"review","name":"In review"},{"id":"blocked","name":"Blocked"}]}])}},"repository":{"issue":{"projectItems":items([item("other-project-item","Todo","other-project"),item("issue-item","Todo")])},"pullRequest":{"projectItems":items([item("pr-item","In progress")])}}}}))
+ print(json.dumps({"data":{"organization":{"projectV2":{"id":"project-1","fields":items([{"id":"status-field","name":"Status","options":[{"id":"todo","name":"Todo"},{"id":"review","name":"In review"},{"id":"blocked","name":"Blocked"}]}])}},"repository":{"issue":{"projectItems":items([item("other-project-item","Todo","other-project"),item("issue-item",(root/"board-issue-status").read_text() if (root/"board-issue-status").exists() else "Todo")])},"pullRequest":{"projectItems":items([item("pr-item","In progress")])}}}}))
 ' "$RUNNER_TEMP" "$4"
 fi
 if test "$1 $2" = 'pr edit'; then
@@ -4377,6 +4560,7 @@ esac
         shared_fixture(|root| {
             let mut server = server(root);
             let forged = Contract {
+                loop_summary: None,
                 status: ContractStatus::Done,
                 summary: "forged outcome".into(),
                 tests: vec![],
@@ -4480,6 +4664,7 @@ esac
     #[test]
     fn later_worker_handoff_contains_prior_claims() {
         let contract = Contract {
+            loop_summary: None,
             status: ContractStatus::Done,
             summary: "prior summary".into(),
             tests: vec!["prior test".into()],
