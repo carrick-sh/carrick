@@ -768,7 +768,12 @@ fn unrelated_workspace_edits_preserve_fixture_identity() {
         &fs::read(f.repo.path().join(fixtures::INSTALLED_MANIFEST)).unwrap(),
     )
     .unwrap();
-    assert_eq!(installed["validation"], validation);
+    // Restore verifies the bundle bytes anew, whereas the earlier installed
+    // verification reused its stat stamp. Their input identities still match.
+    assert_eq!(validation["elf_hash_verification"], "reused_stamp");
+    let mut restored_validation = validation;
+    restored_validation["elf_hash_verification"] = serde_json::json!("recomputed");
+    assert_eq!(installed["validation"], restored_validation);
 }
 
 #[test]
@@ -3069,4 +3074,69 @@ fn verification_stamp_reuses_unchanged_files_and_refuses_restored_mtime_tamper()
         .unwrap();
     assert!(fixtures::verify_installed(f.repo.path()).is_err());
     assert!(!stamp.exists());
+}
+
+#[test]
+fn installed_receipts_distinguish_recomputed_hashes_from_stamp_reuse() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    // An installed historical receipt lacks work metadata; revalidation must
+    // produce the concrete current mode rather than guessing historical work.
+    let installed_path = f.repo.path().join(fixtures::INSTALLED_MANIFEST);
+    let mut installed: serde_json::Value =
+        serde_json::from_slice(&fs::read(&installed_path).unwrap()).unwrap();
+    installed["validation"]
+        .as_object_mut()
+        .unwrap()
+        .remove("elf_hash_verification");
+    fs::write(&installed_path, serde_json::to_vec(&installed).unwrap()).unwrap();
+    let receipt = fixtures::verify_installed_receipt(f.repo.path()).unwrap();
+    assert_eq!(
+        serde_json::to_value(receipt).unwrap()["elf_hash_verification"],
+        "reused_stamp"
+    );
+    fs::remove_file(f.repo.path().join("target/fixtures/verified-stat-v1.json")).unwrap();
+    let receipt = fixtures::verify_installed_receipt(f.repo.path()).unwrap();
+    assert_eq!(
+        serde_json::to_value(receipt).unwrap()["elf_hash_verification"],
+        "recomputed"
+    );
+    let path = f.repo.path().join("target/fixture-validation.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .arg("--root")
+        .arg(f.repo.path())
+        .args(["fixtures", "verify", "--receipt"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cli_receipt: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(cli_receipt["elf_hash_verification"], "reused_stamp");
+}
+
+#[test]
+fn concurrent_installed_verification_tolerates_missing_stamps() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    fs::remove_file(f.repo.path().join("target/fixtures/verified-stat-v1.json")).unwrap();
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let barrier = &barrier;
+            let root = f.repo.path();
+            workers.push(scope.spawn(move || {
+                barrier.wait();
+                fixtures::verify_installed(root).unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    fixtures::verify_installed(f.repo.path()).unwrap();
 }

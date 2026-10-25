@@ -130,3 +130,16 @@ test_signed_publish_receipt() {
     echo "test-signed: failed to publish receipt $canonical_receipt" >&2
     return 1
 }
+
+# One explicit integration target is supported only by direct focused runs.
+test_signed_validate_target() {
+    local target="${1:-}"
+    [ -n "$target" ] || return 0
+    case "$target" in
+        [A-Za-z0-9]*) ;;
+        *) echo "test-signed: invalid CARRICK_TEST_TARGET: expected a target component" >&2; return 2 ;;
+    esac
+    case "$target" in
+        *[!A-Za-z0-9_-]*) echo "test-signed: invalid CARRICK_TEST_TARGET: unsafe target component" >&2; return 2 ;;
+    esac
+}

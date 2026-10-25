@@ -583,6 +583,7 @@ impl HostLease {
     /// scope pipe (never a lock description) also covers fork without exec.
     pub fn configure_command(&self, command: &mut Command) -> io::Result<()> {
         self.check_connection()?;
+        crate::command::sanitize_cargo_package_env(command);
         command
             .env_remove("CARRICK_HOST_LEASE_FD")
             .env_remove("CARRICK_HOST_LEASE_MODE")

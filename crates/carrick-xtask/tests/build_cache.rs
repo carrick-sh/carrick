@@ -347,33 +347,117 @@ fn path_change_replaces_inherited_cache_selection() {
 }
 
 #[test]
-fn signed_nesting_removes_cargo_package_metadata_without_changing_cache() {
+fn lease_and_worktree_children_have_identical_cargo_environments() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let output = Command::new("sh")
-        .current_dir(repo)
-        .env("CARGO_MANIFEST_DIR", "/injected/xtask")
-        .env("CARGO_PKG_NAME", "carrick-xtask")
-        .env("CARRICK_SCCACHE", "0")
-        .args([
-            "-c",
-            r#"
-            set -eu
-            . scripts/lib/build-env.sh
-            first=$CARRICK_CARGO_CACHE_CONFIG
-            test "${CARGO_MANIFEST_DIR+x}" != x
-            test "${CARGO_PKG_NAME+x}" != x
-            CARGO_MANIFEST_DIR=/injected/xtask
-            export CARGO_MANIFEST_DIR
-            . scripts/lib/build-env.sh
-            test "${CARGO_MANIFEST_DIR+x}" != x
-            test "$first" = "$CARRICK_CARGO_CACHE_CONFIG"
-        "#,
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let dir = tempfile::tempdir().unwrap();
+    let xtask = env!("CARGO_BIN_EXE_carrick-xtask");
+    let mut baseline = None;
+    // Both top-level supervisor custody and inherited lease children must
+    // remove metadata, even when a Cargo-like launcher reinjects it between
+    // boundaries. A future CARGO_PKG_* name must follow the same policy.
+    for route in [
+        vec!["worktree"],
+        vec!["lease"],
+        vec!["lease", "worktree"],
+        vec!["lease", "worktree", "lease"],
+    ] {
+        let mut args: Vec<OsString> = vec![
+            "sh".into(),
+            "-c".into(),
+            "env | LC_ALL=C sort | grep -E '^(CARGO_|RUSTC_WRAPPER=|CARRICK_CARGO_CACHE_CONFIG=)'"
+                .into(),
+        ];
+        for boundary in route.iter().rev() {
+            let mut next: Vec<OsString> = vec![xtask.into()];
+            if *boundary == "worktree" {
+                next.extend(["worktree-run".into(), "--".into()]);
+            } else {
+                next.extend([
+                    "host-lease".into(),
+                    "--mode".into(),
+                    "carrick".into(),
+                    "--".into(),
+                ]);
+            }
+            next.extend(args);
+            args = vec![
+                "sh".into(),
+                "-c".into(),
+                "export CARGO_MANIFEST_DIR=/injected/xtask CARGO_PKG_FUTURE=sentinel; exec \"$@\""
+                    .into(),
+                "inject-cargo-metadata".into(),
+            ];
+            args.extend(next);
+        }
+        let output = Command::new(&args[0])
+            .args(&args[1..])
+            .current_dir(&repo)
+            .env_remove("CARRICK_HOST_LEASE_SOCKET")
+            .env("CARRICK_HOST_LEASE_PATH", dir.path().join("host.lock"))
+            .env("CARGO_TARGET_DIR", dir.path().join("target"))
+            .env("RUSTC_WRAPPER", "/preserved/wrapper")
+            .env("CARRICK_CARGO_CACHE_CONFIG", "preserved-cache-config")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{route:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let environment = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            !environment
+                .lines()
+                .any(|line| line.starts_with("CARGO_MANIFEST_")),
+            "{route:?}: leaked Cargo package metadata"
+        );
+        assert!(
+            !environment
+                .lines()
+                .any(|line| line.starts_with("CARGO_PKG_")),
+            "{route:?}: leaked Cargo package metadata"
+        );
+        assert!(environment.contains("RUSTC_WRAPPER=/preserved/wrapper"));
+        assert!(environment.contains("CARRICK_CARGO_CACHE_CONFIG=preserved-cache-config"));
+        assert!(environment.contains(&format!(
+            "CARGO_TARGET_DIR={}",
+            dir.path().join("target").display()
+        )));
+        if let Some(expected) = &baseline {
+            assert!(
+                environment.eq(expected),
+                "{route:?}: Cargo environments differ"
+            );
+        } else {
+            baseline = Some(environment);
+        }
+    }
+}
+
+#[test]
+fn signed_gate_recipes_remove_ambient_target_overrides() {
+    let build = Build::new();
+    symlink(find("env"), build.root.path().join("bin/env")).unwrap();
+    let runner = build.root.path().join("scripts/test-signed.sh");
+    fs::write(
+        &runner,
+        "#!/bin/sh\ntest \"${CARRICK_TEST_TARGET+x}\" != x\n",
+    )
+    .unwrap();
+    fs::set_permissions(&runner, fs::Permissions::from_mode(0o755)).unwrap();
+    for recipe in [
+        "test-embed",
+        "test-hvf",
+        "test-hvf-trap-engine",
+        "test-conformance-next",
+    ] {
+        passed(
+            build
+                .command("--no-deps")
+                .arg(recipe)
+                .env("CARRICK_TEST_TARGET", "accidentally_exported")
+                .output()
+                .unwrap(),
+        );
+    }
 }
