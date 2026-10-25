@@ -620,6 +620,64 @@ mod tests {
     }
 
     #[test]
+    fn ipc_reservation_commit_refuses_a_stale_occupied_host_slot() {
+        let ids = ObjectIdRegistry::new();
+        let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+        let map = map();
+        let table = Arc::new(FileTable::new(ids.file_table_id().unwrap()));
+        let old = Arc::new(FileDescription::regular(ids.file_description_id().unwrap()));
+        old.retain_fd_ref();
+        table.install(
+            FileSlotNumber::for_open_fd(3).unwrap(),
+            Arc::clone(&old),
+            false,
+        );
+        table.publish_ipc(Arc::clone(&owner), map).unwrap();
+
+        let shared = fd::TableId::from_raw(map.lookup(table.id().raw()).unwrap());
+        owner
+            .region()
+            .fd(crate::el1_zone::HostLockWait)
+            .close(shared, fd::Fd(3))
+            .unwrap();
+        let reservation = table.reserve_slot_at_or_above(0, 64).unwrap();
+        assert_eq!(reservation.fd(), 3);
+        let replacement = Arc::new(FileDescription::regular(ids.file_description_id().unwrap()));
+        assert_eq!(
+            reservation.commit(FileSlot::new(Arc::clone(&replacement), 0)),
+            Err(crate::linux_abi::LINUX_EBUSY)
+        );
+        assert!(Arc::ptr_eq(
+            &table
+                .slot(FileSlotNumber::for_open_fd(3).unwrap())
+                .unwrap()
+                .description(),
+            &old
+        ));
+        assert_eq!(old.fd_ref_count(), 1);
+        assert_eq!(replacement.fd_ref_count(), 0);
+        assert!(!table.is_slot_reserved(3));
+    }
+
+    #[test]
+    fn epoll_detach_reservation_propagates_shared_claim_conflict() {
+        let ids = ObjectIdRegistry::new();
+        let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
+        let table = Arc::new(FileTable::new(ids.file_table_id().unwrap()));
+        table.publish_ipc(owner, map()).unwrap();
+        let first = table.reserve_exact_target(7, 64).unwrap();
+
+        assert!(matches!(
+            table.reserve_slot_for_epoll_detach(7),
+            Err(crate::linux_abi::LINUX_EBUSY)
+        ));
+        assert_eq!(
+            table.lock_reserved_slots().get(&7).copied(),
+            Some(first.reservation_id())
+        );
+    }
+
+    #[test]
     fn serial_host_el1_ipc_file_table_fork_exec_and_refusal() {
         let ids = ObjectIdRegistry::new();
         let owner = Arc::new(HostIpc::new(1 << 16).unwrap());
