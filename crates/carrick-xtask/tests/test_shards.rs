@@ -152,10 +152,7 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
         "macOS cfg documentation must retain native coverage"
     );
     assert!(
-        runs(
-            "macos-clippy",
-            "cargo run --locked -p carrick-xtask -- authority-debt"
-        ),
+        runs("macos-clippy", "just xtask authority-debt"),
         "compiled macOS authority profiles cannot be replaced by Linux discovery"
     );
 }

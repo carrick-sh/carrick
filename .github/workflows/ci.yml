@@ -20,8 +20,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Ephemeral hosted runners persist this bounded compiler cache via rust-cache.
-  SCCACHE_CACHE_SIZE: "1G"
+  # Only cache-warm publishes the three bounded hosted compiler caches.
+  SCCACHE_CACHE_SIZE: "3G"
   # Harden registry transport against intermittent network errors without retrying tests.
   CARGO_HTTP_MULTIPLEXING: "false"   # avoid HTTP/2 framing failures against the crates.io index
   CARGO_NET_RETRY: "10"              # transport retries for registry/download fetches only
@@ -30,6 +30,142 @@ env:
   CARRICK_AUTHORITY_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
 
 jobs:
+  xtask-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just,sccache@0.18.0
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - name: Configure compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Build lean xtask
+        run: just ci-prebuild-xtask
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: target/debug/carrick-xtask
+          retention-days: 1
+
+  # Trusted default-branch publishers only; PR and queue jobs never save.
+  cache-warm:
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: linux-x64
+            runner: ubuntu-latest
+          - family: darwin-hosted
+            runner: macos-15
+          - family: linux-arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just,sccache@0.18.0
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - name: Configure compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-${{ matrix.family }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Identify runner image for warm cross toolchains
+        id: warm-runner-image
+        if: matrix.family == 'linux-x64'
+        run: echo "id=${ImageOS}-${ImageVersion}" >> "$GITHUB_OUTPUT"
+      - name: Restore Linux cross toolchain packages for warming
+        if: matrix.family == 'linux-x64'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/apt-cross
+          key: apt-ci-install-linux-cross-${{ steps.warm-runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}
+          restore-keys: apt-ci-install-linux-cross-${{ steps.warm-runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-
+      - name: Restore BSD cross toolchain packages for warming
+        if: matrix.family == 'linux-x64'
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ runner.temp }}/apt-bsd
+          key: apt-ci-install-freebsd-cross-${{ steps.warm-runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}
+          restore-keys: apt-ci-install-freebsd-cross-${{ steps.warm-runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-
+      - name: Install the cross compiler union from existing package caches
+        if: matrix.family == 'linux-x64'
+        run: |
+          scripts/ci/apt-cached-install.sh "$RUNNER_TEMP/apt-cross" gcc-aarch64-linux-gnu
+          scripts/ci/apt-cached-install.sh "$RUNNER_TEMP/apt-bsd" clang llvm
+      - name: Warm native build and test compilation union
+        env:
+          FAMILY: ${{ matrix.family }}
+          RUSTC_WRAPPER: sccache
+          FBSD_VERSION: 14.3-RELEASE
+          FBSD_MAJOR: "14"
+          FBSD_SYSROOT: ${{ github.workspace }}/.freebsd-sysroot
+          NBSD_VERSION: "10.1"
+          NBSD_SYSROOT: ${{ github.workspace }}/.netbsd-sysroot
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: |
+          just ci-prebuild-xtask
+          case "$FAMILY" in
+            darwin-hosted)
+              just check
+              just build
+              just doc
+              just clippy
+              just xtask test-batch --no-run test
+              just xtask test-batch --no-run test-integration
+              just test-xtask --no-run
+              ;;
+            linux-x64)
+              just check
+              just check-kernel-portable
+              just ci-freebsd-sysroot
+              just ci-netbsd-sysroot
+              just check-linux
+              CC_x86_64_unknown_freebsd=clang CXX_x86_64_unknown_freebsd=clang++ AR_x86_64_unknown_freebsd=llvm-ar CFLAGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsd14 --sysroot=$FBSD_SYSROOT" CXXFLAGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsd14 --sysroot=$FBSD_SYSROOT" just check-freebsd
+              just check-netbsd
+              just cross-check-macos
+              just check-fuzz
+              just clippy-linux
+              just doc
+              just xtask test-batch --no-run test
+              just xtask test-batch --no-run test-integration
+              just test-xtask --no-run
+              just test-loom --no-run
+              just test-kernel-semantics --no-run
+              cargo test --locked --no-run -p carrick-host-linux
+              cargo test --locked --no-run -p carrick-softcpu-x86 --lib --tests
+              ;;
+            linux-arm64)
+              cargo check --locked -p carrick-kernel-example --tests
+              cargo build --locked -p carrick-kernel-example --tests
+              cargo test --locked --no-run -p carrick-kernel-example --tests
+              ;;
+          esac
+      - name: Save shared compiler cache
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-${{ matrix.family }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
   changes:
     name: changes
     runs-on: ubuntu-latest
@@ -46,7 +182,7 @@ jobs:
       # Only same-repository pull_request jobs run on the self-hosted
       # carrick-m4 ci runner (dedicated non-admin user, no sudo; #650).
       # Fork PRs, merge groups (which may queue fork code) and the
-      # cache-saving push/schedule events stay hosted, so no trusted or
+      # cache-saving schedule events stay hosted, so no trusted or
       # cache-publishing job shares that persistent host with PR code.
       macos_runner: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","macOS","ARM64","carrick-macos-ci"]' || '"macos-15"' }}
     steps:
@@ -61,12 +197,17 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -136,6 +277,7 @@ jobs:
   # Runs on every event so ci-ok can require plain success; it passes trivially
   # outside pull_request.
   commit-trailers:
+    needs: xtask-build
     name: commit-trailers
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -150,27 +292,34 @@ jobs:
       - name: Skip non-pull-request events
         if: github.event_name != 'pull_request'
         run: echo "commit-trailers (${{ github.event_name }}) is not a pull_request; passing."
+      - name: Download xtask
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: ${{ runner.temp }}/xtask
+      - name: Configure xtask artifact
+        run: |
+          chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
+          echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         if: github.event_name == 'pull_request'
         with:
           shared-key: gate-xtask-release
           cache-workspace-crates: "true"
+          cache-targets: false
           save-if: false
-      - name: Build xtask
-        if: github.event_name == 'pull_request'
-        run: cargo build --locked --release -p carrick-xtask
       - name: Enforce Co-Authored-By trailers
         if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: target/release/carrick-xtask commit-trailers check-range "$BASE_SHA..$HEAD_SHA"
+        run: '"$CARRICK_XTASK_BIN" commit-trailers check-range "$BASE_SHA..$HEAD_SHA"'
 
   # Independent checks keep reporting after an earlier check fails. No
   # continue-on-error: every failure still makes its job (and ci-ok) fail.
 
   lint:
-    needs: changes
+    needs: [changes, xtask-build]
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -186,16 +335,30 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: true
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Download xtask
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: ${{ runner.temp }}/xtask
+      - name: Configure xtask artifact
+        run: |
+          chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
+          echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Exact Linux and macOS unit shard coverage
@@ -232,7 +395,7 @@ jobs:
         run: just build-cache
 
   lint-domains:
-    needs: changes
+    needs: [changes, xtask-build]
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -252,16 +415,30 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Download xtask
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: ${{ runner.temp }}/xtask
+      - name: Configure xtask artifact
+        run: |
+          chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
+          echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Install Semgrep
@@ -276,7 +453,7 @@ jobs:
         run: just build-cache
 
   portable:
-    needs: changes
+    needs: [changes, xtask-build]
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -291,18 +468,32 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Compiler cache fallback without sccache
         run: cargo test -p carrick-xtask --test build_cache
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Download xtask
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: ${{ runner.temp }}/xtask
+      - name: Configure xtask artifact
+        run: |
+          chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
+          echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Identify the runner image for the apt cache
@@ -332,7 +523,7 @@ jobs:
             echo "key=apt-ci-install-linux-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
           fi
       - name: Save cross toolchain packages
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
         uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ runner.temp }}/apt-cross
@@ -352,7 +543,7 @@ jobs:
         run: just build-cache
 
   loom:
-    needs: changes
+    needs: [changes, xtask-build]
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     # The fd-core model alone runs about 15 minutes on an M-class core.
@@ -368,16 +559,30 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Download xtask
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: ${{ runner.temp }}/xtask
+      - name: Configure xtask artifact
+        run: |
+          chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
+          echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Loom protocol models (first entry, fd, kernel wake, terminal clear, invalidation domain)
@@ -389,7 +594,7 @@ jobs:
         run: just build-cache
 
   linux-doc:
-    needs: changes
+    needs: [changes, xtask-build]
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -404,19 +609,33 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
+          cache-targets: false
           workspaces: |
             . -> target
             fuzz -> target
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Download xtask
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: ${{ runner.temp }}/xtask
+      - name: Configure xtask artifact
+        run: |
+          chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
+          echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Linux crate rustdoc (including Linux host and KVM modules)
@@ -451,12 +670,17 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: true
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -468,7 +692,7 @@ jobs:
         run: just clippy
       - name: Live host-authority compiler census
         if: ${{ !cancelled() }}
-        run: cargo run --locked -p carrick-xtask -- authority-debt
+        run: just xtask authority-debt
 
       - name: Compiler cache statistics
         if: ${{ always() }}
@@ -490,12 +714,17 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -531,12 +760,17 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -567,12 +801,17 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -603,12 +842,17 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-darwin-hosted-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -624,7 +868,7 @@ jobs:
         run: just build-cache
 
   cross-check-linux:
-    needs: changes
+    needs: [changes, xtask-build]
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -639,16 +883,30 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Download xtask
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: ${{ runner.temp }}/xtask
+      - name: Configure xtask artifact
+        run: |
+          chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
+          echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: aarch64 Linux cross-check and no-HVF closure
@@ -705,12 +963,17 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-arm64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -726,7 +989,7 @@ jobs:
         run: just build-cache
 
   cross-check-freebsd:
-    needs: changes
+    needs: [changes, xtask-build]
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -746,16 +1009,30 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Download xtask
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: ${{ runner.temp }}/xtask
+      - name: Configure xtask artifact
+        run: |
+          chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
+          echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Identify the runner image for the apt cache
@@ -785,20 +1062,26 @@ jobs:
             echo "key=apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
           fi
       - name: Save cross toolchain packages
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
         uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ runner.temp }}/apt-cross
           key: ${{ steps.apt-cross-key.outputs.key }}
       - name: Cache FreeBSD sysroot
         id: fbsd-sysroot
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.FBSD_SYSROOT }}
           key: freebsd-sysroot-${{ env.FBSD_VERSION }}
       - name: Fetch FreeBSD headers and libraries from permanent archive
         if: ${{ !cancelled() && steps.fbsd-sysroot.outputs.cache-hit != 'true' }}
         run: just ci-freebsd-sysroot
+      - name: Save FreeBSD sysroot on trusted main runs
+        if: ${{ success() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.FBSD_SYSROOT }}
+          key: freebsd-sysroot-${{ env.FBSD_VERSION }}
       - name: Cross-check FreeBSD CLI and runtime (including tests)
         if: ${{ !cancelled() }}
         env:
@@ -817,7 +1100,7 @@ jobs:
         run: just build-cache
 
   cross-check-netbsd:
-    needs: changes
+    needs: [changes, xtask-build]
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -836,16 +1119,30 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Download xtask
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: ${{ runner.temp }}/xtask
+      - name: Configure xtask artifact
+        run: |
+          chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
+          echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Identify the runner image for the apt cache
@@ -875,20 +1172,26 @@ jobs:
             echo "key=apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
           fi
       - name: Save cross toolchain packages
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
         uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ runner.temp }}/apt-cross
           key: ${{ steps.apt-cross-key.outputs.key }}
       - name: Cache NetBSD sysroot
         id: nbsd-sysroot
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.NBSD_SYSROOT }}
           key: netbsd-authority-sysroot-${{ env.NBSD_VERSION }}
       - name: Fetch NetBSD C headers from permanent archive
         if: ${{ !cancelled() && steps.nbsd-sysroot.outputs.cache-hit != 'true' }}
         run: just ci-netbsd-sysroot
+      - name: Save NetBSD sysroot on trusted main runs
+        if: ${{ success() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.NBSD_SYSROOT }}
+          key: netbsd-authority-sysroot-${{ env.NBSD_VERSION }}
       - name: Cross-check NetBSD NVMM backend (including tests)
         if: ${{ !cancelled() }}
         run: just check-netbsd
@@ -901,7 +1204,7 @@ jobs:
         run: just build-cache
 
   cross-check-macos:
-    needs: changes
+    needs: [changes, xtask-build]
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -917,16 +1220,30 @@ jobs:
         run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - name: Restore shared compiler cache (read-only)
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-linux-x64-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          cache-targets: false
+          save-if: false
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Download xtask
+        uses: actions/download-artifact@v4
+        with:
+          name: xtask-linux-x64
+          path: ${{ runner.temp }}/xtask
+      - name: Configure xtask artifact
+        run: |
+          chmod +x "$RUNNER_TEMP/xtask/carrick-xtask"
+          echo "CARRICK_XTASK_BIN=$RUNNER_TEMP/xtask/carrick-xtask" >> "$GITHUB_ENV"
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Identify the runner image for the apt cache
@@ -956,7 +1273,7 @@ jobs:
             echo "key=apt-ci-install-freebsd-cross-${{ steps.runner-image.outputs.id }}-${{ hashFiles('scripts/ci/apt-cached-install.sh') }}-partial-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
           fi
       - name: Save cross toolchain packages
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
         uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ runner.temp }}/apt-cross
@@ -975,6 +1292,7 @@ jobs:
     if: always()
     needs:
       - changes
+      - xtask-build
       - actionlint
       - linked-issue
       - commit-trailers

@@ -461,3 +461,43 @@ fn signed_gate_recipes_remove_ambient_target_overrides() {
         );
     }
 }
+
+#[test]
+fn artifact_serves_admission_and_direct_xtask_calls_without_cargo_bootstrap() {
+    let build = Build::new();
+    symlink(find("bash"), build.root.path().join("bin/bash")).unwrap();
+    let artifact = build.root.path().join("xtask artifact");
+    let log = build.root.path().join("calls");
+    fs::write(&artifact, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$XTASK_LOG\"\nif [ \"$1\" = worktree-run ]; then shift 2; exec \"$@\"; fi\n").unwrap();
+    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o755)).unwrap();
+    for (recipe, args) in [
+        ("ci-prebuild-xtask", vec![]),
+        ("xtask", vec!["authority-debt"]),
+        (
+            "authority-check-cross",
+            vec!["x86_64-unknown-freebsd", "clang", "", "llvm-ar"],
+        ),
+        ("xtask", vec!["test-batch", "_test-unit-workspace"]),
+    ] {
+        passed(
+            build
+                .command(recipe)
+                .args(args)
+                .env("CARRICK_XTASK_BIN", &artifact)
+                .env("XTASK_LOG", &log)
+                .output()
+                .unwrap(),
+        );
+    }
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains("authority-debt"));
+    assert!(calls.contains("--cross-target x86_64-unknown-freebsd"));
+    assert!(calls.contains("test-batch"));
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.starts_with("worktree-run --"))
+            .count(),
+        3
+    );
+}

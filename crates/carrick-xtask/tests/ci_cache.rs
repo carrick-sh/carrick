@@ -1,83 +1,69 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[test]
-fn hosted_caches_keep_profiles_compiler_data_and_bootstrap_artifacts() {
+fn only_trusted_warmer_publishes_bounded_shared_compiler_caches() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     let documents = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
     let workflow = &documents[0];
-    let mut cached_jobs = 0;
-    for (job, body) in workflow["jobs"].as_hash().unwrap() {
-        if job.as_str() == Some("commit-trailers") {
-            // commit-trailers reuses the cheap gate-xtask-release cache without sccache.
-            continue;
-        }
+    assert_eq!(workflow["env"]["SCCACHE_CACHE_SIZE"].as_str(), Some("3G"));
+    let jobs = workflow["jobs"].as_hash().unwrap();
+    for (job, body) in jobs {
         let Some(steps) = body["steps"].as_vec() else {
             continue;
         };
-        let Some(cache) = steps.iter().find(|s| {
-            s["uses"]
+        for step in steps {
+            let Some(action) = step["uses"].as_str() else {
+                continue;
+            };
+            assert!(
+                !action.starts_with("actions/cache@"),
+                "cache readers must use restore-only actions"
+            );
+            if action.starts_with("actions/cache/save@") && job.as_str() != Some("cache-warm") {
+                let condition = step["if"].as_str().unwrap();
+                assert!(condition.contains("refs/heads/main"));
+                assert!(condition.contains("'schedule'"));
+                assert!(condition.contains("'workflow_dispatch'"));
+            }
+            if action.starts_with("Swatinem/rust-cache@") {
+                assert_eq!(step["with"]["save-if"].as_bool(), Some(false), "{job:?}");
+                assert!(step["with"]["cache-directories"].is_badvalue());
+                assert_eq!(
+                    step["with"]["cache-targets"].as_bool(),
+                    Some(matches!(job.as_str(), Some("lint" | "macos-clippy")))
+                );
+            }
+            if step["with"]["key"]
                 .as_str()
-                .is_some_and(|s| s.starts_with("Swatinem/rust-cache@"))
-        }) else {
-            continue;
-        };
-        cached_jobs += 1;
-        let configured = steps
-            .iter()
-            .position(|s| {
-                s["run"].as_str()
-                    == Some("echo \"SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache\" >> \"$GITHUB_ENV\"")
-            })
-            .unwrap();
-        let restored = steps.iter().position(|s| s == cache).unwrap();
-        assert!(
-            configured < restored,
-            "compiler cache path must be set before restore"
-        );
-        assert_eq!(
-            cache["with"]["shared-key"].as_str(),
-            Some("${{ github.job }}-debug"),
-            "{job:?}"
-        );
-        assert_eq!(
-            cache["with"]["cache-directories"].as_str(),
-            Some("${{ env.SCCACHE_DIR }}")
-        );
-        assert_eq!(
-            cache["with"]["cache-workspace-crates"].as_str(),
-            Some("true")
-        );
-        assert!(
-            steps
-                .iter()
-                .any(|s| s["run"].as_str() == Some("just ci-prebuild-xtask"))
-        );
-        assert!(
-            steps
-                .iter()
-                .any(|s| s["run"].as_str() == Some("just build-cache")
-                    && s["if"].as_str() == Some("${{ always() }}"))
-        );
+                .is_some_and(|k| k.starts_with("sccache-"))
+            {
+                assert!(
+                    step["with"]["key"]
+                        .as_str()
+                        .unwrap()
+                        .contains("hashFiles('Cargo.lock', 'rust-toolchain.toml')")
+                );
+                if action.starts_with("actions/cache/save@") {
+                    assert_eq!(job.as_str(), Some("cache-warm"));
+                } else {
+                    assert!(action.starts_with("actions/cache/restore@"));
+                }
+            }
+        }
     }
+    let warmer = &workflow["jobs"]["cache-warm"];
+    let condition = warmer["if"].as_str().unwrap();
+    assert!(condition.contains("'schedule'"));
+    assert!(condition.contains("'workflow_dispatch'"));
+    assert!(condition.contains("refs/heads/main"));
+    let families = warmer["strategy"]["matrix"]["include"].as_vec().unwrap();
+    assert_eq!(families.len(), 3);
     assert!(
-        cached_jobs > 0,
-        "hosted compiler caches must remain enabled"
+        families
+            .iter()
+            .all(|f| !f["runner"].as_str().unwrap().contains("self-hosted"))
     );
-    let text = std::fs::read_to_string(root.join(".github/workflows/kernel-runtime.yml")).unwrap();
-    let documents = yaml_rust2::YamlLoader::load_from_str(&text).unwrap();
-    let steps = documents[0]["jobs"]["hvf-kernel"]["steps"]
-        .as_vec()
-        .unwrap();
-    let cache = steps
-        .iter()
-        .find(|s| {
-            s["uses"]
-                .as_str()
-                .is_some_and(|s| s.starts_with("Swatinem/rust-cache@"))
-        })
-        .unwrap();
-    assert!(cache["with"]["save-if"].is_badvalue());
 }
 
 #[test]
@@ -138,8 +124,12 @@ fn cross_toolchain_installs_restore_their_package_cache_first() {
                     .as_str()
                     .is_some_and(|uses| uses.starts_with("actions/cache/save@"))
             );
-            // Saved after a failed install too: only cancellation skips it.
-            assert_eq!(save["if"].as_str(), Some("${{ !cancelled() }}"));
+            // Trusted main runs retain partial installs; PR/queue readers never publish.
+            let condition = save["if"].as_str().unwrap();
+            assert!(condition.contains("!cancelled()"));
+            assert!(condition.contains("refs/heads/main"));
+            assert!(condition.contains("'schedule'"));
+            assert!(condition.contains("'workflow_dispatch'"));
             assert_eq!(
                 save["with"]["key"].as_str(),
                 Some("${{ steps.apt-cross-key.outputs.key }}")
