@@ -152,6 +152,13 @@ pub(crate) fn comment_digest(comment: &Value) -> String {
 }
 
 pub fn validate_event(event: &Value, triggering_actor: &str) -> Result<Dispatch, ScalerError> {
+    validate_event_with_publication(event, triggering_actor, None)
+}
+fn validate_event_with_publication(
+    event: &Value,
+    triggering_actor: &str,
+    publication: Option<&PublishedPr>,
+) -> Result<Dispatch, ScalerError> {
     let review = event.get("review").is_some();
     let comment = event.get("comment").is_some();
     if event["repository"]["full_name"] != REPOSITORY
@@ -197,7 +204,8 @@ pub fn validate_event(event: &Value, triggering_actor: &str) -> Result<Dispatch,
     let branch = if resume {
         let pr = &event["pull_request"];
         let branch = pr["head"]["ref"].as_str().unwrap_or_default();
-        if event["issue"]["state"] != "open" || !owned_pr(pr, &event["dispatch_run"], issue, branch)
+        if event["issue"]["state"] != "open"
+            || !owned_pr(pr, &event["dispatch_run"], issue, branch, publication)
         {
             return Err(ScalerError::Guard(
                 "trigger requires an open issue and owned dispatch PR",
@@ -941,14 +949,88 @@ fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
 }
 /// Only publication writes use the scoped App credential. Reads and comments
 /// continue to inherit the job token from the runner's environment.
-fn publish_token() -> Option<String> {
-    std::env::var("DISPATCH_PUBLISH_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty())
+struct PublishCredential<'a> {
+    app: Option<String>,
+    job: &'a str,
+    wrote: bool,
 }
-fn publish_gh(root: &Path, args: &[&str], job_token: &str) -> Result<String, ScalerError> {
-    let token = publish_token();
-    gh_with_token(root, args, Some(token.as_deref().unwrap_or(job_token)))
+impl<'a> PublishCredential<'a> {
+    fn new(job: &'a str) -> Self {
+        Self {
+            app: std::env::var("DISPATCH_PUBLISH_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            job,
+            wrote: false,
+        }
+    }
+    fn write<T>(
+        &mut self,
+        mut operation: impl FnMut(&str) -> Result<T, ScalerError>,
+    ) -> Result<T, ScalerError> {
+        let mut result = operation(self.app.as_deref().unwrap_or(self.job));
+        if self.app.is_some()
+            && result
+                .as_ref()
+                .is_err_and(|e| publish_auth_failure(&e.to_string()))
+        {
+            self.app = None;
+            result = operation(self.job);
+        }
+        if result.is_ok() {
+            self.wrote = true;
+        }
+        if self.app.is_none() && self.wrote {
+            Applied::record(|a| a.ci_requires_owner = true)?;
+        }
+        result
+    }
+    fn gh(&mut self, root: &Path, args: &[&str]) -> Result<String, ScalerError> {
+        self.write(|token| gh_with_token(root, args, Some(token)))
+    }
+}
+fn publish_auth_failure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    if [
+        "http 403",
+        "http/1.1 403",
+        "http/2 403",
+        "returned error: 403",
+        "[rejected]",
+        "stale info",
+        "lease rejection",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+    {
+        return false;
+    }
+    [
+        "bad credentials",
+        "http 401",
+        "http/1.1 401",
+        "http/2 401",
+        "returned error: 401",
+        "authentication failed",
+        "could not read username",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
+fn publish_permission_failure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase().replace(['`', '\'', '"'], "");
+    [
+        "http 403",
+        "http/1.1 403",
+        "http/2 403",
+        "returned error: 403",
+        "permission denied",
+        "workflows permission",
+        "workflow permission",
+        "write access to repository not granted",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
 }
 fn gh_with_token(root: &Path, args: &[&str], token: Option<&str>) -> Result<String, ScalerError> {
     let endpoint = match args {
@@ -1244,19 +1326,57 @@ pub(crate) fn dispatch_run_identity(run: &Value, issue: Option<u64>) -> bool {
         })
 }
 
-fn dispatch_bot(user: &Value) -> bool {
-    user["type"] == "Bot"
-        && matches!(
-            user["login"].as_str(),
-            Some("github-actions[bot]" | "carrick-workers[bot]")
-        )
+fn dispatch_comment_author(user: &Value) -> bool {
+    user["type"] == "Bot" && user["login"] == "github-actions[bot]"
+}
+fn publish_app_author(user: &Value) -> bool {
+    user["type"] == "Bot" && user["login"] == "carrick-workers[bot]"
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationRecord {
+    issue: u64,
+    branch: String,
+    publication_pr: u64,
+}
+/// Created only from a successful server write or authenticated run evidence.
+pub(crate) struct PublishedPr(PublicationRecord);
+impl PublishedPr {
+    fn matches(&self, pr: &Value, issue: u64, branch: &str) -> bool {
+        self.0.issue == issue
+            && self.0.branch == branch
+            && pr["number"].as_u64() == Some(self.0.publication_pr)
+    }
+}
+pub(crate) type PublicationLookup<'a> =
+    dyn FnMut(&Value, &Value, u64, &str) -> Option<PublishedPr> + 'a;
+/// The controller uses the same authenticated artifact/comment resolver as the
+/// hosted guard and tool server. Every gh destination is repository-explicit.
+pub(crate) fn recorded_publication(
+    pr: &Value,
+    run: &Value,
+    issue: u64,
+    branch: &str,
+) -> Option<PublishedPr> {
+    let limit = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = COMMAND_DEADLINE.with(|slot| slot.get().map_or(limit, |d| d.min(limit)));
+    let _window = CommandWindow::until(deadline);
+    agent_loop::RunCache::for_controller().publication(Path::new("."), pr, run, issue, branch)
 }
 
-pub(crate) fn owned_pr(pr: &Value, run: &Value, issue: u64, branch: &str) -> bool {
+pub(crate) fn owned_pr(
+    pr: &Value,
+    run: &Value,
+    issue: u64,
+    branch: &str,
+    publication: Option<&PublishedPr>,
+) -> bool {
     let Ok(id) = branch_run(issue, branch) else {
         return false;
     };
-    dispatch_bot(&pr["user"])
+    (dispatch_comment_author(&pr["user"])
+        || (publish_app_author(&pr["user"])
+            && publication.is_some_and(|p| p.matches(pr, issue, branch))))
         && pr["head"]["repo"]["full_name"] == REPOSITORY
         && pr["head"]["ref"] == branch
         && pr["base"]["ref"] == "main"
@@ -1284,7 +1404,36 @@ fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerErr
         .into_iter()
         .flatten()
     {
-        if owned_pr(pr, &run, dispatch.issue, &dispatch.branch) {
+        let publication = if publish_app_author(&pr["user"]) {
+            let local = branch_run(dispatch.issue, &dispatch.branch)? == run_id()?
+                && Applied::load()?.publication_pr == pr["number"].as_u64();
+            if local {
+                pr["number"].as_u64().map(|number| {
+                    PublishedPr(PublicationRecord {
+                        issue: dispatch.issue,
+                        branch: dispatch.branch.clone(),
+                        publication_pr: number,
+                    })
+                })
+            } else {
+                agent_loop::RunCache::default().publication(
+                    root,
+                    pr,
+                    &run,
+                    dispatch.issue,
+                    &dispatch.branch,
+                )
+            }
+        } else {
+            None
+        };
+        if owned_pr(
+            pr,
+            &run,
+            dispatch.issue,
+            &dispatch.branch,
+            publication.as_ref(),
+        ) {
             return Ok(pr.clone());
         }
     }
@@ -1419,6 +1568,10 @@ fn select_base(
         .ok_or(ScalerError::Guard("missing admitted base SHA"))
 }
 
+fn authenticated_api(root: &Path, endpoint: &str) -> Result<Value, ScalerError> {
+    Ok(serde_json::from_str(&gh(root, &["api", endpoint])?)?)
+}
+
 fn api(root: &Path, endpoint: &str) -> Result<Value, ScalerError> {
     let response = if std::env::var_os("GH_TOKEN").is_some() {
         gh(root, &["api", endpoint])?
@@ -1487,6 +1640,8 @@ pub(crate) fn load_event(root: &Path, path: &Path) -> Result<Value, ScalerError>
         }
         event["pull_request"] = live;
         event["dispatch_run"] = api(root, &format!("repos/{REPOSITORY}/actions/runs/{id}"))?;
+        // Validate the exact App PR against server evidence before producing a
+        // private admission. validate_event receives that proof separately.
         event["issue"] = api(root, &format!("repos/{REPOSITORY}/issues/{issue}"))?;
     }
     Ok(event)
@@ -1496,7 +1651,7 @@ pub(crate) fn load_event(root: &Path, path: &Path) -> Result<Value, ScalerError>
 fn select_owned_pr(
     issue: u64,
     prs: &[Value],
-    mut run: impl FnMut(&str) -> Result<Value, ScalerError>,
+    mut run: impl FnMut(&Value, &str) -> Result<(Value, Option<PublishedPr>), ScalerError>,
 ) -> Result<Option<Value>, ScalerError> {
     let mut selected = None;
     for pr in prs.iter().filter(|pr| pr["state"] == "open") {
@@ -1504,8 +1659,8 @@ fn select_owned_pr(
         if dispatch_branch(branch) != Some(issue) {
             continue;
         }
-        let original = run(branch_run(issue, branch)?)?;
-        if owned_pr(pr, &original, issue, branch) {
+        let (original, publication) = run(pr, branch_run(issue, branch)?)?;
+        if owned_pr(pr, &original, issue, branch, publication.as_ref()) {
             if selected.is_some() {
                 return Err(ScalerError::Guard("multiple open owned dispatch PRs"));
             }
@@ -1568,9 +1723,25 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         DispatchAction::Guard { event, admit, .. } => (event, admit),
     };
     let event = load_event(&root, &event_path)?;
-    let mut dispatch = validate_event(
+    let publication = if publish_app_author(&event["pull_request"]["user"]) {
+        let branch = event["pull_request"]["head"]["ref"]
+            .as_str()
+            .unwrap_or_default();
+        let issue = event["issue"]["number"].as_u64().unwrap_or_default();
+        agent_loop::RunCache::default().publication(
+            &root,
+            &event["pull_request"],
+            &event["dispatch_run"],
+            issue,
+            branch,
+        )
+    } else {
+        None
+    };
+    let mut dispatch = validate_event_with_publication(
         &event,
         &std::env::var("GITHUB_TRIGGERING_ACTOR").unwrap_or_default(),
+        publication.as_ref(),
     )?;
     dispatch.base = admitted_base(dispatch.review || event.get("comment").is_some())?;
     if admit {
@@ -2259,7 +2430,7 @@ impl Applied {
                     .join(", ")
             },
             if self.ci_requires_owner {
-                "\n- CI won't start automatically: publication used the job token because DISPATCH_PUBLISH_TOKEN is empty or absent; mark the PR ready to start CI."
+                "\n- CI won't start automatically: publication used the job token; mark the PR ready to start CI."
             } else {
                 ""
             }
@@ -2377,9 +2548,9 @@ fn proposed_pr_body(
     if text.len() > 8192 {
         return Err(ScalerError::Guard("PR body exceeds 8 KiB"));
     }
-    if text.contains("Outcome contract:") {
+    if text.contains("Outcome contract:") || text.contains("Publication receipt:") {
         return Err(ScalerError::Guard(
-            "PR body contains a reserved Outcome contract: marker",
+            "PR body contains a reserved server report marker",
         ));
     }
     let canonical = format!("Closes #{issue}");
@@ -2512,12 +2683,17 @@ fn template_pr_body(
     Ok(final_pr_body(&text, issue, id, token))
 }
 
-fn patch_pr_body(root: &Path, number: u64, body: &str, token: &str) -> Result<(), ScalerError> {
+fn patch_pr_body(
+    root: &Path,
+    number: u64,
+    body: &str,
+    credential: &mut PublishCredential<'_>,
+) -> Result<(), ScalerError> {
     // Recovery may restore text written before mention protection was installed.
-    let body = neutralize_mentions(&agent_loop::masked(body, token));
+    let body = neutralize_mentions(&agent_loop::masked(body, credential.job));
     let path = crate::agent_runner::state()?.join("pr-body.md");
     std::fs::write(&path, body)?;
-    publish_gh(
+    credential.gh(
         root,
         &[
             "api",
@@ -2527,7 +2703,6 @@ fn patch_pr_body(root: &Path, number: u64, body: &str, token: &str) -> Result<()
             "-F",
             &format!("body=@{}", path.display()),
         ],
-        token,
     )?;
     Ok(())
 }
@@ -2785,13 +2960,13 @@ fn restore_pr_body(
     replacement: (&str, &str),
     expected: &ClosingIssues,
     failure: &str,
-    token: &str,
+    credential: &mut PublishCredential<'_>,
     check: &mut ReferenceCheck<impl ReferenceHost>,
 ) -> Result<String, ScalerError> {
     check.recovery = true;
     let _window = CommandWindow::until(check.deadline());
     let (body, label) = replacement;
-    let (reason, manual) = match patch_pr_body(root, number, body, token) {
+    let (reason, manual) = match patch_pr_body(root, number, body, credential) {
         Err(error) => (
             format!("{failure}; {label} was not restored: {error}"),
             true,
@@ -2806,7 +2981,7 @@ fn restore_pr_body(
             ),
         },
     };
-    let reason = agent_loop::masked(&reason, token);
+    let reason = agent_loop::masked(&reason, credential.job);
     Applied::record(|a| {
         a.body = AppliedBody::Failed(reason.clone());
         a.manual_repair = manual.then(|| reason.clone());
@@ -2864,7 +3039,7 @@ fn publish(
     token: &str,
     runs: &mut agent_loop::RunCache,
 ) -> Result<Option<u64>, ScalerError> {
-    let publish_token = publish_token();
+    let mut credential = PublishCredential::new(token);
     let mut check = ReferenceCheck::new(reference_host());
     // Push, snapshot and write share the primary window; recovery alone may
     // use its reserved thirty seconds, without extending the caller's budget.
@@ -3009,17 +3184,17 @@ fn publish(
                 } else {
                     commits.clone()
                 };
-                let mut push = push_command(&work, dispatch, id, &receipt.expected_tip)?;
-                push.env("GH_TOKEN", publish_token.as_deref().unwrap_or(token))
-                    .env_remove("GITHUB_TOKEN");
-                output(&mut push).map_err(|error| {
-                    if publish_token.is_some() {
+                credential.write(|token| {
+                    let mut push = push_command(&work, dispatch, id, &receipt.expected_tip)?;
+                    push.env("GH_TOKEN", token).env_remove("GITHUB_TOKEN");
+                    output(&mut push)
+                }).map_err(|error| {
+                    if credential.app.is_some() && publish_permission_failure(&error.to_string()) {
                         ScalerError::Usage(format!("App token push refused (requires contents write; workflow files are not permitted): {error}"))
                     } else { error }
                 })?;
             }
             Applied::record(|a| {
-                a.ci_requires_owner = publish_token.is_none();
                 a.commits = commits;
                 a.new_commits = new_commits;
                 a.published_checkpoint = receipt.checkpointed;
@@ -3064,7 +3239,7 @@ fn publish(
                 let mut expected: ClosingIssues =
                     previous.all.difference(&previous.body).cloned().collect();
                 expected.insert(issue_reference(dispatch.issue));
-                patch_pr_body(root, number, &body, token)?;
+                patch_pr_body(root, number, &body, &mut credential)?;
                 if let Err(error) = check.verify(root, number, &expected) {
                     if matches!(error, ReferenceFailure::Deadline) {
                         return Err(ScalerError::Usage(keep_unverified_body(&error, token)?));
@@ -3075,7 +3250,7 @@ fn publish(
                         (pr["body"].as_str().unwrap_or_default(), "previous body"),
                         &expected,
                         &error.to_string(),
-                        token,
+                        &mut credential,
                         &mut check,
                     )?;
                     return Err(ScalerError::Usage(reason));
@@ -3098,7 +3273,13 @@ fn publish(
             };
             let path = state.join("pr-body.md");
             std::fs::write(&path, body)?;
-            publish_gh(
+            // A later run cannot add a publication binding to the immutable
+            // creation run's artifacts. Use Actions identity for this recovery
+            // create so the original run's branch remains independently owned.
+            if id != run_id()? {
+                credential.app = None;
+            }
+            let created = credential.gh(
                 root,
                 &[
                     "pr",
@@ -3115,8 +3296,15 @@ fn publish(
                     "--body-file",
                     path.to_str().ok_or(ScalerError::Guard("body path"))?,
                 ],
-                token,
             )?;
+            let created_number = created
+                .trim()
+                .strip_prefix(&format!("https://github.com/{REPOSITORY}/pull/"))
+                .filter(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+                .and_then(|n| n.parse::<u64>().ok())
+                .filter(|n| *n > 0)
+                .ok_or(ScalerError::Guard("invalid created PR URL"))?;
+            Applied::record(|a| a.publication_pr = Some(created_number))?;
             let number = require_owned_pr(root, dispatch)?["number"]
                 .as_u64()
                 .ok_or(ScalerError::Guard("invalid PR number"))?;
@@ -3142,7 +3330,7 @@ fn publish(
                     (&fallback, "default template"),
                     &expected,
                     &error.to_string(),
-                    token,
+                    &mut credential,
                     &mut check,
                 )?;
                 return Err(ScalerError::Usage(reason));
@@ -3637,22 +3825,73 @@ mod tests {
         publication_fixture("timeout");
     }
     #[test]
+    fn shared_app_pr_without_publication_binding_is_not_owned() {
+        let event = review_event();
+        let mut pr = event["pull_request"].clone();
+        pr["user"]["login"] = "carrick-workers[bot]".into();
+        assert!(
+            !owned_pr(
+                &pr,
+                &event["dispatch_run"],
+                634,
+                "work/dispatch-634-42",
+                None
+            ),
+            "shared App PR without authenticated publication_pr is owned"
+        );
+    }
+    #[test]
+    fn publish_recovery_create_on_prior_branch_remains_owned() {
+        publication_fixture("publish-token-recovery-create");
+    }
+    #[test]
+    fn publish_auth_failure_on_push_falls_back_once() {
+        publication_fixture("publish-token-auth-push");
+    }
+    #[test]
+    fn publish_auth_failure_on_create_after_push_falls_back_once() {
+        publication_fixture("publish-token-auth-create");
+    }
+    #[test]
+    fn publish_auth_failure_on_patch_falls_back_once() {
+        publication_fixture("publish-token-auth-patch");
+    }
+    #[test]
+    fn publish_lease_rejection_is_not_retried_or_labelled_permission() {
+        publication_fixture("publish-token-lease");
+    }
+    #[test]
+    fn publish_network_error_is_not_labelled_permission() {
+        publication_fixture("publish-token-network");
+    }
+    #[test]
+    fn publish_noop_does_not_claim_job_token_fallback() {
+        publication_fixture("publish-empty-noop");
+    }
+    #[test]
     fn publish_token_app_pr_retains_authenticated_dispatch_ownership() {
         let event = review_event();
         let mut pr = event["pull_request"].clone();
+        let publication = PublishedPr(PublicationRecord {
+            issue: 634,
+            branch: "work/dispatch-634-42".into(),
+            publication_pr: 800,
+        });
         pr["user"]["login"] = "carrick-workers[bot]".into();
         assert!(owned_pr(
             &pr,
             &event["dispatch_run"],
             634,
-            "work/dispatch-634-42"
+            "work/dispatch-634-42",
+            Some(&publication)
         ));
         pr["user"]["login"] = "another-app[bot]".into();
         assert!(!owned_pr(
             &pr,
             &event["dispatch_run"],
             634,
-            "work/dispatch-634-42"
+            "work/dispatch-634-42",
+            Some(&publication)
         ));
     }
     #[test]
@@ -3703,8 +3942,17 @@ for arg do
    fi
    if test -f "$RUNNER_TEMP/remote-tip"; then cat "$RUNNER_TEMP/remote-tip"; fi; exit 0 ;;
  push)
- test "$GH_TOKEN" = "${DISPATCH_TEST_WRITE_TOKEN:-fixture-token}" || { echo 'push did not use publish credential' >&2; exit 89; }
- if test -f "$RUNNER_TEMP/refuse-push"; then echo 'refusing to allow an App to create or update workflow without workflows permission' >&2; exit 88; fi
+ kind=app; test "$GH_TOKEN" != fixture-token || kind=job
+ printf '%s\n' "$kind" >> "$RUNNER_TEMP/push-attempts"
+ if test -f "$RUNNER_TEMP/publish-mode"; then
+  mode=$(cat "$RUNNER_TEMP/publish-mode")
+  if test "$mode" = publish-token-auth-push && test "$kind" = app; then touch "$RUNNER_TEMP/publish-fallback"; echo 'fatal: Authentication failed' >&2; exit 87; fi
+  if test "$mode" = publish-token-lease; then echo 'rejected: stale info (lease rejection)' >&2; exit 86; fi
+  if test "$mode" = publish-token-network; then echo 'fatal: unable to access remote: Could not resolve host' >&2; exit 85; fi
+ fi
+ if test -f "$RUNNER_TEMP/publish-fallback"; then expected=fixture-token; else expected=${DISPATCH_TEST_WRITE_TOKEN:-fixture-token}; fi
+ test "$GH_TOKEN" = "$expected" || { echo 'push did not use publish credential' >&2; exit 89; }
+ if test -f "$RUNNER_TEMP/refuse-push"; then echo 'refusing to allow a GitHub App to create or update workflow without `workflows` permission' >&2; exit 88; fi
  printf '%s\n' "$@" >> "$RUNNER_TEMP/push.args"; /usr/bin/git rev-parse HEAD > "$RUNNER_TEMP/remote-tip"; exit 0 ;;
  esac
 done
@@ -3719,11 +3967,23 @@ case "$1 $2 $3" in
  'pr create '*|'api -X PATCH') expected=${DISPATCH_TEST_WRITE_TOKEN:-fixture-token} ;;
  *) expected=fixture-token ;;
 esac
+if test -f "$RUNNER_TEMP/publish-fallback"; then expected=fixture-token; fi
+if test "$1 $2" = 'pr create' && test -f "$RUNNER_TEMP/publish-mode" && test "$(cat "$RUNNER_TEMP/publish-mode")" = publish-token-recovery-create; then expected=fixture-token; fi
+if test "$1 $2" = 'pr create' && test -f "$RUNNER_TEMP/publish-mode"; then
+ kind=app; test "$GH_TOKEN" != fixture-token || kind=job
+ printf '%s\n' "$kind" >> "$RUNNER_TEMP/create-attempts"
+ if test "$(cat "$RUNNER_TEMP/publish-mode")" = publish-token-auth-create && test "$kind" = app; then touch "$RUNNER_TEMP/publish-fallback"; echo 'gh: Bad credentials (HTTP 401)' >&2; exit 84; fi
+fi
 test "$GH_TOKEN" = "$expected" || { echo 'GitHub call used wrong credential' >&2; exit 89; }
 if test "$1" = api; then
  case "$2" in
  -X)
  test "$3" = PATCH || exit 96
+ if test -f "$RUNNER_TEMP/publish-mode"; then
+  kind=app; test "$GH_TOKEN" != fixture-token || kind=job
+  printf '%s\n' "$kind" >> "$RUNNER_TEMP/patch-attempts"
+  if test "$(cat "$RUNNER_TEMP/publish-mode")" = publish-token-auth-patch && test "$kind" = app; then touch "$RUNNER_TEMP/publish-fallback"; echo 'gh: Bad credentials (HTTP 401)' >&2; exit 84; fi
+ fi
  test ! -f "$RUNNER_TEMP/fail-edit" || exit 94
  if test -f "$RUNNER_TEMP/reference-mode" && test "$(cat "$RUNNER_TEMP/reference-mode")" = restore-fail && test "$(cat "$RUNNER_TEMP/body-writes")" = 2; then exit 98; fi
  cp "${6#body=@}" "$RUNNER_TEMP/applied-body.md"
@@ -3767,6 +4027,12 @@ elif test "$1 $2" = 'pr edit'; then
 elif test "$1 $2" = 'pr create'; then
  test ! -f "$RUNNER_TEMP/created" || exit 92
  touch "$RUNNER_TEMP/created"
+ if test "$GH_TOKEN" = fixture-token; then
+  /usr/bin/python3 - "$RUNNER_TEMP/pr.json" <<'AUTHOR'
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]);prs=json.loads(p.read_text());prs[0]["user"]["login"]="github-actions[bot]";p.write_text(json.dumps(prs))
+AUTHOR
+ fi
  echo 1 > "$RUNNER_TEMP/body-writes"
  rm -f "$RUNNER_TEMP/phase-reads"
  while test "$1" != --body-file; do shift; done
@@ -3803,7 +4069,11 @@ fi
                 .env("RUNNER_TEMP", temp.path())
                 .env(
                     "GITHUB_RUN_ID",
-                    if witness == "footer" { "999" } else { "42" },
+                    if matches!(witness, "footer" | "publish-token-recovery-create") {
+                        "999"
+                    } else {
+                        "42"
+                    },
                 )
                 .env("GITHUB_RUN_ATTEMPT", "1")
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
@@ -3852,7 +4122,7 @@ fi
         let mut dispatch = validate_event(&event, "tjfontaine").unwrap();
         dispatch.base = base.clone();
         assigned_branch(&mut dispatch).unwrap();
-        if witness == "footer" {
+        if matches!(witness, "footer" | "publish-token-recovery-create") {
             dispatch.branch = "work/dispatch-634-42".into();
         }
         assert_eq!(dispatch.branch, "work/dispatch-634-42");
@@ -3895,6 +4165,104 @@ fi
         }
         let report = state.join("report.md");
         std::fs::write(&report, "").unwrap();
+        if matches!(
+            witness,
+            "publish-token-auth-push"
+                | "publish-token-recovery-create"
+                | "publish-token-auth-create"
+                | "publish-token-auth-patch"
+                | "publish-token-lease"
+                | "publish-token-network"
+                | "publish-empty-noop"
+        ) {
+            std::fs::write(outer.join("publish-mode"), witness).unwrap();
+            if witness == "publish-token-recovery-create" {
+                std::fs::write(outer.join("remote-tip"), &receipt.head).unwrap();
+                receipt.expected_tip = receipt.head.clone();
+            }
+            if witness == "publish-empty-noop" {
+                std::fs::write(outer.join("created"), "").unwrap();
+                std::fs::write(
+                    outer.join("remote-tip"),
+                    git(&work, &["rev-parse", "HEAD"]).unwrap(),
+                )
+                .unwrap();
+            }
+            if witness == "publish-token-auth-patch" {
+                std::fs::remove_file(outer.join("publish-mode")).unwrap();
+                publish(
+                    &work,
+                    &dispatch,
+                    &receipt,
+                    &contract,
+                    &report,
+                    "fixture-token",
+                    &mut agent_loop::RunCache::default(),
+                )
+                .unwrap();
+                std::fs::write(outer.join("publish-mode"), witness).unwrap();
+                receipt.expected_tip = git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+                git(
+                    &work,
+                    &["commit", "--allow-empty", "-m", "fix(ci): continue App PR"],
+                )
+                .unwrap();
+                receipt.pr_body = Some("Update the explanation.".into());
+            }
+            let result = publish(
+                &work,
+                &dispatch,
+                &receipt,
+                &contract,
+                &report,
+                "fixture-token",
+                &mut agent_loop::RunCache::default(),
+            );
+            if matches!(witness, "publish-token-lease" | "publish-token-network") {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    !error.contains("App token push refused"),
+                    "non-permission error labelled as App permission refusal: {error}"
+                );
+                assert_eq!(regular_text(&outer.join("push-attempts")).unwrap(), "app\n");
+                assert!(
+                    !Applied::load()
+                        .unwrap()
+                        .report()
+                        .contains("CI won't start automatically")
+                );
+            } else {
+                assert_eq!(result.unwrap(), Some(800));
+                let applied = Applied::load().unwrap().report();
+                if witness == "publish-empty-noop" {
+                    assert!(
+                        !applied.contains("CI won't start automatically"),
+                        "no-op publication claimed fallback"
+                    );
+                } else {
+                    assert!(
+                        applied.contains("CI won't start automatically"),
+                        "auth fallback omitted CI note"
+                    );
+                    let file = if witness == "publish-token-auth-push" {
+                        "push-attempts"
+                    } else if witness == "publish-token-auth-patch" {
+                        "patch-attempts"
+                    } else {
+                        "create-attempts"
+                    };
+                    assert_eq!(
+                        regular_text(&outer.join(file)).unwrap(),
+                        if witness == "publish-token-recovery-create" {
+                            "job\n"
+                        } else {
+                            "app\njob\n"
+                        }
+                    );
+                }
+            }
+            return;
+        }
         if witness.starts_with("publish-") {
             receipt.pr_body = Some("Publish the owner's change.".into());
             if witness == "publish-token-refused" {
@@ -3914,6 +4282,11 @@ fi
                     "{error}"
                 );
                 assert!(!error.to_string().contains("opaque-publish-credential"));
+                assert_eq!(
+                    regular_text(&outer.join("push-attempts")).unwrap(),
+                    "app\n",
+                    "permission refusal was retried"
+                );
                 return;
             }
             for continuation in [false, true] {
@@ -4126,8 +4499,8 @@ fi
             "--draft\n--base\nmain\n--head\n{}\n--title\n{subject}",
             dispatch.branch
         )));
-        let selected = select_owned_pr(dispatch.issue, std::slice::from_ref(&pr), |_| {
-            Ok(run.clone())
+        let selected = select_owned_pr(dispatch.issue, std::slice::from_ref(&pr), |_, _| {
+            Ok((run.clone(), None))
         })
         .unwrap()
         .unwrap();
@@ -4135,7 +4508,7 @@ fi
         let mut unowned = pr;
         unowned["user"]["login"] = "outsider".into();
         assert!(
-            select_owned_pr(dispatch.issue, &[unowned], |_| Ok(run.clone()))
+            select_owned_pr(dispatch.issue, &[unowned], |_, _| Ok((run.clone(), None)))
                 .unwrap()
                 .is_none()
         );
@@ -4510,7 +4883,7 @@ fi
             let mut edited = selected.clone();
             edited["body"] = body.into();
             assert!(
-                select_owned_pr(dispatch.issue, &[edited], |_| Ok(run.clone()))
+                select_owned_pr(dispatch.issue, &[edited], |_, _| Ok((run.clone(), None)))
                     .unwrap()
                     .is_some(),
                 "edited PR lost dispatch ownership"
@@ -4892,9 +5265,9 @@ fi
         let run = json!({"id":42,"path":".github/workflows/dispatch-worker.yml",
             "event":"issues","head_branch":"main","repository":{"full_name":REPOSITORY},
             "actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"},"head_repository":{"full_name":REPOSITORY},"head_sha":"a".repeat(40)});
-        assert!(owned_pr(&pr, &run, 634, branch));
-        assert!(!owned_pr(&pr, &run, 635, branch));
-        assert!(!owned_pr(&pr, &run, 634, "work/dispatch-634-43"));
+        assert!(owned_pr(&pr, &run, 634, branch, None));
+        assert!(!owned_pr(&pr, &run, 635, branch, None));
+        assert!(!owned_pr(&pr, &run, 634, "work/dispatch-634-43", None));
         for pointer in [
             "/user/login",
             "/user/type",
@@ -4905,11 +5278,11 @@ fi
         ] {
             let mut bad = pr.clone();
             *bad.pointer_mut(pointer).unwrap() = "foreign".into();
-            assert!(!owned_pr(&bad, &run, 634, branch), "{pointer}");
+            assert!(!owned_pr(&bad, &run, 634, branch, None), "{pointer}");
         }
         let mut ready = pr.clone();
         ready["draft"] = false.into();
-        assert!(!owned_pr(&ready, &run, 634, branch));
+        assert!(!owned_pr(&ready, &run, 634, branch, None));
         for pointer in [
             "/path",
             "/event",
@@ -4919,7 +5292,7 @@ fi
         ] {
             let mut bad = run.clone();
             *bad.pointer_mut(pointer).unwrap() = "foreign".into();
-            assert!(!owned_pr(&pr, &bad, 634, branch), "{pointer}");
+            assert!(!owned_pr(&pr, &bad, 634, branch, None), "{pointer}");
         }
     }
 

@@ -92,11 +92,33 @@ masked and included in diagnostic redaction and the complete artifact scan.
 The App has no workflow permission, so dispatch continues to refuse workflow
 file changes and reports an App push refusal explicitly.
 
-App-created PRs are authored by `carrick-workers[bot]`. They retain the same
-run, branch, draft and issue ownership checks as job-token PRs. If the publish
-secret is absent or empty, publication falls back to the job token and the
-outcome says that CI won't start automatically and asks a person to mark the
-PR ready. That fallback does not fail the run.
+The publish token shares the `carrick-workers` App identity with the ctb-w1..w4
+worker VMs, which run untrusted LLM workers. Comments, reviews and inline
+comments deliberately authenticate dispatch output only from
+`github-actions[bot]`; the publish token never posts them. A separate App for
+dispatch publication is a pending owner decision.
+
+App-created PRs are authored by `carrick-workers[bot]`. Besides the existing
+run, branch, draft and issue checks, ownership requires that the exact PR
+number appears as `publication_pr` in an authenticated creation-run handoff
+or an Actions-authored server outcome receipt. The branch must be that run's
+`work/dispatch-<issue>-<run>`. An App PR without that binding stays unverified
+and its body is withheld. The private server records the number returned by a
+successful create before verifying its newly created PR, then publishes that
+binding in its handoff and outcome. The controller, hosted guard and loop use
+the same evidence resolver. If an earlier run pushed a branch but never
+created its PR, a later run creates that PR with the job token: it cannot add
+an App publication binding to the original run's immutable artifacts.
+
+If the publish secret is absent or empty, publication uses the job token. An
+authentication failure from an App push, PR create or body PATCH retries
+that operation once with the job token and keeps the job token for the rest
+of publication,
+including restoration. Bad credentials, HTTP 401 and Git's authentication or
+missing-username errors qualify. Lease rejections, network failures and 403
+workflow or permission refusals do not retry. The outcome says CI won't start
+automatically and asks a person to mark the PR ready only after a push or PR
+write actually happened. Falling back does not fail the run.
 
 The dedicated nologin accounts `carrick-dispatch-loop` and
 `carrick-dispatch-agent` have distinct uids and groups, no sudo rights and no

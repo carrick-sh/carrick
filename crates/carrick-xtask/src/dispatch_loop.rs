@@ -459,7 +459,7 @@ fn provenance_with(
     if login == "tjfontaine" && user["type"] == "User" {
         return "owner".into();
     }
-    if dispatch_bot(user)
+    if dispatch_comment_author(user)
         && let Some(id) = run_from_body(item["body"].as_str().unwrap_or_default())
         && run(id).is_some_and(|r| {
             let issue_bound =
@@ -965,12 +965,96 @@ pub(super) struct RunCache {
     artifacts: LookupCache<RunId, Vec<Value>>,
     bundles: LookupCache<(u64, RunId), std::collections::BTreeMap<String, String>>,
     branches: std::collections::BTreeMap<(u64, String), BranchSnapshot>,
+    stored_gh_auth: bool,
 }
 struct BranchSnapshot {
     prs: Value,
     target: BranchTarget,
 }
 impl RunCache {
+    pub(super) fn for_controller() -> Self {
+        Self {
+            stored_gh_auth: true,
+            ..Self::default()
+        }
+    }
+    pub(super) fn publication(
+        &mut self,
+        root: &Path,
+        pr: &Value,
+        run: &Value,
+        issue: u64,
+        branch: &str,
+    ) -> Option<PublishedPr> {
+        if !publish_app_author(&pr["user"]) {
+            return None;
+        }
+        let id = branch_run(issue, branch).ok()?.parse::<u64>().ok()?;
+        let authenticated = self.authenticate(root, issue, RunId(id)).ok()?;
+        if authenticated.run["id"] != run["id"] {
+            return None;
+        }
+        if let Ok(text) = self.prior_artifact(root, issue, RunId(id), "handoff.json")
+            && let Ok(handoff) = serde_json::from_str::<Value>(&text)
+            && handoff["issue"] == issue
+            && handoff["branch"] == branch
+            && let Some(number) = handoff["applied"]["publication_pr"].as_u64()
+        {
+            let publication = PublishedPr(PublicationRecord {
+                issue,
+                branch: branch.to_owned(),
+                publication_pr: number,
+            });
+            if publication.matches(pr, issue, branch) {
+                return Some(publication);
+            }
+        }
+        // An Actions-authored server outcome remains usable after artifact expiry.
+        if authenticated.footer_issue != Some(issue)
+            && authenticated.run["event"] != "pull_request_review"
+        {
+            return None;
+        }
+        let number = pr["number"].as_u64()?;
+        for destination in [number, issue] {
+            let Ok(comments) = list(
+                root,
+                &format!("repos/{REPOSITORY}/issues/{destination}/comments"),
+            ) else {
+                continue;
+            };
+            for comment in comments {
+                let body = comment["body"].as_str().unwrap_or_default();
+                if !dispatch_comment_author(&comment["user"])
+                    || run_from_body(body).and_then(|s| s.parse::<u64>().ok()) != Some(id)
+                    || outcome_contract("pr_comment", body).is_none()
+                {
+                    continue;
+                }
+                let body = body
+                    .split("\n\nWorker contract (claims for review):")
+                    .next()
+                    .unwrap_or_default();
+                let marker = "Publication receipt:\n```json\n";
+                if body.matches(marker).count() != 1 {
+                    continue;
+                }
+                let Some(text) = body
+                    .split_once(marker)
+                    .and_then(|(_, s)| s.split_once("\n```").map(|(json, _)| json))
+                else {
+                    continue;
+                };
+                if let Ok(record) = serde_json::from_str::<PublicationRecord>(text) {
+                    let publication = PublishedPr(record);
+                    if publication.matches(pr, issue, branch) {
+                        return Some(publication);
+                    }
+                }
+            }
+        }
+        None
+    }
     fn authenticate_with(
         &mut self,
         issue: u64,
@@ -1003,12 +1087,23 @@ impl RunCache {
         issue: u64,
         id: RunId,
     ) -> Result<ArtifactRun, ScalerError> {
-        self.authenticate_with(issue, id, |endpoint| api(root, endpoint).ok())
+        // The controller uses gh's stored credentials without a job token.
+        let lookup = if self.stored_gh_auth {
+            authenticated_api
+        } else {
+            api
+        };
+        self.authenticate_with(issue, id, |endpoint| lookup(root, endpoint).ok())
     }
     fn artifacts(&mut self, root: &Path, id: RunId) -> Result<Vec<Value>, ScalerError> {
+        let lookup = if self.stored_gh_auth {
+            authenticated_api
+        } else {
+            api
+        };
         self.artifacts
             .resolve(id, || {
-                let data = api(
+                let data = lookup(
                     root,
                     &format!(
                         "repos/{REPOSITORY}/actions/runs/{}/artifacts?per_page=100",
@@ -1030,7 +1125,9 @@ impl RunCache {
         issue: u64,
         id: RunId,
     ) -> Result<(ArtifactRun, Vec<Value>), ScalerError> {
-        if id.0.to_string() == run_id()? {
+        // Controllers have no current Actions run; dispatch callers validated
+        // their run id before reaching this shared resolver.
+        if std::env::var("GITHUB_RUN_ID").ok().as_deref() == Some(id.0.to_string().as_str()) {
             return Err(ScalerError::Guard("current run is not a prior run"));
         }
         let run = self.authenticate(root, issue, id)?;
@@ -1209,7 +1306,12 @@ pub(super) fn verified_branch_cached(
         issue,
         prs.as_array()
             .ok_or(ScalerError::Guard("invalid PR list"))?,
-        |_| Ok(run.clone()),
+        |pr, _| {
+            Ok((
+                run.clone(),
+                cache.publication(root, pr, &run, issue, branch),
+            ))
+        },
     )?;
     let mut expected = None;
     let pr = if let Some(pr) = pr {
@@ -1531,7 +1633,19 @@ impl Server<'_> {
         let warning = manual_repair
             .map(|reason| format!("**PR body needs manual repair.** {reason}\n\n"))
             .unwrap_or_default();
-        let posted = self.post(&format!("{warning}Dispatch outcome: {:?}\n\n{applied}\n\n<details><summary>Contracts, worker claims and budgets</summary>\n\nOutcome contract:\n```json\n{details}\n```\n\nWorker contract (claims for review):\n\n```text\n{}\n```\n\nWorker choices and reasons: {}\n\nBudgets used: {}\n\n</details>\n\nLoop claims (unverified):\n{status_claim}{summary}\n", outcome.status, contract.chars().take(2000).collect::<String>(), serde_json::to_string(&choices)?, serde_json::to_string(&self.used)?));
+        let publication = Applied::load()?
+            .publication_pr
+            .map(|number| {
+                serde_json::to_string(&PublicationRecord {
+                    issue: self.dispatch.issue,
+                    branch: self.dispatch.branch.clone(),
+                    publication_pr: number,
+                })
+                .map(|record| format!("\n\nPublication receipt:\n```json\n{record}\n```"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let posted = self.post(&format!("{warning}Dispatch outcome: {:?}\n\n{applied}\n\n<details><summary>Contracts, worker claims and budgets</summary>\n\nOutcome contract:\n```json\n{details}\n```{publication}\n\nWorker contract (claims for review):\n\n```text\n{}\n```\n\nWorker choices and reasons: {}\n\nBudgets used: {}\n\n</details>\n\nLoop claims (unverified):\n{status_claim}{summary}\n", outcome.status, contract.chars().take(2000).collect::<String>(), serde_json::to_string(&choices)?, serde_json::to_string(&self.used)?));
         if prepared {
             mask_artifacts(
                 path.parent().ok_or(ScalerError::Guard("artifact parent"))?,
@@ -1746,7 +1860,18 @@ impl Server<'_> {
                 && let Ok(id_number) = id.parse::<u64>()
             {
                 earlier.insert(RunId(id_number));
-                if pr["state"] == "open" && owned_pr(&pr, &origin, self.dispatch.issue, branch) {
+                if pr["state"] == "open" && {
+                    let publication =
+                        self.runs
+                            .publication(self.root, &pr, &origin, self.dispatch.issue, branch);
+                    owned_pr(
+                        &pr,
+                        &origin,
+                        self.dispatch.issue,
+                        branch,
+                        publication.as_ref(),
+                    )
+                } {
                     items.push(json!({"kind":"branch_candidate","provenance":format!("dispatch-agent(run {id})"),"data":{"branch":branch,"pr":number}}));
                 }
             }
@@ -1785,12 +1910,48 @@ impl Server<'_> {
                     commits.push(item);
                     continue;
                 }
-                let provenance = self.provenance.classify(
-                    &item,
-                    self.dispatch.issue,
-                    &mut self.runs,
-                    |endpoint| api(self.root, endpoint).ok(),
-                );
+                let provenance = if kind == "pr" && publish_app_author(&item["user"]) {
+                    let branch = item["head"]["ref"].as_str().unwrap_or_default();
+                    let bound = branch_run(self.dispatch.issue, branch)
+                        .ok()
+                        .and_then(|id| id.parse::<u64>().ok())
+                        .and_then(|id| {
+                            self.runs
+                                .authenticate(self.root, self.dispatch.issue, RunId(id))
+                                .ok()
+                        })
+                        .is_some_and(|origin| {
+                            let publication = self.runs.publication(
+                                self.root,
+                                &item,
+                                &origin.run,
+                                self.dispatch.issue,
+                                branch,
+                            );
+                            owned_pr(
+                                &item,
+                                &origin.run,
+                                self.dispatch.issue,
+                                branch,
+                                publication.as_ref(),
+                            )
+                        });
+                    if bound {
+                        format!(
+                            "dispatch-agent(run {})",
+                            branch_run(self.dispatch.issue, branch)?
+                        )
+                    } else {
+                        "unverified".into()
+                    }
+                } else {
+                    self.provenance.classify(
+                        &item,
+                        self.dispatch.issue,
+                        &mut self.runs,
+                        |endpoint| api(self.root, endpoint).ok(),
+                    )
+                };
                 if provenance.starts_with("dispatch-agent(")
                     && let Some(id) = run_from_body(item["body"].as_str().unwrap_or_default())
                 {
@@ -2112,9 +2273,9 @@ impl Server<'_> {
             }
             Request::Comment(Comment { body }) => {
                 bounded_text(&body)?;
-                if body.contains("Outcome contract:") {
+                if body.contains("Outcome contract:") || body.contains("Publication receipt:") {
                     return Err(ScalerError::Guard(
-                        "Outcome contract: markers are reserved for server reports",
+                        "outcome contract and publication receipt markers are reserved for server reports",
                     ));
                 }
                 self.used.admit(
@@ -2959,6 +3120,51 @@ mod tests {
         });
     }
     #[test]
+    fn shared_app_outcome_comment_cannot_supply_fallback_contract() {
+        shared_fixture(|root| {
+            let mut comments: Value =
+                serde_json::from_str(&regular_text(&root.join("comments.json")).unwrap()).unwrap();
+            comments[0][0]["user"]["login"] = "carrick-workers[bot]".into();
+            std::fs::write(root.join("comments.json"), comments.to_string()).unwrap();
+            std::fs::write(root.join("artifacts.json"), r#"{"artifacts":[]}"#).unwrap();
+            let response = server(root).read_state().unwrap();
+            let items = response["state"].as_array().unwrap();
+            let comment = items.iter().find(|i| i["kind"] == "issue_comment").unwrap();
+            assert_eq!(
+                comment["provenance"], "unverified",
+                "shared App forged dispatch comment provenance"
+            );
+            assert_eq!(comment["data"]["body"], "body withheld: unverified");
+            let run = items
+                .iter()
+                .find(|i| i["kind"] == "earlier_dispatch_run")
+                .unwrap();
+            assert!(
+                run["data"]["outcome_contract"].is_null(),
+                "shared App forged fallback contract"
+            );
+        });
+    }
+    #[test]
+    fn shared_app_pr_without_publication_binding_is_withheld() {
+        shared_fixture(|root| {
+            let mut pr: Value =
+                serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+            pr["user"]["login"] = "carrick-workers[bot]".into();
+            std::fs::write(root.join("pr.json"), pr.to_string()).unwrap();
+            std::fs::write(root.join("prs.json"), json!([pr]).to_string()).unwrap();
+            let response = server(root).read_state().unwrap();
+            let items = response["state"].as_array().unwrap();
+            assert!(
+                !items.iter().any(|i| i["kind"] == "branch_candidate"),
+                "unbound shared App PR became a branch candidate"
+            );
+            let pr = items.iter().find(|i| i["kind"] == "pr").unwrap();
+            assert_eq!(pr["provenance"], "unverified");
+            assert_eq!(pr["data"]["body"], "body withheld: unverified");
+        });
+    }
+    #[test]
     fn publish_token_app_pr_has_authenticated_provenance() {
         shared_fixture(|root| {
             let mut pr: Value =
@@ -2966,6 +3172,10 @@ mod tests {
             pr["user"]["login"] = "carrick-workers[bot]".into();
             std::fs::write(root.join("pr.json"), pr.to_string()).unwrap();
             std::fs::write(root.join("prs.json"), json!([pr]).to_string()).unwrap();
+            let mut handoff: Value =
+                serde_json::from_str(&regular_text(&root.join("handoff.json")).unwrap()).unwrap();
+            handoff["applied"] = json!({"publication_pr":800});
+            std::fs::write(root.join("handoff.json"), handoff.to_string()).unwrap();
             let response = server(root).read_state().unwrap();
             assert!(
                 response["state"]
@@ -2975,6 +3185,89 @@ mod tests {
                     .any(|item| item["kind"] == "pr"
                         && item["provenance"] == "dispatch-agent(run 42)"),
                 "App-created PR was hidden as unverified"
+            );
+        });
+    }
+    #[test]
+    fn controller_publication_uses_handoff_without_current_actions_run() {
+        shared_fixture(|root| {
+            assert!(std::env::var_os("GITHUB_RUN_ID").is_none());
+            assert!(std::env::var_os("GH_TOKEN").is_none());
+            let curl = root.join("bin/curl");
+            std::fs::write(&curl, "#!/bin/sh\nexit 96\n").unwrap();
+            std::fs::set_permissions(curl, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut pr: Value =
+                serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+            pr["user"]["login"] = "carrick-workers[bot]".into();
+            let run: Value =
+                serde_json::from_str(&regular_text(&root.join("run.json")).unwrap()).unwrap();
+            let mut handoff: Value =
+                serde_json::from_str(&regular_text(&root.join("handoff.json")).unwrap()).unwrap();
+            handoff["applied"] = json!({"publication_pr":800});
+            std::fs::write(root.join("handoff.json"), handoff.to_string()).unwrap();
+            let publication = recorded_publication(&pr, &run, 799, "work/dispatch-799-42")
+                .expect("controller lost authenticated handoff ownership");
+            assert!(owned_pr(
+                &pr,
+                &run,
+                799,
+                "work/dispatch-799-42",
+                Some(&publication)
+            ));
+            pr["number"] = 801.into();
+            assert!(!owned_pr(
+                &pr,
+                &run,
+                799,
+                "work/dispatch-799-42",
+                Some(&publication)
+            ));
+        });
+    }
+    #[test]
+    fn shared_app_pr_actions_outcome_binds_exact_number_after_artifact_expiry() {
+        shared_fixture(|root| {
+            let mut pr: Value =
+                serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+            pr["user"]["login"] = "carrick-workers[bot]".into();
+            std::fs::write(root.join("pr.json"), pr.to_string()).unwrap();
+            std::fs::write(root.join("prs.json"), json!([pr.clone()]).to_string()).unwrap();
+            std::fs::write(root.join("artifacts.json"), r#"{"artifacts":[]}"#).unwrap();
+            let mut comments: Value =
+                serde_json::from_str(&regular_text(&root.join("comments.json")).unwrap()).unwrap();
+            let original = comments[0][0]["body"].as_str().unwrap().to_owned();
+            for (number, author, owned) in [
+                (801, "github-actions[bot]", false),
+                (800, "carrick-workers[bot]", false),
+                (800, "github-actions[bot]", true),
+            ] {
+                comments[0][0]["user"]["login"] = author.into();
+                comments[0][0]["body"] = original.replace("\nDispatch run:", &format!("\nPublication receipt:\n```json\n{{\"issue\":799,\"branch\":\"work/dispatch-799-42\",\"publication_pr\":{number}}}\n```\nDispatch run:" )).into();
+                std::fs::write(root.join("comments.json"), comments.to_string()).unwrap();
+                let response = server(root).read_state().unwrap();
+                assert_eq!(
+                    response["state"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|i| i["kind"] == "branch_candidate"),
+                    owned,
+                    "publication binding accepted wrong PR number or shared App author"
+                );
+            }
+            let run: Value =
+                serde_json::from_str(&regular_text(&root.join("run.json")).unwrap()).unwrap();
+            assert!(
+                RunCache::default()
+                    .publication(root, &pr, &run, 799, "work/dispatch-799-42")
+                    .is_some()
+            );
+            let mut forged = pr;
+            forged["number"] = 801.into();
+            assert!(
+                RunCache::default()
+                    .publication(root, &forged, &run, 799, "work/dispatch-799-42")
+                    .is_none()
             );
         });
     }
@@ -3747,7 +4040,7 @@ mod tests {
                 serde_json::from_str(&regular_text(&root.join("run.json")).unwrap()).unwrap();
             pr["body"] = body.clone().into();
             assert!(
-                owned_pr(&pr, &run, dispatch.issue, &dispatch.branch),
+                owned_pr(&pr, &run, dispatch.issue, &dispatch.branch, None),
                 "edited PR lost creation-run ownership"
             );
             assert!(!body.contains("Failed worker body") && !body.contains("fixture-token"));
@@ -4429,9 +4722,20 @@ exec /usr/bin/git "$@"
                 ])
                 .env(CHILD, "1")
                 .env("RUNNER_TEMP", temp.path())
-                .env("GITHUB_RUN_ID", "999")
+                .env_remove("GITHUB_RUN_ID")
+                .env_remove("GH_TOKEN")
+                .envs(
+                    if std::thread::current()
+                        .name()
+                        .unwrap()
+                        .contains("::tests::controller_publication_")
+                    {
+                        vec![]
+                    } else {
+                        vec![("GITHUB_RUN_ID", "999"), ("GH_TOKEN", "fixture-token")]
+                    },
+                )
                 .env("GITHUB_RUN_ATTEMPT", "1")
-                .env("GH_TOKEN", "fixture-token")
                 .env(
                     "DISPATCH_PUBLISH_TOKEN",
                     if std::thread::current()
