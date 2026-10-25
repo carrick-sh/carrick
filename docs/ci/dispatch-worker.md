@@ -106,19 +106,25 @@ or an Actions-authored server outcome receipt. The branch must be that run's
 and its body is withheld. The private server records the number returned by a
 successful create before verifying its newly created PR, then publishes that
 binding in its handoff and outcome. The controller, hosted guard and loop use
-the same evidence resolver. If an earlier run pushed a branch but never
+the same evidence resolver. The credential-free hosted guard reads public
+PR and issue comments in pages of 100, up to five pages per destination. It
+requires a complete scan and refuses failed, malformed or over-cap pages.
+The loop, token-bearing admission step and controller independently resolve
+ownership with authenticated artifact and comment reads; the guard's proof
+is not reused at admission. If an earlier run pushed a branch but never
 created its PR, a later run creates that PR with the job token: it cannot add
 an App publication binding to the original run's immutable artifacts.
 
 If the publish secret is absent or empty, publication uses the job token. An
 authentication failure from an App push, PR create or body PATCH retries
 that operation once with the job token and keeps the job token for the rest
-of publication,
-including restoration. Bad credentials, HTTP 401 and Git's authentication or
-missing-username errors qualify. Lease rejections, network failures and 403
+of publication, including restoration. Bad credentials, HTTP 401 and Git's
+authentication or missing-username errors qualify. Lease rejections, network failures and 403
 workflow or permission refusals do not retry. The outcome says CI won't start
 automatically and asks a person to mark the PR ready only after a push or PR
-write actually happened. Falling back does not fail the run.
+write actually happened, unless an App push to an existing PR or an App PR
+creation already triggered CI. A push before a PR exists does not count as a
+PR synchronize event. Falling back does not fail the run.
 
 The dedicated nologin accounts `carrick-dispatch-loop` and
 `carrick-dispatch-agent` have distinct uids and groups, no sudo rights and no
