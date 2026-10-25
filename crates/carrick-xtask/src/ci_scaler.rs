@@ -1306,19 +1306,28 @@ where
     let wait_thread = std::thread::spawn(move || {
         let _ = wait_tx.send(child.wait());
     });
-    if let Some(hook) = on_ready
-        && let Err(err) = hook(child_pid)
-    {
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
+    if let Some(hook) = on_ready {
+        let failure =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(child_pid))) {
+                Ok(Ok(())) => None,
+                Ok(Err(err)) => Some(Ok(err)),
+                Err(payload) => Some(Err(payload)),
+            };
+        if let Some(failure) = failure {
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+            if let Some(thread) = input_thread {
+                let _ = thread.join();
+            }
+            let _ = wait_thread.join();
+            let _ = output_thread.join();
+            let _ = stderr_thread.join();
+            match failure {
+                Ok(err) => return Err(err),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
         }
-        if let Some(thread) = input_thread {
-            let _ = thread.join();
-        }
-        let _ = wait_thread.join();
-        let _ = output_thread.join();
-        let _ = stderr_thread.join();
-        return Err(err);
     }
     let deadline = deadline.unwrap_or_else(|| Instant::now() + limit);
     let status = wait_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
