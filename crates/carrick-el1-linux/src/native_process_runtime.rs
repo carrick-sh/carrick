@@ -4748,18 +4748,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .native()
             .resources()
             .page;
-        let entry = self.control.entry().ok_or(NativeProcessError::Stale)?;
-        let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
-            self.binding,
-            Some(entry),
-            status,
-        )
-        .ok_or(NativeProcessError::Stale)?;
+        let entry = self.control.entry();
+        let identity =
+            carrick_core::terminal::ThreadTerminalIdentity::from_exit(self.binding, entry, status)
+                .ok_or(NativeProcessError::Stale)?;
         let custody = carrick_core::terminal::TerminalCustody::<
             carrick_core::terminal::Thread,
             carrick_core::terminal::Live,
         >::admitted(identity)
         .begin();
+        let Some(entry) = entry else {
+            if !ProcessNative::route_host_thread_exit(self, custody.route_to_host()) {
+                return Err(NativeProcessError::Stale);
+            }
+            return Ok(LifecycleOutcome::HostCustody);
+        };
         let (custody, membership) = custody
             .reserve_nonfinal(page)
             .map_err(|_| NativeProcessError::Quarantined)?;
