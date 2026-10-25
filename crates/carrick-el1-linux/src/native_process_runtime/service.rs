@@ -292,14 +292,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         };
         self.runtime.graph.lock().insert_member_wait(
             self.record,
-            MemberWait::Service(PendingService {
+            MemberWait::Service(Box::new(PendingService {
                 reply,
                 _exec_payload: exec_payload,
                 request,
                 wait: owner_wait,
                 claim,
                 control,
-            }),
+            })),
         );
         drop(owner_queue);
         if let Some(wait) = owner_wait {
@@ -555,7 +555,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         request: ServiceRequest,
         mut result: ServiceResult,
-        mut pending: PendingService<'a>,
+        mut pending: Box<PendingService<'a>>,
     ) -> Result<NativeResume, NativeProcessError> {
         if pending.request != request {
             return Err(NativeProcessError::Quarantined);

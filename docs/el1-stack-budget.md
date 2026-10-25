@@ -203,6 +203,15 @@ closures. Linux clippy feature closures produce different compiled frames and
 reach 11,311 bytes. These results are distinct from the two standalone
 measurements above and still pass 12,288.
 
+Slice 4 keeps 11,311 bytes as a chain-specific ceiling for native backing
+reply, so exec service growth cannot consume the headroom recovered above.
+Keeping `PendingService` boxed while it leaves the owner table avoids moving
+the request, reply, payload, claim, and control custody through both
+`finish_owner_wait` and `finish_service`. With exec argument staging present,
+the Linux clippy closure measures 11,071 bytes for backing reply; its broad
+maximum is the separate 11,327-byte signal-terminal-exit envelope. The
+ordinary test closure measures 10,735 bytes for backing reply.
+
 A tighter limit is mechanically possible by replacing `stack_size * 3 / 4`
 in `Frames::check` with a lower ceiling. An 11 KiB ceiling (11,264 bytes)
 leaves 289 bytes above the standalone maximum but would reject the Linux
