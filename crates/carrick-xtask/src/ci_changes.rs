@@ -637,7 +637,7 @@ pub fn evaluate_changes(
     let _ = pr_draft;
     // Pull requests run the full macOS suite whenever they run heavy jobs; the
     // same-repo ones land on the self-hosted carrick-macos-ci runners (#650).
-    // Merge groups keep only macos-build and macos-clippy as a skew check.
+    // Merge groups keep the macOS build, clippy and authority census.
     CiChangesOutputs {
         heavy,
         macos: heavy,

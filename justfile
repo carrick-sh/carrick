@@ -402,9 +402,13 @@ test-kernel *ARGS:
 # CI runs it in the Linux `loom` job (PRs and merge groups); `just ci` runs
 # it locally. Runtime takes the host's platform features (Linux has no HVF).
 # Pipe venue lock/wake model waits for N1; see the M2 handoff.
-test-loom *ARGS:
-    {{_admit}} {{_cargo}} test --locked -p carrick-sched-core --features loom --lib loom_models {{ARGS}}
+test-loom *ARGS: (test-loom-a ARGS) (test-loom-b ARGS)
+
+test-loom-a *ARGS:
     {{_admit}} {{_cargo}} test --locked -p carrick-fd-core --features loom --lib loom_models {{ARGS}}
+
+test-loom-b *ARGS:
+    {{_admit}} {{_cargo}} test --locked -p carrick-sched-core --features loom --lib loom_models {{ARGS}}
     {{_admit}} {{_cargo}} test --locked -p carrick-kernel --features loom --lib loom_models {{ARGS}}
     {{_admit}} {{_cargo}} test --locked -p carrick-runtime {{_platform_features}} --features loom --lib terminal_clear_loom {{ARGS}}
     {{_admit}} {{_cargo}} test --locked -p carrick-runtime {{_platform_features}} --features loom --lib owner_wait_loom {{ARGS}}
@@ -1349,35 +1353,39 @@ ci-results:
     #!/usr/bin/env bash
     set -euo pipefail
     jq -e --arg event "${CI_EVENT:?}" --arg draft "${CI_DRAFT:-false}" --arg lower "${CI_LOWER_LAYER:-false}" '
+      has("lint-clippy") and has("lint-gates") and has("loom") and
       .changes.result == "success" and
-      (.["xtask-build"].result == "success") and
+      .["xtask-build"].result == "success" and
+      (.["macos-authority"].result ==
+        (if $event == "merge_group" then "success" else "skipped" end)) and
       (length > 1) and
       (. as $root |
        (($root.changes.outputs.lower_layer // $lower) == "true") as $is_lower |
        if $event == "pull_request" then
-         (del(.changes, .["xtask-build"]) | with_entries(select(.key | startswith("macos-")))
+         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select(.key | startswith("macos-")))
            | if ($root.changes.outputs.heavy // "true") == "true" and ($root.changes.outputs.macos // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
-         (del(.changes, .["xtask-build"]).lint
+         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select(.key == "lint-clippy" or .key == "lint-gates"))
+           | select(length == 2)
+           | if ($root.changes.outputs.heavy // "true") == "true" then all(.[]; .result == "success")
+             else all(.[]; .result == "skipped") end) and
+         (del(.changes, .["xtask-build"], .["macos-authority"])["lint-domains"]
            | if ($root.changes.outputs.heavy // "true") == "true" then .result == "success"
              else .result == "skipped" end) and
-         (del(.changes, .["xtask-build"])["lint-domains"]
-           | if ($root.changes.outputs.heavy // "true") == "true" then .result == "success"
-             else .result == "skipped" end) and
-         (del(.changes, .["xtask-build"]) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "lint" and .key != "lint-domains"))
+         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "lint-clippy" and .key != "lint-gates" and .key != "lint-domains"))
            | if ($root.changes.outputs.heavy // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
          (.["linked-issue"].result == "success") and
          (.["commit-trailers"].result == "success") and
-         (del(.changes, .["xtask-build"]).actionlint
+         (del(.changes, .["xtask-build"], .["macos-authority"]).actionlint
            | if ($root.changes.outputs.workflows // "false") == "true" then .result == "success"
              else .result == "skipped" end)
        elif $root.changes.outputs.heavy == "true" and $root.changes.outputs.macos == "true" and ($is_lower | not) then
-         # Merge groups run macos-build and macos-clippy only (a skew check);
+         # Merge groups run macOS build, clippy and the authority census;
          # the unit and integration suites ran on the PR and run nightly.
          ["macos-unit-a", "macos-unit-b", "macos-integration"] as $pr_only |
-         (del(.changes, .["xtask-build"]) | with_entries(select(.key as $k | $pr_only | index($k) | not)) | all(.[]; .result == "success")) and
-         (del(.changes, .["xtask-build"]) | with_entries(select(.key as $k | $pr_only | index($k)))
+         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select(.key as $k | $pr_only | index($k) | not)) | all(.[]; .result == "success")) and
+         (del(.changes, .["xtask-build"], .["macos-authority"]) | with_entries(select(.key as $k | $pr_only | index($k)))
            | if $event == "merge_group" then all(.[]; .result == "skipped") else all(.[]; .result == "success") end)
        else false end)
     ' <<< "${CI_NEEDS:?}"
