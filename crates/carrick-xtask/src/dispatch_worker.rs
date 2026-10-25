@@ -1661,6 +1661,7 @@ fn harvest_worker(
     work: &Path,
     dispatch: &Dispatch,
     result: Result<i32, ScalerError>,
+    since: &str,
 ) -> Result<(Contract, bool, String, i32), ScalerError> {
     if work.exists() {
         std::fs::remove_dir_all(work)?;
@@ -1700,6 +1701,9 @@ fn harvest_worker(
             .risks
             .push("Workflow checkpointed unfinished changes".into());
     }
+    // Validate only commits added by this worker, including any checkpoint.
+    // Earlier accepted checkpoints retain their own admission and ownership.
+    check_commit_closures(work, since, dispatch.issue)?;
     let refused_workflow = git(
         work,
         &[
@@ -1842,6 +1846,7 @@ fn produce(
                 "41898282+github-actions[bot]@users.noreply.github.com",
             ],
         )?;
+        let starting_tip = git(&actor_work, &["rev-parse", "HEAD"])?.trim().to_owned();
         drop(preparation_commands);
         let mut agent_dispatch = dispatch.clone();
         if let Some(body) = previous
@@ -1894,7 +1899,13 @@ fn produce(
             .prefix("harvest-")
             .tempdir_in(&state)?;
         (contract, refused_workflow, diffstat, code) = timed_phase("worker.harvest", || {
-            harvest_worker(&actor, &staging.path().join("candidate"), dispatch, result)
+            harvest_worker(
+                &actor,
+                &staging.path().join("candidate"),
+                dispatch,
+                result,
+                &starting_tip,
+            )
         })?;
         proposed_body = read_pr_body(&actor)?.or_else(|| {
             previous
@@ -2188,35 +2199,74 @@ fn body_without_comments(text: &str) -> Result<String, ScalerError> {
     body.push_str(rest);
     Ok(body)
 }
-fn closing_reference(text: &str) -> bool {
+fn closing_target(reference: &str) -> bool {
+    let lower = reference.to_ascii_lowercase();
+    reference.contains('#')
+        || lower.contains("https://github.com/")
+        || lower.contains("www.github.com/")
+        || ["github.com", "http://", "gh-"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+}
+/// Share the conservative keyword/target filter between prose and commits.
+/// Include further references on the same line, so a list cannot smuggle a
+/// second issue after an otherwise permitted local reference.
+fn closing_targets(text: &str) -> Vec<&str> {
     let lower = text.to_ascii_lowercase();
-    [
+    let mut targets = Vec::new();
+    for keyword in [
         "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
-    ]
-    .iter()
-    .any(|keyword| {
-        lower.match_indices(*keyword).any(|(start, _)| {
+    ] {
+        for (start, _) in lower.match_indices(keyword) {
             let end = start + keyword.len();
             if text[..start].ends_with(|c: char| c.is_ascii_alphabetic())
                 || text[end..].starts_with(|c: char| c.is_ascii_alphabetic())
             {
-                return false;
+                continue;
             }
-            let reference = text[end..]
-                .trim_start_matches(|c: char| c.is_whitespace() || ":*_`[('\"".contains(c))
-                .split_whitespace()
-                .next()
-                .unwrap_or_default();
-            reference.contains('#')
-                || reference
-                    .to_ascii_lowercase()
-                    .contains("https://github.com/")
-                || reference.to_ascii_lowercase().contains("www.github.com/")
-                || ["github.com", "http://", "gh-"]
-                    .iter()
-                    .any(|prefix| reference.to_ascii_lowercase().starts_with(prefix))
-        })
-    })
+            let rest = text[end..]
+                .trim_start_matches(|c: char| c.is_whitespace() || ":*_`[('\"".contains(c));
+            let line = rest.lines().next().unwrap_or_default();
+            let mut words = line.split_whitespace();
+            if let Some(first) = words.next().filter(|reference| closing_target(reference)) {
+                targets.push(first);
+                targets.extend(words.filter(|reference| closing_target(reference)));
+            }
+        }
+    }
+    targets
+}
+fn closing_reference(text: &str) -> bool {
+    !closing_targets(text).is_empty()
+}
+fn check_commit_closures(work: &Path, since: &str, issue: u64) -> Result<(), ScalerError> {
+    let log = git(
+        work,
+        &["log", "--format=%H%x00%B%x00", &format!("{since}..HEAD")],
+    )?;
+    let mut fields = log.split('\0');
+    while let Some(commit) = fields.next().map(str::trim).filter(|s| !s.is_empty()) {
+        if !sha(commit) {
+            return Err(ScalerError::Guard("invalid harvested commit id"));
+        }
+        let message = fields
+            .next()
+            .ok_or(ScalerError::Guard("missing harvested commit message"))?;
+        let allowed = [
+            format!("#{issue}"),
+            format!("{REPOSITORY}#{issue}"),
+            format!("https://github.com/{REPOSITORY}/issues/{issue}"),
+        ];
+        if closing_targets(message).iter().any(|target| {
+            let target = target.trim_end_matches(|c: char| ",.;:)]>\"'`".contains(c));
+            !allowed.iter().any(|own| target.eq_ignore_ascii_case(own))
+        }) {
+            return Err(ScalerError::Usage(format!(
+                "Refused commit {commit}: closing keyword targets another issue or repository; only {REPOSITORY}#{issue} is allowed"
+            )));
+        }
+    }
+    Ok(())
 }
 fn read_pr_body(directory: &Path) -> Result<Option<String>, ScalerError> {
     let path = directory.join("pr-body.md");
@@ -2325,7 +2375,7 @@ fn neutralize_mentions(text: &str) -> String {
     while let Some(c) = chars.next() {
         result.push(c);
         if c == '@'
-            && previous.is_none_or(|p: char| !p.is_alphanumeric())
+            && previous.is_none_or(|p: char| !(p.is_ascii_alphanumeric() || p == '_'))
             && chars
                 .peek()
                 .is_some_and(|c| c.is_ascii_alphanumeric() || "-_/".contains(*c))
@@ -2469,55 +2519,174 @@ fn read_closing_references(root: &Path, number: u64) -> Result<ClosingReferences
     }
     Ok(references)
 }
-fn closing_delay(
-    delay: std::time::Duration,
-    deadline: std::time::Instant,
-) -> Result<(), ScalerError> {
-    if deadline.saturating_duration_since(std::time::Instant::now()) <= delay {
-        return Err(ScalerError::Guard(
-            "closing references unverified: index did not settle within the publish command window",
-        ));
+/// Time and sleeping are injected so consistency tests never compare epochs
+/// from separate processes, or spend real seconds waiting for a fake index.
+trait ReferenceHost {
+    fn now(&self) -> std::time::Instant;
+    fn sleep(&mut self, delay: std::time::Duration);
+    fn read(&mut self, root: &Path, number: u64) -> Result<ClosingReferences, ScalerError> {
+        read_closing_references(root, number)
     }
-    std::thread::sleep(delay);
-    Ok(())
 }
-/// The derived reference index lags writes. Delay the first read and require two
-/// matching reads two seconds apart, within both twenty seconds and caller time.
-fn verify_closing_references(
-    root: &Path,
-    number: u64,
-    expected: &ClosingIssues,
-) -> Result<(), ScalerError> {
-    let deadline = COMMAND_DEADLINE
-        .with(|slot| slot.get())
-        .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(20))
-        .min(std::time::Instant::now() + std::time::Duration::from_secs(20));
-    let _window = CommandWindow::until(deadline);
-    closing_delay(std::time::Duration::from_secs(3), deadline)?;
-    let mut matched = false;
-    loop {
-        let current = read_closing_references(root, number)
-            .map_err(|e| ScalerError::Usage(format!("closing references unverified: {e}")))?;
-        if std::time::Instant::now() >= deadline {
-            return Err(ScalerError::Guard(
-                "closing references unverified: publish command window exhausted",
-            ));
-        }
-        if !current.all.is_subset(expected) {
-            return Err(ScalerError::Guard(
-                "closing references unverified: unexpected extra reference",
-            ));
-        }
-        if current.all == *expected {
-            if matched {
-                return Ok(());
-            }
-            matched = true;
-        } else {
-            matched = false;
-        }
-        closing_delay(std::time::Duration::from_secs(2), deadline)?;
+#[cfg(not(test))]
+struct SystemReferenceHost;
+#[cfg(not(test))]
+impl ReferenceHost for SystemReferenceHost {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
     }
+    fn sleep(&mut self, delay: std::time::Duration) {
+        std::thread::sleep(delay);
+    }
+}
+#[cfg(not(test))]
+fn reference_host() -> impl ReferenceHost {
+    SystemReferenceHost
+}
+#[cfg(test)]
+std::thread_local! {
+    static REFERENCE_DELAYS: std::cell::RefCell<Vec<std::time::Duration>> = const { std::cell::RefCell::new(Vec::new()) };
+    static REFERENCE_READ_TIMES: std::cell::RefCell<Vec<std::time::Duration>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+struct TestReferenceHost {
+    epoch: std::time::Instant,
+    elapsed: std::time::Duration,
+}
+#[cfg(test)]
+impl Default for TestReferenceHost {
+    fn default() -> Self {
+        Self {
+            epoch: std::time::Instant::now(),
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+}
+#[cfg(test)]
+impl ReferenceHost for TestReferenceHost {
+    fn now(&self) -> std::time::Instant {
+        self.epoch + self.elapsed
+    }
+    fn sleep(&mut self, delay: std::time::Duration) {
+        REFERENCE_DELAYS.with(|delays| delays.borrow_mut().push(delay));
+        self.elapsed += delay;
+    }
+    fn read(&mut self, root: &Path, number: u64) -> Result<ClosingReferences, ScalerError> {
+        REFERENCE_READ_TIMES.with(|times| times.borrow_mut().push(self.elapsed));
+        read_closing_references(root, number)
+    }
+}
+#[cfg(test)]
+fn reference_host() -> impl ReferenceHost {
+    TestReferenceHost::default()
+}
+fn primary_reference_deadline(deadline: std::time::Instant) -> std::time::Instant {
+    deadline - std::time::Duration::from_secs(30)
+}
+#[derive(Debug)]
+enum ReferenceFailure {
+    Deadline,
+    Read(String),
+    Extra,
+}
+impl std::fmt::Display for ReferenceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deadline => f.write_str("closing references unverified (deadline): index did not settle within the publish command window"),
+            Self::Read(reason) => write!(f, "closing references unverified: {reason}"),
+            Self::Extra => f.write_str("closing references unverified: unexpected extra reference"),
+        }
+    }
+}
+struct ReferenceCheck<C> {
+    clock: C,
+    publish_deadline: std::time::Instant,
+    recovery: bool,
+}
+impl<C: ReferenceHost> ReferenceCheck<C> {
+    fn new(clock: C) -> Self {
+        let publish_deadline = COMMAND_DEADLINE
+            .with(|slot| slot.get())
+            .unwrap_or_else(|| clock.now() + std::time::Duration::from_secs(120));
+        Self {
+            clock,
+            publish_deadline,
+            recovery: false,
+        }
+    }
+    fn deadline(&self) -> std::time::Instant {
+        if self.recovery {
+            self.publish_deadline
+        } else {
+            primary_reference_deadline(self.publish_deadline)
+        }
+    }
+    fn delay(
+        &mut self,
+        delay: std::time::Duration,
+        deadline: std::time::Instant,
+    ) -> Result<(), ReferenceFailure> {
+        if deadline.saturating_duration_since(self.clock.now()) <= delay {
+            return Err(ReferenceFailure::Deadline);
+        }
+        self.clock.sleep(delay);
+        Ok(())
+    }
+    /// The index lags writes: delay three seconds, then require two matches
+    /// two seconds apart. Each read gets one retry, within the same deadline.
+    fn verify(
+        &mut self,
+        root: &Path,
+        number: u64,
+        expected: &ClosingIssues,
+    ) -> Result<(), ReferenceFailure> {
+        let deadline = self
+            .deadline()
+            .min(self.clock.now() + std::time::Duration::from_secs(20));
+        let _window = CommandWindow::until(deadline);
+        self.delay(std::time::Duration::from_secs(3), deadline)?;
+        let mut matched = false;
+        loop {
+            let mut current = self.clock.read(root, number);
+            if current.is_err() && self.clock.now() < deadline {
+                current = self.clock.read(root, number);
+            }
+            let current = current.map_err(|e| {
+                if self.clock.now() >= deadline {
+                    ReferenceFailure::Deadline
+                } else {
+                    ReferenceFailure::Read(e.to_string())
+                }
+            })?;
+            // An observed extra reference always wins over a simultaneous
+            // deadline, so a known unsafe write is never kept as merely late.
+            if !current.all.is_subset(expected) {
+                return Err(ReferenceFailure::Extra);
+            }
+            if self.clock.now() >= deadline {
+                return Err(ReferenceFailure::Deadline);
+            }
+            if current.all == *expected {
+                if matched {
+                    return Ok(());
+                }
+                matched = true;
+            } else {
+                matched = false;
+            }
+            self.delay(std::time::Duration::from_secs(2), deadline)?;
+        }
+    }
+}
+/// A deadline without an observed extra reference is not evidence of a bad
+/// body. Keep locally validated prose and report the verification gap honestly.
+fn keep_unverified_body(failure: &ReferenceFailure, token: &str) -> Result<String, ScalerError> {
+    let reason = agent_loop::masked(
+        &format!("{failure}; new body kept, not restored (no extra reference observed)"),
+        token,
+    );
+    Applied::record(|a| a.body = AppliedBody::Failed(reason.clone()))?;
+    Ok(reason)
 }
 /// Recovery is a body write too: verify it with the same consistency protocol.
 /// Keep byte restoration and reference verification distinct in the report.
@@ -2528,14 +2697,17 @@ fn restore_pr_body(
     expected: &ClosingIssues,
     failure: &str,
     token: &str,
+    check: &mut ReferenceCheck<impl ReferenceHost>,
 ) -> Result<String, ScalerError> {
+    check.recovery = true;
+    let _window = CommandWindow::until(check.deadline());
     let (body, label) = replacement;
     let (reason, manual) = match patch_pr_body(root, number, body, token) {
         Err(error) => (
             format!("{failure}; {label} was not restored: {error}"),
             true,
         ),
-        Ok(()) => match verify_closing_references(root, number, expected) {
+        Ok(()) => match check.verify(root, number, expected) {
             Ok(()) => (format!("{failure}; {label} restored and verified"), false),
             Err(error) => (
                 format!(
@@ -2562,6 +2734,10 @@ fn publish(
     token: &str,
     runs: &mut agent_loop::RunCache,
 ) -> Result<Option<u64>, ScalerError> {
+    let mut check = ReferenceCheck::new(reference_host());
+    // Push, snapshot and write share the primary window; recovery alone may
+    // use its reserved thirty seconds, without extending the caller's budget.
+    let _primary_window = CommandWindow::until(check.deadline());
     if dispatch.resume {
         agent_loop::verified_branch_cached(root, dispatch.issue, &dispatch.branch, runs)?;
     } else {
@@ -2657,14 +2833,27 @@ fn publish(
                     )
                 };
                 Applied::record(|a| a.publication_pr = Some(number))?;
-                let previous = read_closing_references(root, number).map_err(|e| {
-                    ScalerError::Usage(format!("closing references unverified before edit: {e}"))
-                })?;
+                let previous = match read_closing_references(root, number) {
+                    Ok(previous) => previous,
+                    Err(error) => {
+                        let reason = agent_loop::masked(
+                            &format!(
+                                "body not updated: closing references unverified before edit: {error}"
+                            ),
+                            token,
+                        );
+                        Applied::record(|a| a.body = AppliedBody::Failed(reason.clone()))?;
+                        return Err(ScalerError::Usage(reason));
+                    }
+                };
                 let mut expected: ClosingIssues =
                     previous.all.difference(&previous.body).cloned().collect();
                 expected.insert(issue_reference(dispatch.issue));
                 patch_pr_body(root, number, &body, token)?;
-                if let Err(error) = verify_closing_references(root, number, &expected) {
+                if let Err(error) = check.verify(root, number, &expected) {
+                    if matches!(error, ReferenceFailure::Deadline) {
+                        return Err(ScalerError::Usage(keep_unverified_body(&error, token)?));
+                    }
                     let reason = restore_pr_body(
                         root,
                         number,
@@ -2672,6 +2861,7 @@ fn publish(
                         &expected,
                         &error.to_string(),
                         token,
+                        &mut check,
                     )?;
                     return Err(ScalerError::Usage(reason));
                 }
@@ -2712,7 +2902,10 @@ fn publish(
                 .ok_or(ScalerError::Guard("invalid PR number"))?;
             Applied::record(|a| a.publication_pr = Some(number))?;
             let expected = ClosingIssues::from([issue_reference(dispatch.issue)]);
-            if let Err(error) = verify_closing_references(root, number, &expected) {
+            if let Err(error) = check.verify(root, number, &expected) {
+                if matches!(error, ReferenceFailure::Deadline) {
+                    return Err(ScalerError::Usage(keep_unverified_body(&error, token)?));
+                }
                 // Recovery prose is server-owned, independent of worker claims.
                 let recovery = Contract {
                     summary: "The server restored this template because the proposed body's closing references could not be verified.".into(),
@@ -2726,6 +2919,7 @@ fn publish(
                     &expected,
                     &error.to_string(),
                     token,
+                    &mut check,
                 )?;
                 return Err(ScalerError::Usage(reason));
             }
@@ -2960,6 +3154,84 @@ mod tests {
         }
     }
     #[test]
+    fn rev4_non_ascii_prefixes_do_not_hide_mentions() {
+        for input in ["é@alice", "中@alice", "٣@alice"] {
+            assert!(
+                neutralize_mentions(input).contains("@\u{2060}alice"),
+                "non-ASCII mention prefix was treated as an email: {input}"
+            );
+        }
+        assert_eq!(neutralize_mentions("_@alice"), "_@alice");
+    }
+    #[test]
+    fn rev4_recovery_reserves_thirty_seconds() {
+        let clock = TestReferenceHost::default();
+        let deadline = clock.now() + std::time::Duration::from_secs(120);
+        let _window = CommandWindow::until(deadline);
+        let mut check = ReferenceCheck::new(clock);
+        assert!(
+            deadline.duration_since(check.deadline()).as_secs() >= 30,
+            "primary publication can consume the reserved recovery window"
+        );
+        check.clock.sleep(std::time::Duration::from_secs(90));
+        check.recovery = true;
+        assert_eq!(
+            check.deadline(),
+            deadline,
+            "recovery extended the caller's budget"
+        );
+        assert_eq!(
+            check.deadline().duration_since(check.clock.now()).as_secs(),
+            30,
+            "recovery did not retain its own window after primary time was spent"
+        );
+    }
+    #[test]
+    fn rev4_commit_filter_allows_own_issue_and_excludes_inherited_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        fixture_repository(temp.path());
+        git(
+            temp.path(),
+            &["commit", "--allow-empty", "-m", "Fixes #999"],
+        )
+        .unwrap();
+        let since = git(temp.path(), &["rev-parse", "HEAD"]).unwrap();
+        for message in [
+            "Fixes #634",
+            "Closes carrick-sh/carrick#634",
+            "Resolves https://github.com/carrick-sh/carrick/issues/634",
+        ] {
+            git(temp.path(), &["commit", "--allow-empty", "-m", message]).unwrap();
+        }
+        assert!(check_commit_closures(temp.path(), since.trim(), 634).is_ok());
+        let safe_tip = git(temp.path(), &["rev-parse", "HEAD"]).unwrap();
+        for message in [
+            "Fixes #999",
+            "Closes other/repo#634",
+            "Fixes #634, #999",
+            "Fixes https://github.com/other/repo/issues/634",
+            "Fixes GH-999",
+        ] {
+            git(temp.path(), &["commit", "--allow-empty", "-m", message]).unwrap();
+            let bad = git(temp.path(), &["rev-parse", "HEAD"]).unwrap();
+            let error = check_commit_closures(temp.path(), safe_tip.trim(), 634)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(bad.trim()),
+                "unsafe commit was not named: {message}"
+            );
+        }
+    }
+    #[test]
+    fn rev4_transient_reference_read_is_retried() {
+        publication_fixture("transient");
+    }
+    #[test]
+    fn rev4_failed_snapshot_still_pushes_and_names_the_skip() {
+        publication_fixture("snapshot-fail");
+    }
+    #[test]
     fn rev3_create_waits_for_two_settled_reads() {
         publication_fixture("lag");
     }
@@ -3025,13 +3297,15 @@ if test "$1" = api; then
  graphql)
  test "$GH_TOKEN" = fixture-token || exit 97
  /usr/bin/python3 - "$RUNNER_TEMP" <<'REFS'
-import json,pathlib,sys,time
+import json,pathlib,sys
 r=pathlib.Path(sys.argv[1]); m=(r/"reference-mode").read_text() if (r/"reference-mode").exists() else ""
 w=int((r/"body-writes").read_text()) if (r/"body-writes").exists() else 0
 p=r/"phase-reads"; n=int(p.read_text())+1 if p.exists() else 1;p.write_text(str(n))
-with (r/"reference-reads.jsonl").open("a") as f:f.write(json.dumps({"time":time.monotonic(),"write":w,"read":n})+"\n")
+with (r/"reference-reads.jsonl").open("a") as f:f.write(json.dumps({"write":w,"read":n})+"\n")
 all_refs=body_refs=[634]
 if (r/"two-references").exists(): all_refs=body_refs=[634,999]
+if m=="transient" and w==1 and n%2==1: sys.exit(95)
+if m=="snapshot-fail" and w==1: sys.exit(95)
 if m=="lag" and w==1 and n<=2: all_refs=body_refs=[]
 if m=="extra-after-match" and w==1 and n>=2: all_refs=body_refs=[634,999]
 if m=="create-repair" and w==1: all_refs=body_refs=[634,999]
@@ -3058,7 +3332,6 @@ elif test "$1 $2" = 'pr edit'; then
 elif test "$1 $2" = 'pr create'; then
  test ! -f "$RUNNER_TEMP/created" || exit 92
  touch "$RUNNER_TEMP/created"
- /usr/bin/python3 -c 'import time,pathlib,sys;pathlib.Path(sys.argv[1]).write_text(str(time.monotonic()))' "$RUNNER_TEMP/body-written-at"
  echo 1 > "$RUNNER_TEMP/body-writes"
  rm -f "$RUNNER_TEMP/phase-reads"
  while test "$1" != --body-file; do shift; done
@@ -3146,11 +3419,10 @@ fi
         std::fs::write(&report, "").unwrap();
         if matches!(
             witness,
-            "lag" | "extra-after-match" | "create-repair" | "timeout"
+            "lag" | "extra-after-match" | "create-repair" | "timeout" | "transient"
         ) {
             std::fs::write(outer.join("reference-mode"), witness).unwrap();
             receipt.pr_body = Some("Proposed explanation.".into());
-            let started = std::time::Instant::now();
             let result = publish(
                 &work,
                 &dispatch,
@@ -3160,7 +3432,12 @@ fi
                 "fixture-token",
                 &mut agent_loop::RunCache::default(),
             );
-            if witness == "lag" {
+            if witness == "transient" {
+                assert!(
+                    result.is_ok(),
+                    "transient reference read blocked publication: {result:?}"
+                );
+            } else if witness == "lag" {
                 assert!(
                     result.is_ok(),
                     "created PR rejected a lagging reference index: {result:?}"
@@ -3174,27 +3451,48 @@ fi
                     rows.len() >= 4,
                     "publication did not require two settled reads"
                 );
-                assert!(started.elapsed().as_secs_f64() >= 9.0);
-                let written_at: f64 = regular_text(&outer.join("body-written-at"))
-                    .unwrap()
-                    .parse()
-                    .unwrap();
-                assert!(
-                    rows[0]["time"].as_f64().unwrap() - written_at >= 3.0,
-                    "closing-reference index was read before the initial three-second delay"
-                );
-                assert!(
-                    rows.windows(2).all(|r| r[1]["time"].as_f64().unwrap()
-                        - r[0]["time"].as_f64().unwrap()
-                        >= 2.0),
-                    "closing reads were less than two seconds apart"
-                );
+                REFERENCE_DELAYS.with(|delays| assert_eq!(
+                    *delays.borrow(),
+                    [3, 2, 2, 2].map(std::time::Duration::from_secs),
+                    "settle did not request the initial three-second delay and two-second spacing"
+                ));
+                REFERENCE_READ_TIMES.with(|times| {
+                    assert_eq!(
+                        *times.borrow(),
+                        [3, 5, 7, 9].map(std::time::Duration::from_secs),
+                        "closing-reference reads did not follow the requested delays"
+                    )
+                });
             } else {
                 assert!(
                     result.is_err(),
                     "create accepted an index that later exposed an extra reference"
                 );
                 outcome(&work, &dispatch);
+                if witness == "timeout" {
+                    assert!(
+                        !outer.join("applied-body.md").exists(),
+                        "deadline-only verification reverted the locally validated body"
+                    );
+                    assert!(
+                        Applied::load().unwrap().report().contains("kept"),
+                        "unverified outcome did not say the new body was kept"
+                    );
+                    assert!(
+                        Applied::load()
+                            .unwrap()
+                            .report()
+                            .contains("closing references unverified")
+                    );
+                    REFERENCE_DELAYS.with(|delays| {
+                        assert!(
+                            delays.borrow().iter().sum::<std::time::Duration>()
+                                < std::time::Duration::from_secs(20),
+                            "reference wait exceeded its twenty-second verification window"
+                        )
+                    });
+                    return;
+                }
                 let fallback = regular_text(&outer.join("applied-body.md"))
                     .expect("new PR kept the rejected body instead of the default template");
                 assert!(
@@ -3205,19 +3503,6 @@ fi
                     Applied::load().unwrap().report().contains("restored"),
                     "outcome did not say whether the body was restored"
                 );
-                if witness == "timeout" {
-                    assert!(
-                        Applied::load()
-                            .unwrap()
-                            .report()
-                            .contains("closing references unverified"),
-                        "unsettled index was not reported as unverified"
-                    );
-                    assert!(
-                        started.elapsed() < std::time::Duration::from_secs(30),
-                        "reference wait exceeded its bounded recovery window"
-                    );
-                }
             }
             return;
         }
@@ -3238,7 +3523,8 @@ fi
             let _window =
                 CommandWindow::until(std::time::Instant::now() + std::time::Duration::from_secs(1));
             assert!(
-                verify_closing_references(&work, 800, &ClosingIssues::from([issue_reference(634)]))
+                ReferenceCheck::new(reference_host())
+                    .verify(&work, 800, &ClosingIssues::from([issue_reference(634)]))
                     .is_err(),
                 "closing-reference wait escaped the command window"
             );
@@ -3297,6 +3583,7 @@ fi
                 | "manual"
                 | "restore-fail"
                 | "restore-html"
+                | "snapshot-fail"
         ) {
             let package = outer.join("dispatch-output");
             std::fs::create_dir_all(&package).unwrap();
@@ -3316,11 +3603,38 @@ fi
                 | "manual"
                 | "restore-fail"
                 | "restore-html"
+                | "snapshot-fail"
         ) {
             receipt.pr_body = read_pr_body(&outer.join("dispatch-output")).unwrap();
         }
-        if matches!(witness, "manual" | "restore-fail" | "restore-html") {
+        if matches!(
+            witness,
+            "manual" | "restore-fail" | "restore-html" | "snapshot-fail"
+        ) {
             std::fs::write(outer.join("reference-mode"), witness).unwrap();
+        }
+        if witness == "snapshot-fail" {
+            let result = publish(
+                &work,
+                &dispatch,
+                &receipt,
+                &contract,
+                &report,
+                "fixture-token",
+                &mut agent_loop::RunCache::default(),
+            );
+            let applied = Applied::load().unwrap();
+            assert_eq!(
+                applied.commits.len(),
+                1,
+                "snapshot failure prevented the push"
+            );
+            assert!(
+                applied.report().contains("before edit"),
+                "snapshot refusal was absent from the applied report: {result:?}"
+            );
+            assert!(!outer.join("applied-body.md").exists());
+            return;
         }
         if witness == "restore-fail" {
             let result = publish(
