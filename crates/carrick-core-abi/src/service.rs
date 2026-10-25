@@ -580,6 +580,8 @@ pub struct ExecSuccessorManifest {
     root_generation: u64,
     asid: u64,
     asid_generation: u64,
+    entry: u64,
+    stack_pointer: u64,
     receipt: u64,
     digest: u64,
 }
@@ -587,6 +589,22 @@ pub struct ExecSuccessorManifest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecSuccessorManifestView {
     pub successor_mm: ReservationMm,
+    pub root: carrick_guest_arch::RootGpa,
+    pub root_generation: NonZeroU64,
+    pub asid: carrick_guest_arch::Asid,
+    pub asid_generation: NonZeroU64,
+    pub entry: carrick_guest_arch::UserVa,
+    pub stack_pointer: carrick_guest_arch::UserVa,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecSuccessorEntry {
+    pub entry: carrick_guest_arch::UserVa,
+    pub stack_pointer: carrick_guest_arch::UserVa,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecSuccessorBacking {
     pub root: carrick_guest_arch::RootGpa,
     pub root_generation: NonZeroU64,
     pub asid: carrick_guest_arch::Asid,
@@ -612,7 +630,7 @@ impl ServiceIdentity {
 }
 
 impl ExecSuccessorManifest {
-    fn words(&self) -> [u64; 19] {
+    fn words(&self) -> [u64; 21] {
         [
             self.revision,
             self.phase,
@@ -631,6 +649,8 @@ impl ExecSuccessorManifest {
             self.root_generation,
             self.asid,
             self.asid_generation,
+            self.entry,
+            self.stack_pointer,
             self.receipt,
             0,
         ]
@@ -650,6 +670,8 @@ impl ExecSuccessorManifest {
             root_generation: 0,
             asid: 0,
             asid_generation: 0,
+            entry: 0,
+            stack_pointer: 0,
             receipt: 0,
             digest: 0,
         };
@@ -665,6 +687,8 @@ impl ExecSuccessorManifest {
             && self.root_generation == 0
             && self.asid == 0
             && self.asid_generation == 0
+            && self.entry == 0
+            && self.stack_pointer == 0
             && self.receipt == 0
             && self.has_valid_digest())
         .then(|| ReservationMm::new(self.successor_mm))?
@@ -674,17 +698,17 @@ impl ExecSuccessorManifest {
         mut self,
         identity: ServiceIdentity,
         receipt: ExecAdoptionReceipt,
-        root: carrick_guest_arch::RootGpa,
-        root_generation: NonZeroU64,
-        asid: carrick_guest_arch::Asid,
-        asid_generation: NonZeroU64,
+        backing: ExecSuccessorBacking,
+        image: ExecSuccessorEntry,
     ) -> Option<Self> {
         self.proposal(identity)?;
         self.phase = EXEC_SUCCESSOR_SEALED;
-        self.root = root.address().raw();
-        self.root_generation = root_generation.get();
-        self.asid = u64::from(asid.raw());
-        self.asid_generation = asid_generation.get();
+        self.root = backing.root.address().raw();
+        self.root_generation = backing.root_generation.get();
+        self.asid = u64::from(backing.asid.raw());
+        self.asid_generation = backing.asid_generation.get();
+        self.entry = image.entry.raw();
+        self.stack_pointer = image.stack_pointer.raw();
         self.receipt = receipt.raw().get();
         self.digest = crate::integrity_digest(&self.words());
         Some(self)
@@ -713,6 +737,8 @@ impl ExecSuccessorManifest {
                 u16::try_from(self.asid).ok()?,
             )?),
             asid_generation: NonZeroU64::new(self.asid_generation)?,
+            entry: carrick_guest_arch::UserVa::new(self.entry),
+            stack_pointer: carrick_guest_arch::UserVa::new(self.stack_pointer),
         })
     }
 }
@@ -1568,14 +1594,22 @@ mod tests {
             core::num::NonZeroU16::new(47).unwrap(),
         );
         let asid_generation = NonZeroU64::new(53).unwrap();
+        let entry = carrick_guest_arch::UserVa::new(0x40_0000);
+        let stack_pointer = carrick_guest_arch::UserVa::new(0x7fff_f000);
         let sealed = proposal
             .seal(
                 identity,
                 receipt,
-                root,
-                root_generation,
-                asid,
-                asid_generation,
+                ExecSuccessorBacking {
+                    root,
+                    root_generation,
+                    asid,
+                    asid_generation,
+                },
+                ExecSuccessorEntry {
+                    entry,
+                    stack_pointer,
+                },
             )
             .unwrap();
         assert_eq!(
@@ -1586,6 +1620,8 @@ mod tests {
                 root_generation,
                 asid,
                 asid_generation,
+                entry,
+                stack_pointer,
             })
         );
         let mut stale = identity;

@@ -114,6 +114,54 @@ impl ForkPhysicalCustody {
         }
         Ok(Some((pin, mapping, record)))
     }
+
+    /// Retain one already-published native-exec mapping as sendable process
+    /// stock custody. Publication established the carrier records; this
+    /// method only pins their exact generations and backing allocations.
+    pub(crate) fn retain_published_exec_mapping(
+        &self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+    ) -> Result<Option<ForkPhysicalRetention>, TrapError> {
+        let Some(end) = ipa.checked_add(len).filter(|_| len != 0) else {
+            return Ok(None);
+        };
+        let mut cursor = ipa;
+        let mut frames = Vec::new();
+        let mut native_owners = Vec::new();
+        while cursor < end {
+            let Some((pin, mapping, record)) = self.retain_extent(cursor, 1)? else {
+                return Ok(None);
+            };
+            let Some(bound) = record.ipa.checked_add(record.len as u64) else {
+                return Ok(None);
+            };
+            if let Some(logical) = record.logical_owner
+                && let Some(owner) = self
+                    .custody
+                    .native_frame_backings
+                    .lock()
+                    .get(&(record.ipa, logical.generation))
+                    .and_then(std::sync::Weak::upgrade)
+            {
+                native_owners.push(owner);
+            }
+            cursor = bound.min(end);
+            frames.push((pin, mapping));
+        }
+        Ok(Some(ForkPhysicalRetention {
+            selected: PortalForkCustody::Frame {
+                va,
+                ipa,
+                len,
+                shared: false,
+            },
+            _frames: frames,
+            _native_owners: native_owners,
+            source: None,
+        }))
+    }
 }
 impl ForkCustody for ForkPhysicalCustody {
     type Retention = ForkPhysicalRetention;

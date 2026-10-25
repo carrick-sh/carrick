@@ -16,7 +16,9 @@ use carrick_guest_arch::{AddressContext, Asid, KernelVa, RootGpa};
 use core::num::NonZeroU64;
 
 #[allow(unused_imports)]
-pub use crate::{GRANT_OP_CHILD_RETIRE, GRANT_OP_FORK_STOCK, GRANT_OP_ROOT_EXIT};
+pub use crate::{
+    GRANT_OP_CHILD_RETIRE, GRANT_OP_EXEC_ADOPT, GRANT_OP_FORK_STOCK, GRANT_OP_ROOT_EXIT,
+};
 
 /// x86 synchronous I/O port for physical fork stock loans and settlements.
 pub const FORK_STOCK_PORT: u16 = 0xd2;
@@ -25,6 +27,92 @@ pub const NATIVE_PEER_READY_PORT: u16 = 0xd4;
 /// x86 synchronous I/O port for [`NativeChildRetire`], the twin of AArch64
 /// `HVC #6` with [`GRANT_OP_CHILD_RETIRE`].
 pub const NATIVE_CHILD_RETIRE_PORT: u16 = 0xd6;
+
+/// One synchronous, consuming native-exec adoption request. The carrier
+/// authenticates the manifest against the retained service identity and the
+/// stopped execution before changing physical ownership. A receipt is only
+/// selection; neither word is authority on its own.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct NativeExecAdoption {
+    words: [u64; 8],
+}
+
+impl NativeExecAdoption {
+    const MAGIC: u64 = 0x4352_4558_4144_4f50;
+    const PENDING: u64 = 0;
+    const ACCEPTED: u64 = 1;
+    const REFUSED: u64 = 2;
+    const CONSUMED: u64 = 3;
+
+    pub fn new(
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+        manifest: KernelVa,
+    ) -> Option<Self> {
+        (manifest.raw() != 0
+            && manifest.raw().is_multiple_of(core::mem::align_of::<
+                carrick_core_abi::service::ExecSuccessorManifest,
+            >() as u64))
+        .then_some(Self {
+            words: [
+                Self::MAGIC,
+                receipt.raw().get(),
+                manifest.raw(),
+                Self::PENDING,
+                0,
+                0,
+                0,
+                0,
+            ],
+        })
+    }
+
+    pub fn request(&self) -> Option<(carrick_core_abi::service::ExecAdoptionReceipt, KernelVa)> {
+        if self.words[0] != Self::MAGIC || self.words[3] != Self::PENDING {
+            return None;
+        }
+        let receipt = carrick_core_abi::service::ExecAdoptionReceipt::checked(NonZeroU64::new(
+            self.words[1],
+        )?)?;
+        Some((receipt, KernelVa::new(self.words[2])))
+    }
+
+    pub fn accept(&mut self) -> bool {
+        self.reply(Self::ACCEPTED)
+    }
+
+    pub fn refuse(&mut self) -> bool {
+        self.reply(Self::REFUSED)
+    }
+
+    fn reply(&mut self, status: u64) -> bool {
+        if self.request().is_none() {
+            return false;
+        }
+        self.words[3] = status;
+        true
+    }
+
+    pub fn take(
+        &mut self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+        manifest: KernelVa,
+    ) -> Option<Result<(), ()>> {
+        if self.words[0] != Self::MAGIC
+            || self.words[1] != receipt.raw().get()
+            || self.words[2] != manifest.raw()
+        {
+            return None;
+        }
+        let result = match self.words[3] {
+            Self::ACCEPTED => Ok(()),
+            Self::REFUSED => Err(()),
+            _ => return None,
+        };
+        self.words[3] = Self::CONSUMED;
+        Some(result)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForkStockKind {
@@ -1486,5 +1574,19 @@ mod tests {
         assert_eq!(exchange_zero._reserved, 0);
         let loan_zero = exchange_zero.take(request).unwrap().unwrap();
         assert_eq!(loan_zero.asid, None);
+    }
+
+    #[test]
+    fn exec_adoption_receipt_is_consumed_once() {
+        let receipt =
+            carrick_core_abi::service::ExecAdoptionReceipt::checked(NonZeroU64::new(17).unwrap())
+                .unwrap();
+        let manifest = KernelVa::new(0x8000);
+        let mut request = NativeExecAdoption::new(receipt, manifest).unwrap();
+        assert_eq!(request.request(), Some((receipt, manifest)));
+        assert!(request.accept());
+        assert_eq!(request.take(receipt, manifest), Some(Ok(())));
+        assert_eq!(request.take(receipt, manifest), None);
+        assert_eq!(request.request(), None);
     }
 }

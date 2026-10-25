@@ -180,10 +180,19 @@ impl NativeService {
             .seal(
                 identity,
                 receipt,
-                prepared.root(),
-                receipt.raw(),
-                asid.asid(),
-                core::num::NonZeroU64::new(asid.generation()).ok_or_else(stale)?,
+                carrick_core_abi::service::ExecSuccessorBacking {
+                    root: prepared.root(),
+                    root_generation: receipt.raw(),
+                    asid: asid.asid(),
+                    asid_generation: core::num::NonZeroU64::new(asid.generation())
+                        .ok_or_else(stale)?,
+                },
+                carrick_core_abi::service::ExecSuccessorEntry {
+                    entry: carrick_guest_arch::UserVa::new(prepared.entry()),
+                    stack_pointer: carrick_guest_arch::UserVa::new(
+                        prepared.stack_pointer().ok_or_else(stale)?,
+                    ),
+                },
             )
             .ok_or_else(stale)?;
         if sealed

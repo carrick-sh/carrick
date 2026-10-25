@@ -469,6 +469,9 @@ pub struct CarrierVmCustody {
         )>,
     >,
     pub(crate) native_exec_preparations: parking_lot::Mutex<Vec<RetainedNativeExecPreparation>>,
+    pub(crate) native_exec_predecessors: parking_lot::Mutex<
+        Vec<carrick_hal::fork_stock::ExecPredecessorReceipt<carrick_hal::asid::AsidGeneration>>,
+    >,
     pub(crate) native_exec_receipt_sequence: std::sync::atomic::AtomicU64,
 }
 
@@ -525,6 +528,35 @@ impl CarrierVmCustody {
         self.native_exec_preparations
             .lock()
             .push((receipt, identity, prepared));
+    }
+
+    pub(crate) fn take_native_exec_preparation(
+        &self,
+        receipt: carrick_core_abi::service::ExecAdoptionReceipt,
+        manifest: &carrick_core_abi::service::ExecSuccessorManifest,
+        execution: carrick_hal::fork_stock::GrantExecution,
+    ) -> Option<(
+        crate::trap::PreparedNativeExecSuccessor,
+        carrick_core_abi::service::ExecSuccessorManifestView,
+    )> {
+        let mut retained = self.native_exec_preparations.lock();
+        let index = retained
+            .iter()
+            .position(|(candidate, _, _)| *candidate == receipt)?;
+        let (_, identity, _) = &retained[index];
+        let view = manifest.open(*identity, receipt)?;
+        let birth = identity.birth;
+        if birth.process.id.raw() as u64 != execution.binding.task.raw()
+            || identity.execution != execution.binding.generation
+            || birth.thread != execution.binding.thread_generation
+            || birth.mm.carrier() != self.transfer_carrier
+            || birth.mm.mm().raw() != execution.binding.mm.raw()
+            || birth.mm.incarnation().get() != execution.context.generation.raw().get()
+        {
+            return None;
+        }
+        let (_, _, prepared) = retained.swap_remove(index);
+        Some((prepared, view))
     }
 }
 
@@ -744,6 +776,7 @@ impl CarrierVmCustody {
             guest_cow_states: parking_lot::Mutex::new(std::collections::HashMap::new()),
             native_exec_services: parking_lot::Mutex::new(Vec::new()),
             native_exec_preparations: parking_lot::Mutex::new(Vec::new()),
+            native_exec_predecessors: parking_lot::Mutex::new(Vec::new()),
             native_exec_receipt_sequence: std::sync::atomic::AtomicU64::new(0),
         }
     }

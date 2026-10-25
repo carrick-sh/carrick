@@ -693,6 +693,10 @@ pub trait ForkStockCrossing {
     fn cross_root_exit(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError>;
+    fn cross_exec_adopt(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        let _ = (record_gpa, cpu);
+        Err(NativeProcessError::Unsupported)
+    }
     fn cross_wait_channel_wake(
         &self,
         channel: super::native_process_runtime::ProcessWaitChannel,
@@ -715,6 +719,9 @@ impl<T: ForkStockCrossing> ForkStockCrossing for &T {
     }
     fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError> {
         (**self).cross_child_reclaim(mm, cpu)
+    }
+    fn cross_exec_adopt(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        (**self).cross_exec_adopt(record_gpa, cpu)
     }
     fn cross_cow_supply(&self, address: UserVa, cpu: u64) -> Result<(), NativeProcessError> {
         (**self).cross_cow_supply(address, cpu)
@@ -750,6 +757,18 @@ impl<T: ForkStockCrossing> ForkStockCrossing for &T {
 pub struct HvcForkStockCrossing;
 
 impl ForkStockCrossing for HvcForkStockCrossing {
+    fn cross_exec_adopt(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            carrick_el1::isa::aarch64::cross_hvc_exec_adopt(record_gpa, cpu)
+                .map_err(|_| NativeProcessError::Stale)
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (record_gpa, cpu);
+            Err(NativeProcessError::Unsupported)
+        }
+    }
     fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
