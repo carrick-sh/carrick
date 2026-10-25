@@ -2052,6 +2052,9 @@ impl CarrierVmCustody {
         identity: CarrierStage2RecordIdentity,
         stage1: super::frame_inventory::Stage1Unpublished,
     ) -> CarrierStage2RetireOutcome {
+        if stage1.identity() != identity {
+            return CarrierStage2RetireOutcome::NotFound;
+        }
         let Some(snapshot) = self.stage2_record_snapshot(identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };

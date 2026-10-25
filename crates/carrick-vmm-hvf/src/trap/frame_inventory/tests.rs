@@ -115,6 +115,7 @@ fn el1_partial_discard_peer_retention_three_scales() {
             .release_with(
                 &mut parent.frames.lock(),
                 Stage1UnpublicationReceipt::Inventory(&parent_proof),
+                |lease| custody.carrier_stage2_records.lock().get(&lease).copied(),
             )
             .unwrap()
             .0;
@@ -146,6 +147,7 @@ fn el1_partial_discard_peer_retention_three_scales() {
             .release_with(
                 &mut child.frames.lock(),
                 Stage1UnpublicationReceipt::Inventory(&child_proof),
+                |lease| custody.carrier_stage2_records.lock().get(&lease).copied(),
             )
             .unwrap()
             .0;
@@ -8552,6 +8554,13 @@ pub(crate) fn assert_fork_child_exec_retirement(
         .release_with(
             &mut child.frames.lock(),
             Stage1UnpublicationReceipt::Inventory(&stage1),
+            |lease| {
+                legacy_test_carrier_vm_custody()
+                    .carrier_stage2_records
+                    .lock()
+                    .get(&lease)
+                    .copied()
+            },
         )
         .expect("release child stage-2 references after stage-1")
         .0;

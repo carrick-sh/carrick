@@ -445,6 +445,7 @@ impl StagedProcessStage2Retirement {
         self,
         registry: &mut InventoryFrameRegistry,
         receipt: Stage1UnpublicationReceipt<'_>,
+        mut identity_for: impl FnMut((u64, u64)) -> Option<CarrierStage2RecordIdentity>,
     ) -> Result<
         (
             std::collections::BTreeSet<(u64, u64)>,
@@ -456,7 +457,7 @@ impl StagedProcessStage2Retirement {
         for (lease, count) in self.reference_releases {
             for _ in 0..count {
                 if let Some(proof) = registry
-                    .release_stage2_reference(lease, None, receipt)
+                    .release_stage2_reference(lease, identity_for(lease), receipt)
                     .map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "release process stage-2 reference {lease:?}: {error:?}"
@@ -559,11 +560,16 @@ pub(crate) struct InventoryFrameRegistry {
 #[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct Stage1Unpublished {
     lease: (u64, u64),
+    identity: CarrierStage2RecordIdentity,
 }
 
 impl Stage1Unpublished {
     pub(crate) fn lease(&self) -> (u64, u64) {
         self.lease
+    }
+
+    pub(crate) fn identity(&self) -> CarrierStage2RecordIdentity {
+        self.identity
     }
 }
 
@@ -611,7 +617,8 @@ impl InventoryFrameRegistry {
             return Ok(None);
         }
         self.stage2_references.remove(&lease);
-        Ok(Some(Stage1Unpublished { lease }))
+        let identity = identity.ok_or(Stage2ReferenceReleaseError::ReceiptMismatch(lease))?;
+        Ok(Some(Stage1Unpublished { lease, identity }))
     }
 }
 
@@ -3741,6 +3748,7 @@ impl HvfVmState {
             staged.release_with(
                 &mut registry,
                 Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
+                |lease| custody.carrier_stage2_records.lock().get(&lease).copied(),
             )?
         };
 
