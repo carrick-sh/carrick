@@ -85,6 +85,10 @@ opt-level = 3
 [profile.dev.package.quote]
 opt-level = 3
 
+# Fixture verification hashes large bundles even in the host task runner.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.test]
 split-debuginfo = "unpacked"
 incremental = false

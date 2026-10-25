@@ -3043,3 +3043,30 @@ fn real_repo_inventory_includes_perf_probes() {
         "conformance-probes/target/aarch64-unknown-linux-gnu/release/perf_wait_pipe_pingpong"
     ));
 }
+
+#[test]
+fn verification_stamp_reuses_unchanged_files_and_refuses_restored_mtime_tamper() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    fixtures::verify_installed(f.repo.path()).unwrap();
+    let stamp = f.repo.path().join("target/fixtures/verified-stat-v1.json");
+    let stamp_time = fs::metadata(&stamp).unwrap().modified().unwrap();
+    fixtures::verify_installed(f.repo.path()).unwrap();
+    assert_eq!(
+        fs::metadata(&stamp).unwrap().modified().unwrap(),
+        stamp_time
+    );
+    let path = f.repo.path().join(&f.manifest.executables[0].path);
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] ^= 1;
+    fs::write(&path, bytes).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert!(fixtures::verify_installed(f.repo.path()).is_err());
+    assert!(!stamp.exists());
+}

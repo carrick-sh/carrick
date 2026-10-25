@@ -345,3 +345,35 @@ fn path_change_replaces_inherited_cache_selection() {
         "{stderr}"
     );
 }
+
+#[test]
+fn signed_nesting_removes_cargo_package_metadata_without_changing_cache() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new("sh")
+        .current_dir(repo)
+        .env("CARGO_MANIFEST_DIR", "/injected/xtask")
+        .env("CARGO_PKG_NAME", "carrick-xtask")
+        .env("CARRICK_SCCACHE", "0")
+        .args([
+            "-c",
+            r#"
+            set -eu
+            . scripts/lib/build-env.sh
+            first=$CARRICK_CARGO_CACHE_CONFIG
+            test "${CARGO_MANIFEST_DIR+x}" != x
+            test "${CARGO_PKG_NAME+x}" != x
+            CARGO_MANIFEST_DIR=/injected/xtask
+            export CARGO_MANIFEST_DIR
+            . scripts/lib/build-env.sh
+            test "${CARGO_MANIFEST_DIR+x}" != x
+            test "$first" = "$CARRICK_CARGO_CACHE_CONFIG"
+        "#,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

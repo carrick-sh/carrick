@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Validate with the existing library before Git-based admission; retain the
 # Rust guard through build, signing, execution and scoped EXIT cleanup.
+# CARRICK_TEST_TARGET=<integration-target> narrows Cargo linking while retaining
+# the package's negative control. Omit it to build all test targets.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib/build-env.sh
