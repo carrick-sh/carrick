@@ -4129,6 +4129,13 @@ impl UnpublishedTaskStage1 {
             .position(|(candidate, _)| *candidate == identity)?;
         Some(receipts.swap_remove(index).1)
     }
+
+    fn names(&self, identity: CarrierStage2RecordIdentity) -> bool {
+        self.rollback_receipts
+            .lock()
+            .iter()
+            .any(|(candidate, _)| *candidate == identity)
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

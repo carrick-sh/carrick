@@ -3853,6 +3853,7 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         extents,
         predecessor_aliases: Vec::new(),
         frames: Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
+        stage2_reference_releases: std::collections::BTreeMap::new(),
         mm_root_slot: None,
         mm_access: None,
         predecessor_identity: carrick_hal::ExecPredecessorIdentity {

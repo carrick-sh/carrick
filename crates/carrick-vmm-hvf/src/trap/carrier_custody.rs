@@ -2695,6 +2695,7 @@ mod carrier_vm_custody_tests {
         CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, Stage1UnpublicationReceipt,
         Stage1Unpublished, create_vm_with_custody_using, destroy_vm_with_custody_using,
     };
+    use crate::trap::frame_inventory::{InventoryFrameRegistry, Stage2ReferenceReleaseError};
 
     #[test]
     fn retirement_request_signature_requires_stage1_unpublished_witness() {
@@ -2704,6 +2705,59 @@ mod carrier_vm_custody_tests {
             Stage1Unpublished,
         ) -> CarrierStage2RetireOutcome = CarrierVmCustody::request_stage2_record_retirement;
         let _ = request;
+    }
+
+    #[test]
+    fn reference_ledger_mints_only_at_zero_for_a_receipt_naming_the_lease() {
+        let (custody, generation) = live_custody();
+        let identity = custody
+            .register_stage2_record(CarrierStage2RecordSpec {
+                ipa: 0xa081_a000_0000,
+                ..stage2_spec(generation, 71)
+            })
+            .unwrap();
+        let other = custody
+            .register_stage2_record(CarrierStage2RecordSpec {
+                ipa: 0xa081_a020_0000,
+                ..stage2_spec(generation, 72)
+            })
+            .unwrap();
+        let lease = (0xa081_a000_0000, 0x4000);
+        let mut frames = InventoryFrameRegistry::default();
+        frames.stage2_references.insert(lease, 2);
+
+        let wrong = custody.editor_receipt_after_test_unmap(other);
+        assert_eq!(
+            frames.release_stage2_reference(
+                lease,
+                Some(identity),
+                Stage1UnpublicationReceipt::EditorRange(&wrong),
+            ),
+            Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease))
+        );
+        assert_eq!(frames.stage2_references.get(&lease), Some(&2));
+
+        let exact = custody.editor_receipt_after_test_unmap(identity);
+        assert!(
+            frames
+                .release_stage2_reference(
+                    lease,
+                    Some(identity),
+                    Stage1UnpublicationReceipt::EditorRange(&exact),
+                )
+                .unwrap()
+                .is_none()
+        );
+        let proof = frames
+            .release_stage2_reference(
+                lease,
+                Some(identity),
+                Stage1UnpublicationReceipt::EditorRange(&exact),
+            )
+            .unwrap()
+            .expect("the zero crossing mints the one-shot proof");
+        assert_eq!(proof.lease(), lease);
+        assert!(!frames.stage2_references.contains_key(&lease));
     }
 
     /// Work budget of the instruction-cache authority: an executable

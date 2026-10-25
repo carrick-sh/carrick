@@ -18,6 +18,9 @@ pub(crate) struct PendingExecStage2Cleanup {
     pub(crate) predecessor_aliases: Vec<AliasBacking>,
     /// Shared backend reference authority rechecked immediately before recycle.
     pub(crate) frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+    /// Backend reference decrements staged during exec and consumed only after
+    /// the predecessor's whole-MM stage-1 proof is available.
+    pub(crate) stage2_reference_releases: std::collections::BTreeMap<(u64, u64), usize>,
     /// Semantic alias ownership of the address space replaced by exec.
     pub(crate) mm_root_slot: Option<(u64, u64)>,
     /// Exact predecessor MM authority retained independently of its frame
@@ -194,6 +197,31 @@ impl PendingExecStage2Cleanup {
             publish(classification);
             return Ok(None);
         }
+        let stage1_reference_proofs = if self.stage2_reference_releases.is_empty() {
+            std::collections::BTreeMap::new()
+        } else {
+            let stage1_unpublished = stage1_unpublished.ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "exec predecessor reference release lacks stage-1 unpublication proof"
+                        .to_owned(),
+                )
+            })?;
+            let staged = StagedProcessStage2Retirement {
+                candidates: self
+                    .extents
+                    .keys()
+                    .map(|&(ipa, size)| (ipa, size as u64))
+                    .collect(),
+                reference_releases: std::mem::take(&mut self.stage2_reference_releases),
+            };
+            let mut registry = self.frames.lock();
+            staged
+                .release_with(
+                    &mut registry,
+                    Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
+                )?
+                .1
+        };
         let mut retired_extents = Vec::new();
         for (&(ipa, size), &owner_identity) in &self.extents {
             let owner_generation = owner_identity.generation;
@@ -207,6 +235,17 @@ impl PendingExecStage2Cleanup {
             if global_frame_host_owner_generation_in(custody, ipa, size as u64) != owner_generation
             {
                 continue;
+            }
+            let stage1_reference = stage1_reference_proofs.get(&lease).ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "exec predecessor extent {lease:?} did not cross the stage-1 reference ledger"
+                ))
+            })?;
+            if stage1_reference.lease() != lease {
+                return Err(TrapError::Hypervisor(format!(
+                    "exec predecessor receipt names {:?}, expected {lease:?}",
+                    stage1_reference.lease()
+                )));
             }
             let mut exact_owner_retired = false;
             if HvfVmState::retire_stage2_candidate_if_unreferenced(&self.frames, lease, || {
@@ -2029,6 +2068,7 @@ impl HvfVmState {
         let address_space_teardown_started = std::time::Instant::now();
         let mut pending_exec_vcpu = None;
         let mut pending_exec_vm = None;
+        let mut predecessor_stage2_reference_releases = std::collections::BTreeMap::new();
         let retired_physical_extents = if self.persistent_vm_lifecycle {
             // The vCPU is stopped at the execve syscall exit and every sibling
             // has already retired. Build the complete predecessor/replacement
@@ -2084,14 +2124,14 @@ impl HvfVmState {
                 } else {
                     Vec::new()
                 };
-                if let Err(error) =
-                    Self::stage_retirement(&mut inventory, retired, authority.as_ref())
-                {
-                    carrick_fatal!(
-                        "hvpatch::frame_inventory",
-                        "stage inventory after HVPatch exec unmap: {error}"
-                    );
-                }
+                let staged = Self::stage_retirement(&mut inventory, retired, authority.as_ref())
+                    .unwrap_or_else(|error| {
+                        carrick_fatal!(
+                            "hvpatch::frame_inventory",
+                            "stage inventory after HVPatch exec unmap: {error}"
+                        );
+                    });
+                predecessor_stage2_reference_releases = staged.reference_releases;
                 let scope = CowInventoryLifecycleScope {
                     custody: &self.carrier_foreign_mm_transport.custody,
                     identity: self.cow_identity,
@@ -2253,6 +2293,7 @@ impl HvfVmState {
                     extents: predecessor_extents,
                     predecessor_aliases,
                     frames: predecessor_frames,
+                    stage2_reference_releases: predecessor_stage2_reference_releases,
                     mm_root_slot: predecessor_mm_root_slot,
                     mm_access: predecessor_mm_access,
                     predecessor_identity,

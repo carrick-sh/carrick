@@ -22,6 +22,17 @@ fn retire_test_process_mappings_with_root_proof(
     )
 }
 
+fn test_whole_mm_stage1_proof() -> carrick_core::mm::retirement::Stage1UnpublishedMm {
+    let mut task = hvpatch_neutral_task_state_for_test();
+    task.cow_identity = Some(carrick_hal::FrameCowIdentity {
+        linux_pid: 1,
+        linux_tid: 1,
+        mm: 1,
+        asid: 1,
+    });
+    prepare_test_whole_mm_retirement(&mut task)
+}
+
 /// Model the inventory after one 4 KiB semantic discard in each 16 KiB
 /// compound, with a fork peer still retaining the complete compound. This
 /// exercises inventory/physical retirement, not the guest DONTNEED adapter.
@@ -93,12 +104,20 @@ fn el1_partial_discard_peer_retention_three_scales() {
                 Vec::new(),
             )
         };
-        let parent_candidates = HvfVmState::stage_retirement(
+        let parent_staged = HvfVmState::stage_retirement(
             &mut parent,
             &mut reservation(1),
             &TestFrameMappingCount::Exact(2),
         )
         .unwrap();
+        let parent_proof = test_whole_mm_stage1_proof();
+        let parent_candidates = parent_staged
+            .release_with(
+                &mut parent.frames.lock(),
+                Stage1UnpublicationReceipt::Inventory(&parent_proof),
+            )
+            .unwrap()
+            .0;
         assert!(parent_candidates.is_empty());
         assert_eq!(observer.snapshot().bytes_returned, 0);
         assert_eq!(
@@ -116,12 +135,20 @@ fn el1_partial_discard_peer_retention_three_scales() {
                     .all(|byte| *byte == 0x7c)
             );
         }
-        let child_candidates = HvfVmState::stage_retirement(
+        let child_staged = HvfVmState::stage_retirement(
             &mut child,
             &mut reservation(2),
             &TestFrameMappingCount::Exact(1),
         )
         .unwrap();
+        let child_proof = test_whole_mm_stage1_proof();
+        let child_candidates = child_staged
+            .release_with(
+                &mut child.frames.lock(),
+                Stage1UnpublicationReceipt::Inventory(&child_proof),
+            )
+            .unwrap()
+            .0;
         assert_eq!(child_candidates.len(), scale as usize);
         let mut unmaps = 0;
         for (base, length, generation, _) in physical {
@@ -1517,6 +1544,7 @@ fn serial_host_exec_predecessor_backing_stays_live_until_detached_cleanup() {
         .collect(),
         predecessor_aliases: Vec::new(),
         frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
+        stage2_reference_releases: std::collections::BTreeMap::new(),
         mm_root_slot: task.mm_root_slot,
         mm_access: None,
         predecessor_identity,
@@ -1551,6 +1579,7 @@ fn shared_exec_predecessor_cleanup_retains_and_emits_exact_classification() {
         extents: std::collections::BTreeMap::new(),
         predecessor_aliases: Vec::new(),
         frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
+        stage2_reference_releases: std::collections::BTreeMap::new(),
         mm_root_slot: task.mm_root_slot,
         mm_access: None,
         predecessor_identity,
@@ -1670,6 +1699,7 @@ fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
             },
         )],
         frames,
+        stage2_reference_releases: std::collections::BTreeMap::new(),
         mm_root_slot: task.mm_root_slot,
         mm_access: None,
         predecessor_identity,
@@ -1758,6 +1788,7 @@ fn exec_predecessor_cleanup_rejects_a_recycled_owner_generation() {
             .collect(),
         predecessor_aliases: Vec::new(),
         frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
+        stage2_reference_releases: std::collections::BTreeMap::new(),
         mm_root_slot: task.mm_root_slot,
         mm_access: None,
         predecessor_identity,
@@ -1865,6 +1896,7 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
         .collect(),
         predecessor_aliases: vec![old_alias],
         frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
+        stage2_reference_releases: std::collections::BTreeMap::new(),
         mm_root_slot: task.mm_root_slot,
         mm_access: None,
         predecessor_identity,
@@ -3194,6 +3226,7 @@ fn exec_predecessor_returns_proof_for_a_root_omitted_from_retirement_candidates(
         extents: std::collections::BTreeMap::new(),
         predecessor_aliases: Vec::new(),
         frames: std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default())),
+        stage2_reference_releases: std::collections::BTreeMap::new(),
         mm_root_slot: Some(root_slot),
         mm_access: Some(std::sync::Arc::clone(&task.mm_access)),
         predecessor_identity,
@@ -7896,6 +7929,7 @@ fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
         extents: std::collections::BTreeMap::new(),
         predecessor_aliases: Vec::new(),
         frames: frames.clone(),
+        stage2_reference_releases: std::collections::BTreeMap::new(),
         mm_root_slot: None,
         mm_access: Some(old.mm_access.clone()),
         predecessor_identity,
@@ -8511,8 +8545,16 @@ pub(crate) fn assert_fork_child_exec_retirement(
         );
     }
     let mut reservation = kernel.reserve(0, 0, child.extents.len() * 2).unwrap();
-    let retired = HvfVmState::stage_retirement(child, &mut reservation, &kernel)
+    let staged = HvfVmState::stage_retirement(child, &mut reservation, &kernel)
         .expect("stage the fork child's old-mm exec retirement");
+    let stage1 = test_whole_mm_stage1_proof();
+    let retired = staged
+        .release_with(
+            &mut child.frames.lock(),
+            Stage1UnpublicationReceipt::Inventory(&stage1),
+        )
+        .expect("release child stage-2 references after stage-1")
+        .0;
     kernel
         .apply(reservation.commit(()))
         .expect("apply child exec retirement");

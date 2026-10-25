@@ -434,6 +434,43 @@ pub(crate) struct InventoryLeaseRetirement {
     pub(crate) declined: Vec<DeclinedLeaseRemainder>,
 }
 
+#[derive(::core::fmt::Debug)]
+pub(crate) struct StagedProcessStage2Retirement {
+    pub(crate) candidates: std::collections::BTreeSet<(u64, u64)>,
+    pub(crate) reference_releases: std::collections::BTreeMap<(u64, u64), usize>,
+}
+
+impl StagedProcessStage2Retirement {
+    pub(crate) fn release_with(
+        self,
+        registry: &mut InventoryFrameRegistry,
+        receipt: Stage1UnpublicationReceipt<'_>,
+    ) -> Result<
+        (
+            std::collections::BTreeSet<(u64, u64)>,
+            std::collections::BTreeMap<(u64, u64), ReleasedStage1Reference>,
+        ),
+        TrapError,
+    > {
+        let mut proofs = std::collections::BTreeMap::new();
+        for (lease, count) in self.reference_releases {
+            for _ in 0..count {
+                if let Some(proof) = registry
+                    .release_stage2_reference(lease, None, receipt)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "release process stage-2 reference {lease:?}: {error:?}"
+                        ))
+                    })?
+                {
+                    proofs.insert(lease, proof);
+                }
+            }
+        }
+        Ok((self.candidates, proofs))
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl InventoryLeaseRetirement {
     /// Room for every Kernel event the retirement can push: an unmap per
@@ -513,6 +550,69 @@ pub(crate) struct InventoryFrameRegistry {
     /// The carrier destructor consumes a token and leaves the lease parked; a
     /// later exact retirement may then take that parked lease normally.
     pub(crate) authority_retained_stage2: std::collections::BTreeSet<(u64, u64)>,
+}
+
+/// One-shot proof that the carrier reverse map reached zero for an exact
+/// physical lease after a stage-1 operation naming that lease committed.
+/// This value is deliberately non-cloneable: retirement must consume the
+/// zero-reference crossing rather than rediscovering or caching it.
+#[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
+pub(crate) struct ReleasedStage1Reference {
+    lease: (u64, u64),
+}
+
+impl ReleasedStage1Reference {
+    pub(crate) fn lease(&self) -> (u64, u64) {
+        self.lease
+    }
+}
+
+#[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
+pub(crate) enum Stage2ReferenceReleaseError {
+    Missing((u64, u64)),
+    ReceiptMismatch((u64, u64)),
+}
+
+impl InventoryFrameRegistry {
+    /// Drop one carrier-wide stage-2 reference. The exact receipt is checked
+    /// before the ledger moves; only the zero crossing mints retirement
+    /// authority.
+    pub(crate) fn release_stage2_reference(
+        &mut self,
+        lease: (u64, u64),
+        identity: Option<CarrierStage2RecordIdentity>,
+        receipt: Stage1UnpublicationReceipt<'_>,
+    ) -> Result<Option<ReleasedStage1Reference>, Stage2ReferenceReleaseError> {
+        let names = match receipt {
+            Stage1UnpublicationReceipt::EditorRange(receipt) => {
+                receipt.names(lease.0, lease.1 as usize)
+            }
+            Stage1UnpublicationReceipt::EditorArenas(receipt) => receipt.retired_base(lease.0),
+            Stage1UnpublicationReceipt::FrameAbsence(receipt) => {
+                receipt.covers(lease.0, lease.1 as usize)
+            }
+            Stage1UnpublicationReceipt::Inventory(_) => true,
+            Stage1UnpublicationReceipt::InventoryRollback(receipt) => {
+                identity.is_some_and(|identity| receipt.names(identity))
+            }
+            Stage1UnpublicationReceipt::El1Metadata(receipt) => {
+                identity.is_some_and(|identity| receipt.matches(identity))
+            }
+        };
+        if !names {
+            return Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease));
+        }
+        let count = self
+            .stage2_references
+            .get_mut(&lease)
+            .ok_or(Stage2ReferenceReleaseError::Missing(lease))?;
+        *count -= 1;
+        if *count != 0 {
+            return Ok(None);
+        }
+        self.stage2_references.remove(&lease);
+        Ok(Some(ReleasedStage1Reference { lease }))
+    }
 }
 
 /// One exact global-frame owner incarnation a retirement left in place
@@ -2728,7 +2828,7 @@ impl HvfVmState {
         inventory: &mut HvpatchFrameInventory,
         reservation: &mut carrick_hal::FrameInventoryReservation,
         authority: &dyn carrick_hal::FrameCowAuthority,
-    ) -> Result<std::collections::BTreeSet<(u64, u64)>, TrapError> {
+    ) -> Result<StagedProcessStage2Retirement, TrapError> {
         let mut candidate_extents = Vec::with_capacity(inventory.extents.len());
         for (&(gpa, mapping_length), extent) in &inventory.extents {
             let non_zero_len = std::num::NonZeroU64::new(mapping_length).ok_or_else(|| {
@@ -2923,14 +3023,6 @@ impl HvfVmState {
                 frames.shared.remove(&extent.backing);
             }
         }
-        for (&lease, &local) in &local_stage2_references {
-            let remaining = frames.stage2_references[&lease] - local;
-            if remaining == 0 {
-                frames.stage2_references.remove(&lease);
-            } else {
-                frames.stage2_references.insert(lease, remaining);
-            }
-        }
         for (&lease, &population_complete) in &stage2_population_complete {
             reconcile_carrier_stage2_authority_retention(&mut frames, lease, population_complete);
         }
@@ -2948,7 +3040,10 @@ impl HvfVmState {
         expected.dedup();
         inventory.retirement_expected = expected;
         inventory.extents.clear();
-        Ok(retired_stage2)
+        Ok(StagedProcessStage2Retirement {
+            candidates: retired_stage2,
+            reference_releases: local_stage2_references,
+        })
     }
 
     pub(crate) fn frame_inventory_extent_count(&self) -> usize {
@@ -3445,7 +3540,7 @@ impl HvfVmState {
         // the IPA to a COW transaction whose per-mm inventory still contained
         // that key (`HVPatch COW new inventory extent collided`).
         let ledger = std::sync::Arc::clone(&task.frame_inventory.ledger);
-        let (candidates, frames, retirement_commit, stage2_owners) = {
+        let (staged, frames, retirement_commit, stage2_owners) = {
             let mut inventory = ledger.lock();
             if inventory.extents.is_empty() {
                 if task.mappings.is_empty() {
@@ -3626,7 +3721,7 @@ impl HvfVmState {
             } else {
                 Vec::new()
             };
-            let candidates =
+            let staged =
                 Self::stage_retirement(&mut inventory, &mut reservation, authority.as_ref())?;
             let scope = CowInventoryLifecycleScope {
                 custody,
@@ -3644,7 +3739,15 @@ impl HvfVmState {
                     extent,
                 );
             }
-            (candidates, frames, reservation.commit(()), stage2_owners)
+            (staged, frames, reservation.commit(()), stage2_owners)
+        };
+
+        let (candidates, stage1_reference_proofs) = {
+            let mut registry = frames.lock();
+            staged.release_with(
+                &mut registry,
+                Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
+            )?
         };
 
         // `stage_mapping` increments the same registry while holding this exact
@@ -3662,6 +3765,17 @@ impl HvfVmState {
                     "HVPatch process retirement candidate {lease:?} lost inventory owner identity"
                 ))
             })?;
+            let stage1_reference = stage1_reference_proofs.get(&lease).ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "process retirement candidate {lease:?} did not cross the stage-1 reference ledger"
+                ))
+            })?;
+            if stage1_reference.lease() != lease {
+                return Err(TrapError::Hypervisor(format!(
+                    "process retirement receipt names {:?}, expected {lease:?}",
+                    stage1_reference.lease()
+                )));
+            }
             if is_reusable_global_frame_extent(ipa, length) {
                 let live_owner = global_frame_host_owner_identity_in(custody, ipa, length);
                 if owner.generation == 0 {
