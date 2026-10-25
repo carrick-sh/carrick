@@ -1,7 +1,7 @@
 //! Physical half of UserTransfer. EL1 selects and authorizes the user VA;
 //! this adapter resolves only its IPA through existing carrier directories.
 use super::*;
-use carrick_aarch64::user_transfer::{TransferCustody, TransferPin};
+use carrick_aarch64::user_transfer::{TransferCustody, TransferPin, TransferRetention};
 use carrick_el1_abi::{PortalRetainedData, PortalSelectedData, PortalTransferIntent};
 use core::num::NonZeroU64;
 use std::sync::Arc;
@@ -348,7 +348,7 @@ impl TransferCustody for UserTransferCustody {
         selected: PortalSelectedData,
         len: usize,
         intent: PortalTransferIntent,
-    ) -> Result<Option<Self::Pin>, TrapError> {
+    ) -> Result<TransferRetention<Self::Pin>, TrapError> {
         self.retain_exact(selected, len, intent)
     }
 }
@@ -398,7 +398,7 @@ impl UserTransferCustody {
         selected: PortalSelectedData,
         len: usize,
         intent: PortalTransferIntent,
-    ) -> Result<Option<RetainedUserData>, TrapError> {
+    ) -> Result<TransferRetention<RetainedUserData>, TrapError> {
         let error =
             || TrapError::Hypervisor("UserTransfer physical custody invariant refused".to_owned());
         if len == 0 || len > 4096 || selected.ipa.checked_add(len as u64).is_none() {
@@ -428,7 +428,9 @@ impl UserTransferCustody {
         // end cannot be mistaken for absent backing (and endlessly reselected).
         let Some(identity) = self.custody.stage2_record_covering(selected.ipa, 1) else {
             carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 1);
-            return Ok(None);
+            return Ok(TransferRetention::Physical(
+                self.custody.stage2_retirement_wait(None),
+            ));
         };
         let extent = self
             .custody
@@ -467,7 +469,9 @@ impl UserTransferCustody {
                         _ => 5,
                     },
                 );
-                return Ok(None);
+                return Ok(TransferRetention::Physical(
+                    self.custody.stage2_retirement_wait(Some(identity)),
+                ));
             }
             Err(reason) => {
                 return Err(TrapError::Hypervisor(format!(
@@ -541,7 +545,7 @@ impl UserTransferCustody {
         } else {
             None
         };
-        Ok(Some(RetainedUserData {
+        Ok(TransferRetention::Retained(RetainedUserData {
             _pin: pin,
             custody: self.custody.clone(),
             _mapping: mapping,
@@ -614,6 +618,7 @@ pub(super) mod tests {
             let pin = physical
                 .retain(selection(0x4800_0000), 4, PortalTransferIntent::UserWrite)
                 .unwrap()
+                .into_retained()
                 .unwrap();
             sent.send(()).unwrap();
             drop(pin);
@@ -657,7 +662,12 @@ pub(super) mod tests {
                 intent: PortalTransferIntent,
             ) -> PortalRetainedData {
                 assert!(self.pin.is_none());
-                let pin = self.custody.retain(selected, len, intent).unwrap().unwrap();
+                let pin = self
+                    .custody
+                    .retain(selected, len, intent)
+                    .unwrap()
+                    .into_retained()
+                    .unwrap();
                 let identity = pin.identity();
                 self.pin = Some(pin);
                 assert_eq!(
@@ -728,16 +738,17 @@ pub(super) mod tests {
                 .is_err(),
             "known backing range overflow must not become a recheck wait"
         );
-        assert!(
-            physical
-                .retain(
-                    selection(0xa085_3100_0000 + 32768),
-                    4,
-                    PortalTransferIntent::UserRead
-                )
-                .unwrap()
-                .is_none()
-        );
+        let TransferRetention::Physical(wait) = physical
+            .retain(
+                selection(0xa085_3100_0000 + 32768),
+                4,
+                PortalTransferIntent::UserRead,
+            )
+            .unwrap()
+        else {
+            panic!("absent stage-2 selection must name physical retirement");
+        };
+        assert!(wait.0.is_ready(), "an already-absent record has completed");
     }
 
     #[test]
@@ -749,7 +760,11 @@ pub(super) mod tests {
         let physical = UserTransferCustody::new(custody);
         let selected = selection(ipa);
         let intent = PortalTransferIntent::CarrickIdentityWrite;
-        let mut pin = physical.retain(selected, 4, intent).unwrap().unwrap();
+        let mut pin = physical
+            .retain(selected, 4, intent)
+            .unwrap()
+            .into_retained()
+            .unwrap();
         assert!(
             pin._write.is_some(),
             "internal publication requires content writer custody"
@@ -798,6 +813,7 @@ pub(super) mod tests {
         let mut pin = physical
             .retain(selected, 4, PortalTransferIntent::UserWrite)
             .unwrap()
+            .into_retained()
             .unwrap();
         assert!(pin.pending().is_none());
         let request = carrick_el1_abi::PortalTransferRequest::new(
@@ -845,6 +861,7 @@ pub(super) mod tests {
         let mut pin = physical
             .retain(selected, 4, PortalTransferIntent::UserWrite)
             .unwrap()
+            .into_retained()
             .unwrap();
         // A different MM publishes the same physical source after write
         // admission, before the exact transfer copy fence has been entered.
@@ -910,6 +927,7 @@ pub(super) mod tests {
         let mut pin = physical
             .retain(selected, 4, PortalTransferIntent::UserWrite)
             .unwrap()
+            .into_retained()
             .unwrap();
         // A different MM publishes the same physical source after write
         // admission, before the exact transfer copy fence has been entered.
@@ -978,6 +996,7 @@ pub(super) mod tests {
         let mut pin = physical
             .retain(selected, 4096, PortalTransferIntent::UserWrite)
             .unwrap()
+            .into_retained()
             .unwrap();
         assert_eq!(
             custody
@@ -1019,12 +1038,23 @@ pub(super) mod tests {
             CarrierStage2RetireOutcome::DeferredActivePins
         );
         assert_eq!(unmaps, 0);
+        let TransferRetention::Physical(wait) = physical
+            .retain(selected, 4096, PortalTransferIntent::UserRead)
+            .unwrap()
+        else {
+            panic!("retiring record must return its physical producer");
+        };
         assert!(
-            physical
-                .retain(selected, 4096, PortalTransferIntent::UserRead)
-                .unwrap()
-                .is_none()
+            !wait.0.is_ready(),
+            "the retained pin still blocks retirement"
         );
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_count = Arc::clone(&wakes);
+        let (_subscription, ready) = wait.0.enroll(Arc::new(move || {
+            wake_count.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert!(!ready, "retirement request must remain parked while pinned");
+        assert_eq!(wakes.load(Ordering::Relaxed), 0);
         // SAFETY: the owned mapping and pin still retain the checked interval.
         let actual =
             unsafe { core::slice::from_raw_parts(owner.mapping.host_base().add(4096), 4096) };
@@ -1044,6 +1074,12 @@ pub(super) mod tests {
             }),
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
+        assert!(wait.0.is_ready());
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            1,
+            "backend retirement completion owns the physical wake"
+        );
     }
     #[test]
     fn prepared_short_commit_copies_only_actual_prefix_with_exact_physical_pin() {
@@ -1055,6 +1091,7 @@ pub(super) mod tests {
         let mut pin = physical
             .retain(selected, 4096, PortalTransferIntent::UserWrite)
             .unwrap()
+            .into_retained()
             .unwrap();
         let request = carrick_el1_abi::PortalTransferRequest::new(
             PortalOperation {
@@ -1127,10 +1164,12 @@ pub(super) mod tests {
         let pin_a = pa
             .retain(selected, 1, PortalTransferIntent::UserRead)
             .unwrap()
+            .into_retained()
             .unwrap();
         let mut pin_b = pb
             .retain(selected, 1, PortalTransferIntent::UserRead)
             .unwrap()
+            .into_retained()
             .unwrap();
         assert_eq!(pin_a.identity(), pin_b.identity()); // Identical local generation namespaces.
         let request = carrick_el1_abi::PortalTransferRequest::new(
@@ -1176,6 +1215,7 @@ pub(super) mod tests {
         let mut pin = physical
             .retain(selected, bytes.len(), intent)
             .unwrap()
+            .into_retained()
             .unwrap();
         let request = carrick_el1_abi::PortalTransferRequest::new(
             PortalOperation {

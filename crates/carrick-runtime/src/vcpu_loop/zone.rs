@@ -37,6 +37,11 @@ pub(super) enum OwnerMemoryAction {
     Retained,
 }
 
+enum OwnerMemoryPark {
+    Parked(executor::ExecutorExit),
+    Recheck(OwnerMemoryAction),
+}
+
 /// A Reservations receipt names the root-release stream, but selection can
 /// outlive the holder that justified sampling it. Only a currently held root
 /// has a future release producer. Region identity is checked before consulting
@@ -788,12 +793,64 @@ where
         wait: carrick_el1_abi::PortalOwnerWait,
         resume: OwnedSyscallResume,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        self.park_owner_memory_action(
-            engine,
-            control,
-            OwnerMemoryAction::Syscall { frame, resume },
-            wait,
-        )
+        let mut wait = wait;
+        let mut resume = resume;
+        loop {
+            match self.park_owner_memory_action(
+                engine,
+                control,
+                OwnerMemoryAction::Syscall { frame, resume },
+                wait,
+            )? {
+                OwnerMemoryPark::Parked(exit) => return Ok(exit),
+                OwnerMemoryPark::Recheck(OwnerMemoryAction::Syscall {
+                    frame: retry_frame,
+                    resume: retry,
+                }) => {
+                    debug_assert_eq!(retry_frame, frame);
+                    let outcome =
+                        match self.resume_owner_ready_step(engine, control, retry_frame, retry)? {
+                            super::binding::OwnerReadyStep::Outcome(outcome) => outcome,
+                            super::binding::OwnerReadyStep::Exit(exit) => return Ok(exit),
+                        };
+                    if let Some(park) = self.state.pending_ipc_park.take() {
+                        return self.ipc_park(engine, control, frame, park);
+                    }
+                    let (outcome, next_resume) = super::binding::owner_copyin_route(outcome);
+                    let next_resume = next_resume.or_else(|| {
+                        self.state
+                            .pending_ipc_owner
+                            .take()
+                            .map(OwnedSyscallResume::Ipc)
+                    });
+                    if let DispatchOutcome::OwnerMemoryWait {
+                        wait: next_wait,
+                        committed,
+                    } = outcome
+                    {
+                        self.state.owner_read_progress = self
+                            .state
+                            .owner_read_progress
+                            .checked_add(committed)
+                            .ok_or_else(|| {
+                                RuntimeError::Configuration(
+                                    "owner read progress overflow".to_owned(),
+                                )
+                            })?;
+                        wait = next_wait;
+                        resume = next_resume.unwrap_or(OwnedSyscallResume::CopyoutRedispatch);
+                        continue;
+                    }
+                    return self.service_outcome(engine, control, frame, outcome, next_resume);
+                }
+                OwnerMemoryPark::Recheck(OwnerMemoryAction::Retained) => {
+                    return Err(RuntimeError::Configuration(
+                        "syscall owner park changed action".to_owned(),
+                    )
+                    .into());
+                }
+            }
+        }
     }
 
     pub(super) fn park_retained_memory_owner(
@@ -802,16 +859,25 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         wait: carrick_el1_abi::PortalOwnerWait,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        self.park_owner_memory_action(engine, control, OwnerMemoryAction::Retained, wait)
+        match self.park_owner_memory_action(engine, control, OwnerMemoryAction::Retained, wait)? {
+            OwnerMemoryPark::Parked(exit) => Ok(exit),
+            OwnerMemoryPark::Recheck(OwnerMemoryAction::Retained) => {
+                let action = self.take_retained_memory_action()?;
+                self.drive_retained_memory(engine, control, action)
+            }
+            OwnerMemoryPark::Recheck(OwnerMemoryAction::Syscall { .. }) => Err(
+                RuntimeError::Configuration("retained owner park changed action".to_owned()).into(),
+            ),
+        }
     }
 
-    pub(super) fn park_owner_memory_action(
+    fn park_owner_memory_action(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         action: OwnerMemoryAction,
         wait: carrick_el1_abi::PortalOwnerWait,
-    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+    ) -> Result<OwnerMemoryPark, ProductionHvpatchPollError> {
         use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
         let wait_mm = wait.handle().mm();
         let Some((zone, mm)) = zone_for(self.state.zone_mm) else {
@@ -923,7 +989,7 @@ where
                             resume,
                             origin,
                         };
-                        Ok(exit)
+                        Ok(OwnerMemoryPark::Parked(exit))
                     }
                     (OwnerMemoryAction::Retained, None) => {
                         let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
@@ -941,13 +1007,13 @@ where
                         self.phase = HvpatchProductionPhase::ResumeRetainedOwner {
                             action: Box::new(action),
                         };
-                        Ok(self.suspend(
+                        Ok(OwnerMemoryPark::Parked(self.suspend(
                             HvpatchLoopSuspension::BlockedContinuation,
                             executor::ExecutorExit::BlockedContinuation {
                                 continuation: Box::new(continuation),
                                 vfork_activation: None,
                             },
-                        ))
+                        )))
                     }
                     _ => {
                         carrick_kernel::el1_zone::cancel(zone.record_ref(record));
@@ -960,15 +1026,7 @@ where
             }
             Err((ObjectWaitError::Changed | ObjectWaitError::Stale, _token)) => {
                 zone.free_record(record);
-                match action {
-                    OwnerMemoryAction::Syscall { frame, resume } => {
-                        self.resume_owner_ready(engine, control, frame, resume)
-                    }
-                    OwnerMemoryAction::Retained => {
-                        let action = self.take_retained_memory_action()?;
-                        self.drive_retained_memory(engine, control, action)
-                    }
-                }
+                Ok(OwnerMemoryPark::Recheck(action))
             }
             Err((error, _token)) => {
                 zone.free_record(record);

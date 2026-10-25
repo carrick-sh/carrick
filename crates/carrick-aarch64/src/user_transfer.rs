@@ -201,6 +201,18 @@ pub enum TransferPreparation {
     PeerResident,
     Declined,
 }
+pub enum TransferRetention<P> {
+    Retained(P),
+    Physical(carrick_guest_mem::OwnedMemoryWait),
+}
+impl<P> TransferRetention<P> {
+    pub fn into_retained(self) -> Option<P> {
+        match self {
+            Self::Retained(pin) => Some(pin),
+            Self::Physical(_) => None,
+        }
+    }
+}
 pub trait TransferCustody {
     type Pin: TransferPin;
     fn carrier(&self) -> NonZeroU64;
@@ -240,7 +252,7 @@ pub trait TransferCustody {
         selected: PortalSelectedData,
         len: usize,
         intent: PortalTransferIntent,
-    ) -> Result<Option<Self::Pin>, TrapError>;
+    ) -> Result<TransferRetention<Self::Pin>, TrapError>;
 }
 
 pub type ErasedPhysicalCustody = dyn TransferCustody<Pin = Box<dyn TransferPin>>;
@@ -680,10 +692,15 @@ where
         selected: PortalSelectedData,
         len: usize,
         intent: PortalTransferIntent,
-    ) -> Result<Option<Self::Pin>, TrapError> {
+    ) -> Result<TransferRetention<Self::Pin>, TrapError> {
         self.0
             .retain(selected, len, intent)
-            .map(|pin| pin.map(|pin| Box::new(pin) as Box<dyn TransferPin>))
+            .map(|retention| match retention {
+                TransferRetention::Retained(pin) => {
+                    TransferRetention::Retained(Box::new(pin) as Box<dyn TransferPin>)
+                }
+                TransferRetention::Physical(wait) => TransferRetention::Physical(wait),
+            })
     }
 }
 

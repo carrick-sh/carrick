@@ -244,15 +244,7 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
         root_generation: nz(frame.x[9]),
         offset: offset as u64,
     };
-    let retry = carrick_el1_abi::PortalWaitCause::decode(frame.x[16])
-        .filter(|cause| *cause == carrick_el1_abi::PortalWaitCause::Reservations)
-        .map(|cause| {
-            // SAFETY: this exact authenticated selection returned its pre-probe revision.
-            unsafe {
-                carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, cause, frame.x[17])
-            }
-        });
-    let pin = retain_selected(custody.retain(selected, len, intent), retry)?;
+    let pin = retain_selected(custody.retain(selected, len, intent))?;
     if let Some(wait) = pin.pending() {
         return Err(MemoryPrepareError::Physical(wait));
     }
@@ -287,51 +279,41 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
 }
 
 fn retain_selected<P>(
-    result: Result<Option<P>, TrapError>,
-    observed: Option<carrick_el1_abi::PortalOwnerWait>,
+    result: Result<TransferRetention<P>, TrapError>,
 ) -> Result<P, MemoryPrepareError> {
-    result
-        .map_err(|error| {
-            MemoryPrepareError::Fault(carrick_guest_mem::MemoryError::HostMap(error.to_string()))
-        })?
-        .ok_or_else(|| {
-            observed.map_or_else(
-                || {
-                    MemoryPrepareError::Fault(carrick_guest_mem::MemoryError::HostMap(
-                        "selection omitted recheck authority".into(),
-                    ))
-                },
-                MemoryPrepareError::OwnerWait,
-            )
-        })
+    match result.map_err(|error| {
+        MemoryPrepareError::Fault(carrick_guest_mem::MemoryError::HostMap(error.to_string()))
+    })? {
+        TransferRetention::Retained(pin) => Ok(pin),
+        TransferRetention::Physical(wait) => Err(MemoryPrepareError::Physical(wait)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn stale_physical_selection_returns_exact_owner_observation() {
-        let handle = unsafe {
-            carrick_el1_abi::El1MmHandle::from_admitted_owner(
-                NonZeroU64::new(1).unwrap(),
-                ReservationMm::new(77).unwrap(),
-                NonZeroU64::new(3).unwrap(),
-            )
-        };
-        let observed = unsafe {
-            carrick_el1_abi::PortalOwnerWait::from_owner(
-                handle,
-                carrick_el1_abi::PortalWaitCause::Reservations,
-                41,
-            )
-        };
-        assert!(matches!(retain_selected::<()>(Ok(None), Some(observed)),
-            Err(MemoryPrepareError::OwnerWait(wait)) if wait == observed));
+    fn stale_physical_selection_returns_physical_producer() {
+        #[derive(Debug)]
+        struct Pending;
+        impl carrick_guest_mem::PhysicalMemoryWait for Pending {
+            fn is_ready(&self) -> bool {
+                false
+            }
+            fn enroll(
+                &self,
+                _: std::sync::Arc<dyn Fn() + Send + Sync>,
+            ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+                (Box::new(()), false)
+            }
+        }
+        let wait = carrick_guest_mem::OwnedMemoryWait(std::sync::Arc::new(Pending));
         assert!(matches!(
-            retain_selected::<()>(
-                Err(TrapError::Hypervisor("physical failure".into())),
-                Some(observed)
-            ),
+            retain_selected::<()>(Ok(TransferRetention::Physical(wait.clone()))),
+            Err(MemoryPrepareError::Physical(found)) if found == wait
+        ));
+        assert!(matches!(
+            retain_selected::<()>(Err(TrapError::Hypervisor("physical failure".into()))),
             Err(MemoryPrepareError::Fault(
                 carrick_guest_mem::MemoryError::HostMap(_)
             ))

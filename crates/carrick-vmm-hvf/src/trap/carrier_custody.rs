@@ -434,6 +434,10 @@ pub struct CarrierVmCustody {
     >,
     pub asids: carrick_hal::asid::AsidAllocator,
     pub(crate) state: parking_lot::Mutex<CarrierVmCustodyState>,
+    /// Subscribers recheck an exact stage-2 retirement after enrolling.
+    /// Retirement publishes only after its backend mapping is gone or the VM
+    /// terminalizes the record, never merely because a reservation root moved.
+    stage2_retirement_changed: carrick_thread::completion::CompletionCallbacks,
     pub(crate) structural_backings: parking_lot::Mutex<
         std::collections::BTreeMap<
             CarrierStage2RecordId,
@@ -787,6 +791,7 @@ impl CarrierVmCustody {
                 stage2_records: std::collections::BTreeMap::new(),
                 stage2_extent_index: std::collections::BTreeMap::new(),
             }),
+            stage2_retirement_changed: carrick_thread::completion::CompletionCallbacks::default(),
             structural_backings: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             carrier_stage2_records: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             global_frame_host_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
@@ -1024,6 +1029,7 @@ impl CarrierVmCustody {
             }
         };
         drop(destroyed_stock);
+        self.stage2_retirement_changed.publish(0);
         Ok(())
     }
 
@@ -1557,6 +1563,14 @@ impl CarrierVmCustody {
             };
             match carrick_core::mm::retirement::prepare_record_retirement(record, identity) {
                 carrick_core::mm::retirement::RecordRetirement::Complete(outcome) => {
+                    drop(state);
+                    if matches!(
+                        outcome,
+                        CarrierStage2RetireOutcome::RetiredUnmapped
+                            | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
+                    ) {
+                        self.stage2_retirement_changed.publish(0);
+                    }
                     return outcome;
                 }
                 carrick_core::mm::retirement::RecordRetirement::Unmap { ipa, len } => (ipa, len),
@@ -1568,7 +1582,20 @@ impl CarrierVmCustody {
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };
-        carrick_core::mm::retirement::settle_record_retirement(record, identity, backend_result)
+        let outcome = carrick_core::mm::retirement::settle_record_retirement(
+            record,
+            identity,
+            backend_result,
+        );
+        drop(state);
+        if matches!(
+            outcome,
+            CarrierStage2RetireOutcome::RetiredUnmapped
+                | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
+        ) {
+            self.stage2_retirement_changed.publish(0);
+        }
+        outcome
     }
 }
 
@@ -1586,8 +1613,59 @@ impl carrick_core::mm::retirement::RecordPinVenue for CarrierPinVenue {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type CarrierStage2Pin = carrick_core::mm::retirement::RecordPin<CarrierPinVenue>;
 
+#[derive(::core::fmt::Debug)]
+pub(crate) struct Stage2RetirementWait {
+    custody: std::sync::Weak<CarrierVmCustody>,
+    identity: Option<CarrierStage2RecordIdentity>,
+}
+
+impl Stage2RetirementWait {
+    fn is_complete(&self) -> bool {
+        let Some(custody) = self.custody.upgrade() else {
+            return true;
+        };
+        let Some(identity) = self.identity else {
+            return true;
+        };
+        let state = custody.state.lock();
+        let Some(record) = state.stage2_records.get(&identity.record_id) else {
+            return true;
+        };
+        CarrierVmCustody::stage2_identity_mismatch(record, identity).is_some()
+            || record.snapshot.terminalized_by_vm_destroy
+            || (!record.snapshot.mapped && !record.unmap_in_flight)
+    }
+}
+
+impl carrick_guest_mem::PhysicalMemoryWait for Stage2RetirementWait {
+    fn is_ready(&self) -> bool {
+        self.is_complete()
+    }
+
+    fn enroll(
+        &self,
+        wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+        let Some(custody) = self.custody.upgrade() else {
+            return (Box::new(()), true);
+        };
+        let enrollment = custody.stage2_retirement_changed.enroll(move |_| wake());
+        (Box::new(enrollment), self.is_complete())
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierVmCustody {
+    pub(crate) fn stage2_retirement_wait(
+        self: &std::sync::Arc<Self>,
+        identity: Option<CarrierStage2RecordIdentity>,
+    ) -> carrick_guest_mem::OwnedMemoryWait {
+        carrick_guest_mem::OwnedMemoryWait(std::sync::Arc::new(Stage2RetirementWait {
+            custody: std::sync::Arc::downgrade(self),
+            identity,
+        }))
+    }
+
     /// Release one pin on the exact record `identity` (the drop half of
     /// [`Self::pin_stage2_record`]).
     pub(crate) fn release_stage2_pin(&self, identity: CarrierStage2RecordIdentity) {

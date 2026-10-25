@@ -5209,14 +5209,16 @@ fn initial_fixed_mapping_publishes_exact_structural_owner() {
         offset: 0,
     };
     assert!(
-        carrick_aarch64::user_transfer::TransferCustody::retain(
-            &transfer,
-            selected,
-            1,
-            carrick_el1_abi::PortalTransferIntent::UserRead,
-        )
-        .expect("first-load selected IPA must retain stage-2 custody")
-        .is_some(),
+        matches!(
+            carrick_aarch64::user_transfer::TransferCustody::retain(
+                &transfer,
+                selected,
+                1,
+                carrick_el1_abi::PortalTransferIntent::UserRead,
+            )
+            .expect("first-load selected IPA must retain stage-2 custody"),
+            carrick_aarch64::user_transfer::TransferRetention::Retained(_)
+        ),
         "first-load structural stage-2 custody must be visible to EL1 copyin"
     );
 

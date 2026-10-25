@@ -756,8 +756,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         let Some(root) = self.roots.get(index) else {
             return false;
         };
+        let word = root.locked.load(Ordering::Acquire);
         root.key.load(Ordering::Acquire) == mm.raw()
-            && root.locked.load(Ordering::Acquire) & !ROOT_NOTIFICATION_REQUIRED != 0
+            && word & ROOT_NOTIFICATION_REQUIRED != 0
+            && word & !ROOT_NOTIFICATION_REQUIRED != 0
     }
 
     /// Snapshot one live root's lock state without acquiring it. Values are
@@ -3695,6 +3697,17 @@ mod tests {
             core::mem::size_of::<carrick_core_abi::PortalTransferSlot>(),
             SharedReservations::LAYOUT_HASH,
             carrick_sched_core::object_wait::OBJECT_WAIT_LAYOUT_HASH
+        );
+    }
+    #[test]
+    fn source_free_holder_is_not_a_notification_release_producer() {
+        let table = table();
+        let mm = ReservationMm::new(90).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let _held = table.lock(0, mm).unwrap();
+        assert!(
+            !table.root_has_release_producer(0, mm),
+            "a source-free holder releases with no notification publication"
         );
     }
     #[test]

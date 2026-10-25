@@ -9416,7 +9416,7 @@ mod transfer_service_tests {
             _: carrick_el1_abi::PortalSelectedData,
             _: usize,
             _: carrick_el1_abi::PortalTransferIntent,
-        ) -> Result<Option<Self::Pin>, TrapError> {
+        ) -> Result<crate::user_transfer::TransferRetention<Self::Pin>, TrapError> {
             panic!("no pin expected")
         }
     }

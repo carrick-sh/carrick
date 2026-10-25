@@ -4207,6 +4207,7 @@ pub(crate) mod tests {
             false,
             false,
             false,
+            false,
         );
     }
 
@@ -4218,6 +4219,7 @@ pub(crate) mod tests {
             false,
             false,
             true,
+            false,
         );
     }
 
@@ -4227,6 +4229,7 @@ pub(crate) mod tests {
             carrick_abi::syscall::nr::READ,
             Some(carrick_abi::LINUX_SIGKILL),
             true,
+            false,
             false,
             false,
         );
@@ -4240,6 +4243,7 @@ pub(crate) mod tests {
             true,
             false,
             true,
+            false,
         );
     }
 
@@ -4486,6 +4490,18 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn serial_host_free_reservation_recheck_parks_on_physical_retirement() {
+        exercise_owner_wait_schedule_at(
+            carrick_abi::syscall::nr::FSTAT,
+            None,
+            false,
+            false,
+            false,
+            true,
+        );
+    }
+
     fn exercise_owner_wait(nr: carrick_abi::CanonicalNr, signum: Option<i32>, native: bool) {
         exercise_owner_wait_schedule(nr, signum, native, false);
     }
@@ -4496,7 +4512,7 @@ pub(crate) mod tests {
         native: bool,
         release_wins: bool,
     ) {
-        exercise_owner_wait_schedule_at(nr, signum, native, release_wins, false);
+        exercise_owner_wait_schedule_at(nr, signum, native, release_wins, false, false);
     }
 
     fn exercise_owner_wait_schedule_at(
@@ -4505,18 +4521,29 @@ pub(crate) mod tests {
         native: bool,
         release_wins: bool,
         physical: bool,
+        free_reservation_redrive: bool,
     ) {
         #[derive(Debug)]
-        struct UnreadyBacking;
-        impl carrick_guest_mem::PhysicalMemoryWait for UnreadyBacking {
+        struct RetirementRequestedBacking {
+            ready: std::sync::atomic::AtomicBool,
+            callbacks: carrick_thread::completion::CompletionCallbacks,
+        }
+        impl RetirementRequestedBacking {
+            fn complete(&self) {
+                self.ready.store(true, std::sync::atomic::Ordering::Release);
+                self.callbacks.publish(0);
+            }
+        }
+        impl carrick_guest_mem::PhysicalMemoryWait for RetirementRequestedBacking {
             fn is_ready(&self) -> bool {
-                false
+                self.ready.load(std::sync::atomic::Ordering::Acquire)
             }
             fn enroll(
                 &self,
-                _: Arc<dyn Fn() + Send + Sync>,
+                wake: Arc<dyn Fn() + Send + Sync>,
             ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
-                (Box::new(()), false)
+                let subscription = self.callbacks.enroll(move |_| wake());
+                (Box::new(subscription), self.is_ready())
             }
         }
         use carrick_abi::{LinuxCloneFlags, syscall::nr};
@@ -4844,7 +4871,7 @@ pub(crate) mod tests {
                         }
                     });
                     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                    let wait = portal
+                    let mut wait = portal
                         .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
                         .unwrap()
                         .unwrap();
@@ -4852,9 +4879,13 @@ pub(crate) mod tests {
                         wait,
                         zone: zone as *const _ as usize,
                     });
+                    let retirement = Arc::new(RetirementRequestedBacking {
+                        ready: std::sync::atomic::AtomicBool::new(false),
+                        callbacks: carrick_thread::completion::CompletionCallbacks::default(),
+                    });
                     if physical {
                         engine.prepare_dependency =
-                            Some(carrick_guest_mem::OwnedMemoryWait(Arc::new(UnreadyBacking)));
+                            Some(carrick_guest_mem::OwnedMemoryWait(retirement.clone()));
                     }
                     let (first, resume) = if let Some((owner, object, _, raw)) = &ipc {
                         use carrick_kernel::kernel::continuation::ipc as host_ipc;
@@ -4908,9 +4939,35 @@ pub(crate) mod tests {
                             resume.unwrap_or(binding::OwnedSyscallResume::CopyoutRedispatch),
                         )
                     };
+                    if free_reservation_redrive {
+                        assert_eq!(
+                            first,
+                            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+                            "the first refusal establishes an owned syscall to redrive"
+                        );
+                        let source = zone
+                            .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+                            .unwrap()
+                            .notifications(handle.incarnation())
+                            .unwrap();
+                        let revision = source
+                            .observe(
+                                carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations,
+                            )
+                            .revision();
+                        wait = unsafe {
+                            carrick_el1_abi::PortalOwnerWait::from_owner(
+                                handle,
+                                carrick_el1_abi::PortalWaitCause::Reservations,
+                                revision,
+                            )
+                        };
+                        engine.prepare_dependency =
+                            Some(carrick_guest_mem::OwnedMemoryWait(retirement.clone()));
+                    }
                     if physical {
                         assert!(matches!(first, DispatchOutcome::OwnerPhysicalWait { .. }));
-                    } else {
+                    } else if !free_reservation_redrive {
                         assert_eq!(
                             first,
                             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
@@ -5005,6 +5062,7 @@ pub(crate) mod tests {
                         carrick_kernel::kernel::continuation::CarrierWaitService::new(Arc::clone(
                             &scheduler,
                         ));
+                    let physical_park = physical || free_reservation_redrive;
                     if physical {
                         let binding::OwnedSyscallResume::Ipc(pending) = resume else {
                             panic!("retained pipe read")
@@ -5028,22 +5086,39 @@ pub(crate) mod tests {
                         let parked = job
                             .owner_memory_park(&mut engine, &mut control, frame, wait, resume)
                             .unwrap();
-                        let executor::ExecutorExit::BlockedContinuation {
-                            continuation,
-                            vfork_activation: None,
-                        } = parked
-                        else {
-                            panic!("owner wait did not return its production continuation");
-                        };
-                        let mut wait_registration =
-                            wait_service.prepare_registration(&continuation);
-                        wait_service.enroll(&mut wait_registration).unwrap();
-                        running
-                            .restore_lease(submission.take_execution_lease().unwrap())
-                            .unwrap();
-                        scheduler
-                            .settle_blocked_continuation(running, *continuation, wait_registration)
-                            .unwrap();
+                        if free_reservation_redrive {
+                            assert!(matches!(parked, executor::ExecutorExit::Blocked(_)));
+                            running
+                                .restore_lease(submission.take_execution_lease().unwrap())
+                                .unwrap();
+                            scheduler
+                                .settle_blocked(
+                                    running,
+                                    carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                                )
+                                .unwrap();
+                        } else {
+                            let executor::ExecutorExit::BlockedContinuation {
+                                continuation,
+                                vfork_activation: None,
+                            } = parked
+                            else {
+                                panic!("owner wait did not return its production continuation");
+                            };
+                            let mut wait_registration =
+                                wait_service.prepare_registration(&continuation);
+                            wait_service.enroll(&mut wait_registration).unwrap();
+                            running
+                                .restore_lease(submission.take_execution_lease().unwrap())
+                                .unwrap();
+                            scheduler
+                                .settle_blocked_continuation(
+                                    running,
+                                    *continuation,
+                                    wait_registration,
+                                )
+                                .unwrap();
+                        }
                     }
 
                     if release_wins {
@@ -5141,6 +5216,14 @@ pub(crate) mod tests {
                         }
                     }
                     let killing = signum == Some(carrick_abi::LINUX_SIGKILL);
+                    if free_reservation_redrive {
+                        assert_eq!(
+                            scheduler.queued_len(),
+                            0,
+                            "a persistently refused physical pin must park without polling"
+                        );
+                        retirement.complete();
+                    }
                     if !killing {
                         release_tx.send(()).unwrap();
                         peer.join().unwrap();
@@ -5156,7 +5239,7 @@ pub(crate) mod tests {
                         .try_take(&registration)
                         .unwrap()
                         .expect("owner wake must reach the registered host executor");
-                    if !physical {
+                    if !physical_park {
                         let saved = binding
                             .take_zone_save()
                             .expect("owner park saves residency");
@@ -5197,7 +5280,7 @@ pub(crate) mod tests {
                         &mut resumed_submission,
                     );
                     resumed_control.binding = Some(&binding);
-                    let completed = if physical {
+                    let completed = if physical_park {
                         job.poll_with_engine(&mut engine, &mut resumed_control)
                             .unwrap()
                     } else {

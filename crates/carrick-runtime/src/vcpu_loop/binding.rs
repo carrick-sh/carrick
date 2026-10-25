@@ -252,6 +252,11 @@ pub(super) enum OwnedIoResume {
     DirectoryRead(Box<carrick_kernel::dispatch::OwnedDirectoryRead>),
 }
 
+pub(super) enum OwnerReadyStep {
+    Outcome(DispatchOutcome),
+    Exit(executor::ExecutorExit),
+}
+
 pub(super) fn owner_copyin_route(
     outcome: DispatchOutcome,
 ) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
@@ -3355,6 +3360,19 @@ where
         frame: carrick_hal::RawSyscall,
         resume: OwnedSyscallResume,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        match self.resume_owner_ready_step(engine, control, frame, resume)? {
+            OwnerReadyStep::Outcome(outcome) => self.route_outcome(engine, control, frame, outcome),
+            OwnerReadyStep::Exit(exit) => Ok(exit),
+        }
+    }
+
+    pub(super) fn resume_owner_ready_step(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        resume: OwnedSyscallResume,
+    ) -> Result<OwnerReadyStep, ProductionHvpatchPollError> {
         let origin = self.state.owner_wait_origin()?;
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("ready owner resume lost context".to_owned())
@@ -3370,11 +3388,11 @@ where
                     resume,
                     control.submission.host_wait_context(),
                 )?;
-                self.route_outcome(engine, control, frame, outcome)
+                Ok(OwnerReadyStep::Outcome(outcome))
             }
-            super::owner_wait::Settlement::Cancelled(cancellation) => {
-                self.finish_owner_cancellation(engine, control, frame, cancellation, origin)
-            }
+            super::owner_wait::Settlement::Cancelled(cancellation) => self
+                .finish_owner_cancellation(engine, control, frame, cancellation, origin)
+                .map(OwnerReadyStep::Exit),
             super::owner_wait::Settlement::Waiting(_) => Err(RuntimeError::Configuration(
                 "ready owner wait did not settle".to_owned(),
             )
@@ -3450,7 +3468,7 @@ where
         self.service_outcome(engine, control, frame, outcome, resume)
     }
 
-    fn service_outcome(
+    pub(super) fn service_outcome(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
