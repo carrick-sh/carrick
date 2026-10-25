@@ -2543,7 +2543,7 @@ fn mapped_host_address_is_not_proof_of_a_retired_global_owner() {
 
     let identity = global_frame_stage2_identity_in(custody, live_ipa, LENGTH).unwrap();
     let stage1 = custody
-        .stage1_unpublished_from_rollback(identity, rollback)
+        .stage1_unpublished_from_rollback(identity, rollback.rollback())
         .unwrap();
     assert!(retire_global_frame_host_owner_in(custody, stage1, live_ipa, LENGTH).is_retired());
     assert!(!global_frame_host_owner_matches(
@@ -2583,7 +2583,7 @@ fn mapped_host_address_is_not_proof_of_a_retired_global_owner() {
     );
     let successor_identity = global_frame_stage2_identity_in(custody, live_ipa, LENGTH).unwrap();
     let successor_stage1 = custody
-        .stage1_unpublished_from_rollback(successor_identity, successor_rollback)
+        .stage1_unpublished_from_rollback(successor_identity, successor_rollback.rollback())
         .unwrap();
     assert!(
         retire_global_frame_host_owner_in(custody, successor_stage1, live_ipa, LENGTH,)

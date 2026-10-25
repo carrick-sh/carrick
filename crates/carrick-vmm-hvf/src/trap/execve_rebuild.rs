@@ -1746,7 +1746,7 @@ pub(crate) fn reapply_global_exec_page_spans(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct GlobalFrameOwnerRollback {
     pub(crate) custody: std::sync::Arc<CarrierVmCustody>,
-    pub(crate) keys: Vec<((u64, u64), Stage2RollbackReceipt)>,
+    pub(crate) keys: Vec<((u64, u64), Stage2PublicationAuthority)>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1758,7 +1758,7 @@ impl GlobalFrameOwnerRollback {
         }
     }
 
-    pub(crate) fn record(&mut self, key: (u64, u64), receipt: Stage2RollbackReceipt) {
+    pub(crate) fn record(&mut self, key: (u64, u64), receipt: Stage2PublicationAuthority) {
         self.keys.push((key, receipt));
     }
 
@@ -1766,7 +1766,7 @@ impl GlobalFrameOwnerRollback {
         self.keys.clear();
     }
 
-    pub(crate) fn take(&mut self, key: (u64, u64)) -> Option<Stage2RollbackReceipt> {
+    pub(crate) fn take(&mut self, key: (u64, u64)) -> Option<Stage2PublicationAuthority> {
         let index = self
             .keys
             .iter()
@@ -1784,7 +1784,7 @@ impl Drop for GlobalFrameOwnerRollback {
             };
             let Some(stage1) = self
                 .custody
-                .stage1_unpublished_from_rollback(identity, receipt)
+                .stage1_unpublished_from_rollback(identity, receipt.rollback())
             else {
                 continue;
             };

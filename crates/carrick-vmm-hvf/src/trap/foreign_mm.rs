@@ -462,7 +462,7 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
             .ok_or_else(|| "raw Fork rollback lost its publication receipt".to_owned())?;
         let stage1 = self
             .custody
-            .stage1_unpublished_from_rollback(identity, rollback)
+            .stage1_unpublished_from_rollback(identity, rollback.rollback())
             .ok_or_else(|| "raw Fork rollback receipt names another record".to_owned())?;
         if self
             .custody

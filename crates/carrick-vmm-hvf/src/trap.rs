@@ -4103,7 +4103,7 @@ struct HvpatchPreparedTaskAuthority {
 
 pub(super) struct UnpublishedTaskStage1 {
     rollback_receipts:
-        parking_lot::Mutex<Vec<(CarrierStage2RecordIdentity, Stage2RollbackReceipt)>>,
+        parking_lot::Mutex<Vec<(CarrierStage2RecordIdentity, Stage2PublicationAuthority)>>,
 }
 
 impl UnpublishedTaskStage1 {
@@ -4113,7 +4113,7 @@ impl UnpublishedTaskStage1 {
         }
     }
 
-    fn record(&self, identity: CarrierStage2RecordIdentity, receipt: Stage2RollbackReceipt) {
+    fn record(&self, identity: CarrierStage2RecordIdentity, receipt: Stage2PublicationAuthority) {
         let mut receipts = self.rollback_receipts.lock();
         debug_assert!(
             !receipts.iter().any(|(candidate, _)| *candidate == identity),
@@ -4122,7 +4122,7 @@ impl UnpublishedTaskStage1 {
         receipts.push((identity, receipt));
     }
 
-    fn consume(&self, identity: CarrierStage2RecordIdentity) -> Option<Stage2RollbackReceipt> {
+    fn consume(&self, identity: CarrierStage2RecordIdentity) -> Option<Stage2PublicationAuthority> {
         let mut receipts = self.rollback_receipts.lock();
         let index = receipts
             .iter()

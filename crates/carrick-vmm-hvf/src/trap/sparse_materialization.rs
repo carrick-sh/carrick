@@ -26,7 +26,7 @@ pub(super) struct PublishedFrameGrant {
     pub(super) ready: carrick_hal::El1FrameGrantReady,
     pub(super) receipt: carrick_hal::FrameInventoryApplyReceipt,
     pub(super) inventory_entry: ((u64, u64), InventoryExtent),
-    pub(super) rollback: Option<Stage2RollbackReceipt>,
+    pub(super) rollback: Option<Stage2PublicationAuthority>,
 }
 
 pub(super) fn frame_grant_local_lease_is_current(
@@ -1946,7 +1946,7 @@ impl MmAccessState {
                     )
                 })?;
                 let stage1 = custody
-                    .stage1_unpublished_from_rollback(identity, rollback)
+                    .stage1_unpublished_from_rollback(identity, rollback.rollback())
                     .ok_or_else(|| {
                         TrapError::Hypervisor(
                             "rollback arena receipt names another stage-2 record".to_owned(),
@@ -2949,7 +2949,7 @@ impl Drop for PendingTransferGrant {
                 if let Some(stage1) = publication.rollback.take().and_then(|receipt| {
                     self.context
                         .custody
-                        .stage1_unpublished_from_rollback(identity, receipt)
+                        .stage1_unpublished_from_rollback(identity, receipt.rollback())
                 }) {
                     retire_global_frame_host_owner_if_generation_in(
                         &self.context.custody,

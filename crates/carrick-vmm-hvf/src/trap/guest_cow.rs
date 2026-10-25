@@ -241,7 +241,7 @@ pub(crate) fn allocate_grant_compound(
 fn allocate_unpublished_grant_compound(
     custody: &std::sync::Arc<CarrierVmCustody>,
     stage2_perms: applevisor::memory::MemPerms,
-) -> Result<(*mut u8, u64, u64, Stage2RollbackReceipt), TrapError> {
+) -> Result<(*mut u8, u64, u64, Stage2PublicationAuthority), TrapError> {
     allocate_unpublished_grant_extent(custody, stage2_perms, CowArmedRanges::COMPOUND_SIZE)
 }
 
@@ -258,7 +258,7 @@ fn allocate_unpublished_grant_extent(
     custody: &std::sync::Arc<CarrierVmCustody>,
     stage2_perms: applevisor::memory::MemPerms,
     length: u64,
-) -> Result<(*mut u8, u64, u64, Stage2RollbackReceipt), TrapError> {
+) -> Result<(*mut u8, u64, u64, Stage2PublicationAuthority), TrapError> {
     if length == 0
         || !length.is_multiple_of(CowArmedRanges::COMPOUND_SIZE)
         || length > carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE + 32768

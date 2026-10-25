@@ -461,7 +461,7 @@ pub(crate) struct Stage2RetirementAuthorization {
 }
 
 #[derive(::core::fmt::Debug)]
-pub(crate) struct Stage2RollbackReceipt {
+pub(crate) struct NeverPublishedRecord {
     identity: CarrierStage2RecordIdentity,
 }
 
@@ -554,22 +554,49 @@ impl Drop for Stage2RecordRemoval<'_> {
 /// One stage-2 directory mutation. Dropping the guard publishes after every
 /// directory lock acquired by the mutation has left scope, including rollback
 /// and early-return paths.
-pub(crate) struct Stage2PublicationAuthority<'a> {
+pub(crate) struct Stage2AvailabilityPublication<'a> {
     custody: &'a CarrierVmCustody,
     changed: bool,
 }
 
-impl Stage2PublicationAuthority<'_> {
+impl Stage2AvailabilityPublication<'_> {
     pub(crate) fn changed(&mut self) {
         self.changed = true;
     }
 }
 
-impl Drop for Stage2PublicationAuthority<'_> {
+impl Drop for Stage2AvailabilityPublication<'_> {
     fn drop(&mut self) {
         if self.changed {
             self.custody.publish_stage2_availability_change();
         }
+    }
+}
+
+/// One publication transaction which inserted a stage-2 record before any
+/// stage-1 leaf could name it. Dropping the authority publishes the state
+/// transition; consuming it through `rollback` is the only constructor for a
+/// never-published retirement receipt.
+#[derive(::core::fmt::Debug)]
+pub(crate) struct Stage2PublicationAuthority {
+    identity: Option<CarrierStage2RecordIdentity>,
+    publication: carrick_thread::completion::CompletionCallbacks,
+}
+
+impl Stage2PublicationAuthority {
+    pub(crate) fn rollback(mut self) -> NeverPublishedRecord {
+        NeverPublishedRecord {
+            identity: self
+                .identity
+                .take()
+                .expect("stage-2 publication authority consumed once"),
+        }
+    }
+}
+
+impl Drop for Stage2PublicationAuthority {
+    fn drop(&mut self) {
+        self.publication.publish(0);
     }
 }
 
@@ -830,8 +857,8 @@ impl CarrierVmCustody {
         }
     }
 
-    pub(crate) fn stage2_publication_authority(&self) -> Stage2PublicationAuthority<'_> {
-        Stage2PublicationAuthority {
+    pub(crate) fn stage2_publication_authority(&self) -> Stage2AvailabilityPublication<'_> {
+        Stage2AvailabilityPublication {
             custody: self,
             changed: false,
         }
@@ -840,7 +867,7 @@ impl CarrierVmCustody {
     pub(crate) fn stage1_unpublished_from_rollback(
         &self,
         identity: CarrierStage2RecordIdentity,
-        receipt: Stage2RollbackReceipt,
+        receipt: NeverPublishedRecord,
     ) -> Option<Stage1Unpublished> {
         (receipt.identity == identity).then_some(Stage1Unpublished {
             identity,
@@ -896,7 +923,7 @@ impl CarrierVmCustody {
         identity: CarrierStage2RecordIdentity,
         receipt: &super::UnpublishedTaskStage1,
     ) -> Option<Stage1Unpublished> {
-        self.stage1_unpublished_from_rollback(identity, receipt.consume(identity)?)
+        self.stage1_unpublished_from_rollback(identity, receipt.consume(identity)?.rollback())
     }
 
     /// Test support that obtains the same non-forgeable editor receipt as a
@@ -1696,10 +1723,16 @@ impl CarrierVmCustody {
     pub(crate) fn register_unpublished_stage2_record(
         &self,
         spec: CarrierStage2RecordSpec,
-    ) -> Result<(CarrierStage2RecordIdentity, Stage2RollbackReceipt), CarrierStage2RecordError>
+    ) -> Result<(CarrierStage2RecordIdentity, Stage2PublicationAuthority), CarrierStage2RecordError>
     {
         let identity = Self::register_stage2_record_locked(&mut self.state.lock(), spec)?;
-        Ok((identity, Stage2RollbackReceipt { identity }))
+        Ok((
+            identity,
+            Stage2PublicationAuthority {
+                identity: Some(identity),
+                publication: self.stage2_publication_changed.clone(),
+            },
+        ))
     }
 
     /// Commit backend mapping and its exact record under one lifecycle lock.
@@ -1721,7 +1754,7 @@ impl CarrierVmCustody {
         &self,
         spec: CarrierStage2RecordSpec,
         map: impl FnOnce(CarrierStage2RecordIdentity) -> i32,
-    ) -> Result<(CarrierStage2RecordIdentity, Stage2RollbackReceipt), TrapError> {
+    ) -> Result<(CarrierStage2RecordIdentity, Stage2PublicationAuthority), TrapError> {
         let mut publication = self.stage2_publication_authority();
         let mut state = self.state.lock();
         let identity = Self::register_stage2_record_locked(&mut state, spec).map_err(|error| {
@@ -1736,7 +1769,13 @@ impl CarrierVmCustody {
             )));
         }
         drop(state);
-        Ok((identity, Stage2RollbackReceipt { identity }))
+        Ok((
+            identity,
+            Stage2PublicationAuthority {
+                identity: Some(identity),
+                publication: self.stage2_publication_changed.clone(),
+            },
+        ))
     }
 
     fn register_stage2_record_locked(

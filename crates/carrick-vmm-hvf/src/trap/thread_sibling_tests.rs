@@ -100,7 +100,7 @@ fn shared_mm_task_projection_preserves_structural_owner() {
         .take_unpublished_rollback()
         .expect("unpublished shared-MM projection owns its rollback receipt");
     let stage1 = custody
-        .stage1_unpublished_from_rollback(identity, rollback)
+        .stage1_unpublished_from_rollback(identity, rollback.rollback())
         .expect("rollback receipt names the shared-MM projection record");
     assert_eq!(
         custody.request_stage2_record_retirement(identity, stage1),

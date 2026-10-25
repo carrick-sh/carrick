@@ -1726,7 +1726,7 @@ fn transfer_unpublished_global_frame_stage2_lease_to_custody(
     host_addr: usize,
     perms: u64,
     logical_owner: Option<CarrierLogicalOwner>,
-) -> Result<(CarrierStage2RecordIdentity, Stage2RollbackReceipt), TrapError> {
+) -> Result<(CarrierStage2RecordIdentity, Stage2PublicationAuthority), TrapError> {
     if !lease.active || !lease.mapped || host_addr == 0 {
         return Err(TrapError::Hypervisor(format!(
             "global frame host owner lease is not active and mapped: key={:?} active={} mapped={} host=0x{host_addr:x}",
@@ -1844,7 +1844,7 @@ pub(crate) fn register_unpublished_global_frame_host_owner_in(
     lease: GlobalFrameStage2Lease,
     mapping: crate::host_mapping::OwnedHostMapping,
     perms: u64,
-) -> Result<(u64, Stage2RollbackReceipt), TrapError> {
+) -> Result<(u64, Stage2PublicationAuthority), TrapError> {
     register_unpublished_global_frame_host_owner_in_using(
         custody,
         lease,
@@ -1860,7 +1860,7 @@ fn register_unpublished_global_frame_host_owner_in_using(
     mapping: crate::host_mapping::OwnedHostMapping,
     perms: u64,
     rollback_unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
-) -> Result<(u64, Stage2RollbackReceipt), TrapError> {
+) -> Result<(u64, Stage2PublicationAuthority), TrapError> {
     let key = lease.key();
     if key.1 != mapping.len() as u64 || !lease.mapped {
         return Err(TrapError::Hypervisor(format!(
@@ -1899,7 +1899,8 @@ fn register_unpublished_global_frame_host_owner_in_using(
     let mut owners = custody.global_frame_host_owners.lock();
     if owners.contains_key(&key) {
         drop(owners);
-        let Some(stage1) = custody.stage1_unpublished_from_rollback(record_identity, rollback)
+        let Some(stage1) =
+            custody.stage1_unpublished_from_rollback(record_identity, rollback.rollback())
         else {
             return Err(TrapError::Hypervisor(
                 "global-frame lease rollback lacks stage-1 proof".to_owned(),
@@ -1949,7 +1950,7 @@ pub(crate) fn register_unpublished_pooled_global_frame_host_owner_in(
     custody: &std::sync::Arc<CarrierVmCustody>,
     handle: crate::frame_pool::PooledFrameHandle,
     perms: u64,
-) -> Result<(u64, Stage2RollbackReceipt), TrapError> {
+) -> Result<(u64, Stage2PublicationAuthority), TrapError> {
     let key = (handle.ipa(), handle.len() as u64);
     let host_addr = handle.as_mut_ptr() as usize;
     let vm_generation = custody.setup_generation().ok_or_else(|| {
@@ -1990,7 +1991,8 @@ pub(crate) fn register_unpublished_pooled_global_frame_host_owner_in(
     let mut owners = custody.global_frame_host_owners.lock();
     if owners.contains_key(&key) {
         drop(owners);
-        let Some(stage1) = custody.stage1_unpublished_from_rollback(record_identity, rollback)
+        let Some(stage1) =
+            custody.stage1_unpublished_from_rollback(record_identity, rollback.rollback())
         else {
             return Err(TrapError::Hypervisor(
                 "global-frame owner rollback lacks stage-1 proof".to_owned(),
@@ -2386,7 +2388,7 @@ pub(crate) struct StructuralBackingOwner {
 pub(crate) struct StructuralBackingCustodyEntry {
     pub(crate) mapping: std::sync::Arc<GlobalFrameSharedMapping>,
     pub(crate) record_identity: parking_lot::Mutex<CarrierStage2RecordIdentity>,
-    pub(crate) rollback: parking_lot::Mutex<Option<Stage2RollbackReceipt>>,
+    pub(crate) rollback: parking_lot::Mutex<Option<Stage2PublicationAuthority>>,
     pub(crate) owner_retired: std::sync::atomic::AtomicBool,
     pub(crate) physical_ipa: u64,
     pub(crate) physical_size: usize,
@@ -2589,7 +2591,7 @@ impl StructuralBackingOwner {
         *self.retained.record_identity.lock()
     }
 
-    pub(crate) fn take_unpublished_rollback(&self) -> Option<Stage2RollbackReceipt> {
+    pub(crate) fn take_unpublished_rollback(&self) -> Option<Stage2PublicationAuthority> {
         self.retained.rollback.lock().take()
     }
 

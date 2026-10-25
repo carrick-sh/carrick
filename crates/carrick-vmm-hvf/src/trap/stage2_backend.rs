@@ -1514,7 +1514,7 @@ pub(crate) fn install_ipc_window_using(
             Err(error) => {
                 for (identity, rollback) in records {
                     let stage1 = custody
-                        .stage1_unpublished_from_rollback(identity, rollback)
+                        .stage1_unpublished_from_rollback(identity, rollback.rollback())
                         .ok_or_else(|| {
                             TrapError::Hypervisor(
                                 "IPC rollback receipt names another stage-2 record".to_owned(),

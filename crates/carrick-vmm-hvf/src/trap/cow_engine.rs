@@ -3990,7 +3990,7 @@ impl HvfTaskState {
                         CowArmedRanges::COMPOUND_SIZE,
                     ) {
                         if let Some(stage1) = rollback_receipt.take().and_then(|receipt| {
-                            custody.stage1_unpublished_from_rollback(identity, receipt)
+                            custody.stage1_unpublished_from_rollback(identity, receipt.rollback())
                         }) {
                             let _ = retire_global_frame_host_owner_in(
                                 custody,
@@ -4330,7 +4330,7 @@ impl HvfTaskState {
                     CowArmedRanges::COMPOUND_SIZE,
                 ) {
                     if let Some(stage1) = rollback_receipt.take().and_then(|receipt| {
-                        custody.stage1_unpublished_from_rollback(identity, receipt)
+                        custody.stage1_unpublished_from_rollback(identity, receipt.rollback())
                     }) {
                         let _ = retire_global_frame_host_owner_in(
                             custody,
