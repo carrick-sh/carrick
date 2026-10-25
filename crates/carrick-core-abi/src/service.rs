@@ -520,6 +520,35 @@ pub struct ServiceCell {
     result: AtomicU64,
     wait_revision: AtomicU64,
 }
+
+pub struct PreparedExecServiceRebind<'a> {
+    cell: &'a ServiceCell,
+    predecessor: ServiceBirth,
+    successor: El1MmHandle,
+    armed: bool,
+}
+
+impl PreparedExecServiceRebind<'_> {
+    pub fn commit(mut self) -> ServiceBirth {
+        self.cell.words[6].store(self.successor.mm().raw(), Ordering::Relaxed);
+        self.cell.words[7].store(self.successor.incarnation().get(), Ordering::Relaxed);
+        let rebound = ServiceBirth {
+            mm: self.successor,
+            ..self.predecessor
+        };
+        self.cell.state.store(IDLE, Ordering::Release);
+        self.armed = false;
+        rebound
+    }
+}
+
+impl Drop for PreparedExecServiceRebind<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cell.state.store(IDLE, Ordering::Release);
+        }
+    }
+}
 impl ServiceCell {
     pub const fn new() -> Self {
         Self {
@@ -843,6 +872,14 @@ impl ServiceCell {
         predecessor: ServiceBirth,
         successor: El1MmHandle,
     ) -> Result<ServiceBirth, ServiceError> {
+        Ok(self.prepare_exec_rebind(predecessor, successor)?.commit())
+    }
+
+    pub fn prepare_exec_rebind(
+        &self,
+        predecessor: ServiceBirth,
+        successor: El1MmHandle,
+    ) -> Result<PreparedExecServiceRebind<'_>, ServiceError> {
         self.state
             .compare_exchange(IDLE, WRITING, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| ServiceError::Busy)?;
@@ -850,14 +887,12 @@ impl ServiceCell {
             self.state.store(IDLE, Ordering::Release);
             return Err(ServiceError::Stale);
         }
-        self.words[6].store(successor.mm().raw(), Ordering::Relaxed);
-        self.words[7].store(successor.incarnation().get(), Ordering::Relaxed);
-        let rebound = ServiceBirth {
-            mm: successor,
-            ..predecessor
-        };
-        self.state.store(IDLE, Ordering::Release);
-        Ok(rebound)
+        Ok(PreparedExecServiceRebind {
+            cell: self,
+            predecessor,
+            successor,
+            armed: true,
+        })
     }
     pub fn publish(
         &self,
@@ -2016,6 +2051,16 @@ mod tests {
                 NonZeroU64::new(old.mm.incarnation().get() + 1).unwrap(),
             )
         };
+        let rollback = cell.prepare_exec_rebind(old, successor).unwrap();
+        assert_eq!(
+            cell.bound_birth(old.process, old.thread, old.record),
+            Err(ServiceError::Busy)
+        );
+        drop(rollback);
+        assert_eq!(
+            cell.bound_birth(old.process, old.thread, old.record),
+            Ok(old)
+        );
         let rebound = cell.rebind_exec_mm(old, successor).unwrap();
         assert_eq!(rebound.mm, successor);
         assert_eq!(rebound.process, old.process);
