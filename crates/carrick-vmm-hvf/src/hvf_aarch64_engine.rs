@@ -2372,6 +2372,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             ticket.len,
             ticket.prepared,
             &registry,
+            None,
         )
     }
 

@@ -1758,7 +1758,13 @@ impl HvfVmState {
             identity.linux_pid,
             identity.linux_tid,
         );
-        self.commit_process_alias_retirement(grant.semantic_base, len, retirement, &registry)?;
+        self.commit_process_alias_retirement(
+            grant.semantic_base,
+            len,
+            retirement,
+            &registry,
+            None,
+        )?;
         register_shared_alias(pending.alias);
         drop(registry);
         Ok(())
@@ -1818,6 +1824,7 @@ impl HvfVmState {
             Some(registry),
             AliasRetirementAuthorityState::Pending,
             AliasRetirementRows::NeverRegistered,
+            None,
         )
     }
 
@@ -2001,6 +2008,7 @@ impl HvfVmState {
                         semantic_len,
                         retirement,
                         &registry,
+                        None,
                     )
                         .unwrap_or_else(|error| {
                             carrick_fatal!(
@@ -6086,7 +6094,6 @@ impl HvfVmState {
         // The range receipt is created only by the Editor edit which removed
         // these leaves. Keeping it in this production boundary prevents a
         // caller from replacing the exact unmap proof with an IPA assertion.
-        let _stage1_receipt = stage1.map(Stage1UnpublicationReceipt::EditorRange);
         // An unmap is a stage-1 repointer that publishes NO receipt of its own,
         // so it has to void the promises naming the range it is tearing down —
         // the contract `supersede_cow_receipts` states for every repointer.
@@ -6131,7 +6138,7 @@ impl HvfVmState {
                 identity.linux_pid,
                 identity.linux_tid,
             );
-            self.commit_process_alias_retirement(va, len, prepared, &registry)
+            self.commit_process_alias_retirement(va, len, prepared, &registry, stage1)
         } else {
             self.commit_process_alias_retirement_inner(
                 va,
@@ -6140,6 +6147,7 @@ impl HvfVmState {
                 None,
                 AliasRetirementAuthorityState::Pending,
                 AliasRetirementRows::Registered,
+                stage1,
             )
         }
     }
@@ -6277,6 +6285,7 @@ impl HvfVmState {
         len: usize,
         prepared: PreparedProcessAliasRetirement,
         registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
+        stage1: Option<&carrick_aarch64::stage1_authority::Stage1LeafRetired>,
     ) -> Result<(), TrapError> {
         self.commit_process_alias_retirement_inner(
             va,
@@ -6285,6 +6294,7 @@ impl HvfVmState {
             Some(registry),
             AliasRetirementAuthorityState::Pending,
             AliasRetirementRows::Registered,
+            stage1,
         )
     }
 
@@ -6302,6 +6312,7 @@ impl HvfVmState {
             Some(registry),
             AliasRetirementAuthorityState::AppliedWithReplacement,
             AliasRetirementRows::Registered,
+            None,
         )
     }
 
@@ -6327,6 +6338,7 @@ impl HvfVmState {
         registry: Option<&crate::fork_quiesce::FrameRegistryGuard<'_>>,
         authority_state: AliasRetirementAuthorityState,
         rows: AliasRetirementRows,
+        stage1: Option<&carrick_aarch64::stage1_authority::Stage1LeafRetired>,
     ) -> Result<(), TrapError> {
         let mut prepared = prepared;
         loop {
@@ -6338,6 +6350,7 @@ impl HvfVmState {
                 registry,
                 authority_state,
                 rows,
+                stage1,
             )?
             else {
                 return Ok(());
@@ -6367,6 +6380,7 @@ impl HvfVmState {
         registry: Option<&crate::fork_quiesce::FrameRegistryGuard<'_>>,
         authority_state: AliasRetirementAuthorityState,
         rows: AliasRetirementRows,
+        stage1: Option<&carrick_aarch64::stage1_authority::Stage1LeafRetired>,
     ) -> Result<Option<StaleAliasRetirement>, TrapError> {
         if prepared.inventory.is_some() && registry.is_none() {
             return Err(TrapError::Hypervisor(
@@ -6550,10 +6564,16 @@ impl HvfVmState {
                 inventory.extents.len(),
             );
         }
-        let stage1 = crate::trap::frame_inventory::Stage1UnpublishedFrames::after_alias_retirement(
-            authority.as_ref(),
-            &retirement,
-        )?;
+        let frame_absence = if stage1.is_none() {
+            Some(
+                crate::trap::frame_inventory::Stage1UnpublishedFrames::after_alias_retirement(
+                    authority.as_ref(),
+                    &retirement,
+                )?,
+            )
+        } else {
+            None
+        };
         let scope = CowInventoryLifecycleScope {
             custody: &custody,
             identity: Some(identity),
@@ -6590,11 +6610,17 @@ impl HvfVmState {
                         "HVPatch alias retirement IPA 0x{ipa:x} size {length} has no exact inventory owner"
                     ))
             })?;
-            self.retire_stage2_extent(
-                Stage1UnpublicationReceipt::FrameAbsence(&stage1),
-                ipa,
-                length,
-            )?;
+            let receipt = if let Some(stage1) = stage1 {
+                Stage1UnpublicationReceipt::EditorRange(stage1)
+            } else {
+                let absence = frame_absence.as_ref().ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "grant rollback lost its frame-absence fallback".to_owned(),
+                    )
+                })?;
+                Stage1UnpublicationReceipt::FrameAbsence(absence)
+            };
+            self.retire_stage2_extent(receipt, ipa, length)?;
             let retired = [retired];
             let cleanup = mutate_known_external_alias_state(
                 AliasWriterActor::Mm {
