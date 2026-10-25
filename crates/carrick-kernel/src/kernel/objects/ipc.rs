@@ -651,17 +651,17 @@ mod tests {
     }
 
     #[test]
-    fn epoll_detach_reservation_propagates_shared_claim_conflict() {
+    fn epoll_detach_reservation_borrows_shared_exact_claim() {
         let ids = ObjectIdRegistry::new();
         let owner = Arc::new(HostIpc::new(1 << 20).unwrap());
         let table = Arc::new(FileTable::new(ids.file_table_id().unwrap()));
         table.publish_ipc(owner, map()).unwrap();
         let first = table.reserve_exact_target(7, 64).unwrap();
 
-        assert!(matches!(
-            table.reserve_slot_for_epoll_detach(7),
-            Err(crate::linux_abi::LINUX_EBUSY)
-        ));
+        table
+            .reserve_slot_for_epoll_detach(7)
+            .expect("close borrows the exact claim")
+            .release();
         assert_eq!(
             table.lock_reserved_slots().get(&7).copied(),
             Some(first.reservation_id())

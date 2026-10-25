@@ -1975,29 +1975,37 @@ impl Drop for ExactSlotReservation {
 pub struct EpollDetachReservation<'a> {
     table: &'a FileTable,
     fd: i32,
-    reservation_id: u64,
-    active: bool,
+    custody: EpollDetachReservationCustody,
+}
+
+#[derive(Debug)]
+enum EpollDetachReservationCustody {
+    Owned(u64),
+    BorrowedExact,
+    Released,
 }
 
 impl EpollDetachReservation<'_> {
     pub fn release(mut self) {
-        if self.active {
-            self.table.lock_reserved_slots().remove(&self.fd);
-            self.table
-                .cancel_ipc_reservation(self.fd, self.reservation_id);
-            self.active = false;
+        self.release_owned();
+    }
+
+    fn release_owned(&mut self) {
+        let custody = std::mem::replace(&mut self.custody, EpollDetachReservationCustody::Released);
+        if let EpollDetachReservationCustody::Owned(reservation_id) = custody {
+            let mut reserved = self.table.lock_reserved_slots();
+            if reserved.get(&self.fd).copied() == Some(reservation_id) {
+                reserved.remove(&self.fd);
+                drop(reserved);
+                self.table.cancel_ipc_reservation(self.fd, reservation_id);
+            }
         }
     }
 }
 
 impl Drop for EpollDetachReservation<'_> {
     fn drop(&mut self) {
-        if self.active {
-            self.table.lock_reserved_slots().remove(&self.fd);
-            self.table
-                .cancel_ipc_reservation(self.fd, self.reservation_id);
-            self.active = false;
-        }
+        self.release_owned();
     }
 }
 
@@ -2822,7 +2830,18 @@ impl FileTable {
     ) -> Result<EpollDetachReservation<'_>, crate::linux_abi::LinuxErrno> {
         let mut reserved = self.lock_reserved_slots();
         if reserved.contains_key(&fd) {
-            return Err(crate::linux_abi::LINUX_EBUSY);
+            // The caller holds `open_files.write` and has observed an occupied
+            // slot. Allocation claims are admitted only for empty slots, so a
+            // live claim on this occupied number is the sibling dup2/dup3
+            // exact-replacement claim. Its custody already keeps the number
+            // unavailable while close detaches the displaced description.
+            // Borrow it: close may linearize before the replacement commit,
+            // but must neither cancel nor wait for the sibling's claim.
+            return Ok(EpollDetachReservation {
+                table: self,
+                fd,
+                custody: EpollDetachReservationCustody::BorrowedExact,
+            });
         }
         let res_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
         self.reserve_ipc_exact(fd, res_id)?;
@@ -2830,8 +2849,7 @@ impl FileTable {
         Ok(EpollDetachReservation {
             table: self,
             fd,
-            reservation_id: res_id,
-            active: true,
+            custody: EpollDetachReservationCustody::Owned(res_id),
         })
     }
 
