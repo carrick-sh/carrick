@@ -42,6 +42,7 @@ impl<'a> FsView<'a> {
         if let DispatchOutcome::Returned { value, .. } = *outcome {
             let fd = value as i32;
             if fd >= 0 {
+                self.require_close_effects_for_open_fd(fd);
                 if let Some(open_file) = self.open_file(fd) {
                     let _ = crate::el1_delegation::enter_zone_at_open(
                         &open_file,

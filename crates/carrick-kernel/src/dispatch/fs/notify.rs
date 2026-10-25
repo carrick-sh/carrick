@@ -398,6 +398,7 @@ impl<'a> FsView<'a> {
                 this.fs
                     .inotify_registry
                     .register(&path, &state, wd, effective);
+                this.require_inotify_close_effects_for_open_files();
                 if !this.attach_watch_to_zone_file(
                     pathname.0,
                     &state,
@@ -491,6 +492,7 @@ impl<'a> FsView<'a> {
                     .inotify_registry
                     .register(&path, &state, wd, mask);
             }
+            this.require_inotify_close_effects_for_open_files();
             if !this.attach_watch_to_zone_file(
                 pathname.0,
                 &state,

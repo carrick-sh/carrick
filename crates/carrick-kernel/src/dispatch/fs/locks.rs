@@ -14,6 +14,7 @@ struct RecordLockRequest<'a, M> {
     kernel: &'a crate::kernel::KernelContext,
     memory: &'a mut M,
     tid: crate::thread::ThreadId,
+    fd: i32,
     host_fd: i32,
     lease: FileDescriptionFdLease,
     desc_ptr: usize,
@@ -216,6 +217,13 @@ fn forward_record_lock<M: CurrentMmMemory>(
         } else {
             None
         };
+        if !is_ofd {
+            // Publish before attempting the lock. A failed/nonblocking
+            // request may retain harmless host replay, while publishing after
+            // success would let a sibling ring-close pass between the lock
+            // acquisition and its close-time obligation.
+            this.same_file_other_openers(req.fd, Some(req.kernel.task()));
+        }
         match this.fs.classic_record_locks.try_set(request.clone()) {
             Ok(()) => DispatchOutcome::Returned { value: 0 },
             Err(errno) if matches!(req.linux_cmd, LINUX_F_SETLK | LINUX_F_OFD_SETLK) => {
@@ -576,6 +584,17 @@ impl LogicalRecordLocks {
 
     pub(crate) fn conflict(&self, request: &LogicalRecordLockRequest) -> Option<LogicalRecordLock> {
         Self::conflict_locked(&self.state().locks, request)
+    }
+
+    pub(crate) fn holds_file_owner(
+        &self,
+        file: &LeaseFileId,
+        owner: LogicalRecordLockOwner,
+    ) -> bool {
+        self.state()
+            .locks
+            .iter()
+            .any(|lock| lock.file == *file && lock.owner == owner)
     }
 
     pub(crate) fn release_file_owner(&self, file: &LeaseFileId, owner: LogicalRecordLockOwner) {
@@ -1178,6 +1197,22 @@ fn write_logical_record_lock_conflict(
 }
 
 impl<'a> FsView<'a> {
+    /// Identity available without recalling a description from the EL1 zone.
+    /// Host regular files admitted to native-child IPC already retain their
+    /// inode registration; in-memory regular files use the same stable path
+    /// identity as the logical record-lock table.
+    pub(in crate::dispatch) fn ring_close_file_identity(
+        description: &Arc<crate::kernel::FileDescription>,
+    ) -> Option<LeaseFileId> {
+        if let Some(identity) = description.el1_identity() {
+            return Some(LeaseFileId::Inode {
+                dev: identity.dev,
+                ino: identity.ino,
+            });
+        }
+        description.open_path_snapshot().map(LeaseFileId::Path)
+    }
+
     /// Access modes (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) of every OTHER open file
     /// description that refers to the SAME underlying file as `fd` — i.e. a
     /// distinct `open(2)` of the same inode, not a `dup(2)` (which shares the
@@ -1190,7 +1225,11 @@ impl<'a> FsView<'a> {
     /// guest open-path for the in-memory `File` backing. Descriptions that are
     /// not regular files (pipes/sockets/anon-inodes) never share inode identity
     /// with a regular-file lease target and are skipped.
-    fn same_file_other_openers(&self, fd: i32) -> Vec<u64> {
+    fn same_file_other_openers(
+        &self,
+        fd: i32,
+        close_effect_task: Option<&crate::kernel::TaskRef>,
+    ) -> Vec<u64> {
         let Some(target) = self.open_file(fd) else {
             return Vec::new();
         };
@@ -1202,20 +1241,30 @@ impl<'a> FsView<'a> {
             return Vec::new();
         };
         let mut others = Vec::new();
-        for (other_fd, open_file) in self.captured_file_table().read_open_files().iter() {
-            if *other_fd == fd {
-                continue;
-            }
-            // A `dup(2)`/inherited fd shares the same description `Arc`; it is the
-            // same open file description, not a separate opener, so it does not
-            // conflict.
-            if Arc::ptr_eq(&open_file.description, &target.description) {
-                continue;
-            }
-            if let Some(desc) = crate::kernel::FileDescription::read_for_io(&open_file.description)
-                && Self::lease_file_identity(&desc).as_ref() == Some(&target_id)
-            {
-                others.push(open_file.description.common().status_flags() & LINUX_O_ACCMODE);
+        let tables = close_effect_task.map_or_else(
+            || vec![self.captured_file_table()],
+            |task| task.file_tables(),
+        );
+        for files in tables {
+            for open_file in files.read_open_files().values() {
+                let same_description = Arc::ptr_eq(&open_file.description, &target.description);
+                let same_file = same_description
+                    || crate::kernel::FileDescription::read_for_io(&open_file.description)
+                        .and_then(|desc| Self::lease_file_identity(&desc))
+                        .as_ref()
+                        == Some(&target_id);
+                if !same_file {
+                    continue;
+                }
+                if close_effect_task.is_some() {
+                    open_file.description.require_close_effects(
+                        carrick_el1_abi::ipc::fd::CloseEffects::POSIX_RECORD_LOCKS,
+                    );
+                } else if !same_description {
+                    // A dup/inherited fd shares the same open file description
+                    // and is not another opener for F_SETLEASE.
+                    others.push(open_file.description.common().status_flags() & LINUX_O_ACCMODE);
+                }
             }
         }
         others
@@ -1838,6 +1887,7 @@ impl<'a> FsView<'a> {
                                     kernel: cx.kernel,
                                     memory: &mut *cx.memory,
                                     tid,
+                                    fd: fd.0,
                                     host_fd,
                                     lease,
                                     desc_ptr,
@@ -1866,6 +1916,7 @@ impl<'a> FsView<'a> {
                                     kernel: cx.kernel,
                                     memory: &mut *cx.memory,
                                     tid,
+                                    fd: fd.0,
                                     host_fd,
                                     lease,
                                     desc_ptr,
@@ -1897,6 +1948,7 @@ impl<'a> FsView<'a> {
                                     kernel: cx.kernel,
                                     memory: &mut *cx.memory,
                                     tid,
+                                    fd: fd.0,
                                     host_fd,
                                     lease,
                                     desc_ptr,
@@ -1941,7 +1993,7 @@ impl<'a> FsView<'a> {
                         // A write lease demands exclusive access: any other open
                         // file description for the file is a conflict.
                         LINUX_F_WRLCK => {
-                            if !this.same_file_other_openers(fd.0).is_empty() {
+                            if !this.same_file_other_openers(fd.0, None).is_empty() {
                                 return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                             }
                         }
@@ -1954,7 +2006,7 @@ impl<'a> FsView<'a> {
                                 return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                             }
                             let writer_exists = this
-                                .same_file_other_openers(fd.0)
+                                .same_file_other_openers(fd.0, None)
                                 .into_iter()
                                 .any(|acc| acc != LINUX_O_RDONLY);
                             if writer_exists {

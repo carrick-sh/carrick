@@ -7836,6 +7836,15 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     writer.install(table.id(), fd::Fd(4), true).unwrap();
     let mut host_file =
         carrick_kernel::dispatch::NativeFileWitness::new(&table, fd::Fd(5)).unwrap();
+    host_file.require_close_effects(carrick_el1_abi::ipc::fd::CloseEffects::POSIX_RECORD_LOCKS);
+    assert_eq!(
+        owner
+            .region()
+            .fd(carrick_kernel::el1_zone::HostLockWait)
+            .close_effects(table.id(), fd::Fd(5))
+            .unwrap(),
+        carrick_el1_abi::ipc::fd::CloseEffects::POSIX_RECORD_LOCKS,
+    );
 
     let region = Box::leak(carrick_test_support::TestEl1Region::zeroed());
     let map = unsafe {
@@ -8062,8 +8071,26 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     // 6. Duplicate a host-backed description through the same reservation
     // transaction. Child 0's fd 2 keeps the physical object alive after both
     // inherited fd 5 entries close.
+    let child0_table = carrick_el1_abi::ipc::fd::TableId::from_raw(
+        map.lookup_owned(children[0]).expect("owned child table"),
+    );
+    assert_eq!(
+        owner
+            .region()
+            .fd(carrick_kernel::el1_zone::HostLockWait)
+            .close_effects(child0_table, fd::Fd(5))
+            .unwrap(),
+        carrick_el1_abi::ipc::fd::CloseEffects::POSIX_RECORD_LOCKS,
+    );
     assert_eq!(run_in_child(0, sys_dup, [5, 0, 0]).1, 2);
-    assert_eq!(run_in_child(0, sys_close, [5, 0, 0]).1, 0);
+    let (close_effect_route, close_effect_result) = run_in_child(0, sys_close, [5, 0, 0]);
+    assert_eq!(close_effect_result, 0);
+    assert_eq!(close_effect_route, CompletionRoute::WithWork);
+    assert_eq!(
+        task.linux.take_served_boundary(),
+        Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0: 5 }),
+        "host-owned close effects must replay the already-committed numeric close"
+    );
     assert_eq!(
         run_in_child(0, sys_close, [5, 0, 0]).1,
         -9,
@@ -8091,7 +8118,13 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
         (LINUX_O_WRONLY | LINUX_O_NONBLOCK) as i64,
         "child 1 shares the writer OFD flags mutated by child 0"
     );
-    assert_eq!(run_in_child(1, sys_close, [5, 0, 0]).1, 0);
+    let (close_effect_route, close_effect_result) = run_in_child(1, sys_close, [5, 0, 0]);
+    assert_eq!(close_effect_result, 0);
+    assert_eq!(close_effect_route, CompletionRoute::WithWork);
+    assert_eq!(
+        task.linux.take_served_boundary(),
+        Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0: 5 }),
+    );
     let _ = owner.drain_retired_tables().unwrap();
     assert_eq!(
         owner.retained_host_resources(),
@@ -8119,8 +8152,8 @@ fn serial_host_native_fork_two_children_descriptor_mutations_and_last_writer_eof
     assert_eq!(route, CompletionRoute::WithWork);
     assert_eq!(
         task.linux.take_served_boundary(),
-        Some(carrick_el1_abi::ServedBoundary::Completed),
-        "a real host-resource finalizer must still cross the carrier boundary"
+        Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0: 2 }),
+        "close effects and the final host resource must share one carrier crossing"
     );
     assert!(
         task.linux.has_pending_host_work(),

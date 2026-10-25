@@ -151,6 +151,32 @@ impl Description {
     }
 }
 
+/// Host-owned work that Linux requires on every numeric close of this open
+/// description. The ring may remove the fd first, but must retain the original
+/// close for the host authority whenever this set is nonempty.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CloseEffects(u64);
+
+impl CloseEffects {
+    pub const NONE: Self = Self(0);
+    pub const POSIX_RECORD_LOCKS: Self = Self(1 << 0);
+    pub const EPOLL_DETACH: Self = Self(1 << 1);
+    pub const INOTIFY_CLOSE: Self = Self(1 << 2);
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// Final-reference outcome when a venue defers selected physical releases
 /// (`retired_ofds`) to a host boundary.
 #[must_use = "an immediate final description owns backing resources to release"]
@@ -632,7 +658,7 @@ pub struct OfdRecord {
     mode: AtomicU64,
     immutable: AtomicU64,
     next_free: AtomicU64,
-    _reserved: u64,
+    close_effects: AtomicU64,
 }
 
 const MODE_ACCESS: u64 = 3;
@@ -1334,12 +1360,14 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             encode_mode(description.access, description.flags),
             Ordering::Relaxed,
         );
+        ofd.close_effects.store(0, Ordering::Relaxed);
         ofd.holds.store(REF, Ordering::Release);
         Ok(index)
     }
 
     fn free_ofd(&self, index: u32) -> Result<(), Error> {
         let ofd = self.ofd(index)?;
+        ofd.close_effects.store(0, Ordering::Relaxed);
         // A generation that cannot advance retires the record (fail closed).
         if ofd.generation.fetch_add(1, Ordering::AcqRel) < u64::MAX - 1 {
             push(&self.core.free_ofds, index as usize, &ofd.next_free);
@@ -1588,6 +1616,31 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             let snapshot = entry.map(|e| self.snapshot(e.ofd)).transpose();
             if Self::slot(&storage, fd) == entry && record.unchanged_since(seq) {
                 return snapshot?.ok_or(Error::BadFd);
+            }
+            attempt = attempt.saturating_add(1);
+            if !self.wait.wait(attempt) {
+                return Err(Error::Contended);
+            }
+        }
+    }
+
+    /// O(1) read-only snapshot of the host work retained for this numeric
+    /// close. Kept separate from [`Description`] so the hot by-value backing
+    /// snapshot does not grow with close-only metadata.
+    pub fn close_effects(&self, table: TableId, fd: Fd) -> Result<CloseEffects, Error> {
+        let mut attempt: u32 = 0;
+        loop {
+            let (record, seq, storage) = self.read_table(table)?;
+            let entry = Self::slot(&storage, fd);
+            let effects = entry
+                .map(|entry| {
+                    self.ofd(entry.ofd).map(|ofd| {
+                        CloseEffects::from_bits(ofd.close_effects.load(Ordering::Acquire))
+                    })
+                })
+                .transpose();
+            if Self::slot(&storage, fd) == entry && record.unchanged_since(seq) {
+                return effects?.ok_or(Error::BadFd);
             }
             attempt = attempt.saturating_add(1);
             if !self.wait.wait(attempt) {
@@ -2326,6 +2379,22 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     pub fn set_pinned_flags(&self, pin: &OfdPin, flags: StatusFlags) -> Result<(), Error> {
         self.check_pin(pin)?;
         Self::set_ofd_flags(self.ofd(pin.key.index)?, flags)
+    }
+
+    /// Add host-owned close-time work to this exact open description. Effects
+    /// are sticky for the incarnation: retaining an unnecessary host close is
+    /// safe, while clearing one before every numeric alias closes would lose
+    /// Linux's process-lock or observer semantics.
+    pub fn require_pinned_close_effects(
+        &self,
+        pin: &OfdPin,
+        effects: CloseEffects,
+    ) -> Result<(), Error> {
+        self.check_pin(pin)?;
+        self.ofd(pin.key.index)?
+            .close_effects
+            .fetch_or(effects.bits(), Ordering::AcqRel);
+        Ok(())
     }
 
     /// Release a pin. Returns the description exactly when this was its final

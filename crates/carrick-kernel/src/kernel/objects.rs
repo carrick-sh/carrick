@@ -818,6 +818,7 @@ impl SocketCork {
 pub struct DescriptionCommon {
     cursor: file_cursor::FileCursor,
     status_flags: AtomicU64,
+    close_effects: AtomicU64,
     ipc_status_flags: std::sync::OnceLock<Arc<crate::el1_ipc::HostDescriptionFlags>>,
     /// A shared routing record for descriptions whose effects remain host-owned.
     /// This pin ends with functional fd ownership, never diagnostic Arc lifetime.
@@ -854,6 +855,7 @@ impl DescriptionCommon {
         Self {
             cursor: file_cursor::FileCursor::new(),
             status_flags: AtomicU64::new(status_flags),
+            close_effects: AtomicU64::new(0),
             ipc_status_flags: std::sync::OnceLock::new(),
             ipc_forwarding: Mutex::new(None),
             physical: Arc::new(DescriptionPhysicalLifetime::default()),
@@ -876,6 +878,7 @@ impl DescriptionCommon {
         Self {
             cursor: file_cursor::FileCursor::new(),
             status_flags: AtomicU64::new(status_flags),
+            close_effects: AtomicU64::new(0),
             ipc_status_flags: std::sync::OnceLock::new(),
             ipc_forwarding: Mutex::new(None),
             physical: Arc::new(DescriptionPhysicalLifetime::default()),
@@ -901,7 +904,7 @@ impl DescriptionCommon {
     fn bind_ipc_status_flags(&self, flags: Arc<crate::el1_ipc::HostDescriptionFlags>) {
         let bound = self.ipc_status_flags.get_or_init(|| {
             let initial = self.status_flags.load(Ordering::Relaxed);
-            flags.set_linux_flags(initial);
+            flags.set_linux_flags(Some(initial), carrick_el1_abi::ipc::fd::CloseEffects::NONE);
             // Access mode and supported mutable bits have one shared owner.
             // Retain only the remaining immutable personality bits locally.
             self.status_flags.store(
@@ -918,6 +921,30 @@ impl DescriptionCommon {
                 "common flags bound to different OFDs"
             );
         }
+        flags.require_close_effects(carrick_el1_abi::ipc::fd::CloseEffects::from_bits(
+            self.close_effects.load(Ordering::Acquire),
+        ));
+    }
+
+    pub(crate) fn require_close_effects(&self, effects: carrick_el1_abi::ipc::fd::CloseEffects) {
+        if effects.is_empty() {
+            return;
+        }
+        self.close_effects
+            .fetch_or(effects.bits(), Ordering::AcqRel);
+        if let Some(flags) = self.ipc_status_flags.get() {
+            flags.require_close_effects(effects);
+        }
+        if let Some(description) = &*self.ipc_forwarding.lock() {
+            description.flags().require_close_effects(effects);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_effects(&self) -> carrick_el1_abi::ipc::fd::CloseEffects {
+        carrick_el1_abi::ipc::fd::CloseEffects::from_bits(
+            self.close_effects.load(Ordering::Acquire),
+        )
     }
 
     pub(crate) fn status_flags(&self) -> u64 {
@@ -929,7 +956,7 @@ impl DescriptionCommon {
 
     pub(crate) fn set_status_flags(&self, next: u64) {
         if let Some(flags) = self.ipc_status_flags.get() {
-            flags.set_linux_flags(next);
+            flags.set_linux_flags(Some(next), carrick_el1_abi::ipc::fd::CloseEffects::NONE);
         } else {
             self.status_flags.store(next, Ordering::Relaxed);
         }
@@ -1251,12 +1278,24 @@ impl FileDescription {
         lifecycle.ipc_holds += 1;
         admitted.store(true, Ordering::Release);
         let flags = description.flags();
+        flags.require_close_effects(fd::CloseEffects::from_bits(
+            self.common.close_effects.load(Ordering::Acquire),
+        ));
         *forwarding = Some(description);
         Ok(flags)
     }
 
     pub(crate) fn common(&self) -> &DescriptionCommon {
         &self.common
+    }
+
+    pub(crate) fn require_close_effects(&self, effects: carrick_el1_abi::ipc::fd::CloseEffects) {
+        self.common.require_close_effects(effects);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_effects(&self) -> carrick_el1_abi::ipc::fd::CloseEffects {
+        self.common.close_effects()
     }
 
     #[allow(dead_code)]
@@ -1489,6 +1528,7 @@ impl FileDescription {
     }
 
     pub(crate) fn register_epoll_owner(self: &Arc<Self>, owner: &Arc<Self>, registration_fd: i32) {
+        self.require_close_effects(carrick_el1_abi::ipc::fd::CloseEffects::EPOLL_DETACH);
         self.epoll_registrations
             .lock()
             .insert((owner.id(), registration_fd), Arc::downgrade(owner));

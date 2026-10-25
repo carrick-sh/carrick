@@ -82,7 +82,7 @@ contracts = ["kernel.ipc.permission-classes"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fs.rs"
-contracts = ["kernel.ipc.permission-classes"]
+contracts = ["kernel.ipc.permission-classes", "kernel.el1.ipc-fd-authority"]
 
 [[surfaces]]
 path = "crates/carrick-signal-core/src/wait.rs"
@@ -122,11 +122,11 @@ contracts = ["kernel.futex.requeue"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/objects.rs"
-contracts = ["kernel.fork.filetable", "core.personality.files", "kernel.el1.open-lifetime"]
+contracts = ["kernel.fork.filetable", "core.personality.files", "kernel.el1.open-lifetime", "kernel.el1.ipc-fd-authority"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/objects/task.rs"
-contracts = ["kernel.memory.owner-wait", "kernel.fork.filetable", "kernel.dispatch.resource-scope"]
+contracts = ["kernel.memory.owner-wait", "kernel.fork.filetable", "kernel.dispatch.resource-scope", "kernel.el1.ipc-fd-authority"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/resources.rs"
@@ -250,6 +250,7 @@ contracts = [
   "kernel.inotify.watch",
   "kernel.inotify.readiness",
   "kernel.inotify.mark-race-hotpath",
+  "kernel.el1.ipc-fd-authority",
 ]
 
 [[surfaces]]
@@ -278,7 +279,7 @@ contracts = ["kernel.inotify.watch"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/fd_table.rs"
-contracts = ["kernel.inotify.readiness"]
+contracts = ["kernel.inotify.readiness", "kernel.el1.ipc-fd-authority"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/scheduler/host_wait.rs"
@@ -1142,7 +1143,7 @@ contracts = ["kernel.el1.fork-cow", "kernel.el1.mm-exclusive-owner", "process.na
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission"]
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission", "kernel.el1.ipc-fd-authority"]
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0/src/native_execution.rs"
@@ -1518,7 +1519,7 @@ contracts = ["core.entry.completion"]
 
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/dispatch.rs"
-contracts = ["process.native.arm-admission", "core.entry.completion", "core.personality.files"]
+contracts = ["process.native.arm-admission", "core.entry.completion", "core.personality.files", "kernel.el1.ipc-fd-authority"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/trap.rs"
@@ -1643,6 +1644,22 @@ contracts = ["core.personality.handle-table"]
 [[surfaces]]
 path = "crates/carrick-fd-core/src/lib.rs"
 contracts = ["kernel.fork.filetable", "kernel.el1.ipc-fd-authority", "core.personality.handle-table"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/el1_ipc.rs"
+contracts = ["kernel.el1.ipc-fd-authority"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/locks.rs"
+contracts = ["kernel.el1.ipc-fd-authority"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/fd_helpers.rs"
+contracts = ["kernel.el1.ipc-fd-authority"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/fs/open.rs"
+contracts = ["kernel.el1.ipc-fd-authority"]
 
 [[surfaces]]
 path = "crates/carrick-fd-core/src/storage.rs"
