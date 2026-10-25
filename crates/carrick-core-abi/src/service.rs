@@ -1077,9 +1077,10 @@ pub struct ServiceTicket<P: Deref<Target = ServiceCell>> {
     // wrapper inside every retained service ticket.
     reply: Option<NonZeroU64>,
 }
-// Failed acknowledgement returns the unique ticket so the caller cannot lose
-// service custody. Boxing that error would add allocation to the EL1 crossing.
-#[allow(clippy::result_large_err)]
+#[allow(
+    clippy::result_large_err,
+    reason = "the linear ticket must be returned on refusal so exact service custody is never lost"
+)]
 impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
     pub fn reply_address(&self) -> Option<carrick_guest_arch::KernelVa> {
         self.reply

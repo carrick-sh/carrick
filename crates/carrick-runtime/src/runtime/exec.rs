@@ -44,9 +44,101 @@ impl ExecLoaderCapabilities {
 /// Carrier-retained physical capabilities for a ring-owned exec. The opaque id
 /// is inherited by native fork; resolving it never consults a host task table.
 pub(crate) struct NativeExecCapability {
-    _id: carrick_core_abi::service::ExecCapabilityId,
-    _files: carrick_kernel::dispatch::exec_files::ExecFiles,
-    _loader: ExecLoaderCapabilities,
+    id: carrick_core_abi::service::ExecCapabilityId,
+    files: carrick_kernel::dispatch::exec_files::ExecFiles,
+    loader: ExecLoaderCapabilities,
+}
+
+impl core::fmt::Debug for NativeExecCapability {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("NativeExecCapability")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeExecCapability {
+    pub(crate) fn id(&self) -> carrick_core_abi::service::ExecCapabilityId {
+        self.id
+    }
+}
+
+fn prepare_native_exec_image(
+    capability: &NativeExecCapability,
+    payload: &[u8],
+) -> Result<LoadedExecImage, LinuxErrno> {
+    let view = carrick_core_abi::service::ExecPayloadView::parse(payload)
+        .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+    let path = core::str::from_utf8(view.path()).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+    let path = match view.call() {
+        carrick_core_abi::service::ExecCall::Execve => path.to_owned(),
+        carrick_core_abi::service::ExecCall::Execveat { dirfd, flags } => {
+            const VALID: u32 = carrick_abi::LINUX_AT_EMPTY_PATH as u32
+                | carrick_abi::LINUX_AT_SYMLINK_NOFOLLOW as u32;
+            if flags & !VALID != 0 {
+                return Err(crate::linux_abi::LINUX_EINVAL);
+            }
+            if path.is_empty() && flags & carrick_abi::LINUX_AT_EMPTY_PATH as u32 != 0 {
+                format!("/proc/self/fd/{dirfd}")
+            } else if path.starts_with('/') || dirfd == -100 {
+                path.to_owned()
+            } else {
+                return Err(crate::linux_abi::LINUX_EBADF);
+            }
+        }
+    };
+    let argv = view.argv().map(<[u8]>::to_vec).collect();
+    let env = view.envp().map(<[u8]>::to_vec).collect();
+    load_execve_image(
+        &capability.loader,
+        &capability.files,
+        &path,
+        argv,
+        env,
+        false,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct NativePreparedExecImage {
+    _request: carrick_core_abi::service::ServiceIdentity,
+    loaded: LoadedExecImage,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl core::fmt::Debug for NativePreparedExecImage {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("NativePreparedExecImage")
+            .field("request", &self._request)
+            .field("entry", &self.loaded.image.entry())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_vmm_hvf::metadata_grant::NativeExecHostService for NativeExecCapability {
+    fn prepare(
+        &self,
+        request: carrick_core_abi::service::ServiceRequest,
+        payload: &[u8],
+    ) -> Result<
+        Box<dyn carrick_vmm_hvf::metadata_grant::NativeExecPreparation>,
+        carrick_core_abi::service::ServiceFailureCode,
+    > {
+        let fail = |errno: LinuxErrno| match carrick_core_abi::service::ServiceFailureCode::new(
+            errno.get() as u32,
+        ) {
+            Some(failure) => failure,
+            None => carrick_fatal!("runtime::native_exec", "zero Linux errno"),
+        };
+        let loaded = prepare_native_exec_image(self, payload).map_err(fail)?;
+        Ok(Box::new(NativePreparedExecImage {
+            _request: request.identity,
+            loaded,
+        }))
+    }
 }
 
 pub(crate) fn capture_native_exec_capability(
@@ -60,9 +152,9 @@ pub(crate) fn capture_native_exec_capability(
         core::num::NonZeroU64::new(raw).ok_or(crate::linux_abi::LINUX_ESRCH)?,
     );
     Ok(NativeExecCapability {
-        _id: id,
-        _files: dispatcher.capture_exec_files(&context)?,
-        _loader: ExecLoaderCapabilities::capture(dispatcher),
+        id,
+        files: dispatcher.capture_exec_files(&context)?,
+        loader: ExecLoaderCapabilities::capture(dispatcher),
     })
 }
 
@@ -643,21 +735,25 @@ mod tests {
         std::fs::write(&path, b"not an executable image").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let dispatcher = SyscallDispatcher::new();
-        let context = dispatcher.capture_one_task_context().unwrap();
-        let files = dispatcher.capture_exec_files(&context).unwrap();
-        let loader = ExecLoaderCapabilities::capture(&dispatcher);
-        drop(context);
+        let capability = capture_native_exec_capability(&dispatcher).unwrap();
         drop(dispatcher);
-        let load_errno = || match load_execve_image(
-            &loader,
-            &files,
-            path.to_str().unwrap(),
-            vec![],
-            vec![],
-            false,
-        ) {
-            Ok(_) => panic!("invalid image was accepted"),
-            Err(errno) => errno.get(),
+        let load_errno = || {
+            let spelling = path.to_str().unwrap();
+            let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
+            payload.extend_from_slice(spelling.as_bytes());
+            payload.push(0);
+            carrick_core_abi::service::encode_exec_payload_header(
+                &mut payload,
+                carrick_core_abi::service::ExecCall::Execve,
+                spelling.len() + 1,
+                0,
+                0,
+            )
+            .unwrap();
+            match prepare_native_exec_image(&capability, &payload) {
+                Ok(_) => panic!("invalid image was accepted"),
+                Err(errno) => errno.get(),
+            }
         };
         assert_eq!(load_errno(), 13, "EACCES before image parsing");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -676,9 +772,9 @@ mod tests {
         let capability = capture_native_exec_capability(&dispatcher).unwrap();
         drop(context);
 
-        assert_eq!(capability._id, id);
+        assert_eq!(capability.id, id);
         assert!(matches!(
-            capability._files.caller(),
+            capability.files.caller(),
             carrick_kernel::dispatch::exec_files::ExecCaller::Host { .. }
         ));
     }

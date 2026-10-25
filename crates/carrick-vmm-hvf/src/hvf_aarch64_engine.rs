@@ -2085,6 +2085,16 @@ pub fn persistent_executor_factory_authority(
 }
 
 impl HvpatchPersistentExecutorFactoryAuthority {
+    pub fn install_native_exec_service(
+        &self,
+        capability: carrick_core_abi::service::ExecCapabilityId,
+        service: Arc<dyn crate::metadata_grant::NativeExecHostService>,
+    ) -> Result<(), TrapError> {
+        self.spec
+            .install_native_exec_service(capability, service)
+            .map_err(|()| TrapError::Hypervisor("duplicate native exec capability".into()))
+    }
+
     /// The settlement of guest EL1 COW completions for every MM of this
     /// carrier, to install where the host excludes an MM's EL1 editor.
     pub fn guest_cow_settlement(&self) -> Arc<dyn carrick_el1_abi::CowGrantSettlement> {

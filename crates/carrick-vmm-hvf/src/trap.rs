@@ -2724,6 +2724,16 @@ pub(crate) struct PersistentExecutorSpec {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PersistentExecutorSpec {
+    pub(crate) fn install_native_exec_service(
+        &self,
+        capability: carrick_core_abi::service::ExecCapabilityId,
+        service: std::sync::Arc<dyn crate::metadata_grant::NativeExecHostService>,
+    ) -> Result<(), ()> {
+        self.carrier_mappings
+            .custody
+            .install_native_exec_service(capability, service)
+    }
+
     /// The carrier's guest COW settlement over its MM directory.
     pub(crate) fn guest_cow_settlement(&self) -> CarrierGuestCowSettlement {
         CarrierGuestCowSettlement::new(std::sync::Arc::clone(&self.carrier_mappings))
