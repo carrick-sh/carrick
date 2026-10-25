@@ -1330,12 +1330,41 @@ fn publish_test_exec_reply(
     receipt_raw: u64,
     root_raw: u64,
 ) -> carrick_core_abi::ReservationMm {
-    publish_test_exec_reply_with(fixture, control, slot, receipt_raw, root_raw, false)
+    publish_test_exec_reply_for(
+        fixture,
+        fixture.task,
+        control,
+        slot,
+        receipt_raw,
+        root_raw,
+        false,
+    )
 }
 
 #[cfg(test)]
 fn publish_test_exec_reply_with(
     fixture: &NativeSignalFixture,
+    control: &ThreadControlSlot,
+    slot: SlotId,
+    receipt_raw: u64,
+    root_raw: u64,
+    corrupt_after_prepare: bool,
+) -> carrick_core_abi::ReservationMm {
+    publish_test_exec_reply_for(
+        fixture,
+        fixture.task,
+        control,
+        slot,
+        receipt_raw,
+        root_raw,
+        corrupt_after_prepare,
+    )
+}
+
+#[cfg(test)]
+fn publish_test_exec_reply_for(
+    fixture: &NativeSignalFixture,
+    task: &CurrentTask,
     control: &ThreadControlSlot,
     slot: SlotId,
     receipt_raw: u64,
@@ -1350,13 +1379,14 @@ fn publish_test_exec_reply_with(
     use carrick_sched_core::object_wait::ObjectWaitKey;
     use core::num::NonZeroU16;
 
-    let selector = fixture.task.service_notice.take().unwrap().unwrap();
+    let selector = task.service_notice.take().unwrap().unwrap();
     let key = ObjectWaitKey::native_service(selector.record).unwrap();
     let queue = fixture
         .zone
         .object_wait(key, &carrick_sched_core::ShortLockSpin)
         .unwrap();
-    let member = queue.native_service_member(selector.record).unwrap();
+    let record = fixture.zone.record(selector.record.id);
+    let member = record.identity();
     // SAFETY: this test owns the announced exact service member and consumes
     // its ticket once before releasing the queue.
     let ticket =
@@ -2022,6 +2052,342 @@ fn native_exec_drains_a_spinning_sibling_without_reentering_el0() {
 #[test]
 fn native_exec_drains_a_sibling_parked_in_an_owned_read() {
     exec_after_sibling_drain(true);
+}
+
+#[cfg(test)]
+#[test]
+fn concurrent_native_exec_loser_is_killed_without_a_run_failure() {
+    let fixture = native_exec_fixture();
+    let sibling = add_exec_sibling(&fixture, false);
+    assert!(take_exec_cancellations().is_empty());
+
+    let root_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut root_service = fixture.service();
+    {
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                root_source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut root_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.begin_exec_service(test_exec_payload(b"/bin/winner")),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(root.take_handoff_receipt().is_some());
+    }
+    let sibling_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: sibling.slot,
+    };
+    let mut sibling_service = fixture.service();
+    {
+        let mut loser = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                sibling_source,
+                sibling.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut sibling_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            loser.begin_exec_service(test_exec_payload(b"/bin/loser")),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(loser.take_handoff_receipt().is_some());
+    }
+
+    let successor_mm =
+        publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 171, 0xd0_0000);
+    let _loser_mm = publish_test_exec_reply_for(
+        &fixture,
+        sibling.task,
+        sibling.control,
+        sibling.slot,
+        172,
+        0xe0_0000,
+        false,
+    );
+
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    {
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                root_source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut root_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.resume_checkpoint(),
+            Ok(NativeResume::Left(None))
+        ));
+        let failure = root.take_run_failure();
+        assert!(
+            failure.is_none(),
+            "losing exec owner failed run: {failure:?}"
+        );
+    }
+
+    let selected = fixture.zone.switch_in_full(sibling.slot).unwrap();
+    assert_eq!(selected.record, sibling.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+        .unwrap()
+        .words;
+    {
+        let mut loser = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                sibling_source,
+                sibling.task,
+                fixture.address,
+                &saved,
+                &mut sibling_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            loser.resume_service(),
+            Some(Ok(NativeResume::NoPending))
+        ));
+        assert!(matches!(
+            loser.resume_pending_lifecycle(),
+            Some(LifecycleOutcome::Transferred { .. })
+        ));
+        assert!(loser.take_run_failure().is_none());
+    }
+    assert_eq!(take_exec_cancellations(), vec![172]);
+
+    let resume_slot = [fixture.slot, sibling.slot]
+        .into_iter()
+        .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+        .unwrap();
+    let selected = fixture.zone.switch_in_full(resume_slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    let mut root = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: resume_slot,
+            },
+            fixture.task,
+            fixture.address,
+            &saved,
+            &mut root_service,
+        )
+        .unwrap();
+    assert!(matches!(
+        root.resume_checkpoint(),
+        Ok(NativeResume::NoPending)
+    ));
+    assert!(root.take_run_failure().is_none());
+    assert_eq!(
+        fixture.task.mm.key.load(Ordering::Acquire),
+        successor_mm.raw()
+    );
+}
+
+#[cfg(test)]
+fn exec_drain_is_upgraded_by_terminal_sibling(signal: Option<u8>) {
+    let fixture = native_exec_fixture();
+    let sibling = add_exec_sibling(&fixture, false);
+    assert!(take_exec_cancellations().is_empty());
+    let root_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut root_service = fixture.service();
+    {
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                root_source,
+                fixture.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut root_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.begin_exec_service(test_exec_payload(b"/bin/replaced")),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(root.take_handoff_receipt().is_some());
+    }
+    let _successor =
+        publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 181, 0xf0_0000);
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    {
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                root_source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut root_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.resume_checkpoint(),
+            Ok(NativeResume::Left(None))
+        ));
+        assert!(root.take_run_failure().is_none());
+    }
+
+    let sibling_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: sibling.slot,
+    };
+    let mut sibling_service = fixture.service();
+    {
+        let mut terminator = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                sibling_source,
+                sibling.task,
+                fixture.address,
+                &words(fixture.address),
+                &mut sibling_service,
+            )
+            .unwrap();
+        let outcome = match signal {
+            Some(signal) => terminator.exit_with_signal(signal).unwrap(),
+            None => terminator.exit_group(23),
+        };
+        assert!(matches!(outcome, LifecycleOutcome::Transferred { .. }));
+        assert!(terminator.take_run_failure().is_none());
+    }
+    assert_eq!(take_exec_cancellations(), vec![181]);
+    let expected = signal.map_or_else(
+        || LinuxWaitStatus::exited(23),
+        |signal| LinuxWaitStatus::signaled(signal, false),
+    );
+    let retained_status = {
+        let graph = fixture.runtime.graph.lock();
+        graph
+            .pending
+            .exit(&graph.root_key)
+            .and_then(|pending| match pending.operation {
+                PendingCloseOperation::Exit { status, .. } => Some(status),
+                PendingCloseOperation::Exec(_) => None,
+            })
+    };
+    assert_eq!(
+        retained_status,
+        Some(expected),
+        "terminal close must replace the exec drain and retain its status"
+    );
+
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert_eq!(selected.record, fixture.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
+        .unwrap()
+        .words;
+    {
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                root_source,
+                fixture.task,
+                fixture.address,
+                &saved,
+                &mut root_service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.resume_pending_lifecycle(),
+            Some(LifecycleOutcome::HostCustody)
+        ));
+        let failure = root.take_run_failure();
+        assert!(
+            failure.is_none(),
+            "losing exec owner failed run: {failure:?}"
+        );
+        fixture
+            .page
+            .reserve_cancelled_member_exit()
+            .unwrap()
+            .publish();
+        let birth = fixture.control.host_birth_identity().unwrap();
+        fixture
+            .page
+            .publish_exact_host_retirement(fixture.control, birth.retirement());
+        root.lifecycle_admission_settled().unwrap();
+    }
+
+    let resume_slot = [fixture.slot, sibling.slot]
+        .into_iter()
+        .find(|slot| fixture.zone.slot(*slot).queued() != 0)
+        .unwrap();
+    let selected = fixture.zone.switch_in_full(resume_slot).unwrap();
+    assert_eq!(selected.record, sibling.record.id);
+    let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+        .unwrap()
+        .words;
+    let mut terminator = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: resume_slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut sibling_service,
+        )
+        .unwrap();
+    assert!(matches!(
+        terminator.resume_pending_lifecycle(),
+        Some(LifecycleOutcome::Transferred { .. })
+    ));
+    assert!(terminator.take_run_failure().is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn exit_group_wins_over_an_in_progress_native_exec_drain() {
+    exec_drain_is_upgraded_by_terminal_sibling(None);
+}
+
+#[cfg(test)]
+#[test]
+fn sigkill_wins_over_an_in_progress_native_exec_drain() {
+    exec_drain_is_upgraded_by_terminal_sibling(Some(9));
 }
 
 #[cfg(test)]

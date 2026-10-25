@@ -1162,8 +1162,16 @@ impl ServiceCell {
             REQUESTED | CANCEL_QUEUED | SERVICING | CANCEL_REQUESTED | COMPLETED | CANCELLED => {
                 self.lock_exact(state, identity)?;
                 let acknowledged = matches!(state, COMPLETED | CANCELLED);
+                // A delivered exec preparation transferred a retained host
+                // resource before COMPLETED became visible. Preserve its
+                // receipt so the ring can drive the exact cancellation path;
+                // collapsing it to Cancelled would orphan that preparation.
+                let delivered_exec = state == COMPLETED
+                    && decode_exec_prepared(self.result.load(Ordering::Relaxed)).is_some();
                 self.state.store(
-                    if acknowledged {
+                    if delivered_exec {
+                        COMPLETED
+                    } else if acknowledged {
                         CANCELLED
                     } else if matches!(state, REQUESTED | CANCEL_QUEUED) {
                         CANCEL_QUEUED
@@ -1572,6 +1580,36 @@ mod tests {
             Ok(ServiceResult::ExecPrepared(receipt))
         );
         assert_eq!(cell.consume(request.identity), Err(ServiceError::Busy));
+    }
+
+    #[test]
+    fn cancelling_a_delivered_exec_preserves_its_settlement_receipt() {
+        let cell = ServiceCell::new();
+        let owner = birth(1, 7);
+        cell.bind(owner).unwrap();
+        let request = cell
+            .publish(
+                owner,
+                SnapshotGeneration::INITIAL,
+                ServiceOperation::Exec {
+                    capability: exec_capability(),
+                    payload: exec_payload(0x4000_0000, 4096),
+                },
+                None,
+            )
+            .unwrap();
+        let receipt = ExecAdoptionReceipt::checked(NonZeroU64::new(43).unwrap()).unwrap();
+        assert!(
+            cell.claim(request)
+                .unwrap()
+                .publish_exec_prepared(receipt, (), |_, ()| {})
+                .is_ok()
+        );
+        assert_eq!(cell.cancel(request.identity), Ok(true));
+        assert_eq!(
+            cell.consume(request.identity),
+            Ok(ServiceResult::ExecPrepared(receipt))
+        );
     }
 
     #[test]
