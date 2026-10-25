@@ -986,6 +986,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
         true
     }
 
+    /// Publish an exec successor after the process owner validated the exact
+    /// OnCpu predecessor and closed every competing member publication.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own this record through the claim protocol, must have
+    /// compared its current identity with the predecessor retained by the
+    /// exec transaction, and must exclude every scheduler publisher until the
+    /// complete successor cutover is visible.
+    pub unsafe fn rebind_exec_owned(&self, successor: ThreadIdentity) {
+        self.set_identity(successor);
+    }
+
     /// Whether the thread may run on a slot bound to guest CPU `cpu_plus_one`
     /// (0: the slot's CPU is unknown, which allows any thread).
     fn allows_cpu(&self, cpu_plus_one: u32) -> bool {

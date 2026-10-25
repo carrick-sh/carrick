@@ -1425,7 +1425,7 @@ fn refused_exec_preparation_is_cancelled_exactly_once() {
             )
             .unwrap();
         assert!(matches!(
-            entry.begin_exec_service(Box::from(&b"/bin/static\0\0\0"[..])),
+            entry.begin_exec_service(test_exec_payload(b"/bin/static")),
             Ok(NativeResume::Left(None))
         ));
         assert!(entry.take_handoff_receipt().is_some());
@@ -1455,7 +1455,11 @@ fn refused_exec_preparation_is_cancelled_exactly_once() {
             &mut service,
         )
         .unwrap();
-    assert!(entry.resume_checkpoint().is_err());
+    assert!(matches!(
+        entry.resume_checkpoint(),
+        Ok(NativeResume::Left(None))
+    ));
+    assert!(entry.take_run_failure().is_none());
     assert_eq!(take_exec_cancellations(), vec![113]);
     assert_eq!(fixture.task.mm.key.load(Ordering::Acquire), 1);
     assert!(fixture.zone.spaces.find(successor_mm.raw()).is_none());
@@ -1641,9 +1645,34 @@ fn add_exec_sibling(fixture: &NativeSignalFixture, parked_read: bool) -> ExecSib
 }
 
 #[cfg(test)]
+fn test_exec_payload(path: &[u8]) -> Box<[u8]> {
+    let mut payload = vec![0; carrick_core_abi::service::EXEC_PAYLOAD_HEADER_BYTES];
+    payload.extend_from_slice(path);
+    payload.push(0);
+    carrick_core_abi::service::encode_exec_payload_header(
+        &mut payload,
+        carrick_core_abi::service::ExecCall::Execve,
+        path.len() + 1,
+        0,
+        0,
+    )
+    .unwrap();
+    payload.into_boxed_slice()
+}
+
+#[cfg(test)]
 #[test]
 fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
     let fixture = native_exec_fixture();
+    fixture.control.set_robust_list(0x5000, 24);
+    fixture.control.set_clear_child_tid(0x6000);
+    fixture
+        .control
+        .write_altstack(carrick_personality_linux::abi::thread::AltStack {
+            sp: 0x7000,
+            size: 16 * 1024,
+            flags: 0,
+        });
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -1677,7 +1706,7 @@ fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
                 &mut service,
             )
             .unwrap();
-        let result = entry.begin_exec_service(Box::from(&b"/bin/static\0\0\0"[..]));
+        let result = entry.begin_exec_service(test_exec_payload(b"/bin/static"));
         match result {
             Ok(NativeResume::Left(None)) => {}
             Ok(_) => panic!("exec intake returned the wrong continuation"),
@@ -1726,6 +1755,21 @@ fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
         successor_mm.raw()
     );
     assert!(fixture.zone.spaces.find(1).is_none());
+    assert_eq!(fixture.control.robust_list(), (0, 0));
+    assert_eq!(fixture.control.clear_child_tid(), 0);
+    assert!(fixture.control.read_altstack().is_disabled());
+    assert_eq!(
+        fixture
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(entry.key)
+            .unwrap()
+            .comm_for(41)
+            .unwrap(),
+        b"static\0\0\0\0\0\0\0\0\0\0"
+    );
 }
 
 #[cfg(test)]
@@ -1750,7 +1794,7 @@ fn exec_after_sibling_drain(parked_read: bool) {
             )
             .unwrap();
         assert!(matches!(
-            entry.begin_exec_service(Box::from(&b"/bin/static\0\0\0"[..])),
+            entry.begin_exec_service(test_exec_payload(b"/bin/static")),
             Ok(NativeResume::Left(None))
         ));
         assert!(entry.take_handoff_receipt().is_some());
@@ -2014,7 +2058,7 @@ fn native_parent_observes_exec_child_exit_after_successor_first_syscall() {
             Ok(NativeResume::NoPending)
         ));
         assert!(matches!(
-            child.begin_exec_service(Box::from(&b"/bin/static\0\0\0"[..])),
+            child.begin_exec_service(test_exec_payload(b"/bin/static")),
             Ok(NativeResume::Left(None))
         ));
         assert!(child.take_handoff_receipt().is_some());
