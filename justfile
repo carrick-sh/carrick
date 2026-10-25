@@ -123,7 +123,7 @@ build-cache:
 
 # Run the Carrick xtask maintenance tool.
 xtask *ARGS:
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- {{ARGS}}
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask {{if ARGS =~ "^impact( |$)" { "--features impact" } else { "" } }} -- {{ARGS}}
 
 # Physical-host lease (site SSH broker when configured, otherwise local flock).
 # Cancels on runner death or TERM/INT/HUP; cleanup failure releases with error.
@@ -205,7 +205,7 @@ clippy *ARGS:
     # --workspace --features is rejected on a virtual workspace). Also lint
     # carrick-xtask so CI/xtask changes are clippy-gated on Linux.
     {{_admit}} {{_cargo}} clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
-    exec {{_admit}} {{_cargo}} clippy -p carrick-xtask --all-targets --keep-going {{ARGS}} -- -D warnings
+    exec {{_admit}} {{_cargo}} clippy -p carrick-xtask --all-features --all-targets --keep-going {{ARGS}} -- -D warnings
 
 # Lint the Linux platform closure and freestanding x86 CPL0 crates across all
 # targets (`tests/`, `benches/`, `examples/`, unit tests). `_platform_crates`
@@ -472,7 +472,7 @@ test-shard-b *ARGS: _test-stdio
 
 # Run carrick-xtask unit and CI gate tests on Linux so ci-xtask changes are verified even when macos=false.
 test-xtask *ARGS:
-    {{_admit}} {{_cargo}} test --locked -p carrick-xtask --lib --bins --test test_batch --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
+    {{_admit}} {{_cargo}} test --locked -p carrick-xtask --all-features --lib --bins --test test_batch --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
 
 # Fail on missing, duplicate or changed selections or per-binary features, plus missing workflow jobs.
 check-test-shards:

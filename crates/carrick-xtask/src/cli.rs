@@ -70,6 +70,7 @@ pub enum Commands {
     )]
     AuthorityCensus,
 
+    #[cfg(feature = "impact")]
     #[command(about = "Per-landing Carrick vs native Docker receipts")]
     Impact(crate::impact::ImpactArgs),
 
@@ -398,6 +399,7 @@ where
                 }
                 _ => None,
             },
+            #[cfg(feature = "impact")]
             Commands::Impact(args) => match &args.action {
                 crate::impact::Action::Carrick { .. } => {
                     Some((crate::host_lease::HostLeaseMode::Carrick, true))
@@ -496,6 +498,7 @@ where
             crate::worktree_gc::run(&info.repository_root, args, writer)?;
             Ok(())
         }
+        #[cfg(feature = "impact")]
         Commands::Impact(args) => crate::impact::run(cli.root.as_deref(), args.action)
             .map_err(|e| CliError::Impact(e.to_string())),
         Commands::Info => {
