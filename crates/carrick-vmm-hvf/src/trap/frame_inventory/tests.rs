@@ -4944,7 +4944,7 @@ fn final_carrier_mm_drop_keeps_a_backend_referenced_stage2_lease_live() {
 }
 
 #[test]
-fn final_carrier_mm_drop_requests_then_safe_point_releases_stage2_once() {
+fn final_carrier_mm_drop_drives_unpinned_stage2_retirement_without_idle() {
     let _allocator_test_guard = global_frame_allocator_test_lock().lock();
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
@@ -4956,10 +4956,6 @@ fn final_carrier_mm_drop_requests_then_safe_point_releases_stage2_once() {
         frames,
     });
 
-    assert!(global_frame_ipa_allocator().lock().is_live(key.0, key.1));
-    assert!(carrier_stage2_leases().lock().contains_key(&key));
-    HvfVmState::retire_stage2_extent_from_mappings(&mut TaskMappingIndex::new(), key.0, key.1)
-        .expect("explicit safe point performs requested carrier retirement");
     assert!(!global_frame_ipa_allocator().lock().is_live(key.0, key.1));
     assert!(!carrier_stage2_leases().lock().contains_key(&key));
 }

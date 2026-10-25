@@ -1125,7 +1125,7 @@ impl GlobalFrameHostOwner {
     pub(crate) fn pending_grant(&self) -> Option<carrick_guest_mem::OwnedMemoryWait> {
         use carrick_guest_mem::PhysicalMemoryWait;
         let wait = self.grant_publication.get()?.upgrade()?;
-        (!wait.is_ready()).then_some(carrick_guest_mem::OwnedMemoryWait(wait))
+        (!wait.is_ready()).then_some(carrick_guest_mem::OwnedMemoryWait::new(wait))
     }
     pub(crate) fn from_record(
         mapping: std::sync::Arc<GlobalFrameSharedMapping>,
@@ -1651,6 +1651,38 @@ pub(crate) fn retire_carrier_stage2_record_at_safe_point(
         unmap_global_frame_stage2_record,
         release_retired_stage2_ipa,
     )
+}
+
+/// Drive a carrier-MM teardown record from its named producer event.
+///
+/// The first attempt belongs to the request or last-pin-drop event. A backend
+/// `RetryPending` gets one bounded completion attempt in that same event; it
+/// never waits for a persistent executor to become idle. Persistent backend
+/// failure remains queued and exact for the existing terminal diagnostics.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn drive_pending_carrier_stage2_retirement(
+    custody: &CarrierVmCustody,
+    identity: CarrierStage2RecordIdentity,
+) {
+    drive_pending_carrier_stage2_retirement_using(custody, identity, || {
+        retire_carrier_stage2_record_at_safe_point(custody, identity)
+    });
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn drive_pending_carrier_stage2_retirement_using(
+    custody: &CarrierVmCustody,
+    identity: CarrierStage2RecordIdentity,
+    mut retire: impl FnMut() -> Result<(), TrapError>,
+) {
+    if !custody.claim_carrier_stage2_retirement(identity) {
+        return;
+    }
+    let complete = retire().or_else(|_| retire()).is_ok();
+    custody.settle_carrier_stage2_retirement(identity, complete);
+    if !complete {
+        custody.request_global_frame_retirement_retry();
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

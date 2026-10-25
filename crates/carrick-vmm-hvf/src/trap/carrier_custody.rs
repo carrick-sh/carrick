@@ -449,6 +449,12 @@ pub struct CarrierVmCustody {
     /// physical custody for a selected IPA.
     pub(crate) carrier_stage2_records:
         parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2RecordIdentity>>,
+    /// Carrier-MM teardown records whose exact neutral owner has requested
+    /// retirement. These are driven by the request itself when already
+    /// unpinned, or by the last-pin-drop event, rather than executor idleness.
+    pending_carrier_stage2_retirements: parking_lot::Mutex<
+        std::collections::BTreeMap<CarrierStage2RecordId, (CarrierStage2RecordIdentity, bool)>,
+    >,
     pub(crate) global_frame_host_owners: GlobalFrameHostOwnerDirectory,
     pub(crate) pending_global_frame_owners: parking_lot::Mutex<
         std::collections::BTreeMap<CarrierStage2RecordId, std::sync::Arc<GlobalFrameHostOwner>>,
@@ -794,6 +800,9 @@ impl CarrierVmCustody {
             stage2_retirement_changed: carrick_thread::completion::CompletionCallbacks::default(),
             structural_backings: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             carrier_stage2_records: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+            pending_carrier_stage2_retirements: parking_lot::Mutex::new(
+                std::collections::BTreeMap::new(),
+            ),
             global_frame_host_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             pending_global_frame_owners: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             pending_global_frame_retirement_retry: std::sync::atomic::AtomicBool::new(false),
@@ -1551,6 +1560,66 @@ impl CarrierVmCustody {
         carrick_core::mm::retirement::request_record_retirement(record, identity)
     }
 
+    pub(crate) fn enqueue_carrier_stage2_retirement(&self, identity: CarrierStage2RecordIdentity) {
+        self.pending_carrier_stage2_retirements
+            .lock()
+            .entry(identity.record_id)
+            .or_insert((identity, false));
+    }
+
+    pub(crate) fn cancel_carrier_stage2_retirement(&self, identity: CarrierStage2RecordIdentity) {
+        let mut pending = self.pending_carrier_stage2_retirements.lock();
+        if pending.get(&identity.record_id).map(|entry| entry.0) == Some(identity) {
+            pending.remove(&identity.record_id);
+        }
+    }
+
+    pub(crate) fn claim_carrier_stage2_retirement(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> bool {
+        let mut pending = self.pending_carrier_stage2_retirements.lock();
+        let Some((expected, in_flight)) = pending.get_mut(&identity.record_id) else {
+            return false;
+        };
+        if *expected != identity || *in_flight {
+            return false;
+        }
+        *in_flight = true;
+        true
+    }
+
+    pub(crate) fn settle_carrier_stage2_retirement(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        complete: bool,
+    ) {
+        let mut pending = self.pending_carrier_stage2_retirements.lock();
+        if pending.get(&identity.record_id).map(|entry| entry.0) != Some(identity) {
+            return;
+        }
+        if complete {
+            pending.remove(&identity.record_id);
+        } else if let Some((_, in_flight)) = pending.get_mut(&identity.record_id) {
+            *in_flight = false;
+        }
+    }
+
+    pub(crate) fn carrier_stage2_retirement_is_ready(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> bool {
+        let requested = self
+            .pending_carrier_stage2_retirements
+            .lock()
+            .get(&identity.record_id)
+            .is_some_and(|entry| entry.0 == identity && !entry.1);
+        requested
+            && self
+                .stage2_record_snapshot(identity.record_id)
+                .is_some_and(|record| record.retirement_requested && record.pin_count == 0)
+    }
+
     pub(crate) fn retire_stage2_record_using(
         &self,
         identity: CarrierStage2RecordIdentity,
@@ -1660,7 +1729,7 @@ impl CarrierVmCustody {
         self: &std::sync::Arc<Self>,
         identity: Option<CarrierStage2RecordIdentity>,
     ) -> carrick_guest_mem::OwnedMemoryWait {
-        carrick_guest_mem::OwnedMemoryWait(std::sync::Arc::new(Stage2RetirementWait {
+        carrick_guest_mem::OwnedMemoryWait::new(std::sync::Arc::new(Stage2RetirementWait {
             custody: std::sync::Arc::downgrade(self),
             identity,
         }))
@@ -1669,6 +1738,16 @@ impl CarrierVmCustody {
     /// Release one pin on the exact record `identity` (the drop half of
     /// [`Self::pin_stage2_record`]).
     pub(crate) fn release_stage2_pin(&self, identity: CarrierStage2RecordIdentity) {
+        self.release_stage2_pin_using(identity, |custody, identity| {
+            super::drive_pending_carrier_stage2_retirement(custody, identity);
+        });
+    }
+
+    fn release_stage2_pin_using(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        drive_carrier: impl FnOnce(&Self, CarrierStage2RecordIdentity),
+    ) {
         use carrick_core::mm::retirement::{RecordPinRelease, release_record_pin_outcome};
         let outcome = {
             let mut state = self.state.lock();
@@ -1681,6 +1760,10 @@ impl CarrierVmCustody {
             }
             outcome
         };
+        if self.carrier_stage2_retirement_is_ready(identity) {
+            drive_carrier(self, identity);
+            return;
+        }
         if let RecordPinRelease::ReadyToRetire { ipa } = outcome
             && self.is_active_root_slot_pool_ipa(ipa)
         {
@@ -4660,6 +4743,91 @@ mod carrier_vm_custody_tests {
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
         assert_eq!(unmap_calls.get(), 1);
+    }
+
+    #[test]
+    fn carrier_teardown_request_and_last_pin_drive_the_exact_owner_without_idle() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        for (index, pinned) in [false, true].into_iter().enumerate() {
+            let (custody, generation) = live_custody();
+            let spec = stage2_spec(generation, 920 + index as u64);
+            let identity = custody
+                .register_stage2_record(spec)
+                .expect("register carrier teardown record");
+            custody
+                .carrier_stage2_records
+                .lock()
+                .insert((spec.ipa, spec.len as u64), identity);
+            let pin = pinned.then(|| {
+                custody
+                    .pin_stage2_record(identity)
+                    .expect("pin carrier teardown record")
+            });
+            custody.enqueue_carrier_stage2_retirement(identity);
+            assert_eq!(
+                custody.request_stage2_record_retirement(identity),
+                CarrierStage2RetireOutcome::DeferredActivePins
+            );
+            let attempts = std::cell::Cell::new(0_u32);
+            let drive = |custody: &CarrierVmCustody, identity| {
+                super::drive_pending_carrier_stage2_retirement_using(custody, identity, || {
+                    attempts.set(attempts.get() + 1);
+                    super::retire_carrier_stage2_record_at_safe_point_using(
+                        custody,
+                        identity,
+                        |_, _| Ok(()),
+                        |_, _| Ok(()),
+                    )
+                });
+            };
+            if let Some(pin) = pin {
+                let identity = pin.into_transferred_identity();
+                custody.release_stage2_pin_using(identity, drive);
+            } else if custody.carrier_stage2_retirement_is_ready(identity) {
+                drive(&custody, identity);
+            }
+            assert_eq!(attempts.get(), 1);
+            assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
+        }
+    }
+
+    #[test]
+    fn carrier_teardown_retry_pending_gets_a_bounded_producer_redrive() {
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let (custody, generation) = live_custody();
+        let spec = stage2_spec(generation, 923);
+        let identity = custody
+            .register_stage2_record(spec)
+            .expect("register carrier retry record");
+        custody
+            .carrier_stage2_records
+            .lock()
+            .insert((spec.ipa, spec.len as u64), identity);
+        custody.enqueue_carrier_stage2_retirement(identity);
+        assert_eq!(
+            custody.request_stage2_record_retirement(identity),
+            CarrierStage2RetireOutcome::DeferredActivePins
+        );
+        let attempts = std::cell::Cell::new(0_u32);
+
+        super::drive_pending_carrier_stage2_retirement_using(&custody, identity, || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(super::TrapError::Hypervisor(
+                    "injected transient backend-unmap refusal".to_owned(),
+                ))
+            } else {
+                super::retire_carrier_stage2_record_at_safe_point_using(
+                    &custody,
+                    identity,
+                    |_, _| Ok(()),
+                    |_, _| Ok(()),
+                )
+            }
+        });
+
+        assert_eq!(attempts.get(), 2);
+        assert!(custody.stage2_record_snapshot(identity.record_id).is_none());
     }
 
     #[test]

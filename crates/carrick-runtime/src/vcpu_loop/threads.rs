@@ -78,6 +78,10 @@ impl PendingChildTidClear {
         }
         Ok(())
     }
+
+    fn address(&self) -> carrick_guest_mem::GuestVa {
+        self.clear.address()
+    }
 }
 
 /// A clear's physical authority is local to one retirement attempt. Dropping
@@ -982,6 +986,12 @@ where
         last
     }
 
+    pub(super) fn terminal_child_tid_fault_address(&self) -> Option<carrick_guest_mem::GuestVa> {
+        self.child_tid_clear
+            .as_ref()
+            .map(PendingChildTidClear::address)
+    }
+
     pub(super) fn commit_terminal_child_tid<R, D>(
         &mut self,
         kernel: &Kernel,
@@ -1021,6 +1031,7 @@ where
             ))
         })?;
         while let Some(clear) = pending.pop() {
+            let fault_address = clear.address();
             // settled() may have folded an EL1 exit since the census. Its
             // exact-incarnation receipt survives ABI EntryRef reuse: never
             // clear a stack the completed in-zone wake already released.
@@ -1076,7 +1087,10 @@ where
                 result => {
                     pending.push(clear);
                     return Err(match result {
-                        Err(error) => PersistentThreadExitDisposition::Memory(error),
+                        Err(error) => PersistentThreadExitDisposition::Memory {
+                            error,
+                            fault_address,
+                        },
                         Ok(Err(Ok(carrick_kernel::kernel::ProcessThreadExit::Busy {
                             observed_epoch,
                         }))) => PersistentThreadExitDisposition::Busy { observed_epoch },
@@ -1165,6 +1179,7 @@ where
                 if let Err(error) = clear.validate(context) {
                     return PersistentThreadExitDisposition::Failed(error);
                 }
+                let fault_address = clear.address();
                 match clear.retire_and_wake(engine, retire, || {
                     wake_persistent_child_tid(
                         kernel,
@@ -1180,7 +1195,12 @@ where
                         retired
                     }
                     Ok(Err(deferred)) => deferred,
-                    Err(wait) => return PersistentThreadExitDisposition::Memory(wait),
+                    Err(error) => {
+                        return PersistentThreadExitDisposition::Memory {
+                            error,
+                            fault_address,
+                        };
+                    }
                 }
             } else {
                 match retire() {
@@ -1239,7 +1259,10 @@ where
 pub(super) enum PersistentThreadExitDisposition {
     /// The exit completed; the job finishes with this outcome.
     Done(VcpuLoopOutcome),
-    Memory(carrick_guest_mem::MemoryPrepareError),
+    Memory {
+        error: carrick_guest_mem::MemoryPrepareError,
+        fault_address: carrick_guest_mem::GuestVa,
+    },
     Failed(RuntimeError),
     /// The kernel graph holds a task reservation (a sibling exec/fork/exit
     /// transaction). The job parks as a scheduler-visible retry subscribed
@@ -1615,7 +1638,7 @@ mod child_tid_owner_tests {
         dependency: &Arc<ClearDependency>,
     ) -> super::super::tests::CrashCaptureTestEngine {
         let mut engine = super::super::tests::CrashCaptureTestEngine {
-            prepare_dependency: Some(carrick_guest_mem::OwnedMemoryWait(dependency.clone())),
+            prepare_dependency: Some(carrick_guest_mem::OwnedMemoryWait::new(dependency.clone())),
             prepared_write_context: Some(context.retain_exact()),
             ..Default::default()
         };
@@ -1843,9 +1866,10 @@ mod child_tid_owner_tests {
         let (wakes, _subscription) = clear_wakes(&state.futex);
         assert!(matches!(
             state.handle_persistent_thread_exit(&kernel, &mut engine, 0, 0),
-            PersistentThreadExitDisposition::Memory(
-                carrick_guest_mem::MemoryPrepareError::Physical(_)
-            )
+            PersistentThreadExitDisposition::Memory {
+                error: carrick_guest_mem::MemoryPrepareError::Physical(_),
+                fault_address,
+            } if fault_address.raw() == VA
         ));
         assert!(sibling.exact_thread_is_live());
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
@@ -1966,9 +1990,10 @@ mod child_tid_owner_tests {
         drop(loser);
         assert!(matches!(
             owner.drain_child_tid_clears(&kernel, &mut engine),
-            Err(PersistentThreadExitDisposition::Memory(
-                carrick_guest_mem::MemoryPrepareError::Physical(_)
-            ))
+            Err(PersistentThreadExitDisposition::Memory {
+                error: carrick_guest_mem::MemoryPrepareError::Physical(_),
+                fault_address,
+            }) if fault_address.raw() == VA
         ));
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
         assert!(registry.is_clear_child_tid_addr(VA));

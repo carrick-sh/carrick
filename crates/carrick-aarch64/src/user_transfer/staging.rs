@@ -335,7 +335,7 @@ mod tests {
                 (Box::new(()), false)
             }
         }
-        let wait = carrick_guest_mem::OwnedMemoryWait(std::sync::Arc::new(Pending));
+        let wait = carrick_guest_mem::OwnedMemoryWait::new(std::sync::Arc::new(Pending));
         assert!(matches!(
             retain_selected::<()>(
                 Ok(TransferRetention::Physical(wait.clone())),

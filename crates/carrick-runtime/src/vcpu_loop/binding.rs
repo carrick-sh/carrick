@@ -424,21 +424,20 @@ enum RetainedMemoryAttempt {
     Wait {
         action: RetainedMemoryAction,
         error: carrick_guest_mem::MemoryPrepareError,
+        fault_address: carrick_guest_mem::GuestVa,
     },
 }
 
 enum RetainedMemoryWaitAttempt {
     Exit(executor::ExecutorExit),
-    Retry {
-        action: RetainedMemoryAction,
-        producer: Option<OwnerRedriveProducer>,
-    },
+    Retry { action: RetainedMemoryAction },
 }
 
 enum OwnerRedriveProducer {
     Owner(carrick_el1_abi::PortalOwnerWait),
-    Physical(usize),
+    Physical(carrick_guest_mem::PhysicalMemoryWaitGeneration),
 }
+
 impl PartialEq for OwnerRedriveProducer {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -450,6 +449,70 @@ impl PartialEq for OwnerRedriveProducer {
 }
 impl Eq for OwnerRedriveProducer {}
 
+struct OwnerRedriveProgress {
+    last_producer: Option<OwnerRedriveProducer>,
+    consecutive_stalled_passes: usize,
+    committed_bytes: u64,
+}
+
+// Keep the construction explicit: the authority-dialect gate rejects a
+// derived constructor for progress state in this ownership boundary.
+#[allow(clippy::derivable_impls)]
+impl Default for OwnerRedriveProgress {
+    fn default() -> Self {
+        Self {
+            last_producer: None,
+            consecutive_stalled_passes: 0,
+            committed_bytes: 0,
+        }
+    }
+}
+
+impl OwnerRedriveProgress {
+    fn observe(
+        &mut self,
+        producer: Option<OwnerRedriveProducer>,
+        committed: u64,
+    ) -> Result<(), RuntimeError> {
+        if committed != 0 {
+            self.committed_bytes =
+                self.committed_bytes.checked_add(committed).ok_or_else(|| {
+                    RuntimeError::Configuration("owner redrive byte progress overflow".to_owned())
+                })?;
+            self.consecutive_stalled_passes = 0;
+            self.last_producer = None;
+            return Ok(());
+        }
+        if producer.is_some() && producer != self.last_producer {
+            self.last_producer = producer;
+            self.consecutive_stalled_passes = 0;
+            return Ok(());
+        }
+        self.consecutive_stalled_passes = self
+            .consecutive_stalled_passes
+            .checked_add(1)
+            .ok_or_else(|| {
+                RuntimeError::Configuration("owner redrive stall count overflow".to_owned())
+            })?;
+        if self.consecutive_stalled_passes > OWNER_REDRIVE_MAX_STALLED_PASSES {
+            return Err(RuntimeError::Configuration(
+                "owner resume exceeded its consecutive no-progress bound".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn committed_bytes(&self) -> u64 {
+        self.committed_bytes
+    }
+
+    #[cfg(test)]
+    fn consecutive_stalled_passes(&self) -> usize {
+        self.consecutive_stalled_passes
+    }
+}
+
 enum OwnerResumeWork {
     Syscall {
         frame: carrick_hal::RawSyscall,
@@ -460,7 +523,37 @@ enum OwnerResumeWork {
     RetainedWait {
         action: RetainedMemoryAction,
         error: carrick_guest_mem::MemoryPrepareError,
+        fault_address: carrick_guest_mem::GuestVa,
     },
+}
+
+impl OwnerResumeWork {
+    fn progress_observation(&self) -> (Option<OwnerRedriveProducer>, u64) {
+        match self {
+            Self::Syscall { outcome, .. } => match outcome {
+                DispatchOutcome::OwnerMemoryWait { wait, committed } => {
+                    (Some(OwnerRedriveProducer::Owner(*wait)), *committed)
+                }
+                DispatchOutcome::OwnerPhysicalWait { wait, committed } => (
+                    Some(OwnerRedriveProducer::Physical(wait.producer_generation())),
+                    *committed,
+                ),
+                DispatchOutcome::OwnerMemorySupply { committed, .. } => (None, *committed),
+                _ => (None, 0),
+            },
+            Self::RetainedWait { error, .. } => match error {
+                carrick_guest_mem::MemoryPrepareError::OwnerWait(wait) => {
+                    (Some(OwnerRedriveProducer::Owner(*wait)), 0)
+                }
+                carrick_guest_mem::MemoryPrepareError::Physical(wait) => (
+                    Some(OwnerRedriveProducer::Physical(wait.producer_generation())),
+                    0,
+                ),
+                _ => (None, 0),
+            },
+            Self::RetainedAction(_) => (None, 0),
+        }
+    }
 }
 
 enum OwnerResumeStep {
@@ -468,7 +561,7 @@ enum OwnerResumeStep {
     Continue(OwnerResumeWork),
 }
 
-const OWNER_REDRIVE_MAX_PASSES: usize = 4096;
+const OWNER_REDRIVE_MAX_STALLED_PASSES: usize = 4096;
 
 impl RetainedMemoryAction {
     fn is_drain_owner(&self) -> bool {
@@ -1363,12 +1456,21 @@ where
                     // before parking. Keep only exact clear/terminal custody.
                     drop(topology);
                     drop(owner_set_edit);
+                    let fault_address =
+                        self.state
+                            .terminal_child_tid_fault_address()
+                            .ok_or_else(|| {
+                                RuntimeError::Configuration(
+                                    "terminal child-TID refusal lost its fault address".to_owned(),
+                                )
+                            })?;
                     return Ok(RetainedMemoryAttempt::Wait {
                         action: RetainedMemoryAction::ProcessFinish {
                             context: terminal_context,
                             terminal,
                         },
                         error,
+                        fault_address,
                     });
                 }
             };
@@ -1614,6 +1716,7 @@ where
                         tid,
                     },
                     error,
+                    fault_address: address,
                 });
             }
             self.state
@@ -1669,9 +1772,16 @@ where
         }
         if let Err(disposition) = self.state.drain_child_tid_clears(&self.kernel, engine) {
             return match disposition {
-                threads::PersistentThreadExitDisposition::Memory(error) => {
+                threads::PersistentThreadExitDisposition::Memory {
+                    error,
+                    fault_address,
+                } => {
                     let action = self.take_retained_memory_action()?;
-                    Ok(RetainedMemoryAttempt::Wait { action, error })
+                    Ok(RetainedMemoryAttempt::Wait {
+                        action,
+                        error,
+                        fault_address,
+                    })
                 }
                 threads::PersistentThreadExitDisposition::Busy { observed_epoch } => {
                     let context = current.retain_exact();
@@ -1724,6 +1834,7 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         action: RetainedMemoryAction,
         mut error: carrick_guest_mem::MemoryPrepareError,
+        fault_address: carrick_guest_mem::GuestVa,
     ) -> Result<RetainedMemoryWaitAttempt, ProductionHvpatchPollError> {
         self.phase = HvpatchProductionPhase::RetainedMemoryRetry {
             action: Box::new(action),
@@ -1745,18 +1856,40 @@ where
                             super::zone::OwnerMemoryAction::Retained,
                         ) => {
                             let action = self.take_retained_memory_action()?;
-                            return Ok(RetainedMemoryWaitAttempt::Retry {
-                                action,
-                                producer: Some(OwnerRedriveProducer::Owner(wait)),
-                            });
+                            return Ok(RetainedMemoryWaitAttempt::Retry { action });
                         }
                         super::zone::OwnerMemoryPark::NoProducer(
                             super::zone::OwnerMemoryAction::Retained,
                         ) => {
-                            return Err(RuntimeError::Configuration(
-                                "retained memory wait has no live producer".to_owned(),
-                            )
-                            .into());
+                            drop(self.take_retained_memory_action()?);
+                            let context = self
+                                .state
+                                .service_kernel_context
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    RuntimeError::Configuration(
+                                        "retained memory fault lost context".to_owned(),
+                                    )
+                                })?
+                                .retain_exact();
+                            let outcome = deliver_fault_signal(
+                                &self.kernel,
+                                &context,
+                                engine,
+                                self.state.this_tid,
+                                self.state.fatal_image_generation,
+                                signal::FaultSignal {
+                                    signum: crate::linux_abi::LINUX_SIGSEGV,
+                                    si_code: 1,
+                                    si_addr: fault_address.raw(),
+                                    interrupted_pc: None,
+                                },
+                                self.traps,
+                            )?;
+                            return Ok(RetainedMemoryWaitAttempt::Exit(match outcome {
+                                Some(outcome) => self.enter_terminal_with_outcome(engine, outcome),
+                                None => executor::ExecutorExit::Syscall,
+                            }));
                         }
                         _ => {
                             return Err(RuntimeError::Configuration(
@@ -1775,10 +1908,7 @@ where
                         continue;
                     }
                     let action = self.take_retained_memory_action()?;
-                    return Ok(RetainedMemoryWaitAttempt::Retry {
-                        action,
-                        producer: None,
-                    });
+                    return Ok(RetainedMemoryWaitAttempt::Retry { action });
                 }
                 MemoryPrepareError::Physical(wait) => {
                     let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
@@ -1796,12 +1926,7 @@ where
                     let action = self.take_retained_memory_action()?;
                     if ready || wait.0.is_ready() {
                         drop(subscription);
-                        return Ok(RetainedMemoryWaitAttempt::Retry {
-                            action,
-                            producer: Some(OwnerRedriveProducer::Physical(
-                                wait.producer_identity(),
-                            )),
-                        });
+                        return Ok(RetainedMemoryWaitAttempt::Retry { action });
                     }
                     self.phase = HvpatchProductionPhase::ResumeRetainedPhysical {
                         action: Box::new(action),
@@ -1841,10 +1966,14 @@ where
     ) -> Result<RetainedMemoryAttempt, ProductionHvpatchPollError> {
         Ok(RetainedMemoryAttempt::Exit(match disposition {
             threads::PersistentThreadExitDisposition::Failed(error) => return Err(error.into()),
-            threads::PersistentThreadExitDisposition::Memory(error) => {
+            threads::PersistentThreadExitDisposition::Memory {
+                error,
+                fault_address,
+            } => {
                 return Ok(RetainedMemoryAttempt::Wait {
                     action: RetainedMemoryAction::ThreadExit { code },
                     error,
+                    fault_address,
                 });
             }
             threads::PersistentThreadExitDisposition::Done(VcpuLoopOutcome::ThreadDone) => {
@@ -3597,70 +3726,44 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         mut work: OwnerResumeWork,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        let mut passes = 0usize;
-        let mut last_producer = None;
+        let mut progress = OwnerRedriveProgress::default();
         loop {
-            passes = passes.checked_add(1).ok_or_else(|| {
-                RuntimeError::Configuration("owner resume pass overflow".to_owned())
-            })?;
-            if passes > OWNER_REDRIVE_MAX_PASSES {
-                return Err(RuntimeError::Configuration(
-                    "owner resume exceeded its structural pass bound".to_owned(),
-                )
-                .into());
-            }
+            let (producer, committed) = work.progress_observation();
+            progress.observe(producer, committed)?;
             let step = match work {
                 OwnerResumeWork::Syscall {
                     frame,
                     outcome,
                     resume,
-                } => {
-                    let producer = match &outcome {
-                        DispatchOutcome::OwnerMemoryWait { wait, .. } => {
-                            Some(OwnerRedriveProducer::Owner(*wait))
-                        }
-                        DispatchOutcome::OwnerPhysicalWait { wait, .. } => {
-                            Some(OwnerRedriveProducer::Physical(wait.producer_identity()))
-                        }
-                        DispatchOutcome::OwnerMemorySupply { .. } => {
-                            last_producer = None;
-                            None
-                        }
-                        _ => None,
-                    };
-                    if producer.is_some() && producer == last_producer {
-                        return Err(RuntimeError::Configuration(
-                            "owner syscall redrive made no producer progress".to_owned(),
-                        )
-                        .into());
-                    }
-                    if producer.is_some() {
-                        last_producer = producer;
-                    }
-                    self.service_owner_step(engine, control, frame, outcome, resume)?
-                }
+                } => self.service_owner_step(engine, control, frame, outcome, resume)?,
                 OwnerResumeWork::RetainedAction(action) => {
                     match self.drive_retained_memory_attempt(engine, control, action)? {
                         RetainedMemoryAttempt::Exit(exit) => OwnerResumeStep::Exit(exit),
-                        RetainedMemoryAttempt::Wait { action, error } => {
-                            OwnerResumeStep::Continue(OwnerResumeWork::RetainedWait {
-                                action,
-                                error,
-                            })
-                        }
+                        RetainedMemoryAttempt::Wait {
+                            action,
+                            error,
+                            fault_address,
+                        } => OwnerResumeStep::Continue(OwnerResumeWork::RetainedWait {
+                            action,
+                            error,
+                            fault_address,
+                        }),
                     }
                 }
-                OwnerResumeWork::RetainedWait { action, error } => {
-                    match self.wait_for_owned_memory_action(engine, control, action, error)? {
+                OwnerResumeWork::RetainedWait {
+                    action,
+                    error,
+                    fault_address,
+                } => {
+                    match self.wait_for_owned_memory_action(
+                        engine,
+                        control,
+                        action,
+                        error,
+                        fault_address,
+                    )? {
                         RetainedMemoryWaitAttempt::Exit(exit) => OwnerResumeStep::Exit(exit),
-                        RetainedMemoryWaitAttempt::Retry { action, producer } => {
-                            if producer.is_some() && producer == last_producer {
-                                return Err(RuntimeError::Configuration(
-                                    "retained owner redrive made no producer progress".to_owned(),
-                                )
-                                .into());
-                            }
-                            last_producer = producer;
+                        RetainedMemoryWaitAttempt::Retry { action } => {
                             OwnerResumeStep::Continue(OwnerResumeWork::RetainedAction(action))
                         }
                     }
@@ -7387,6 +7490,138 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn owner_redrive_progress_allows_a_large_page_windowed_host_copy() {
+        const PAGE_BYTES: u64 = 4096;
+        const COPY_BYTES: u64 = 16 * 1024 * 1024 + PAGE_BYTES;
+        let mut progress = OwnerRedriveProgress::default();
+
+        for _ in 0..COPY_BYTES / PAGE_BYTES {
+            progress
+                .observe(None, PAGE_BYTES)
+                .expect("each committed host-copy page resets the stall bound");
+            progress
+                .observe(None, 0)
+                .expect("one supply redrive after progress remains bounded");
+        }
+
+        assert_eq!(progress.committed_bytes(), COPY_BYTES);
+        assert_eq!(progress.consecutive_stalled_passes(), 1);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn retained_write_without_an_editor_producer_delivers_sigsegv_at_its_address() {
+        use carrick_el1_abi::{PortalOwnerWait, PortalWaitCause};
+        use carrick_el1_linux::mm_portal::MmPortal;
+        use carrick_el1_linux::mm_portal::test_support::{ROOT, Region, admit_notified, nodes};
+        use carrick_sched_core::spaces::notification::SpaceWaitCause;
+
+        struct RestoreRegion(usize);
+        impl Drop for RestoreRegion {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(self.0);
+            }
+        }
+
+        const FAULT_ADDRESS: u64 = 0x4040_3000;
+        let region = Box::leak(Box::new(Region::new()));
+        let _restore = RestoreRegion(carrick_el1_abi::get_el1_region_host_ptr());
+        carrick_el1_abi::record_el1_region_host_ptr(region.ptr.as_ptr() as usize);
+        carrick_kernel::el1_zone::with_test_zone(region.zone(), || {
+            let dispatcher = SyscallDispatcher::new();
+            let (_runtime, scheduler, kernel, root, process, _) =
+                test_carrier_graph_with_dispatcher!(72_847, dispatcher);
+            let mm = admit_notified(region, root.shared().mm().id().raw(), ROOT, 1, 0);
+            let resolved = nodes(region);
+            let portal = MmPortal::new(
+                NonZeroU64::new(1).unwrap(),
+                region.table(),
+                &region.zone().spaces,
+                &resolved,
+            )
+            .with_zone(region.zone())
+            .unwrap();
+            let handle = portal.admitted_handle(mm, 0).unwrap();
+            assert!(region.portal_slots().bind_carrier(handle.carrier()));
+            let entry = region
+                .zone()
+                .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+                .unwrap();
+            let source = entry.notifications(handle.incarnation()).unwrap();
+            let revision = source.observe(SpaceWaitCause::Editor).revision();
+            let wait =
+                unsafe { PortalOwnerWait::from_owner(handle, PortalWaitCause::Editor, revision) };
+
+            let tid = root.thread().registry_id();
+            let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+                Arc::new(ThreadRegistry::new(tid)),
+                Arc::new(FutexTable::new()),
+                Arc::new(NoopPlatformFutex),
+                Arc::new(|_| Arc::new(NoopPlatformFutex)),
+                kernel.process_fork_barrier.clone(),
+                kernel.crash_capture.clone(),
+                Some(Arc::clone(root.thread())),
+                Some(process.pid()),
+                root.thread().key().tid,
+                kernel.fatal_signal.current_generation(),
+                tid,
+                VcpuThreadRegistry::default(),
+                Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+                carrick_hal::InGuestFlag::for_guest_thread(),
+                1_000,
+            );
+            state.service_kernel_context = Some(root.retain_exact());
+            state.zone_mm = Some(mm.raw());
+            let generation = state.fatal_image_generation;
+            let mut job =
+                suffix_failure_test_job(&kernel, state, HvpatchProductionPhase::Resident, None);
+            let registration = scheduler
+                .register_executor(Arc::new(RuntimeTestExecutorKick::default()))
+                .unwrap();
+            let mut running = scheduler.take(&registration).unwrap();
+            let reject_descendant = |_, _| unreachable!();
+            let mut submission = executor::ExecutorSubmissionContext {
+                registration: Some(&registration),
+                scheduler: &scheduler,
+                publish_test_descendant: &reject_descendant,
+                current: None,
+                authority: executor::ExecutionLeaseAuthoritySlot::new(Some(running.take_lease())),
+                exec_replacement: None,
+            };
+            let need_resched = std::sync::atomic::AtomicBool::new(false);
+            let mut control =
+                executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
+            let mut engine = CrashCaptureTestEngine::default();
+
+            let result = job.drive_owner_resume(
+                &mut engine,
+                &mut control,
+                OwnerResumeWork::RetainedWait {
+                    action: RetainedMemoryAction::ChildTid {
+                        context: root.retain_exact(),
+                        address: carrick_guest_mem::GuestVa::new(FAULT_ADDRESS),
+                        tid: root.thread().key().tid.raw(),
+                    },
+                    error: carrick_guest_mem::MemoryPrepareError::OwnerWait(wait),
+                    fault_address: carrick_guest_mem::GuestVa::new(FAULT_ADDRESS),
+                },
+            );
+
+            assert!(
+                result.is_ok(),
+                "guest fault must not become a carrier error"
+            );
+            let fatal = kernel
+                .fatal_signal
+                .recorded_for(generation)
+                .expect("default SIGSEGV action must publish through shared signal custody");
+            assert_eq!(fatal.signo, carrick_abi::LINUX_SIGSEGV);
+            assert_eq!(fatal.addr, FAULT_ADDRESS);
+            scheduler.close();
+        });
+    }
+
+    #[test]
     fn owner_copyin_route_keeps_the_transfer_for_zone_resume() {
         use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
         use carrick_guest_mem::{
@@ -8161,7 +8396,7 @@ mod tests {
             let mut executing = content.observe(0, 4).unwrap();
             executing.begin_execution().unwrap();
             let reader = Arc::new(Mutex::new(Some(executing)));
-            let physical = OwnedMemoryWait(Arc::new(
+            let physical = OwnedMemoryWait::new(Arc::new(
                 PendingContentWrite::new(content.clone(), 0, 4096).unwrap(),
             ));
             assert_eq!(content.writer_count(), 1);
@@ -8195,7 +8430,7 @@ mod tests {
             };
             let enrollment_kill = kill.clone();
             let enrollment_reader = reader.clone();
-            let mut refusal = Some(OwnedMemoryWait(Arc::new(EnrollmentHook {
+            let mut refusal = Some(OwnedMemoryWait::new(Arc::new(EnrollmentHook {
                 wait: physical,
                 hook: Mutex::new(Some(Box::new(move || {
                     if during_enrollment {
@@ -8729,7 +8964,7 @@ mod tests {
             let mut executing = content.observe(0, 4).unwrap();
             executing.begin_execution().unwrap();
             let reader = Arc::new(Mutex::new(Some(executing)));
-            let physical = OwnedMemoryWait(Arc::new(
+            let physical = OwnedMemoryWait::new(Arc::new(
                 PendingContentWrite::new(content.clone(), 0, 4096).unwrap(),
             ));
             assert_eq!(content.writer_count(), 1);
@@ -8774,7 +9009,7 @@ mod tests {
             };
             let enrollment_kill = kill.clone();
             let enrollment_reader = reader.clone();
-            let mut refusal = Some(OwnedMemoryWait(Arc::new(EnrollmentHook {
+            let mut refusal = Some(OwnedMemoryWait::new(Arc::new(EnrollmentHook {
                 wait: physical,
                 hook: Mutex::new(Some(Box::new(move || {
                     if during_enrollment {
@@ -9138,7 +9373,7 @@ mod tests {
         );
         let mut engine = CrashCaptureTestEngine {
             native_owner: native_owner.clone(),
-            prepare_dependency: Some(carrick_guest_mem::OwnedMemoryWait(Arc::new(NotReady))),
+            prepare_dependency: Some(carrick_guest_mem::OwnedMemoryWait::new(Arc::new(NotReady))),
             ..Default::default()
         };
         let frame = carrick_hal::RawSyscall {

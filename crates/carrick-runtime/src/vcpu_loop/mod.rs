@@ -4904,7 +4904,7 @@ pub(crate) mod tests {
                     });
                     if physical {
                         engine.prepare_dependency =
-                            Some(carrick_guest_mem::OwnedMemoryWait(retirement.clone()));
+                            Some(carrick_guest_mem::OwnedMemoryWait::new(retirement.clone()));
                     }
                     let (first, resume) = if let Some((owner, object, _, raw)) = &ipc {
                         use carrick_kernel::kernel::continuation::ipc as host_ipc;
@@ -4982,7 +4982,7 @@ pub(crate) mod tests {
                             )
                         };
                         engine.prepare_dependency =
-                            Some(carrick_guest_mem::OwnedMemoryWait(retirement.clone()));
+                            Some(carrick_guest_mem::OwnedMemoryWait::new(retirement.clone()));
                     }
                     if stale_selection_without_editor {
                         release_tx.send(()).unwrap();

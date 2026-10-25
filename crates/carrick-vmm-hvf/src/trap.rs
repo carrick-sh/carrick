@@ -3624,31 +3624,41 @@ fn request_carrier_stage2_record_retirements(
         stage2_logical_leases.clear();
         return;
     };
-    let mut frames = frames.lock();
-    for logical_lease in std::mem::take(stage2_logical_leases) {
-        let Some(identity) = custody
-            .carrier_stage2_records
-            .lock()
-            .get(&logical_lease.key)
-            .copied()
-            .filter(|identity| identity.logical_owner == logical_lease.logical_owner)
-        else {
-            continue;
-        };
-        let Some(snapshot) = custody.stage2_record_snapshot(identity.record_id) else {
-            continue;
-        };
-        let key = (snapshot.ipa, snapshot.len as u64);
-        let authority_retained = frames.authority_retained_stage2.remove(&key);
-        if frames.stage2_references.contains_key(&key) || authority_retained {
-            // Another MM still names this physical lease, or the Kernel reported
-            // a mapping outside the backend population. Consume the one-shot
-            // handoff and leave the process-global carrier registry as owner;
-            // a later exact retirement takes it through
-            // `retire_stage2_extent_from_mappings`.
+    let retirements = {
+        let mut frames = frames.lock();
+        std::mem::take(stage2_logical_leases)
+            .into_iter()
+            .filter_map(|logical_lease| {
+                let identity = custody
+                    .carrier_stage2_records
+                    .lock()
+                    .get(&logical_lease.key)
+                    .copied()
+                    .filter(|identity| identity.logical_owner == logical_lease.logical_owner)?;
+                let snapshot = custody.stage2_record_snapshot(identity.record_id)?;
+                let key = (snapshot.ipa, snapshot.len as u64);
+                let authority_retained = frames.authority_retained_stage2.remove(&key);
+                if frames.stage2_references.contains_key(&key) || authority_retained {
+                    // Another MM still names this physical lease, or the Kernel
+                    // reported a mapping outside the backend population. Consume
+                    // the handoff; later exact mapping retirement owns it.
+                    None
+                } else {
+                    Some(identity)
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    for identity in retirements {
+        custody.enqueue_carrier_stage2_retirement(identity);
+        let outcome = custody.request_stage2_record_retirement(identity);
+        if outcome != CarrierStage2RetireOutcome::DeferredActivePins {
+            custody.cancel_carrier_stage2_retirement(identity);
             continue;
         }
-        let _ = custody.request_stage2_record_retirement(identity);
+        if custody.carrier_stage2_retirement_is_ready(identity) {
+            drive_pending_carrier_stage2_retirement(&custody, identity);
+        }
     }
 }
 

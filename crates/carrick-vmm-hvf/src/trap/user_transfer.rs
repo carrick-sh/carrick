@@ -126,7 +126,7 @@ impl TransferPin for RetainedUserData {
         self._write
             .as_ref()
             .filter(|write| !write.is_ready())
-            .map(|write| carrick_guest_mem::OwnedMemoryWait(write.clone()))
+            .map(|write| carrick_guest_mem::OwnedMemoryWait::new(write.clone()))
     }
     fn identity(&self) -> PortalRetainedData {
         self.identity

@@ -14604,7 +14604,7 @@ fn directory_retained_selection_survives_sibling_fd_reuse_and_releases_on_drop()
     let physical = Arc::new(ReadyPhysical);
     memory.released_physical = Some(Arc::downgrade(&physical));
     memory.refusal = Some(MemoryPrepareError::Physical(
-        carrick_guest_mem::OwnedMemoryWait(physical.clone()),
+        carrick_guest_mem::OwnedMemoryWait::new(physical.clone()),
     ));
     let DispatchOutcome::DirectoryReadSuspended(pending) = dispatcher
         .dispatch(&root, read, &mut memory, &reporter)

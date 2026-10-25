@@ -69,8 +69,14 @@ pub trait PhysicalMemoryWait: std::fmt::Debug + Send + Sync {
         wake: std::sync::Arc<dyn Fn() + Send + Sync>,
     ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool);
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalMemoryWaitGeneration(u64);
+
 #[derive(Clone, Debug)]
-pub struct OwnedMemoryWait(pub std::sync::Arc<dyn PhysicalMemoryWait>);
+pub struct OwnedMemoryWait(
+    pub std::sync::Arc<dyn PhysicalMemoryWait>,
+    PhysicalMemoryWaitGeneration,
+);
 impl PartialEq for OwnedMemoryWait {
     fn eq(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.0, &other.0)
@@ -78,9 +84,17 @@ impl PartialEq for OwnedMemoryWait {
 }
 impl Eq for OwnedMemoryWait {}
 impl OwnedMemoryWait {
-    /// Stable identity of this exact producer without retaining its custody.
-    pub fn producer_identity(&self) -> usize {
-        std::sync::Arc::as_ptr(&self.0) as *const () as usize
+    pub fn new(wait: std::sync::Arc<dyn PhysicalMemoryWait>) -> Self {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        Self(wait, PhysicalMemoryWaitGeneration(generation))
+    }
+
+    /// Monotonic identity of this exact producer issuance. A clone preserves
+    /// it; a later wait cannot inherit it when the allocator reuses an address.
+    pub fn producer_generation(&self) -> PhysicalMemoryWaitGeneration {
+        self.1
     }
 }
 
@@ -503,6 +517,38 @@ mod authority_tests {
 #[cfg(test)]
 mod read_continuation_tests {
     use super::*;
+    #[derive(Debug)]
+    struct NeverReady;
+    impl PhysicalMemoryWait for NeverReady {
+        fn is_ready(&self) -> bool {
+            false
+        }
+        fn enroll(
+            &self,
+            _wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+        ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+            (Box::new(()), false)
+        }
+    }
+
+    #[test]
+    fn sequential_physical_waits_do_not_use_recycled_allocation_identity() {
+        let allocation: std::sync::Arc<dyn PhysicalMemoryWait> = std::sync::Arc::new(NeverReady);
+        let first = OwnedMemoryWait::new(std::sync::Arc::clone(&allocation));
+        let recycled = OwnedMemoryWait::new(allocation);
+
+        assert_ne!(
+            first.producer_generation(),
+            recycled.producer_generation(),
+            "a new wait at the same allocation address needs a new producer generation"
+        );
+        assert_eq!(
+            first.clone().producer_generation(),
+            first.producer_generation(),
+            "cloning one wait must preserve its exact producer generation"
+        );
+    }
+
     #[test]
     fn stream_preparation_bounds_bytes_and_empty_range_population() {
         let limit = carrick_el1_abi::MM_PORTAL_MAX_BYTES as usize;
