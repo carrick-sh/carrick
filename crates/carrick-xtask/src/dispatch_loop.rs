@@ -242,7 +242,8 @@ impl Server<'_> {
             .current_dir(self.root)
             .env("GH_TOKEN", token)
             .env_remove("GITHUB_TOKEN")
-            .env_remove("DISPATCH_BOARD_TOKEN");
+            .env_remove("DISPATCH_BOARD_TOKEN")
+            .env_remove("DISPATCH_PUBLISH_TOKEN");
         // The request is runner-private data; gh always receives null stdin.
         let bytes = crate::ci_scaler::execute(
             &mut command,
@@ -458,8 +459,7 @@ fn provenance_with(
     if login == "tjfontaine" && user["type"] == "User" {
         return "owner".into();
     }
-    if login == "github-actions[bot]"
-        && user["type"] == "Bot"
+    if dispatch_bot(user)
         && let Some(id) = run_from_body(item["body"].as_str().unwrap_or_default())
         && run(id).is_some_and(|r| {
             let issue_bound =
@@ -2940,6 +2940,57 @@ mod tests {
         });
     }
     #[test]
+    fn publish_token_app_pr_has_authenticated_provenance() {
+        shared_fixture(|root| {
+            let mut pr: Value =
+                serde_json::from_str(&regular_text(&root.join("pr.json")).unwrap()).unwrap();
+            pr["user"]["login"] = "carrick-workers[bot]".into();
+            std::fs::write(root.join("pr.json"), pr.to_string()).unwrap();
+            std::fs::write(root.join("prs.json"), json!([pr]).to_string()).unwrap();
+            let response = server(root).read_state().unwrap();
+            assert!(
+                response["state"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["kind"] == "pr"
+                        && item["provenance"] == "dispatch-agent(run 42)"),
+                "App-created PR was hidden as unverified"
+            );
+        });
+    }
+    #[test]
+    fn publish_token_is_masked_in_responses_comments_and_artifacts() {
+        shared_fixture(|root| {
+            let mut server = server(root);
+            assert!(
+                crate::dispatch_redaction::DiagnosticSecrets::capture()
+                    .unwrap()
+                    .check(b"opaque-publish-credential")
+                    .is_err(),
+                "publish token missing from artifact scan"
+            );
+            let response =
+                server.respond(br#"{"tool":"opaque-publish-credential","arguments":{}}"#);
+            assert!(!response.to_string().contains("opaque-publish-credential"));
+            server
+                .outcome(ContractStatus::Done, "opaque-publish-credential")
+                .unwrap();
+            assert!(
+                !regular_text(&root.join("posted.md"))
+                    .unwrap()
+                    .contains("opaque-publish-credential")
+            );
+            for entry in std::fs::read_dir(root.join("dispatch-output")).unwrap() {
+                assert!(
+                    !regular_text(&entry.unwrap().path())
+                        .unwrap()
+                        .contains("opaque-publish-credential")
+                );
+            }
+        });
+    }
+    #[test]
     fn outcome_reports_server_actions_separately_from_claims() {
         shared_fixture(|root| {
             server(root)
@@ -4016,6 +4067,7 @@ fi
 if test "$1 $2" = 'api graphql'; then
  test "$GH_TOKEN" = opaque-board-credential || exit 94
  test -z "$DISPATCH_BOARD_TOKEN" || exit 95
+ test -z "$DISPATCH_PUBLISH_TOKEN" || exit 95
  exec /usr/bin/python3 -c '
 import sys,json,pathlib
 root=pathlib.Path(sys.argv[1])
@@ -4144,6 +4196,18 @@ exec /usr/bin/git "$@"
                 .env("GITHUB_RUN_ID", "999")
                 .env("GITHUB_RUN_ATTEMPT", "1")
                 .env("GH_TOKEN", "fixture-token")
+                .env(
+                    "DISPATCH_PUBLISH_TOKEN",
+                    if std::thread::current()
+                        .name()
+                        .unwrap()
+                        .contains("::tests::publish_token_")
+                    {
+                        "opaque-publish-credential"
+                    } else {
+                        ""
+                    },
+                )
                 .env(
                     "DISPATCH_BOARD_TOKEN",
                     if std::thread::current()
@@ -5449,6 +5513,7 @@ exec /usr/bin/git "$@"
         for key in [
             "GH_TOKEN",
             "DISPATCH_BOARD_TOKEN",
+            "DISPATCH_PUBLISH_TOKEN",
             "GITHUB_TOKEN",
             "GITHUB_OUTPUT",
             "AGENT_DIRECTOR_TOKEN",
@@ -5954,6 +6019,7 @@ exec /usr/bin/git "$@"
         for key in [
             "GH_TOKEN",
             "DISPATCH_BOARD_TOKEN",
+            "DISPATCH_PUBLISH_TOKEN",
             "GITHUB_TOKEN",
             "GITHUB_OUTPUT",
             "GITHUB_ENV",

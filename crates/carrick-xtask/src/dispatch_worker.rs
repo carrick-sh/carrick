@@ -897,7 +897,9 @@ fn output(command: &mut Command) -> Result<Vec<u8>, ScalerError> {
 pub(crate) fn git_invocation(root: &Path, args: &[&str]) -> Command {
     // Worktree .gitattributes is honored; it has no driver without config.
     let mut command = crate::safe_copy::git_command(root, args);
-    command.env_remove("DISPATCH_BOARD_TOKEN");
+    command
+        .env_remove("DISPATCH_BOARD_TOKEN")
+        .env_remove("DISPATCH_PUBLISH_TOKEN");
     command
 }
 
@@ -935,6 +937,20 @@ fn draft_pr_title(work: &Path, base: &str, issue: u64, token: &str) -> Result<St
 }
 
 fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
+    gh_with_token(root, args, None)
+}
+/// Only publication writes use the scoped App credential. Reads and comments
+/// continue to inherit the job token from the runner's environment.
+fn publish_token() -> Option<String> {
+    std::env::var("DISPATCH_PUBLISH_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+fn publish_gh(root: &Path, args: &[&str], job_token: &str) -> Result<String, ScalerError> {
+    let token = publish_token();
+    gh_with_token(root, args, Some(token.as_deref().unwrap_or(job_token)))
+}
+fn gh_with_token(root: &Path, args: &[&str], token: Option<&str>) -> Result<String, ScalerError> {
     let endpoint = match args {
         ["api", rest @ ..] => rest
             .iter()
@@ -950,24 +966,28 @@ fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
         _ => "GitHub operation".into(),
     };
     let result = timed_phase(&format!("github:{endpoint}"), || {
-        output(
-            Command::new("gh")
-                .args(args)
-                .current_dir(root)
-                .env_remove("DISPATCH_BOARD_TOKEN"),
-        )
-        .and_then(|bytes| {
-            String::from_utf8(bytes).map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
-        })
-        .map_err(|error| {
-            // execute already drains and redacts a bounded stderr prefix. Mask
-            // again before clipping so a cut credential cannot escape.
-            let detail = crate::dispatch_redaction::redact(error.to_string().as_bytes());
-            ScalerError::Usage(format!(
-                "GitHub {endpoint}: {}",
-                detail.chars().take(2048).collect::<String>()
-            ))
-        })
+        let mut command = Command::new("gh");
+        command
+            .args(args)
+            .current_dir(root)
+            .env_remove("DISPATCH_BOARD_TOKEN")
+            .env_remove("DISPATCH_PUBLISH_TOKEN");
+        if let Some(token) = token {
+            command.env("GH_TOKEN", token).env_remove("GITHUB_TOKEN");
+        }
+        output(&mut command)
+            .and_then(|bytes| {
+                String::from_utf8(bytes).map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
+            })
+            .map_err(|error| {
+                // execute already drains and redacts a bounded stderr prefix. Mask
+                // again before clipping so a cut credential cannot escape.
+                let detail = crate::dispatch_redaction::redact(error.to_string().as_bytes());
+                ScalerError::Usage(format!(
+                    "GitHub {endpoint}: {}",
+                    detail.chars().take(2048).collect::<String>()
+                ))
+            })
     });
     GITHUB_FAILURES.with(|failures| {
         let mut failures = failures.borrow_mut();
@@ -1224,12 +1244,19 @@ pub(crate) fn dispatch_run_identity(run: &Value, issue: Option<u64>) -> bool {
         })
 }
 
+fn dispatch_bot(user: &Value) -> bool {
+    user["type"] == "Bot"
+        && matches!(
+            user["login"].as_str(),
+            Some("github-actions[bot]" | "carrick-workers[bot]")
+        )
+}
+
 pub(crate) fn owned_pr(pr: &Value, run: &Value, issue: u64, branch: &str) -> bool {
     let Ok(id) = branch_run(issue, branch) else {
         return false;
     };
-    pr["user"]["login"] == "github-actions[bot]"
-        && pr["user"]["type"] == "Bot"
+    dispatch_bot(&pr["user"])
         && pr["head"]["repo"]["full_name"] == REPOSITORY
         && pr["head"]["ref"] == branch
         && pr["base"]["ref"] == "main"
@@ -2160,6 +2187,8 @@ struct Applied {
     publication_pr: Option<u64>,
     #[serde(default)]
     manual_repair: Option<String>,
+    #[serde(default)]
+    ci_requires_owner: bool,
 }
 impl Applied {
     fn load() -> Result<Self, ScalerError> {
@@ -2181,7 +2210,7 @@ impl Applied {
     }
     fn report(&self) -> String {
         format!(
-            "- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.",
+            "- PR commits: {}.{}\n- PR body: {}.\n- Board status: {}.{}",
             if self.commits.is_empty() {
                 "none".into()
             } else {
@@ -2228,6 +2257,11 @@ impl Applied {
                     .cloned()
                     .collect::<Vec<_>>()
                     .join(", ")
+            },
+            if self.ci_requires_owner {
+                "\n- CI won't start automatically: publication used the job token because DISPATCH_PUBLISH_TOKEN is empty or absent; mark the PR ready to start CI."
+            } else {
+                ""
             }
         )
     }
@@ -2483,7 +2517,7 @@ fn patch_pr_body(root: &Path, number: u64, body: &str, token: &str) -> Result<()
     let body = neutralize_mentions(&agent_loop::masked(body, token));
     let path = crate::agent_runner::state()?.join("pr-body.md");
     std::fs::write(&path, body)?;
-    gh(
+    publish_gh(
         root,
         &[
             "api",
@@ -2493,6 +2527,7 @@ fn patch_pr_body(root: &Path, number: u64, body: &str, token: &str) -> Result<()
             "-F",
             &format!("body=@{}", path.display()),
         ],
+        token,
     )?;
     Ok(())
 }
@@ -2829,6 +2864,7 @@ fn publish(
     token: &str,
     runs: &mut agent_loop::RunCache,
 ) -> Result<Option<u64>, ScalerError> {
+    let publish_token = publish_token();
     let mut check = ReferenceCheck::new(reference_host());
     // Push, snapshot and write share the primary window; recovery alone may
     // use its reserved thirty seconds, without extending the caller's budget.
@@ -2884,7 +2920,7 @@ fn publish(
         .any(|path| path.starts_with(".github/workflows/"));
         if refused_workflow {
             return Err(ScalerError::Guard(
-                "Refused workflow changes: job token cannot publish .github/workflows/*",
+                "Refused workflow changes: dispatch publishing credentials cannot publish .github/workflows/*; the App token has no workflows permission",
             ));
         }
         let tip = git(
@@ -2973,14 +3009,17 @@ fn publish(
                 } else {
                     commits.clone()
                 };
-                output(&mut push_command(
-                    &work,
-                    dispatch,
-                    id,
-                    &receipt.expected_tip,
-                )?)?;
+                let mut push = push_command(&work, dispatch, id, &receipt.expected_tip)?;
+                push.env("GH_TOKEN", publish_token.as_deref().unwrap_or(token))
+                    .env_remove("GITHUB_TOKEN");
+                output(&mut push).map_err(|error| {
+                    if publish_token.is_some() {
+                        ScalerError::Usage(format!("App token push refused (requires contents write; workflow files are not permitted): {error}"))
+                    } else { error }
+                })?;
             }
             Applied::record(|a| {
+                a.ci_requires_owner = publish_token.is_none();
                 a.commits = commits;
                 a.new_commits = new_commits;
                 a.published_checkpoint = receipt.checkpointed;
@@ -3059,7 +3098,7 @@ fn publish(
             };
             let path = state.join("pr-body.md");
             std::fs::write(&path, body)?;
-            gh(
+            publish_gh(
                 root,
                 &[
                     "pr",
@@ -3076,6 +3115,7 @@ fn publish(
                     "--body-file",
                     path.to_str().ok_or(ScalerError::Guard("body path"))?,
                 ],
+                token,
             )?;
             let number = require_owned_pr(root, dispatch)?["number"]
                 .as_u64()
@@ -3596,6 +3636,41 @@ mod tests {
     fn rev3_reference_wait_has_a_deadline() {
         publication_fixture("timeout");
     }
+    #[test]
+    fn publish_token_app_pr_retains_authenticated_dispatch_ownership() {
+        let event = review_event();
+        let mut pr = event["pull_request"].clone();
+        pr["user"]["login"] = "carrick-workers[bot]".into();
+        assert!(owned_pr(
+            &pr,
+            &event["dispatch_run"],
+            634,
+            "work/dispatch-634-42"
+        ));
+        pr["user"]["login"] = "another-app[bot]".into();
+        assert!(!owned_pr(
+            &pr,
+            &event["dispatch_run"],
+            634,
+            "work/dispatch-634-42"
+        ));
+    }
+    #[test]
+    fn publish_token_authenticates_create_and_continuation_writes() {
+        publication_fixture("publish-token");
+    }
+    #[test]
+    fn publish_token_push_refusal_names_app_permissions() {
+        publication_fixture("publish-token-refused");
+    }
+    #[test]
+    fn missing_publish_token_keeps_publication_and_reports_ci_gap() {
+        publication_fixture("publish-missing");
+    }
+    #[test]
+    fn empty_publish_token_keeps_publication_and_reports_ci_gap() {
+        publication_fixture("publish-empty");
+    }
     fn publication_fixture(witness: &str) {
         publication_fixture_outcome(witness, |_, _| {});
     }
@@ -3627,7 +3702,10 @@ for arg do
      exec /usr/bin/git ls-remote "$RUNNER_TEMP/live-main.git" refs/heads/main
    fi
    if test -f "$RUNNER_TEMP/remote-tip"; then cat "$RUNNER_TEMP/remote-tip"; fi; exit 0 ;;
- push) printf '%s\n' "$@" >> "$RUNNER_TEMP/push.args"; /usr/bin/git rev-parse HEAD > "$RUNNER_TEMP/remote-tip"; exit 0 ;;
+ push)
+ test "$GH_TOKEN" = "${DISPATCH_TEST_WRITE_TOKEN:-fixture-token}" || { echo 'push did not use publish credential' >&2; exit 89; }
+ if test -f "$RUNNER_TEMP/refuse-push"; then echo 'refusing to allow an App to create or update workflow without workflows permission' >&2; exit 88; fi
+ printf '%s\n' "$@" >> "$RUNNER_TEMP/push.args"; /usr/bin/git rev-parse HEAD > "$RUNNER_TEMP/remote-tip"; exit 0 ;;
  esac
 done
 exec /usr/bin/git "$@"
@@ -3637,6 +3715,11 @@ exec /usr/bin/git "$@"
                     "gh",
                     r#"#!/bin/sh
 printf '%s\n' "$@" >> "$RUNNER_TEMP/gh.args"
+case "$1 $2 $3" in
+ 'pr create '*|'api -X PATCH') expected=${DISPATCH_TEST_WRITE_TOKEN:-fixture-token} ;;
+ *) expected=fixture-token ;;
+esac
+test "$GH_TOKEN" = "$expected" || { echo 'GitHub call used wrong credential' >&2; exit 89; }
 if test "$1" = api; then
  case "$2" in
  -X)
@@ -3705,6 +3788,17 @@ fi
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
+                .env_remove("DISPATCH_PUBLISH_TOKEN")
+                .envs(if witness.starts_with("publish-token") {
+                    vec![
+                        ("DISPATCH_PUBLISH_TOKEN", "opaque-publish-credential"),
+                        ("DISPATCH_TEST_WRITE_TOKEN", "opaque-publish-credential"),
+                    ]
+                } else if witness == "publish-empty" {
+                    vec![("DISPATCH_PUBLISH_TOKEN", "")]
+                } else {
+                    vec![]
+                })
                 .env("GH_TOKEN", "fixture-token")
                 .env("RUNNER_TEMP", temp.path())
                 .env(
@@ -3769,6 +3863,9 @@ fi
         if witness == "restore-html" {
             pr["body"] = format!("Legacy <p>@alice</p>\nCloses #634\nDispatch run: https://github.com/{REPOSITORY}/actions/runs/42").into();
         }
+        if witness.starts_with("publish-token") {
+            pr["user"]["login"] = "carrick-workers[bot]".into();
+        }
         let mut run = review_event()["dispatch_run"].clone();
         run["status"] = "completed".into();
         std::fs::write(outer.join("original.json"), run.to_string()).unwrap();
@@ -3798,6 +3895,71 @@ fi
         }
         let report = state.join("report.md");
         std::fs::write(&report, "").unwrap();
+        if witness.starts_with("publish-") {
+            receipt.pr_body = Some("Publish the owner's change.".into());
+            if witness == "publish-token-refused" {
+                std::fs::write(outer.join("refuse-push"), "").unwrap();
+                let error = publish(
+                    &work,
+                    &dispatch,
+                    &receipt,
+                    &contract,
+                    &report,
+                    "fixture-token",
+                    &mut agent_loop::RunCache::default(),
+                )
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains("App token push refused"),
+                    "{error}"
+                );
+                assert!(!error.to_string().contains("opaque-publish-credential"));
+                return;
+            }
+            for continuation in [false, true] {
+                if continuation {
+                    receipt.expected_tip =
+                        git(&work, &["rev-parse", "HEAD"]).unwrap().trim().into();
+                    git(
+                        &work,
+                        &["commit", "--allow-empty", "-m", "fix(ci): continue work"],
+                    )
+                    .unwrap();
+                }
+                assert_eq!(
+                    publish(
+                        &work,
+                        &dispatch,
+                        &receipt,
+                        &contract,
+                        &report,
+                        "fixture-token",
+                        &mut agent_loop::RunCache::default()
+                    )
+                    .unwrap(),
+                    Some(800)
+                );
+            }
+            let calls = regular_text(&outer.join("gh.args")).unwrap();
+            assert!(
+                calls.contains("create") && calls.contains("PATCH") && calls.contains("graphql")
+            );
+            assert!(
+                regular_text(&outer.join("push.args"))
+                    .unwrap()
+                    .contains("--force-with-lease=")
+            );
+            let applied = Applied::load().unwrap().report();
+            if witness != "publish-token" {
+                assert!(
+                    applied.contains("CI won't start automatically"),
+                    "missing fallback note: {applied}"
+                );
+                assert!(applied.contains("mark the PR ready"));
+            }
+            assert!(!applied.contains("opaque-publish-credential"));
+            return;
+        }
         if witness == "worker-workflow" {
             std::fs::create_dir_all(work.join(".github/workflows")).unwrap();
             std::fs::write(work.join(".github/workflows/worker.yml"), "name: worker\n").unwrap();
@@ -4665,6 +4827,7 @@ fi
             .env("GITHUB_TOKEN", "planted")
             .env("AGENT_DIRECTOR_TOKEN", "planted")
             .env("DISPATCH_BOARD_TOKEN", "planted")
+            .env("DISPATCH_PUBLISH_TOKEN", "planted")
             .env("GITHUB_OUTPUT", "/runner/set_output")
             .env("GIT_CONFIG_GLOBAL", "/credential/helper")
             .env("RUSTC_WRAPPER", "/runner/sccache")
@@ -4675,6 +4838,7 @@ fi
             "GH_TOKEN",
             "AGENT_DIRECTOR_TOKEN",
             "DISPATCH_BOARD_TOKEN",
+            "DISPATCH_PUBLISH_TOKEN",
         ] {
             assert!(
                 !cmd.get_envs()
