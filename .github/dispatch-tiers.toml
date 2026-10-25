@@ -1,7 +1,7 @@
 # Owner budgets (#797). The server refuses calls beyond these per-event caps.
 [loop]
-backend = "agy"
-model = "high"
+loop_backend = "agy"
+loop_model = "high"
 calls = 12
 reads = 2
 workers = 3
