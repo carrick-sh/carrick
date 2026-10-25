@@ -660,6 +660,94 @@ fn rollback_after_install_failure(
         .map(|failure| failure.installed)
 }
 
+/// Install and publish one completely prepared successor using only its
+/// retained carrier custody and the exact closed root selected by the owner.
+/// Both host-graph and native-ring exec enter the same physical transaction.
+/// An ordinary error means every partially installed record was rolled back;
+/// unresolved physical custody is terminal and never returns to an old image.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn install_prepared_exec_backing(
+    prepared: PreparedExecBacking,
+    successor_root_slot: (u64, u64),
+) -> Result<PublishedExecBacking, TrapError> {
+    let fail_after = exec_stage2_fail_after_maps();
+    let mut maps_completed = 0usize;
+    let installed = prepared.install_using(
+        |extent, _record| {
+            if extent.pre_mapped {
+                return 0;
+            }
+            if fail_after.is_some_and(|limit| maps_completed >= limit) {
+                return -1;
+            }
+            crate::probes::hvpatch_exec_stage2(
+                carrick_observability::probes::HvpatchExecStage2::new(
+                    carrick_observability::probes::HvpatchExecStage2Phase::MapBegin,
+                    extent.ipa,
+                    extent.size as u64,
+                    u64::MAX,
+                    0,
+                ),
+            );
+            let rc = unsafe {
+                inventory_hv_vm_map(extent.host.cast(), extent.ipa, extent.size, extent.perms)
+            };
+            if rc == 0
+                && let Some(replay_key) = extent.replay_key()
+            {
+                mutate_external_alias_state(|registry| {
+                    let bucket = registry
+                        .by_scope
+                        .entry(AliasOwnershipScope::Global)
+                        .or_default();
+                    bucket.replay.insert(replay_key);
+                });
+            }
+            crate::probes::hvpatch_exec_stage2(
+                carrick_observability::probes::HvpatchExecStage2::new(
+                    carrick_observability::probes::HvpatchExecStage2Phase::MapEnd,
+                    extent.ipa,
+                    extent.size as u64,
+                    u64::MAX,
+                    rc as i32,
+                ),
+            );
+            if rc == 0 {
+                maps_completed += 1;
+            }
+            rc as i32
+        },
+        |ipa, len| {
+            let rc = unsafe { inventory_hv_vm_unmap(ipa, len) };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(CarrierStage2BackendError::HvReturn(rc as u32))
+            }
+        },
+    );
+    let published = match installed {
+        Ok(installed) => installed
+            .publish(successor_root_slot)
+            .unwrap_or_else(|failure| {
+                carrick_fatal!(
+                    "hvpatch::exec_commit",
+                    "{}",
+                    TerminalExecBackingFailure::Publish(failure)
+                );
+            }),
+        Err(failure) if failure.retained.is_some() => {
+            carrick_fatal!(
+                "hvpatch::exec_commit",
+                "{}",
+                TerminalExecBackingFailure::Install(failure)
+            );
+        }
+        Err(failure) => return Err(failure.error),
+    };
+    Ok(published)
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl InstalledExecBacking {
     fn publish(
@@ -1560,92 +1648,27 @@ impl HvfVmState {
             let extents =
                 final_exec_physical_extents(&self.frame_inventory.lock(), authority.as_ref())?;
             let authority_before = self.exec_authority_fingerprint();
-            let fail_after = exec_stage2_fail_after_maps();
-            let mut maps_completed = 0usize;
             let prepared = prepared_exec_backing.take().ok_or_else(|| {
                 TrapError::Hypervisor(
                     "persistent exec lost its prepared physical backing".to_owned(),
                 )
             })?;
-            let installed = prepared.install_using(
-                |extent, _record| {
-                    if extent.pre_mapped {
-                        return 0;
-                    }
-                    if fail_after.is_some_and(|limit| maps_completed >= limit) {
-                        return -1;
-                    }
-                    crate::probes::hvpatch_exec_stage2(
-                        carrick_observability::probes::HvpatchExecStage2::new(
-                            carrick_observability::probes::HvpatchExecStage2Phase::MapBegin,
-                            extent.ipa,
-                            extent.size as u64,
-                            u64::MAX,
-                            0,
-                        ),
-                    );
-                    let rc = unsafe {
-                        inventory_hv_vm_map(
-                            extent.host.cast(),
-                            extent.ipa,
-                            extent.size,
-                            extent.perms,
-                        )
-                    };
-                    if rc == 0
-                        && let Some(replay_key) = extent.replay_key()
-                    {
-                        mutate_external_alias_state(|registry| {
-                            let bucket = registry
-                                .by_scope
-                                .entry(AliasOwnershipScope::Global)
-                                .or_default();
-                            bucket.replay.insert(replay_key);
-                        });
-                    }
-                    crate::probes::hvpatch_exec_stage2(
-                        carrick_observability::probes::HvpatchExecStage2::new(
-                            carrick_observability::probes::HvpatchExecStage2Phase::MapEnd,
-                            extent.ipa,
-                            extent.size as u64,
-                            u64::MAX,
-                            rc as i32,
-                        ),
-                    );
-                    if rc == 0 {
-                        maps_completed += 1;
-                    }
-                    rc as i32
-                },
-                |ipa, len| {
-                    let rc = unsafe { inventory_hv_vm_unmap(ipa, len) };
-                    if rc == 0 {
-                        Ok(())
-                    } else {
-                        Err(CarrierStage2BackendError::HvReturn(rc as u32))
-                    }
-                },
-            );
-            let published = match installed {
-                Ok(installed) => installed
-                    .publish(replacement_mm_root_slot)
-                    .map_err(TerminalExecBackingFailure::Publish),
-                Err(failure) if failure.retained.is_some() => {
-                    Err(TerminalExecBackingFailure::Install(failure))
-                }
-                Err(failure) => {
+            let published = match install_prepared_exec_backing(prepared, replacement_mm_root_slot)
+            {
+                Ok(published) => published,
+                Err(error) => {
                     let authority_after = self.exec_authority_fingerprint();
-                    match verify_exec_authority_rollback(&authority_before, &authority_after) {
-                        Ok(()) => return Err(failure.error),
-                        Err(rollback_error) => {
-                            Err(TerminalExecBackingFailure::Rollback(rollback_error))
-                        }
-                    }
+                    verify_exec_authority_rollback(&authority_before, &authority_after)
+                        .unwrap_or_else(|rollback_error| {
+                            carrick_fatal!(
+                                "hvpatch::exec_commit",
+                                "{}",
+                                TerminalExecBackingFailure::Rollback(rollback_error)
+                            );
+                        });
+                    return Err(error);
                 }
-            }
-            .unwrap_or_else(|failure| {
-                carrick_fatal!("hvpatch::exec_commit", "{failure}");
-            });
+            };
             published_exec_plan = Some(published.plan);
             published_exec_regions = published.regions;
             if let Some((Some(retired), _)) = inventory_reservations.as_mut() {
