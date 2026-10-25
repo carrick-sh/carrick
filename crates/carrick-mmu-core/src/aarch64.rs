@@ -2437,6 +2437,20 @@ pub struct PageTableManager {
     live_descriptor_owner: LiveDescriptorOwner,
 }
 
+/// Non-cloneable proof that one structural page-table arena was detached
+/// from a concrete manager image.
+#[derive(Debug, Eq, PartialEq)]
+pub struct TableArenaDetached {
+    base: u64,
+}
+
+impl TableArenaDetached {
+    /// Physical base of the detached arena.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+}
+
 impl core::fmt::Debug for PageTableManager {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PageTableManager")
@@ -3357,16 +3371,16 @@ impl PageTableManager {
         self.arenas.iter().map(|a| a.next_free).sum()
     }
 
-    /// Pop all extension arenas. Returns the bases of the retired extension
-    /// arenas so callers can unmap and retire them.
-    pub fn retire_extension_arenas(&mut self) -> Vec<u64> {
-        let mut bases = Vec::new();
+    /// Pop all extension arenas. Each returned receipt is minted by the
+    /// manager mutation which made that exact structural backing unreachable.
+    pub fn retire_extension_arenas(&mut self) -> Vec<TableArenaDetached> {
+        let mut detached = Vec::new();
         while self.arenas.len() > 1 {
             if let Some(arena) = self.arenas.pop() {
-                bases.push(arena.base);
+                detached.push(TableArenaDetached { base: arena.base });
             }
         }
-        bases
+        detached
     }
 
     fn total_pages(&self) -> usize {
@@ -12768,6 +12782,10 @@ mod tests {
         for &page in grants.as_slice().iter().chain(more.as_slice()) {
             assert!(mgr.is_spare_table(page));
         }
+        let detached = mgr.retire_extension_arenas();
+        assert_eq!(detached.len(), 1);
+        assert_eq!(detached[0].base(), extension.0);
+        assert_eq!(mgr.arenas.len(), 1);
     }
 
     /// A guest editor can link a table page past the host's cached cursor
