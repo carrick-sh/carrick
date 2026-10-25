@@ -64,17 +64,44 @@ impl Channel {
         }
         Ok(u64::from_ne_bytes(bytes))
     }
-    fn close_read_end(&mut self) {
+    fn try_send(&self, value: u64, label: &str) -> Result<(), String> {
+        let bytes = value.to_ne_bytes();
+        let written = unsafe { libc::write(self.write, bytes.as_ptr().cast(), bytes.len()) };
+        if written != bytes.len() as isize {
+            return Err(format!(
+                "{label}: write returned {written}, errno={}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+    fn try_close_read_end(&mut self, label: &str) -> Result<(), String> {
         if self.read != self.write {
-            assert_eq!(unsafe { libc::close(self.read) }, 0, "close reader");
+            let closed = unsafe { libc::close(self.read) };
+            if closed != 0 {
+                return Err(format!(
+                    "{label}: close reader {} returned {closed}, errno={}",
+                    self.read,
+                    std::io::Error::last_os_error()
+                ));
+            }
             self.read = -1;
         }
+        Ok(())
     }
-    fn close_write_end(&mut self) {
+    fn try_close_write_end(&mut self, label: &str) -> Result<(), String> {
         if self.write != self.read {
-            assert_eq!(unsafe { libc::close(self.write) }, 0, "close writer");
+            let closed = unsafe { libc::close(self.write) };
+            if closed != 0 {
+                return Err(format!(
+                    "{label}: close writer {} returned {closed}, errno={}",
+                    self.write,
+                    std::io::Error::last_os_error()
+                ));
+            }
             self.write = -1;
         }
+        Ok(())
     }
     fn send_vector(&self, value: u64) {
         let mut bytes = value.to_ne_bytes();
@@ -171,11 +198,11 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
         .map(|(pair, (mut request, mut response))| {
             std::thread::spawn(move || {
                 if child {
-                    request.close_write_end();
-                    response.close_read_end();
+                    request.try_close_write_end("child request")?;
+                    response.try_close_read_end("child response")?;
                 } else {
-                    request.close_read_end();
-                    response.close_write_end();
+                    request.try_close_read_end("parent request")?;
+                    response.try_close_write_end("parent response")?;
                 }
                 for round in 0..rounds {
                     let value = ((pair as u64 + 1) << 32) | (round as u64 + 1);
@@ -186,9 +213,9 @@ pub fn processes(kind: &str, pairs: usize, rounds: usize) -> i32 {
                                 "inherited request identity: got {received:#x}, expected {value:#x}"
                             ));
                         }
-                        response.send(value ^ 0x1000_0000);
+                        response.try_send(value ^ 0x1000_0000, "inherited response")?;
                     } else {
-                        request.send(value);
+                        request.try_send(value, "inherited request")?;
                         let received = response.receive_bounded("inherited response")?;
                         let expected = value ^ 0x1000_0000;
                         if received != expected {
