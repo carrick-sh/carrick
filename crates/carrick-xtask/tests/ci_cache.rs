@@ -27,7 +27,20 @@ fn only_trusted_warmer_publishes_bounded_shared_compiler_caches() {
                 assert!(condition.contains("'workflow_dispatch'"));
             }
             if action.starts_with("Swatinem/rust-cache@") {
-                assert_eq!(step["with"]["save-if"].as_bool(), Some(false), "{job:?}");
+                if matches!(job.as_str(), Some("lint" | "macos-clippy")) {
+                    let condition = step["with"]["save-if"].as_str().unwrap();
+                    assert!(condition.contains("refs/heads/main"));
+                    assert!(condition.contains("'schedule'"));
+                    assert!(condition.contains("'workflow_dispatch'"));
+                } else {
+                    assert_eq!(step["with"]["save-if"].as_bool(), Some(false), "{job:?}");
+                }
+                assert!(
+                    step["with"]["shared-key"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with("-v2")
+                );
                 assert!(step["with"]["cache-directories"].is_badvalue());
                 assert_eq!(
                     step["with"]["cache-targets"].as_bool(),
@@ -44,10 +57,26 @@ fn only_trusted_warmer_publishes_bounded_shared_compiler_caches() {
                         .unwrap()
                         .contains("hashFiles('Cargo.lock', 'rust-toolchain.toml')")
                 );
+                let key = step["with"]["key"].as_str().unwrap();
+                assert!(key.ends_with("-${{ github.run_id }}"));
                 if action.starts_with("actions/cache/save@") {
                     assert_eq!(job.as_str(), Some("cache-warm"));
                 } else {
                     assert!(action.starts_with("actions/cache/restore@"));
+                    let prefixes: Vec<_> = step["with"]["restore-keys"]
+                        .as_str()
+                        .unwrap()
+                        .lines()
+                        .collect();
+                    assert_eq!(prefixes.len(), 2);
+                    assert_eq!(
+                        prefixes[0],
+                        key.strip_suffix("${{ github.run_id }}").unwrap()
+                    );
+                    assert_eq!(
+                        prefixes[1],
+                        format!("{}-", key.split("-${{ hashFiles").next().unwrap())
+                    );
                 }
             }
         }
