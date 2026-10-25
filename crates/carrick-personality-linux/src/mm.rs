@@ -2,6 +2,12 @@
 mod reservation;
 use carrick_core_abi::*;
 
+pub const LINUX_HEAP_BASE: u64 = 0x40_0000_0000;
+pub const LINUX_HEAP_SIZE: u64 = 128 * 1024 * 1024;
+pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000;
+pub const LINUX_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
+pub const LINUX_MMAP_SIZE_MAX: u64 = 0x88_0000_0000 - LINUX_MMAP_BASE;
+
 /// Linux edit authority and rlimit charging for the neutral flag record.
 pub trait NodeFlagsPolicy {
     fn root_editable(self) -> bool;

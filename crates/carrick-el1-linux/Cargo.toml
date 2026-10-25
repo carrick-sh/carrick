@@ -37,6 +37,7 @@ path = "src/lib.rs"
 [dev-dependencies]
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
 carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
+carrick-mem = { path = "../carrick-mem" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-test-support = { path = "../carrick-test-support" }
 carrick-core = { path = "../carrick-core", features = ["host-test"] }
@@ -44,7 +45,6 @@ carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-sched-core = { path = "../carrick-sched-core", features = ["host-test"] }
 carrick-personality-linux = { path = "../carrick-personality-linux", features = ["host-test"] }
-carrick-mem = { path = "../carrick-mem" }
 
 [target.'cfg(not(target_os = "none"))'.dependencies]
 carrick-fatal = { path = "../carrick-fatal" }

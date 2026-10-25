@@ -186,14 +186,13 @@ impl ActionTable {
     /// Exec makes a private table: caught handlers reset and ignored actions
     /// stay ignored. Reset default metadata as the existing kernel Sighand does.
     pub fn clone_for_exec(&self) -> Self {
-        Self {
-            actions: self
-                .actions
-                .iter()
-                .filter(|(_, action)| action.disposition == Disposition::Ignore)
-                .map(|(&signal, &action)| (signal, action))
-                .collect(),
+        let mut actions = BTreeMap::new();
+        for (&signal, &action) in &self.actions {
+            if action.disposition == Disposition::Ignore {
+                actions.insert(signal, action);
+            }
         }
+        Self { actions }
     }
 
     /// CLONE_SIGHAND selects the exact existing authority; it does not copy

@@ -721,6 +721,18 @@ impl ThreadControlSlot {
         self.visible_tid.store(0, Ordering::Release);
     }
 
+    /// Promote the sole surviving exec caller to its thread-group leader's
+    /// visible tid. Exact predecessor comparison prevents a stale drain from
+    /// renaming a replacement member.
+    pub fn promote_exec_identity(&self, predecessor: u32, leader: u32) -> bool {
+        predecessor != 0
+            && leader != 0
+            && self
+                .visible_tid
+                .compare_exchange(predecessor, leader, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
     pub fn visible_tid(&self) -> Option<u32> {
         let tid = self.visible_tid.load(Ordering::Acquire);
         (tid != 0).then_some(tid)
@@ -2911,6 +2923,16 @@ mod tests {
         assert_eq!(first.visible_tid(), None);
         assert_eq!(second.visible_tid(), Some(73));
         assert!(first.publish_visible_tid(91));
+    }
+
+    #[test]
+    fn exec_promotion_requires_the_exact_predecessor_tid() {
+        let slot = ThreadControlSlot::new();
+        assert!(slot.publish_visible_tid(41));
+        assert!(!slot.promote_exec_identity(40, 7));
+        assert!(slot.promote_exec_identity(41, 7));
+        assert_eq!(slot.visible_tid(), Some(7));
+        assert!(!slot.promote_exec_identity(41, 9));
     }
 
     #[test]
