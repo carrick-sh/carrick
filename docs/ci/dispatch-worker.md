@@ -156,10 +156,11 @@ includes both repository and issue number, so the write cannot introduce a new
 closing reference in any repository. Both connections are bounded at 100 nodes;
 truncated or malformed responses, and responses over 64 KiB, are unverifiable.
 
-At harvest, the server applies the same conservative closing-keyword filter to
-messages of commits added by that worker, before accepting the checkpoint for
-publication. Closing this issue in this repository is allowed. A keyword for
-another issue or any cross-repository target refuses the harvest and names the
+Before publication, the server applies the same conservative closing-keyword
+filter to `merge-base(live main, HEAD)..HEAD`, excluding commits already
+published on the branch before this run. Main and previously published history
+are trusted. Closing this issue in this repository is allowed. A new worker
+commit targeting another issue or repository refuses publication and names the
 commit, so rebase landing cannot close an unrelated issue through its message.
 
 Every PR body write (including restoration) and loop-authored post, including
@@ -169,6 +170,14 @@ HTML and code blocks. Numeric at-sign entities and `&commat;` are decoded before
 neutralisation. An ASCII alphanumeric or underscore prefix leaves an address such as
 `user@example.com` or `https://user@host` intact.
 
+The server's observed result governs the outcome status. A failed, timed-out
+or incomplete last worker, or a published HEAD created by the server as a
+checkpoint, forces a failed outcome even when the loop requests done. A later
+worker returning done does not validate an unchanged checkpoint. The server
+verdict and evidence appear first; the loop's claimed status and summary are
+quoted below them. A successful worker that replaces the checkpoint with its
+own commit can recover the outcome.
+
 Fallback outcome contracts come only from authenticated server outcome comments,
 never from PR bodies. `Outcome contract:` is reserved for those reports; body
 proposals and the comment tool refuse the marker.
@@ -176,9 +185,12 @@ proposals and the comment tool refuse the marker.
 `[loop].loop_backend` and `[loop].loop_model` select the coordinator itself.
 They are omitted from its event budgets and do not constrain workers. Worker
 choice is the loop's own decision from `read_capacity` and task difficulty.
-The applied outcome lists only `merge-base(admitted main, head)..head` as
-commits pushed, and reports a moved main base separately as “Rebased onto
-main at <sha>”.
+At publication the server resolves and fetches live main with its own token.
+It lists `merge-base(live main, head)..head` as “PR commits”, marking commits
+not reachable from the previous remote tip as “new in this run”. The same
+base governs workflow-change refusal, so main's workflow edits are not
+attributed to the worker. A rewritten branch reports “Rebased onto main at
+<sha>”; merging main does not produce that claim.
 
 The only ceilings are `[loop]` in `.github/dispatch-tiers.toml`: 12 tool calls,
 two state reads, three workers, three refused worker requests, one publication,
@@ -190,8 +202,9 @@ result collection use the reserved window. A timed-out worker retains partial
 work and logs with a failed timeout contract. Harvest failures name the original
 error and discard the failed candidate. The last successfully harvested tree
 and its receipt stay available for continuation and publication. The receipt
-retains that worker's model and contract; the PR body identifies the published
-checkpoint and uses its claims, even after a later harvest fails. A failed
+retains that worker's model, contract and exact HEAD; a mismatched tree and
+receipt is refused. The PR body puts the human summary first, then the
+published checkpoint's provenance, even after a later harvest fails. A failed
 checkpoint install restores the previous pair, or invalidates the receipt if
 rollback also fails. Without a valid
 pair, publication is refused with a named reason. Production is never rerun as
@@ -234,8 +247,8 @@ creation checks issue-derived artifact-name prefixes before authenticating
 runs; it never scans the repository-wide artifact inventory. Each server
 caches authenticated runs, artifact listings and downloaded text, including
 confirmed predicate refusals. Lookups and downloads get at most three attempts
-per cache key and event; transport failures are never cached as predicate
-refusals.
+per cache key and event, one attempt per call so later calls can recover from
+an outage. Transport failures are never cached as predicate refusals.
 Unchanged branch selections reuse history verification while rechecking live
 remote tips and all-state PR ownership before admission or publication. Contracts from verified
 artifacts take precedence over comment previews, and the server’s outcome

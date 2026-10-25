@@ -942,24 +942,19 @@ impl<K: Ord + Clone, V: Clone> LookupCache<K, V> {
     fn resolve(
         &mut self,
         key: K,
-        mut fetch: impl FnMut() -> Result<Option<V>, ScalerError>,
+        fetch: impl FnOnce() -> Result<Option<V>, ScalerError>,
     ) -> Result<Option<V>, ScalerError> {
         if let Some(value) = self.values.get(&key) {
             return Ok(value.clone());
         }
         let attempts = self.attempts.entry(key.clone()).or_default();
-        while *attempts < RUN_LOOKUP_ATTEMPTS {
-            *attempts += 1;
-            match fetch() {
-                Ok(value) => {
-                    self.values.insert(key, value.clone());
-                    return Ok(value);
-                }
-                Err(error) if *attempts == RUN_LOOKUP_ATTEMPTS => return Err(error),
-                Err(_) => {}
-            }
+        if *attempts >= RUN_LOOKUP_ATTEMPTS {
+            return Err(ScalerError::Guard("run lookup retry budget exhausted"));
         }
-        Err(ScalerError::Guard("run lookup retry budget exhausted"))
+        *attempts += 1;
+        let value = fetch()?;
+        self.values.insert(key, value.clone());
+        Ok(value)
     }
 }
 /// Completed positive evidence and predicate refusals are immutable. Transport
@@ -1436,6 +1431,12 @@ impl Server<'_> {
         Ok(())
     }
     fn outcome(&mut self, status: ContractStatus, summary: &str) -> Result<(), ScalerError> {
+        let requested_status = status;
+        let loop_claimed = match status {
+            ContractStatus::Done => "done",
+            ContractStatus::Blocked => "blocked",
+            ContractStatus::Failed => "failed",
+        };
         artifacts_ready(false)?;
         let path = PathBuf::from(
             std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?,
@@ -1450,12 +1451,37 @@ impl Server<'_> {
         let applied = Applied::load()?;
         self.pr = applied.publication_pr.or(self.pr);
         let manual_repair = applied.manual_repair.clone();
-        let status = if matches!(applied.body, AppliedBody::Failed(_)) {
-            ContractStatus::Failed
-        } else {
+        let mut observations = Vec::new();
+        if self.used.workers > 0
+            && (u32::try_from(self.history.len()).ok() != Some(self.used.workers)
+                || self
+                    .history
+                    .last()
+                    .is_none_or(|worker| worker.status == ContractStatus::Failed))
+        {
+            observations
+                .push("the last worker failed, timed out, or did not produce complete output");
+        }
+        if applied.published_checkpoint {
+            observations.push("the published HEAD is a server-created checkpoint");
+        }
+        if matches!(applied.body, AppliedBody::Failed(_)) {
+            observations.push("PR body publication failed");
+        }
+        let status = if observations.is_empty() {
             status
+        } else {
+            ContractStatus::Failed
         };
-        let applied = applied.report();
+        let applied = if observations.is_empty() {
+            applied.report()
+        } else {
+            format!(
+                "Server observed: {}.\n\n{}",
+                observations.join("; "),
+                applied.report()
+            )
+        };
         let mut outcome = Contract {
             loop_summary: Some(masked(summary, &self.token)),
             status,
@@ -1496,11 +1522,16 @@ impl Server<'_> {
             .map(|line| format!("> {line}"))
             .collect::<Vec<_>>()
             .join("\n");
+        let status_claim = if requested_status != outcome.status {
+            format!("> loop claimed: {loop_claimed}\n")
+        } else {
+            String::new()
+        };
         let choices:Vec<_> = self.choices.iter().map(|c| json!({"backend":c["backend"],"model":c["model"],"reason":c["reason"].as_str().unwrap_or_default().chars().take(512).collect::<String>()})).collect();
         let warning = manual_repair
             .map(|reason| format!("**PR body needs manual repair.** {reason}\n\n"))
             .unwrap_or_default();
-        let posted = self.post(&format!("{warning}Dispatch outcome: {:?}\n\n{applied}\n\n<details><summary>Contracts, worker claims and budgets</summary>\n\nOutcome contract:\n```json\n{details}\n```\n\nWorker contract (claims for review):\n\n```text\n{}\n```\n\nWorker choices and reasons: {}\n\nBudgets used: {}\n\n</details>\n\nLoop claims (unverified):\n{summary}\n", outcome.status, contract.chars().take(2000).collect::<String>(), serde_json::to_string(&choices)?, serde_json::to_string(&self.used)?));
+        let posted = self.post(&format!("{warning}Dispatch outcome: {:?}\n\n{applied}\n\n<details><summary>Contracts, worker claims and budgets</summary>\n\nOutcome contract:\n```json\n{details}\n```\n\nWorker contract (claims for review):\n\n```text\n{}\n```\n\nWorker choices and reasons: {}\n\nBudgets used: {}\n\n</details>\n\nLoop claims (unverified):\n{status_claim}{summary}\n", outcome.status, contract.chars().take(2000).collect::<String>(), serde_json::to_string(&choices)?, serde_json::to_string(&self.used)?));
         if prepared {
             mask_artifacts(
                 path.parent().ok_or(ScalerError::Guard("artifact parent"))?,
@@ -2033,10 +2064,7 @@ impl Server<'_> {
                 let receipt = worker_checkpoint(&state, &self.dispatch)?.ok_or(
                     ScalerError::Guard("no successfully harvested worker checkpoint to publish"),
                 )?;
-                if receipt.branch != self.dispatch.branch
-                    || receipt.base != self.dispatch.base
-                    || receipt.refused_workflow
-                {
+                if receipt.branch != self.dispatch.branch || receipt.base != self.dispatch.base {
                     return Err(ScalerError::Guard("publication receipt refused"));
                 }
                 let package = PathBuf::from(
@@ -2925,7 +2953,7 @@ mod tests {
                 posted.contains("PR body: not updated"),
                 "outcome omits unapplied PR body"
             );
-            assert!(posted.contains("Commits pushed: none"));
+            assert!(posted.contains("PR commits: none"));
             assert!(posted.contains("Board status: not changed"));
             assert!(posted.contains("Loop claims (unverified):"));
         });
@@ -3049,11 +3077,12 @@ mod tests {
             std::fs::write(
                 state.join("receipt.json"),
                 serde_json::to_vec(&Receipt {
+                    head: git(&work, &["rev-parse", "HEAD"])?.trim().into(),
+                    checkpointed: false,
                     base: dispatch.base.clone(),
                     branch: dispatch.branch.clone(),
                     exit_code: 0,
                     expected_tip,
-                    refused_workflow: false,
                     pr_body: None,
                     worker: dispatch.worker.clone(),
                     contract: Contract {
@@ -3112,6 +3141,9 @@ mod tests {
         ContinueBody,
         Timeout,
         HandBackFailure,
+        MissingResult,
+        LauncherFailure,
+        ReportedTimeout,
     }
     struct NativeFixtureHost {
         turns: std::collections::VecDeque<FixtureTurn>,
@@ -3168,6 +3200,10 @@ mod tests {
                 }
                 FixtureTurn::Timeout => "printf partial > unfinished; sleep 30",
                 FixtureTurn::HandBackFailure => "printf lost > incomplete",
+                FixtureTurn::MissingResult => {
+                    "rm ../result.json; printf partial > incomplete-output"
+                }
+                FixtureTurn::LauncherFailure | FixtureTurn::ReportedTimeout => "true",
             };
             // This is the real foreground process: it writes its own contract,
             // stdout evidence and work before the deadline runner can kill it.
@@ -3205,7 +3241,11 @@ mod tests {
                     git(root, &["add", "--", "first-good"])?;
                     git(root, &["commit", "-m", "fix(ci): first good worker"])?;
                 }
-                Ok(0)
+                Ok(match self.active {
+                    FixtureTurn::MissingResult | FixtureTurn::LauncherFailure => 1,
+                    FixtureTurn::ReportedTimeout => 124,
+                    _ => 0,
+                })
             }
         }
         fn retire(&mut self) -> Result<(), ScalerError> {
@@ -3249,6 +3289,102 @@ mod tests {
         dispatch.loop_deadline = Some(Instant::now() + Duration::from_secs(60));
         dispatch.harvest_deadline = Some(Instant::now() + Duration::from_secs(60));
         dispatch
+    }
+    struct ObservedNativeLauncher(NativeLauncher);
+    impl WorkerLauncher for ObservedNativeLauncher {
+        fn capacity(&mut self, _: Instant) -> Result<Value, ScalerError> {
+            Ok(live_capacity())
+        }
+        fn produce(
+            &mut self,
+            root: &Path,
+            dispatch: &Dispatch,
+            setup: &str,
+        ) -> Result<(), ScalerError> {
+            self.0.produce(root, dispatch, setup)
+        }
+    }
+    #[test]
+    fn followup_missing_worker_output_floors_finish_done() {
+        outcome_floor_fixture(vec![FixtureTurn::MissingResult], false);
+    }
+    #[test]
+    fn followup_launcher_failure_floors_finish_done() {
+        outcome_floor_fixture(vec![FixtureTurn::LauncherFailure], false);
+    }
+    #[test]
+    fn followup_worker_timeout_floors_finish_done() {
+        outcome_floor_fixture(vec![FixtureTurn::ReportedTimeout], false);
+    }
+    #[test]
+    fn followup_published_checkpoint_floors_later_done_worker() {
+        outcome_floor_fixture(
+            vec![FixtureTurn::ProposeBody, FixtureTurn::ContinueBody],
+            true,
+        );
+    }
+    #[test]
+    fn followup_recovered_worker_can_finish_done() {
+        outcome_floor_fixture(vec![FixtureTurn::MissingResult, FixtureTurn::Good], true);
+    }
+    fn outcome_floor_fixture(turns: Vec<FixtureTurn>, publish_tree: bool) {
+        shared_fixture(|root| {
+            let recovered = matches!(turns.last(), Some(FixtureTurn::Good));
+            let base = root.join("base");
+            let dispatch = native_dispatch(&base);
+            let mut server = server(&base);
+            server.dispatch = dispatch;
+            let count = turns.len();
+            let (native, _) = native_fixture(turns.clone());
+            server.launcher = Box::new(ObservedNativeLauncher(native));
+            for _ in 0..count {
+                server.execute(worker_request()).unwrap();
+            }
+            if publish_tree {
+                assert_eq!(
+                    server.history.last().unwrap().status,
+                    ContractStatus::Done,
+                    "last worker must claim done to isolate the published-head floor"
+                );
+                std::fs::write(root.join("remote-tip"), "").unwrap();
+                server.execute(Request::Publish(Empty {})).unwrap();
+            }
+            server
+                .execute(Request::Finish(Outcome {
+                    status: ContractStatus::Done,
+                    summary: "All work is complete".into(),
+                }))
+                .unwrap();
+            let outcome: Contract = serde_json::from_str(
+                &regular_text(&root.join("dispatch-output/contract.json")).unwrap(),
+            )
+            .unwrap();
+            let expected = if recovered {
+                ContractStatus::Done
+            } else {
+                ContractStatus::Failed
+            };
+            assert_eq!(
+                outcome.status, expected,
+                "loop finish(done) overrode the server's worker/checkpoint verdict"
+            );
+            let posted = regular_text(&root.join("posted.md")).unwrap();
+            if !recovered {
+                assert!(
+                    posted.starts_with("Dispatch outcome: Failed"),
+                    "server verdict was not first"
+                );
+                assert!(
+                    posted.contains("> loop claimed: done"),
+                    "loop's claimed status was not quoted below the server verdict"
+                );
+                assert!(
+                    regular_text(&root.join("outputs"))
+                        .unwrap()
+                        .contains("worker_failed=true")
+                );
+            }
+        });
     }
     #[test]
     fn p2_checkpoint_inherits_body_without_new_proposal() {
@@ -3338,7 +3474,12 @@ mod tests {
                 .outcome(ContractStatus::Done, "Worker claims body updated.")
                 .unwrap();
             let posted = regular_text(&root.join("posted.md")).unwrap();
-            assert!(posted.contains("PR body: updated") && posted.contains("Commits pushed: none"));
+            assert!(
+                posted.contains("PR body: updated")
+                    && posted.contains(&head[..12])
+                    && !posted.contains("(new in this run)"),
+                "body-only publication lost existing PR commit evidence"
+            );
         });
     }
     #[test]
@@ -3415,7 +3556,7 @@ mod tests {
                     .expect("failed harvest erased previous publication receipt"),
             )
             .unwrap();
-            assert!(!receipt.refused_workflow);
+            assert_eq!(receipt.head, good.trim());
             assert_eq!(
                 git(&state.join("work"), &["rev-parse", "HEAD"]).unwrap(),
                 good,
@@ -3494,6 +3635,34 @@ mod tests {
         });
     }
     #[test]
+    fn followup_lookup_recovers_on_a_later_call() {
+        let mut cache = LookupCache::<u64, String>::default();
+        let mut attempts = 0;
+        for turn in 1..=3 {
+            let result = cache.resolve(42, || {
+                attempts += 1;
+                if turn < 3 {
+                    Err(ScalerError::Guard("HTTP 503"))
+                } else {
+                    Ok(Some("recovered".into()))
+                }
+            });
+            assert_eq!(attempts, turn, "lookup spent later calls in one burst");
+            if turn < 3 {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap().as_deref(), Some("recovered"));
+            }
+        }
+        assert_eq!(
+            cache
+                .resolve(42, || panic!("positive result was not cached"))
+                .unwrap()
+                .as_deref(),
+            Some("recovered")
+        );
+    }
+    #[test]
     fn p816_lookup_errors_are_bounded_and_refusals_are_cached() {
         let mut runs = RunCache::default();
         let mut errors = 0;
@@ -3570,9 +3739,10 @@ mod tests {
             let mut server = server(root);
             server.dispatch.review = false;
             std::fs::write(root.join("fail-next-endpoint"), "/jobs?").unwrap();
+            assert!(server.select_branch("work/dispatch-799-42").is_err());
             assert!(
                 server.select_branch("work/dispatch-799-42").is_ok(),
-                "transient jobs lookup refused the branch instead of retrying"
+                "transient jobs lookup refused the branch on its later call"
             );
         });
     }
@@ -3580,8 +3750,14 @@ mod tests {
     fn p816_transient_artifact_list_recovers() {
         shared_fixture(|root| {
             std::fs::write(root.join("fail-next-endpoint"), "/artifacts?").unwrap();
+            let mut cache = RunCache::default();
             assert!(
-                RunCache::default()
+                cache
+                    .prior_artifact(root, 799, RunId(42), "contract.json")
+                    .is_err()
+            );
+            assert!(
+                cache
                     .prior_artifact(root, 799, RunId(42), "contract.json")
                     .is_ok(),
                 "transient artifact list failure was cached as refusal"
@@ -3592,8 +3768,14 @@ mod tests {
     fn p816_transient_bundle_download_recovers() {
         shared_fixture(|root| {
             std::fs::write(root.join("fail-next-download"), "").unwrap();
+            let mut cache = RunCache::default();
             assert!(
-                RunCache::default()
+                cache
+                    .prior_artifact(root, 799, RunId(42), "contract.json")
+                    .is_err()
+            );
+            assert!(
+                cache
                     .prior_artifact(root, 799, RunId(42), "contract.json")
                     .is_ok(),
                 "transient bundle download failure was cached as refusal"
@@ -3921,7 +4103,30 @@ esac
                 ),
                 (
                     "git",
-                    "#!/bin/sh\nfor arg do case \"$arg\" in ls-remote) cat \"$RUNNER_TEMP/remote-tip\"; exit 0 ;; esac; done\nexec /usr/bin/git \"$@\"\n",
+                    r#"#!/bin/sh
+authenticated=0
+for arg do
+ case "$arg" in
+ 'credential.helper=!gh auth git-credential') authenticated=1 ;;
+ fetch)
+  if test "$authenticated" = 1; then
+   test "$GH_TOKEN" = fixture-token || exit 96
+   for ref do :; done
+   exec /usr/bin/git fetch --no-tags "$RUNNER_TEMP/base" "$ref"
+  fi ;;
+ push)
+  /usr/bin/git rev-parse HEAD > "$RUNNER_TEMP/remote-tip"; exit 0 ;;
+ ls-remote)
+  for ref do :; done
+  if test "$ref" = refs/heads/main; then
+   test "$GH_TOKEN" = fixture-token || exit 96
+   exec /usr/bin/git ls-remote "$RUNNER_TEMP/base" refs/heads/main
+  fi
+  cat "$RUNNER_TEMP/remote-tip"; exit 0 ;;
+ esac
+done
+exec /usr/bin/git "$@"
+"#,
                 ),
             ] {
                 let path = bin.join(name);
@@ -4434,7 +4639,7 @@ esac
         });
     }
     #[test]
-    fn rev4_harvest_refuses_closing_another_issue_and_names_commit() {
+    fn rev4_commit_filter_refuses_closing_another_issue_and_names_commit() {
         shared_fixture(|root| {
             let base = root.join("base");
             std::fs::create_dir(&base).unwrap();
@@ -4449,18 +4654,19 @@ esac
             worker_checkout(&base, &root.join("unused"), &work, &server.dispatch, None).unwrap();
             git(&work, &["commit", "--allow-empty", "-m", "Fixes #999"]).unwrap();
             let bad = git(&work, &["rev-parse", "HEAD"]).unwrap();
-            let result = harvest_worker(
-                &actor,
-                &root.join("harvest"),
-                &server.dispatch,
-                Ok(0),
+            let harvested = root.join("harvest");
+            harvest_worker(&actor, &harvested, &server.dispatch, Ok(0)).unwrap();
+            let result = check_commit_closures(
+                &harvested,
                 &server.dispatch.base,
+                None,
+                server.dispatch.issue,
             );
             assert!(
                 result
                     .as_ref()
                     .is_err_and(|e| e.to_string().contains(bad.trim())),
-                "harvest accepted a closing keyword for another issue without naming its commit"
+                "publication filter accepted a closing keyword for another issue without naming its commit"
             );
         });
     }
@@ -4485,14 +4691,9 @@ esac
             )
             .unwrap();
             std::fs::write(actor.join("result.json"), json!({"structured_output":{"status":"blocked","summary":"implemented parser; linker failed","tests":["unit test passed"],"risks":[]}}).to_string()).unwrap();
-            let (contract, _, _, _) = harvest_worker(
-                &actor,
-                &root.join("harvest"),
-                &server.dispatch,
-                Ok(124),
-                &server.dispatch.base,
-            )
-            .unwrap();
+            let harvested =
+                harvest_worker(&actor, &root.join("harvest"), &server.dispatch, Ok(124)).unwrap();
+            let contract = harvested.contract;
             assert!(
                 contract
                     .summary
