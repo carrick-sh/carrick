@@ -1043,6 +1043,105 @@ fn native_exec_adoption_publishes_closed_manifest_before_consuming_receipt() {
 }
 
 #[test]
+fn first_exec_after_fork_exit_reuses_the_slot_with_a_fresh_root_incarnation() {
+    use carrick_core_abi::service::{
+        ExecAdoptionReceipt, ExecSuccessorBacking, ExecSuccessorEntry, ExecSuccessorManifest,
+        ServiceBirth, ServiceIdentity,
+    };
+    use carrick_core_abi::{El1MmHandle, EntryThreadGeneration, SnapshotGeneration};
+    use carrick_sched_core::process::TaskId;
+    use core::num::NonZeroI32;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let service = fixture.process_service();
+    let retired_mm = ReservationMm::new(7).unwrap();
+    let retired_space = fixture
+        .zone
+        .spaces
+        .publish_closed(retired_mm.raw(), 0x7000, 0x7000)
+        .unwrap();
+    assert_eq!(retired_space.index(), 7);
+    fixture
+        .region
+        .table()
+        .publish(
+            retired_space.index(),
+            retired_mm,
+            carrick_el1_abi::Layout {
+                heap: carrick_el1_abi::ReservationRange::new(4096, VA).unwrap(),
+                arena: carrick_el1_abi::ReservationRange::new(VA, VA + 0x1000_0000).unwrap(),
+                policy: carrick_el1_abi::ReservationPolicyPayload::new([
+                    4096,
+                    u64::MAX,
+                    u64::MAX,
+                    0,
+                    0,
+                ]),
+            },
+        )
+        .unwrap();
+    let view = crate::mm_portal::test_support::nodes(fixture.region);
+    fixture
+        .region
+        .table()
+        .lock_el1_resolved(retired_space.index(), retired_mm, &view, 0)
+        .unwrap()
+        .retire_final()
+        .unwrap();
+    fixture.zone.spaces.free(retired_space);
+
+    let identity = ServiceIdentity {
+        birth: ServiceBirth {
+            process: TaskKey {
+                id: TaskId::from_registry_allocation(NonZeroI32::new(7).unwrap()),
+                serial: TaskSerial::from_registry_allocation(NonZeroU64::new(11).unwrap()),
+            },
+            thread: EntryThreadGeneration::from_raw(13),
+            record: carrick_sched_core::RecordRef {
+                id: RecordId::from_raw(7).unwrap(),
+                incarnation: 17,
+            },
+            mm: unsafe {
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::MIN,
+                    ReservationMm::new(19).unwrap(),
+                    NonZeroU64::new(23).unwrap(),
+                )
+            },
+        },
+        execution: SnapshotGeneration::from_raw(29),
+        sequence: NonZeroU64::new(31).unwrap(),
+    };
+    // This key hashes to the just-retired slot. Receipt 1 is intentionally
+    // distinct from the real next reservation-root incarnation 2.
+    let successor_mm = ReservationMm::new(1031).unwrap();
+    let receipt = ExecAdoptionReceipt::checked(NonZeroU64::MIN).unwrap();
+    let manifest = ExecSuccessorManifest::propose(identity, successor_mm)
+        .seal(
+            identity,
+            receipt,
+            ExecSuccessorBacking {
+                root: RootGpa::page_aligned(FrameGpa::new(0x90_0000)).unwrap(),
+                root_generation: NonZeroU64::new(2).unwrap(),
+                asid: asid(47),
+                asid_generation: NonZeroU64::new(53).unwrap(),
+            },
+            ExecSuccessorEntry {
+                entry: UserVa::new(0x40_0000),
+                stack_pointer: UserVa::new(0x7fff_f000),
+            },
+        )
+        .unwrap();
+
+    assert!(
+        service
+            .adopt_exec_successor(identity, receipt, &manifest)
+            .is_ok(),
+        "the first exec after a fork/exit must use slot 7 incarnation 2"
+    );
+}
+
+#[test]
 fn first_process_call_acquires_a_root_authenticated_home_record() {
     let fixture = Fixture::new(0x10000, asid(1));
     let source = BornInZoneSource {

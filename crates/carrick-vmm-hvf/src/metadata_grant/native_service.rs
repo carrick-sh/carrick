@@ -176,13 +176,29 @@ impl NativeService {
             TrapError::Hypervisor("native exec receipt space exhausted".to_owned())
         })?;
         let asid = prepared.prepared_asid().ok_or_else(stale)?;
+        let region = retained_abi_region(&self.custody).ok_or_else(stale)?;
+        let (_, zone) = stopped_records(
+            region,
+            carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
+        )
+        .ok_or_else(stale)?;
+        let root_index = zone
+            .spaces
+            .next_publication_index(successor_mm.raw())
+            .ok_or_else(stale)?;
+        let root_generation = region
+            .reservations()
+            .ok_or_else(stale)?
+            .next_publication_generation(root_index.index())
+            .map_err(|_| stale())?;
         let sealed = unsafe { manifest.as_ref() }
             .seal(
                 identity,
                 receipt,
                 carrick_core_abi::service::ExecSuccessorBacking {
                     root: prepared.root(),
-                    root_generation: receipt.raw(),
+                    root_generation: core::num::NonZeroU64::new(root_generation.raw())
+                        .ok_or_else(stale)?,
                     asid: asid.asid(),
                     asid_generation: core::num::NonZeroU64::new(asid.generation())
                         .ok_or_else(stale)?,

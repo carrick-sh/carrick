@@ -448,6 +448,26 @@ impl AddressSpaces {
         None
     }
 
+    /// Host, serialized: identify the slot that the next closed publication
+    /// for `key` will use without mutating it. A later publication still
+    /// revalidates the slot; this is only for sealing the exact reservation
+    /// root incarnation into a prepared transaction.
+    pub fn next_publication_index(&self, key: u64) -> Option<SpaceIndex> {
+        if key == 0 || key == FREED {
+            return None;
+        }
+        let start = (key % ADDRESS_SPACES as u64) as usize;
+        for probe in 0..ADDRESS_SPACES {
+            let index = (start + probe) % ADDRESS_SPACES;
+            let entry = &self.entries[index];
+            let current = entry.key.load(Ordering::SeqCst);
+            if (current == 0 || current == FREED) && entry.notifications.reusable() {
+                return SpaceIndex::from_index(index);
+            }
+        }
+        None
+    }
+
     /// Host: let EL1 install the entry (pauses raised meanwhile stay
     /// counted).
     pub fn open(&self, index: SpaceIndex) {

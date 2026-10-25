@@ -69,6 +69,15 @@ impl<'a> RetainedAbiRegion<'a> {
             .is_multiple_of(core::mem::align_of::<T>())
             .then_some(pointer.cast())
     }
+
+    fn reservations(self) -> Option<&'a carrick_el1::memory::reservations::SharedReservations> {
+        let pointer = self.record_ptr::<carrick_el1::memory::reservations::SharedReservations>(
+            carrick_el1_abi::EL1_RESERVATIONS_OFFSET as usize,
+        )?;
+        // SAFETY: the retained ABI mapping contains the initialized shared
+        // reservation table at this typed, layout-hashed offset.
+        Some(unsafe { &*pointer })
+    }
 }
 
 /// Runtime-owned handback venue for an already enrolled parent wait.
