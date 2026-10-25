@@ -281,3 +281,22 @@ fn workspace_test_and_shards_agree_including_unconditional_kernel_control() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn workspace_capture_with_artifact_and_no_cargo_environment() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let directory = tempfile::tempdir().unwrap();
+    let artifact = directory.path().join("xtask artifact");
+    std::fs::copy(env!("CARGO_BIN_EXE_carrick-xtask"), &artifact).unwrap();
+    let output = Command::new(&artifact)
+        .args(["--root", root.to_str().unwrap(), "check-test-shards"])
+        .env("CARRICK_XTASK_BIN", &artifact)
+        .env_remove("CARGO")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

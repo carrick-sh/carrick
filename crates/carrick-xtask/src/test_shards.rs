@@ -3,8 +3,8 @@
 //! Equality of the Cargo invocation multiset is deliberately stronger than a
 //! list of test names: features, target kinds, filters, serial execution and
 //! stack budgets must also match. Whole selections include future tests without
-//! maintaining a second test-name inventory. Cargo tree still runs normally so
-//! the portable dependency closure remains authoritative.
+//! maintaining a second test-name inventory. Cargo tree and metadata still run normally
+//! so dependency closures and lane selections remain authoritative.
 //!
 //! In addition to the Cargo invocation multiset, `check-test-shards` resolves
 //! per-binary compile-time feature sets across each compilation unit (including
@@ -63,7 +63,7 @@ case "$subcmd" in
         fi
         exec "$CARRICK_REAL_CARGO" "$@"
         ;;
-    tree)
+    tree|metadata)
         exec "$CARRICK_REAL_CARGO" "$@"
         ;;
     test)
