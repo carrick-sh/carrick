@@ -1936,10 +1936,7 @@ impl MmAccessState {
                 }
             };
             let identity = owner.record_identity();
-            if custody
-                .stage1_unpublished_for_retirement(identity)
-                .is_none()
-            {
+            if custody.stage2_retirement_authorization(identity).is_none() {
                 let rollback = owner.take_unpublished_rollback().ok_or_else(|| {
                     TrapError::Hypervisor(
                         "rollback arena lost its unpublished stage-2 receipt".to_owned(),

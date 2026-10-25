@@ -715,9 +715,7 @@ fn retire_test_structural_backing_identities_in_using(
 ) -> Result<(), TrapError> {
     for &identity in identities {
         if custody.stage2_record_snapshot(identity.record_id).is_some()
-            && custody
-                .stage1_unpublished_for_retirement(identity)
-                .is_none()
+            && custody.stage2_retirement_authorization(identity).is_none()
         {
             let receipt = custody.editor_receipt_after_test_unmap(identity);
             let stage1 = custody

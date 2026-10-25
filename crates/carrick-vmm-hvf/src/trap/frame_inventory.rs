@@ -1621,7 +1621,7 @@ impl HvfVmState {
     ) -> Result<(), TrapError> {
         let outcome = if let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length)
         {
-            let proof = if let Some(proof) = custody.stage1_unpublished_for_retirement(identity) {
+            let proof = if let Some(proof) = custody.stage2_retirement_authorization(identity) {
                 Stage2RetirementProof::Authorized(proof)
             } else {
                 Stage2RetirementProof::Unpublished(
@@ -1679,10 +1679,7 @@ impl HvfVmState {
                 .retained
                 .owner_retired
                 .store(true, std::sync::atomic::Ordering::Release);
-            if custody
-                .stage1_unpublished_for_retirement(identity)
-                .is_none()
-            {
+            if custody.stage2_retirement_authorization(identity).is_none() {
                 let proof = custody
                     .stage1_unpublished_from_receipt(identity, stage1_receipt)
                     .ok_or_else(|| {
@@ -1727,10 +1724,7 @@ impl HvfVmState {
         // whose lease was still live, and the lease's `Drop` then released it
         // again.
         if let Some(identity) = take_carrier_stage2_record(custody, ipa, length) {
-            if custody
-                .stage1_unpublished_for_retirement(identity)
-                .is_none()
-            {
+            if custody.stage2_retirement_authorization(identity).is_none() {
                 let proof = custody
                     .stage1_unpublished_from_receipt(identity, stage1_receipt)
                     .ok_or_else(|| {
@@ -2341,7 +2335,7 @@ impl HvfVmState {
                 continue;
             };
             let stage1 =
-                if let Some(stage1) = custody.stage1_unpublished_for_retirement(record_identity) {
+                if let Some(stage1) = custody.stage2_retirement_authorization(record_identity) {
                     Stage2RetirementProof::Authorized(stage1)
                 } else {
                     let absence =

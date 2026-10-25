@@ -1527,13 +1527,17 @@ pub(crate) fn install_ipc_window_using(
                         )));
                     }
                     let stage1 = custody
-                        .stage1_unpublished_for_retirement(identity)
+                        .stage2_retirement_authorization(identity)
                         .ok_or_else(|| {
                             TrapError::Hypervisor(
                                 "IPC rollback lost exact retirement authority".to_owned(),
                             )
                         })?;
-                    match custody.retire_stage2_record_using(identity, stage1, &mut unmap) {
+                    match custody.retire_stage2_record_using(
+                        identity,
+                        std::sync::Arc::clone(&stage1),
+                        &mut unmap,
+                    ) {
                         CarrierStage2RetireOutcome::RetiredUnmapped
                         | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
                             if custody

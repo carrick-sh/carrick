@@ -963,10 +963,10 @@ fn retire_metadata_record_using(
     {
         return false;
     }
-    let Some(stage1) = custody.stage1_unpublished_for_retirement(identity) else {
+    let Some(stage1) = custody.stage2_retirement_authorization(identity) else {
         return false;
     };
-    match custody.retire_stage2_record_using(identity, stage1, unmap) {
+    match custody.retire_stage2_record_using(identity, std::sync::Arc::clone(&stage1), unmap) {
         CarrierStage2RetireOutcome::RetiredUnmapped
         | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => custody
             .remove_terminal_stage2_record(identity, stage1)
