@@ -58,6 +58,7 @@ pub enum CarrierStage2RetireOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CarrierStage2RecordError {
     InvalidExtent,
+    ExtentCollision,
     NoLiveVm,
     VmGenerationMismatch,
     RecordIdExhausted,

@@ -3565,11 +3565,13 @@ enum HvpatchCarrierTaskState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-enum HvpatchCarrierMmAuthority {
+pub(crate) enum HvpatchCarrierMmAuthority {
     Live {
         stage2_logical_leases: Vec<CarrierStage2LogicalLease>,
         custody: std::sync::Weak<CarrierVmCustody>,
         frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+        stage1_unpublished:
+            parking_lot::Mutex<Option<carrick_core::mm::retirement::Stage1UnpublishedMm>>,
         _vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     },
     #[cfg(test)]
@@ -3584,6 +3586,33 @@ enum HvpatchCarrierMmAuthority {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvpatchCarrierMmAuthority {
+    fn publish_stage1_unpublished(
+        &self,
+        proof: carrick_core::mm::retirement::Stage1UnpublishedMm,
+    ) -> Result<(), TrapError> {
+        #[cfg(not(test))]
+        let Self::Live {
+            stage1_unpublished, ..
+        } = self;
+        #[cfg(test)]
+        let stage1_unpublished = match self {
+            Self::Live {
+                stage1_unpublished, ..
+            } => stage1_unpublished,
+            Self::Test { .. } | Self::LeaseTest { .. } => return Ok(()),
+        };
+        let mut slot = stage1_unpublished.lock();
+        if slot.replace(proof).is_some() {
+            return Err(TrapError::Hypervisor(
+                "duplicate stage-1 unpublication proof for carrier MM".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -3591,7 +3620,7 @@ enum HvpatchCarrierMmAuthority {
     ::core::cmp::Eq,
     ::core::cmp::PartialEq,
 )]
-struct CarrierStage2LogicalLease {
+pub(crate) struct CarrierStage2LogicalLease {
     key: (u64, u64),
     logical_owner: Option<CarrierLogicalOwner>,
 }
@@ -3619,6 +3648,7 @@ fn request_carrier_stage2_record_retirements(
     stage2_logical_leases: &mut Vec<CarrierStage2LogicalLease>,
     custody: &std::sync::Weak<CarrierVmCustody>,
     frames: &std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+    stage1_unpublished: Option<&carrick_core::mm::retirement::Stage1UnpublishedMm>,
 ) {
     let Some(custody) = custody.upgrade() else {
         stage2_logical_leases.clear();
@@ -3651,7 +3681,16 @@ fn request_carrier_stage2_record_retirements(
     };
     for identity in retirements {
         custody.enqueue_carrier_stage2_retirement(identity);
-        let outcome = custody.request_stage2_record_retirement(identity);
+        let stage1 = match stage1_unpublished {
+            Some(stage1_unpublished) => {
+                custody.stage1_unpublished_by_inventory_commit(identity, stage1_unpublished)
+            }
+            #[cfg(test)]
+            None => custody.stage1_unpublished_by_inventory_commit_for_test(identity),
+            #[cfg(not(test))]
+            None => unreachable!("production MM retirement requires stage-1 proof"),
+        };
+        let outcome = custody.request_stage2_record_retirement(identity, stage1);
         if outcome != CarrierStage2RetireOutcome::DeferredActivePins {
             custody.cancel_carrier_stage2_retirement(identity);
             continue;
@@ -3670,9 +3709,30 @@ impl Drop for HvpatchCarrierMmAuthority {
                 stage2_logical_leases,
                 custody,
                 frames,
+                stage1_unpublished,
                 ..
             } => {
-                request_carrier_stage2_record_retirements(stage2_logical_leases, custody, frames);
+                if stage2_logical_leases.is_empty() {
+                    return;
+                }
+                let Some(stage1_unpublished) = stage1_unpublished.get_mut().take() else {
+                    // The typed exit/exec paths publish this proof before the
+                    // last MM authority can drop.  If a future internal path
+                    // violates that contract, leave the stage-2 records in
+                    // the directory: their IPAs stay quarantined instead of
+                    // retiring authority ahead of stage 1.
+                    debug_assert!(
+                        false,
+                        "carrier MM dropped without stage-1 unpublication proof"
+                    );
+                    return;
+                };
+                request_carrier_stage2_record_retirements(
+                    stage2_logical_leases,
+                    custody,
+                    frames,
+                    Some(&stage1_unpublished),
+                );
             }
             #[cfg(test)]
             Self::Test { order } => {
@@ -3693,6 +3753,7 @@ impl Drop for HvpatchCarrierMmAuthority {
                     &mut logical_leases,
                     &std::sync::Arc::downgrade(custody),
                     frames,
+                    None,
                 );
             }
         }
@@ -5715,7 +5776,7 @@ impl HvpatchCarrierTaskStateDirectory {
         task_mm: &std::sync::Arc<HvpatchTaskMmAuthority>,
         stage2_record_identities: Vec<CarrierStage2RecordIdentity>,
         custody: &std::sync::Arc<CarrierVmCustody>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<std::sync::Arc<HvpatchCarrierMmAuthority>>, TrapError> {
         if key.directory_instance != self.instance {
             return Err(TrapError::Hypervisor(
                 "cross-directory HVPatch carrier token rejected".to_owned(),
@@ -5755,6 +5816,7 @@ impl HvpatchCarrierTaskStateDirectory {
                     ),
                     custody: std::sync::Arc::downgrade(custody),
                     frames,
+                    stage1_unpublished: parking_lot::Mutex::new(None),
                     _vm: _vm.clone(),
                 }))
             }
@@ -5786,7 +5848,7 @@ impl HvpatchCarrierTaskStateDirectory {
         }
         inner.retain_mm_binding(new_mm_key, task_mm);
         task_mm.record_holder(HvpatchTaskMmHolder::CarrierDirectory);
-        Ok(())
+        Ok(existing_carrier_mm)
     }
 
     /// The live CLONE_VM/vfork sharer authority interned for `mm` on the
@@ -5828,6 +5890,27 @@ pub(crate) struct HvpatchTaskRegistration {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvpatchTaskRegistration {
+    #[cfg_attr(test, allow(dead_code))]
+    fn publish_stage1_unpublished(
+        &self,
+        proof: carrick_core::mm::retirement::Stage1UnpublishedMm,
+    ) -> Result<(), TrapError> {
+        let carrier_mm = self
+            .directory
+            .inner
+            .lock()
+            .states
+            .get(&self.key)
+            .and_then(|row| row._mm.as_ref())
+            .cloned()
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "stage-1 unpublication has no exact carrier MM authority".to_owned(),
+                )
+            })?;
+        carrier_mm.publish_stage1_unpublished(proof)
+    }
+
     fn register_foreign_mm(&mut self, task: &HvfTaskState) -> Result<(), TrapError> {
         if self.foreign_mm_registration.is_some() {
             return Err(TrapError::Hypervisor(
@@ -6088,13 +6171,13 @@ impl HvpatchTaskRegistration {
         stage2_record_identities: Vec<CarrierStage2RecordIdentity>,
         custody: &std::sync::Arc<CarrierVmCustody>,
         retain_shared_predecessor_authority: bool,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<std::sync::Arc<HvpatchCarrierMmAuthority>>, TrapError> {
         let new_mm_key = HvpatchMmAuthorityKey {
             task_serial: self.expected_identity.task_serial,
             mm_root_slot: Some(replacement_mm_root_slot),
             shared_kernel_mm: None,
         };
-        self.directory.rebind_exec_task_mm(
+        let predecessor_carrier_mm = self.directory.rebind_exec_task_mm(
             self.key,
             new_mm_key,
             &new_task_mm,
@@ -6152,7 +6235,7 @@ impl HvpatchTaskRegistration {
             }
         }
         self.task_mm = Some(new_task_mm);
-        Ok(())
+        Ok(predecessor_carrier_mm)
     }
 
     pub(crate) fn retire_dormant_authority(&mut self) {
@@ -6571,6 +6654,7 @@ impl HvpatchCarrierTaskStateDirectory {
                                 );
                             }),
                         ),
+                        stage1_unpublished: parking_lot::Mutex::new(None),
                     }))
                 }),
                 None,
@@ -6590,6 +6674,7 @@ impl HvpatchCarrierTaskStateDirectory {
                                 );
                             }),
                         ),
+                        stage1_unpublished: parking_lot::Mutex::new(None),
                     }))
                 }),
                 None,
@@ -6645,6 +6730,7 @@ impl HvpatchCarrierTaskStateDirectory {
                                 );
                             }),
                         ),
+                        stage1_unpublished: parking_lot::Mutex::new(None),
                     })),
                     None,
                 )

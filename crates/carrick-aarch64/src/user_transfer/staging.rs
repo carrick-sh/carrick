@@ -66,7 +66,6 @@ pub(super) fn stage_page<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
     intent: PortalTransferIntent,
     fork_sequence: Option<NonZeroU64>,
 ) -> Result<Result<prepared::RetainedWritePage<C::Pin>, MemoryPrepareError>, TrapError> {
-    custody.settle_stage1_rewrites(target);
     let service = engine.transfer_service_loan()?;
     Ok(stage_with_loan(
         service,
@@ -255,7 +254,10 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
     let retry = unsafe {
         carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, retry_cause, frame.x[17])
     };
-    let pin = retain_selected(custody.retain_for(target, va, selected, len, intent), retry)?;
+    let pin = retain_selected(
+        custody.retain_for(target, va, selected, len, intent, retry),
+        retry,
+    )?;
     if let Some(wait) = pin.pending() {
         return Err(MemoryPrepareError::Physical(wait));
     }
@@ -291,23 +293,14 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
 
 fn retain_selected<P>(
     result: Result<TransferRetention<P>, TrapError>,
-    retry: carrick_el1_abi::PortalOwnerWait,
+    _retry: carrick_el1_abi::PortalOwnerWait,
 ) -> Result<P, MemoryPrepareError> {
     match result.map_err(|error| {
         MemoryPrepareError::Fault(carrick_guest_mem::MemoryError::HostMap(error.to_string()))
     })? {
         TransferRetention::Retained(pin) => Ok(pin),
         TransferRetention::Physical(wait) => Err(MemoryPrepareError::Physical(wait)),
-        TransferRetention::PendingStage1Rewrite => Err(MemoryPrepareError::OwnerWait(unsafe {
-            carrick_el1_abi::PortalOwnerWait::from_owner(
-                retry.handle(),
-                carrick_el1_abi::PortalWaitCause::PendingStage1Rewrite,
-                retry.revision(),
-            )
-        })),
-        TransferRetention::Unmapped { address, length } => Err(MemoryPrepareError::Fault(
-            carrick_guest_mem::MemoryError::OutOfBounds { address, length },
-        )),
+        TransferRetention::Editor(wait) => Err(MemoryPrepareError::OwnerWait(wait)),
     }
 }
 
@@ -365,34 +358,14 @@ mod tests {
     }
 
     #[test]
-    fn owed_stage1_rewrite_returns_exact_editor_producer() {
+    fn stale_selection_returns_exact_editor_producer() {
         let retry = editor_retry();
         assert!(matches!(
-            retain_selected::<()>(Ok(TransferRetention::PendingStage1Rewrite), retry),
+            retain_selected::<()>(Ok(TransferRetention::Editor(retry)), retry),
             Err(MemoryPrepareError::OwnerWait(found))
                 if found.handle() == retry.handle()
                     && found.revision() == retry.revision()
-                    && found.cause() == carrick_el1_abi::PortalWaitCause::PendingStage1Rewrite
-        ));
-    }
-
-    #[test]
-    fn producer_free_selection_is_a_guest_mapping_fault() {
-        let retry = editor_retry();
-        assert!(matches!(
-            retain_selected::<()>(
-                Ok(TransferRetention::Unmapped {
-                    address: 0x4040_1000,
-                    length: 4,
-                }),
-                retry,
-            ),
-            Err(MemoryPrepareError::Fault(
-                carrick_guest_mem::MemoryError::OutOfBounds {
-                    address: 0x4040_1000,
-                    length: 4,
-                }
-            ))
+                    && found.cause() == carrick_el1_abi::PortalWaitCause::Editor
         ));
     }
 }

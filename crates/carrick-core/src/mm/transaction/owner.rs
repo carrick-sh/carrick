@@ -413,7 +413,7 @@ impl<
             Wire::PendingEdit => Cause::PendingEdit,
             Wire::Gate => Cause::Gate,
             Wire::Metadata => Cause::Metadata,
-            Wire::ReservationPool | Wire::PendingStage1Rewrite => {
+            Wire::ReservationPool => {
                 return Err(MmError::Invalid);
             }
         };

@@ -1,5 +1,73 @@
 # Issue #847 signed hardware evidence
 
+## Stage-1-first retirement candidate (2026-10-25)
+
+The current candidate supersedes the producer-by-producer corrections recorded
+later in this file. It makes the problematic state unrepresentable: a carrier
+stage-2 retirement request requires a non-cloneable `Stage1Unpublished`
+witness. Ordinary mapping retirement mints that witness only at its Editor
+release boundary. Whole-MM exit and exec first close and retire the MM's
+published stage-1 entry, then carry `Stage1UnpublishedMm` through detached
+inventory cleanup. The predecessor carrier-MM authority remains retained until
+that proof arrives, so exec replacement cannot drop it early.
+
+Host copy now has three outcomes after SELECT: an advanced Editor revision
+reselects immediately, a held Editor parks on its guaranteed release, and an
+unchanged/free Editor with a current leaf records
+`STAGE2_AUTHORITY_INVARIANT` and SIGKILLs only that MM. It never fabricates
+`EFAULT` for a valid buffer and never aborts the carrier. Stage-2 publication
+and rollback use one RAII publication guard. Terminal retirement refusal keeps
+the physical extent quarantined; overlapping stage-2 registration is rejected
+with `ExtentCollision`.
+
+The VM-free production-path proof covers the issue's ten requested shapes:
+
+1. `serial_host_editor_release_after_select_reselects_without_stranding`
+   advances the Editor after SELECT and completes through immediate reselect.
+2. The owner-wait population parks with an Editor held, enrolls before probing,
+   and wakes whether release wins before or after enrollment. The typed whole-MM
+   ordering witness confirms that Editor publication/source retirement precede
+   the first global-frame free operation.
+3. `stage2_publication_commit_guard_wakes_valid_leaf_and_rebinds_successor` and
+   `stage2_publication_rollback_guard_wakes_enrolled_copy` cover both RAII
+   outcomes.
+4. The commit witness retains the inserted successor without another park.
+5. The existing two-live-thread IPC owner-wait cancellation witness drives
+   process exit while a sibling copy is parked; the executor ordering witness
+   drives exec cleanup through the same typed unpublication crossing.
+6. `terminal_stage2_retirement_is_invisible_and_quarantines_ipa` proves the
+   copy cannot retain the refused record and the IPA cannot be registered
+   again.
+7. `retirement_request_signature_requires_stage1_unpublished_witness` fixes
+   the request signature at compile time.
+8. `serial_host_unchanged_selection_without_stage2_authority_kills_only_its_mm`
+   drives the production park consumer and observes MM-local SIGKILL handling.
+9. `two_mms_reselect_without_accumulating_retirement_state` drives 256
+   selections across two MMs and observes no copy-side retirement state.
+10. `host_read_retains_pooled_frame_across_concurrent_munmap` and the bounded
+    production IPC owner-wait/executor witnesses cover the munmap/read and
+    exhausted-capacity halves: the admitted copy either completes or follows
+    its guest fault path, without losing its retained frame or polling.
+
+There is deliberately no `OwedStage1Rewrite` token in the terminal witness.
+The terminal record itself is the carrier quarantine: it remains in the
+physical extent index, rejects reuse, and is invisible to correct copies after
+stage-1 unpublication.
+
+Portable verification on the stage-1-first candidate:
+
+- the focused production-path witnesses listed above passed;
+- `just fmt-check`, `just clippy`, `just clippy-linux`, `just lint-domains`,
+  and `just test-kernel` passed;
+- the normal EL1 image loads 1,053,104 of 1,572,864 bytes and its maximum
+  checked stack is 11,503 of 12,288 bytes (`native wait copy`);
+- the all-target EL1 image loads 1,077,712 of 1,572,864 bytes and its maximum
+  checked stack is 11,951 of 12,288 bytes (`signal terminal exit`).
+
+The exact candidate SHA is recorded in the worker handoff. No new signed run
+was made because this source needs an exact fixture bundle; the requested
+20/20 hardware proof remains the next step.
+
 This receipt records the final cloudmac/HVF proof for PR #855 at source
 `6c45f14f90cb22c5f1279fb0ab92b433c61f45f3`. The exact fixture archive was:
 

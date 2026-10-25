@@ -1552,7 +1552,8 @@ pub(crate) fn register_carrier_stage2_leases(
                     0,
                     None,
                 )?;
-                let _ = custody.request_stage2_record_retirement(identity);
+                let stage1 = custody.stage1_unpublished_by_unpublished_inventory_rollback(identity);
+                let _ = custody.request_stage2_record_retirement(identity, stage1);
             }
         }
         return Err(error);
@@ -1571,7 +1572,7 @@ pub(crate) fn register_carrier_stage2_leases(
         identities.push(identity);
     }
     drop(registered);
-    custody.publish_stage2_availability_change();
+    custody.stage2_publication_authority().changed();
     Ok(identities)
 }
 
@@ -1852,7 +1853,7 @@ pub(crate) fn register_global_frame_host_owner_in_using(
     }
     owners.insert(key, GlobalFrameOwnerEntry::Live(owner));
     drop(owners);
-    custody.publish_stage2_availability_change();
+    custody.stage2_publication_authority().changed();
     Ok(generation)
 }
 
@@ -1927,7 +1928,7 @@ pub(crate) fn register_pooled_global_frame_host_owner_in(
     }
     owners.insert(key, GlobalFrameOwnerEntry::Live(owner));
     drop(owners);
-    custody.publish_stage2_availability_change();
+    custody.stage2_publication_authority().changed();
     Ok(generation)
 }
 
@@ -2354,7 +2355,7 @@ impl StructuralBackingOwner {
             .structural_backings
             .lock()
             .insert(identity.record_id, std::sync::Arc::clone(&retained));
-        custody.publish_stage2_availability_change();
+        custody.stage2_publication_authority().changed();
         Ok(std::sync::Arc::new(Self {
             custody: std::sync::Arc::downgrade(custody),
             retained,
@@ -2422,7 +2423,7 @@ impl StructuralBackingOwner {
             .structural_backings
             .lock()
             .insert(identity.record_id, std::sync::Arc::clone(&retained));
-        custody.publish_stage2_availability_change();
+        custody.stage2_publication_authority().changed();
         Ok(std::sync::Arc::new(Self {
             custody: std::sync::Arc::downgrade(custody),
             retained,
@@ -2479,7 +2480,8 @@ impl Drop for StructuralBackingOwner {
             return;
         };
         let identity = *self.retained.record_identity.lock();
-        let _ = custody.request_stage2_record_retirement(identity);
+        let stage1 = custody.stage1_unpublished_by_editor(identity);
+        let _ = custody.request_stage2_record_retirement(identity, stage1);
         // The carrier pre-maps pooled table slots. Their stage-2 record has no
         // backend mapping to unmap, so the final owner can complete retirement
         // without issuing a hypervisor operation from Drop. This also releases
@@ -2941,7 +2943,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             ));
             owners.insert(key, GlobalFrameOwnerEntry::Live(successor));
             drop(owners);
-            custody.publish_stage2_availability_change();
+            custody.stage2_publication_authority().changed();
             let _ = custody.remove_terminal_stage2_record(owner.record_identity);
             report.rebound += 1;
             continue;
@@ -3068,7 +3070,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             }
             records.insert(key, new_identity);
             drop(records);
-            custody.publish_stage2_availability_change();
+            custody.stage2_publication_authority().changed();
             let _ = custody.remove_terminal_stage2_record(old_identity);
             report.rebound += 1;
             continue;
@@ -3306,7 +3308,8 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
         }
         let generation = owner.generation();
         if owner.mapping.pin_count() != 0 {
-            let outcome = custody.request_stage2_record_retirement(owner.record_identity);
+            let stage1 = custody.stage1_unpublished_by_editor(owner.record_identity);
+            let outcome = custody.request_stage2_record_retirement(owner.record_identity, stage1);
             if outcome != CarrierStage2RetireOutcome::DeferredActivePins {
                 return GlobalFrameRetirementOutcome::RetryPending {
                     ipa,

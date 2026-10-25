@@ -658,13 +658,13 @@ impl PoolControl {
         backend: &mut E,
         boundary: &WorkerBoundaryAudit,
         receipts: &ReceiptLog,
-    ) -> Result<(), String> {
+    ) -> Result<carrick_core::mm::retirement::Stage1UnpublishedMm, String> {
         // Guest EL1 may have installed the address space on vCPUs itself:
         // they are out of it (and its entry freed) before the ASID's
         // translations are invalidated for reuse.
-        retirement.retire_address_space();
+        let stage1_unpublished = retirement.retire_address_space();
         if !retirement.needs_invalidation() {
-            return Ok(());
+            return Ok(stage1_unpublished);
         }
         let generation = retirement.asid_generation();
         boundary
@@ -688,7 +688,8 @@ impl PoolControl {
         );
         retirement
             .acknowledge(crate::hvpatch::BroadcastInvalidation::completed(generation))
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok(stage1_unpublished)
     }
 }
 

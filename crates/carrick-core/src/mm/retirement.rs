@@ -785,22 +785,73 @@ impl LeaseGate {
 pub trait AddressPublication {
     fn retire_reservations(&self);
 }
+
+/// Non-cloneable proof that an MM's published stage-1 identity was closed,
+/// drained, and released before any of its stage-2 authority can retire.
+///
+/// Only [`drain_publication`] constructs this proof. Backends receive it from
+/// the address-space retirement owner instead of reconstructing the ordering
+/// from a flag or a revision sampled after the fact.
+#[derive(::core::fmt::Debug)]
+pub struct Stage1UnpublishedMm {
+    _private: (),
+}
+
 /// Drop the closed publication (draining sched-core occupants) before waiting
 /// for admitted host loads and deciding which hardware invalidation is owed.
 pub fn drain_publication<V: ResidencyVenue, G: Copy + Eq, P: AddressPublication>(
     publication: Option<P>,
     residency: &ResidencyRetirement<V, G>,
-) {
+) -> Stage1UnpublishedMm {
     if let Some(publication) = publication.as_ref() {
         publication.retire_reservations();
     }
     drop(publication);
     residency.wait_for_admitted_loads();
+    Stage1UnpublishedMm { _private: () }
 }
 
 #[cfg(test)]
 mod nonce_tests {
     use super::*;
+    use std::vec::Vec;
+
+    #[derive(Clone, Debug, Default)]
+    struct TestResidencyVenue {
+        state: std::sync::Arc<parking_lot::Mutex<ResidencyState>>,
+        settled: std::sync::Arc<parking_lot::Condvar>,
+    }
+
+    // SAFETY: every clone shares the same mutex and condition variable.
+    unsafe impl ResidencyVenue for TestResidencyVenue {
+        type Guard<'a> = parking_lot::MutexGuard<'a, ResidencyState>;
+
+        fn lock(&self) -> Self::Guard<'_> {
+            self.state.lock()
+        }
+
+        fn wait(&self, guard: &mut Self::Guard<'_>) {
+            self.settled.wait(guard);
+        }
+
+        fn notify_all(&self) {
+            self.settled.notify_all();
+        }
+    }
+
+    struct OrderedPublication(std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>);
+
+    impl AddressPublication for OrderedPublication {
+        fn retire_reservations(&self) {
+            self.0.lock().push("editor-revision");
+        }
+    }
+
+    impl Drop for OrderedPublication {
+        fn drop(&mut self) {
+            self.0.lock().push("editor-source-retired");
+        }
+    }
 
     #[derive(
         ::core::clone::Clone,
@@ -817,6 +868,31 @@ mod nonce_tests {
         fn size(self) -> u64 {
             0x4000
         }
+    }
+
+    #[test]
+    fn whole_mm_stage2_free_follows_editor_revision_and_source_retirement() {
+        let order = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let residency = AddressResidency::<TestResidencyVenue, u64>::new(1)
+            .begin_retirement()
+            .expect("retirement");
+
+        let _stage1_unpublished = drain_publication(
+            Some(OrderedPublication(std::sync::Arc::clone(&order))),
+            &residency,
+        );
+        // This models the first operation a consumer of Stage1UnpublishedMm
+        // may perform: carrier global-frame retirement/free.
+        order.lock().push("global-frame-free");
+
+        assert_eq!(
+            *order.lock(),
+            [
+                "editor-revision",
+                "editor-source-retired",
+                "global-frame-free"
+            ]
+        );
     }
 
     #[test]

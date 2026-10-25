@@ -70,10 +70,6 @@ pub enum PortalWaitCause {
     Gate = 4,
     Metadata = 5,
     ReservationPool = 6,
-    /// Host physical retirement owes a future stage-1 rewrite.  It shares the
-    /// MM Editor queue, but unlike a plain Editor refusal the producer may not
-    /// have taken the editor word yet.
-    PendingStage1Rewrite = 7,
 }
 impl PortalWaitCause {
     pub const fn encode(self) -> u64 {
@@ -87,7 +83,6 @@ impl PortalWaitCause {
             4 => Some(Self::Gate),
             5 => Some(Self::Metadata),
             6 => Some(Self::ReservationPool),
-            7 => Some(Self::PendingStage1Rewrite),
             _ => None,
         }
     }
@@ -359,9 +354,8 @@ pub struct PortalTransferSlot {
 /// when new words fit in the previous cache-line padding.
 pub const MM_TRANSFER_LAYOUT_HASH: u64 = {
     let words = [
-        3u64,
+        4u64,
         MM_PORTAL_PROTOCOL,
-        PortalWaitCause::PendingStage1Rewrite as u64,
         PREPARED,
         SUSPENDED,
         core::mem::size_of::<PortalTransferSlot>() as u64,
@@ -851,7 +845,6 @@ mod prepared_tests {
             PortalWaitCause::Gate,
             PortalWaitCause::Metadata,
             PortalWaitCause::ReservationPool,
-            PortalWaitCause::PendingStage1Rewrite,
         ] {
             let slot = PortalTransferSlot::new();
             let request = super::tests::request(1);

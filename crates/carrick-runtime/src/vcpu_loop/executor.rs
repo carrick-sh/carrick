@@ -980,14 +980,14 @@ where
         }
         let exec_cleanup_ran = pending_exec_retirement.is_some() || pending_exec_cleanup;
         if let Some(mut retirement) = pending_exec_retirement.take() {
-            match control.invalidate_after_exec(
+            let stage1_unpublished = match control.invalidate_after_exec(
                 &retirement,
                 executor_id,
                 backend,
                 boundary,
                 receipts,
             ) {
-                Ok(()) => {}
+                Ok(stage1_unpublished) => stage1_unpublished,
                 Err(error) => {
                     let settlement = match settlement_authority {
                         SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
@@ -1012,7 +1012,7 @@ where
                         settlement,
                     ));
                 }
-            }
+            };
             let root_ticket = match retirement.take_root_retirement_ticket() {
                 Ok(ticket) => ticket,
                 Err(error) => {
@@ -1040,7 +1040,9 @@ where
                     ));
                 }
             };
-            let root_receipt = match binding.retire_detached_exec_predecessor(root_ticket) {
+            let root_receipt = match binding
+                .retire_detached_exec_predecessor(root_ticket, Some(stage1_unpublished))
+            {
                 Ok(receipt) => receipt,
                 Err(error) => {
                     let settlement = match settlement_authority {
@@ -1094,7 +1096,7 @@ where
             pending_exec_cleanup = false;
         }
         if pending_exec_cleanup {
-            match binding.retire_detached_exec_predecessor(None) {
+            match binding.retire_detached_exec_predecessor(None, None) {
                 Ok(None) => {}
                 Ok(Some(_)) => {
                     carrick_fatal!(
@@ -1165,15 +1167,15 @@ where
                 tid = ?retirement.guest_tid(),
                 "terminal address space retirement",
             );
-            if let Some(stage1) = retirement.retirement() {
-                match control.invalidate_after_exec(
+            let stage1_unpublished = if let Some(stage1) = retirement.retirement() {
+                let stage1_unpublished = match control.invalidate_after_exec(
                     stage1,
                     executor_id,
                     backend,
                     boundary,
                     receipts,
                 ) {
-                    Ok(()) => {}
+                    Ok(stage1_unpublished) => stage1_unpublished,
                     Err(error) => {
                         tracing::error!(
                             executor = ?executor_id,
@@ -1205,8 +1207,11 @@ where
                             settlement,
                         ));
                     }
-                }
-            }
+                };
+                Some(stage1_unpublished)
+            } else {
+                None
+            };
             let root_ticket = match retirement.take_root_retirement_ticket() {
                 Ok(ticket) => ticket,
                 Err(error) => {
@@ -1234,8 +1239,8 @@ where
                     ));
                 }
             };
-            let cleanup = if retirement.retirement().is_some() {
-                binding.retire_detached_address_space(root_ticket)
+            let cleanup = if let Some(stage1_unpublished) = stage1_unpublished {
+                binding.retire_detached_address_space(root_ticket, stage1_unpublished)
             } else {
                 binding.retire_detached_shared_mm_edge().map(|()| None)
             };

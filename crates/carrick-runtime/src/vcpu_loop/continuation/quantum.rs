@@ -521,6 +521,7 @@ impl HvpatchTaskBinding {
     pub(crate) fn retire_detached_address_space(
         &self,
         _root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+        _stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, crate::trap::TrapError> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -545,6 +546,7 @@ impl HvpatchTaskBinding {
             // the only thing an operator saw.
             let retired = backend.retire_detached_address_space_with(
                 _root_ticket,
+                _stage1_unpublished,
                 |commit| {
                     self.quantum
                         .apply_detached_address_space_retirement_with_receipt(commit)
@@ -608,6 +610,7 @@ impl HvpatchTaskBinding {
     pub(crate) fn retire_detached_exec_predecessor(
         &self,
         _root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+        _stage1_unpublished: Option<carrick_core::mm::retirement::Stage1UnpublishedMm>,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, crate::trap::TrapError> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -624,7 +627,7 @@ impl HvpatchTaskBinding {
                         "detached exec cleanup backend type mismatch".to_owned(),
                     )
                 })?;
-            backend.retire_detached_exec_predecessor(_root_ticket)
+            backend.retire_detached_exec_predecessor(_root_ticket, _stage1_unpublished)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         Err(crate::trap::TrapError::Hypervisor(

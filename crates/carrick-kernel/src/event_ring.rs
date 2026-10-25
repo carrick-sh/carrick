@@ -341,6 +341,14 @@ pub const ZONE_IDLE_EXIT: u8 = 82;
 pub const ZONE_IDLE_ESR: u8 = 83;
 /// Full-width fault address for [`ZONE_IDLE_EXIT`]; `c` is the vCPU slot.
 pub const ZONE_IDLE_FAR: u8 = 84;
+/// A current unchanged stage-1 selection lost its required stage-2 authority.
+/// `a` is the low 32 bits of the MM key, `b` the guest TID, and `c` the
+/// selected Editor revision. The runtime terminates only this MM with SIGKILL.
+pub const STAGE2_AUTHORITY_INVARIANT: u8 = 85;
+
+pub fn rec_stage2_authority_invariant(mm: u64, tid: i32, revision: u64) {
+    rec(STAGE2_AUTHORITY_INVARIANT, low32(mm), tid, low32(revision));
+}
 
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -29,6 +29,9 @@ pub(crate) struct PendingExecStage2Cleanup {
     /// Never-reused predecessor MM identity from the matching COW binding.
     pub(crate) predecessor_mm: u64,
     pub(crate) shared_projection: bool,
+    /// The predecessor carrier-MM authority cannot drop until the exec's
+    /// stage-1 publication is closed and its Editor revision is visible.
+    pub(crate) carrier_mm: Option<std::sync::Arc<HvpatchCarrierMmAuthority>>,
     pub(crate) armed: bool,
 }
 
@@ -40,6 +43,51 @@ unsafe impl Send for PendingExecStage2Cleanup {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl PendingExecStage2Cleanup {
+    pub(crate) fn retire_after_stage1_unpublished(
+        &mut self,
+        stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
+    ) -> Result<(), TrapError> {
+        if self.shared_projection {
+            return Err(TrapError::Hypervisor(
+                "shared exec projection cannot consume MM unpublication proof".to_owned(),
+            ));
+        }
+        let carrier_mm = self.carrier_mm.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor(
+                "exec predecessor stage-1 proof has no retained carrier MM".to_owned(),
+            )
+        })?;
+        carrier_mm.publish_stage1_unpublished(stage1_unpublished)?;
+        let retired = self.retire();
+        if retired.is_ok() {
+            drop(self.carrier_mm.take());
+        }
+        retired
+    }
+
+    pub(crate) fn retire_with_root_proof_after_stage1_unpublished(
+        &mut self,
+        expected_root_slot: (u64, u64),
+        stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
+    ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
+        if self.shared_projection {
+            return Err(TrapError::Hypervisor(
+                "shared exec projection cannot consume MM unpublication proof".to_owned(),
+            ));
+        }
+        let carrier_mm = self.carrier_mm.as_ref().ok_or_else(|| {
+            TrapError::Hypervisor(
+                "exec predecessor stage-1 proof has no retained carrier MM".to_owned(),
+            )
+        })?;
+        carrier_mm.publish_stage1_unpublished(stage1_unpublished)?;
+        let retired = self.retire_with_root_proof(expected_root_slot);
+        if retired.is_ok() {
+            drop(self.carrier_mm.take());
+        }
+        retired
+    }
+
     pub(crate) fn retire(&mut self) -> Result<(), TrapError> {
         self.retire_with(&mut |event| {
             crate::probes::hvpatch_exec_predecessor_classification(event);
@@ -298,6 +346,14 @@ impl PendingExecStage2Cleanup {
 impl Drop for PendingExecStage2Cleanup {
     fn drop(&mut self) {
         if self.armed {
+            #[cfg(not(test))]
+            if !self.shared_projection {
+                // The typed commit path consumes this cleanup only after it
+                // receives the predecessor's stage-1-unpublished proof.  An
+                // unexpected unwind must not retire stage 2 early; retaining
+                // the directory records quarantines their IPAs.
+                return;
+            }
             if let Err(error) = self.retire() {
                 carrick_fatal!(
                     "hvpatch::exec_commit",
@@ -2143,6 +2199,7 @@ impl HvfVmState {
                     predecessor_identity,
                     predecessor_mm: predecessor_cow_identity.mm,
                     shared_projection,
+                    carrier_mm: None,
                     armed: true,
                 })
                 .is_some()
@@ -2411,17 +2468,23 @@ impl HvfVmState {
                         "missing registration for HVPatch exec rebind"
                     );
                 };
-                if let Err(error) = reg.rebind_exec_authority(
+                let predecessor_carrier_mm = match reg.rebind_exec_authority(
                     new_task_mm,
                     replacement_mm_root_slot,
                     stage2_lease_keys,
                     &custody,
                     shared_projection,
                 ) {
-                    carrick_fatal!(
+                    Ok(authority) => authority,
+                    Err(error) => carrick_fatal!(
                         "hvpatch::task_backend_lifecycle",
                         "rebind HVPatch exec MM authority: {error}"
-                    );
+                    ),
+                };
+                if !shared_projection {
+                    if let Some(cleanup) = self.pending_exec_stage2_cleanup.as_mut() {
+                        cleanup.carrier_mm = predecessor_carrier_mm;
+                    }
                 }
                 None
             } else {

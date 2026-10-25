@@ -3013,23 +3013,45 @@ impl HvfVmState {
         Self::retire_task_state_process_mappings(&mut self.task)
     }
 
+    pub(crate) fn retire_process_mappings_after_stage1_unpublished(
+        &mut self,
+        stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
+    ) -> Result<(), TrapError> {
+        Self::retire_task_state_process_mappings_after_stage1_unpublished(
+            &mut self.task,
+            stage1_unpublished,
+        )
+    }
+
     pub(crate) fn retire_task_state_process_mappings(
         task: &mut HvfTaskState,
     ) -> Result<(), TrapError> {
-        Self::retire_task_state_process_mappings_inner(task, None).map(|_| ())
+        Self::retire_task_state_process_mappings_inner(task, None, None).map(|_| ())
+    }
+
+    pub(crate) fn retire_task_state_process_mappings_after_stage1_unpublished(
+        task: &mut HvfTaskState,
+        stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
+    ) -> Result<(), TrapError> {
+        Self::retire_task_state_process_mappings_inner(task, None, Some(stage1_unpublished))
+            .map(|_| ())
     }
 
     pub(crate) fn retire_task_state_process_mappings_with_root_proof(
         task: &mut HvfTaskState,
         expected_root_slot: (u64, u64),
+        stage1_unpublished: Option<carrick_core::mm::retirement::Stage1UnpublishedMm>,
     ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
-        Self::retire_task_state_process_mappings_inner(task, Some(expected_root_slot))?.ok_or_else(
-            || {
-                TrapError::Hypervisor(
-                    "HVPatch process retirement produced no stage-1 root proof".to_owned(),
-                )
-            },
-        )
+        Self::retire_task_state_process_mappings_inner(
+            task,
+            Some(expected_root_slot),
+            stage1_unpublished,
+        )?
+        .ok_or_else(|| {
+            TrapError::Hypervisor(
+                "HVPatch process retirement produced no stage-1 root proof".to_owned(),
+            )
+        })
     }
 
     /// [`Self::settle_declined_lease_remainders`] for the remainders a
@@ -3081,6 +3103,7 @@ impl HvfVmState {
     pub(crate) fn retire_task_state_process_mappings_inner(
         task: &mut HvfTaskState,
         expected_root_slot: Option<(u64, u64)>,
+        stage1_unpublished: Option<carrick_core::mm::retirement::Stage1UnpublishedMm>,
     ) -> Result<Option<HvpatchMmRootRetirementProof>, TrapError> {
         /// Answer "which mapping rows contain `[ipa, ipa + length)`" for terminal
         /// retirement without re-walking every row per inventory extent.
@@ -3172,6 +3195,22 @@ impl HvfVmState {
         if !task.persistent_vm_lifecycle {
             return Ok(None);
         }
+        #[cfg(not(test))]
+        task.registration
+            .as_ref()
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "whole-MM retirement has no carrier registration for stage-1 proof".to_owned(),
+                )
+            })?
+            .publish_stage1_unpublished(stage1_unpublished.ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "production whole-MM retirement requires stage-1 unpublication proof"
+                        .to_owned(),
+                )
+            })?)?;
+        #[cfg(test)]
+        let _stage1_unpublished = stage1_unpublished;
         if let Some(mm) = task
             .cow_identity
             .and_then(|identity| carrick_el1_abi::ReservationMm::new(identity.mm))
@@ -3620,25 +3659,42 @@ impl HvfVmState {
 
     pub(crate) fn retire_task_state_exec_predecessor(
         task: &mut HvfTaskState,
+        stage1_unpublished: Option<carrick_core::mm::retirement::Stage1UnpublishedMm>,
     ) -> Result<(), TrapError> {
         let mut cleanup = task.pending_exec_stage2_cleanup.take().ok_or_else(|| {
             TrapError::Hypervisor(
                 "detached exec successor lost predecessor stage-2 cleanup authority".to_owned(),
             )
         })?;
-        cleanup.retire()
+        match stage1_unpublished {
+            Some(stage1_unpublished) => cleanup.retire_after_stage1_unpublished(stage1_unpublished),
+            None if cleanup.shared_projection => cleanup.retire(),
+            None => Err(TrapError::Hypervisor(
+                "exec predecessor stage-2 retirement lacks stage-1 unpublication proof".to_owned(),
+            )),
+        }
     }
 
     pub(crate) fn retire_task_state_exec_predecessor_with_root_proof(
         task: &mut HvfTaskState,
         expected_root_slot: (u64, u64),
+        stage1_unpublished: Option<carrick_core::mm::retirement::Stage1UnpublishedMm>,
     ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
         let mut cleanup = task.pending_exec_stage2_cleanup.take().ok_or_else(|| {
             TrapError::Hypervisor(
                 "detached exec successor lost predecessor stage-2 cleanup authority".to_owned(),
             )
         })?;
-        cleanup.retire_with_root_proof(expected_root_slot)
+        match stage1_unpublished {
+            Some(stage1_unpublished) => cleanup.retire_with_root_proof_after_stage1_unpublished(
+                expected_root_slot,
+                stage1_unpublished,
+            ),
+            None if cleanup.shared_projection => cleanup.retire_with_root_proof(expected_root_slot),
+            None => Err(TrapError::Hypervisor(
+                "exec predecessor stage-2 retirement lacks stage-1 unpublication proof".to_owned(),
+            )),
+        }
     }
 
     pub(crate) fn retire_task_state_dormant_authority(

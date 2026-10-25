@@ -1830,9 +1830,12 @@ pub fn detach_task_engine(
 
 pub fn retire_detached_task_engine(
     state: &mut HvpatchTaskEngineState,
+    stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
 ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
     let backend = state.backend_mut();
-    backend.state.retire_process_mappings()?;
+    backend
+        .state
+        .retire_process_mappings_after_stage1_unpublished(stage1_unpublished)?;
     backend.state.take_retirement_inventory().ok_or_else(|| {
         TrapError::Hypervisor(
             "detached HVPatch task retirement produced no inventory commit".to_owned(),
@@ -1844,6 +1847,7 @@ pub fn retire_detached_task_engine_with_root_proof(
     state: &mut HvpatchTaskEngineState,
     expected_root_base: u64,
     expected_root_size: u64,
+    stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
 ) -> Result<
     (
         carrick_hal::FrameInventoryCommit<()>,
@@ -1855,6 +1859,7 @@ pub fn retire_detached_task_engine_with_root_proof(
     let proof = HvfVmState::retire_task_state_process_mappings_with_root_proof(
         &mut backend.state.task,
         (expected_root_base, expected_root_size),
+        Some(stage1_unpublished),
     )?;
     let inventory = backend.state.take_retirement_inventory().ok_or_else(|| {
         TrapError::Hypervisor(
@@ -1897,12 +1902,16 @@ pub fn settle_detached_task_only_engine_declined_remainders(
 
 pub fn retire_detached_task_only_engine(
     state: &HvpatchTaskOnlyEngineState,
+    stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
 ) -> Result<carrick_hal::FrameInventoryCommit<()>, TrapError> {
     let mut parked = state.parked_task.lock();
     let task = parked.as_mut().ok_or_else(|| {
         TrapError::Hypervisor("detached task-only retirement has no parked task state".to_owned())
     })?;
-    HvfVmState::retire_task_state_process_mappings(task)?;
+    HvfVmState::retire_task_state_process_mappings_after_stage1_unpublished(
+        task,
+        stage1_unpublished,
+    )?;
     HvfVmState::take_task_state_retirement_inventory(task).ok_or_else(|| {
         TrapError::Hypervisor(
             "detached task-only retirement produced no inventory commit".to_owned(),
@@ -1914,6 +1923,7 @@ pub fn retire_detached_task_only_engine_with_root_proof(
     state: &HvpatchTaskOnlyEngineState,
     expected_root_base: u64,
     expected_root_size: u64,
+    stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
 ) -> Result<
     (
         carrick_hal::FrameInventoryCommit<()>,
@@ -1928,6 +1938,7 @@ pub fn retire_detached_task_only_engine_with_root_proof(
     let proof = HvfVmState::retire_task_state_process_mappings_with_root_proof(
         task,
         (expected_root_base, expected_root_size),
+        Some(stage1_unpublished),
     )?;
     let inventory = HvfVmState::take_task_state_retirement_inventory(task).ok_or_else(|| {
         TrapError::Hypervisor(
@@ -1968,35 +1979,43 @@ pub fn retire_detached_task_only_shared_rootless_capacity(
 
 pub fn retire_detached_exec_predecessor(
     state: &mut HvpatchTaskEngineState,
+    stage1_unpublished: Option<carrick_core::mm::retirement::Stage1UnpublishedMm>,
 ) -> Result<(), TrapError> {
-    HvfVmState::retire_task_state_exec_predecessor(&mut state.backend_mut().state.task)
+    HvfVmState::retire_task_state_exec_predecessor(
+        &mut state.backend_mut().state.task,
+        stage1_unpublished,
+    )
 }
 
 pub fn retire_detached_exec_predecessor_with_root_proof(
     state: &mut HvpatchTaskEngineState,
     expected_root_base: u64,
     expected_root_size: u64,
+    stage1_unpublished: Option<carrick_core::mm::retirement::Stage1UnpublishedMm>,
 ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
     HvfVmState::retire_task_state_exec_predecessor_with_root_proof(
         &mut state.backend_mut().state.task,
         (expected_root_base, expected_root_size),
+        stage1_unpublished,
     )
 }
 
 pub fn retire_detached_task_only_exec_predecessor(
     state: &HvpatchTaskOnlyEngineState,
+    stage1_unpublished: Option<carrick_core::mm::retirement::Stage1UnpublishedMm>,
 ) -> Result<(), TrapError> {
     let mut parked = state.parked_task.lock();
     let task = parked.as_mut().ok_or_else(|| {
         TrapError::Hypervisor("detached exec cleanup has no parked task state".to_owned())
     })?;
-    HvfVmState::retire_task_state_exec_predecessor(task)
+    HvfVmState::retire_task_state_exec_predecessor(task, stage1_unpublished)
 }
 
 pub fn retire_detached_task_only_exec_predecessor_with_root_proof(
     state: &HvpatchTaskOnlyEngineState,
     expected_root_base: u64,
     expected_root_size: u64,
+    stage1_unpublished: Option<carrick_core::mm::retirement::Stage1UnpublishedMm>,
 ) -> Result<HvpatchMmRootRetirementProof, TrapError> {
     let mut parked = state.parked_task.lock();
     let task = parked.as_mut().ok_or_else(|| {
@@ -2005,6 +2024,7 @@ pub fn retire_detached_task_only_exec_predecessor_with_root_proof(
     HvfVmState::retire_task_state_exec_predecessor_with_root_proof(
         task,
         (expected_root_base, expected_root_size),
+        stage1_unpublished,
     )
 }
 

@@ -3802,6 +3802,7 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         },
         predecessor_mm: snapshot.mm.get(),
         shared_projection: false,
+        carrier_mm: None,
         armed: true,
     };
     cleanup
@@ -13888,7 +13889,8 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
                 let extent = *inventory.extents.get(&key).unwrap();
                 HvfVmState::rollback_unpublished_mappings(&mut inventory, &[(key, extent)])
                     .unwrap();
-                let _ = custody.request_stage2_record_retirement(owner.record_identity);
+                let stage1 = custody.stage1_unpublished_by_editor(owner.record_identity);
+                let _ = custody.request_stage2_record_retirement(owner.record_identity, stage1);
             }
             register_shared_alias(successor);
         }

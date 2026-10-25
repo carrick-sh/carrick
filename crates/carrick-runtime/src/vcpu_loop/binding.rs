@@ -1804,31 +1804,47 @@ where
                             let action = self.take_retained_memory_action()?;
                             return Ok(RetainedMemoryWaitAttempt::Retry { action });
                         }
-                        super::zone::OwnerMemoryPark::NoProducer {
+                        super::zone::OwnerMemoryPark::Stage2AuthorityInvariant {
                             action: super::zone::OwnerMemoryAction::Retained,
-                            ..
+                            wait,
                         } => {
-                            let action = self.take_retained_memory_action()?;
-                            match action {
-                                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                                RetainedMemoryAction::ChildTid { .. } => {
-                                    self.state
-                                        .complete_precompleted_child(&self.kernel.reporter, 0)?;
-                                    self.phase = HvpatchProductionPhase::Resident;
-                                    return Ok(RetainedMemoryWaitAttempt::Exit(
-                                        executor::ExecutorExit::Syscall,
-                                    ));
-                                }
-                                action @ RetainedMemoryAction::ThreadExit { .. } => {
-                                    self.state.skip_terminal_child_tid_write()?;
-                                    return Ok(RetainedMemoryWaitAttempt::Retry { action });
-                                }
-                                action @ (RetainedMemoryAction::ExecDrain { .. }
-                                | RetainedMemoryAction::ProcessFinish { .. }) => {
-                                    self.state.skip_one_drained_child_tid_write()?;
-                                    return Ok(RetainedMemoryWaitAttempt::Retry { action });
-                                }
-                            }
+                            let _ = self.take_retained_memory_action()?;
+                            let context = self
+                                .state
+                                .service_kernel_context
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    RuntimeError::Configuration(
+                                        "stage-2 invariant lost its process context".to_owned(),
+                                    )
+                                })?
+                                .retain_exact();
+                            carrick_kernel::event_ring::rec_stage2_authority_invariant(
+                                wait.handle().mm().raw(),
+                                context.thread().key().tid.raw(),
+                                wait.revision(),
+                            );
+                            self.kernel.record_fatal_signal(FatalSignalRecord {
+                                image_generation: self.state.fatal_image_generation,
+                                tid: context.thread().key().tid,
+                                signo: carrick_abi::LINUX_SIGKILL,
+                                code: 0,
+                                addr: 0,
+                            });
+                            let outcome =
+                                VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
+                                    &self.kernel,
+                                    128 + carrick_abi::LINUX_SIGKILL,
+                                    Some(carrick_abi::LINUX_SIGKILL),
+                                    self.traps,
+                                    false,
+                                )));
+                            let exit = self.begin_persistent_process_terminal(
+                                engine,
+                                PersistentTerminal::from_outcome(outcome),
+                                context,
+                            );
+                            return Ok(RetainedMemoryWaitAttempt::Exit(exit));
                         }
                         _ => {
                             return Err(RuntimeError::Configuration(
@@ -1878,6 +1894,31 @@ where
                             carrick_kernel::kernel::objects::BlockedReason::HostWait,
                         ),
                     )));
+                }
+                MemoryPrepareError::Fault(carrick_guest_mem::MemoryError::OutOfBounds {
+                    ..
+                }) => {
+                    let action = self.take_retained_memory_action()?;
+                    match action {
+                        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                        RetainedMemoryAction::ChildTid { .. } => {
+                            self.state
+                                .complete_precompleted_child(&self.kernel.reporter, 0)?;
+                            self.phase = HvpatchProductionPhase::Resident;
+                            return Ok(RetainedMemoryWaitAttempt::Exit(
+                                executor::ExecutorExit::Syscall,
+                            ));
+                        }
+                        action @ RetainedMemoryAction::ThreadExit { .. } => {
+                            self.state.skip_terminal_child_tid_write()?;
+                            return Ok(RetainedMemoryWaitAttempt::Retry { action });
+                        }
+                        action @ (RetainedMemoryAction::ExecDrain { .. }
+                        | RetainedMemoryAction::ProcessFinish { .. }) => {
+                            self.state.skip_one_drained_child_tid_write()?;
+                            return Ok(RetainedMemoryWaitAttempt::Retry { action });
+                        }
+                    }
                 }
                 other => {
                     return Err(RuntimeError::Configuration(format!(
@@ -3808,40 +3849,30 @@ where
                 super::zone::OwnerMemoryPark::Parked(exit) => {
                     return Ok(OwnerResumeStep::Exit(exit));
                 }
-                super::zone::OwnerMemoryPark::NoProducer {
+                super::zone::OwnerMemoryPark::Stage2AuthorityInvariant {
                     action:
                         super::zone::OwnerMemoryAction::Syscall {
                             frame: retry_frame,
-                            resume: retry,
+                            resume: _,
                         },
                     wait,
                 } => {
                     debug_assert_eq!(retry_frame, frame);
-                    let _ = wait;
-                    let outcome =
-                        match self.resume_owner_ready_step(engine, control, retry_frame, retry)? {
-                            OwnerReadyStep::Exit(exit) => {
-                                return Ok(OwnerResumeStep::Exit(exit));
-                            }
-                            OwnerReadyStep::Outcome(outcome) => outcome,
-                        };
-                    if let Some(park) = self.state.pending_ipc_park.take() {
-                        return self
-                            .ipc_park(engine, control, frame, park)
-                            .map(OwnerResumeStep::Exit);
-                    }
-                    let (outcome, next_resume) = owner_copyin_route(outcome);
-                    resume = next_resume.or_else(|| {
-                        self.state
-                            .pending_ipc_owner
-                            .take()
-                            .map(OwnedSyscallResume::Ipc)
-                    });
-                    return Ok(OwnerResumeStep::Continue(OwnerResumeWork::Syscall {
-                        frame,
-                        outcome,
-                        resume,
-                    }));
+                    carrick_kernel::event_ring::rec_stage2_authority_invariant(
+                        wait.handle().mm().raw(),
+                        self.state.linux_tid.raw(),
+                        wait.revision(),
+                    );
+                    return self
+                        .service_outcome(
+                            engine,
+                            control,
+                            frame,
+                            DispatchOutcome::SignalDeath {
+                                signum: carrick_abi::LINUX_SIGKILL,
+                            },
+                        )
+                        .map(OwnerResumeStep::Exit);
                 }
                 super::zone::OwnerMemoryPark::Recheck(
                     super::zone::OwnerMemoryAction::Syscall {
@@ -7486,18 +7517,6 @@ mod tests {
 
         assert_eq!(progress.committed_bytes(), COPY_BYTES);
         assert_eq!(progress.consecutive_stalled_passes(), 1);
-    }
-
-    #[test]
-    fn producer_free_owner_redrive_is_a_bounded_guest_fault_guard() {
-        let mut progress = OwnerRedriveProgress::default();
-        for _ in 0..OWNER_REDRIVE_MAX_STALLED_PASSES {
-            assert!(progress.observe(0));
-        }
-        assert!(
-            !progress.observe(0),
-            "an impossible producer-free syscall must take the guest EFAULT guard"
-        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

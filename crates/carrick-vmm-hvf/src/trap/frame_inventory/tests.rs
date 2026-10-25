@@ -1505,11 +1505,13 @@ fn serial_host_exec_predecessor_backing_stays_live_until_detached_cleanup() {
         predecessor_identity,
         predecessor_mm,
         shared_projection: false,
+        carrier_mm: None,
         armed: true,
     });
 
     assert!(alias_backing_is_live(host_addr as usize));
-    HvfVmState::retire_task_state_exec_predecessor(&mut task).expect("post-TLBI detached cleanup");
+    HvfVmState::retire_task_state_exec_predecessor(&mut task, None)
+        .expect("post-TLBI detached cleanup");
     assert!(
         !observed.load(std::sync::atomic::Ordering::SeqCst),
         "lease Drop must not execute stage-2 retirement"
@@ -1533,6 +1535,7 @@ fn shared_exec_predecessor_cleanup_retains_and_emits_exact_classification() {
         predecessor_identity,
         predecessor_mm,
         shared_projection: true,
+        carrier_mm: None,
         armed: true,
     };
     let mut observed = Vec::new();
@@ -1651,10 +1654,11 @@ fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
         predecessor_identity,
         predecessor_mm,
         shared_projection: false,
+        carrier_mm: None,
         armed: true,
     });
 
-    HvfVmState::retire_task_state_exec_predecessor(&mut task)
+    HvfVmState::retire_task_state_exec_predecessor(&mut task, None)
         .expect("recheck deferred predecessor cleanup");
     assert!(
         !observed.load(std::sync::atomic::Ordering::SeqCst),
@@ -1738,10 +1742,11 @@ fn exec_predecessor_cleanup_rejects_a_recycled_owner_generation() {
         predecessor_identity,
         predecessor_mm,
         shared_projection: false,
+        carrier_mm: None,
         armed: true,
     });
 
-    HvfVmState::retire_task_state_exec_predecessor(&mut task)
+    HvfVmState::retire_task_state_exec_predecessor(&mut task, None)
         .expect("reject recycled exec predecessor owner");
     assert_eq!(
         global_frame_host_owner_generation(lease_key.0, lease_key.1 as u64),
@@ -1844,6 +1849,7 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
         predecessor_identity,
         predecessor_mm,
         shared_projection: false,
+        carrier_mm: None,
         armed: true,
     };
 
@@ -2981,7 +2987,7 @@ fn process_retirement_terminalizes_a_nonselected_structural_root_before_slot_reu
     }
 
     let proof =
-        HvfVmState::retire_task_state_process_mappings_with_root_proof(&mut task, root_slot)
+        HvfVmState::retire_task_state_process_mappings_with_root_proof(&mut task, root_slot, None)
             .expect("retire process whose structural root frame is not globally complete");
     assert_eq!(proof.root_slot_base(), root_slot.0);
     assert_eq!(proof.root_slot_size(), root_slot.1);
@@ -3175,11 +3181,12 @@ fn exec_predecessor_returns_proof_for_a_root_omitted_from_retirement_candidates(
         predecessor_identity,
         predecessor_mm,
         shared_projection: false,
+        carrier_mm: None,
         armed: true,
     });
 
     let proof =
-        HvfVmState::retire_task_state_exec_predecessor_with_root_proof(&mut task, root_slot)
+        HvfVmState::retire_task_state_exec_predecessor_with_root_proof(&mut task, root_slot, None)
             .expect("exec predecessor exact root proof");
 
     assert_eq!((proof.root_slot_base(), proof.root_slot_size()), root_slot);
@@ -7743,7 +7750,10 @@ fn sequential_container_roots_return_their_final_pooled_arena() {
         let record = relocate_exit_fixture_root(&mut task, base);
         if let Some(old) = predecessor {
             assert_eq!(
-                custody.request_stage2_record_retirement(old),
+                custody.request_stage2_record_retirement(
+                    old,
+                    custody.stage1_unpublished_by_inventory_commit_for_test(old),
+                ),
                 CarrierStage2RetireOutcome::NotFound,
                 "retired predecessor cannot release the successor's reused slot"
             );
@@ -7845,6 +7855,7 @@ fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
         predecessor_identity,
         predecessor_mm,
         shared_projection: false,
+        carrier_mm: None,
         armed: true,
     };
     let result = cleanup.retire();

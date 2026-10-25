@@ -1105,9 +1105,9 @@ impl Stage1MmRetirement {
     /// Before the retired ASID is invalidated for reuse: no vCPU in the guest
     /// has the address space installed by EL1 any more, and its published
     /// entry is freed.
-    pub(crate) fn retire_address_space(&self) {
+    pub(crate) fn retire_address_space(&self) -> carrick_core::mm::retirement::Stage1UnpublishedMm {
         let space = self.space.lock().take();
-        carrick_core::mm::retirement::drain_publication(space, &self.residency);
+        carrick_core::mm::retirement::drain_publication(space, &self.residency)
     }
 
     pub(crate) fn asid_generation(&self) -> AsidGeneration {

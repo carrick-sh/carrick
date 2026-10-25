@@ -414,6 +414,36 @@ struct Stage2RecordRemoval<'a> {
     removed: bool,
 }
 
+/// Proof that every stage-1 leaf which could name one exact stage-2 record
+/// was unpublished before physical retirement was requested.
+///
+/// The fields are private to this module so adding a retirement caller without
+/// choosing one of the two ordering boundaries is a compile error.
+#[derive(::core::fmt::Debug)]
+pub(crate) struct Stage1Unpublished {
+    identity: CarrierStage2RecordIdentity,
+    source: Stage1UnpublishedSource,
+}
+
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+enum Stage1UnpublishedSource {
+    EditorRelease,
+    InventoryCommit,
+    UnpublishedInventoryRollback,
+}
+
+impl Stage1Unpublished {
+    fn matches(&self, identity: CarrierStage2RecordIdentity) -> bool {
+        self.identity == identity
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Stage2RecordRemoval<'_> {
     fn state(&self) -> &CarrierVmCustodyState {
@@ -438,6 +468,28 @@ impl Drop for Stage2RecordRemoval<'_> {
         // before publishing. This is its sole explicit drop.
         unsafe { std::mem::ManuallyDrop::drop(&mut self.state) };
         if self.removed {
+            self.custody.publish_stage2_availability_change();
+        }
+    }
+}
+
+/// One stage-2 directory mutation. Dropping the guard publishes after every
+/// directory lock acquired by the mutation has left scope, including rollback
+/// and early-return paths.
+pub(crate) struct Stage2PublicationAuthority<'a> {
+    custody: &'a CarrierVmCustody,
+    changed: bool,
+}
+
+impl Stage2PublicationAuthority<'_> {
+    pub(crate) fn changed(&mut self) {
+        self.changed = true;
+    }
+}
+
+impl Drop for Stage2PublicationAuthority<'_> {
+    fn drop(&mut self) {
+        if self.changed {
             self.custody.publish_stage2_availability_change();
         }
     }
@@ -664,6 +716,59 @@ enum ExecutableBacking {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierVmCustody {
+    pub(crate) fn stage2_publication_authority(&self) -> Stage2PublicationAuthority<'_> {
+        Stage2PublicationAuthority {
+            custody: self,
+            changed: false,
+        }
+    }
+
+    /// Minted only after an Editor edit has removed the last stage-1 leaf and
+    /// its release has advanced the Editor revision.
+    pub(crate) fn stage1_unpublished_by_editor(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Stage1Unpublished {
+        Stage1Unpublished {
+            identity,
+            source: Stage1UnpublishedSource::EditorRelease,
+        }
+    }
+
+    /// Minted only by the whole-MM inventory commit after that transaction has
+    /// unpublished the terminal MM's complete stage-1 image.
+    pub(crate) fn stage1_unpublished_by_inventory_commit(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+        _inventory: &carrick_core::mm::retirement::Stage1UnpublishedMm,
+    ) -> Stage1Unpublished {
+        Stage1Unpublished {
+            identity,
+            source: Stage1UnpublishedSource::InventoryCommit,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage1_unpublished_by_inventory_commit_for_test(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Stage1Unpublished {
+        Stage1Unpublished {
+            identity,
+            source: Stage1UnpublishedSource::InventoryCommit,
+        }
+    }
+
+    pub(crate) fn stage1_unpublished_by_unpublished_inventory_rollback(
+        &self,
+        identity: CarrierStage2RecordIdentity,
+    ) -> Stage1Unpublished {
+        Stage1Unpublished {
+            identity,
+            source: Stage1UnpublishedSource::UnpublishedInventoryRollback,
+        }
+    }
+
     fn stage2_record_removal(&self) -> Stage2RecordRemoval<'_> {
         Stage2RecordRemoval {
             custody: self,
@@ -1099,7 +1204,7 @@ impl CarrierVmCustody {
         };
         drop(destroyed_stock);
         self.stage2_retirement_changed.publish(0);
-        self.publish_stage2_availability_change();
+        self.stage2_publication_authority().changed();
         Ok(())
     }
 
@@ -1386,10 +1491,12 @@ impl CarrierVmCustody {
         spec: CarrierStage2RecordSpec,
         map: impl FnOnce(CarrierStage2RecordIdentity) -> i32,
     ) -> Result<CarrierStage2RecordIdentity, TrapError> {
+        let mut publication = self.stage2_publication_authority();
         let mut state = self.state.lock();
         let identity = Self::register_stage2_record_locked(&mut state, spec).map_err(|error| {
             TrapError::Hypervisor(format!("stage-2 record admission: {error:?}"))
         })?;
+        publication.changed();
         let rc = map(identity);
         if rc != 0 {
             let _ = state.remove_unpublished_record(identity.record_id);
@@ -1398,7 +1505,6 @@ impl CarrierVmCustody {
             )));
         }
         drop(state);
-        self.publish_stage2_availability_change();
         Ok(identity)
     }
 
@@ -1408,6 +1514,17 @@ impl CarrierVmCustody {
     ) -> Result<CarrierStage2RecordIdentity, CarrierStage2RecordError> {
         if spec.len == 0 || (spec.mapped && spec.host_addr == 0) {
             return Err(CarrierStage2RecordError::InvalidExtent);
+        }
+        let end = spec
+            .ipa
+            .checked_add(spec.len as u64)
+            .ok_or(CarrierStage2RecordError::InvalidExtent)?;
+        if state.stage2_records.values().any(|record| {
+            let existing = &record.snapshot;
+            let existing_end = existing.ipa.saturating_add(existing.len as u64);
+            spec.ipa < existing_end && existing.ipa < end
+        }) {
+            return Err(CarrierStage2RecordError::ExtentCollision);
         }
         match state.lifecycle {
             CarrierVmLifecycle::Creating(generation) | CarrierVmLifecycle::Live(generation)
@@ -1617,7 +1734,13 @@ impl CarrierVmCustody {
     pub(crate) fn request_stage2_record_retirement(
         &self,
         identity: CarrierStage2RecordIdentity,
+        stage1: Stage1Unpublished,
     ) -> CarrierStage2RetireOutcome {
+        debug_assert!(stage1.matches(identity));
+        let _source = stage1.source;
+        if !stage1.matches(identity) {
+            return CarrierStage2RetireOutcome::OwnerIdentityMismatch;
+        }
         let mut state = self.state.lock();
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
@@ -1639,35 +1762,6 @@ impl CarrierVmCustody {
         let mut pending = self.pending_carrier_stage2_retirements.lock();
         if pending.get(&identity.record_id).map(|entry| entry.0) == Some(identity) {
             pending.remove(&identity.record_id);
-        }
-    }
-
-    fn begin_owed_stage1_rewrites(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-        ipa: u64,
-        len: u64,
-    ) {
-        let states = self
-            .guest_cow_states
-            .lock()
-            .values()
-            .filter_map(std::sync::Weak::upgrade)
-            .collect::<Vec<_>>();
-        for state in states {
-            state.owe_stage1_rewrite(identity, ipa, len);
-        }
-    }
-
-    fn cancel_owed_stage1_rewrites(&self, identity: CarrierStage2RecordIdentity) {
-        let states = self
-            .guest_cow_states
-            .lock()
-            .values()
-            .filter_map(std::sync::Weak::upgrade)
-            .collect::<Vec<_>>();
-        for state in states {
-            state.cancel_owed_stage1_rewrite(identity);
         }
     }
 
@@ -1709,12 +1803,6 @@ impl CarrierVmCustody {
         &self,
         identity: CarrierStage2RecordIdentity,
     ) {
-        if let Some(snapshot) = self.stage2_record_snapshot(identity.record_id)
-            && snapshot.vm_generation == identity.vm_generation
-            && snapshot.logical_owner == identity.logical_owner
-        {
-            self.begin_owed_stage1_rewrites(identity, snapshot.ipa, snapshot.len as u64);
-        }
         self.pending_carrier_stage2_retirements
             .lock()
             .remove(&identity.record_id);
@@ -1722,7 +1810,7 @@ impl CarrierVmCustody {
             .lock()
             .insert(identity.record_id, identity);
         self.stage2_retirement_changed.publish(0);
-        self.publish_stage2_availability_change();
+        self.stage2_publication_authority().changed();
     }
 
     pub(crate) fn carrier_stage2_retirement_is_terminal(
@@ -1785,7 +1873,7 @@ impl CarrierVmCustody {
                             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy
                     ) {
                         self.stage2_retirement_changed.publish(0);
-                        self.publish_stage2_availability_change();
+                        self.stage2_publication_authority().changed();
                     }
                     return outcome;
                 }
@@ -1797,7 +1885,6 @@ impl CarrierVmCustody {
             }
         };
 
-        self.begin_owed_stage1_rewrites(identity, ipa, len as u64);
         let backend_result = if backend_map_installed {
             unmap(ipa, len)
         } else {
@@ -1806,7 +1893,6 @@ impl CarrierVmCustody {
         let mut state = self.state.lock();
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             drop(state);
-            self.cancel_owed_stage1_rewrites(identity);
             return CarrierStage2RetireOutcome::NotFound;
         };
         let outcome = carrick_core::mm::retirement::settle_record_retirement(
@@ -1819,18 +1905,14 @@ impl CarrierVmCustody {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
                 self.stage2_retirement_changed.publish(0);
-                self.publish_stage2_availability_change();
+                self.stage2_publication_authority().changed();
             }
-            // Backend retry retains the same removed-authority obligation.
-            // Terminalization and its eventual stage-1 rewrite consume it.
             CarrierStage2RetireOutcome::RetryPending(_) => {}
             CarrierStage2RetireOutcome::DeferredActivePins
             | CarrierStage2RetireOutcome::NotFound
             | CarrierStage2RetireOutcome::OwnerIdentityMismatch
             | CarrierStage2RetireOutcome::OwnerGenerationMismatch
-            | CarrierStage2RetireOutcome::VmGenerationMismatch => {
-                self.cancel_owed_stage1_rewrites(identity);
-            }
+            | CarrierStage2RetireOutcome::VmGenerationMismatch => {}
         }
         outcome
     }
@@ -1850,6 +1932,7 @@ impl carrick_core::mm::retirement::RecordPinVenue for CarrierPinVenue {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) type CarrierStage2Pin = carrick_core::mm::retirement::RecordPin<CarrierPinVenue>;
 
+#[cfg(test)]
 #[derive(::core::fmt::Debug)]
 pub(crate) struct Stage2RetirementWait {
     custody: std::sync::Weak<CarrierVmCustody>,
@@ -1892,6 +1975,7 @@ impl carrick_guest_mem::PhysicalMemoryWait for Stage2PublicationWait {
     }
 }
 
+#[cfg(test)]
 impl Stage2RetirementWait {
     fn is_complete(&self) -> bool {
         let Some(custody) = self.custody.upgrade() else {
@@ -1913,6 +1997,7 @@ impl Stage2RetirementWait {
     }
 }
 
+#[cfg(test)]
 impl carrick_guest_mem::PhysicalMemoryWait for Stage2RetirementWait {
     fn is_ready(&self) -> bool {
         self.is_complete()
@@ -2057,8 +2142,9 @@ impl CarrierVmCustody {
                 .then(|| owners.remove(&key))
                 .flatten()
         };
+        let mut publication = self.stage2_publication_authority();
         if removed.is_some() {
-            self.publish_stage2_availability_change();
+            publication.changed();
         }
         removed
     }
@@ -2076,8 +2162,9 @@ impl CarrierVmCustody {
                 .then(|| backings.remove(&record))
                 .flatten()
         };
+        let mut publication = self.stage2_publication_authority();
         if removed.is_some() {
-            self.publish_stage2_availability_change();
+            publication.changed();
         }
         removed
     }
@@ -2102,8 +2189,9 @@ impl CarrierVmCustody {
                 false
             }
         };
+        let mut publication = self.stage2_publication_authority();
         if replaced {
-            self.publish_stage2_availability_change();
+            publication.changed();
         }
         replaced
     }
@@ -2122,8 +2210,9 @@ impl CarrierVmCustody {
                 .then(|| records.remove(&key))
                 .flatten()
         };
+        let mut publication = self.stage2_publication_authority();
         if removed.is_some() {
-            self.publish_stage2_availability_change();
+            publication.changed();
         }
         removed
     }
@@ -2138,6 +2227,7 @@ impl CarrierVmCustody {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn stage2_retirement_wait(
         self: &std::sync::Arc<Self>,
         identity: Option<CarrierStage2RecordIdentity>,
@@ -2340,9 +2430,19 @@ mod carrier_vm_custody_tests {
     use super::{
         CarrierLogicalOwner, CarrierStage2BackendError, CarrierStage2PinError,
         CarrierStage2RecordIdentity, CarrierStage2RecordSpec, CarrierStage2RetireOutcome,
-        CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, create_vm_with_custody_using,
-        destroy_vm_with_custody_using,
+        CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, Stage1Unpublished,
+        create_vm_with_custody_using, destroy_vm_with_custody_using,
     };
+
+    #[test]
+    fn retirement_request_signature_requires_stage1_unpublished_witness() {
+        let request: fn(
+            &CarrierVmCustody,
+            CarrierStage2RecordIdentity,
+            Stage1Unpublished,
+        ) -> CarrierStage2RetireOutcome = CarrierVmCustody::request_stage2_record_retirement;
+        let _ = request;
+    }
 
     /// Work budget of the instruction-cache authority: an executable
     /// publication over a fresh frame invalidates once, re-publication of the
@@ -4102,7 +4202,10 @@ mod carrier_vm_custody_tests {
         custody.commit_create(g2).expect("publish G2");
 
         assert_eq!(
-            custody.request_stage2_record_retirement(old_identity),
+            custody.request_stage2_record_retirement(
+                old_identity,
+                custody.stage1_unpublished_by_inventory_commit_for_test(old_identity),
+            ),
             super::CarrierStage2RetireOutcome::NotFound
         );
         assert!(
@@ -4369,6 +4472,7 @@ mod carrier_vm_custody_tests {
             &mut authority,
             &std::sync::Arc::downgrade(&custody),
             &frames,
+            None,
         );
         assert!(
             custody
@@ -5183,7 +5287,10 @@ mod carrier_vm_custody_tests {
             });
             custody.enqueue_carrier_stage2_retirement(identity);
             assert_eq!(
-                custody.request_stage2_record_retirement(identity),
+                custody.request_stage2_record_retirement(
+                    identity,
+                    custody.stage1_unpublished_by_inventory_commit_for_test(identity),
+                ),
                 CarrierStage2RetireOutcome::DeferredActivePins
             );
             let schedules = std::cell::Cell::new(0_u32);
@@ -5229,7 +5336,10 @@ mod carrier_vm_custody_tests {
             .insert((spec.ipa, spec.len as u64), identity);
         custody.enqueue_carrier_stage2_retirement(identity);
         assert_eq!(
-            custody.request_stage2_record_retirement(identity),
+            custody.request_stage2_record_retirement(
+                identity,
+                custody.stage1_unpublished_by_inventory_commit_for_test(identity),
+            ),
             CarrierStage2RetireOutcome::DeferredActivePins
         );
         let attempts = std::cell::Cell::new(0_u32);

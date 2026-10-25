@@ -99,6 +99,7 @@ pub trait PersistentTaskBinding {
     fn retire_detached_address_space(
         &self,
         _root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+        _stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         Err(TrapError::Hypervisor(
             "task binding has no detached address-space cleanup authority".to_owned(),
@@ -114,6 +115,7 @@ pub trait PersistentTaskBinding {
     fn retire_detached_exec_predecessor(
         &self,
         _root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+        _stage1_unpublished: Option<carrick_core::mm::retirement::Stage1UnpublishedMm>,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         Err(TrapError::Hypervisor(
             "task binding has no detached exec predecessor authority".to_owned(),
@@ -217,10 +219,12 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
     fn retire_detached_address_space(
         &self,
         root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+        stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_address_space(
             self,
             root_ticket,
+            stage1_unpublished,
         )
     }
 
@@ -231,10 +235,12 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
     fn retire_detached_exec_predecessor(
         &self,
         root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+        stage1_unpublished: Option<carrick_core::mm::retirement::Stage1UnpublishedMm>,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         crate::vcpu_loop::continuation::HvpatchTaskBinding::retire_detached_exec_predecessor(
             self,
             root_ticket,
+            stage1_unpublished,
         )
     }
 }

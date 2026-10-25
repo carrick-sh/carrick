@@ -204,22 +204,16 @@ pub enum TransferPreparation {
 pub enum TransferRetention<P> {
     Retained(P),
     Physical(carrick_guest_mem::OwnedMemoryWait),
-    /// Retirement removed stage-2 authority before the exact stage-1 leaf.
-    /// The retirement token guarantees a future Editor publication, so retry
-    /// on the selection's existing Editor receipt.
-    PendingStage1Rewrite,
-    /// No physical or stage-1-edit producer owns this selection.  Only the
-    /// guest-visible mapping-fault path may consume this typed result.
-    Unmapped {
-        address: u64,
-        length: usize,
-    },
+    /// The exact SELECT Editor receipt. Runtime either observes that its
+    /// revision changed, parks behind the held Editor, or diagnoses the typed
+    /// stage-2-authority invariant if neither producer exists.
+    Editor(carrick_el1_abi::PortalOwnerWait),
 }
 impl<P> TransferRetention<P> {
     pub fn into_retained(self) -> Option<P> {
         match self {
             Self::Retained(pin) => Some(pin),
-            Self::Physical(_) | Self::PendingStage1Rewrite | Self::Unmapped { .. } => None,
+            Self::Physical(_) | Self::Editor(_) => None,
         }
     }
 }
@@ -257,11 +251,6 @@ pub trait TransferCustody {
     ) -> Result<bool, TrapError> {
         Ok(false)
     }
-    /// Settle stage-2 retirement tokens against the current authoritative
-    /// stage-1 image before issuing another owner selection.  Production
-    /// tokens wait on the MM's existing Editor publication; its wake reaches
-    /// this hook before the next SELECT.
-    fn settle_stage1_rewrites(&self, _target: TransferTarget) {}
     fn retain(
         &self,
         selected: PortalSelectedData,
@@ -275,7 +264,9 @@ pub trait TransferCustody {
         selected: PortalSelectedData,
         len: usize,
         intent: PortalTransferIntent,
+        retry: carrick_el1_abi::PortalOwnerWait,
     ) -> Result<TransferRetention<Self::Pin>, TrapError> {
+        let _ = retry;
         self.retain(selected, len, intent)
     }
 }
@@ -712,9 +703,6 @@ where
     ) -> Result<bool, TrapError> {
         self.0.refill_maintenance(target, request)
     }
-    fn settle_stage1_rewrites(&self, target: TransferTarget) {
-        self.0.settle_stage1_rewrites(target);
-    }
     fn retain(
         &self,
         selected: PortalSelectedData,
@@ -728,10 +716,7 @@ where
                     TransferRetention::Retained(Box::new(pin) as Box<dyn TransferPin>)
                 }
                 TransferRetention::Physical(wait) => TransferRetention::Physical(wait),
-                TransferRetention::PendingStage1Rewrite => TransferRetention::PendingStage1Rewrite,
-                TransferRetention::Unmapped { address, length } => {
-                    TransferRetention::Unmapped { address, length }
-                }
+                TransferRetention::Editor(wait) => TransferRetention::Editor(wait),
             })
     }
     fn retain_for(
@@ -741,18 +726,16 @@ where
         selected: PortalSelectedData,
         len: usize,
         intent: PortalTransferIntent,
+        retry: carrick_el1_abi::PortalOwnerWait,
     ) -> Result<TransferRetention<Self::Pin>, TrapError> {
         self.0
-            .retain_for(target, va, selected, len, intent)
+            .retain_for(target, va, selected, len, intent, retry)
             .map(|retention| match retention {
                 TransferRetention::Retained(pin) => {
                     TransferRetention::Retained(Box::new(pin) as Box<dyn TransferPin>)
                 }
                 TransferRetention::Physical(wait) => TransferRetention::Physical(wait),
-                TransferRetention::PendingStage1Rewrite => TransferRetention::PendingStage1Rewrite,
-                TransferRetention::Unmapped { address, length } => {
-                    TransferRetention::Unmapped { address, length }
-                }
+                TransferRetention::Editor(wait) => TransferRetention::Editor(wait),
             })
     }
 }

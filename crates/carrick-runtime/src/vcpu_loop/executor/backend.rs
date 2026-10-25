@@ -256,6 +256,7 @@ impl HvpatchTaskEngineBindingState {
     pub(crate) fn retire_detached_address_space_with(
         &mut self,
         root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+        stage1_unpublished: carrick_core::mm::retirement::Stage1UnpublishedMm,
         apply_with_receipt: impl FnOnce(
             carrick_hal::FrameInventoryCommit<()>,
         ) -> Result<
@@ -272,6 +273,7 @@ impl HvpatchTaskEngineBindingState {
                             state,
                             ticket.base(),
                             ticket.size(),
+                            stage1_unpublished,
                         )?;
                         let receipt = ticket.redeem(proof).map_err(|error| {
                             TrapError::Hypervisor(format!(
@@ -281,7 +283,10 @@ impl HvpatchTaskEngineBindingState {
                         (commit, Some(receipt))
                     }
                     None => (
-                        carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_engine(state)?,
+                        carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_engine(
+                            state,
+                            stage1_unpublished,
+                        )?,
                         None,
                     ),
                 };
@@ -341,6 +346,7 @@ impl HvpatchTaskEngineBindingState {
                             state,
                             ticket.base(),
                             ticket.size(),
+                            stage1_unpublished,
                         )?;
                         let receipt = ticket.redeem(proof).map_err(|error| {
                             TrapError::Hypervisor(format!(
@@ -352,6 +358,7 @@ impl HvpatchTaskEngineBindingState {
                     None => (
                         carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_engine(
                             state,
+                            stage1_unpublished,
                         )?,
                         None,
                     ),
@@ -373,6 +380,7 @@ impl HvpatchTaskEngineBindingState {
     pub(crate) fn retire_detached_exec_predecessor(
         &mut self,
         root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+        stage1_unpublished: Option<carrick_core::mm::retirement::Stage1UnpublishedMm>,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         match &mut self.payload {
             HvpatchTaskEngineBindingPayload::Resident(state) => match root_ticket {
@@ -381,6 +389,7 @@ impl HvpatchTaskEngineBindingState {
                             state,
                             ticket.base(),
                             ticket.size(),
+                            stage1_unpublished,
                         )?;
                     ticket.redeem(proof).map(Some).map_err(|error| {
                         TrapError::Hypervisor(format!(
@@ -389,7 +398,10 @@ impl HvpatchTaskEngineBindingState {
                     })
                 }
                 None => {
-                    carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_exec_predecessor(state)?;
+                    carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_exec_predecessor(
+                        state,
+                        stage1_unpublished,
+                    )?;
                     Ok(None)
                 }
             },
@@ -399,6 +411,7 @@ impl HvpatchTaskEngineBindingState {
                             state,
                             ticket.base(),
                             ticket.size(),
+                            stage1_unpublished,
                         )?;
                     ticket.redeem(proof).map(Some).map_err(|error| {
                         TrapError::Hypervisor(format!(
@@ -407,7 +420,7 @@ impl HvpatchTaskEngineBindingState {
                     })
                 }
                 None => {
-                    carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_exec_predecessor(state)?;
+                    carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_exec_predecessor(state, stage1_unpublished)?;
                     Ok(None)
                 }
             },

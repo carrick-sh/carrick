@@ -40,7 +40,7 @@ pub(super) enum OwnerMemoryAction {
 pub(super) enum OwnerMemoryPark {
     Parked(executor::ExecutorExit),
     Recheck(OwnerMemoryAction),
-    NoProducer {
+    Stage2AuthorityInvariant {
         action: OwnerMemoryAction,
         wait: carrick_el1_abi::PortalOwnerWait,
     },
@@ -880,7 +880,6 @@ where
         let enrollment = slots.authenticate_wait(zone, wait).map_err(|error| {
             RuntimeError::Configuration(format!("owner wait receipt rejected: {error:?}"))
         })?;
-        let portal_cause = wait.cause();
         let token = OperationToken::metadata_request(context.thread().key().serial.raw())
             .ok_or_else(|| RuntimeError::Configuration("owner wait serial is zero".to_owned()))?;
         let record = zone.alloc_record(identity).map_err(|error| {
@@ -900,19 +899,17 @@ where
         let cause = enrollment.cause();
         if enrollment.current_revision() == enrollment.revision()
             && cause == carrick_sched_core::spaces::notification::SpaceWaitCause::Editor
-            && portal_cause != carrick_el1_abi::PortalWaitCause::PendingStage1Rewrite
             && !editor_is_held(zone, wait_mm)
         {
             zone.free_record(record);
-            return Ok(OwnerMemoryPark::NoProducer { action, wait });
+            return Ok(OwnerMemoryPark::Stage2AuthorityInvariant { action, wait });
         }
         match enrollment.park_host_rechecked(record, token, &complete, || match cause {
             carrick_sched_core::spaces::notification::SpaceWaitCause::Reservations => {
                 reservation_root_is_held(zone, wait_mm)
             }
             carrick_sched_core::spaces::notification::SpaceWaitCause::Editor => {
-                portal_cause == carrick_el1_abi::PortalWaitCause::PendingStage1Rewrite
-                    || editor_is_held(zone, wait_mm)
+                editor_is_held(zone, wait_mm)
             }
             _ => true,
         }) {

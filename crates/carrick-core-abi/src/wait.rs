@@ -117,9 +117,7 @@ impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
         }
         use crate::PortalWaitCause;
         let cause = match receipt.cause() {
-            PortalWaitCause::Editor | PortalWaitCause::PendingStage1Rewrite => {
-                SpaceWaitCause::Editor
-            }
+            PortalWaitCause::Editor => SpaceWaitCause::Editor,
             PortalWaitCause::Reservations => SpaceWaitCause::Reservations,
             PortalWaitCause::PendingEdit => SpaceWaitCause::PendingEdit,
             PortalWaitCause::Gate => SpaceWaitCause::Gate,

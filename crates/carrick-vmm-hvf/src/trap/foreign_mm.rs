@@ -368,40 +368,6 @@ pub(crate) struct RetiredMmRootStage2 {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::Eq,
-    ::core::cmp::Ord,
-    ::core::cmp::PartialEq,
-    ::core::cmp::PartialOrd,
-)]
-struct OwedStage1RewriteKey {
-    record_id: carrick_core_abi::mm::CarrierStage2RecordId,
-    vm_generation: u64,
-    generation: u64,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(::core::fmt::Debug)]
-struct OwedStage1Rewrite {
-    ipa: u64,
-    len: u64,
-    /// Stage-1 selections which actually encountered this obligation.  Each
-    /// remains live only until an authoritative reselect observes that the
-    /// leaf no longer names the retired IPA.
-    selections: std::collections::BTreeSet<(u64, u64)>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(::core::fmt::Debug, ::core::default::Default)]
-struct OwedStage1Rewrites {
-    next_generation: u64,
-    by_key: std::collections::BTreeMap<OwedStage1RewriteKey, OwedStage1Rewrite>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct MmAccessState {
     pub(crate) host_cow_stats: crate::hvf_aarch64_engine::HostCowStats,
     #[cfg(any(test, feature = "foreign-cow-test-support"))]
@@ -434,11 +400,6 @@ pub(crate) struct MmAccessState {
     >,
     pub(crate) mm_root_stage2: parking_lot::Mutex<Option<MmRootStage2Authority>>,
     pub(crate) mutation_coordinator: parking_lot::Mutex<()>,
-    /// Exact stage-2 retirements which removed physical authority before a
-    /// still-live stage-1 leaf was rewritten.  A transfer can wait only on an
-    /// entry covering its selected IPA; editor release, rollback and teardown
-    /// are the only completion producers.
-    owed_stage1_rewrites: parking_lot::Mutex<OwedStage1Rewrites>,
     /// First-touch producers held only through synchronous descriptor
     /// publication and completion (see `PendingEl1GrantPublication`).
     pub(crate) el1_grant_publications: parking_lot::Mutex<PendingEl1GrantPublications>,
@@ -934,7 +895,6 @@ impl MmAccessState {
             structural_owners: parking_lot::RwLock::new(std::collections::BTreeMap::new()),
             mm_root_stage2: parking_lot::Mutex::new(None),
             mutation_coordinator: parking_lot::Mutex::new(()),
-            owed_stage1_rewrites: parking_lot::Mutex::new(OwedStage1Rewrites::default()),
             el1_grant_publications: parking_lot::Mutex::new(PendingEl1GrantPublications::default()),
             cow_runtime: parking_lot::RwLock::new(None),
             deferred_anonymous: parking_lot::RwLock::new(None),
@@ -948,133 +908,6 @@ impl MmAccessState {
             #[cfg(test)]
             test_descriptor_slots: parking_lot::Mutex::new(None),
         })
-    }
-
-    pub(crate) fn owe_stage1_rewrite(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-        ipa: u64,
-        len: u64,
-    ) {
-        if len == 0 || ipa.checked_add(len).is_none() {
-            return;
-        }
-        let mut owed = self.owed_stage1_rewrites.lock();
-        if owed.by_key.keys().any(|key| {
-            key.record_id == identity.record_id && key.vm_generation == identity.vm_generation.0
-        }) {
-            return;
-        }
-        owed.next_generation = owed.next_generation.saturating_add(1);
-        let key = OwedStage1RewriteKey {
-            record_id: identity.record_id,
-            vm_generation: identity.vm_generation.0,
-            generation: owed.next_generation,
-        };
-        owed.by_key.insert(
-            key,
-            OwedStage1Rewrite {
-                ipa,
-                len,
-                selections: std::collections::BTreeSet::new(),
-            },
-        );
-    }
-
-    pub(crate) fn cancel_owed_stage1_rewrite(&self, identity: CarrierStage2RecordIdentity) {
-        let removed = {
-            let mut owed = self.owed_stage1_rewrites.lock();
-            let keys = owed
-                .by_key
-                .keys()
-                .copied()
-                .filter(|key| {
-                    key.record_id == identity.record_id
-                        && key.vm_generation == identity.vm_generation.0
-                })
-                .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|key| owed.by_key.remove(&key))
-                .collect::<Vec<_>>()
-        };
-        drop(removed);
-    }
-
-    pub(crate) fn has_owed_stage1_rewrite(&self, va: u64, ipa: u64) -> bool {
-        let found = {
-            let mut owed = self.owed_stage1_rewrites.lock();
-            let Some((_, rewrite)) = owed.by_key.iter_mut().rev().find(|(_, rewrite)| {
-                rewrite.ipa <= ipa && ipa < rewrite.ipa.saturating_add(rewrite.len)
-            }) else {
-                return false;
-            };
-            rewrite.selections.insert((va, ipa));
-            true
-        };
-        let still_selected = self
-            .page_tables_authority()
-            .with_manager(|manager| manager.translate(va) == Some(ipa))
-            .unwrap_or(false);
-        if !still_selected {
-            self.settle_owed_stage1_rewrites();
-        }
-        found
-    }
-
-    pub(crate) fn settle_owed_stage1_rewrites(&self) {
-        let candidates = {
-            let owed = self.owed_stage1_rewrites.lock();
-            owed.by_key
-                .iter()
-                .filter(|(_, rewrite)| !rewrite.selections.is_empty())
-                .map(|(&key, rewrite)| (key, rewrite.selections.clone()))
-                .collect::<Vec<_>>()
-        };
-        if candidates.is_empty() {
-            return;
-        }
-        let translations = self.page_tables_authority().with_manager(|manager| {
-            candidates
-                .iter()
-                .map(|(_, selections)| {
-                    selections
-                        .iter()
-                        .map(|&(va, ipa)| manager.translate(va) != Some(ipa))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<Vec<bool>>>()
-        });
-        let completed = match translations {
-            Some(translations) => candidates
-                .iter()
-                .zip(translations)
-                .filter_map(|((key, selections), changed)| {
-                    changed
-                        .iter()
-                        .all(|changed| *changed)
-                        .then_some((*key, selections))
-                })
-                .collect::<Vec<_>>(),
-            None => candidates
-                .iter()
-                .map(|(key, selections)| (*key, selections))
-                .collect::<Vec<_>>(),
-        };
-        let mut owed = self.owed_stage1_rewrites.lock();
-        for (key, observed) in completed {
-            if owed
-                .by_key
-                .get(&key)
-                .is_some_and(|rewrite| &rewrite.selections == observed)
-            {
-                owed.by_key.remove(&key);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn owed_stage1_rewrite_count(&self) -> usize {
-        self.owed_stage1_rewrites.lock().by_key.len()
     }
 
     /// The EL1 region's descriptor-transaction slots this MM's guest
@@ -1325,7 +1158,6 @@ impl MmAccessState {
                 new_root,
             });
         }
-        self.settle_owed_stage1_rewrites();
     }
 
     pub(crate) fn bind_cow_runtime(&self, binding: MmCowRuntimeBinding) {
@@ -1420,7 +1252,7 @@ impl MmAccessState {
                 .flatten()
         };
         if removed.is_some() {
-            custody.publish_stage2_availability_change();
+            custody.stage2_publication_authority().changed();
         }
         removed
     }

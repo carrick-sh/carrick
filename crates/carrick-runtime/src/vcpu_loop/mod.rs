@@ -4515,7 +4515,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn serial_host_stale_selection_without_editor_reselects_and_parks_on_physical_producer() {
+    fn serial_host_unchanged_selection_without_stage2_authority_kills_only_its_mm() {
         exercise_owner_wait_schedule_at(
             carrick_abi::syscall::nr::FSTAT,
             None,
@@ -4528,16 +4528,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn serial_host_owed_stage1_rewrite_parks_on_future_editor_publication() {
-        exercise_owner_wait_schedule_at(
-            carrick_abi::syscall::nr::FSTAT,
-            None,
-            false,
-            false,
-            false,
-            false,
-            OwnerWaitSelection::OwedRewrite,
-        );
+    fn serial_host_editor_release_after_select_reselects_without_stranding() {
+        exercise_owner_wait_schedule(carrick_abi::syscall::nr::FSTAT, None, false, true);
     }
 
     fn exercise_owner_wait(nr: carrick_abi::CanonicalNr, signum: Option<i32>, native: bool) {
@@ -4565,7 +4557,6 @@ pub(crate) mod tests {
     enum OwnerWaitSelection {
         Normal,
         Stale,
-        OwedRewrite,
     }
 
     fn exercise_owner_wait_schedule_at(
@@ -4578,7 +4569,6 @@ pub(crate) mod tests {
         selection: OwnerWaitSelection,
     ) {
         let stale_selection_without_editor = selection == OwnerWaitSelection::Stale;
-        let owed_stage1_rewrite = selection == OwnerWaitSelection::OwedRewrite;
         #[derive(Debug)]
         struct RetirementRequestedBacking {
             ready: std::sync::atomic::AtomicBool,
@@ -5021,7 +5011,7 @@ pub(crate) mod tests {
                         engine.prepare_dependency =
                             Some(carrick_guest_mem::OwnedMemoryWait::new(retirement.clone()));
                     }
-                    if stale_selection_without_editor || owed_stage1_rewrite {
+                    if stale_selection_without_editor {
                         release_tx.send(()).unwrap();
                         peer.take().unwrap().join().unwrap();
                         carrick_kernel::el1_zone::hand_back_completions();
@@ -5029,15 +5019,6 @@ pub(crate) mod tests {
                             .observe_wait(handle, carrick_el1_abi::PortalWaitCause::Editor)
                             .unwrap()
                             .unwrap();
-                        if owed_stage1_rewrite {
-                            wait = unsafe {
-                                carrick_el1_abi::PortalOwnerWait::from_owner(
-                                    wait.handle(),
-                                    carrick_el1_abi::PortalWaitCause::PendingStage1Rewrite,
-                                    wait.revision(),
-                                )
-                            };
-                        }
                         engine.copyout_owner_probe = Some(CopyoutOwnerProbe {
                             wait,
                             zone: zone as *const _ as usize,
@@ -5049,16 +5030,13 @@ pub(crate) mod tests {
                     }
                     if physical {
                         assert!(matches!(first, DispatchOutcome::OwnerPhysicalWait { .. }));
-                    } else if !free_reservation_redrive
-                        && !stale_selection_without_editor
-                        && !owed_stage1_rewrite
-                    {
+                    } else if !free_reservation_redrive && !stale_selection_without_editor {
                         assert_eq!(
                             first,
                             DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
                             "the production service must park on the sibling's editor, never return EFAULT",
                         );
-                    } else if stale_selection_without_editor || owed_stage1_rewrite {
+                    } else if stale_selection_without_editor {
                         assert!(matches!(first, DispatchOutcome::OwnerMemoryWait { .. }));
                     }
                     assert_eq!(engine.prepared_commits, 0);
@@ -5174,6 +5152,24 @@ pub(crate) mod tests {
                         let parked = job
                             .owner_memory_park(&mut engine, &mut control, frame, wait, resume)
                             .unwrap();
+                        if stale_selection_without_editor {
+                            assert!(
+                                !matches!(parked, executor::ExecutorExit::Blocked(_)),
+                                "a producer-free current selection must not park"
+                            );
+                            let fatal = kernel
+                                .fatal_signal
+                                .recorded_for(job.state.fatal_image_generation)
+                                .expect("typed stage-2 invariant must terminate this MM");
+                            assert_eq!(fatal.signo, carrick_abi::LINUX_SIGKILL);
+                            assert_eq!(fatal.tid, root.thread().key().tid);
+                            assert!(
+                                peer.as_ref().is_none_or(|peer| peer.is_finished()),
+                                "invariant containment must not strand the carrier peer"
+                            );
+                            scheduler.close();
+                            return;
+                        }
                         if free_reservation_redrive || stale_selection_without_editor {
                             assert!(matches!(parked, executor::ExecutorExit::Blocked(_)));
                             running
@@ -5304,10 +5300,7 @@ pub(crate) mod tests {
                         }
                     }
                     let killing = signum == Some(carrick_abi::LINUX_SIGKILL);
-                    if free_reservation_redrive
-                        || stale_selection_without_editor
-                        || owed_stage1_rewrite
-                    {
+                    if free_reservation_redrive || stale_selection_without_editor {
                         assert_eq!(
                             scheduler.queued_len(),
                             0,
@@ -5318,24 +5311,9 @@ pub(crate) mod tests {
                             engine.copyout_owner_probe = None;
                             engine.copyout_prepare = Some(Box::new(|| None));
                         }
-                        if owed_stage1_rewrite {
-                            let access = carrick_el1_linux::sched::object_wait::space_access(
-                                zone,
-                                carrick_sched_core::SlotId::new(1),
-                            );
-                            let editor = access
-                                .try_begin_edit(
-                                    zone.spaces.find(mm.raw()).unwrap(),
-                                    mm.raw(),
-                                    NonZeroU64::new(4).unwrap(),
-                                )
-                                .unwrap();
-                            drop(editor);
-                        } else {
-                            retirement.complete();
-                        }
+                        retirement.complete();
                     }
-                    if !killing && !stale_selection_without_editor && !owed_stage1_rewrite {
+                    if !killing && !stale_selection_without_editor {
                         release_tx.send(()).unwrap();
                         peer.take().unwrap().join().unwrap();
                     }
