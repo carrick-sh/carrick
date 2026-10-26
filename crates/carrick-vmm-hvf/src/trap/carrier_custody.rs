@@ -491,7 +491,13 @@ struct PendingStage2Retirement {
     proof: Option<Stage2RetirementProof>,
 }
 
-#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 enum PendingStage2RetirementOwner {
     /// The subsystem whose directory still owns the physical record drives
     /// its exact retirement and finalization.
