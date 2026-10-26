@@ -1191,6 +1191,35 @@ fn el1_honours_affinity_for_floating_threads() {
     );
 }
 
+#[test]
+fn host_places_a_native_owned_wake_on_a_stopped_live_slot() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    zone.leave_guest(SLOT, &HostWait);
+    let record = zone.alloc_record(identity(3)).unwrap();
+    assert!(zone.mark_native_owned(record));
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, 0x4400), &HostWait)
+        .unwrap();
+    let seq = zone.next_seq(record);
+    zone.enqueue(&guard, record, seq, MM, 0x4400, u32::MAX, 0)
+        .unwrap();
+    zone.publish_park(record, seq);
+    let mut woken = [const { WakeRecord::Empty }; 1];
+    assert_eq!(
+        zone.wake(&guard, MM, 0x4400, u32::MAX, 1, Waker::Host, &mut woken),
+        Ok(1)
+    );
+    drop(guard);
+    assert_eq!(woken[0].take_ready(&HostWait).map(|r| r.id), Some(record));
+    assert!(matches!(zone.record(record).claim(), Claim::Host { .. }));
+    assert_eq!(zone.place_from_host(record).unwrap().slot, SLOT);
+    assert_eq!(
+        zone.record(record).claim(),
+        Claim::Queued { slot: SLOT, seq }
+    );
+}
+
 /// The slot's timer ends its home thread's timed park with the caller-supplied
 /// result, once; a waker that wins the record first leaves the timer nothing to
 /// claim.
