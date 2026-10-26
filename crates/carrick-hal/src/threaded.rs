@@ -3835,7 +3835,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
 
     fn build_process_spec(
         &mut self,
-        _editor: &carrick_guest_mem::El1EditorExcluded,
+        _editor: Option<&carrick_guest_mem::El1EditorExcluded>,
         _request: ProcessForkRequest,
     ) -> Result<Self::ProcessSpec, TrapError> {
         Err(TrapError::Hypervisor(
@@ -3880,7 +3880,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
 
     fn commit_process_fork(
         &mut self,
-        _editor: &carrick_guest_mem::El1EditorExcluded,
+        _editor: Option<&carrick_guest_mem::El1EditorExcluded>,
     ) -> Result<(), TrapError> {
         Ok(())
     }
@@ -3898,7 +3898,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// spawn/materialization failure.
     fn rollback_process_fork(
         &mut self,
-        _editor: &carrick_guest_mem::El1EditorExcluded,
+        _editor: Option<&carrick_guest_mem::El1EditorExcluded>,
     ) -> Result<(), TrapError> {
         Ok(())
     }

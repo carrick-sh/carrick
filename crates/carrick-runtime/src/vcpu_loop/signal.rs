@@ -883,7 +883,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
         }
         dispatcher
             .with_kernel_resources(&context, || {
-                dispatcher.reconcile_el1_deferred_returns(&permit, engine)
+                dispatcher.reconcile_el1_deferred_returns(&permit, engine, mutation.el1_editor_license())
             })
             .map_err(|error| {
                 TrapError::Hypervisor(format!(
@@ -1038,7 +1038,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                         use carrick_hal::threaded::{
                             El1FrameGrantPublication, El1FrameGrantPublished,
                         };
-                        match engine.publish_el1_frame_grant(El1FrameGrantPublication {
+                        match engine.publish_el1_frame_grant(Some(mutation.el1_editor_license()), El1FrameGrantPublication {
                             mm_key: grant.mm_key,
                             semantic_base: grant.semantic_base,
                             len: grant.len,
@@ -1183,6 +1183,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                 prot,
                 access,
                 || match engine.protect_range(
+                    mutation.el1_editor_license(),
                     page,
                     crate::linux_abi::LINUX_PAGE_SIZE as usize,
                     prot,
@@ -1223,6 +1224,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
             None => FirstTouchGrowdown::NoPlan,
             Some(plan) => {
                 match engine.protect_range(
+                    mutation.el1_editor_license(),
                     plan.start(),
                     plan.len(),
                     crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE,

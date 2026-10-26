@@ -1305,7 +1305,12 @@ where
                             prepared_kernel_exec.replacement_mm_id(),
                             &new_image,
                         );
-                        runtime.execve_into(&new_image)?;
+                        let editor = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+                            prepared_kernel_exec.replacement_mm_id(),
+                        ).ok_or_else(|| RuntimeError::Configuration(
+                            "single-threaded exec has no exact-MM EL1 Editor exclusion".into()
+                        ))?;
+                        runtime.execve_into(editor.license(), &new_image)?;
                         let exec_context =
                             dispatcher.commit_one_task_kernel_exec(prepared_kernel_exec)?;
                         prepared_dispatch_mm_exec.commit();
@@ -1380,7 +1385,7 @@ where
                         }
                         Some(install) => {
                             if runtime
-                                .map_host_alias(va, ipa, len, &payload, backing)
+                                .map_host_alias(mutation.el1_editor_license(), va, ipa, len, &payload, backing)
                                 .is_err()
                             {
                                 // Backend `Err` does not prove that stage-2/page-table
@@ -1404,7 +1409,7 @@ where
                                 .contains(carrick_abi::LinuxProtFlags::EXEC);
                             if (prot_none || exec)
                                 && runtime
-                                    .protect_range(va.raw(), len, if prot_none { 0 } else { prot })
+                                    .protect_range(mutation.el1_editor_license(), va.raw(), len, if prot_none { 0 } else { prot })
                                     .is_err()
                             {
                                 carrick_fatal!(
@@ -1438,7 +1443,7 @@ where
                                         "bus fault length exceeds usize"
                                     );
                                 };
-                                if runtime.protect_range(bus_start, bus_len, 0).is_err() {
+                                if runtime.protect_range(mutation.el1_editor_license(), bus_start, bus_len, 0).is_err() {
                                     carrick_fatal!(
                                         "runtime::host_alias_mapping",
                                         "protect_range failed for bus fault range"
@@ -2573,42 +2578,45 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
         self.mem
             .set_mapping_protection_and_sharing(address, len, no_access, no_write, sharing);
     }
-    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
-        self.mem.protect_range(address, len, prot)
+    fn protect_range(&mut self, editor: &carrick_guest_mem::El1EditorExcluded, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        self.mem.protect_range(editor, address, len, prot)
     }
     fn supports_concurrent_exec_protection(&self) -> bool {
         self.mem.supports_concurrent_exec_protection()
     }
-    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.mem.unmap_range(address, len)
+    fn unmap_range(&mut self, editor: &carrick_guest_mem::El1EditorExcluded, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.mem.unmap_range(editor, address, len)
     }
     fn retire_mapping(
         &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
         address: carrick_guest_mem::GuestVa,
         len: usize,
     ) -> Result<(), carrick_guest_mem::MappingRetirementError> {
-        self.mem.retire_mapping(address, len)
+        self.mem.retire_mapping(editor, address, len)
     }
-    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
-        self.mem.unmap_alias_range(address, len)
+    fn unmap_alias_range(&mut self, editor: &carrick_guest_mem::El1EditorExcluded, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.mem.unmap_alias_range(editor, address, len)
     }
     fn repoint_private(
         &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
         va: u64,
         overlay_ipa: u64,
         len: usize,
         content: &[u8],
     ) -> Result<(), carrick_guest_mem::RepointPrivateError> {
-        self.mem.repoint_private(va, overlay_ipa, len, content)
+        self.mem.repoint_private(editor, va, overlay_ipa, len, content)
     }
     fn repoint_shared_leaf(
         &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
         va: u64,
         target_ipa: u64,
         len: usize,
         prot: u64,
     ) -> Result<(), MemoryError> {
-        self.mem.repoint_shared_leaf(va, target_ipa, len, prot)
+        self.mem.repoint_shared_leaf(editor, va, target_ipa, len, prot)
     }
     fn translate_va(&self, va: u64) -> Option<u64> {
         self.mem.translate_va(va)
@@ -2644,8 +2652,8 @@ impl<M: CurrentMmMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
         self.trap.complete_syscall(return_value)
     }
-    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
-        self.trap.execve_into(new_image)
+    fn execve_into(&mut self, editor: &carrick_guest_mem::El1EditorExcluded, new_image: &AddressSpace) -> Result<(), TrapError> {
+        self.trap.execve_into(editor, new_image)
     }
     fn is_forked_child(&self) -> bool {
         self.trap.is_forked_child()
@@ -2667,13 +2675,14 @@ impl<M: CurrentMmMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
     }
     fn map_host_alias(
         &mut self,
+        editor: &carrick_guest_mem::El1EditorExcluded,
         va: GuestVa,
         ipa: Gpa,
         len: u64,
         payload: &[u8],
         backing: carrick_hal::HostAliasBacking,
     ) -> Result<(), TrapError> {
-        self.trap.map_host_alias(va, ipa, len, payload, backing)
+        self.trap.map_host_alias(editor, va, ipa, len, payload, backing)
     }
 }
 

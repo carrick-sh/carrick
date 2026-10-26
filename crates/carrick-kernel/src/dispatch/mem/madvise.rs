@@ -234,6 +234,7 @@ impl<'a> MemView<'a> {
     pub(super) fn lock_current_mappings(
         &self,
         memory: &mut impl CurrentMmMemory,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         onfault: bool,
     ) -> Result<(), LinuxErrno> {
         let mem_authority_40 = self.mem();
@@ -279,7 +280,7 @@ impl<'a> MemView<'a> {
         }
         if !onfault {
             for range in &ranges {
-                self.populate_resident_range(memory, *range)?;
+                self.populate_resident_range(memory, editor_excluded, *range)?;
             }
         }
         let authority = self.mem();
@@ -505,7 +506,7 @@ impl<'a> MemView<'a> {
                 page_size,
                 committed_vma_covers_range,
             )?;
-            this.populate_resident_range(&mut *cx.memory, range)?;
+            this.populate_resident_range(&mut *cx.memory, cx.mm_mutation.el1_editor_license(), range)?;
             this.add_locked_range(range)?;
             Ok(DispatchOutcome::Returned { value: 0 })
         }
@@ -550,6 +551,7 @@ impl<'a> MemView<'a> {
             if flags.contains(LinuxMlockallFlags::CURRENT) {
                 this.lock_current_mappings(
                     &mut *cx.memory,
+                    cx.mm_mutation.el1_editor_license(),
                     flags.contains(LinuxMlockallFlags::ONFAULT),
                 )?;
             }
@@ -586,7 +588,7 @@ impl<'a> MemView<'a> {
                 committed_vma_covers_range,
             )?;
             if !flags.contains(LinuxMlock2Flags::ONFAULT) {
-                this.populate_resident_range(&mut *cx.memory, range)?;
+                this.populate_resident_range(&mut *cx.memory, cx.mm_mutation.el1_editor_license(), range)?;
             }
             this.add_locked_range(range)?;
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -745,7 +747,7 @@ impl<'a> MemView<'a> {
                         };
                         if segment.provenance == VmaBackingProvenance::PrivateFile {
                             this.mark_vma_dispatch(&mut host_alias_dispatch);
-                            if let Err(errno) = this.discard_private_file_segment(cx.memory, segment) {
+                            if let Err(errno) = this.discard_private_file_segment(cx.memory, cx.mm_mutation.el1_editor_license(), segment) {
                                 return Ok(DispatchOutcome::errno(errno));
                             }
                             continue;

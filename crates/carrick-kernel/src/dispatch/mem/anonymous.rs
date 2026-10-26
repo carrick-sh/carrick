@@ -2318,6 +2318,7 @@ impl MemView<'_> {
     fn publish_fresh_anonymous<M: CurrentMmMemory>(
         &self,
         memory: &mut M,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         start: u64,
         len: u64,
         prot: LinuxProtFlags,
@@ -2335,7 +2336,7 @@ impl MemView<'_> {
             !prot_none && !prot.contains(LinuxProtFlags::WRITE),
             carrick_guest_mem::MappingSharing::Private,
         );
-        if memory.protect_range(start, length, prot.bits()).is_err() {
+        if memory.protect_range(editor_excluded, start, length, prot.bits()).is_err() {
             mark_range_unmapped(memory, start, length);
             return Err(LINUX_ENOMEM);
         }
@@ -2353,11 +2354,12 @@ impl MemView<'_> {
     fn populate_locked<M: CurrentMmMemory>(
         &self,
         memory: &mut M,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         start: u64,
         len: u64,
     ) -> Result<(), LinuxErrno> {
         match guest_range(start, start.saturating_add(len)) {
-            Some(range) => self.populate_resident_range(memory, range),
+            Some(range) => self.populate_resident_range(memory, editor_excluded, range),
             None => Ok(()),
         }
     }
@@ -2372,17 +2374,18 @@ impl MemView<'_> {
     ) -> Result<DispatchOutcome, DispatchError> {
         let permit = cx.mm_mutation.host_alias_permit();
         let mut dispatch = self.begin_conditional_vma_dispatch(&permit);
+        let editor_excluded = cx.mm_mutation.el1_editor_license();
         let memory = &mut *cx.memory;
         let extension = proposed.range;
         let prot = LinuxProtFlags::from_bits_retain(proposed.protection.bits());
         let stale = extension.start() < self.writable_high();
         if let Err(errno) =
-            self.publish_fresh_anonymous(memory, extension.start(), extension.len(), prot, stale)
+            self.publish_fresh_anonymous(memory, editor_excluded, extension.start(), extension.len(), prot, stale)
         {
             return Ok(DispatchOutcome::errno(errno));
         }
         if locked
-            && let Err(errno) = self.populate_locked(memory, extension.start(), extension.len())
+            && let Err(errno) = self.populate_locked(memory, editor_excluded, extension.start(), extension.len())
         {
             return Ok(DispatchOutcome::errno(errno));
         }
@@ -2403,6 +2406,7 @@ impl MemView<'_> {
     ) -> Result<DispatchOutcome, DispatchError> {
         let permit = cx.mm_mutation.host_alias_permit();
         let mut dispatch = self.begin_conditional_vma_dispatch(&permit);
+        let editor_excluded = cx.mm_mutation.el1_editor_license();
         let memory = &mut *cx.memory;
         let destination = proposed.range;
         let relocation = super::Relocation {
@@ -2422,7 +2426,7 @@ impl MemView<'_> {
                 super::MoveSource::Reclaim
             },
         };
-        if let Err(errno) = self.relocate_contents(memory, relocation) {
+        if let Err(errno) = self.relocate_contents(memory, editor_excluded, relocation) {
             return Ok(DispatchOutcome::errno(errno));
         }
         {
@@ -2435,7 +2439,7 @@ impl MemView<'_> {
             self.remove_mapping_metadata(source.start(), source.len());
         }
         if locked
-            && let Err(errno) = self.populate_locked(memory, destination.start(), destination.len())
+            && let Err(errno) = self.populate_locked(memory, editor_excluded, destination.start(), destination.len())
         {
             return Ok(DispatchOutcome::errno(errno));
         }

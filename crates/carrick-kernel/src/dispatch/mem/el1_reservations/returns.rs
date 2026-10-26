@@ -122,6 +122,7 @@ impl MemView<'_> {
         &self,
         permit: &HostAliasPermit<'_>,
         memory: &mut M,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
     ) -> Result<usize, El1ReturnError> {
         let authority = self.mm_authority();
         if !permit.authorizes(&authority.mutation_coordinator, authority.mm_id) {
@@ -145,7 +146,7 @@ impl MemView<'_> {
             for range in owed.iter().chain(&stock) {
                 let len = usize::try_from(range.len())
                     .map_err(|_| El1ReturnError::Authority(Refusal::Invalid))?;
-                if let Err(error) = memory.unmap_range(range.start(), len) {
+                if let Err(error) = memory.unmap_range(editor_excluded, range.start(), len) {
                     // Nothing is acknowledged; the stock is retried too.
                     self.restore_first_touch_stock(stock_spans);
                     return Err(El1ReturnError::Backend {
@@ -196,8 +197,9 @@ impl SyscallDispatcher {
         &self,
         permit: &HostAliasPermit<'_>,
         memory: &mut M,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
     ) -> Result<usize, El1ReturnError> {
         self.mem_view()
-            .reconcile_el1_deferred_returns(permit, memory)
+            .reconcile_el1_deferred_returns(permit, memory, editor_excluded)
     }
 }

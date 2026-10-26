@@ -226,7 +226,7 @@ impl SyscallDispatcher {
         let permit = ctx.mm_mutation.host_alias_permit();
         let reconciled = self
             .mem_view()
-            .reconcile_el1_deferred_returns(&permit, ctx.memory);
+            .reconcile_el1_deferred_returns(&permit, ctx.memory, ctx.mm_mutation.el1_editor_license());
         drop(permit);
         match reconciled {
             Ok(_) => {}

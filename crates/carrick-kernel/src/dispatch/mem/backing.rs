@@ -1100,6 +1100,7 @@ impl<'a> MemView<'a> {
     pub(crate) fn discard_private_file_segment(
         &self,
         memory: &mut impl CurrentMmMemory,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         segment: &MadviseCoveredSegment,
     ) -> Result<(), LinuxErrno> {
         let mut sources: Vec<_> = self
@@ -1201,7 +1202,7 @@ impl<'a> MemView<'a> {
                         .map_err(|_| LINUX_ENOMEM)?;
                 }
                 memory
-                    .protect_range(source.start, valid_len, segment.prot.bits())
+                    .protect_range(editor_excluded, source.start, valid_len, segment.prot.bits())
                     .map_err(|_| LINUX_ENOMEM)?;
                 memory.set_mapping_protection(
                     source.start,
@@ -1216,7 +1217,7 @@ impl<'a> MemView<'a> {
             if valid_len < len {
                 let bus_start = source.start + valid_len as u64;
                 memory
-                    .protect_range(bus_start, len - valid_len, 0)
+                    .protect_range(editor_excluded, bus_start, len - valid_len, 0)
                     .map_err(|_| LINUX_ENOMEM)?;
                 if let Some(protections) = memory.protections() {
                     protections.set_bus_fault(bus_start, len - valid_len, true);

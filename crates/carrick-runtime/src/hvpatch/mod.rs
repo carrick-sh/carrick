@@ -1166,7 +1166,7 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
             // fault can mint an `MmMutationGuard`.  The sparse aperture carve
             // is nevertheless a live stage-1 edit, so acquire the exact root
             // MM's Editor exclusion here and keep it through ASID setup.
-            let _root_editor = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
+            let root_editor = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(
                 root_context.shared().mm().id(),
             )
             .ok_or_else(|| {
@@ -1174,7 +1174,7 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
                     "exclude root EL1 Editor before HVPatch ASID setup".to_owned(),
                 )
             })?;
-            engine.configure_process_asid(binding.asid.raw())?;
+            engine.configure_process_asid(root_editor.license(), binding.asid.raw())?;
             debug_assert_eq!(
                 binding.ttbr0.raw(),
                 engine.get_sys_reg(SysReg::Ttbr0).unwrap_or(0)

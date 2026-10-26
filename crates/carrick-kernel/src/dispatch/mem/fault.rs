@@ -1261,6 +1261,7 @@ impl<'a> MemView<'a> {
     pub(in crate::dispatch::mem) fn rearm_first_touch_after_mprotect(
         &self,
         memory: &mut impl CurrentMmMemory,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         address: u64,
         length: u64,
         prot: LinuxProtFlags,
@@ -1280,7 +1281,7 @@ impl<'a> MemView<'a> {
             return Ok(());
         }
         for sub in &untouched {
-            memory.protect_range(sub.start().raw(), sub.len(), 0)?;
+            memory.protect_range(editor_excluded, sub.start().raw(), sub.len(), 0)?;
         }
         let mem_authority = self.mem();
         let mut mem = mem_authority.lock();
@@ -1797,6 +1798,7 @@ impl<'a> MemView<'a> {
     pub(in crate::dispatch::mem) fn populate_resident_range(
         &self,
         memory: &mut impl CurrentMmMemory,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         range: carrick_vfs::GuestMemoryRange,
     ) -> Result<(), LinuxErrno> {
         let faults = {
@@ -1807,7 +1809,7 @@ impl<'a> MemView<'a> {
         for fault in &faults {
             let len = range_len_usize(fault.range)?;
             memory
-                .protect_range(fault.range.start().raw(), len, fault.prot.bits())
+                .protect_range(editor_excluded, fault.range.start().raw(), len, fault.prot.bits())
                 .map_err(|_| LINUX_ENOMEM)?;
         }
         let mem_authority_35 = self.mem();

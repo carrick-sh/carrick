@@ -24,6 +24,12 @@ enum ForkMemoryAuthority<'a> {
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl ForkMemoryAuthority<'_> {
+    fn editor_excluded(&self) -> Option<&carrick_guest_mem::El1EditorExcluded> {
+        match self {
+            Self::Setup(guard) => Some(guard.el1_editor_license()),
+            Self::Owner(_) => None,
+        }
+    }
     fn host_alias_permit(&self) -> carrick_kernel::dispatch::mm_mutation::HostAliasPermit<'_> {
         match self {
             Self::Setup(guard) => guard.host_alias_permit(),
@@ -1122,7 +1128,7 @@ where
                 if let Err(error) = kernel.dispatcher.with_kernel_resources(parent_context, || {
                     kernel
                         .dispatcher
-                        .reconcile_el1_deferred_returns(&permit, memory)
+                        .reconcile_el1_deferred_returns(&permit, memory, setup.el1_editor_license())
                 }) {
                     tracing::warn!(
                         ?error,
@@ -1303,6 +1309,7 @@ where
             };
         let (prepared_backend, cpu, child_kicker) = match ops.prepare(
             memory,
+            parent_mutation.editor_excluded(),
             inventory_preparation,
             carrick_hal::ProcessForkRequest {
                 entry: carrick_hal::GuestEntryRegs {
@@ -1359,7 +1366,7 @@ where
             .is_some_and(|work| !work.begin_publication())
         {
             if let Err(error) =
-                ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
+                ops.abort_and_rollback_prepared(prepared_backend, memory, parent_mutation.editor_excluded(), !shares_mm)
             {
                 return Err(ops.fail_stop(error));
             }
@@ -1400,7 +1407,7 @@ where
                     "dispatcher fork install rejected stale parent revision; fork(2) = EAGAIN"
                 );
                 if let Err(error) =
-                    ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
+                    ops.abort_and_rollback_prepared(prepared_backend, memory, parent_mutation.editor_excluded(), !shares_mm)
                 {
                     return Err(ops.fail_stop(error));
                 }
@@ -1489,7 +1496,7 @@ where
                 });
             }
             if let Err(cleanup_error) =
-                ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
+                ops.abort_and_rollback_prepared(prepared_backend, memory, parent_mutation.editor_excluded(), !shares_mm)
             {
                 return Err(ops.fail_stop(cleanup_error));
             }
@@ -1514,7 +1521,7 @@ where
                     }
                 }
                 if let Err(error) =
-                    ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
+                    ops.abort_and_rollback_prepared(prepared_backend, memory, parent_mutation.editor_excluded(), !shares_mm)
                 {
                     return Err(ops.fail_stop(error));
                 }
@@ -1558,7 +1565,7 @@ where
                     carrick_fatal!("hvpatch::fork_commit", "owner Fork child authentication refused: child_pid={child_pid}, refusal={refusal:?}")
                 });
             }
-            ops.commit_parent(memory).unwrap_or_else(|error| {
+            ops.commit_parent(memory, parent_mutation.editor_excluded()).unwrap_or_else(|error| {
                 carrick_fatal!(
                     "hvpatch::fork_parent_commit",
                     "failed to commit parent fork: parent_pid={parent_pid}, error={error}"

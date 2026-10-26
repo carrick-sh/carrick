@@ -6616,7 +6616,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn build_process_spec(
         &mut self,
-        editor: &carrick_guest_mem::El1EditorExcluded,
+        editor: Option<&carrick_guest_mem::El1EditorExcluded>,
         mut request: ProcessForkRequest,
     ) -> Result<Self::ProcessSpec, TrapError> {
         use carrick_observability::probes::{
@@ -6626,6 +6626,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         if request.plan.owner_target().is_some() {
             return self.build_owner_process_spec(request);
         }
+        let editor = editor.ok_or_else(|| TrapError::Hypervisor("host fork has no exact-MM EL1 Editor exclusion".into()))?;
         if self.pending_process_fork.is_some() {
             return Err(TrapError::Hypervisor(
                 "overlapping in-process parent fork transaction".to_owned(),
@@ -7064,7 +7065,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn commit_process_fork(
         &mut self,
-        editor: &carrick_guest_mem::El1EditorExcluded,
+        editor: Option<&carrick_guest_mem::El1EditorExcluded>,
     ) -> Result<(), TrapError> {
         if let Some(owner) = self.pending_owner_fork.take() {
             let used = owner.pending.completion().parent_tables_used;
@@ -7079,6 +7080,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             drop(receipt);
             return Ok(());
         }
+        let editor = editor.ok_or_else(|| TrapError::Hypervisor("host fork commit has no exact-MM EL1 Editor exclusion".into()))?;
         let _ = self.pending_process_fork.take();
         self.page_tables.commit_undo(editor);
         Ok(())
@@ -7086,7 +7088,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
 
     fn rollback_process_fork(
         &mut self,
-        editor: &carrick_guest_mem::El1EditorExcluded,
+        editor: Option<&carrick_guest_mem::El1EditorExcluded>,
     ) -> Result<(), TrapError> {
         if let Some(owner) = self.pending_owner_fork.take() {
             let receipt = owner.pending.finish(false, |frame, effect| {
@@ -7101,6 +7103,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 .map_err(TrapError::Hypervisor)?;
             return Ok(());
         }
+        let editor = editor.ok_or_else(|| TrapError::Hypervisor("host fork rollback has no exact-MM EL1 Editor exclusion".into()))?;
         let Some(rollback) = self.pending_process_fork.take() else {
             return Ok(());
         };

@@ -2087,12 +2087,13 @@ impl<'a> MemView<'a> {
     pub(in crate::dispatch::mem) fn commit_mmap_locked_range(
         &self,
         memory: &mut impl CurrentMmMemory,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         range: Option<carrick_vfs::GuestMemoryRange>,
     ) -> Result<(), LinuxErrno> {
         let Some(range) = range else {
             return Ok(());
         };
-        self.populate_resident_range(memory, range)?;
+        self.populate_resident_range(memory, editor_excluded, range)?;
         locked_ranges_insert(&mut self.mem().lock().locked_ranges, range);
         Ok(())
     }
@@ -2114,6 +2115,7 @@ impl<'a> MemView<'a> {
     fn rollback_shared_anon_mapping(
         &self,
         memory: &mut impl CurrentMmMemory,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         address: u64,
         guest_length: u64,
         mapped_length: usize,
@@ -2130,8 +2132,8 @@ impl<'a> MemView<'a> {
                 "shared-anon rollback range is empty at 0x{address:x}"
             )));
         };
-        if let Err(first) = memory.unmap_range(address, mapped_length)
-            && let Err(retry) = memory.unmap_range(address, mapped_length)
+        if let Err(first) = memory.unmap_range(editor_excluded, address, mapped_length)
+            && let Err(retry) = memory.unmap_range(editor_excluded, address, mapped_length)
         {
             // A concurrent-exec backend maps guest bytes into this host
             // process. Returning would destroy the only rollback authority
@@ -2177,6 +2179,7 @@ impl<'a> MemView<'a> {
     pub(in crate::dispatch::mem) fn relocate_contents<M: CurrentMmMemory>(
         &self,
         memory: &mut M,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         relocation: Relocation,
     ) -> Result<(), LinuxErrno> {
         let Relocation {
@@ -2191,7 +2194,7 @@ impl<'a> MemView<'a> {
             source_after,
         } = relocation;
         let rollback = |this: &Self, memory: &mut M, errno: LinuxErrno| -> LinuxErrno {
-            match this.rollback_fresh_arena_mapping(memory, destination, destination_len) {
+            match this.rollback_fresh_arena_mapping(memory, editor_excluded, destination, destination_len) {
                 Ok(()) => errno,
                 // The destination could not be unpublished either: report
                 // the syscall failure; the rollback itself fail-stops under
@@ -2222,7 +2225,7 @@ impl<'a> MemView<'a> {
         // private/cacheable mid-move.
         memory.set_mapping_protection_and_sharing(destination, dest_len, false, false, sharing);
         if memory
-            .protect_range(destination, dest_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
+            .protect_range(editor_excluded, destination, dest_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
             .is_err()
         {
             return Err(rollback(self, memory, LINUX_ENOMEM));
@@ -2238,7 +2241,7 @@ impl<'a> MemView<'a> {
             !prot_none && !prot.contains(LinuxProtFlags::WRITE),
         );
         if memory
-            .protect_range(destination, dest_len, prot.bits())
+            .protect_range(editor_excluded, destination, dest_len, prot.bits())
             .is_err()
         {
             return Err(rollback(self, memory, LINUX_ENOMEM));
@@ -2256,7 +2259,7 @@ impl<'a> MemView<'a> {
                 let overlaps = destination < source.saturating_add(source_len)
                     && source < destination.saturating_add(destination_len);
                 if !overlaps {
-                    if memory.unmap_range(source, src_len).is_err() {
+                    if memory.unmap_range(editor_excluded, source, src_len).is_err() {
                         return Err(rollback(self, memory, LINUX_ENOMEM));
                     }
                     mark_range_unmapped(memory, source, src_len);
@@ -2273,14 +2276,15 @@ impl<'a> MemView<'a> {
     fn rollback_fresh_arena_mapping(
         &self,
         memory: &mut impl CurrentMmMemory,
+        editor_excluded: &carrick_guest_mem::El1EditorExcluded,
         address: u64,
         len: u64,
     ) -> Result<(), MemoryError> {
         let len_usize = usize::try_from(len).map_err(|_| {
             MemoryError::HostMap(format!("arena rollback length does not fit usize: {len}"))
         })?;
-        if let Err(first) = memory.unmap_range(address, len_usize)
-            && let Err(retry) = memory.unmap_range(address, len_usize)
+        if let Err(first) = memory.unmap_range(editor_excluded, address, len_usize)
+            && let Err(retry) = memory.unmap_range(editor_excluded, address, len_usize)
         {
             if memory.supports_concurrent_exec_protection() {
                 carrick_fatal!(

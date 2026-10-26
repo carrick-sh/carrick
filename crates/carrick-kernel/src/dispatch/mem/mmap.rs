@@ -18,6 +18,7 @@ struct AnonymousBackingRetirement {
 fn retire_anonymous_mapping_backing(
     dispatcher: &MemView<'_>,
     memory: &mut impl CurrentMmMemory,
+    editor_excluded: &carrick_guest_mem::El1EditorExcluded,
     address: u64,
     length: u64,
     length_usize: usize,
@@ -27,6 +28,7 @@ fn retire_anonymous_mapping_backing(
     retire_anonymous_mapping_backing_with_residency(
         dispatcher,
         memory,
+        editor_excluded,
         AnonymousBackingRetirement {
             address,
             length,
@@ -41,6 +43,7 @@ fn retire_anonymous_mapping_backing(
 fn retire_anonymous_mapping_backing_with_residency(
     dispatcher: &MemView<'_>,
     memory: &mut impl CurrentMmMemory,
+    editor_excluded: &carrick_guest_mem::El1EditorExcluded,
     request: AnonymousBackingRetirement,
     residency: Option<&carrick_el1_abi::FrameGrantResidencyTable>,
 ) -> Result<(), MemoryError> {
@@ -61,7 +64,7 @@ fn retire_anonymous_mapping_backing_with_residency(
                     .ok_or(MemoryError::MetadataAllocation)
             })
             .transpose()?;
-        memory.unmap_range(request.address, request.length_usize)?;
+        memory.unmap_range(editor_excluded, request.address, request.length_usize)?;
         if residency_retirement.is_some_and(|retirement| !retirement.commit()) {
             // The backend edit is already live. Returning a Linux errno would
             // let the MM continue with two answers for the replacement, so use
@@ -80,6 +83,7 @@ fn retire_anonymous_mapping_backing_with_residency(
 pub(super) fn retire_anonymous_mapping_backing_with_residency_for_test(
     dispatcher: &MemView<'_>,
     memory: &mut impl CurrentMmMemory,
+    editor_excluded: &carrick_guest_mem::El1EditorExcluded,
     request: (u64, u64, usize, bool, bool),
     residency: &carrick_el1_abi::FrameGrantResidencyTable,
 ) -> Result<(), MemoryError> {
@@ -87,6 +91,7 @@ pub(super) fn retire_anonymous_mapping_backing_with_residency_for_test(
     retire_anonymous_mapping_backing_with_residency(
         dispatcher,
         memory,
+        editor_excluded,
         AnonymousBackingRetirement {
             address,
             length,
@@ -254,6 +259,7 @@ impl<'a> MemView<'a> {
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let mut flags = flags;
+            let editor_excluded = cx.mm_mutation.el1_editor_license();
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
 
@@ -820,6 +826,7 @@ impl<'a> MemView<'a> {
                     .map(|alloc| this.snapshot_shared_writeback(memory, alloc))
                     .collect::<Vec<_>>();
                 if let Err(failure) = memory.repoint_private(
+                    editor_excluded,
                     requested.0,
                     overlay_va,
                     length_usize,
@@ -886,7 +893,7 @@ impl<'a> MemView<'a> {
                     !prot_none && !prot_flags.contains(LinuxProtFlags::WRITE),
                     carrick_guest_mem::MappingSharing::Private,
                 );
-                if let Err(error) = memory.protect_range(requested.0, length_usize, prot) {
+                if let Err(error) = memory.protect_range(editor_excluded, requested.0, length_usize, prot) {
                     // Repoint succeeded, so the prior mapping cannot be restored.
                     // Match the runtime alias transaction: do not return to the
                     // guest with split backing/metadata ownership after a
@@ -905,7 +912,7 @@ impl<'a> MemView<'a> {
                         );
                     };
                     if memory
-                        .protect_range(bus_start, bus_len_usize, 0)
+                        .protect_range(editor_excluded, bus_start, bus_len_usize, 0)
                         .is_err()
                     {
                         mark_range_unmapped(memory, requested.0, length_usize);
@@ -1246,7 +1253,7 @@ impl<'a> MemView<'a> {
                         .shared
                         .range_needs_identity_restore(addr, map_len);
                     if needs_identity_restore {
-                        if memory.restore_shared_identity(addr, map_len_usize).is_err() {
+                        if memory.restore_shared_identity(editor_excluded, addr, map_len_usize).is_err() {
                             // The page-table edit may already be live even when
                             // its required TLB flush reports failure. Recycling
                             // this VA would publish unowned translation state.
@@ -1284,14 +1291,14 @@ impl<'a> MemView<'a> {
                         carrick_guest_mem::MappingSharing::Shared,
                     );
                     let protection = if prot_none {
-                        memory.protect_range(addr, map_len_usize, 0)
+                        memory.protect_range(editor_excluded, addr, map_len_usize, 0)
                     } else if memory
                         .resident_pages(GuestVa::new(addr), 1, this.linux_page_size())
                         .is_none()
                     {
                         // Backends without live host residency use a temporary
                         // inaccessible mapping to observe the first touch.
-                        let protected = memory.protect_range(addr, map_len_usize, 0);
+                        let protected = memory.protect_range(editor_excluded, addr, map_len_usize, 0);
                         if protected.is_ok() {
                             this.track_resident_fault_range(addr, length, prot_flags);
                             // The temporary backing state is not the guest VMA
@@ -1317,13 +1324,14 @@ impl<'a> MemView<'a> {
                         // manufacturing a demand fault. This call also consumes
                         // a failure recorded by the preceding void metadata
                         // setter; an error must roll the allocation back.
-                        memory.protect_range(addr, map_len_usize, prot)
+                        memory.protect_range(editor_excluded, addr, map_len_usize, prot)
                     };
                     if let Err(error) = protection
                         && memory.supports_concurrent_exec_protection()
                     {
                         this.rollback_shared_anon_mapping(
                             memory,
+                            editor_excluded,
                             addr,
                             length,
                             map_len_usize,
@@ -1336,9 +1344,10 @@ impl<'a> MemView<'a> {
                             format_args!("at {addr:#x}+{map_len:#x}: {error}"),
                         ));
                     }
-                    if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
+                    if let Err(errno) = this.commit_mmap_locked_range(memory, editor_excluded, locked_range) {
                         memory.set_mapping_protection(addr, map_len_usize, false, false);
                         let _ = memory.protect_range(
+                            editor_excluded,
                             addr,
                             map_len_usize,
                             crate::linux_abi::LINUX_PROT_READ
@@ -1346,6 +1355,7 @@ impl<'a> MemView<'a> {
                         );
                         this.rollback_shared_anon_mapping(
                             memory,
+                            editor_excluded,
                             addr,
                             length,
                             map_len_usize,
@@ -1555,7 +1565,7 @@ impl<'a> MemView<'a> {
             if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 if let Err(error) = retire_anonymous_mapping_backing(
-                    this, memory, address, length, length_usize,
+                    this, memory, editor_excluded, address, length, length_usize,
                     fixed_anonymous, sparse_anonymous_backing,
                 ) {
                     return Ok(request.refused_by(
@@ -1578,7 +1588,7 @@ impl<'a> MemView<'a> {
                 // is fatal only inside the eager arena (where eager backends
                 // must succeed); an out-of-arena protect_range failure is
                 // benign (KVM/NVMM host-map lazily, HVF maps the arena eagerly).
-                if let Err(error) = memory.protect_range(address, length_usize, 0)
+                if let Err(error) = memory.protect_range(editor_excluded, address, length_usize, 0)
                     && (in_arena || memory.supports_concurrent_exec_protection())
                 {
                     mark_range_unmapped(memory, address, length_usize);
@@ -1590,7 +1600,7 @@ impl<'a> MemView<'a> {
                         ),
                     ));
                 }
-                if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
+                if let Err(errno) = this.commit_mmap_locked_range(memory, editor_excluded, locked_range) {
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("mmap locked range population failed"),
@@ -1643,7 +1653,7 @@ impl<'a> MemView<'a> {
             {
                 let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
                 if let Err(error) = retire_anonymous_mapping_backing(
-                    this, memory, address, length, length_usize,
+                    this, memory, editor_excluded, address, length, length_usize,
                     fixed_anonymous, sparse_anonymous_backing,
                 ) {
                     return Ok(request.refused_by(
@@ -1666,7 +1676,7 @@ impl<'a> MemView<'a> {
                 let initial_prot = if defer_anonymous { 0 } else { prot };
                 // Unconditional (see the PROT_NONE arm above): reserve across
                 // the whole arena for demand-paged backends; fatal only in-arena.
-                if let Err(error) = memory.protect_range(address, length_usize, initial_prot)
+                if let Err(error) = memory.protect_range(editor_excluded, address, length_usize, initial_prot)
                     && (in_arena || memory.supports_concurrent_exec_protection())
                 {
                     mark_range_unmapped(memory, address, length_usize);
@@ -1678,7 +1688,7 @@ impl<'a> MemView<'a> {
                         ),
                     ));
                 }
-                if let Err(errno) = this.commit_mmap_locked_range(memory, locked_range) {
+                if let Err(errno) = this.commit_mmap_locked_range(memory, editor_excluded, locked_range) {
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("mmap locked range population failed"),
@@ -1725,7 +1735,7 @@ impl<'a> MemView<'a> {
                     && memory
                         .resident_pages(GuestVa::new(address), 1, this.linux_page_size())
                         .is_none()
-                    && memory.protect_range(address, length_usize, 0).is_ok())
+                    && memory.protect_range(editor_excluded, address, length_usize, 0).is_ok())
                 {
                     this.track_resident_fault_range(address, length, prot_flags);
                     // The temporary inaccessible backing is NOT the guest's VMA
@@ -2297,7 +2307,7 @@ impl<'a> MemView<'a> {
                         MmapRefusal::Internal("private file source capacity exhausted"), LINUX_ENOMEM,
                     ));
                 };
-                match memory.retire_mapping(GuestVa::new(address), length_usize) {
+                match memory.retire_mapping(editor_excluded, GuestVa::new(address), length_usize) {
                     Ok(()) => {}
                     Err(carrick_guest_mem::MappingRetirementError::Clean(error)) => {
                         return Ok(request.refused_by(
@@ -2324,7 +2334,7 @@ impl<'a> MemView<'a> {
             // requested Linux permission immediately afterward.
             if !bytes.is_empty() {
                 let rw = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
-                if let Err(error) = memory.protect_range(address, length_usize, rw)
+                if let Err(error) = memory.protect_range(editor_excluded, address, length_usize, rw)
                     && (in_arena || memory.supports_concurrent_exec_protection())
                 {
                     mark_range_unmapped(memory, address, length_usize);
@@ -2363,7 +2373,7 @@ impl<'a> MemView<'a> {
                 prot
             };
             if !owner_file_backed
-                && let Err(error) = memory.protect_range(address, length_usize, initial_prot)
+                && let Err(error) = memory.protect_range(editor_excluded, address, length_usize, initial_prot)
                 && (in_arena || memory.supports_concurrent_exec_protection())
             {
                 if deferred_file_backed_len.is_some() {
@@ -2388,8 +2398,8 @@ impl<'a> MemView<'a> {
                 if !owner_file_backed {
                     memory.set_no_access(bus_start, bus_len_usize, true);
                     if let Err(error) = memory
-                        .protect_range(bus_start, bus_len_usize, 0)
-                        .and_then(|()| memory.mark_bus_fault(bus_start, bus_len_usize))
+                        .protect_range(editor_excluded, bus_start, bus_len_usize, 0)
+                        .and_then(|()| memory.mark_bus_fault(editor_excluded, bus_start, bus_len_usize))
                         && memory.supports_concurrent_exec_protection()
                     {
                         if deferred_file_backed_len.is_some() {
@@ -2422,7 +2432,7 @@ impl<'a> MemView<'a> {
             {
                 this.mark_range_resident(address, length);
             }
-            this.commit_mmap_locked_range(memory, locked_range)?;
+            this.commit_mmap_locked_range(memory, editor_excluded, locked_range)?;
             if mmap_write_sealed_shared {
                 this.record_write_sealed_shared_map(address, length);
             }
@@ -2627,7 +2637,7 @@ impl<'a> MemView<'a> {
                 // one table per alias and a churning guest hits OutOfTables.
                 if cx
                     .memory
-                    .unmap_alias_range(address.0, len_usize)
+                    .unmap_alias_range(cx.mm_mutation.el1_editor_license(), address.0, len_usize)
                     .is_err()
                 {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -2678,6 +2688,7 @@ impl<'a> MemView<'a> {
             let user_ceiling = UserVaCeiling::for_abi(cx.guest_abi());
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
+            let editor_excluded = cx.mm_mutation.el1_editor_license();
             let memory = &mut *cx.memory;
             let page_size = this.linux_page_size();
             // Well-formedness first (`mremap_request`), exactly as Linux orders it.
@@ -2927,9 +2938,9 @@ impl<'a> MemView<'a> {
                     if this.range_is_alias_vma(va, new_size)
                         || mmap_address_uses_alias(va, new_size, layout, user_ceiling)
                     {
-                        let _ = memory.unmap_alias_range(va, new_len);
+                        let _ = memory.unmap_alias_range(editor_excluded, va, new_len);
                     } else {
-                        let _ = memory.unmap_range(va, new_len);
+                        let _ = memory.unmap_range(editor_excluded, va, new_len);
                     }
                     mark_range_unmapped(memory, va, new_len);
                     this.remove_mapping_metadata(va, new_size);
@@ -2960,7 +2971,7 @@ impl<'a> MemView<'a> {
 
                 // Repoint destination stage-1 leaf to the existing shared extent.
                 if let Err(err) = memory
-                    .repoint_shared_leaf(va, destination_leaf_ipa, new_len, pf.bits())
+                    .repoint_shared_leaf(editor_excluded, va, destination_leaf_ipa, new_len, pf.bits())
                 {
                     return fail(
                         SharedFileFixedMremapError::RepointSharedLeaf { source: err },
@@ -2976,9 +2987,9 @@ impl<'a> MemView<'a> {
                     if this.range_is_alias_vma(old_address.0, old_size)
                         || mmap_address_uses_alias(old_address.0, old_size, layout, user_ceiling)
                     {
-                        let _ = memory.unmap_alias_range(old_address.0, old_len);
+                        let _ = memory.unmap_alias_range(editor_excluded, old_address.0, old_len);
                     } else {
-                        let _ = memory.unmap_range(old_address.0, old_len);
+                        let _ = memory.unmap_range(editor_excluded, old_address.0, old_len);
                     }
                     mark_range_unmapped(memory, old_address.0, old_len);
                     this.remove_mapping_metadata(old_address.0, old_size);
@@ -3338,7 +3349,7 @@ impl<'a> MemView<'a> {
                     if let Ok(old_len) = usize::try_from(old_size)
                         && old_len > 0
                     {
-                        let _ = memory.unmap_alias_range(old_address.0, old_len);
+                        let _ = memory.unmap_alias_range(editor_excluded, old_address.0, old_len);
                         mark_range_unmapped(memory, old_address.0, old_len);
                         this.remove_mapping_metadata(old_address.0, old_size);
                     }
@@ -3438,7 +3449,7 @@ impl<'a> MemView<'a> {
                             .range_needs_identity_restore(claim_start, claim_len)
                         {
                             if memory
-                                .restore_shared_identity(claim_start, claim_len_usize)
+                                .restore_shared_identity(editor_excluded, claim_start, claim_len_usize)
                                 .is_err()
                             {
                                 // The page-table edit may already be live even
@@ -3475,7 +3486,7 @@ impl<'a> MemView<'a> {
                             carrick_guest_mem::MappingSharing::Shared,
                         );
                         if memory
-                            .protect_range(claim_start, claim_len_usize, source_metadata.prot.bits())
+                            .protect_range(editor_excluded, claim_start, claim_len_usize, source_metadata.prot.bits())
                             .is_err()
                         {
                             return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -3514,9 +3525,9 @@ impl<'a> MemView<'a> {
                             && (this.range_is_alias_vma(old_address.0, old_size)
                                  || mmap_address_uses_alias(old_address.0, old_size, layout, user_ceiling))
                         {
-                            memory.unmap_alias_range(tail_start, tail_len_usize)
+                            memory.unmap_alias_range(editor_excluded, tail_start, tail_len_usize)
                         } else {
-                            memory.unmap_range(tail_start, tail_len_usize)
+                            memory.unmap_range(editor_excluded, tail_start, tail_len_usize)
                         };
                         if unmap_result.is_err() {
                             return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -3588,7 +3599,7 @@ impl<'a> MemView<'a> {
                     // Invalidate guest translation first, then publish the
                     // post-unmap VMA state last so backend protection hooks
                     // cannot overwrite it with live PROT_NONE metadata.
-                    if memory.unmap_range(tail_start, tl).is_err() {
+                    if memory.unmap_range(editor_excluded, tail_start, tl).is_err() {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     }
                     mark_range_unmapped(memory, tail_start, tl);
@@ -3659,7 +3670,7 @@ impl<'a> MemView<'a> {
                         scrub_destination: reused,
                         source_after: MoveSource::Reclaim,
                     };
-                    if let Err(errno) = this.relocate_contents(memory, relocation) {
+                    if let Err(errno) = this.relocate_contents(memory, editor_excluded, relocation) {
                         return Ok(DispatchOutcome::errno(errno));
                     }
                     // Re-publish the past-EOF tail at the destination exactly as
@@ -3671,7 +3682,7 @@ impl<'a> MemView<'a> {
                         && bus_len_usize != 0
                     {
                         memory.set_no_access(bus_start_abs, bus_len_usize, true);
-                        let _ = memory.protect_range(bus_start_abs, bus_len_usize, 0);
+                        let _ = memory.protect_range(editor_excluded, bus_start_abs, bus_len_usize, 0);
                     }
                     this.record_mmap_bus_fault_range(bus_start_abs, bus_len);
                     this.record_remapped_dynamic_mapping(
@@ -3738,7 +3749,7 @@ impl<'a> MemView<'a> {
                         proc_mapping_sharing(source_metadata.sharing),
                     );
                     if memory
-                        .protect_range(old_end, grow_len, source_metadata.prot.bits())
+                        .protect_range(editor_excluded, old_end, grow_len, source_metadata.prot.bits())
                         .is_err()
                     {
                         mark_range_unmapped(memory, old_end, grow_len);
@@ -3779,7 +3790,7 @@ impl<'a> MemView<'a> {
                 if let Ok(dst_len) = usize::try_from(new_size)
                     && dst_len > 0
                 {
-                    let _ = memory.unmap_range(new_address.0, dst_len);
+                    let _ = memory.unmap_range(editor_excluded, new_address.0, dst_len);
                     mark_range_unmapped(memory, new_address.0, dst_len);
                     this.remove_mapping_metadata(new_address.0, new_size);
                 }
@@ -3834,7 +3845,7 @@ impl<'a> MemView<'a> {
                     MoveSource::Reclaim
                 },
             };
-            if let Err(errno) = this.relocate_contents(memory, relocation) {
+            if let Err(errno) = this.relocate_contents(memory, editor_excluded, relocation) {
                 return Ok(DispatchOutcome::errno(errno));
             }
             this.record_remapped_dynamic_mapping(
@@ -4175,7 +4186,7 @@ impl<'a> MemView<'a> {
                     mem.mmap_writable_high = mem.mmap_writable_high.max(end);
                 }
                 if !owner_proposal && let Err(error) = this.rearm_first_touch_after_mprotect(
-                    cx.memory, address.0, length, prot_flags,
+                    cx.memory, cx.mm_mutation.el1_editor_license(), address.0, length, prot_flags,
                 ) {
                     tracing::error!(
                         address = address.0,

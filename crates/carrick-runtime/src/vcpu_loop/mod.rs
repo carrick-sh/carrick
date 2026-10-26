@@ -2265,7 +2265,7 @@ where
                 } if kernel.hvpatch_process.is_some() => {
                     let shared = backing.is_shared();
                     let install_alias =
-                        |permit: &carrick_kernel::dispatch::mm_mutation::HostAliasPermit<'_>| {
+                        |permit: &carrick_kernel::dispatch::mm_mutation::HostAliasPermit<'_>, editor_excluded: &carrick_guest_mem::El1EditorExcluded| {
                             let Some(install) = transaction.claim(permit) else {
                                 drop(backing);
                                 return Ok(DispatchOutcome::Returned {
@@ -2311,7 +2311,7 @@ where
                             }
 
                             if let Err(error) =
-                                engine.map_host_alias(va, ipa, len, &payload, backing)
+                                engine.map_host_alias(editor_excluded, va, ipa, len, &payload, backing)
                             {
                                 // A failed alias install is guest-argument-reachable
                                 // (an oversized/awkwardly-placed mmap can exhaust the
@@ -2434,6 +2434,7 @@ where
                                 .contains(carrick_abi::LinuxProtFlags::EXEC);
                             if (prot_none || exec)
                                 && let Err(error) = engine.protect_range(
+                                    editor_excluded,
                                     va.raw(),
                                     len_bytes,
                                     if prot_none { 0 } else { prot },
@@ -2463,7 +2464,7 @@ where
                                         None,
                                     ));
                                 };
-                                if let Err(error) = engine.protect_range(bus_start, bus_len, 0) {
+                                if let Err(error) = engine.protect_range(editor_excluded, bus_start, bus_len, 0) {
                                     return Err(refuse(
                                         Site::BusFaultProtect,
                                         format!(
@@ -2497,7 +2498,7 @@ where
                         }
                     };
                     let permit = mutation.host_alias_permit();
-                    let installed = install_alias(&permit);
+                    let installed = install_alias(&permit, mutation.el1_editor_license());
                     break 'service installed;
                 }
                 other => break 'service Ok(other),
