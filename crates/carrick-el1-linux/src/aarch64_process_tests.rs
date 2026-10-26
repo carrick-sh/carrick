@@ -3463,6 +3463,78 @@ fn unregistered_in_zone_thread_restores_process_identity_across_slots() {
 }
 
 #[test]
+fn in_zone_clone_reaches_native_owner_on_its_first_entry() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let mut child = None;
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |process| {
+                process
+                    .thread_spawned(41, 42, &mut || {
+                        child = Some(imported_thread_on_slot(fixture, fixture.slot, |identity| {
+                            identity.generation = fixture.leader.generation
+                        }));
+                        Ok(())
+                    })
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    let (child_control, child) = child.unwrap();
+    assert!(registry().for_record(fixture.zone, child).is_none());
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        child.id
+    );
+    let identity = fixture.zone.record(child.id).identity();
+    fixture.task.set(
+        El1TaskId::from_linux_tid(identity.tid as i32),
+        carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+        identity.file_table,
+    );
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(identity.serial, Ordering::Release);
+    fixture
+        .task
+        .publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+    fixture.task.publish_visible_pid(fixture.leader.tid as u32);
+    let saved = unsafe { *fixture.zone.record(child.id).ctx_mut() };
+    with_process_entry(
+        BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        },
+        &fixture.task,
+        &saved.native,
+        fixture_ttbr0(fixture),
+        fixture.page,
+        child_control,
+        &mut service,
+        |entry| {
+            let result = entry.begin_service(
+                carrick_core_abi::service::ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
+                    address: UserVa::new(VA + 0x9000),
+                    access: carrick_guest_arch::Access::Write,
+                    present: false,
+                }),
+                None,
+            )?;
+            assert!(entry.take_handoff_receipt().is_some());
+            Ok::<_, NativeProcessError>(result)
+        },
+    )
+    .unwrap_or_else(|error| panic!("first cloned-thread entry failed: {error:?}; {identity:?}"))
+    .unwrap_or_else(|error| panic!("first cloned-thread fault failed: {error:?}; {identity:?}"));
+}
+
+#[test]
 fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
     for notified in [false, true] {
         let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));

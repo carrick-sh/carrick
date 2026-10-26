@@ -76,6 +76,12 @@ impl<'a> core::ops::Deref for PreparedWords<'a> {
 }
 
 type Runtime = NativeProcessRuntime<'static, Mm, Aarch64ParkedContext>;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MemberServiceBinding {
+    Retained,
+    Required,
+}
 static REGISTRY: NativeProcessRegistry<'static, Mm, Aarch64ParkedContext> =
     NativeProcessRegistry::new();
 
@@ -309,7 +315,7 @@ pub fn admit_entry(
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
 ) -> Result<(Arc<Runtime>, Mm, Aarch64ParkedContext), NativeProcessError> {
-    let (runtime, address) =
+    let (runtime, address, _) =
         admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
     let words = Aarch64ParkedContext::from_register(
         *native,
@@ -330,7 +336,7 @@ fn admit_entry_runtime(
     record: RecordId,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
-) -> Result<(Arc<Runtime>, Mm), NativeProcessError> {
+) -> Result<(Arc<Runtime>, Mm, MemberServiceBinding), NativeProcessError> {
     // SAFETY: the EL1 caller owns the running slot and its record until the
     // process route returns to the vector.
     let observed = unsafe { observed_entry_address(source, task, ttbr0, record)? };
@@ -352,7 +358,7 @@ fn admit_entry_runtime(
             .for_record(source.zone, source.zone.record_ref(record))
             .is_some_and(|retained| Arc::ptr_eq(&retained, &runtime))
     {
-        return Ok((runtime, address));
+        return Ok((runtime, address, MemberServiceBinding::Retained));
     }
     if control.entry().is_some()
         || REGISTRY
@@ -364,11 +370,15 @@ fn admit_entry_runtime(
             )
             .is_some()
     {
-        let runtime = match REGISTRY.rehome_entry(source, task, address, page, control)? {
-            Some(runtime) => runtime,
-            None => REGISTRY.register_thread(source, task, address, page, control)?,
-        };
-        return Ok((runtime, address));
+        let (runtime, service_binding) =
+            match REGISTRY.rehome_entry(source, task, address, page, control)? {
+                Some(runtime) => (runtime, MemberServiceBinding::Retained),
+                None => (
+                    REGISTRY.register_thread(source, task, address, page, control)?,
+                    MemberServiceBinding::Required,
+                ),
+            };
+        return Ok((runtime, address, service_binding));
     }
     let words = Aarch64ParkedContext::from_register(
         *native,
@@ -380,7 +390,7 @@ fn admit_entry_runtime(
         source, task, page, control, address, address, words,
     )?);
     REGISTRY.register_root(runtime.clone(), source, task, address)?;
-    Ok((runtime, address))
+    Ok((runtime, address, MemberServiceBinding::Retained))
 }
 
 /// Unpublished admission custody is scoped to this call: a home left in a
@@ -436,7 +446,7 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         source,
         record: source.zone.record_ref(record),
     };
-    let (runtime, address) =
+    let (runtime, address, service_binding) =
         admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
     task.publish_root_generation(address.generation);
     let (result, root_exit) = {
@@ -449,7 +459,12 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
             ));
             #[cfg(target_os = "none")]
             drain_native_signal_ingress(registry(), source, service);
-            runtime.enter_registered(registry(), source, task, address, &words, service)?
+            let mut process =
+                runtime.enter_registered(registry(), source, task, address, &words, service)?;
+            if service_binding == MemberServiceBinding::Required {
+                process.bind_service_channel()?;
+            }
+            process
         };
         process.import_in_zone_standard_signals()?;
         let result = dispatch(&mut process);
