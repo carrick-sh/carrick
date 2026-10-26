@@ -2767,7 +2767,7 @@ mod carrier_vm_custody_tests {
             .1
             .expect("editor removed the exact test stage-1 leaf")
             .complete_after(|| Ok::<(), ()>(()))
-            .unwrap()
+            .expect("test TLBI completes")
     }
 
     #[test]
@@ -5031,11 +5031,11 @@ mod carrier_vm_custody_tests {
                 4096,
                 |editor| editor.invalidate(va, 4096).map(|_| ()),
             )
-            .unwrap();
+            .expect("test unpublication edit succeeds");
         let receipt = receipt
-            .unwrap()
+            .expect("test unpublication removes the exact leaf")
             .complete_after(|| Ok::<(), ()>(()))
-            .unwrap();
+            .expect("test TLBI completes");
         let lease = (0xa081_b000_0000, 0x4000);
         let mut frames = InventoryFrameRegistry::default();
         frames.stage2_references.insert(lease, 1);

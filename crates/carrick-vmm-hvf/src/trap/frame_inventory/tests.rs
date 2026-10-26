@@ -28,7 +28,7 @@ fn test_leaf_retirement_receipt(ipa: u64) -> carrick_aarch64::stage1_authority::
                 )
                 .map(|_| ())
         })
-        .unwrap();
+        .expect("test mapping installs");
     authority
         .edit_unpublishing(
             crate::trap::test_stage1_edit_license(),
@@ -37,11 +37,11 @@ fn test_leaf_retirement_receipt(ipa: u64) -> carrick_aarch64::stage1_authority::
             0x1000,
             |editor| editor.invalidate(va, 0x1000).map(|_| ()),
         )
-        .unwrap()
+        .expect("test unpublication edit succeeds")
         .1
-        .unwrap()
+        .expect("test unpublication removes the exact leaf")
         .complete_after(|| Ok::<(), ()>(()))
-        .unwrap()
+        .expect("test TLBI completes")
 }
 
 #[test]

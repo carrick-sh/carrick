@@ -1078,7 +1078,7 @@ pub(super) mod tests {
                 let receipt = receipt
                     .expect("retirement edit removed the exact leaf")
                     .complete_after(|| Ok::<(), ()>(()))
-                    .unwrap();
+                    .expect("test TLBI completes");
                 let mut frames = crate::trap::frame_inventory::InventoryFrameRegistry::default();
                 frames.stage2_references.insert((ipa, 16384), 1);
                 let stage1 = frames
