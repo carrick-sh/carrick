@@ -3399,8 +3399,11 @@ pub(crate) fn retire_test_global_frame_host_owner_if_generation_in_using(
     let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length) else {
         return GlobalFrameRetirementOutcome::NotFound { ipa, length };
     };
-    let stage1 = if let Some(stage1) = custody.claim_stage2_retirement(identity) {
-        Stage2RetirementProof::from(stage1)
+    let stage1 = if let Some(stage1) = custody
+        .claim_stage2_retirement(identity)
+        .and_then(Stage2RetirementClaim::into_proof)
+    {
+        stage1
     } else {
         Stage2RetirementProof::Released(
             super::frame_inventory::release_stage2_reference_after_test_mm_close(custody, identity),
@@ -3764,7 +3767,7 @@ pub(crate) fn drain_all_global_frame_retirements_in_using(
             custody,
             custody
                 .claim_stage2_retirement(identity)
-                .map(Stage2RetirementProof::from)
+                .and_then(Stage2RetirementClaim::into_proof)
                 .unwrap_or_else(|| {
                     Stage2RetirementProof::Released(
                         super::frame_inventory::release_stage2_reference_after_test_mm_close(
@@ -3819,6 +3822,9 @@ pub(crate) fn retry_pending_global_frame_retirements_in_using(
             continue;
         };
         let Some(stage1) = custody.claim_stage2_retirement(identity) else {
+            continue;
+        };
+        let Some(stage1) = stage1.into_proof() else {
             continue;
         };
         let _ = retire_global_frame_host_owner_inner_in_using(
@@ -4076,6 +4082,7 @@ pub(crate) fn retry_pending_global_frame_retirements_at_idle_in_and_release_usin
         }
         let outcome = global_frame_stage2_identity_in(custody, ipa, length)
             .and_then(|identity| custody.claim_stage2_retirement(identity))
+            .and_then(Stage2RetirementClaim::into_proof)
             .map_or(
                 GlobalFrameRetirementOutcome::RetryPending {
                     ipa,

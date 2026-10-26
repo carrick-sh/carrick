@@ -533,24 +533,13 @@ impl Stage2RetirementClaim<'_> {
         self.proof.take();
     }
 
-    fn into_proof(mut self) -> Stage2RetirementProof {
+    pub(crate) fn into_proof(mut self) -> Option<Stage2RetirementProof> {
         self.completed = true;
         self.custody
             .pending_carrier_stage2_retirements
             .lock()
             .remove(&self.identity.record_id);
-        self.proof.take().unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvpatch::stage2_retirement",
-                "exclusive pending retirement claim lost its consume-once proof"
-            )
-        })
-    }
-}
-
-impl<'a> From<Stage2RetirementClaim<'a>> for Stage2RetirementProof {
-    fn from(value: Stage2RetirementClaim<'a>) -> Self {
-        value.into_proof()
+        self.proof.take()
     }
 }
 

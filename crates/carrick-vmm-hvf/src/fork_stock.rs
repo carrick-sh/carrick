@@ -60,6 +60,7 @@ impl Drop for NativeFrameBacking {
             if let Some(identity) =
                 crate::trap::global_frame_stage2_identity_in(&carrier, self.ipa, self.length)
                 && let Some(stage1) = carrier.claim_stage2_retirement(identity)
+                && let Some(stage1) = stage1.into_proof()
             {
                 crate::trap::retire_global_frame_host_owner_if_generation_in(
                     &carrier,

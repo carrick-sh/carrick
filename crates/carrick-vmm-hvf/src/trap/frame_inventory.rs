@@ -1599,7 +1599,11 @@ impl HvfVmState {
         let outcome = if let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length)
         {
             let proof = if let Some(proof) = custody.claim_stage2_retirement(identity) {
-                Stage2RetirementProof::from(proof)
+                proof.into_proof().ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "claimed stage-2 retirement lost its exclusive proof".to_owned(),
+                    )
+                })?
             } else {
                 let proof = frames
                     .lock()
@@ -2320,7 +2324,7 @@ impl HvfVmState {
             };
             let stage1 = custody
                 .claim_stage2_retirement(record_identity)
-                .map(Stage2RetirementProof::from)
+                .and_then(Stage2RetirementClaim::into_proof)
                 .ok_or_else(|| {
                     TrapError::Hypervisor(format!(
                         "declined stage-2 retirement {lease:?} lost its pending zero-reference proof"
