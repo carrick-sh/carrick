@@ -112,7 +112,7 @@ pub struct SourceCensus {
     structural_errors: Vec<String>,
     test_ranges: BTreeMap<String, Vec<(LineColumn, LineColumn)>>,
     aliases: BTreeMap<String, Vec<syn::Type>>,
-    projections: BTreeMap<String, BTreeSet<String>>,
+    projections: Projections,
     vocabulary: BTreeMap<String, AuthorityOperation>,
 }
 #[derive(Debug, serde::Serialize)]
@@ -1743,9 +1743,28 @@ impl SourceCensus {
         Ok(nearest.name.clone())
     }
 }
+// Index every proper path suffix so qualified and unqualified projections
+// retain exactly the same matching rule without scanning all projection keys.
+#[derive(Debug, Default)]
+struct Projections {
+    targets: BTreeMap<String, BTreeSet<String>>,
+    suffixes: BTreeSet<String>,
+}
+impl Projections {
+    fn insert(&mut self, key: String, target: String) {
+        for (offset, _) in key.match_indices("::") {
+            self.suffixes.insert(key[offset + 2..].to_owned());
+        }
+        self.targets.entry(key).or_default().insert(target);
+    }
+    fn get(&self, key: &str) -> Option<&BTreeSet<String>> {
+        self.targets.get(key)
+    }
+}
+
 struct AliasCollector<'a> {
     aliases: &'a mut BTreeMap<String, Vec<syn::Type>>,
-    projections: &'a mut BTreeMap<String, BTreeSet<String>>,
+    projections: &'a mut Projections,
     inherent_methods: &'a mut BTreeMap<String, BTreeSet<String>>,
     unrelated_traits: &'a mut BTreeMap<String, BTreeSet<String>>,
     trait_implementations: &'a mut BTreeMap<String, Vec<(syn::TypePath, String)>>,
@@ -1919,10 +1938,7 @@ impl<'ast> Visit<'ast> for AliasCollector<'_> {
                             associated.ident.unraw()
                         ),
                     ] {
-                        self.projections
-                            .entry(key)
-                            .or_default()
-                            .insert(target.clone());
+                        self.projections.insert(key, target.clone());
                     }
                 }
             }
@@ -2101,7 +2117,7 @@ fn type_alias_keys(path: &syn::TypePath, scope: &str) -> (String, Vec<String>) {
 fn authority_type(
     ty: &syn::Type,
     aliases: &BTreeMap<String, Vec<syn::Type>>,
-    projections: &BTreeMap<String, BTreeSet<String>>,
+    projections: &Projections,
     scope: &str,
     seen: &mut Vec<String>,
     names: &[&str],
@@ -2109,7 +2125,7 @@ fn authority_type(
 ) -> bool {
     struct Types<'a> {
         aliases: &'a BTreeMap<String, Vec<syn::Type>>,
-        projections: &'a BTreeMap<String, BTreeSet<String>>,
+        projections: &'a Projections,
         scope: &'a str,
         seen: &'a mut Vec<String>,
         names: &'a [&'a str],
@@ -2127,10 +2143,7 @@ fn authority_type(
             let (path_name, keys) = type_alias_keys(path, self.scope);
             let projection = path.qself.is_some()
                 || path_name.starts_with("Self::")
-                || self
-                    .projections
-                    .keys()
-                    .any(|key| key.ends_with(&format!("::{path_name}")));
+                || self.projections.suffixes.contains(&path_name);
             let mut resolved = false;
             let keys = keys.into_iter().flat_map(|key| {
                 self.projections
@@ -3006,4 +3019,44 @@ fn census_inputs() -> BTreeMap<&'static str, String> {
     .into_iter()
     .map(|(file, bytes)| (file, source_hash(bytes)))
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_suffix_index_matches_key_scan() {
+        let mut projections = Projections::default();
+        for key in [
+            "crate_name::FileTable::Slots",
+            "crate_name::<Self as module::Trait>::Slots",
+            "crate_name::module::Trait::Slots",
+            "crate_name::Other::Data",
+        ] {
+            projections.insert(key.into(), "target".into());
+        }
+        for path in [
+            "Slots",
+            "Trait::Slots",
+            "module::Trait::Slots",
+            "<Self as module::Trait>::Slots",
+            "Trait>::Slots",
+            "Data",
+            "Other::Data",
+            "crate_name::Other::Data",
+            "Other",
+            "Slot",
+            "Missing::Slots",
+        ] {
+            assert_eq!(
+                projections.suffixes.contains(path),
+                projections
+                    .targets
+                    .keys()
+                    .any(|key| key.ends_with(&format!("::{path}"))),
+                "{path}"
+            );
+        }
+    }
 }
