@@ -26,8 +26,9 @@ No watchdog census was emitted. The signed harness and explicit cleanup
 reported zero remaining processes for `847-f990-smoke-01-b1`, its CLI scope,
 the negative control, and the outer `847-f990-smoke-01` scope. The entitlement
 negative control passed. Per the stop condition, the additional 20 host-read
-runs and all nine companion runs were not started. The full log is retained
-at `/tmp/847-f990-smoke-01.log`. No source change was made.
+runs and all nine companion runs were not started. The failure and cleanup
+receipt are quoted verbatim above so this durable record does not depend on a
+host-local log. No source change was made.
 
 The signed executable was
 `target/release/deps/el1_sched-a135647895e386e6`:
@@ -40,6 +41,44 @@ identifier: el1_sched-a135647895e386e6.tmp.48463
 entitlement: com.apple.security.hypervisor=true
 USDT: __TEXT,__dof_carrick present
 ```
+
+## Portable closure after the `f990f2af5` review (2026-10-26)
+
+Source head `acd200cea` closes the bootstrap fatal and the review's ambient
+license finding before another signed artifact is built:
+
+- whole-MM retirement treats an MM with no carrier registration and no
+  stage-2 references as an empty successful retirement; the VM-free detached
+  and never-registered witnesses pass;
+- `El1EditorExcluded` is non-cloneable and borrowed from the exclusion guard;
+  every production stage-1 edit receives that borrow explicitly, while the
+  exact-MM assertion returns a typed refusal and records
+  `STAGE1_EDITOR_LICENSE_REFUSAL`;
+- when no EL1 region exists at all, bootstrap and VM-free callers receive an
+  exact-MM unpublished proof from an empty directory. Once the region exists,
+  only its live published/unpublished directory can license an edit;
+- stage-2 reference release compares the receipt's Editor authority and MM
+  with the retiring extent owner, the guest-written COW self-termination
+  boundary is documented, rollback removal outcomes are handled, and evidence
+  needed for review is quoted here rather than delegated to `/tmp` paths.
+
+Portable verification on `acd200cea`:
+
+- serialized `carrick-vmm-hvf --lib`: 803 passed, 0 failed, 3 ignored;
+- `just test-kernel`: passed (the first run exposed the missing no-EL1-region
+  proof; the complete rerun passed after that proof was made explicit);
+- `just fmt-check`, `just clippy`, `just clippy-linux`, `just lint-domains`,
+  and the contract-change gate: passed;
+- normal EL1 image: 1,053,200 / 1,572,864 bytes, maximum checked stack
+  11,503 / 12,288 (`native wait copy`);
+- Linux portable all-target EL1 image: 1,077,936 / 1,572,864 bytes, maximum
+  checked stack 12,015 / 12,288 (`signal terminal exit`);
+- embed EL1 image: 1,082,032 / 1,572,864 bytes, maximum checked stack
+  12,015 / 12,288 (`signal terminal exit`).
+
+No signed run has been made from this corrected source. The next required
+evidence is one exact-bundle bootstrap smoke followed by the 20/20 host-read
+population and requested companions.
 
 ## Exact `3e5abed72` bootstrap regression and review closure (2026-10-26)
 
@@ -72,7 +111,7 @@ Classification: source bootstrap regression, not the #847 hang. There was no
 guest EFAULT, watchdog, carrier fatal, or watchdog census. The negative
 entitlement control passed and its scoped cleanup was zero. The full 20-run
 population and companions stopped at the required smoke gate. The complete
-run is retained at `/tmp/847-3e5-smoke-02.log`.
+failure and cleanup receipt is quoted verbatim above.
 
 The signed executable was
 `target/release/deps/el1_sched-a135647895e386e6`:
@@ -142,8 +181,8 @@ remaining carrick procs (run-id 847-3e3-hostread-01-cli) = 0
 Classification: source regression, not the #847 hang. There was no guest
 EFAULT, watchdog, carrier fatal, or watchdog census. The matrix stopped on
 that regression, so the remaining 19 host-read repetitions and all companion
-populations were not run on this artifact. The complete log is retained at
-`/tmp/847-3e3-hostread-01.log`.
+populations were not run on this artifact. The complete failure and cleanup
+receipt is quoted verbatim above.
 
 The signed executable was
 `target/release/deps/el1_sched-a135647895e386e6`:
@@ -208,8 +247,8 @@ there was no EFAULT, watchdog, carrier fatal, or watchdog census. The harness
 and the explicit `scripts/sudo/kill.sh 847-98e-hostread-01` cleanup both
 reported zero remaining scoped processes. Per the stop condition, the other
 19 host-read repetitions, all three companion populations, and the signed
-counterparts of the new witnesses were not run on this broken artifact.
-The complete log is retained at `/tmp/847-98e-hostread-01.log`.
+counterparts of the new witnesses were not run on this broken artifact. The
+complete failure and cleanup receipt is quoted verbatim above.
 
 The signed executable was
 `target/release/deps/el1_sched-a135647895e386e6`:
@@ -349,8 +388,7 @@ requested repetitions without reproducing the #847 watchdog hang:
 ## Run 06 EFAULT attribution and correction
 
 The failed run exited normally, so it produced no watchdog census or event-ring
-post-mortem. Its exact signed log is retained at
-`/tmp/847-final-hostread-06.log`; the only guest failure is the valid-buffer
+post-mortem. The only guest failure is the durable valid-buffer receipt
 `read(fd=5) iter=427 rc=-1 errno=14` quoted above. The source path was exact:
 physical retention reported a stale selected leaf as an Editor wait, the
 editor revision was current while the editor word was free, and
@@ -531,10 +569,9 @@ ipc host-wake index: owed_without_target=0 summary=0x0
 reservation root 1: mm=1 lock_word=0x8000000000000000 notification_required=true holder=None
 ```
 
-The runner wrote the post-mortem to
-`target/embed-post-mortem/847-final-two-process-01-b1`; the worker preserved a
-copy at `/tmp/847-final-two-process-01-b1.post-mortem` together with full run
-logs, cleanup receipts, and the two failed signed executables.
+The runner wrote the durable post-mortem to
+`target/embed-post-mortem/847-final-two-process-01-b1`; the relevant census is
+quoted verbatim above so the diagnosis does not depend on a temporary copy.
 
 ## Structural owed stage-1 rewrite producer
 
