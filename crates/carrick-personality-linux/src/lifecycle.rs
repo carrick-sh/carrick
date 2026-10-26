@@ -1008,8 +1008,10 @@ fn serve_clone<'a>(
                 native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
             }
             return match gate {
-                GateState::AwaitingExecBinding | GateState::HostOnly => None,
-                GateState::ForkClosing | GateState::Closed | GateState::Open => Some(-11),
+                GateState::ForkClosing | GateState::AwaitingExecBinding | GateState::HostOnly => {
+                    None
+                }
+                GateState::Closed | GateState::Open => Some(-11),
             };
         }
         Err(error) => {

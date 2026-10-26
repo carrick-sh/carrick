@@ -626,7 +626,7 @@ fn clone_gate_forwards_when_host_births_remain_legal() {
     };
     let mut w = World::new(LifecycleHatches::ON);
     w.page().close_for_fork().unwrap();
-    run(&mut w, Action::Served);
+    run(&mut w, Action::Forward);
     let mut w = World::new(LifecycleHatches::ON);
     w.page().close();
     run(&mut w, Action::Served);
