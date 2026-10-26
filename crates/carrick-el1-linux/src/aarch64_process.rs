@@ -178,6 +178,20 @@ pub fn resume_production(
     record: RecordId,
 ) -> crate::sched::ResumeAction {
     let Some(runtime) = registry().for_record(zone, zone.record_ref(record)) else {
+        unsafe {
+            let counters =
+                &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters);
+            counters.refused[490].fetch_add(1, Ordering::Relaxed);
+            if zone.record(record).has_object_operation() {
+                counters.refused[491].fetch_add(1, Ordering::Relaxed);
+            }
+            if matches!(
+                zone.record(record).resume_disposition(),
+                carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
+            ) {
+                counters.refused[492].fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if matches!(
             zone.record(record).resume_disposition(),
             carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
@@ -191,6 +205,10 @@ pub fn resume_production(
         }
         return crate::sched::ResumeAction::NoPending;
     };
+    unsafe {
+        (&*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters)).refused[493]
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let source = BornInZoneSource { zone, slot };
     let mut service = Aarch64NativeProcessService::new(task, slot).unwrap_or_else(|_| fatal());
     let resumed = resume_selected(&runtime, registry(), source, task, record, &mut service);

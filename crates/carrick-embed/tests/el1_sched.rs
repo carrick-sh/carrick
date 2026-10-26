@@ -1165,7 +1165,7 @@ fn native_exec_successor_handles_cow_and_sparse_backing_faults() {
         "{} wait_diag={:?}",
         describe(&measured),
         read_el1_counters().map(|counters| {
-            (500..=512)
+            (490..=512)
                 .map(|index| counters.refused[index].load(std::sync::atomic::Ordering::Relaxed))
                 .collect::<Vec<_>>()
         })
