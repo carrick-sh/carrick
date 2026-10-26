@@ -189,6 +189,12 @@ pub fn resume_production(
             let _ = zone.release_current(slot, record, &carrick_sched_core::ShortLockSpin);
             return crate::sched::ResumeAction::Left;
         }
+        if zone.record(record).is_native_owned() {
+            let visible_pid = registry()
+                .unregistered_visible_pid(zone, zone.record_ref(record))
+                .unwrap_or_else(|| fatal());
+            task.publish_visible_pid(visible_pid);
+        }
         return crate::sched::ResumeAction::NoPending;
     };
     let source = BornInZoneSource { zone, slot };
