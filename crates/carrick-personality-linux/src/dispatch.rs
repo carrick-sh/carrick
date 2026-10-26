@@ -67,6 +67,9 @@ pub enum Family {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FamilyCompletion {
     HostCustody,
+    /// Authenticated handoff to a carrier-owned native service. This is not
+    /// an unported host crossing and must retain that distinction to EL1.
+    NativeService,
     FrameRestored,
     Complete(i64),
     CompleteWithWork(i64),
@@ -572,7 +575,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
         Family::Identity(_) => FamilyCompletion::Forward,
         Family::Sysinfo(_) => FamilyCompletion::Forward,
         Family::Ipc(_) => FamilyCompletion::Forward,
-        Family::NativeExec => FamilyCompletion::Forward,
+        Family::NativeExec => FamilyCompletion::NativeService,
         Family::Signal(_) => FamilyCompletion::Forward,
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
@@ -803,6 +806,7 @@ pub const fn route_x86(ordinal: u64, allocator_control: u64) -> Family {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionRoute {
     HostCustody,
+    NativeService,
     Served,
     WithWork,
     Suspended,
@@ -814,6 +818,7 @@ pub enum CompletionRoute {
 pub fn completion_route(completion: FamilyCompletion, pending: bool) -> CompletionRoute {
     match completion {
         FamilyCompletion::HostCustody => CompletionRoute::HostCustody,
+        FamilyCompletion::NativeService => CompletionRoute::NativeService,
         FamilyCompletion::Complete(_)
         | FamilyCompletion::Switched(_)
         | FamilyCompletion::FrameRestored
@@ -969,7 +974,9 @@ fn finish<'a, C: EntryContext + 'a>(
         | FamilyCompletion::AccountedSwitched(_)
         | FamilyCompletion::AccountedForward
         | FamilyCompletion::AccountedSuspended => {}
-        FamilyCompletion::Forward | FamilyCompletion::Handback => pending.record_forwarded(ordinal),
+        FamilyCompletion::NativeService
+        | FamilyCompletion::Forward
+        | FamilyCompletion::Handback => pending.record_forwarded(ordinal),
         _ => pending.record_served(ordinal),
     }
     if route == CompletionRoute::WithWork {
@@ -1225,7 +1232,7 @@ mod ring_first_tests {
 
             assert_eq!(
                 dispatch(ordinal, 42, &mut pending),
-                CompletionRoute::Forward
+                CompletionRoute::NativeService
             );
             assert_eq!(pending.result, 42);
             assert_eq!(
