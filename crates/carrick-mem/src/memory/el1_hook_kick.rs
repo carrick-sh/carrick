@@ -7,8 +7,8 @@
 //! clears `I` in the live `SPSR_EL1` when that holds the EL0 return state, and
 //! makes the owed-kick interrupt pending (`carrick_aarch64::owed_kick`). The
 //! hook saves `SPSR_EL1` into the TrapFrame on entry and reloads it before
-//! `eret`, so the served path must leave through the host (the forward path)
-//! or `eret` with the owed interrupt still pending and unmasked. Otherwise EL0
+//! `eret`, so the served path must re-enter the scheduler IRQ boundary or
+//! `eret` with the owed interrupt still pending and unmasked. Otherwise EL0
 //! resumes with the kick masked or consumed, and a thread that makes no
 //! further host syscall never stops for the page-table drain that kicked it.
 //!
@@ -126,17 +126,23 @@ struct Machine {
 impl Machine {
     fn bytes(irq: El1IrqMode) -> Vec<u8> {
         let mut bytes = vec![0u8; LINUX_EL1_VECTORS_SIZE as usize];
-        write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, CAPTURE, irq);
+        let scheduler_irq_entry =
+            (irq == El1IrqMode::Gic).then(|| write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET));
+        write_el1_vector_hook(
+            &mut bytes,
+            EL1_VECTOR_HOOK_OFFSET,
+            CAPTURE,
+            irq,
+            scheduler_irq_entry,
+        );
         write_el1_hook(
             &mut bytes,
             EL0_FAULT_HOOK_OFFSET,
             CAPTURE,
             irq,
             HookEntry::Fault,
+            scheduler_irq_entry,
         );
-        if irq == El1IrqMode::Gic {
-            let _ = write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);
-        }
         bytes
     }
 
@@ -294,7 +300,7 @@ impl Machine {
             }
         }
         let pending = self.read(Self::pending_host_work_addr()) != 0;
-        self.regs[0] = if self.image == Image::ServedNativeWake {
+        self.regs[0] = if self.image == Image::ServedNativeWake && !irq {
             self.mem.insert(Self::pending_host_work_addr(), 2);
             0
         } else if is_fault || pending {
@@ -938,7 +944,14 @@ fn forwarded_return_and_non_svc_sync_trap_on_clock_vector_page() {
 fn native_signal_work_cause_never_replays_a_served_syscall() {
     let mut machine = Machine::syscall(El1IrqMode::Gic);
     machine.image = Image::ServedNativeWake;
-    assert_eq!(machine.run(None), Exit::Host);
+    assert_eq!(
+        machine.run(None),
+        Exit::Kick {
+            spsr: EL0_DAIF_MASKED & !PSTATE_I,
+            elr: GUEST_ELR,
+        }
+    );
+    assert_eq!(machine.irq_frames, 1);
     assert_eq!(machine.read(Machine::pending_host_work_addr()), 2);
     assert_eq!(
         machine.read(Machine::served_with_work_addr()),
