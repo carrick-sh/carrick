@@ -1150,7 +1150,9 @@ mod tests {
         drop((a, b, both));
         for ipa in [ipa_a, ipa_b] {
             let identity = global_frame_stage2_identity_in(&custody, ipa, 0x4000).unwrap();
-            let stage1 = custody.stage1_unpublished_after_editor_unmap(identity);
+            let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                &custody, identity,
+            );
             assert!(matches!(
                 retire_global_frame_host_owner_inner_in_using(
                     &custody,

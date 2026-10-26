@@ -1153,7 +1153,7 @@ impl GlobalFrameHostOwner {
             lease.mark_test_mapped_without_backend();
         }
         let custody = std::sync::Arc::clone(legacy_test_carrier_vm_custody_arc());
-        let identity = transfer_global_frame_stage2_lease_to_custody(
+        let (identity, publication) = transfer_unpublished_global_frame_stage2_lease_to_custody(
             &custody,
             lease,
             mapping.as_ptr() as usize,
@@ -1164,6 +1164,7 @@ impl GlobalFrameHostOwner {
             }),
         )
         .unwrap_or_else(|error| panic!("register test global owner record: {error}"));
+        publication.commit();
         assert_eq!(
             custody
                 .stage2_record_snapshot(identity.record_id)
@@ -1254,9 +1255,11 @@ impl GlobalFrameHostOwner {
         let custody = self.custody.upgrade().ok_or_else(|| {
             TrapError::Hypervisor("global owner carrier custody disappeared".to_owned())
         })?;
-        match custody
-            .retire_test_stage2_record_using(self.record_identity, unmap_global_frame_stage2_record)
-        {
+        match super::frame_inventory::retire_stage2_record_after_test_unmap_using(
+            &custody,
+            self.record_identity,
+            unmap_global_frame_stage2_record,
+        ) {
             CarrierStage2RetireOutcome::RetiredUnmapped
             | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => {
                 finalize_global_frame_owner_record(&custody, self)
@@ -1532,6 +1535,7 @@ pub(crate) fn register_carrier_stage2_leases(
     custody: &std::sync::Arc<CarrierVmCustody>,
     leases: &mut Vec<GlobalFrameStage2Lease>,
     owner_hosts: &std::collections::BTreeMap<(u64, u64), usize>,
+    unpublished_stage1: &super::UnpublishedTaskStage1,
 ) -> Result<Vec<CarrierStage2RecordIdentity>, TrapError> {
     let keys: Vec<_> = leases.iter().map(GlobalFrameStage2Lease::key).collect();
     let mut distinct = std::collections::BTreeSet::new();
@@ -1558,18 +1562,15 @@ pub(crate) fn register_carrier_stage2_leases(
     if let Some(error) = validation_error {
         for (key, mut lease) in keys.iter().copied().zip(leases.drain(..)) {
             if lease.try_retire().is_err() {
-                let identity = transfer_global_frame_stage2_lease_to_custody(
-                    custody,
-                    lease,
-                    owner_hosts.get(&key).copied().unwrap_or(1),
-                    0,
-                    None,
-                )?;
-                // This lease was never published into stage 1, but no typed
-                // inventory rollback receipt survived the failed batch. Keep
-                // the exact record quarantined instead of manufacturing a
-                // retirement proof from its identity.
-                let _quarantined = identity;
+                let (identity, publication) =
+                    transfer_unpublished_global_frame_stage2_lease_to_custody(
+                        custody,
+                        lease,
+                        owner_hosts.get(&key).copied().unwrap_or(1),
+                        0,
+                        None,
+                    )?;
+                unpublished_stage1.record(identity, publication);
             }
         }
         return Err(error);
@@ -1577,13 +1578,14 @@ pub(crate) fn register_carrier_stage2_leases(
     let mut registered = custody.carrier_stage2_records.lock();
     let mut identities = Vec::with_capacity(keys.len());
     for (key, lease) in keys.iter().copied().zip(leases.drain(..)) {
-        let identity = transfer_global_frame_stage2_lease_to_custody(
+        let (identity, publication) = transfer_unpublished_global_frame_stage2_lease_to_custody(
             custody,
             lease,
             owner_hosts[&key],
             0,
             None,
         )?;
+        unpublished_stage1.record(identity, publication);
         registered.insert(key, identity);
         identities.push(identity);
     }
@@ -1700,26 +1702,7 @@ pub(crate) fn retire_carrier_stage2_record_at_safe_point_using(
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn transfer_global_frame_stage2_lease_to_custody(
-    custody: &std::sync::Arc<CarrierVmCustody>,
-    lease: GlobalFrameStage2Lease,
-    host_addr: usize,
-    perms: u64,
-    logical_owner: Option<CarrierLogicalOwner>,
-) -> Result<CarrierStage2RecordIdentity, TrapError> {
-    let (identity, publication) = transfer_unpublished_global_frame_stage2_lease_to_custody(
-        custody,
-        lease,
-        host_addr,
-        perms,
-        logical_owner,
-    )?;
-    publication.commit();
-    Ok(identity)
-}
-
-fn transfer_unpublished_global_frame_stage2_lease_to_custody(
+pub(crate) fn transfer_unpublished_global_frame_stage2_lease_to_custody(
     custody: &std::sync::Arc<CarrierVmCustody>,
     mut lease: GlobalFrameStage2Lease,
     host_addr: usize,
@@ -3397,7 +3380,9 @@ pub(crate) fn retire_test_global_frame_host_owner_if_generation_in_using(
     let stage1 = if let Some(stage1) = custody.claim_stage2_retirement(identity) {
         Stage2RetirementProof::from(stage1)
     } else {
-        Stage2RetirementProof::Unpublished(custody.stage1_unpublished_after_editor_unmap(identity))
+        Stage2RetirementProof::Released(
+            super::frame_inventory::release_stage2_reference_after_test_unmap(custody, identity),
+        )
     };
     retire_global_frame_host_owner_if_generation_in_using(
         custody,
@@ -3508,17 +3493,6 @@ pub(crate) fn retire_global_frame_host_owner_inner_in_using(
         }
         let generation = owner.generation();
         let outcome = match stage1_receipt {
-            Stage2RetirementProof::Unpublished(stage1) => {
-                if !stage1.matches(owner.record_identity) {
-                    return GlobalFrameRetirementOutcome::RetryPending {
-                        ipa,
-                        length,
-                        generation,
-                        error: "stage-1 receipt names another stage-2 record".to_owned(),
-                    };
-                }
-                custody.request_stage2_record_retirement(owner.record_identity, stage1)
-            }
             Stage2RetirementProof::Released(stage1) => {
                 custody.request_released_stage2_record_retirement(owner.record_identity, stage1)
             }
@@ -3770,8 +3744,10 @@ pub(crate) fn drain_all_global_frame_retirements_in_using(
                 .claim_stage2_retirement(identity)
                 .map(Stage2RetirementProof::from)
                 .unwrap_or_else(|| {
-                    Stage2RetirementProof::Unpublished(
-                        custody.stage1_unpublished_after_editor_unmap(identity),
+                    Stage2RetirementProof::Released(
+                        super::frame_inventory::release_stage2_reference_after_test_unmap(
+                            custody, identity,
+                        ),
                     )
                 }),
             ipa,
@@ -4429,7 +4405,8 @@ pub(crate) fn retire_global_frame_host_owner(
     let Some(identity) = global_frame_stage2_identity_in(custody, ipa, length) else {
         return GlobalFrameRetirementOutcome::NotFound { ipa, length };
     };
-    let stage1 = custody.stage1_unpublished_after_editor_unmap(identity);
+    let stage1 =
+        super::frame_inventory::release_stage2_reference_after_test_unmap(custody, identity);
     retire_global_frame_host_owner_in(custody, stage1, ipa, length)
 }
 

@@ -431,16 +431,6 @@ struct Stage2RecordRemoval<'a> {
     removed: bool,
 }
 
-/// Proof that every stage-1 leaf which could name one exact stage-2 record
-/// was unpublished before physical retirement was requested.
-///
-/// The fields are private to this module so adding a retirement caller without
-/// choosing one of the two ordering boundaries is a compile error.
-#[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
-pub(crate) struct DirectStage1RetirementProof {
-    identity: CarrierStage2RecordIdentity,
-}
-
 #[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct NeverPublishedRecord {
     identity: CarrierStage2RecordIdentity,
@@ -454,16 +444,9 @@ impl NeverPublishedRecord {
 
 #[derive(::core::fmt::Debug)]
 pub(crate) enum Stage2RetirementProof {
-    Unpublished(DirectStage1RetirementProof),
     Released(super::frame_inventory::Stage1Unpublished),
     NeverPublished(NeverPublishedRecord),
     Metadata(CarrierStage2RecordIdentity),
-}
-
-impl From<DirectStage1RetirementProof> for Stage2RetirementProof {
-    fn from(value: DirectStage1RetirementProof) -> Self {
-        Self::Unpublished(value)
-    }
 }
 
 impl From<super::frame_inventory::Stage1Unpublished> for Stage2RetirementProof {
@@ -490,16 +473,9 @@ pub(crate) enum Stage1UnpublicationReceipt<'a> {
     NeverPublished(&'a NeverPublishedRecord),
 }
 
-impl DirectStage1RetirementProof {
-    pub(super) fn matches(&self, identity: CarrierStage2RecordIdentity) -> bool {
-        self.identity == identity
-    }
-}
-
 impl Stage2RetirementProof {
     fn matches(&self, identity: CarrierStage2RecordIdentity) -> bool {
         match self {
-            Self::Unpublished(proof) => proof.matches(identity),
             Self::Released(proof) => proof.identity() == identity,
             Self::NeverPublished(proof) => proof.identity() == identity,
             Self::Metadata(proof_identity) => *proof_identity == identity,
@@ -883,64 +859,11 @@ enum ExecutableBacking {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierVmCustody {
-    pub(crate) fn stage1_unpublished_from_receipt(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-        receipt: Stage1UnpublicationReceipt<'_>,
-    ) -> Option<DirectStage1RetirementProof> {
-        match receipt {
-            Stage1UnpublicationReceipt::EditorRange(receipt) => {
-                self.stage1_unpublished_by_editor(identity, receipt)
-            }
-            Stage1UnpublicationReceipt::TableArena(receipt) => {
-                self.stage1_unpublished_by_retired_arena(identity, receipt)
-            }
-            Stage1UnpublicationReceipt::Inventory(receipt) => {
-                Some(self.stage1_unpublished_by_inventory_commit(identity, receipt))
-            }
-            Stage1UnpublicationReceipt::NeverPublished(receipt) => {
-                (receipt.identity() == identity).then_some(DirectStage1RetirementProof { identity })
-            }
-        }
-    }
-
     pub(crate) fn stage2_publication_authority(&self) -> Stage2AvailabilityPublication<'_> {
         Stage2AvailabilityPublication {
             custody: self,
             changed: false,
         }
-    }
-
-    /// Minted only after an Editor edit has removed the last stage-1 leaf and
-    /// its release has advanced the Editor revision.
-    fn stage1_unpublished_by_editor(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-        receipt: &carrick_aarch64::stage1_authority::Stage1LeafRetired,
-    ) -> Option<DirectStage1RetirementProof> {
-        let snapshot = self.stage2_record_snapshot(identity.record_id)?;
-        receipt
-            .names(snapshot.ipa, snapshot.len)
-            .then_some(DirectStage1RetirementProof { identity })
-    }
-
-    fn stage1_unpublished_by_retired_arena(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-        receipt: &carrick_mmu_core::aarch64::TableArenaDetached,
-    ) -> Option<DirectStage1RetirementProof> {
-        let snapshot = self.stage2_record_snapshot(identity.record_id)?;
-        (receipt.base() == snapshot.ipa).then_some(DirectStage1RetirementProof { identity })
-    }
-
-    /// Minted only by the whole-MM inventory commit after that transaction has
-    /// unpublished the terminal MM's complete stage-1 image.
-    fn stage1_unpublished_by_inventory_commit(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-        _inventory: &carrick_core::mm::retirement::Stage1UnpublishedMm,
-    ) -> DirectStage1RetirementProof {
-        DirectStage1RetirementProof { identity }
     }
 
     /// Test support that obtains the same non-forgeable editor receipt as a
@@ -989,33 +912,6 @@ impl CarrierVmCustody {
             )
             .expect("test stage-1 leaf unpublication");
         receipt.expect("editor removed the exact test stage-1 leaf")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn stage1_unpublished_after_editor_unmap(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-    ) -> DirectStage1RetirementProof {
-        let receipt = self.editor_receipt_after_test_unmap(identity);
-        self.stage1_unpublished_by_editor(identity, &receipt)
-            .expect("editor receipt covers the retired test record")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retire_test_stage2_record_using(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-        unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
-    ) -> CarrierStage2RetireOutcome {
-        let stage1 = if let Some(stage1) = self.claim_stage2_retirement(identity) {
-            stage1
-        } else {
-            let unpublished = self.stage1_unpublished_after_editor_unmap(identity);
-            let _ = self.request_stage2_record_retirement(identity, unpublished);
-            self.claim_stage2_retirement(identity)
-                .expect("test retirement request retained its stage-1 proof")
-        };
-        self.retire_stage2_record_using(identity, &stage1, unmap)
     }
 
     fn stage2_record_removal(&self) -> Stage2RecordRemoval<'_> {
@@ -2049,20 +1945,6 @@ impl CarrierVmCustody {
         )
     }
 
-    pub(crate) fn request_stage2_record_retirement(
-        &self,
-        identity: CarrierStage2RecordIdentity,
-        stage1: DirectStage1RetirementProof,
-    ) -> CarrierStage2RetireOutcome {
-        if !stage1.matches(identity) {
-            return CarrierStage2RetireOutcome::NotFound;
-        }
-        self.request_stage2_record_retirement_with_proof(
-            identity,
-            Stage2RetirementProof::Unpublished(stage1),
-        )
-    }
-
     pub(crate) fn request_never_published_stage2_record_retirement(
         &self,
         identity: CarrierStage2RecordIdentity,
@@ -2842,18 +2724,21 @@ mod carrier_vm_custody_tests {
     use super::{
         CarrierLogicalOwner, CarrierStage2BackendError, CarrierStage2PinError,
         CarrierStage2RecordIdentity, CarrierStage2RecordSpec, CarrierStage2RetireOutcome,
-        CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, DirectStage1RetirementProof,
-        Stage1UnpublicationReceipt, create_vm_with_custody_using, destroy_vm_with_custody_using,
+        CarrierVmCustody, CarrierVmCustodyError, CarrierVmGeneration, Stage1UnpublicationReceipt,
+        create_vm_with_custody_using, destroy_vm_with_custody_using,
     };
-    use crate::trap::frame_inventory::{InventoryFrameRegistry, Stage2ReferenceReleaseError};
+    use crate::trap::frame_inventory::{
+        InventoryFrameRegistry, Stage1Unpublished, Stage2ReferenceReleaseError,
+    };
 
     #[test]
     fn retirement_request_signature_requires_stage1_unpublished_witness() {
         let request: fn(
             &CarrierVmCustody,
             CarrierStage2RecordIdentity,
-            DirectStage1RetirementProof,
-        ) -> CarrierStage2RetireOutcome = CarrierVmCustody::request_stage2_record_retirement;
+            Stage1Unpublished,
+        ) -> CarrierStage2RetireOutcome =
+            CarrierVmCustody::request_released_stage2_record_retirement;
         let _ = request;
     }
 
@@ -4574,7 +4459,11 @@ mod carrier_vm_custody_tests {
             .clone();
         let identity = owner.record_identity;
         assert_eq!(
-            custody.retire_test_stage2_record_using(identity, |_, _| Ok(())),
+            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+                &custody,
+                identity,
+                |_, _| Ok(())
+            ),
             super::CarrierStage2RetireOutcome::RetiredUnmapped
         );
 
@@ -4716,9 +4605,15 @@ mod carrier_vm_custody_tests {
         let mut g1_lease = super::GlobalFrameStage2Lease::fixed(key.0, key.1);
         g1_lease.mark_test_mapped_without_backend();
         let owners = std::collections::BTreeMap::from([(key, 0x1000)]);
-        let old_identity =
-            super::register_carrier_stage2_leases(&custody, &mut vec![g1_lease], &owners)
-                .expect("register G1 carrier-MM record")[0];
+        let unpublished = super::UnpublishedTaskStage1::begin_inventory_transaction();
+        let old_identity = super::register_carrier_stage2_leases(
+            &custody,
+            &mut vec![g1_lease],
+            &owners,
+            &unpublished,
+        )
+        .expect("register G1 carrier-MM record")[0];
+        unpublished.commit_publication();
         assert_eq!(old_identity.vm_generation, g1);
         destroy_vm_with_custody_using(&custody, "carrier G1 destroy", || 0, || {})
             .expect("destroy G1");
@@ -4740,9 +4635,12 @@ mod carrier_vm_custody_tests {
         custody.commit_create(g2).expect("publish G2");
 
         assert_eq!(
-            custody.request_stage2_record_retirement(
+            custody.request_released_stage2_record_retirement(
                 old_identity,
-                custody.stage1_unpublished_after_editor_unmap(old_identity),
+                crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                    &custody,
+                    old_identity
+                ),
             ),
             super::CarrierStage2RetireOutcome::TerminalizedByVmDestroy
         );
@@ -5006,9 +4904,12 @@ mod carrier_vm_custody_tests {
         let frames = std::sync::Arc::new(parking_lot::Mutex::new(
             super::InventoryFrameRegistry::default(),
         ));
-        let stage1 = custody.stage1_unpublished_after_editor_unmap(new_identity);
+        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+            &custody,
+            new_identity,
+        );
         assert_eq!(
-            custody.request_stage2_record_retirement(new_identity, stage1),
+            custody.request_released_stage2_record_retirement(new_identity, stage1),
             CarrierStage2RetireOutcome::DeferredActivePins
         );
         let _ = authority;
@@ -5078,13 +4979,16 @@ mod carrier_vm_custody_tests {
                 |editor| editor.invalidate(va, 4096).map(|_| ()),
             )
             .unwrap();
-        assert!(
-            custody
-                .stage1_unpublished_from_receipt(
-                    identity,
-                    Stage1UnpublicationReceipt::EditorRange(&receipt.unwrap()),
-                )
-                .is_none(),
+        let lease = (0xa081_b000_0000, 0x4000);
+        let mut frames = InventoryFrameRegistry::default();
+        frames.stage2_references.insert(lease, 1);
+        assert_eq!(
+            frames.release_stage2_reference(
+                lease,
+                Some(identity),
+                Stage1UnpublicationReceipt::EditorRange(&receipt.unwrap()),
+            ),
+            Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease)),
             "an editor receipt may authorize only the physical range it actually removed"
         );
     }
@@ -5179,9 +5083,11 @@ mod carrier_vm_custody_tests {
         )
         .expect("publish structural custody");
         let identity = *owner.retained.record_identity.lock();
-        let stage1 = custody.stage1_unpublished_after_editor_unmap(identity);
+        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+            &custody, identity,
+        );
         assert_eq!(
-            custody.request_stage2_record_retirement(identity, stage1),
+            custody.request_released_stage2_record_retirement(identity, stage1),
             super::CarrierStage2RetireOutcome::DeferredActivePins,
         );
 
@@ -5513,9 +5419,12 @@ mod carrier_vm_custody_tests {
         );
         assert!(super::alias_backing_is_live(host_addr));
 
-        let stage1 = custody.stage1_unpublished_after_editor_unmap(new_identity);
+        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+            &custody,
+            new_identity,
+        );
         assert_eq!(
-            custody.request_stage2_record_retirement(new_identity, stage1),
+            custody.request_released_stage2_record_retirement(new_identity, stage1),
             super::CarrierStage2RetireOutcome::DeferredActivePins,
         );
         drop(owner);
@@ -5762,7 +5671,11 @@ mod carrier_vm_custody_tests {
         let injected = CarrierStage2BackendError::HvReturn(0xfae9_4001);
 
         assert_eq!(
-            custody.retire_test_stage2_record_using(identity, |_, _| Err(injected)),
+            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+                &custody,
+                identity,
+                |_, _| Err(injected)
+            ),
             CarrierStage2RetireOutcome::RetryPending(injected)
         );
         let retained = custody
@@ -5778,7 +5691,11 @@ mod carrier_vm_custody_tests {
         assert_eq!(retained.retry_pending, Some(injected));
 
         assert_eq!(
-            custody.retire_test_stage2_record_using(identity, |_, _| Ok(())),
+            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+                &custody,
+                identity,
+                |_, _| Ok(())
+            ),
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
         assert!(
@@ -5799,9 +5716,11 @@ mod carrier_vm_custody_tests {
         let key = (0x4000, 0x4000);
         custody.carrier_stage2_records.lock().insert(key, identity);
         let injected = CarrierStage2BackendError::HvReturn(0xfae9_4001);
-        let stage1 = custody.stage1_unpublished_after_editor_unmap(identity);
+        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+            &custody, identity,
+        );
         assert_eq!(
-            custody.request_stage2_record_retirement(identity, stage1),
+            custody.request_released_stage2_record_retirement(identity, stage1),
             CarrierStage2RetireOutcome::DeferredActivePins
         );
 
@@ -5855,10 +5774,14 @@ mod carrier_vm_custody_tests {
         let unmap_calls = std::cell::Cell::new(0_u32);
 
         assert_eq!(
-            custody.retire_test_stage2_record_using(identity, |_, _| {
-                unmap_calls.set(unmap_calls.get() + 1);
-                Ok(())
-            }),
+            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+                &custody,
+                identity,
+                |_, _| {
+                    unmap_calls.set(unmap_calls.get() + 1);
+                    Ok(())
+                }
+            ),
             CarrierStage2RetireOutcome::DeferredActivePins
         );
         assert_eq!(unmap_calls.get(), 0);
@@ -5875,10 +5798,14 @@ mod carrier_vm_custody_tests {
         assert!(eligible.mapped);
 
         assert_eq!(
-            custody.retire_test_stage2_record_using(identity, |_, _| {
-                unmap_calls.set(unmap_calls.get() + 1);
-                Ok(())
-            }),
+            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+                &custody,
+                identity,
+                |_, _| {
+                    unmap_calls.set(unmap_calls.get() + 1);
+                    Ok(())
+                }
+            ),
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
         assert_eq!(unmap_calls.get(), 1);
@@ -5904,9 +5831,11 @@ mod carrier_vm_custody_tests {
             });
             custody.enqueue_carrier_stage2_retirement(identity);
             assert_eq!(
-                custody.request_stage2_record_retirement(
+                custody.request_released_stage2_record_retirement(
                     identity,
-                    custody.stage1_unpublished_after_editor_unmap(identity),
+                    crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                        &custody, identity
+                    ),
                 ),
                 CarrierStage2RetireOutcome::DeferredActivePins
             );
@@ -5953,9 +5882,11 @@ mod carrier_vm_custody_tests {
             .insert((spec.ipa, spec.len as u64), identity);
         custody.enqueue_carrier_stage2_retirement(identity);
         assert_eq!(
-            custody.request_stage2_record_retirement(
+            custody.request_released_stage2_record_retirement(
                 identity,
-                custody.stage1_unpublished_after_editor_unmap(identity),
+                crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                    &custody, identity
+                ),
             ),
             CarrierStage2RetireOutcome::DeferredActivePins
         );
@@ -6212,10 +6143,14 @@ mod carrier_vm_custody_tests {
         let post_destroy_unmaps = std::cell::Cell::new(0_u32);
         for identity in [first, second] {
             assert_eq!(
-                custody.retire_test_stage2_record_using(identity, |_, _| {
-                    post_destroy_unmaps.set(post_destroy_unmaps.get() + 1);
-                    Ok(())
-                }),
+                crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+                    &custody,
+                    identity,
+                    |_, _| {
+                        post_destroy_unmaps.set(post_destroy_unmaps.get() + 1);
+                        Ok(())
+                    }
+                ),
                 CarrierStage2RetireOutcome::TerminalizedByVmDestroy
             );
         }
@@ -6249,7 +6184,11 @@ mod carrier_vm_custody_tests {
             Some(before)
         );
         assert_eq!(
-            custody.retire_test_stage2_record_using(identity, |_, _| Ok(())),
+            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+                &custody,
+                identity,
+                |_, _| Ok(())
+            ),
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
     }
@@ -6262,9 +6201,11 @@ mod carrier_vm_custody_tests {
             .register_stage2_record(stage2_spec(first_generation, 51))
             .expect("register predecessor record");
         assert_eq!(
-            custody.request_stage2_record_retirement(
+            custody.request_released_stage2_record_retirement(
                 first,
-                custody.stage1_unpublished_after_editor_unmap(first),
+                crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                    &custody, first
+                ),
             ),
             CarrierStage2RetireOutcome::DeferredActivePins
         );
@@ -6289,9 +6230,11 @@ mod carrier_vm_custody_tests {
             ..second
         };
         assert_eq!(
-            custody.request_stage2_record_retirement(
+            custody.request_released_stage2_record_retirement(
                 stale_vm,
-                custody.stage1_unpublished_after_editor_unmap(stale_vm),
+                crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                    &custody, stale_vm
+                ),
             ),
             CarrierStage2RetireOutcome::VmGenerationMismatch
         );
@@ -6304,9 +6247,12 @@ mod carrier_vm_custody_tests {
             ..second
         };
         assert_eq!(
-            custody.request_stage2_record_retirement(
+            custody.request_released_stage2_record_retirement(
                 stale_owner,
-                custody.stage1_unpublished_after_editor_unmap(stale_owner),
+                crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                    &custody,
+                    stale_owner
+                ),
             ),
             CarrierStage2RetireOutcome::OwnerGenerationMismatch
         );

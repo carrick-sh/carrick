@@ -258,6 +258,7 @@ impl PendingExecStage2Cleanup {
                 if owner_generation == 0 {
                     HvfVmState::retire_stage2_extent_from_mappings_in(
                         custody,
+                        &self.frames,
                         &mut self.mappings,
                         Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
                         ipa,
@@ -2486,17 +2487,22 @@ impl HvfVmState {
                         stage2_leases.push(stage2_lease);
                     }
                 }
-                let stage2_lease_keys =
-                    register_carrier_stage2_leases(&custody, &mut stage2_leases, &owner_hosts)
-                        .unwrap_or_else(|error| {
-                            // Replacement inventory already names every candidate.
-                            // Fail-stop before unwinding can drop their leases or host
-                            // backings out from under that published authority.
-                            carrick_fatal!(
-                                "hvpatch::frame_inventory",
-                                "register carrier stage2 lease for exec: {error}"
-                            )
-                        });
+                let unpublished_stage1 = UnpublishedTaskStage1::begin_inventory_transaction();
+                let stage2_lease_keys = register_carrier_stage2_leases(
+                    &custody,
+                    &mut stage2_leases,
+                    &owner_hosts,
+                    &unpublished_stage1,
+                )
+                .unwrap_or_else(|error| {
+                    // Replacement inventory already names every candidate.
+                    // Fail-stop before unwinding can drop their leases or host
+                    // backings out from under that published authority.
+                    carrick_fatal!(
+                        "hvpatch::frame_inventory",
+                        "register carrier stage2 lease for exec: {error}"
+                    )
+                });
                 let mapped_task_mappings: Vec<HvpatchTaskMappingState> = self
                     .mappings
                     .iter()
@@ -2575,6 +2581,7 @@ impl HvfVmState {
                         "rebind HVPatch exec MM authority: {error}"
                     ),
                 };
+                unpublished_stage1.commit_publication();
                 if !shared_projection {
                     if let Some(cleanup) = self.pending_exec_stage2_cleanup.as_mut() {
                         cleanup.carrier_mm = predecessor_carrier_mm;

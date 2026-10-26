@@ -519,6 +519,30 @@ pub(crate) enum Stage2ReferenceReleaseError {
 }
 
 impl InventoryFrameRegistry {
+    /// Release the single structural stage-1 reference owned by an MM root or
+    /// table arena. Structural owners are not frame-inventory mappings, so
+    /// they enter this same zero-crossing ledger exactly when their typed
+    /// detach/whole-MM receipt consumes the sole reference.
+    pub(crate) fn release_structural_stage2_reference(
+        &mut self,
+        lease: (u64, u64),
+        identity: CarrierStage2RecordIdentity,
+        receipt: Stage1UnpublicationReceipt<'_>,
+    ) -> Result<Stage1Unpublished, Stage2ReferenceReleaseError> {
+        if self.stage2_references.contains_key(&lease)
+            || !matches!(
+                receipt,
+                Stage1UnpublicationReceipt::TableArena(_)
+                    | Stage1UnpublicationReceipt::Inventory(_)
+            )
+        {
+            return Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease));
+        }
+        self.stage2_references.insert(lease, 1);
+        self.release_stage2_reference(lease, Some(identity), receipt)?
+            .ok_or(Stage2ReferenceReleaseError::ReceiptMismatch(lease))
+    }
+
     /// Drop one carrier-wide stage-2 reference. The exact receipt is checked
     /// before the ledger moves; only the zero crossing mints retirement
     /// authority.
@@ -533,7 +557,10 @@ impl InventoryFrameRegistry {
                 receipt.names(lease.0, lease.1 as usize)
             }
             Stage1UnpublicationReceipt::TableArena(receipt) => receipt.base() == lease.0,
-            Stage1UnpublicationReceipt::Inventory(_) => true,
+            Stage1UnpublicationReceipt::Inventory(publication) => {
+                let _ = publication;
+                true
+            }
             Stage1UnpublicationReceipt::NeverPublished(receipt) => {
                 identity == Some(receipt.identity())
             }
@@ -553,6 +580,44 @@ impl InventoryFrameRegistry {
         let identity = identity.ok_or(Stage2ReferenceReleaseError::ReceiptMismatch(lease))?;
         Ok(Some(Stage1Unpublished { lease, identity }))
     }
+}
+
+#[cfg(test)]
+pub(crate) fn release_stage2_reference_after_test_unmap(
+    custody: &CarrierVmCustody,
+    identity: CarrierStage2RecordIdentity,
+) -> Stage1Unpublished {
+    let snapshot = custody
+        .stage2_record_snapshot(identity.record_id)
+        .expect("test record exists before stage-1 unpublication");
+    let lease = (snapshot.ipa, snapshot.len as u64);
+    let receipt = custody.editor_receipt_after_test_unmap(identity);
+    let mut frames = InventoryFrameRegistry::default();
+    frames.stage2_references.insert(lease, 1);
+    frames
+        .release_stage2_reference(
+            lease,
+            Some(identity),
+            Stage1UnpublicationReceipt::EditorRange(&receipt),
+        )
+        .expect("test edit receipt names the exact stage-2 lease")
+        .expect("the test edit releases the last stage-2 reference")
+}
+
+#[cfg(test)]
+pub(crate) fn retire_stage2_record_after_test_unmap_using(
+    custody: &CarrierVmCustody,
+    identity: CarrierStage2RecordIdentity,
+    unmap: impl FnOnce(u64, usize) -> Result<(), CarrierStage2BackendError>,
+) -> CarrierStage2RetireOutcome {
+    if custody.claim_stage2_retirement(identity).is_none() {
+        let proof = release_stage2_reference_after_test_unmap(custody, identity);
+        let _ = custody.request_released_stage2_record_retirement(identity, proof);
+    }
+    let Some(claim) = custody.claim_stage2_retirement(identity) else {
+        return CarrierStage2RetireOutcome::NotFound;
+    };
+    custody.retire_stage2_record_using(identity, &claim, unmap)
 }
 
 /// One exact global-frame owner incarnation a retirement left in place
@@ -1525,6 +1590,7 @@ pub(crate) mod tests;
 impl HvfVmState {
     pub(crate) fn retire_stage2_extent_from_mappings_in(
         custody: &CarrierVmCustody,
+        frames: &std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
         mappings: &mut TaskMappingIndex,
         stage1_receipt: Stage1UnpublicationReceipt<'_>,
         ipa: u64,
@@ -1535,16 +1601,19 @@ impl HvfVmState {
             let proof = if let Some(proof) = custody.claim_stage2_retirement(identity) {
                 Stage2RetirementProof::from(proof)
             } else {
-                Stage2RetirementProof::Unpublished(
-                    custody
-                        .stage1_unpublished_from_receipt(identity, stage1_receipt)
-                        .ok_or_else(|| {
-                            TrapError::Hypervisor(
-                                "stage-2 owner remains reachable from authoritative stage-1"
-                                    .to_owned(),
-                            )
-                        })?,
-                )
+                let proof = frames
+                    .lock()
+                    .release_stage2_reference((ipa, length), Some(identity), stage1_receipt)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("release stage-2 owner reference: {error:?}"))
+                    })?
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor(
+                            "stage-2 owner retains another authoritative stage-1 reference"
+                                .to_owned(),
+                        )
+                    })?;
+                Stage2RetirementProof::Released(proof)
             };
             retire_global_frame_host_owner_in(custody, proof, ipa, length)
         } else {
@@ -1591,15 +1660,15 @@ impl HvfVmState {
                 .owner_retired
                 .store(true, std::sync::atomic::Ordering::Release);
             if custody.claim_stage2_retirement(identity).is_none() {
-                let proof = custody
-                    .stage1_unpublished_from_receipt(identity, stage1_receipt)
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(
-                            "structural owner remains reachable from authoritative stage-1"
-                                .to_owned(),
-                        )
+                let proof = frames
+                    .lock()
+                    .release_structural_stage2_reference((ipa, length), identity, stage1_receipt)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "release structural owner reference: {error:?}"
+                        ))
                     })?;
-                let requested = custody.request_stage2_record_retirement(identity, proof);
+                let requested = custody.request_released_stage2_record_retirement(identity, proof);
                 if requested != CarrierStage2RetireOutcome::DeferredActivePins {
                     mappings.restore_structural_owner(row, owner);
                     return Err(TrapError::Hypervisor(format!(
@@ -1636,14 +1705,13 @@ impl HvfVmState {
         // again.
         if let Some(identity) = take_carrier_stage2_record(custody, ipa, length) {
             if custody.claim_stage2_retirement(identity).is_none() {
-                let proof = custody
-                    .stage1_unpublished_from_receipt(identity, stage1_receipt)
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(
-                            "carrier owner remains reachable from authoritative stage-1".to_owned(),
-                        )
+                let proof = frames
+                    .lock()
+                    .release_structural_stage2_reference((ipa, length), identity, stage1_receipt)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("release carrier owner reference: {error:?}"))
                     })?;
-                let requested = custody.request_stage2_record_retirement(identity, proof);
+                let requested = custody.request_released_stage2_record_retirement(identity, proof);
                 if requested != CarrierStage2RetireOutcome::DeferredActivePins {
                     return Err(TrapError::Hypervisor(format!(
                         "carrier stage-2 retirement request failed: {requested:?}"
@@ -1719,8 +1787,12 @@ impl HvfVmState {
             .stage2_record_covering(ipa, 1)
             .expect("test retirement names a registered stage-2 record");
         let receipt = custody.editor_receipt_after_test_unmap(identity);
+        let frames =
+            std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+        frames.lock().stage2_references.insert((ipa, length), 1);
         Self::retire_stage2_extent_from_mappings_in(
             custody,
+            &frames,
             mappings,
             Stage1UnpublicationReceipt::EditorRange(&receipt),
             ipa,
@@ -1739,8 +1811,12 @@ impl HvfVmState {
             .stage2_record_covering(ipa, 1)
             .expect("test retirement names a registered stage-2 record");
         let receipt = custody.editor_receipt_after_test_unmap(identity);
+        let frames =
+            std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+        frames.lock().stage2_references.insert((ipa, length), 1);
         Self::retire_stage2_extent_from_mappings_in(
             custody,
+            &frames,
             mappings,
             Stage1UnpublicationReceipt::EditorRange(&receipt),
             ipa,
@@ -3793,6 +3869,7 @@ impl HvfVmState {
                 if Self::retire_stage2_candidate_if_unreferenced(&frames, lease, || {
                     Self::retire_stage2_extent_from_mappings_in(
                         custody,
+                        &frames,
                         &mut task.mappings,
                         Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
                         ipa,

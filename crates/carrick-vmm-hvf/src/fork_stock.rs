@@ -892,9 +892,12 @@ mod tests {
 
         // The same retirement entry point used by munmap wins before Reserve.
         assert_eq!(
-            custody.request_stage2_record_retirement(
+            custody.request_released_stage2_record_retirement(
                 owner_b.record_identity(),
-                custody.stage1_unpublished_after_editor_unmap(owner_b.record_identity()),
+                crate::trap::release_stage2_reference_after_test_unmap(
+                    &custody,
+                    owner_b.record_identity()
+                ),
             ),
             crate::trap::CarrierStage2RetireOutcome::DeferredActivePins
         );
@@ -1051,9 +1054,12 @@ mod tests {
             1
         );
         assert_eq!(
-            custody.request_stage2_record_retirement(
+            custody.request_released_stage2_record_retirement(
                 owner_a.record_identity(),
-                custody.stage1_unpublished_after_editor_unmap(owner_a.record_identity()),
+                crate::trap::release_stage2_reference_after_test_unmap(
+                    &custody,
+                    owner_a.record_identity()
+                ),
             ),
             crate::trap::CarrierStage2RetireOutcome::DeferredActivePins,
             "retirement after Reserve cannot revoke the admitted child's backing"

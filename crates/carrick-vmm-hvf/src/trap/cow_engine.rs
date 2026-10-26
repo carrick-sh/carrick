@@ -7436,10 +7436,12 @@ impl HvfTaskState {
     ) -> Result<(), TrapError> {
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let custody = self.custody_arc();
+        let frames = std::sync::Arc::clone(&self.frame_inventory.lock().frames);
         for stage1 in detached {
             let base = stage1.base();
             HvfVmState::retire_stage2_extent_from_mappings_in(
                 &custody,
+                &frames,
                 &mut self.mappings,
                 Stage1UnpublicationReceipt::TableArena(stage1),
                 base,

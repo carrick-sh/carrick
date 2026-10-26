@@ -509,17 +509,17 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
             state.release_structural_owner_at(&self.custody, base, 2 * 1024 * 1024);
             return Ok(());
         }
-        let stage1 = self
-            .custody
-            .stage1_unpublished_from_receipt(
+        let stage1 = state
+            .release_structural_stage2_reference(
+                &self.custody,
                 identity,
                 Stage1UnpublicationReceipt::TableArena(receipt),
             )
-            .ok_or_else(|| "raw Fork arena receipt names another record".to_owned())?;
+            .map_err(|error| error.to_string())?;
         if self.custody.claim_stage2_retirement(identity).is_none()
             && self
                 .custody
-                .request_stage2_record_retirement(identity, stage1)
+                .request_released_stage2_record_retirement(identity, stage1)
                 != CarrierStage2RetireOutcome::DeferredActivePins
         {
             return Err("raw Fork arena could not authorize retirement".to_owned());
@@ -1358,6 +1358,33 @@ impl MmAccessState {
         self.structural_owners.write().insert(key, owner);
     }
 
+    fn release_structural_stage2_reference(
+        &self,
+        custody: &CarrierVmCustody,
+        identity: CarrierStage2RecordIdentity,
+        receipt: Stage1UnpublicationReceipt<'_>,
+    ) -> Result<Stage1Unpublished, TrapError> {
+        let snapshot = custody
+            .stage2_record_snapshot(identity.record_id)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "structural reference release lost its exact stage-2 record".to_owned(),
+                )
+            })?;
+        let inventory = self.frame_inventory.lock();
+        inventory
+            .frames
+            .lock()
+            .release_structural_stage2_reference(
+                (snapshot.ipa, snapshot.len as u64),
+                identity,
+                receipt,
+            )
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("release structural stage-2 reference: {error:?}"))
+            })
+    }
+
     /// Host pointer of the structural owner published for exactly
     /// `(physical_ipa, physical_size)` — the O(1) lookup for a stage-1
     /// extension arena's backing.
@@ -1495,18 +1522,12 @@ impl MmAccessState {
                 .owner
                 .record_populated_prefix(copied_bytes as usize);
 
-            let stage1 = custody
-                .stage1_unpublished_from_receipt(
-                    authority.record_identity,
-                    Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
-                )
-                .ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "stage-1 root retirement receipt did not name its physical arena"
-                            .to_owned(),
-                    )
-                })?;
-            if custody.request_stage2_record_retirement(authority.record_identity, stage1)
+            let stage1 = self.release_structural_stage2_reference(
+                custody,
+                authority.record_identity,
+                Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
+            )?;
+            if custody.request_released_stage2_record_retirement(authority.record_identity, stage1)
                 != CarrierStage2RetireOutcome::DeferredActivePins
             {
                 return Err(TrapError::Hypervisor(

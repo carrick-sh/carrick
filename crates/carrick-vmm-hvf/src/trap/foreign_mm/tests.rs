@@ -378,7 +378,9 @@ impl Drop for OwnerCleanup {
             let Some(identity) = global_frame_stage2_identity_in(custody, key.0, key.1) else {
                 continue;
             };
-            let proof = custody.stage1_unpublished_after_editor_unmap(identity);
+            let proof = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                &custody, identity,
+            );
             let outcome = retire_global_frame_host_owner_in(custody, proof, key.0, key.1);
             assert!(
                 outcome.is_retired(),
@@ -728,15 +730,11 @@ fn retire_test_structural_backing_identities_in_using(
         if custody.stage2_record_snapshot(identity.record_id).is_some()
             && custody.claim_stage2_retirement(identity).is_none()
         {
-            let receipt = custody.editor_receipt_after_test_unmap(identity);
-            let stage1 = custody
-                .stage1_unpublished_from_receipt(
-                    identity,
-                    Stage1UnpublicationReceipt::EditorRange(&receipt),
-                )
-                .expect("real test editor unmap covers the structural record");
+            let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                custody, identity,
+            );
             assert_eq!(
-                custody.request_stage2_record_retirement(identity, stage1),
+                custody.request_released_stage2_record_retirement(identity, stage1),
                 CarrierStage2RetireOutcome::DeferredActivePins,
                 "real test editor unmap authorizes structural retirement"
             );
@@ -3707,7 +3705,8 @@ fn foreign_mm_read_rejects_reused_owner_generation() {
     let custody = legacy_test_carrier_vm_custody();
     let identity = global_frame_stage2_identity_in(custody, data_key.0, data_key.1)
         .expect("old data owner has exact stage-2 custody");
-    let proof = custody.stage1_unpublished_after_editor_unmap(identity);
+    let proof =
+        crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(&custody, identity);
     assert!(
         retire_global_frame_host_owner_in(custody, proof, data_key.0, data_key.1).is_retired(),
         "the old incarnation must retire before same-IPA replacement"
@@ -6619,13 +6618,14 @@ fn current_generation_structural_owner_needs_no_replay_rebind() {
     );
     drop(region);
     drop(owner);
-    let stage1 = transport
-        .custody
-        .stage1_unpublished_after_editor_unmap(identity);
+    let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+        &transport.custody,
+        identity,
+    );
     assert_eq!(
         transport
             .custody
-            .request_stage2_record_retirement(identity, stage1),
+            .request_released_stage2_record_retirement(identity, stage1),
         CarrierStage2RetireOutcome::DeferredActivePins
     );
     retire_test_structural_backing_identities_in_using(
@@ -7567,13 +7567,14 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
     drop(child_source);
     drop(prepared);
     drop(owner);
-    let stage1 = transport
-        .custody
-        .stage1_unpublished_after_editor_unmap(identity);
+    let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+        &transport.custody,
+        identity,
+    );
     assert_eq!(
         transport
             .custody
-            .request_stage2_record_retirement(identity, stage1),
+            .request_released_stage2_record_retirement(identity, stage1),
         CarrierStage2RetireOutcome::DeferredActivePins
     );
     retire_test_structural_backing_identities_in_using(
@@ -14048,8 +14049,13 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
                 let extent = *inventory.extents.get(&key).unwrap();
                 HvfVmState::rollback_unpublished_mappings(&mut inventory, &[(key, extent)])
                     .unwrap();
-                let stage1 = custody.stage1_unpublished_after_editor_unmap(owner.record_identity);
-                let _ = custody.request_stage2_record_retirement(owner.record_identity, stage1);
+                let stage1 =
+                    crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                        &custody,
+                        owner.record_identity,
+                    );
+                let _ = custody
+                    .request_released_stage2_record_retirement(owner.record_identity, stage1);
             }
             register_shared_alias(successor);
         }
@@ -14783,7 +14789,11 @@ fn exercise_retained_import(journal_case: u8) {
         .retain_import_source(Gpa::new(source_ipa), 4096, receipt)
         .unwrap();
     assert_eq!(
-        source_custody.retire_test_stage2_record_using(identity, |_, _| Ok(())),
+        crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+            &source_custody,
+            identity,
+            |_, _| Ok(())
+        ),
         CarrierStage2RetireOutcome::DeferredActivePins
     );
     source_custody.remove_global_frame_host_owner_if((source_ipa, 16384), |_| true);

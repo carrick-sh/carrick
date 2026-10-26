@@ -544,14 +544,19 @@ fn exec_predecessor_authority_test_fixture() -> (
 
 // global_frame_allocator_test_lock rehomed to trap.rs stub
 
-fn register_carrier_lease(mut lease: GlobalFrameStage2Lease, host_addr: usize) -> (u64, u64) {
+fn register_carrier_lease(
+    mut lease: GlobalFrameStage2Lease,
+    host_addr: usize,
+) -> ((u64, u64), UnpublishedTaskStage1) {
     let key = lease.key();
     lease.mark_test_mapped_without_backend();
     let owners = std::collections::BTreeMap::from([(key, host_addr)]);
+    let unpublished = UnpublishedTaskStage1::begin_inventory_transaction();
     let identities = register_carrier_stage2_leases(
         legacy_test_carrier_vm_custody_arc(),
         &mut vec![lease],
         &owners,
+        &unpublished,
     )
     .unwrap();
     assert_eq!(identities.len(), 1);
@@ -561,7 +566,24 @@ fn register_carrier_lease(mut lease: GlobalFrameStage2Lease, host_addr: usize) -
             .map(|snapshot| (snapshot.ipa, snapshot.len as u64)),
         Some(key)
     );
-    key
+    (key, unpublished)
+}
+
+fn unpublished_carrier_mm_authority(
+    key: (u64, u64),
+    frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+    unpublished: UnpublishedTaskStage1,
+) -> HvpatchCarrierMmAuthority {
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let identity = custody.carrier_stage2_records.lock()[&key];
+    HvpatchCarrierMmAuthority::PublicationTest {
+        stage2_logical_leases: carrier_stage2_logical_leases(custody, &[identity]),
+        custody: std::sync::Arc::downgrade(custody),
+        frames,
+        stage1_lifecycle: parking_lot::Mutex::new(CarrierMmStage1Lifecycle::Unpublished(
+            unpublished,
+        )),
+    }
 }
 
 enum TestFrameMappingCount {
@@ -3341,7 +3363,8 @@ fn carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority(
             ),
         );
     }
-    register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1), 0x1000);
+    let (_, unpublished) =
+        register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1), 0x1000);
     let frames = std::sync::Arc::clone(&task.frame_inventory.lock().frames);
 
     retire_test_process_mappings(&mut task).expect("retire the backend's final known row");
@@ -3354,10 +3377,11 @@ fn carrier_drop_preserves_a_zero_backend_ref_lease_retained_by_kernel_authority(
             "kernel/backend disagreement must survive a zero backend count",
         );
     }
-    drop(HvpatchCarrierMmAuthority::LeaseTest {
-        stage2_lease_keys: vec![key],
-        frames: std::sync::Arc::clone(&frames),
-    });
+    drop(unpublished_carrier_mm_authority(
+        key,
+        std::sync::Arc::clone(&frames),
+        unpublished,
+    ));
     assert!(
         carrier_stage2_leases().lock().contains_key(&key),
         "carrier teardown must not override authority-retained physical ownership",
@@ -3617,8 +3641,10 @@ fn process_retirement_rejects_a_recycled_owner_generation() {
         .expect("old owner exists before exact same-IPA successor publication")
         .owner()
         .record_identity;
-    let old_stage1 =
-        legacy_test_carrier_vm_custody().stage1_unpublished_after_editor_unmap(old_identity);
+    let old_stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+        legacy_test_carrier_vm_custody(),
+        old_identity,
+    );
     assert!(
         retire_global_frame_host_owner_in(
             legacy_test_carrier_vm_custody(),
@@ -3704,8 +3730,10 @@ fn process_retirement_rejects_a_recycled_owner_generation() {
     let successor_identity =
         global_frame_stage2_identity_in(legacy_test_carrier_vm_custody(), key.0, key.1)
             .expect("successor has exact stage-2 identity");
-    let successor_stage1 =
-        legacy_test_carrier_vm_custody().stage1_unpublished_after_editor_unmap(successor_identity);
+    let successor_stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+        legacy_test_carrier_vm_custody(),
+        successor_identity,
+    );
     assert!(
         retire_global_frame_host_owner_in(
             legacy_test_carrier_vm_custody(),
@@ -4856,7 +4884,8 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
     let new_mapping = carrick_hal::MappingId::from_kernel_allocation(id(54));
     let old_key = (0xa090_0000_0000, 0x4000);
     let new_key = (0xa092_0000_0000, 0x4000);
-    register_carrier_lease(GlobalFrameStage2Lease::fixed(old_key.0, old_key.1), 0x1000);
+    let (_, unpublished) =
+        register_carrier_lease(GlobalFrameStage2Lease::fixed(old_key.0, old_key.1), 0x1000);
     let old = InventoryExtent {
         frame: old_frame,
         mapping: old_mapping,
@@ -4918,10 +4947,11 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
         !frames.lock().stage2_references.contains_key(&old_key),
         "the COW split must remove its last backend reference",
     );
-    drop(HvpatchCarrierMmAuthority::LeaseTest {
-        stage2_lease_keys: vec![old_key],
-        frames: std::sync::Arc::clone(&frames),
-    });
+    drop(unpublished_carrier_mm_authority(
+        old_key,
+        std::sync::Arc::clone(&frames),
+        unpublished,
+    ));
     assert!(
         carrier_stage2_leases().lock().contains_key(&old_key),
         "carrier teardown must preserve a COW lease retained by Kernel authority",
@@ -4961,7 +4991,8 @@ fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
         frames.extent_references.insert((frame, key.0, key.1), 1);
         frames.stage2_references.insert(key, 1);
     }
-    register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1), 0x1000);
+    let (_, unpublished) =
+        register_carrier_lease(GlobalFrameStage2Lease::fixed(key.0, key.1), 0x1000);
     let frames = std::sync::Arc::clone(&inventory.frames);
     let retirement = HvfVmState::inventory_lease_retirement_shape(
         &inventory,
@@ -4984,10 +5015,11 @@ fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
         !frames.lock().stage2_references.contains_key(&key),
         "alias retirement must remove its last backend reference",
     );
-    drop(HvpatchCarrierMmAuthority::LeaseTest {
-        stage2_lease_keys: vec![key],
-        frames: std::sync::Arc::clone(&frames),
-    });
+    drop(unpublished_carrier_mm_authority(
+        key,
+        std::sync::Arc::clone(&frames),
+        unpublished,
+    ));
     assert!(
         carrier_stage2_leases().lock().contains_key(&key),
         "carrier teardown must preserve an alias lease retained by Kernel authority",
@@ -5044,12 +5076,13 @@ fn final_carrier_mm_drop_keeps_a_backend_referenced_stage2_lease_live() {
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
     let key = lease.key();
-    register_carrier_lease(lease, 0x1000);
+    let (_, unpublished) = register_carrier_lease(lease, 0x1000);
     frames.lock().stage2_references.insert(key, 1);
-    drop(HvpatchCarrierMmAuthority::LeaseTest {
-        stage2_lease_keys: vec![key],
-        frames: std::sync::Arc::clone(&frames),
-    });
+    drop(unpublished_carrier_mm_authority(
+        key,
+        std::sync::Arc::clone(&frames),
+        unpublished,
+    ));
 
     assert!(
         global_frame_ipa_allocator().lock().is_live(key.0, key.1),
@@ -5082,12 +5115,9 @@ fn final_carrier_mm_drop_schedules_unpinned_stage2_retirement_at_safe_point() {
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
     let key = lease.key();
-    register_carrier_lease(lease, 0x1000);
+    let (_, unpublished) = register_carrier_lease(lease, 0x1000);
 
-    drop(HvpatchCarrierMmAuthority::LeaseTest {
-        stage2_lease_keys: vec![key],
-        frames,
-    });
+    drop(unpublished_carrier_mm_authority(key, frames, unpublished));
 
     assert!(global_frame_ipa_allocator().lock().is_live(key.0, key.1));
     let report =
@@ -5103,10 +5133,12 @@ fn carrier_stage2_registration_rejects_unmapped_or_missing_host_owner() {
     let key = next_test_physical_key(0x4000);
     let mut unmapped = vec![GlobalFrameStage2Lease::fixed(key.0, key.1)];
     let owners = std::collections::BTreeMap::from([(key, 0x1000)]);
+    let unpublished = UnpublishedTaskStage1::begin_inventory_transaction();
     let error = register_carrier_stage2_leases(
         legacy_test_carrier_vm_custody_arc(),
         &mut unmapped,
         &owners,
+        &unpublished,
     )
     .expect_err("an unmapped carrier lease cannot authenticate retirement");
     assert!(error.to_string().contains("mapped=false"));
@@ -5123,6 +5155,7 @@ fn carrier_stage2_registration_rejects_unmapped_or_missing_host_owner() {
         legacy_test_carrier_vm_custody_arc(),
         &mut unmapped,
         &owners,
+        &unpublished,
     )
     .expect_err("an inactive mapped carrier lease cannot authenticate retirement");
     assert!(error.to_string().contains("active=false"));
@@ -5135,6 +5168,7 @@ fn carrier_stage2_registration_rejects_unmapped_or_missing_host_owner() {
         legacy_test_carrier_vm_custody_arc(),
         &mut unmapped,
         &std::collections::BTreeMap::new(),
+        &unpublished,
     )
     .expect_err("a mapped key without its exact host owner is still insufficient");
     assert!(error.to_string().contains("host=0x0"));
@@ -5223,10 +5257,11 @@ fn unowned_retirement_rejects_an_unmapped_local_lease() {
 fn carrier_lease_batch_collision_publishes_nothing_and_retains_every_candidate() {
     let _allocator_test_guard = global_frame_allocator_test_lock().lock();
     let existing_key = (0x7e10_0000_0000, 0x4000);
-    register_carrier_lease(
+    let (_, existing_publication) = register_carrier_lease(
         GlobalFrameStage2Lease::fixed(existing_key.0, existing_key.1),
         0x1000,
     );
+    existing_publication.commit_publication();
     let reserved = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
     let reserved_key = reserved.key();
     let mut candidates = vec![
@@ -5238,10 +5273,12 @@ fn carrier_lease_batch_collision_publishes_nothing_and_retains_every_candidate()
     }
 
     let owners = std::collections::BTreeMap::from([(reserved_key, 0x2000), (existing_key, 0x1000)]);
+    let unpublished = UnpublishedTaskStage1::begin_inventory_transaction();
     let error = register_carrier_stage2_leases(
         legacy_test_carrier_vm_custody_arc(),
         &mut candidates,
         &owners,
+        &unpublished,
     )
     .expect_err("an existing carrier key must reject the complete batch");
 
@@ -5273,7 +5310,7 @@ fn directory_failpoint_rolls_back_inventory_before_final_carrier_drop() {
     let mapping = carrick_hal::MappingId::from_kernel_allocation(id(302));
     let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x4000).unwrap();
     let key = lease.key();
-    register_carrier_lease(lease, 0x1000);
+    let (_, unpublished) = register_carrier_lease(lease, 0x1000);
     let mut inventory = HvpatchFrameInventory::default();
     let extent = InventoryExtent {
         frame,
@@ -5314,10 +5351,7 @@ fn directory_failpoint_rolls_back_inventory_before_final_carrier_drop() {
         last_holder: parking_lot::Mutex::new(HvpatchTaskMmHolder::FailpointRollback),
         drop_order: None,
     });
-    let carrier = std::sync::Arc::new(HvpatchCarrierMmAuthority::LeaseTest {
-        stage2_lease_keys: vec![key],
-        frames,
-    });
+    let carrier = std::sync::Arc::new(unpublished_carrier_mm_authority(key, frames, unpublished));
     let row = HvpatchCarrierTaskRow {
         mm_key: HvpatchMmAuthorityKey {
             task_serial: 1,
@@ -8211,14 +8245,19 @@ fn two_live_mm_empty_inventory_releases_already_terminal_table_capacity() {
     let peer = relocate_exit_fixture_root(&mut second, base + 0x20_0000);
     // An earlier exact physical retirement may finish before MM metadata drops.
     let stage1_unpublished = prepare_test_whole_mm_retirement(&mut first);
-    let stage1 = custody
-        .stage1_unpublished_from_receipt(
+    let record_snapshot = custody
+        .stage2_record_snapshot(record.record_id)
+        .expect("whole-MM table record exists before retirement");
+    let stage1 = frames
+        .lock()
+        .release_structural_stage2_reference(
+            (record_snapshot.ipa, record_snapshot.len as u64),
             record,
             Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
         )
         .expect("whole-MM inventory proof covers its exact table record");
     assert_eq!(
-        custody.request_stage2_record_retirement(record, stage1),
+        custody.request_released_stage2_record_retirement(record, stage1),
         CarrierStage2RetireOutcome::DeferredActivePins
     );
     retire_carrier_stage2_record_at_safe_point(custody, record).unwrap();

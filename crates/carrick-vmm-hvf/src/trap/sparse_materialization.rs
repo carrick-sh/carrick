@@ -2432,9 +2432,11 @@ mod arena_pin_tests {
         state.structural_owners.write().clear();
         assert_eq!(resolver.host_ptr_for_base(base), Some(pointer));
         assert_eq!(
-            custody.retire_test_stage2_record_using(identity, |_, _| panic!(
-                "pinned backing must not unmap"
-            )),
+            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+                &custody,
+                identity,
+                |_, _| panic!("pinned backing must not unmap")
+            ),
             CarrierStage2RetireOutcome::DeferredActivePins
         );
         drop(resolver);
@@ -2446,7 +2448,11 @@ mod arena_pin_tests {
             0
         );
         assert_eq!(
-            custody.retire_test_stage2_record_using(identity, |_, _| Ok(())),
+            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+                &custody,
+                identity,
+                |_, _| Ok(())
+            ),
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
     }

@@ -814,9 +814,12 @@ pub(super) mod tests {
             .stage2_record_snapshot(owner.record_identity.record_id)
             .unwrap();
         assert_eq!(
-            custody.request_stage2_record_retirement(
+            custody.request_released_stage2_record_retirement(
                 owner.record_identity,
-                custody.stage1_unpublished_after_editor_unmap(owner.record_identity),
+                crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+                    &custody,
+                    owner.record_identity
+                ),
             ),
             CarrierStage2RetireOutcome::DeferredActivePins
         );
@@ -963,9 +966,12 @@ pub(super) mod tests {
         let owner = backing(&custody, ipa);
         let physical = UserTransferCustody::new(Arc::clone(&custody));
         custody.enqueue_carrier_stage2_retirement(owner.record_identity);
-        let stage1 = custody.stage1_unpublished_after_editor_unmap(owner.record_identity);
+        let stage1 = crate::trap::frame_inventory::release_stage2_reference_after_test_unmap(
+            &custody,
+            owner.record_identity,
+        );
         assert_eq!(
-            custody.request_stage2_record_retirement(owner.record_identity, stage1),
+            custody.request_released_stage2_record_retirement(owner.record_identity, stage1),
             CarrierStage2RetireOutcome::DeferredActivePins
         );
         custody.terminalize_carrier_stage2_retirement(owner.record_identity);
@@ -976,10 +982,12 @@ pub(super) mod tests {
         let key = (snapshot.ipa, snapshot.len as u64);
         let mut replacement = vec![GlobalFrameStage2Lease::fixed(key.0, key.1)];
         replacement[0].mark_test_mapped_without_backend();
+        let unpublished = crate::trap::UnpublishedTaskStage1::begin_inventory_transaction();
         let collision = crate::trap::global_frame::register_carrier_stage2_leases(
             &custody,
             &mut replacement,
             &std::collections::BTreeMap::from([(key, snapshot.host_addr)]),
+            &unpublished,
         )
         .expect_err("terminal quarantine must refuse IPA re-registration");
         assert!(collision.to_string().contains("ExtentCollision"));
@@ -1068,12 +1076,16 @@ pub(super) mod tests {
                     )
                     .unwrap();
                 let receipt = receipt.expect("retirement edit removed the exact leaf");
-                let stage1 = custody
-                    .stage1_unpublished_from_receipt(
-                        owner.record_identity,
+                let mut frames = crate::trap::frame_inventory::InventoryFrameRegistry::default();
+                frames.stage2_references.insert((ipa, 4096), 1);
+                let stage1 = frames
+                    .release_stage2_reference(
+                        (ipa, 4096),
+                        Some(owner.record_identity),
                         Stage1UnpublicationReceipt::EditorRange(&receipt),
                     )
-                    .expect("editor receipt covers retired owner");
+                    .expect("editor receipt covers retired owner")
+                    .expect("the production edit released the last reference");
                 assert!(
                     crate::trap::global_frame::retire_global_frame_host_owner_if_generation_in_using(
                         &custody,
@@ -1374,10 +1386,14 @@ pub(super) mod tests {
         // Retirement reaches the existing custodian before any backend unmap.
         let mut unmaps = 0;
         assert_eq!(
-            custody.retire_test_stage2_record_using(owner.record_identity, |_, _| {
-                unmaps += 1;
-                Ok(())
-            }),
+            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+                &custody,
+                owner.record_identity,
+                |_, _| {
+                    unmaps += 1;
+                    Ok(())
+                }
+            ),
             CarrierStage2RetireOutcome::DeferredActivePins
         );
         assert_eq!(unmaps, 0);
@@ -1406,10 +1422,14 @@ pub(super) mod tests {
             0
         );
         assert_eq!(
-            custody.retire_test_stage2_record_using(owner.record_identity, |_, _| {
-                unmaps += 1;
-                Ok(())
-            }),
+            crate::trap::frame_inventory::retire_stage2_record_after_test_unmap_using(
+                &custody,
+                owner.record_identity,
+                |_, _| {
+                    unmaps += 1;
+                    Ok(())
+                }
+            ),
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
         assert!(wait.0.is_ready());
