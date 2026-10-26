@@ -721,6 +721,65 @@ fn a_kick_taken_at_el0_forwards() {
     assert_eq!(frame, copy);
 }
 
+/// A served native frame can observe host work only after its vector handler
+/// returned. The software IRQ re-entry must settle that exact switched owner
+/// before any direct host boundary can escape.
+#[test]
+fn late_host_work_on_a_switched_native_record_enters_its_owner_boundary() {
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    host_publish(&zone, SLOT, 0, None, 0);
+    zone.enter_guest(SLOT);
+    let record = zone.alloc_record(identity(101)).unwrap();
+    assert!(zone.mark_native_owned(record));
+    // SAFETY: the fresh unpublished record is exclusively owned here.
+    unsafe {
+        *zone.record(record).ctx_mut() =
+            Aarch64ParkedContext::from_register(thread_ctx(0xA, 0x1000), TTBR_MM, MM, 1);
+    }
+    zone.requeue_preempted(SLOT, record);
+    let task = CurrentTask::new();
+    let counters = counters();
+    let mut frame = TrapFrame {
+        slot: u64::from(SLOT.raw()),
+        ..TrapFrame::default()
+    };
+    let mut cpu = FakeCpu::default();
+    assert_eq!(
+        Sched {
+            handoff: None,
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters,
+        }
+        .serve_idle_entry(&mut frame),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(zone.slot(SLOT).current(), Some(record));
+    task.linux.mark_pending_host_work();
+    task.linux.record_completed_with_work();
+    cpu.host_work_once = Some(carrick_el1_abi::Action::Idle);
+
+    assert_eq!(
+        Sched {
+            handoff: None,
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters,
+        }
+        .serve_irq(&mut frame),
+        carrick_el1_abi::Action::Idle,
+        "late native host work escaped before its owner settled custody"
+    );
+    assert_eq!(cpu.host_work_boundaries, [record]);
+}
+
 #[test]
 fn a_wait_on_a_changed_word_returns_eagain_without_parking() {
     let zone = zone();

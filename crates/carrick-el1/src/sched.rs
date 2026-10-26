@@ -30,6 +30,19 @@ pub trait ThreadCpu {
     ) -> ResumeAction {
         ResumeAction::NoPending
     }
+    /// Settle a pending host-work boundary while the exact switched record is
+    /// still current. Personality owners may park the record and publish its
+    /// handoff; host-owned records retain the default direct host boundary.
+    fn host_work_boundary(
+        &mut self,
+        _zone: &ZoneTables,
+        _task: &CurrentTask,
+        _slot: SlotId,
+        _record: RecordId,
+        _frame: &mut TrapFrame,
+    ) -> carrick_el1_abi::Action {
+        carrick_el1_abi::Action::Forward
+    }
     /// Install translation roots (`TTBR0_EL1`, `TTBR1_EL1`), effective for
     /// everything after the call.
     fn set_translation(&mut self, ttbr0: u64, ttbr1: u64);
@@ -655,6 +668,19 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if self.task.linux.has_pending_host_work() {
             self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
+            let current = self.zone.slot(self.slot).current();
+            if let Some(record) =
+                current.filter(|record| self.zone.record(*record).is_native_owned())
+            {
+                let action = self
+                    .cpu
+                    .host_work_boundary(self.zone, self.task, self.slot, record, frame);
+                #[cfg(target_os = "none")]
+                if action == carrick_el1_abi::Action::Forward {
+                    hw::fatal_entry_binding();
+                }
+                return action;
+            }
             return carrick_el1_abi::Action::Forward;
         }
         if self.task.mm.key.load(Ordering::Acquire) == 0 {
@@ -867,6 +893,8 @@ pub fn leave_space(zone: &ZoneTables, slot: SlotId, cpu: &mut impl ThreadCpu) {
 #[derive(Clone, Debug)]
 pub struct FakeCpu {
     pub resume_once: Option<ResumeAction>,
+    pub host_work_once: Option<carrick_el1_abi::Action>,
+    pub host_work_boundaries: std::vec::Vec<RecordId>,
     pub regs: FakeRegs,
     pub now: u64,
     pub freq: u64,
@@ -898,6 +926,8 @@ impl Default for FakeCpu {
     fn default() -> Self {
         Self {
             resume_once: None,
+            host_work_once: None,
+            host_work_boundaries: std::vec::Vec::new(),
             regs: FakeRegs::default(),
             now: 1_000_000,
             freq: 24_000_000,
@@ -936,6 +966,19 @@ impl ThreadCpu for FakeCpu {
             zone.clear_current(slot);
         }
         action
+    }
+    fn host_work_boundary(
+        &mut self,
+        _: &ZoneTables,
+        _: &CurrentTask,
+        _: SlotId,
+        record: RecordId,
+        _: &mut TrapFrame,
+    ) -> carrick_el1_abi::Action {
+        self.host_work_boundaries.push(record);
+        self.host_work_once
+            .take()
+            .unwrap_or(carrick_el1_abi::Action::Forward)
     }
     fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext) {
         let ctx = &mut ctx.native;
