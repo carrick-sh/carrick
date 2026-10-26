@@ -1,5 +1,125 @@
 # Issue #847 signed hardware evidence
 
+## Exact `2e26b934d` inventory-commit fatal (2026-10-26)
+
+The exact bundle for `2e26b934d032924e61cf03e1546b054dedef6780`
+verified, restored, and then verified again with 1,195 executables:
+
+```text
+/Volumes/carrick-build/fixtures/published/2e26b934d032924e61cf03e1546b054dedef6780/76be9ca2ad15bf3b16f7c24f1cbc268ed013bfb0ab861c5ff8d7430217a932e1.tar.gz
+bundle identity: 76be9ca2ad15bf3b16f7c24f1cbc268ed013bfb0ab861c5ff8d7430217a932e1
+archive SHA-256: 170bad970ac055cca69ab1cf1ad85b7e70750c15142974da8c129d8eac6bc46d
+input identity: 2492797e6f21b47d83c36ca54d70c7d7a1953857010242670b5def177a0e218c
+```
+
+The first attempt, `847-2e26-smoke-01`, ran no guest: compiling the unsigned
+debug harness filled the gate volume. `cargo clean --profile dev` removed
+only generated debug artifacts, leaving the restored release fixtures
+intact; the bundle was verified again before hardware execution.
+
+The mandatory uninstrumented bootstrap smoke `847-2e26-smoke-02` (backend
+run `847-2e26-smoke-02-b1`) reached HVF and failed 0/1 in 0.11 seconds:
+
+```text
+carrick: FATAL: detached address-space retirement failed (the MM-authority drop abort that follows is a CONSEQUENCE of this, not the cause): hypervisor operation failed: detached HVPatch task retirement produced no inventory commit
+exit 139 signal Some(Signal(11)) stdout "" stderr ""
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 90 filtered out; finished in 0.11s
+remaining carrick procs (run-id 847-2e26-smoke-02-b1) = 0
+remaining carrick procs (run-id 847-2e26-smoke-02-b1-cli) = 0
+remaining carrick procs (run-id 847-2e26-smoke-02-neg) = 0
+remaining carrick procs (run-id 847-2e26-smoke-02) = 0
+remaining carrick procs (run-id 847-2e26-smoke-02-cli) = 0
+```
+
+The entitlement negative control passed. This is a carrier-fatal/new-source
+regression, so the requested acceptance population stopped immediately:
+
+- bootstrap smoke: 0/1 (`847-2e26-smoke-02`);
+- host-blocked-read acceptance population: not started (0/0 of 20);
+- `native_root_exec_replaces_pid1_shell`: not started (0/0);
+- `el1_ipc_pipe_blocking_roundtrips`: not started (0/0 of 3);
+- `el1_fork_cow_resolves_in_guest`: not started (0/0 of 3).
+
+Runs `847-2e26-fatal-03`, `847-2e26-fatalcap-04`, and
+`847-2e26-fatalring-05` through `847-2e26-fatalring-10` reproduced the same
+failure while qualifying a capture method; every signed-harness cleanup line
+was zero. `847-2e26-fatalring-12` and `-13` did not launch a guest because the
+diagnostic debugger invocation itself was refused. Final diagnostic run
+`847-2e26-fatalring-14` launched the exact signed test under LLDB from the
+signed harness, stopped at the failure before retirement unwound, saved a
+34 MiB modified-memory core, dumped both event rings, and then reproduced the
+same terminal result. Its host-local post-mortem is:
+
+```text
+/tmp/847-2e26-fatalring-14/carrier.core
+/tmp/847-2e26-fatalring-14/carrier.lldb.txt
+```
+
+The exact diagnostic artifact was
+`target/release/deps/el1_sched-d8a5a9a0d2511a83`:
+
+```text
+SHA-256: af95f8dc7586a1f16ac399e67283f040e40694eba6ee0222832918af406ebfdf
+CDHash: 0b987df1110106a1c47d4e9fff00aa5e51b830ba
+LC_UUID: 66D88277-F25C-3718-A34C-3D527C98028C
+identifier: el1_sched-d8a5a9a0d2511a83.tmp.2281
+entitlement: com.apple.security.hypervisor=true
+USDT: __TEXT,__dof_carrick present
+```
+
+The lifecycle ring at the failure was, verbatim:
+
+```text
+# carrick event ring (lifecycle)  pid=5051  total=30  showing=30  start=0  oldest=0  errors=0
+     0 SYSLOG_RECORD owner=1 seq=1 total_bytes=68
+     1 SYSLOG_STATE owner=1 read_seq=1 clear_seq=1 unread=68
+     2 SYSLOG_WAKE owner=1 type=1 wake_count=1 poll_fd=16385
+     3 ALIAS    coordinator=0x600003ac2310 tid=0 begin=dispatch
+     4 ALIAS    coordinator=0x600003ac2310 tid=0 end
+     5 SYSLOG_RECORD owner=2 seq=1 total_bytes=52
+     6 SYSLOG_STATE owner=2 read_seq=1 clear_seq=1 unread=52
+     7 SYSLOG_WAKE owner=2 type=1 wake_count=1 poll_fd=16389
+     8 HVPEXEC  pid=1 tid=1 executor=1 phase=claim
+     9 HVPEXEC  pid=1 tid=1 executor=1 phase=load
+    10 ALIAS    coordinator=0x600003ac2310 tid=1 begin=dispatch
+    11 ALIAS    coordinator=0x600003ac2310 tid=1 end
+    12 ALIAS    coordinator=0x600003ac2310 tid=1 begin=dispatch
+    13 ALIAS    coordinator=0x600003ac2310 tid=1 end
+    14 FAULTSIG tid=1 mm=1 signal=11 si_code=1 mutating=false walk=L3-invalid-denies access=write direct=false
+    15 FAULTSIG_ADDR far=0x0000000000000144 esr=0x92000047
+    16 FAULTSIG_PC tid=1 pc=0x000000000029e564
+    17 FAULTSIG_LEAF tid=1 leaf=0x0000000000000000
+    18 FAULTSIG_MBOXES tid=1 busy=0 own_slot=0 mask0_31=0x00000000
+    19 HVPTHREAD pid=1 tid=1 phase=cleanup-start
+    20 HVPTHREAD pid=1 tid=1 phase=registry-removed
+    21 HVPTHREAD pid=1 tid=1 phase=kicker-unregistered
+    22 HVPTHREAD pid=1 tid=1 phase=signal-forgotten
+    23 HVPTHREAD pid=1 tid=1 phase=dispatcher-forgotten
+    24 HVPEXEC  pid=1 tid=1 phase=boundary reason=yielded
+    25 HVPEXEC  pid=1 tid=1 phase=settlement state=runnable
+    26 HVPEXEC  pid=1 tid=1 executor=2 phase=claim
+    27 HVPEXEC  pid=1 tid=1 executor=2 phase=load
+    28 HVPPEXIT pid=1 tid=1 exit=139 publication=begin
+    29 HVPEXEC  pid=1 tid=1 phase=boundary reason=exited
+```
+
+The high-rate ring was also complete and error-free:
+
+```text
+# carrick event ring (high-rate)  pid=5051  total=4  showing=4  start=0  oldest=0  errors=0
+     0 SCHED_DISPATCH tid=2 executor=1 cpu=0
+     1 SCHED_BUDGET executor=1 budget_ms=4 generation=1
+     2 SCHED_DISPATCH tid=2 executor=2 cpu=1
+     3 SCHED_BUDGET executor=2 budget_ms=4 generation=2
+```
+
+The stopped retirement frame carried `Stage1UnpublishedMm { mm: 1 }` and
+returned the inventory-commit error quoted above. The ring shows the preceding
+guest-visible event precisely: PID/TID 1 took a write `SIGSEGV/SEGV_MAPERR` at
+VA `0x144` (PC `0x29e564`), began exit 139 publication, and then detached MM
+retirement found no inventory commit. There was no watchdog and therefore no
+watchdog census. Source was not changed.
+
 ## Exact `f990f2af5` whole-MM retirement fatal (2026-10-26)
 
 The exact bundle for `f990f2af550881bfbbcf5d75afea942d95e9ec69`
