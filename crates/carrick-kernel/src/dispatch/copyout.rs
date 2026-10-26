@@ -46,7 +46,9 @@ pub(crate) fn admit_effect(context: &KernelContext) -> Result<OwnerEffect, Copyo
         } else {
             match cause {
                 ProcessCancellation::FatalSignal => OwnerWaitCancellation::Carrier,
-                ProcessCancellation::GroupExit => OwnerWaitCancellation::GroupExit,
+                ProcessCancellation::GroupExit | ProcessCancellation::Exec => {
+                    OwnerWaitCancellation::GroupExit
+                }
             }
         };
         CopyoutRefusal(Box::new(DispatchOutcome::OwnerCancelled(reason)))

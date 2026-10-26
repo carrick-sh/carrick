@@ -1753,7 +1753,7 @@ fn test_exec_payload(path: &[u8]) -> Box<[u8]> {
 
 #[cfg(test)]
 #[test]
-fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
+fn native_exec_successor_retracts_exec_cancellation_before_owner_wait() {
     let fixture = native_exec_fixture();
     fixture.control.set_robust_list(0x5000, 24);
     fixture.control.set_clear_child_tid(0x6000);
@@ -1861,6 +1861,60 @@ fn native_exec_successor_runs_after_consuming_the_prepared_receipt() {
             .unwrap(),
         b"static\0\0\0\0\0\0\0\0\0\0"
     );
+
+    assert_eq!(
+        fixture.page.process_exit_custody().cancellation(),
+        None,
+        "the committed successor must not inherit its predecessor's exec cancellation"
+    );
+    let successor = fixture
+        .runtime
+        .graph
+        .lock()
+        .owner
+        .task(entry.key)
+        .unwrap()
+        .native()
+        .resources()
+        .mm
+        .clone();
+    let handle = entry.service.service_mm_handle(&successor).unwrap();
+    let successor_entry = fixture
+        .zone
+        .space_entry(NonZeroU64::new(handle.mm().raw()).unwrap())
+        .unwrap();
+    successor_entry
+        .admit_notifications(
+            handle.incarnation(),
+            &carrick_sched_core::BoundedSpin(0),
+            &|effects| {
+                let _ = effects.deliver_handbacks(&mut |_| {});
+            },
+        )
+        .unwrap();
+    let source = successor_entry.notifications(handle.incarnation()).unwrap();
+    let observed = source.observe(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor);
+    // SAFETY: this exact admitted successor owner and editor revision were
+    // sampled immediately before the failed-owner wait is enrolled.
+    let wait = unsafe {
+        carrick_core_abi::PortalOwnerWait::from_owner(
+            handle,
+            carrick_core_abi::PortalWaitCause::Editor,
+            observed.revision(),
+        )
+    };
+    assert!(matches!(
+        entry
+            .begin_owner_service_wait(
+                carrick_core_abi::service::ServiceOperation::CarrierWork {
+                    entry: OwnerEntry::Syscall,
+                },
+                wait,
+            )
+            .unwrap(),
+        NativeResume::Left(None)
+    ));
+    assert!(entry.take_handoff_receipt().is_some());
 }
 
 #[cfg(test)]
@@ -2497,6 +2551,9 @@ fn exec_drain_is_upgraded_by_terminal_sibling(signal: Option<u8>) {
             failure.is_none(),
             "losing exec owner failed run: {failure:?}"
         );
+        // Host-born retirement publication below is deliberately the host's
+        // half of the production protocol. The ring-owned sibling branches in
+        // this suite use `resume_pending_lifecycle` instead.
         fixture
             .page
             .reserve_cancelled_member_exit()

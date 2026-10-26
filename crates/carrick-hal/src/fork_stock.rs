@@ -656,6 +656,9 @@ struct ExecPredecessor<T, C> {
 
 #[derive(Debug)]
 enum ExecPredecessorPhysical<C> {
+    /// PID 1's original image never entered fork-stock child custody. The
+    /// shared child-release closure must not see it; #874 tracks retaining
+    /// and releasing its root frame/residency owner explicitly.
     Root,
     Child(C),
 }

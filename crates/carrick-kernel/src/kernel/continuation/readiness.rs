@@ -1071,7 +1071,9 @@ pub fn owner_wait_cancellation(context: &KernelContext) -> Option<OwnerWaitCance
     } else {
         match cause {
             ProcessCancellation::FatalSignal => OwnerWaitCancellation::Carrier,
-            ProcessCancellation::GroupExit => OwnerWaitCancellation::GroupExit,
+            ProcessCancellation::GroupExit | ProcessCancellation::Exec => {
+                OwnerWaitCancellation::GroupExit
+            }
         }
     })
 }
