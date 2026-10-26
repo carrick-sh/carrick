@@ -2626,6 +2626,82 @@ fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
 }
 
 #[test]
+fn native_thread_birth_replaces_recycled_address_before_first_service() {
+    let mut w = World::new(LifecycleHatches::ON);
+    w.task().publish_lifecycle(
+        w.page() as *const _ as u64,
+        w.venue.leader_slot() as *const _ as u64,
+    );
+    let address = Aarch64ParkedContext::from_register(
+        carrick_sched_core::ThreadCtx::ZERO,
+        0x2220_0000,
+        MM,
+        9,
+    )
+    .address_context()
+    .unwrap();
+    w.task().publish_root_generation(address.generation);
+    let parent = w
+        .zone
+        .alloc_record(crate::sched::identity_of(w.task(), 1 << SLOT_IDX))
+        .unwrap();
+    unsafe {
+        *w.zone.record(parent).ctx_mut() =
+            Aarch64ParkedContext::from_parts(carrick_sched_core::ThreadCtx::ZERO, address);
+    }
+    assert!(w.zone.mark_native_owned(parent));
+    w.zone.requeue_preempted(SLOT, parent);
+    assert_eq!(w.zone.switch_in(SLOT), Some(parent));
+    let recycled = w.zone.alloc_record(ThreadIdentity::default()).unwrap();
+    unsafe {
+        *w.zone.record(recycled).ctx_mut() = Aarch64ParkedContext::from_register(
+            carrick_sched_core::ThreadCtx::ZERO,
+            0x1110_0000,
+            1,
+            1,
+        );
+    }
+    w.zone.free_record(recycled);
+    w.venue.stock(2, CHILD_TID, CHILD_VISIBLE);
+    let (action, mut frame) = w.syscall(SYS_CLONE, &clone_args(GO_FLAGS, 0, 0));
+    assert_eq!(action, Action::Served);
+    let child = w.venue.child_slot(2).zone_record().unwrap();
+    assert_eq!(
+        child.id, recycled,
+        "exercise a recycled parent-process save area"
+    );
+    assert!(w.zone.record(child.id).is_native_owned());
+    assert!(
+        unsafe { w.zone.record(child.id).ctx_mut() }.authenticates(address),
+        "native birth retained another process's address context"
+    );
+    assert_eq!(w.call_native(&mut frame, 124, &[]), Action::Served);
+    assert_eq!(w.zone.slot(SLOT).current(), Some(child.id));
+    let observed = unsafe {
+        crate::aarch64_process::observed_entry_address(
+            BornInZoneSource {
+                zone: &w.zone,
+                slot: SLOT,
+            },
+            w.task(),
+            address.root.address().raw(),
+            child.id,
+        )
+    }
+    .expect("first native service must authenticate the child MM");
+    assert_eq!(observed, address);
+    assert_eq!(
+        w.zone
+            .release_current(SLOT, child.id, &carrick_sched_core::ShortLockSpin),
+        carrick_sched_core::CurrentRelease::Released
+    );
+    assert!(
+        w.zone
+            .leave_slot(SLOT, u64::from(SLOT.raw()) + 1, &mut |_| {}, &mut |_| {})
+    );
+}
+
+#[test]
 fn native_thread_birth_inherits_its_execution_lane_generation() {
     let w = World::new(LifecycleHatches::ON);
     let parent_identity = carrick_sched_core::ThreadIdentity {

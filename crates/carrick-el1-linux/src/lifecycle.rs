@@ -424,12 +424,35 @@ impl<
         let child =
             child_execution_identity(zone, parent, LifecycleNative::binding(self), identity)
                 .ok_or(carrick_sched_core::Exhausted)?;
+        let address = if child.native_owned {
+            let parent = parent.ok_or(carrick_sched_core::Exhausted)?;
+            // SAFETY: this birth runs on the parent's current slot. The
+            // running native owner exclusively holds its saved context.
+            Some(
+                unsafe { zone.record(parent).ctx_mut() }
+                    .address_context()
+                    .filter(|address| address.mm.raw().get() == child.identity.mm)
+                    .ok_or(carrick_sched_core::Exhausted)?,
+            )
+        } else {
+            None
+        };
         let id = zone
             .alloc_record(child.identity)
             .map_err(|_| carrick_sched_core::Exhausted)?;
-        if child.native_owned && !zone.mark_native_owned(id) {
-            zone.free_record(id);
-            return Err(carrick_sched_core::Exhausted);
+        if let Some(address) = address {
+            // Allocation reuses storage: the CPU save below writes only
+            // architectural registers, not the previous owner's MM binding.
+            // Initialize native custody before the child can be published.
+            // SAFETY: this exact new record is unpublished and ours alone.
+            unsafe {
+                *zone.record(id).ctx_mut() =
+                    Aarch64ParkedContext::from_parts(carrick_sched_core::ThreadCtx::ZERO, address);
+            }
+            if !zone.mark_native_owned(id) {
+                zone.free_record(id);
+                return Err(carrick_sched_core::Exhausted);
+            }
         }
         Ok(zone.record_ref(id))
     }

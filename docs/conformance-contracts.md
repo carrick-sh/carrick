@@ -871,6 +871,14 @@ participant reservation cannot license new process topology; already-admitted
 thread membership remains allowed. `process::birth::tests` binds these rules,
 including dropped admission, external peer roots, a genuine exit reservation
 red-first refusal and zero identity reads across 512 unrelated tasks.
+Native pthread birth also retains the creating process's exact address
+context before publishing the new record. A recycled save area cannot
+supply another process's root or MM generation at the first service exit.
+`native_thread_birth_replaces_recycled_address_before_first_service` binds
+this sequence through production clone, selection, ARM admission and slot
+release, with one parent-context read and one child-context initialization.
+The signed bindings are `el1_fork_cow_resolves_in_guest` and
+`el1_ipc_two_processes_blocking`.
 
 `kernel.process.fork-child-tid` covers `clone(SIGCHLD | CLONE_CHILD_SETTID |
 CLONE_CHILD_CLEARTID, ..., ctid)` as a process fork. Linux authority is
