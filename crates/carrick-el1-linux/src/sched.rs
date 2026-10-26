@@ -36,6 +36,21 @@ impl ThreadCpu for HardwareCpu {
         let task = unsafe { &*(task as *const carrick_el1_abi::CurrentTask) };
         super::aarch64_process::resume_production(zone, task, slot, record)
     }
+    fn host_work_boundary(
+        &mut self,
+        _: &carrick_el1_abi::ZoneTables,
+        task: &carrick_el1_abi::CurrentTask,
+        _: carrick_el1_abi::SlotId,
+        _: carrick_el1_abi::RecordId,
+        frame: &mut TrapFrame,
+    ) -> carrick_el1_abi::Action {
+        let action = if task.linux.served_boundary_pending() {
+            carrick_el1_abi::Action::ServedWithWork
+        } else {
+            carrick_el1_abi::Action::Forward
+        };
+        super::dispatch::capture_native_service_exit(frame, action, None)
+    }
     fn set_translation(&mut self, a: u64, b: u64) {
         carrick_el1::substrate::sched::hw::HardwareCpu.set_translation(a, b);
     }
