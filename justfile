@@ -857,7 +857,7 @@ ci:
 # `just conformance` = full tier; `just conformance smoke` = fast gate; extra args pass
 # through (e.g. `just conformance full --bless`, `just conformance full --ecosystem go`).
 conformance TIER="full" *ARGS: build
-    {{_admit}} {{_cargo}} run -p carrick-conformance -- --tier {{TIER}} {{ARGS}}
+    {{_admit}} {{_xtask}} host-lease --mode gate --check-load -- env -u CARRICK_SIGNED_FUNCTIONAL {{_cargo}} run -p carrick-conformance -- --tier {{TIER}} {{ARGS}}
 
 # Fast pre-merge regression gate: the smoke tier, non-zero exit on any regression.
 # Same `hvf` lane as `just conformance` — the local signed binary running whatever
@@ -865,7 +865,7 @@ conformance TIER="full" *ARGS: build
 # Verdicts here are load-coupled — run it on a quiet machine or you will bisect
 # onto the wrong commit.
 conformance-quick *ARGS: build
-    {{_admit}} {{_cargo}} run -p carrick-conformance -- --tier smoke {{ARGS}}
+    {{_admit}} {{_xtask}} host-lease --mode gate --check-load -- env -u CARRICK_SIGNED_FUNCTIONAL {{_cargo}} run -p carrick-conformance -- --tier smoke {{ARGS}}
 
 # KVM/lima Docker-parity gate (Phase 5). Builds carrick IN-GUEST for platform-linux,
 # then runs the smoke tier on the KVM lane vs the (backend-independent) docker oracles,
@@ -881,7 +881,7 @@ conformance-kvm *ARGS:
     # No explicit --baseline-overlay: the arm64 lima `kvm` lane auto-derives its
     # OWN overlay (baseline.kvm-arm64.jsonl), kept distinct from the amd64
     # `kvm-local` lane's baseline.kvm.jsonl so the two arches never cross-excuse.
-    {{_admit}} {{_cargo}} run -p carrick-conformance -- --lane kvm --tier smoke --workers 3 \
+    {{_admit}} {{_xtask}} host-lease --mode gate --check-load -- env -u CARRICK_SIGNED_FUNCTIONAL {{_cargo}} run -p carrick-conformance -- --lane kvm --tier smoke --workers 3 \
         --carrick-bin "$bin" {{ARGS}}
 
 # Re-render docs/support-matrix.md from the latest results (no run).
@@ -952,6 +952,11 @@ el1-gate: build
 conformance-probes: build
     #!/usr/bin/env bash
     set -euo pipefail
+    unset CARRICK_SIGNED_FUNCTIONAL
+    if [ -z "${CARRICK_HOST_LEASE_SOCKET:-}" ]; then
+        exec {{_admit}} {{_xtask}} host-lease --mode gate --check-load -- just --no-deps conformance-probes
+    fi
+    {{_xtask}} host-lease --mode gate --check-load -- true
     case "$(uname -m)" in
         x86_64|amd64) ./scripts/build-probes.sh ;;
     esac
@@ -959,10 +964,10 @@ conformance-probes: build
         # The deterministic arm64 rows run in-process against committed Docker
         # oracles. Only live-oracle and process-poisoning exceptions retain the
         # old signed-binary harness while their embed blockers remain open.
-        env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture
+        env -u CARRICK_SIGNED_FUNCTIONAL -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture
         cp target/test-results/carrick-conformance-next-signed-artifacts.jsonl \
           target/test-results/conformance-probes-generic-signed-artifacts.jsonl
-        env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next case_ --nocapture
+        env -u CARRICK_SIGNED_FUNCTIONAL -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next case_ --nocapture
         cp target/test-results/carrick-conformance-next-signed-artifacts.jsonl \
           target/test-results/conformance-probes-dedicated-signed-artifacts.jsonl
         {{_admit}} {{_cargo}} test -p carrick-cli --test conformance_cli_contract \
@@ -1024,11 +1029,11 @@ gate-containers: build
 # image, so it is an opt-in guest lane like conformance-quick — deliberately
 # NOT part of `just ci`.
 test-embed *ARGS: build
-    env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-embed {{ARGS}}
+    env -u CARRICK_SIGNED_FUNCTIONAL -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-embed {{ARGS}}
 
 # Guest-running tests of carrick-vmm-hvf from SIGNED cargo test executables.
 test-hvf *ARGS:
-    env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-vmm-hvf {{ARGS}}
+    env -u CARRICK_SIGNED_FUNCTIONAL -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-vmm-hvf {{ARGS}}
 
 # HVF trap-engine tests (`crates/carrick-vmm-hvf/tests/trap_engine_hvf.rs`):
 # bring up a real VM via `new_hvf_trap_engine`, load the staged root onto a
@@ -1042,11 +1047,11 @@ test-hvf *ARGS:
 # fresh process: one VM per process), then runs the package's UNENTITLED
 # negative control (`unsigned_executable_maps_hv_denied_to_entitlement`).
 test-hvf-trap-engine:
-    env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_ --ignored --nocapture
+    env -u CARRICK_SIGNED_FUNCTIONAL -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_ --ignored --nocapture
 
 # Guest-running tests of carrick-conformance-next from SIGNED cargo test executables.
 test-conformance-next *ARGS: build
-    env -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next {{ARGS}}
+    env -u CARRICK_SIGNED_FUNCTIONAL -u CARRICK_TEST_TARGET ./scripts/test-signed.sh carrick-conformance-next {{ARGS}}
 
 # Re-sign an already-built release binary (rarely needed on its own).
 sign:
@@ -1055,12 +1060,12 @@ sign:
 # Differential perf benchmark vs Docker (serial; needs Docker + signed binary).
 # `just bench` = quick profile; `just bench full` = full profile.
 bench PROFILE="quick":
-    ./scripts/measure-perf.sh {{PROFILE}}
+    {{_admit}} {{_xtask}} host-lease --mode gate --check-load -- env -u CARRICK_SIGNED_FUNCTIONAL ./scripts/measure-perf.sh {{PROFILE}}
 
 # Report-only legacy/mailbox HVF syscall-transport comparison over identical
 # signed VMM commands and native-PIE guest artifacts.
 bench-hvf-mailbox PROFILE="quick":
-    ./scripts/measure-perf.sh hvf-mailbox {{PROFILE}}
+    {{_admit}} {{_xtask}} host-lease --mode gate --check-load -- env -u CARRICK_SIGNED_FUNCTIONAL ./scripts/measure-perf.sh hvf-mailbox {{PROFILE}}
 
 # --- Linux / KVM aarch64 MVP (spec: hal-seam-kvm-mvp) ----------------------
 

@@ -41,6 +41,7 @@ fn broker(
     let mut child = Command::new(XTASK)
         .args(["host-lease", "broker", "--lock-path"])
         .arg(path)
+        .env("CARRICK_HOST_LEASE_FUNCTIONAL_LIMIT", "2")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -63,15 +64,15 @@ fn broker_two_clients_contend_then_proceed_for_every_exclusive_pair() {
             let lock = temp.path().join("lease.lock");
             std::fs::File::create(&lock).unwrap();
             let (mut first, mut first_out) = broker(&lock, held, 5000);
-            assert_eq!(line(&mut first_out), "acquired\n");
+            assert_eq!(line(&mut first_out), "acquired 1\n");
             let (second, mut second_out) = broker(&lock, requested, 5000);
             if held == "carrick" && requested == "carrick" {
-                assert_eq!(line(&mut second_out), "acquired\n");
+                assert_eq!(line(&mut second_out), "acquired 2\n");
             } else {
                 assert_eq!(line(&mut second_out), "waiting\n");
                 drop(first.0.stdin.take());
                 assert!(first.0.wait().unwrap().success());
-                assert_eq!(line(&mut second_out), "acquired\n");
+                assert_eq!(line(&mut second_out), "acquired 1\n");
             }
             drop(second);
         }
@@ -84,12 +85,12 @@ fn broker_killed_holder_releases_to_waiting_client() {
     let lock = temp.path().join("lease.lock");
     std::fs::File::create(&lock).unwrap();
     let (mut first, mut first_out) = broker(&lock, "gate", 5000);
-    assert_eq!(line(&mut first_out), "acquired\n");
+    assert_eq!(line(&mut first_out), "acquired 1\n");
     let (_second, mut second_out) = broker(&lock, "docker", 5000);
     assert_eq!(line(&mut second_out), "waiting\n");
     first.0.kill().unwrap();
     first.0.wait().unwrap();
-    assert_eq!(line(&mut second_out), "acquired\n");
+    assert_eq!(line(&mut second_out), "acquired 1\n");
 }
 
 #[test]
@@ -98,7 +99,7 @@ fn broker_contention_expires_explicitly_and_disconnected_waiter_exits() {
     let lock = temp.path().join("lease.lock");
     std::fs::File::create(&lock).unwrap();
     let (_first, mut first_out) = broker(&lock, "gate", 5000);
-    assert_eq!(line(&mut first_out), "acquired\n");
+    assert_eq!(line(&mut first_out), "acquired 1\n");
     let (mut second, mut second_out) = broker(&lock, "docker", 0);
     assert_eq!(line(&mut second_out), "waiting\n");
     assert_eq!(line(&mut second_out), "timeout\n");
@@ -305,7 +306,7 @@ fn broker_and_in_process_controller_contend_on_one_inode_without_chmod() {
     let (_client, mut output) = broker(lock.path(), "docker", 5000);
     assert_eq!(line(&mut output), "waiting\n");
     drop(lease);
-    assert_eq!(line(&mut output), "acquired\n");
+    assert_eq!(line(&mut output), "acquired 1\n");
     assert_eq!(
         std::fs::metadata(lock.path()).unwrap().permissions().mode() & 0o777,
         0o660
@@ -382,4 +383,33 @@ fn broker_ssh_custody_runs_in_isolated_session() {
         broker_sid, broker_pid,
         "broker ssh transport is not its own session leader"
     );
+}
+
+#[test]
+fn functional_capacity_and_waiting_gate_prevent_new_admissions() {
+    let temp = tempfile::tempdir().unwrap();
+    let lock = temp.path().join("lease.lock");
+    std::fs::File::create(&lock).unwrap();
+    let (mut first, mut first_out) = broker(&lock, "functional", 5000);
+    assert_eq!(line(&mut first_out), "acquired 1\n");
+    let (mut second, mut second_out) = broker(&lock, "functional", 5000);
+    assert_eq!(line(&mut second_out), "acquired 2\n");
+    let (mut third, mut third_out) = broker(&lock, "functional", 5000);
+    assert_eq!(line(&mut third_out), "waiting\n");
+    let (mut gate, mut gate_out) = broker(&lock, "gate", 5000);
+    assert_eq!(line(&mut gate_out), "waiting\n");
+    drop(first.0.stdin.take());
+    assert!(first.0.wait().unwrap().success());
+    // With a free slot, the queued gate must still block a fresh functional run.
+    let (_fresh, mut fresh_out) = broker(&lock, "functional", 0);
+    assert_eq!(line(&mut fresh_out), "waiting\n");
+    assert_eq!(line(&mut fresh_out), "timeout\n");
+    drop(second.0.stdin.take());
+    assert!(second.0.wait().unwrap().success());
+    assert_eq!(line(&mut gate_out), "acquired 1\n");
+    drop(gate.0.stdin.take());
+    assert!(gate.0.wait().unwrap().success());
+    assert_eq!(line(&mut third_out), "acquired 1\n");
+    drop(third.0.stdin.take());
+    assert!(third.0.wait().unwrap().success());
 }

@@ -7,6 +7,7 @@
 # Usage: scripts/measure-perf.sh [quick|full]          (default: quick)
 #        scripts/measure-perf.sh hvf-mailbox [quick|full]
 set -euo pipefail
+unset CARRICK_SIGNED_FUNCTIONAL
 cd "$(dirname "$0")/.."
 mode="perf"
 if [[ "${1:-}" == "hvf-mailbox" ]]; then

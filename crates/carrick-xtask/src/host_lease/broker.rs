@@ -49,6 +49,43 @@ impl ConfigSource {
         Self::NoBroker
     }
 
+    pub(super) fn functional_limit(&self) -> io::Result<usize> {
+        let text = match self {
+            Self::OptionalFile(path) => match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error),
+            },
+            Self::RequiredFile(path) => std::fs::read_to_string(path)?,
+            #[cfg(test)]
+            Self::NoBroker => String::new(),
+        };
+        let table: toml::Table = toml::from_str(&text)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let configured = table
+            .get("functional_limit")
+            .map(|value| {
+                value
+                    .as_integer()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| io::Error::other("functional_limit must be a positive integer"))
+            })
+            .transpose()?
+            .unwrap_or(3);
+        match std::env::var("CARRICK_HOST_LEASE_FUNCTIONAL_LIMIT") {
+            Ok(value) => value
+                .parse::<usize>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    io::Error::other("CARRICK_HOST_LEASE_FUNCTIONAL_LIMIT must be positive")
+                }),
+            Err(std::env::VarError::NotPresent) => Ok(configured),
+            Err(error) => Err(io::Error::other(error)),
+        }
+    }
+
     pub(super) fn load(&self) -> io::Result<Option<Config>> {
         let path = match self {
             Self::OptionalFile(path) | Self::RequiredFile(path) => path,
@@ -65,7 +102,13 @@ impl ConfigSource {
             }
             Err(error) => return Err(error),
         };
-        Config::parse(&text).map(Some)
+        let mut document: toml::Table = toml::from_str(&text)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        document.remove("functional_limit");
+        if document.is_empty() {
+            return Ok(None);
+        }
+        Config::parse(&toml::to_string(&document).map_err(io::Error::other)?).map(Some)
     }
 }
 
@@ -271,9 +314,9 @@ pub fn run(args: BrokerArgs) -> Result<(), HostLeaseError> {
                 .map_err(HostLeaseError::ChildWait)?;
             output.flush().map_err(HostLeaseError::ChildWait)?;
         }
-        let _lease = lease?;
+        let lease = lease?;
         output
-            .write_all(b"acquired\n")
+            .write_all(format!("acquired {}\n", lease.concurrent_holders).as_bytes())
             .map_err(HostLeaseError::ChildWait)?;
         output.flush().map_err(HostLeaseError::ChildWait)?;
         let mut byte = [0];
@@ -289,6 +332,7 @@ pub fn run(args: BrokerArgs) -> Result<(), HostLeaseError> {
 }
 
 pub(super) struct Session {
+    pub(super) concurrent_holders: usize,
     child: Child,
     input: Option<ChildStdin>,
     output: ChildStdout,
@@ -319,6 +363,7 @@ impl Session {
             .take()
             .ok_or_else(|| HostLeaseError::ChildWait(io::Error::other("broker stdout")))?;
         let mut session = Self {
+            concurrent_holders: 1,
             child,
             input: Some(input),
             output,
@@ -358,7 +403,18 @@ impl Session {
                 Err(error) => return Err(HostLeaseError::ChildWait(error)),
             };
             match reply.as_slice() {
-                b"acquired" => break,
+                message if message.starts_with(b"acquired ") => {
+                    session.concurrent_holders = std::str::from_utf8(&message[9..])
+                        .map_err(|error| HostLeaseError::ChildWait(io::Error::other(error)))?
+                        .parse()
+                        .map_err(|error| HostLeaseError::ChildWait(io::Error::other(error)))?;
+                    if session.concurrent_holders == 0 {
+                        return Err(HostLeaseError::ChildWait(io::Error::other(
+                            "empty broker population",
+                        )));
+                    }
+                    break;
+                }
                 b"waiting" => {
                     waiting_since.get_or_insert_with(Instant::now);
                     eprintln!(
@@ -381,7 +437,10 @@ impl Session {
                 }
             }
         }
-        eprintln!("host-lease: acquired {mode} at {}", config.broker);
+        eprintln!(
+            "host-lease: acquired {mode} at {} concurrent_holders={}",
+            config.broker, session.concurrent_holders
+        );
         Ok(session)
     }
 

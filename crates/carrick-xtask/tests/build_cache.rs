@@ -435,13 +435,13 @@ fn lease_and_worktree_children_have_identical_cargo_environments() {
 }
 
 #[test]
-fn signed_gate_recipes_remove_ambient_target_overrides() {
+fn signed_gate_recipes_remove_ambient_target_and_functional_overrides() {
     let build = Build::new();
     symlink(find("env"), build.root.path().join("bin/env")).unwrap();
     let runner = build.root.path().join("scripts/test-signed.sh");
     fs::write(
         &runner,
-        "#!/bin/sh\ntest \"${CARRICK_TEST_TARGET+x}\" != x\n",
+        "#!/bin/sh\ntest \"${CARRICK_TEST_TARGET+x}\" != x && test \"${CARRICK_SIGNED_FUNCTIONAL+x}\" != x\n",
     )
     .unwrap();
     fs::set_permissions(&runner, fs::Permissions::from_mode(0o755)).unwrap();
@@ -456,6 +456,7 @@ fn signed_gate_recipes_remove_ambient_target_overrides() {
                 .command("--no-deps")
                 .arg(recipe)
                 .env("CARRICK_TEST_TARGET", "accidentally_exported")
+                .env("CARRICK_SIGNED_FUNCTIONAL", "1")
                 .output()
                 .unwrap(),
         );
@@ -572,4 +573,62 @@ artifact-package-env-witness:
         "leaked-package-metadata"
     );
     passed(run(false));
+}
+
+#[test]
+fn timing_recipes_take_checkout_before_gate_and_clear_functional() {
+    let build = Build::new();
+    symlink(find("env"), build.root.path().join("bin/env")).unwrap();
+    let artifact = build.root.path().join("xtask");
+    fs::write(
+        &artifact,
+        r#"#!/bin/sh
+case "$1" in
+worktree-run)
+    test "${LEASE_ORDER:-}" = "" || exit 20
+    export LEASE_ORDER=checkout
+    shift 2
+    exec "$@"
+    ;;
+host-lease)
+    test "${LEASE_ORDER:-}" = checkout || exit 21
+    test "$2 $3 $4 $5" = "--mode gate --check-load --" || exit 22
+    export LEASE_ORDER=gate
+    shift 5
+    exec "$@"
+    ;;
+*) exit 23 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o755)).unwrap();
+    let witness = r#"#!/bin/sh
+test "${LEASE_ORDER:-}" = gate || exit 24
+test "${CARRICK_SIGNED_FUNCTIONAL+x}" != x || exit 25
+"#;
+    let cargo = build.root.path().join("bin/cargo");
+    fs::remove_file(&cargo).unwrap();
+    fs::write(&cargo, witness).unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let perf = build.root.path().join("scripts/measure-perf.sh");
+    fs::write(&perf, witness).unwrap();
+    fs::set_permissions(&perf, fs::Permissions::from_mode(0o755)).unwrap();
+    for recipe in [
+        "conformance",
+        "conformance-quick",
+        "bench",
+        "bench-hvf-mailbox",
+    ] {
+        passed(
+            build
+                .command("--no-deps")
+                .arg(recipe)
+                .env("CARRICK_XTASK_BIN", &artifact)
+                .env("CARRICK_SIGNED_FUNCTIONAL", "1")
+                .env_remove("LEASE_ORDER")
+                .output()
+                .unwrap(),
+        );
+    }
 }

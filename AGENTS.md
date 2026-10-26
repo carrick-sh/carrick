@@ -139,7 +139,18 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   Two-phase gate; `carrick‖carrick`/`docker‖docker` OK.
 - **Machine quietness:** `just accept` holds the host lease in exclusive `gate`
   mode for its entire host/signed run; `scripts/test-signed.sh` holds shared
-  `carrick` mode through build, signing, execution and scoped cleanup. Host
+  `carrick` mode through build, signing, execution and scoped cleanup.
+  Owner decision [#231](https://github.com/carrick-sh/carrick/issues/231) /
+  [#879](https://github.com/carrick-sh/carrick/issues/879) permits explicitly
+  non-timing signed runs to set `CARRICK_SIGNED_FUNCTIONAL=1` for `functional`
+  mode: at most three functional holders by default, configurable with
+  `functional_limit` in `/etc/carrick/host-lease.toml` (or
+  `CARRICK_HOST_LEASE_CONFIG`) and `CARRICK_HOST_LEASE_FUNCTIONAL_LIMIT`.
+  Functional and shared carrick holders may coexist; gate/Docker exclude both
+  and pending exclusive requests block new shared admissions. Acceptance,
+  conformance and perf recipes clear the override and retain exclusive custody.
+  Receipts record actual mode and total holder count at admission; this
+  snapshot is not timing evidence. Functional custody cannot upgrade. Host
   tests/compilation compete for CPU and memory too. Both refuse `yes`, `stress`
   and `stress-ng`, reporting PIDs and parent commands. Deliberate load requires
   `CARRICK_ALLOW_LOAD=1`; logs record detected load and acceptance receipts

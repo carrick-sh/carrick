@@ -114,3 +114,42 @@ of cleanup privilege, descriptor closure, reparenting and PID reuse. If all
 holders die, kernel flock cannot remain held: stronger recovery needs durable
 admission state checked by every participant, including Docker, before work.
 Privileged containment/service installation is a separate reviewed change.
+
+## Functional admission (#879, owner decision #231)
+
+Callers may declare a signed correctness run non-timing with
+`CARRICK_SIGNED_FUNCTIONAL=1 scripts/test-signed.sh ...`. The default remains
+shared `carrick`. Functional holders may coexist with carrick holders; the
+functional cap does not constrain existing carrick concurrency. Acceptance,
+conformance and perf recipes clear the opt-in and use exclusive gate custody.
+
+Set `functional_limit = 3` in the existing host configuration file
+(`/etc/carrick/host-lease.toml`, overridden by `CARRICK_HOST_LEASE_CONFIG`).
+A local-only file needs no broker fields.
+`CARRICK_HOST_LEASE_FUNCTIONAL_LIMIT` overrides that positive integer. Every
+participant on a host must use the same capacity and lock path; do not change
+capacity while leases are live. Broker admission uses the server's capacity.
+This does not restore the retired physical-host broker configuration.
+
+Lock order remains checkout admission, then host lease, then build/test work.
+Within local admission, an exclusive waiter first publishes shared writer
+intent, then holds the admission turnstile exclusively while draining the
+primary lock. New shared callers require exclusive access to the intent file,
+so a stream of functional runs cannot bypass a waiting gate. All contention
+uses the existing single one-hour deadline, including cancellation observation.
+Functional slot and population selection occurs under a short selection lock.
+No shared or functional holder may upgrade; nested gate custody is validated
+and reused without downgrading.
+
+Persistent sidecars beside the primary lock hold writer intent, admission,
+selection high-water metadata and numbered functional/population flock slots.
+Never unlink these files while participants can run. The population high-water
+mark is only a scan bound: live locks, rather than stored PIDs or counters,
+determine occupancy. Logs and signed receipt headers report mode and total
+concurrent holders at admission (including the new holder), not a peak or
+duration-weighted population. Nested work retains its outer admission snapshot.
+
+On macOS both the supervisor and guardian retain every custody descriptor:
+primary exclusion, functional slot, population slot, and exclusive writer
+intent where applicable. Workloads inherit none. The existing cleanup deadline
+and containment limits above continue to apply.

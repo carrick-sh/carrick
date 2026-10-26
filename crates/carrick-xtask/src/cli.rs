@@ -179,7 +179,7 @@ pub struct HostLeaseArgs {
     #[arg(
         long,
         value_enum,
-        help = "Lock mode: carrick (shared), gate or docker (exclusive)"
+        help = "Lock mode: carrick (shared), functional (bounded shared), gate or docker (exclusive)"
     )]
     pub mode: Option<crate::host_lease::HostLeaseMode>,
 

@@ -1043,8 +1043,8 @@ mod serial_host {
 pub struct GuardianArgs {
     #[arg(long)]
     owner: libc::pid_t,
-    #[arg(long)]
-    custody: libc::c_int,
+    #[arg(long, required = true)]
+    custody: Vec<libc::c_int>,
     #[arg(long)]
     lifetime: libc::c_int,
     #[arg(long)]
@@ -1068,18 +1068,25 @@ impl Guardian {
         command
             .args(["lease-guardian", "--owner"])
             .arg(std::process::id().to_string())
-            .arg("--custody")
-            .arg(custody.as_raw_fd().to_string())
             .arg("--lifetime")
             .arg(lifetime.as_raw_fd().to_string())
             .arg("--control")
             .arg(peer.as_raw_fd().to_string())
             .process_group(0);
+        for descriptor in &custody {
+            command
+                .arg("--custody")
+                .arg(descriptor.as_raw_fd().to_string());
+        }
         // Only the trusted guardian receives custody; workload commands never
-        // inherit this fd. All three copies close on exec in the supervisor.
+        // inherit these fds. Supervisor copies retain CLOEXEC.
         unsafe {
             command.pre_exec(move || {
-                for fd in [custody.as_raw_fd(), lifetime.as_raw_fd(), peer.as_raw_fd()] {
+                for fd in custody
+                    .iter()
+                    .map(AsRawFd::as_raw_fd)
+                    .chain([lifetime.as_raw_fd(), peer.as_raw_fd()])
+                {
                     if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
                         return Err(io::Error::last_os_error());
                     }
@@ -1145,10 +1152,19 @@ pub fn run_guardian(args: GuardianArgs) -> Result<i32, HostLeaseError> {
     use std::io::Write;
     // These owned descriptors are handed only by the supervisor's pre_exec.
     // The guardian never spawns a workload or exposes custody to commands.
-    let _custody = unsafe { OwnedFd::from_raw_fd(args.custody) };
+    let _custody: Vec<_> = args
+        .custody
+        .iter()
+        .map(|fd| unsafe { OwnedFd::from_raw_fd(*fd) })
+        .collect();
     let mut lifetime = unsafe { std::fs::File::from_raw_fd(args.lifetime) };
     let mut control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(args.control) };
-    for fd in [args.custody, args.lifetime, args.control] {
+    for fd in args
+        .custody
+        .iter()
+        .copied()
+        .chain([args.lifetime, args.control])
+    {
         if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
             return Err(HostLeaseError::ChildWait(io::Error::last_os_error()));
         }

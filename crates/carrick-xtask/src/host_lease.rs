@@ -27,6 +27,7 @@ const VALIDATION_LIMIT: Duration = Duration::from_secs(5);
 #[serde(rename_all = "kebab-case")]
 pub enum HostLeaseMode {
     Carrick,
+    Functional,
     Docker,
     Gate,
 }
@@ -34,6 +35,7 @@ pub enum HostLeaseMode {
 impl fmt::Display for HostLeaseMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Functional => write!(f, "functional"),
             Self::Carrick => write!(f, "carrick"),
             Self::Docker => write!(f, "docker"),
             Self::Gate => write!(f, "gate"),
@@ -87,6 +89,7 @@ pub struct HostLease {
     socket: PathBuf,
     path: PathBuf,
     mode: HostLeaseMode,
+    concurrent_holders: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -95,6 +98,7 @@ struct LeaseIdentity {
     ino: u64,
     mode: HostLeaseMode,
     scope: Option<ScopeIdentity>,
+    concurrent_holders: usize,
     #[serde(default)]
     broker: Option<broker::Config>,
 }
@@ -138,7 +142,10 @@ struct LeaseHolder {
 }
 
 enum LeaseCustody {
-    Local(OwnedFileLock),
+    Local {
+        primary: OwnedFileLock,
+        _auxiliary: Vec<OwnedFileLock>,
+    },
     Broker(broker::Session),
 }
 
@@ -238,6 +245,133 @@ fn read_validation_identity_until(
     }
 }
 
+// Sidecars are persistent kernel-lock identities, never unlinked. The writer
+// turnstile closes admissions while an exclusive holder waits for main custody.
+fn sidecar(path: &Path, suffix: &str) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o666)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(name)?;
+    // Same multi-user policy as the primary host lock.
+    unsafe {
+        libc::fchmod(file.as_raw_fd(), 0o666);
+    }
+    Ok(file)
+}
+
+fn try_lock(file: std::fs::File, operation: libc::c_int) -> io::Result<Option<OwnedFileLock>> {
+    if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
+        return Ok(Some(OwnedFileLock::from_locked(file)));
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EWOULDBLOCK) | Some(libc::EINTR)
+    ) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+type Admission = (OwnedFileLock, Vec<OwnedFileLock>, usize);
+
+fn admission_try(
+    path: &Path,
+    mode: HostLeaseMode,
+    capacity: usize,
+) -> io::Result<Option<Admission>> {
+    let exclusive = matches!(mode, HostLeaseMode::Gate | HostLeaseMode::Docker);
+    let _reader_intent = if exclusive {
+        None
+    } else {
+        let Some(intent) = try_lock(sidecar(path, ".writers")?, libc::LOCK_EX)? else {
+            return Ok(None);
+        };
+        Some(intent)
+    };
+    let Some(turn) = try_lock(
+        sidecar(path, ".admission")?,
+        if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    if exclusive {
+        return Ok(Some((turn, Vec::new(), 1)));
+    }
+    // This mutex protects both slot selection and the population high-water
+    // mark. Slots remain kernel-owned custody; a crash leaves no stale count.
+    let Some(mut selection) = try_lock(sidecar(path, ".selection")?, libc::LOCK_EX)? else {
+        return Ok(None);
+    };
+    let mut locks = Vec::new();
+    if mode == HostLeaseMode::Functional {
+        let mut selected = None;
+        for index in 0..capacity {
+            if let Some(slot) = try_lock(
+                sidecar(path, &format!(".functional-{index}"))?,
+                libc::LOCK_EX,
+            )? {
+                selected = Some(slot);
+                break;
+            }
+        }
+        let Some(slot) = selected else {
+            return Ok(None);
+        };
+        locks.push(slot);
+    }
+    // Carrick remains unbounded and may coexist with functional. A separate
+    // population slot gives both modes an honest concurrent-holder snapshot.
+    use std::io::{Read, Seek, SeekFrom};
+    let mut text = String::new();
+    selection.read_to_string(&mut text)?;
+    let high_water = if text.is_empty() {
+        0
+    } else {
+        text.parse::<usize>().map_err(io::Error::other)?
+    };
+    let mut selected = None;
+    let mut occupied = 0;
+    for index in 0..high_water {
+        match try_lock(
+            sidecar(path, &format!(".population-{index}"))?,
+            libc::LOCK_EX,
+        )? {
+            Some(slot) if selected.is_none() => selected = Some(slot),
+            Some(_) => {}
+            None => occupied += 1,
+        }
+    }
+    if selected.is_none() {
+        selected = try_lock(
+            sidecar(path, &format!(".population-{high_water}"))?,
+            libc::LOCK_EX,
+        )?;
+        if selected.is_none() {
+            return Err(io::Error::other("unpublished population slot is locked"));
+        }
+        selection.seek(SeekFrom::Start(0))?;
+        write!(selection, "{}", high_water + 1)?;
+        let length = selection.stream_position()?;
+        selection.set_len(length)?;
+    }
+    locks.push(selected.ok_or_else(|| io::Error::other("missing population custody"))?);
+    Ok(Some((turn, locks, occupied + 1)))
+}
+
 impl HostLease {
     /// Claim an idle host directly, without waiting or inherited admission.
     pub fn try_exclusive(path: &Path) -> Result<Option<Self>, HostLeaseError> {
@@ -295,12 +429,16 @@ impl HostLease {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn guardian_custody(&mut self) -> io::Result<OwnedFd> {
+    pub(crate) fn guardian_custody(&mut self) -> io::Result<Vec<OwnedFd>> {
         let holder = self
             ._holder
             .as_mut()
             .ok_or_else(|| io::Error::other("supervisor must own lease"))?;
-        let LeaseCustody::Local(fd) = &mut holder.custody else {
+        let LeaseCustody::Local {
+            primary: fd,
+            _auxiliary: auxiliary,
+        } = &mut holder.custody
+        else {
             return Err(io::Error::other(
                 "remote broker custody is only supported on Linux",
             ));
@@ -309,7 +447,12 @@ impl HostLease {
         // Neither cooperating holder may explicitly unlock the shared file
         // description: release is the last close after workload cleanup.
         fd.retain_until_last_close();
-        Ok(duplicate.into())
+        let mut descriptors = vec![duplicate.into()];
+        for lock in auxiliary {
+            descriptors.push(lock.try_clone()?.into());
+            lock.retain_until_last_close();
+        }
+        Ok(descriptors)
     }
 
     pub(crate) fn acquire_supervised(
@@ -353,12 +496,14 @@ impl HostLease {
             ));
         }
         let session = broker::Session::connect(&config, mode, limit, wait)?;
+        let concurrent_holders = session.concurrent_holders;
         Self::serve_custody(
             Path::new(broker::LOCK_PATH),
             mode,
             LeaseCustody::Broker(session),
             scope,
             Some(config),
+            concurrent_holders,
         )
         .map_err(HostLeaseError::ChildWait)
     }
@@ -447,18 +592,52 @@ impl HostLease {
         fd: OwnedFd,
     ) -> Result<Self, HostLeaseError> {
         let op = match mode {
-            HostLeaseMode::Carrick => libc::LOCK_SH,
+            HostLeaseMode::Carrick | HostLeaseMode::Functional => libc::LOCK_SH,
             HostLeaseMode::Docker | HostLeaseMode::Gate => libc::LOCK_EX,
         };
 
         let start = Instant::now();
+        let capacity = broker::ConfigSource::entry_point()
+            .functional_limit()
+            .map_err(HostLeaseError::ChildWait)?;
+        let writer = matches!(mode, HostLeaseMode::Gate | HostLeaseMode::Docker);
+        let mut writer_intent = None;
         let mut waited = false;
+        let mut admission = None;
+        let mut auxiliary = Vec::new();
+        let mut concurrent_holders = 1;
         loop {
+            if writer && writer_intent.is_none() {
+                writer_intent = try_lock(
+                    sidecar(path, ".writers").map_err(HostLeaseError::ChildWait)?,
+                    libc::LOCK_SH,
+                )
+                .map_err(HostLeaseError::ChildWait)?;
+            }
+            if admission.is_none()
+                && (!writer || writer_intent.is_some())
+                && let Some((turn, locks, count)) =
+                    admission_try(path, mode, capacity).map_err(|source| HostLeaseError::Io {
+                        path: path.into(),
+                        source,
+                    })?
+            {
+                admission = Some(turn);
+                auxiliary = locks;
+                concurrent_holders = count;
+            }
+
             // SAFETY: fd is a valid open file descriptor.
-            if unsafe { libc::flock(fd.as_raw_fd(), op | libc::LOCK_NB) } == 0 {
+            if admission.is_some()
+                && unsafe { libc::flock(fd.as_raw_fd(), op | libc::LOCK_NB) } == 0
+            {
                 break;
             }
-            let err = io::Error::last_os_error();
+            let err = if admission.is_none() {
+                io::Error::from_raw_os_error(libc::EWOULDBLOCK)
+            } else {
+                io::Error::last_os_error()
+            };
             if !matches!(
                 err.raw_os_error(),
                 Some(libc::EINTR) | Some(libc::EWOULDBLOCK)
@@ -467,6 +646,10 @@ impl HostLease {
                     path: path.to_path_buf(),
                     source: err,
                 });
+            }
+            if matches!(mode, HostLeaseMode::Carrick | HostLeaseMode::Functional) {
+                admission = None;
+                auxiliary.clear();
             }
             if !waited {
                 eprintln!(
@@ -497,22 +680,33 @@ impl HostLease {
                 });
             }
         }
-        eprintln!("host-lease: acquired {mode} at {}", path.display());
+        // Exclusive waiters hold admission until the main lock is acquired.
+        // Shared custody retains slots; exclusive custody retains writer intent.
+        drop(admission);
+        if let Some(intent) = writer_intent {
+            auxiliary.push(intent);
+        }
+        eprintln!(
+            "host-lease: acquired {mode} at {} concurrent_holders={concurrent_holders}",
+            path.display()
+        );
 
         let fd = OwnedFileLock::from_locked(std::fs::File::from(fd));
-        Self::serve(path, mode, fd, scope).map_err(|source| HostLeaseError::Io {
+        Self::serve_custody(
+            path,
+            mode,
+            LeaseCustody::Local {
+                primary: fd,
+                _auxiliary: auxiliary,
+            },
+            scope,
+            None,
+            concurrent_holders,
+        )
+        .map_err(|source| HostLeaseError::Io {
             path: path.to_path_buf(),
             source,
         })
-    }
-
-    fn serve(
-        path: &Path,
-        mode: HostLeaseMode,
-        fd: OwnedFileLock,
-        scope: Option<ScopeIdentity>,
-    ) -> io::Result<Self> {
-        Self::serve_custody(path, mode, LeaseCustody::Local(fd), scope, None)
     }
 
     fn serve_custody(
@@ -521,6 +715,7 @@ impl HostLease {
         custody: LeaseCustody,
         scope: Option<ScopeIdentity>,
         broker: Option<broker::Config>,
+        concurrent_holders: usize,
     ) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         // Keep AF_UNIX names short even when the checkout/TMPDIR is long.
@@ -532,7 +727,7 @@ impl HostLease {
         let socket = directory.path().join("lease.sock");
         let listener = UnixListener::bind(&socket)?;
         let (dev, ino) = match &custody {
-            LeaseCustody::Local(fd) => {
+            LeaseCustody::Local { primary: fd, .. } => {
                 let metadata = fd.metadata()?;
                 (metadata.dev(), metadata.ino())
             }
@@ -543,6 +738,7 @@ impl HostLease {
             ino,
             mode,
             scope,
+            concurrent_holders,
             broker,
         })?;
         let stopping = Arc::new(AtomicBool::new(false));
@@ -576,6 +772,7 @@ impl HostLease {
             socket,
             path: path.to_path_buf(),
             mode,
+            concurrent_holders,
         })
     }
 
@@ -586,7 +783,11 @@ impl HostLease {
         crate::command::sanitize_cargo_package_env(command);
         command
             .env_remove("CARRICK_HOST_LEASE_FD")
-            .env_remove("CARRICK_HOST_LEASE_MODE")
+            .env("CARRICK_HOST_LEASE_MODE", self.mode.to_string())
+            .env(
+                "CARRICK_HOST_LEASE_CONCURRENT_HOLDERS",
+                self.concurrent_holders.to_string(),
+            )
             .env(INHERITED_SOCKET, &self.socket);
         if self.connection_fd().is_none() && self._holder.is_some() {
             command.env("CARRICK_HOST_LEASE_PATH", &self.path);
@@ -673,6 +874,7 @@ impl HostLease {
             socket: socket.to_path_buf(),
             path: path.to_path_buf(),
             mode: identity.mode,
+            concurrent_holders: identity.concurrent_holders,
         })
     }
 
@@ -682,7 +884,7 @@ impl HostLease {
 
     pub(crate) fn connection_fd(&self) -> Option<libc::c_int> {
         match &self._holder.as_ref()?.custody {
-            LeaseCustody::Local(_) => None,
+            LeaseCustody::Local { .. } => None,
             LeaseCustody::Broker(session) => Some(session.fd()),
         }
     }
@@ -690,7 +892,7 @@ impl HostLease {
     #[cfg(target_os = "linux")]
     pub(crate) fn connection_custody(&self) -> Option<(libc::pid_t, &AtomicBool)> {
         match &self._holder.as_ref()?.custody {
-            LeaseCustody::Local(_) => None,
+            LeaseCustody::Local { .. } => None,
             LeaseCustody::Broker(session) => Some(session.custody()),
         }
     }
@@ -813,6 +1015,7 @@ mod tests {
             dev: 1,
             ino: 2,
             mode: HostLeaseMode::Gate,
+            concurrent_holders: 1,
             scope: None,
             broker: None,
         };
@@ -1082,6 +1285,114 @@ mod tests {
                 temp.path(),
                 HostLeaseMode::Carrick,
                 other.path()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn functional_capacity_two_and_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("lease.toml");
+        std::fs::write(&config, "functional_limit = 2").unwrap();
+        let source = broker::ConfigSource::RequiredFile(config);
+        assert_eq!(source.functional_limit().unwrap(), 2);
+        assert!(source.load().unwrap().is_none());
+        let path = dir.path().join("lease.lock");
+        let first = admission_try(&path, HostLeaseMode::Functional, 2)
+            .unwrap()
+            .unwrap();
+        drop(first.0);
+        let second = admission_try(&path, HostLeaseMode::Functional, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.2, 2);
+        drop(second.0);
+        assert!(
+            admission_try(&path, HostLeaseMode::Functional, 2)
+                .unwrap()
+                .is_none()
+        );
+        drop(first.1);
+        assert!(
+            admission_try(&path, HostLeaseMode::Functional, 2)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn waiting_gate_blocks_new_readers_until_functional_drain() {
+        let temp = NamedTempFile::new().unwrap();
+        let first = HostLease::acquire_path(temp.path(), HostLeaseMode::Functional).unwrap();
+        let second = HostLease::acquire_path(temp.path(), HostLeaseMode::Functional).unwrap();
+        assert_eq!(second.concurrent_holders, 2);
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::sync_channel(1);
+        let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(1);
+        let path = temp.path().to_path_buf();
+        let gate = std::thread::spawn(move || {
+            let mut announced = false;
+            HostLease::acquire_path_with_wait(
+                &path,
+                HostLeaseMode::Gate,
+                Duration::from_secs(5),
+                None,
+                |_| {
+                    if !announced {
+                        waiting_tx.send(()).unwrap();
+                        continue_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        announced = true;
+                    }
+                    Ok(false)
+                },
+            )
+            .unwrap()
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        for mode in [HostLeaseMode::Functional, HostLeaseMode::Carrick] {
+            assert!(matches!(
+                HostLease::acquire_path_with_limit(temp.path(), mode, Duration::ZERO),
+                Err(HostLeaseError::Timeout { .. })
+            ));
+        }
+        drop(first);
+        assert!(matches!(
+            HostLease::acquire_path_with_limit(
+                temp.path(),
+                HostLeaseMode::Functional,
+                Duration::ZERO
+            ),
+            Err(HostLeaseError::Timeout { .. })
+        ));
+        drop(second);
+        continue_tx.send(()).unwrap();
+        let held = gate.join().unwrap();
+        assert_eq!(held.mode(), HostLeaseMode::Gate);
+        drop(held);
+        HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Functional, Duration::ZERO)
+            .unwrap();
+    }
+
+    #[test]
+    fn functional_cannot_upgrade_and_carrick_can_coexist() {
+        let temp = NamedTempFile::new().unwrap();
+        let functional = HostLease::acquire_path(temp.path(), HostLeaseMode::Functional).unwrap();
+        let _carrick = HostLease::acquire_path(temp.path(), HostLeaseMode::Carrick).unwrap();
+        assert!(
+            HostLease::inherit(
+                &broker::ConfigSource::NoBroker,
+                temp.path(),
+                HostLeaseMode::Gate,
+                &functional.socket
+            )
+            .is_err()
+        );
+        assert!(
+            HostLease::inherit(
+                &broker::ConfigSource::NoBroker,
+                temp.path(),
+                HostLeaseMode::Carrick,
+                &functional.socket
             )
             .is_err()
         );

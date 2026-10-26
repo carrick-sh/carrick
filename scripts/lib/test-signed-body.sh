@@ -60,12 +60,16 @@ if [ "$(uname -s)" != "Darwin" ]; then
     echo "test-signed: macOS/HVF only — the entitlement requirement does not exist on this host" >&2
     exit 1
 fi
+lease_mode=carrick
+if [ "${CARRICK_SIGNED_FUNCTIONAL:-}" = 1 ]; then
+    lease_mode=functional
+fi
 if [ -z "${CARRICK_HOST_LEASE_SOCKET:-}" ]; then
-    exec cargo --config "$CARRICK_CARGO_CACHE_CONFIG" run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- ./scripts/test-signed.sh "$@"
+    exec cargo --config "$CARRICK_CARGO_CACHE_CONFIG" run --locked -p carrick-xtask -- host-lease --mode "$lease_mode" --check-load -- ./scripts/test-signed.sh "$@"
 fi
 # Validate the supervised lease and check host load before any work. The runner
 # logs detected PIDs and parent commands even with CARRICK_ALLOW_LOAD=1.
-cargo run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- true
+cargo run --locked -p carrick-xtask -- host-lease --mode "$lease_mode" --check-load -- true
 
 pkg="${1:?usage: scripts/test-signed.sh <package> [libtest args...]}"
 shift
@@ -164,12 +168,14 @@ jq -nc \
     --arg source_head "$source_head" \
     --arg package "$pkg" \
     --arg run_id "$run_id" \
+    --arg lease_mode "$CARRICK_HOST_LEASE_MODE" \
+    --argjson concurrent_holders "$CARRICK_HOST_LEASE_CONCURRENT_HOLDERS" \
     --argjson arguments "$arguments_json" \
     --argjson requested_filter "$requested_filter_json" \
     --argjson enabled_features "$enabled_features_json" \
     --argjson test_target "$test_target_json" \
     ${contract_header_arg[@]+"${contract_header_arg[@]}"} \
-    "{schema:\$schema,record_type:\"header\",source_head:\$source_head,package:\$package,arguments:\$arguments,requested_test_filter:\$requested_filter,carrick_run_id:\$run_id,test_target:\$test_target,enabled_features:\$enabled_features$contract_header_entry}" \
+    "{schema:\$schema,record_type:\"header\",lease_mode:\$lease_mode,concurrent_holders:\$concurrent_holders,source_head:\$source_head,package:\$package,arguments:\$arguments,requested_test_filter:\$requested_filter,carrick_run_id:\$run_id,test_target:\$test_target,enabled_features:\$enabled_features$contract_header_entry}" \
     >"$receipt_tmp"
 scratch=()
 active_exe_run_id=""

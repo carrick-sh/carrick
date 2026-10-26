@@ -1209,6 +1209,7 @@ fn run_command_redirect(
     }
     // A focused local build override must never narrow an acceptance gate.
     cmd.env_remove("CARRICK_TEST_TARGET");
+    cmd.env_remove("CARRICK_SIGNED_FUNCTIONAL");
 
     let start = Instant::now();
     let mut child = cmd.spawn()?;
@@ -2191,8 +2192,8 @@ mod tests {
         let (status, _) = run_command_redirect(
             &lease,
             "sh",
-            &["-c", "test \"${CARRICK_TEST_TARGET+x}\" != x"],
-            &[("CARRICK_TEST_TARGET", "one_target")],
+            &["-c", "test \"${CARRICK_TEST_TARGET+x}\" != x && test \"${CARRICK_SIGNED_FUNCTIONAL+x}\" != x"],
+            &[("CARRICK_TEST_TARGET", "one_target"), ("CARRICK_SIGNED_FUNCTIONAL", "1")],
             dir.path(),
             &dir.path().join("log"),
         )
