@@ -832,6 +832,11 @@ enum PendingCloseOperation<'a> {
     Exec(PendingExecAdoption<'a>),
 }
 
+enum PendingCloseAdmission<'a> {
+    Exit(carrick_core::terminal::ProcessExitAdmission<'a, ThreadLifecyclePage>),
+    Exec(carrick_core::terminal::ProcessExecAdmission<'a, ThreadLifecyclePage>),
+}
+
 // Pool entries and the carrier's bounded record registry are the maximum
 // member population. A concurrent retirement may lower live() after the
 // snapshot without reducing the receipts Closing still owes.
@@ -1073,16 +1078,27 @@ impl<'a> PendingTable<'a> {
             _ => None,
         }
     }
-    fn remove_exec(&mut self, key: &TaskKey) -> Option<PendingExecAdoption<'a>> {
+    fn remove_settled_exec(
+        &mut self,
+        key: &TaskKey,
+        page: &ThreadLifecyclePage,
+    ) -> Option<(
+        PendingExecAdoption<'a>,
+        carrick_core::terminal::TerminalCustody<
+            carrick_core::terminal::Process,
+            carrick_core::terminal::Settled,
+        >,
+    )> {
+        let receipts = self.exit(key)?.completed_receipts(page)?;
         match self.take_row(&PendingKey::Exit(*key))? {
-            PendingState::Exit(pending) => match *pending {
-                PendingExit {
-                    operation: PendingCloseOperation::Exec(pending),
-                    ..
-                } => Some(pending),
-                _ => unreachable!(),
-            },
-            _ => unreachable!(),
+            PendingState::Exit(mut pending) => {
+                let custody = pending.custody.take()?.settle(page, receipts).ok()?;
+                match pending.operation {
+                    PendingCloseOperation::Exec(exec) => Some((exec, custody)),
+                    PendingCloseOperation::Exit { .. } => None,
+                }
+            }
+            _ => None,
         }
     }
     fn member(&self, record: &RecordRef) -> Option<&MemberWaitState<'a>> {
@@ -5046,10 +5062,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .resources_mut()
                     .interrupted_child_waits
                     .clear();
-                let admission = carrick_core::terminal::TerminalCustody::<
-                    carrick_core::terminal::Process,
-                    carrick_core::terminal::Live,
-                >::close_admission(page);
+                let admission = match &operation {
+                    PendingCloseOperation::Exit { .. } => {
+                        PendingCloseAdmission::Exit(carrick_core::terminal::TerminalCustody::<
+                            carrick_core::terminal::Process,
+                            carrick_core::terminal::Live,
+                        >::close_admission(page))
+                    }
+                    PendingCloseOperation::Exec(_) => {
+                        PendingCloseAdmission::Exec(carrick_core::terminal::TerminalCustody::<
+                            carrick_core::terminal::Process,
+                            carrick_core::terminal::Live,
+                        >::close_exec_admission(
+                            page
+                        ))
+                    }
+                };
                 // Already admitted sibling retirement still needs its own
                 // exact-record cancellation binding. Pre-live claims are
                 // refused by thread_spawned after this terminal close.
@@ -5228,22 +5256,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // drops preparation with admission still closed and no begun
                 // claim or caller live unit consumed.
                 let caller = retain_member_control(self.control)?;
-                let custody = match &operation {
-                    PendingCloseOperation::Exit { status, .. } => {
-                        carrick_core::terminal::TerminalCustody::<
-                            carrick_core::terminal::Process,
-                            carrick_core::terminal::Live,
-                        >::begin_exit(
-                            admission, self.key, address, status.to_termination_status()
-                        )
-                        .map_err(|_| NativeProcessError::Quarantined)?
-                    }
-                    PendingCloseOperation::Exec(_) => {
+                let custody = match (&operation, admission) {
+                    (
+                        PendingCloseOperation::Exit { status, .. },
+                        PendingCloseAdmission::Exit(admission),
+                    ) => carrick_core::terminal::TerminalCustody::<
+                        carrick_core::terminal::Process,
+                        carrick_core::terminal::Live,
+                    >::begin_exit(
+                        admission, self.key, address, status.to_termination_status()
+                    )
+                    .map_err(|_| NativeProcessError::Quarantined)?,
+                    (PendingCloseOperation::Exec(_), PendingCloseAdmission::Exec(admission)) => {
                         carrick_core::terminal::TerminalCustody::<
                             carrick_core::terminal::Process,
                             carrick_core::terminal::Live,
                         >::begin_exec(admission, self.key, address)
                     }
+                    _ => return Err(NativeProcessError::Quarantined),
                 };
                 let carrick_core::terminal::RetirementVerdict::CancelMembers { members, .. } =
                     custody.cancel_members(pool, bindings)

@@ -116,3 +116,27 @@ fn concurrent_publications_elect_one_wake_owner() {
         );
     });
 }
+
+#[test]
+fn terminal_upgrade_wins_over_exec_retraction() {
+    loom::model(|| {
+        let authority = Arc::new(CancellationAuthority::with_word(Word(AtomicU32::new(0))));
+        authority.publish(ProcessCancellation::Exec, thread::yield_now);
+        authority.consume();
+
+        let publisher = authority.clone();
+        let fatal = thread::spawn(move || {
+            publisher
+                .request(ProcessCancellation::FatalSignal)
+                .publish(thread::yield_now);
+        });
+        let _ = authority.retract_exec();
+        fatal.join().unwrap();
+
+        assert_eq!(
+            authority.published(),
+            Some(ProcessCancellation::FatalSignal)
+        );
+        assert!(ProcessEffect::acquire(&*authority).is_err());
+    });
+}

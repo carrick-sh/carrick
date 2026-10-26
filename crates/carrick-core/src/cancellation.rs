@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub enum ProcessCancellation {
     FatalSignal = 1,
     GroupExit = 2,
+    Exec = 3,
 }
 
 const CAUSE: u32 = 3;
@@ -69,6 +70,7 @@ impl<W: CancellationWord> CancellationAuthority<W> {
         match word & CAUSE {
             1 => Some(ProcessCancellation::FatalSignal),
             2 => Some(ProcessCancellation::GroupExit),
+            3 => Some(ProcessCancellation::Exec),
             _ => None,
         }
     }
@@ -89,15 +91,20 @@ impl<W: CancellationWord> CancellationAuthority<W> {
     pub fn request(&self, cause: ProcessCancellation) -> CancellationPublication<'_, W> {
         let mut word = self.0.load(Ordering::Acquire);
         loop {
-            if Self::cause(word).is_some() {
-                break;
-            }
-            match self.0.compare_exchange(
-                word,
-                word | cause as u32,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            let next = match Self::cause(word) {
+                // Exec is a temporary drain cause. A concurrent terminal
+                // request must replace it so successful exec cannot retract
+                // a fatal or group-exit decision.
+                Some(ProcessCancellation::Exec) if cause != ProcessCancellation::Exec => {
+                    (word & !CAUSE) | cause as u32
+                }
+                Some(_) => break,
+                None => word | cause as u32,
+            };
+            match self
+                .0
+                .compare_exchange(word, next, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => break,
                 Err(observed) => word = observed,
             }
@@ -112,6 +119,19 @@ impl<W: CancellationWord> CancellationAuthority<W> {
 
     pub(crate) fn consume(&self) {
         self.0.fetch_or(CONSUMED, Ordering::AcqRel);
+    }
+
+    /// Retract only the fully published and consumed temporary exec drain.
+    /// Terminal causes and any live admitted effect make this refuse.
+    pub(crate) fn retract_exec(&self) -> bool {
+        self.0
+            .compare_exchange(
+                ProcessCancellation::Exec as u32 | PUBLISHED | CONSUMED,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 

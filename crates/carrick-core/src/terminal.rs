@@ -125,9 +125,10 @@ impl ProcessExitCustody {
         }
     }
 
-    /// First fatal publication wins. Delivery reservation and dequeue have no
-    /// clearing operation on this authority. Consumption by terminal custody
-    /// retains the cause so every remaining member still observes cancellation.
+    /// First terminal publication wins. Delivery reservation and dequeue have
+    /// no clearing operation on this authority. Exec publishes a temporary
+    /// cause which a terminal request may upgrade and only settled exec custody
+    /// may retract; terminal consumption retains its cause for every member.
     pub fn publish_cancellation(&self, cause: ProcessCancellation) {
         self.cancellation.publish(cause, core::hint::spin_loop);
     }
@@ -258,6 +259,12 @@ where
 /// Closed birth admission, without a consumed caller membership or begun
 /// terminal claim. Dropping this preparation never reopens the gate.
 pub struct ProcessExitAdmission<'a, L: Lifecycle> {
+    page: &'a L,
+}
+
+/// Closed exec admission. Only this token can begin an exec-flavoured close;
+/// terminal admission uses [`ProcessExitAdmission`] and cannot be retracted.
+pub struct ProcessExecAdmission<'a, L: Lifecycle> {
     page: &'a L,
 }
 
@@ -646,12 +653,23 @@ impl TerminalCustody<Process, Live> {
     pub fn close_admission<L: Lifecycle>(page: &L) -> ProcessExitAdmission<'_, L> {
         page.process_exit_custody()
             .publish_cancellation(ProcessCancellation::GroupExit);
+        Self::close_gate_and_order_birth_snapshot(page);
+        ProcessExitAdmission { page }
+    }
+
+    pub fn close_exec_admission<L: Lifecycle>(page: &L) -> ProcessExecAdmission<'_, L> {
+        page.process_exit_custody()
+            .publish_cancellation(ProcessCancellation::Exec);
+        Self::close_gate_and_order_birth_snapshot(page);
+        ProcessExecAdmission { page }
+    }
+
+    fn close_gate_and_order_birth_snapshot(page: &impl Lifecycle) {
         page.close();
         // Pair with Kernel::thread_spawned's publication-before-gate check.
         // Order the gate store before the Acquire host-born snapshot loads,
         // including targets where Acquire may compile to an RCpc load.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        ProcessExitAdmission { page }
     }
 
     pub fn begin_exit<L: Lifecycle>(
@@ -686,11 +704,11 @@ impl TerminalCustody<Process, Live> {
     }
 
     pub fn begin_exec<L: Lifecycle>(
-        admission: ProcessExitAdmission<'_, L>,
+        admission: ProcessExecAdmission<'_, L>,
         task: TaskKey,
         address: AddressContext<RootGpa>,
     ) -> TerminalCustody<Process, Closing> {
-        let _page = admission.page;
+        admission.page.process_exit_custody().cancellation.consume();
         TerminalCustody {
             identity: ProcessTerminalIdentity::from_exec(task, address),
             phase: PhantomData,
@@ -833,6 +851,22 @@ impl TerminalCustody<Process, Closing> {
 impl TerminalCustody<Process, Settled> {
     pub fn identity(self) -> ProcessTerminalIdentity {
         self.identity
+    }
+
+    /// Successful exec is the sole nonterminal process close. Consuming its
+    /// settled custody proves the sibling drain completed before this exact
+    /// temporary cancellation is retracted. An upgraded terminal cause
+    /// refuses and remains irrevocable.
+    pub fn retract_exec_cancellation(
+        self,
+        page: &impl Lifecycle,
+    ) -> Result<ProcessTerminalIdentity, Self> {
+        if self.identity.disposition != ProcessCloseDisposition::Exec
+            || !page.process_exit_custody().cancellation.retract_exec()
+        {
+            return Err(self);
+        }
+        Ok(self.identity)
     }
 }
 
@@ -1037,9 +1071,13 @@ mod tests {
         };
         let service = NativeServiceClaim::acquire(&page).unwrap();
         let closing = TerminalCustody::<Process, Live>::begin_exec(
-            TerminalCustody::<Process, Live>::close_admission(&page),
+            TerminalCustody::<Process, Live>::close_exec_admission(&page),
             task,
             address,
+        );
+        assert_eq!(
+            page.terminal.cancellation(),
+            Some(ProcessCancellation::Exec)
         );
         let RetirementVerdict::CancelMembers { members, .. } =
             closing.cancel_members(Vec::new(), Vec::new())
@@ -1050,6 +1088,83 @@ mod tests {
         assert!(closing.can_settle(&page, &receipts));
         service.acknowledge(|_| ());
         assert!(!closing.can_settle(&page, &receipts));
+    }
+
+    #[test]
+    fn settled_exec_alone_retracts_its_temporary_cancellation() {
+        let page = Page {
+            terminal: ProcessExitCustody::new(),
+            gate: AtomicU32::new(0),
+            live: AtomicU32::new(1),
+        };
+        let task = TaskKey {
+            id: TaskId::from_registry_allocation(NonZeroI32::new(44).unwrap()),
+            serial: TaskSerial::from_raw_u64(14).unwrap(),
+        };
+        let address = AddressContext {
+            root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x13000)).unwrap(),
+            mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(4).unwrap()),
+            generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(5).unwrap()),
+        };
+        let service = NativeServiceClaim::acquire(&page).unwrap();
+        let closing = TerminalCustody::<Process, Live>::begin_exec(
+            TerminalCustody::<Process, Live>::close_exec_admission(&page),
+            task,
+            address,
+        );
+        let RetirementVerdict::CancelMembers { members, .. } =
+            closing.cancel_members(Vec::new(), Vec::new())
+        else {
+            panic!("exec close must own its member set");
+        };
+        let receipts = closing.observe_members(&page, &members, &[], &[]).unwrap();
+        let Ok(settled) = closing.settle(&page, receipts) else {
+            panic!("completed exec drain must settle");
+        };
+        service.acknowledge(|_| ());
+        assert!(settled.retract_exec_cancellation(&page).is_ok());
+        assert_eq!(page.terminal.cancellation(), None);
+    }
+
+    #[test]
+    fn terminal_upgrade_cannot_be_retracted_by_settled_exec() {
+        let page = Page {
+            terminal: ProcessExitCustody::new(),
+            gate: AtomicU32::new(0),
+            live: AtomicU32::new(1),
+        };
+        let task = TaskKey {
+            id: TaskId::from_registry_allocation(NonZeroI32::new(45).unwrap()),
+            serial: TaskSerial::from_raw_u64(15).unwrap(),
+        };
+        let address = AddressContext {
+            root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x14000)).unwrap(),
+            mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(6).unwrap()),
+            generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(7).unwrap()),
+        };
+        let service = NativeServiceClaim::acquire(&page).unwrap();
+        let closing = TerminalCustody::<Process, Live>::begin_exec(
+            TerminalCustody::<Process, Live>::close_exec_admission(&page),
+            task,
+            address,
+        );
+        let RetirementVerdict::CancelMembers { members, .. } =
+            closing.cancel_members(Vec::new(), Vec::new())
+        else {
+            panic!("exec close must own its member set");
+        };
+        let receipts = closing.observe_members(&page, &members, &[], &[]).unwrap();
+        let Ok(settled) = closing.settle(&page, receipts) else {
+            panic!("completed exec drain must settle");
+        };
+        service.acknowledge(|_| ());
+        page.terminal
+            .publish_cancellation(ProcessCancellation::FatalSignal);
+        assert!(settled.retract_exec_cancellation(&page).is_err());
+        assert_eq!(
+            page.terminal.cancellation(),
+            Some(ProcessCancellation::FatalSignal)
+        );
     }
 
     #[test]
