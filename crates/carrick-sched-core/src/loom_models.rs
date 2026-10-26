@@ -147,6 +147,9 @@ fn current_handback_preserves_birth_incarnation_for_mint() {
                     })
                     .unwrap();
                 let record = zone.record_ref(id);
+                // A host-owned thread switches in only on a slot whose
+                // executor has a task of its address space loaded.
+                zone.publish_slot(SLOT, 7, None, 0);
                 assert!(
                     zone.occupancy
                         .replace(occupancy::ExecutionSlot::zone(SLOT), 0, 7)

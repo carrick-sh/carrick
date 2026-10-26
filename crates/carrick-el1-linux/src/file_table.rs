@@ -1631,6 +1631,7 @@ mod tests {
 
     #[test]
     fn test_blocking_poll_releases_capacity_and_completes() {
+        const LOADED_MM: u64 = 0x5000;
         let (fd_map, open_table, object_table) = setup_tables();
         let file_table = 10;
         let slot = SlotId::new(0);
@@ -1646,7 +1647,7 @@ mod tests {
         let identity = ThreadIdentity {
             tid: 41,
             serial: 101,
-            mm: 0,
+            mm: LOADED_MM,
             file_table,
             generation: 1,
             affinity_source: carrick_sched_core::AffinitySource::UNBOUND,
@@ -1654,8 +1655,15 @@ mod tests {
             lifecycle_page: 0,
             control_slot: 0,
         };
+        // A host-owned waiter runs only on a slot whose executor has its
+        // task (and address space) loaded: an idle executor cannot take it.
         zone.drive(slot, 1);
-        zone.publish_slot(slot, 0, None, 0);
+        zone.publish_slot(slot, LOADED_MM, None, 0);
+        assert!(zone.occupancy.replace(
+            carrick_sched_core::ExecutionSlot::zone(slot),
+            0,
+            LOADED_MM
+        ));
         let guard = zone
             .lock(
                 ZoneTables::bucket_of(0, 0x1000),
