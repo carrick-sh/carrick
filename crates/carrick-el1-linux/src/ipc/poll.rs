@@ -7,8 +7,8 @@
 //! multi-object continuation owns all of its enrollments.
 
 use super::{
-    EL1_WAIT, IpcServed, IpcVenue, Parked, Sched, ThreadCpu, UserCopy, UserWord, finish, handback,
-    leave, mm_key, park, release_pin, snapshot, task_key,
+    EL1_WAIT, IpcServed, IpcVenue, ObjectLockWait, Parked, Sched, ThreadCpu, UserCopy, UserWord,
+    finish, handback, leave, mm_key, park, release_pin, snapshot, task_key,
 };
 use crate::file_table::PollFd;
 use carrick_el1_abi::IpcLeave;
@@ -252,7 +252,13 @@ fn readiness(
     native: NativeObject,
     events: i16,
 ) -> Result<i16, ()> {
-    let mut guard = region.lock(native.object(), &EL1_WAIT).map_err(|_| ())?;
+    // A host holder may be waiting for this very vCPU to stop. Refuse
+    // boundedly without changing scheduler custody; only EL1 holders can
+    // make progress while we remain in the guest.
+    let object = native.object();
+    let mut guard = region
+        .lock(object, &ObjectLockWait { region, object })
+        .map_err(|_| ())?;
     let ready = match native {
         NativeObject::Pipe(_, end) => guard.pipe().map_err(|_| ())?.readiness(end),
         NativeObject::EventFd(_) => guard.eventfd().map_err(|_| ())?.readiness(),
