@@ -6893,15 +6893,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         }
         let _ = self.pending_process_fork.take();
         carrick_hal::el1_editor_exclusion::with_held_exclusion(self.mm_generation, |license| {
-            let license = license.unwrap_or_else(|| {
-                carrick_fatal::carrick_fatal!(
-                    "aarch64::stage1",
-                    "descriptor commit lost its Editor exclusion"
-                )
-            });
+            let license = license.ok_or_else(|| {
+                TrapError::Hypervisor("descriptor commit lost its Editor exclusion".to_owned())
+            })?;
             self.page_tables.commit_undo(license);
-        });
-        Ok(())
+            Ok(())
+        })
     }
 
     fn rollback_process_fork(&mut self) -> Result<(), TrapError> {

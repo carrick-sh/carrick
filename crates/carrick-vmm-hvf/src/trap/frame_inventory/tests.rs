@@ -586,6 +586,24 @@ fn unpublished_carrier_mm_authority(
     }
 }
 
+fn retired_carrier_mm_authority(
+    key: (u64, u64),
+    frames: std::sync::Arc<parking_lot::Mutex<InventoryFrameRegistry>>,
+    unpublished: UnpublishedTaskStage1,
+) -> HvpatchCarrierMmAuthority {
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let identity = custody.carrier_stage2_records.lock()[&key];
+    unpublished.commit_publication();
+    HvpatchCarrierMmAuthority::PublicationTest {
+        stage2_logical_leases: carrier_stage2_logical_leases(custody, &[identity]),
+        custody: std::sync::Arc::downgrade(custody),
+        frames,
+        stage1_lifecycle: parking_lot::Mutex::new(CarrierMmStage1Lifecycle::Retired(
+            std::sync::Arc::new(test_whole_mm_stage1_proof()),
+        )),
+    }
+}
+
 fn retire_pending_carrier_lease(key: (u64, u64)) -> Result<(), TrapError> {
     let custody = legacy_test_carrier_vm_custody();
     let identity = take_carrier_stage2_record(custody, key.0, key.1).ok_or_else(|| {
@@ -5007,18 +5025,38 @@ fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
 
     let custody = legacy_test_carrier_vm_custody();
     let receipt = test_leaf_retirement_receipt(key.0);
-    HvfVmState::commit_inventory_lease_retirement(
+    let mut reservation = carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+        carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0xa9; 32]),
+        carrick_hal::FrameInventoryBatch::prepare(
+            carrick_hal::KernelTransactionId::from_kernel_allocation(id(0xa904)),
+            carrick_hal::FrameEventCapacity::for_event_count(retirement.event_count()).unwrap(),
+        )
+        .unwrap(),
+        Vec::new(),
+        Vec::new(),
+    );
+    HvfVmState::stage_inventory_lease_retirement(&mut reservation, &retirement).unwrap();
+    let inventory = parking_lot::Mutex::new(inventory);
+    HvfVmState::apply_inventory_lease_retirement(
         custody,
-        &mut inventory,
+        &inventory,
         &retirement,
         Stage1UnpublicationReceipt::EditorRange(&receipt),
+        reservation,
+        |_| Ok(()),
     )
-    .expect("commit alias backend retirement");
+    .expect("apply alias retirement through the production transaction");
     assert!(
         !frames.lock().stage2_references.contains_key(&key),
         "alias retirement must remove its last backend reference",
     );
-    drop(unpublished_carrier_mm_authority(
+    let identity = take_carrier_stage2_record(custody, key.0, key.1)
+        .expect("carrier-MM lease retains its exact record");
+    assert!(
+        custody.claim_stage2_retirement(identity).is_some(),
+        "the alias zero crossing must retain its proof with the pending retirement",
+    );
+    drop(retired_carrier_mm_authority(
         key,
         std::sync::Arc::clone(&frames),
         unpublished,
@@ -5026,6 +5064,10 @@ fn alias_retirement_keeps_carrier_lease_when_kernel_population_is_incomplete() {
     assert!(
         carrier_stage2_leases().lock().contains_key(&key),
         "carrier teardown must preserve an alias lease retained by Kernel authority",
+    );
+    assert!(
+        custody.claim_stage2_retirement(identity).is_some(),
+        "carrier teardown must not discard the alias retirement proof",
     );
     assert!(
         HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, key, || {

@@ -3050,17 +3050,18 @@ impl ImportDescriptorUndo {
             active: true,
         })
     }
-    fn commit(&mut self) {
+    fn commit(&mut self) -> Result<(), TrapError> {
         carrick_hal::el1_editor_exclusion::with_held_exclusion(self.mm, |license| {
-            let license = license.unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::user_transfer",
-                    "import descriptor commit lost its Editor exclusion"
+            let license = license.ok_or_else(|| {
+                TrapError::Hypervisor(
+                    "import descriptor commit lost its Editor exclusion".to_owned(),
                 )
-            });
+            })?;
             self.tables.commit_undo(license);
-        });
+            Ok::<(), TrapError>(())
+        })?;
         self.active = false;
+        Ok(())
     }
     fn rollback(&mut self) {
         if !self.active {
@@ -3068,20 +3069,24 @@ impl ImportDescriptorUndo {
         }
         // SAFETY: this owner retains the exact resolver and fresh journal;
         // its caller still holds pre-admission mutation/publication authority.
-        carrick_hal::el1_editor_exclusion::with_held_exclusion(self.mm, |license| {
-            let license = license.unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::user_transfer",
-                    "import descriptor rollback lost its Editor exclusion"
-                )
-            });
-            unsafe { self.tables.rollback_undo(license, &self.resolver) }.unwrap_or_else(|error| {
-                carrick_fatal!(
-                    "hvpatch::user_transfer",
-                    "import descriptor rollback failed before physical release: {error:?}"
-                )
-            });
-        });
+        let rollback = carrick_hal::el1_editor_exclusion::with_held_exclusion(
+            self.mm,
+            |license| -> Result<(), TrapError> {
+                let license = license.ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "import descriptor rollback lost its Editor exclusion".to_owned(),
+                    )
+                })?;
+                unsafe { self.tables.rollback_undo(license, &self.resolver) }
+                    .map(|_| ())
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "import descriptor rollback failed before physical release: {error:?}"
+                        ))
+                    })
+            },
+        );
+        rollback.unwrap_or_else(|error| carrick_fatal!("hvpatch::user_transfer", "{error:?}"));
         self.active = false;
     }
 }
@@ -3126,7 +3131,7 @@ impl PendingImport<'_> {
                 "pending import lost physical publication"
             )
         });
-        self.descriptor_undo.commit();
+        self.descriptor_undo.commit()?;
         drop(self.pending.pin.take());
         publication.commit_stage2_publication();
         Ok(publication.ready)

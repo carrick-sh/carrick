@@ -7024,17 +7024,24 @@ impl HvpatchCarrierTaskStateDirectory {
                             return Err(error);
                         }
                     };
-                let stage2_record_identities = match register_carrier_stage2_leases(
-                    &carrier_custody,
-                    &mut stage2_leases,
-                    &owner_hosts,
-                    task.unpublished_stage1.as_ref().unwrap_or_else(|| {
-                        carrick_fatal!(
-                            "hvpatch::frame_inventory",
-                            "prepared process lost its stage-2 publication authority"
-                        )
-                    }),
-                ) {
+                let registration = match task.unpublished_stage1.as_ref() {
+                    Some(unpublished) => register_carrier_stage2_leases(
+                        &carrier_custody,
+                        &mut stage2_leases,
+                        &owner_hosts,
+                        unpublished,
+                    ),
+                    None => {
+                        abort_prepared_task_and_carrier(
+                            task,
+                            HvpatchCarrierTaskState::Process { vm, stage2_leases },
+                        )?;
+                        return Err(TrapError::Hypervisor(
+                            "prepared process lost its stage-2 publication authority".to_owned(),
+                        ));
+                    }
+                };
+                let stage2_record_identities = match registration {
                     Ok(keys) => keys,
                     Err(error) => {
                         abort_prepared_task_and_carrier(
@@ -7093,17 +7100,24 @@ impl HvpatchCarrierTaskStateDirectory {
                             return Err(error);
                         }
                     };
-                let stage2_record_identities = match register_carrier_stage2_leases(
-                    &carrier_custody,
-                    &mut stage2_leases,
-                    &owner_hosts,
-                    task.unpublished_stage1.as_ref().unwrap_or_else(|| {
-                        carrick_fatal!(
-                            "hvpatch::frame_inventory",
-                            "prepared lease test lost its stage-2 publication authority"
-                        )
-                    }),
-                ) {
+                let registration = match task.unpublished_stage1.as_ref() {
+                    Some(unpublished) => register_carrier_stage2_leases(
+                        &carrier_custody,
+                        &mut stage2_leases,
+                        &owner_hosts,
+                        unpublished,
+                    ),
+                    None => {
+                        abort_prepared_task_and_carrier(
+                            task,
+                            HvpatchCarrierTaskState::PreparedTest { stage2_leases },
+                        )?;
+                        return Err(TrapError::Hypervisor(
+                            "prepared lease test lost its stage-2 publication authority".to_owned(),
+                        ));
+                    }
+                };
+                let stage2_record_identities = match registration {
                     Ok(keys) => keys,
                     Err(error) => {
                         abort_prepared_task_and_carrier(

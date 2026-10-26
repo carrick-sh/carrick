@@ -362,6 +362,7 @@ struct InstalledMm {
     live: TestLiveAuthority,
     state: Arc<MmAccessState>,
     owners: OwnerCleanup,
+    editor_exclusion: parking_lot::Mutex<Option<TestEditorExclusion>>,
 }
 
 struct OwnerCleanup(Vec<(u64, u64)>);
@@ -948,6 +949,7 @@ fn install_mm_sparse(
             (root, table_bytes.len() as u64),
             (data_ipa, data_len as u64),
         ]),
+        editor_exclusion: parking_lot::Mutex::new(None),
     }
 }
 
@@ -983,6 +985,25 @@ fn read_instructions_installed(
         dst,
         deadline,
     )
+}
+
+struct TestEditorExclusion {
+    _spaces: Box<carrick_sched_core::AddressSpaces>,
+    _held: carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion,
+}
+
+impl TestEditorExclusion {
+    fn unpublished(mm: u64) -> Self {
+        let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+        let excluded = spaces
+            .unpublished(mm)
+            .expect("foreign COW target starts unpublished");
+        let held = carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded);
+        Self {
+            _spaces: spaces,
+            _held: held,
+        }
+    }
 }
 
 fn prepare_foreign_cow(
@@ -1070,6 +1091,9 @@ fn prepare_foreign_cow(
         calls: 0,
         fail_call: None,
     };
+    *installed.editor_exclusion.lock() = Some(TestEditorExclusion::unpublished(
+        installed.snapshot.mm.get(),
+    ));
     (authority, lease, invalidator)
 }
 
@@ -3832,6 +3856,7 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
         live,
         state,
         owners,
+        editor_exclusion: _,
     } = install_mm(
         &transport,
         106,
@@ -14544,6 +14569,12 @@ fn exercise_retained_import(journal_case: u8) {
         spaces: &zone,
         mm: nonzero(installed.snapshot.mm.get()),
     };
+    let excluded = zone
+        .spaces
+        .unpublished(guard.mm.get())
+        .expect("target MM starts unpublished");
+    let _held_editor_exclusion =
+        carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded);
     let before = installed.state.frame_inventory.ledger.lock().extents.len();
     let mut stale = receipt;
     stale.owner.as_mut().unwrap().1 = nonzero(stale.owner.unwrap().1.get() + 1);

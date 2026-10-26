@@ -2094,26 +2094,6 @@ impl HvfVmState {
         Ok(())
     }
 
-    /// The backend half of [`Self::apply_inventory_lease_retirement`], for
-    /// tests of the ledger arithmetic alone.
-    #[cfg(test)]
-    pub(crate) fn commit_inventory_lease_retirement(
-        custody: &CarrierVmCustody,
-        inventory: &mut HvpatchFrameInventory,
-        retirement: &InventoryLeaseRetirement,
-        receipt: Stage1UnpublicationReceipt<'_>,
-    ) -> Result<std::collections::BTreeMap<(u64, u64), Stage1Unpublished>, TrapError> {
-        let frames = std::sync::Arc::clone(&inventory.frames);
-        let mut registry = frames.lock();
-        Self::commit_inventory_lease_retirement_in(
-            inventory,
-            &mut registry,
-            retirement,
-            receipt,
-            |lease| global_frame_stage2_identity_in(custody, lease.0, lease.1),
-        )
-    }
-
     fn commit_inventory_lease_retirement_in(
         inventory: &mut HvpatchFrameInventory,
         registry: &mut InventoryFrameRegistry,
@@ -2216,7 +2196,7 @@ impl HvfVmState {
             &mut registry,
             retirement,
             receipt,
-            |lease| global_frame_stage2_identity_in(custody, lease.0, lease.1),
+            |lease| inventory_stage2_identity_in(custody, lease.0, lease.1),
         )
         .unwrap_or_else(|error| {
             carrick_fatal!(
@@ -2237,10 +2217,9 @@ impl HvfVmState {
             if custody.request_released_stage2_record_retirement(identity, proof)
                 != CarrierStage2RetireOutcome::DeferredActivePins
             {
-                carrick_fatal!(
-                    "hvpatch::frame_inventory",
+                return Err(TrapError::Hypervisor(format!(
                     "deferred alias retirement {lease:?} could not retain its zero-reference proof"
-                );
+                )));
             }
         }
         Ok((applied, proofs))
@@ -3754,7 +3733,7 @@ impl HvfVmState {
             staged.release_with(
                 &mut registry,
                 Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
-                |lease| global_frame_stage2_identity_in(custody, lease.0, lease.1),
+                |lease| inventory_stage2_identity_in(custody, lease.0, lease.1),
             )?
         };
 

@@ -2964,17 +2964,19 @@ pub(crate) fn perform_foreign_cow_transaction(
         root_ipa: requested.binding.stage1_root.raw(),
         root_host: page_table_host_ptr,
     };
+    let authority_invariant = |reason: &str| -> ! {
+        carrick_fatal!(
+            "hvpatch::mm_authority",
+            "foreign COW stage-1 authority invariant: {reason}"
+        )
+    };
     let restore_stage1 = |rollback: &mut Option<carrick_mmu_core::aarch64::PageTableManager>,
                           site| {
         carrick_hal::el1_editor_exclusion::with_held_exclusion(
             requested.mm.raw_for_probe(),
             |license| {
-                let license = license.unwrap_or_else(|| {
-                    carrick_fatal!(
-                        "hvpatch::mm_authority",
-                        "foreign COW restore lost its Editor exclusion"
-                    )
-                });
+                let license = license
+                    .unwrap_or_else(|| authority_invariant("restore lost its Editor exclusion"));
                 unsafe {
                     page_tables_authority.restore_image_and_host(
                         license,
@@ -3115,9 +3117,8 @@ pub(crate) fn perform_foreign_cow_transaction(
         }
     };
     if rollback.is_none() {
-        carrick_fatal!(
-            "hvpatch::mm_authority",
-            "missing page-table rollback pre-image after successful page-table modification"
+        authority_invariant(
+            "missing page-table rollback pre-image after successful page-table modification",
         );
     }
     if let Err(error) = invalidator.invalidate_exact_asid(binding, deadline) {
@@ -3506,20 +3507,17 @@ fn perform_foreign_guest_cow(
             return Err(Error::MutationFailed);
         }
     };
-    if *verified.txn() != txn || verified.cow_repoint().is_none() {
-        carrick_fatal!(
+    let stage1 = match (
+        *verified.txn() == txn,
+        verified.cow_repoint().is_some(),
+        tables.verified_guest_cow_unpublication(&verified),
+    ) {
+        (true, true, Some(receipt)) => receipt,
+        _ => carrick_fatal!(
             "hvpatch::foreign_cow",
-            "guest foreign COW receipt names another transaction"
-        );
-    }
-    let stage1 = tables
-        .verified_guest_cow_unpublication(&verified)
-        .unwrap_or_else(|| {
-            carrick_fatal!(
-                "hvpatch::foreign_cow",
-                "verified guest foreign COW did not retire its exact old leaves"
-            )
-        });
+            "guest foreign COW receipt does not authenticate its transaction and retired leaves"
+        ),
+    };
     // The borrowed-TTBR0 window is closed: settle the target ASID admission
     // (resident) before the commit, so the target's retirement is not held.
     drop(publisher);

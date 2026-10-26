@@ -4115,12 +4115,17 @@ impl HvfTaskState {
                         )
                     })
                 })?;
-                if *verified.txn() != txn || verified.cow_repoint().is_none() {
-                    carrick_fatal!(
+                let stage1_leaf = match (
+                    *verified.txn() == txn,
+                    verified.cow_repoint().is_some(),
+                    tables.verified_guest_cow_unpublication(&verified),
+                ) {
+                    (true, true, Some(receipt)) => receipt,
+                    _ => carrick_fatal!(
                         "hvpatch::cow",
-                        "guest COW receipt names another transaction"
-                    );
-                }
+                        "guest COW receipt does not authenticate its transaction and retired leaves"
+                    ),
+                };
                 // Maintenance can repoint a still-invalid page. Retain the
                 // same exact-leaf receipt consumed by the later protection
                 // publication, after authenticating EL1's completion.
@@ -4157,14 +4162,7 @@ impl HvfTaskState {
                         Some((receipt_va, leaf, expected_ipa, leaf & (0b11 << 6)));
                     crate::probes::pt_alias_walk(receipt_va, live, 1 << 3);
                 }
-                Ok(tables
-                    .verified_guest_cow_unpublication(&verified)
-                    .unwrap_or_else(|| {
-                        carrick_fatal!(
-                            "hvpatch::cow",
-                            "verified guest COW did not retire its exact old stage-1 leaves"
-                        )
-                    }))
+                Ok(stage1_leaf)
             })()
             .map(|receipt| ((), Some(receipt)))
         } else {

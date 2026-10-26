@@ -1404,6 +1404,28 @@ pub(crate) fn global_frame_stage2_identity_in(
         .map(|entry| entry.owner().record_identity)
 }
 
+/// The exact stage-2 record named by the frame-inventory reference ledger.
+///
+/// Reusable global frames publish through `global_frame_host_owners`; fresh
+/// per-MM kernel-state frames publish through `carrier_stage2_records`.  Both
+/// owner classes contribute references to the same inventory ledger, so its
+/// zero crossing must retain the record identity from either production
+/// directory rather than deriving retirement authority from the lease key.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn inventory_stage2_identity_in(
+    custody: &CarrierVmCustody,
+    ipa: u64,
+    length: u64,
+) -> Option<CarrierStage2RecordIdentity> {
+    global_frame_stage2_identity_in(custody, ipa, length).or_else(|| {
+        custody
+            .carrier_stage2_records
+            .lock()
+            .get(&(ipa, length))
+            .copied()
+    })
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn pin_exact_live_global_frame_owner_in(
     custody: &CarrierVmCustody,
