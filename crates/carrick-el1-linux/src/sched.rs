@@ -43,13 +43,14 @@ impl ThreadCpu for HardwareCpu {
         _: carrick_el1_abi::SlotId,
         _: carrick_el1_abi::RecordId,
         frame: &mut TrapFrame,
+        counters: &carrick_el1_abi::Counters,
     ) -> carrick_el1_abi::Action {
         let action = if task.linux.served_boundary_pending() {
             carrick_el1_abi::Action::ServedWithWork
         } else {
             carrick_el1_abi::Action::Forward
         };
-        super::dispatch::capture_native_service_exit(frame, action, None)
+        super::dispatch::capture_native_service_exit(frame, action, None, counters)
     }
     fn set_translation(&mut self, a: u64, b: u64) {
         carrick_el1::substrate::sched::hw::HardwareCpu.set_translation(a, b);
