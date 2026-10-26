@@ -1876,8 +1876,7 @@ fn native_exec_successor_retracts_exec_cancellation_before_owner_wait() {
         .unwrap()
         .native()
         .resources()
-        .mm
-        .clone();
+        .mm;
     let handle = entry.service.service_mm_handle(&successor).unwrap();
     let successor_entry = fixture
         .zone
