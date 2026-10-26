@@ -1480,6 +1480,32 @@ fn idle_native_mm_does_not_license_a_host_owned_successor() {
     }
 }
 
+#[test]
+fn idle_native_mm_steals_host_work_without_switching_it_in() {
+    let zone = zone();
+    enter(&zone, OTHER, 1);
+    host_publish(&zone, SLOT, 0, Some(0), 0);
+    zone.enter_guest(SLOT);
+    let space = zone.spaces.publish_closed(MM, 0x1000, 0x1000).unwrap();
+    zone.spaces.open(space);
+    assert!(zone.install_space(SLOT, MM).is_some());
+    let record = zone.alloc_record(identity(2)).unwrap();
+    // SAFETY: this record is freshly allocated and unpublished.
+    unsafe { zone.record(record).ctx_mut().x[0] = 0xabcdef };
+    zone.requeue_preempted(OTHER, record);
+    zone.leave_guest(OTHER, &HostWait);
+
+    assert_eq!(zone.steal(SLOT), None);
+    assert_eq!(zone.slot(SLOT).current(), None);
+    assert!(zone.head_needs_host(SLOT));
+    assert_eq!(zone.runnable_head(OTHER), None);
+    zone.leave_guest(SLOT, &HostWait);
+    assert_eq!(zone.take_service_head(SLOT).unwrap().id, record);
+    // SAFETY: taking the service head gave this executor exclusive custody.
+    assert_eq!(unsafe { zone.record(record).ctx_mut().x[0] }, 0xabcdef);
+    assert!(zone.leave_slot(SLOT, u64::from(SLOT.raw()) + 1, &mut |_| {}, &mut |_| {}));
+}
+
 /// Host placement: a service thread goes to an idle slot of any address
 /// space; a thread ready at EL0 only to a slot running its address space,
 /// else nowhere (the host serves it). A running or WFI target owes a

@@ -2900,10 +2900,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// host-owned threads still require their executor.
     fn runs_mm_of(&self, slot: SlotId, rec: &ZoneRecord<C>) -> bool {
         let mm = rec.mm.load(Ordering::Relaxed);
+        // Installing a native record's MM does not attach a host task to
+        // an idle executor. A host-owned successor still needs that task's
+        // exception/forwarding boundary, even when its MM is already here.
         rec.needs_host()
-            || self.installed_space(slot) == mm
-            || self.may_switch_to(slot, mm)
-            || (rec.is_native_owned() && self.spaces.is_open(mm))
+            || ((self.executor_has_task(slot) || rec.is_native_owned())
+                && (self.installed_space(slot) == mm
+                    || self.may_switch_to(slot, mm)
+                    || (rec.is_native_owned() && self.spaces.is_open(mm))))
     }
 
     /// Whether EL1 on `slot` may install address space `mm` itself: the
@@ -3303,12 +3307,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// installed on the slot that EL1 may not install now (unpublished, a
     /// pause of it is raised, or it is retiring), which its executor loads.
     fn needs_executor(&self, slot: SlotId, rec: &ZoneRecord<C>) -> bool {
-        let mm = rec.mm.load(Ordering::Relaxed);
-        rec.needs_host()
-            || rec.is_unadopted_birth()
-            || (self.installed_space(slot) != mm
-                && !self.may_switch_to(slot, mm)
-                && !(rec.is_native_owned() && self.spaces.is_open(mm)))
+        rec.needs_host() || rec.is_unadopted_birth() || !self.runs_mm_of(slot, rec)
     }
 
     /// The address space installed on `slot`'s vCPU, by the occupancy
