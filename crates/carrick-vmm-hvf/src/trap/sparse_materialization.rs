@@ -2136,7 +2136,7 @@ mod arena_pin_tests {
                     .load(std::sync::atomic::Ordering::Acquire)
             );
         }
-        state.install_structural_owner(owner.clone());
+        state.install_structural_owner(owner.clone()).unwrap();
         state
             .retire_rolled_back_arenas(
                 &custody,
@@ -2376,7 +2376,7 @@ mod arena_pin_tests {
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             crate::hvf_aarch64_engine::HostCowStats::default(),
         );
-        state.install_structural_owner(owner.clone());
+        state.install_structural_owner(owner.clone()).unwrap();
         (state, custody, owner)
     }
 
@@ -2414,7 +2414,7 @@ mod arena_pin_tests {
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             crate::hvf_aarch64_engine::HostCowStats::default(),
         );
-        state.install_structural_owner(owner);
+        state.install_structural_owner(owner).unwrap();
         let wrong_custody = std::sync::Arc::new(CarrierVmCustody::new());
         let other_generation = wrong_custody.begin_create().unwrap();
         wrong_custody.commit_create(other_generation).unwrap();

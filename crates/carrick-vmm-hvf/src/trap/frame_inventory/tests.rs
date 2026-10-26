@@ -42,6 +42,20 @@ fn test_leaf_retirement_receipt(ipa: u64) -> carrick_aarch64::stage1_authority::
         .unwrap()
 }
 
+#[test]
+fn cow_split_receipt_requires_the_exact_stage1_authority() {
+    let exact = test_leaf_retirement_receipt(0xa300_1000_0000);
+    let recycled_address_candidate = test_leaf_retirement_receipt(0xa300_1000_0000);
+    assert!(editor_receipt_matches_authority(
+        exact.authority(),
+        Stage1UnpublicationReceipt::EditorRange(&exact),
+    ));
+    assert!(!editor_receipt_matches_authority(
+        exact.authority(),
+        Stage1UnpublicationReceipt::EditorRange(&recycled_address_candidate),
+    ));
+}
+
 fn retire_test_process_mappings(task: &mut HvfTaskState) -> Result<(), TrapError> {
     let proof = prepare_test_whole_mm_retirement(task);
     HvfVmState::retire_task_state_process_mappings_after_stage1_unpublished(task, proof)
@@ -60,14 +74,43 @@ fn retire_test_process_mappings_with_root_proof(
 }
 
 pub(super) fn test_whole_mm_stage1_proof() -> carrick_core::mm::retirement::Stage1UnpublishedMm {
+    test_whole_mm_stage1_proof_for(1)
+}
+
+fn test_whole_mm_stage1_proof_for(mm: u64) -> carrick_core::mm::retirement::Stage1UnpublishedMm {
     let mut task = hvpatch_neutral_task_state_for_test();
     task.cow_identity = Some(carrick_hal::FrameCowIdentity {
         linux_pid: 1,
         linux_tid: 1,
-        mm: 1,
+        mm,
         asid: 1,
     });
     prepare_test_whole_mm_retirement(&mut task)
+}
+
+#[test]
+fn whole_mm_receipt_cannot_release_another_mms_structural_reference() {
+    let lease = (0xa300_0000_0000, 0x20_0000);
+    let identity = CarrierStage2RecordIdentity {
+        vm_generation: CarrierVmGeneration(1),
+        record_id: CarrierStage2RecordId(1),
+        logical_owner: None,
+    };
+    let mut frames = InventoryFrameRegistry::default();
+    frames
+        .register_structural_stage2_reference(lease, 41)
+        .unwrap();
+    let wrong_mm = test_whole_mm_stage1_proof_for(42);
+    assert_eq!(
+        frames.release_structural_stage2_reference(
+            lease,
+            identity,
+            41,
+            Stage1UnpublicationReceipt::Inventory(&wrong_mm),
+        ),
+        Err(Stage2ReferenceReleaseError::ReceiptMismatch(lease))
+    );
+    assert_eq!(frames.stage2_references.get(&lease), Some(&1));
 }
 
 /// Model the inventory after one 4 KiB semantic discard in each 16 KiB
@@ -4936,7 +4979,9 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
         !shape.retirement.backend_frame_references_complete,
         "the planner must carry the backend/authority mismatch into commit",
     );
+    let stage1 = test_leaf_retirement_receipt(old_key.0);
     let split = CowInventorySplit {
+        stage1_authority: stage1.authority(),
         replacement_is_existing: false,
         old_key,
         old,
@@ -4956,10 +5001,15 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
     let stage2_retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed = std::sync::Arc::clone(&stage2_retired);
 
-    let retired = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, move |_| {
-        observed.store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(true)
-    })
+    let retired = HvfVmState::commit_cow_inventory_split(
+        &mut inventory,
+        &split,
+        (None, Stage1UnpublicationReceipt::EditorRange(&stage1)),
+        move |_| {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        },
+    )
     .expect("commit authority-retained COW split");
 
     assert!(!retired, "the old stage-2 extent must remain installed");
@@ -4981,13 +5031,15 @@ fn cow_split_keeps_stage2_when_the_authority_keeps_the_old_frame_live() {
         carrier_stage2_leases().lock().contains_key(&old_key),
         "carrier teardown must preserve a COW lease retained by Kernel authority",
     );
+    let error = HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, old_key, || {
+        retire_pending_carrier_lease(old_key)
+    })
+    .expect_err("an authority-retained lease has no stage-1 proof for later retirement");
+    assert!(error.to_string().contains("lacks stage-1 proof"));
     assert!(
-        HvfVmState::retire_stage2_candidate_if_unreferenced(&frames, old_key, || {
-            retire_pending_carrier_lease(old_key)
-        })
-        .unwrap(),
+        carrier_stage2_leases().lock().contains_key(&old_key),
+        "a producer-free lease must stay quarantined rather than be reissued"
     );
-    assert!(!carrier_stage2_leases().lock().contains_key(&old_key));
 }
 
 #[test]
@@ -5462,7 +5514,9 @@ fn cow_collision_is_rejected_before_backend_inventory_mutation() {
         frames.stage2_references.insert(old_key, 1);
         frames.stage2_references.insert(new_key, 1);
     }
+    let stage1 = test_leaf_retirement_receipt(old_key.0);
     let split = CowInventorySplit {
+        stage1_authority: stage1.authority(),
         replacement_is_existing: false,
         old_key,
         old,
@@ -5482,8 +5536,13 @@ fn cow_collision_is_rejected_before_backend_inventory_mutation() {
         },
     };
 
-    let error = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, |_| Ok(true))
-        .expect_err("colliding COW extent must fail closed");
+    let error = HvfVmState::commit_cow_inventory_split(
+        &mut inventory,
+        &split,
+        (None, Stage1UnpublicationReceipt::EditorRange(&stage1)),
+        |_| Ok(true),
+    )
+    .expect_err("colliding COW extent must fail closed");
     assert!(error.to_string().contains("before backend mutation"));
     assert_eq!(
         inventory.extents.get(&old_key).unwrap().mapping,
@@ -5550,7 +5609,9 @@ fn cow_split_commit_preserves_old_owner_and_publishes_replacement_owner() {
             mapping: carrick_hal::MappingId::from_kernel_allocation(id(92)),
         },
     ];
+    let stage1 = test_leaf_retirement_receipt(old_key.0);
     let split = CowInventorySplit {
+        stage1_authority: stage1.authority(),
         replacement_is_existing: false,
         old_key,
         old,
@@ -5571,8 +5632,13 @@ fn cow_split_commit_preserves_old_owner_and_publishes_replacement_owner() {
     };
 
     assert!(
-        !HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, |_| Ok(true))
-            .unwrap()
+        !HvfVmState::commit_cow_inventory_split(
+            &mut inventory,
+            &split,
+            (None, Stage1UnpublicationReceipt::EditorRange(&stage1),),
+            |_| Ok(true),
+        )
+        .unwrap()
     );
     assert_eq!(
         inventory
@@ -5623,7 +5689,9 @@ fn cow_stage2_recycle_holds_the_publication_lock() {
             .insert((old_frame, old_key.0, old_key.1), 1);
         frames.stage2_references.insert(old_key, 1);
     }
+    let stage1 = test_leaf_retirement_receipt(old_key.0);
     let split = CowInventorySplit {
+        stage1_authority: stage1.authority(),
         replacement_is_existing: false,
         old_key,
         old,
@@ -5645,13 +5713,18 @@ fn cow_stage2_recycle_holds_the_publication_lock() {
     let frames = std::sync::Arc::clone(&inventory.frames);
 
     assert!(
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, |_| {
-            assert!(
-                frames.try_lock().is_none(),
-                "COW must retain the shared registry lock through old-IPA recycle",
-            );
-            Ok(true)
-        })
+        HvfVmState::commit_cow_inventory_split(
+            &mut inventory,
+            &split,
+            (None, Stage1UnpublicationReceipt::EditorRange(&stage1),),
+            |_| {
+                assert!(
+                    frames.try_lock().is_none(),
+                    "COW must retain the shared registry lock through old-IPA recycle",
+                );
+                Ok(true)
+            },
+        )
         .unwrap(),
     );
     assert!(!inventory.extents.contains_key(&old_key));
@@ -5771,6 +5844,7 @@ fn cow_reuse_commit_keeps_destination_mapping_and_reference_counts() {
         Vec::new(),
         Vec::new(),
     );
+    let stage1 = test_leaf_retirement_receipt(old_key.0);
     let mut split = HvfVmState::stage_cow_inventory_split(
         &mut reservation,
         old_key,
@@ -5786,21 +5860,31 @@ fn cow_reuse_commit_keeps_destination_mapping_and_reference_counts() {
             stage2_owner: new.stage2_owner,
             existing: Some(new),
         },
+        stage1.authority(),
     )
     .unwrap();
     assert_eq!(reservation.commit(()).batch().events().len(), 2);
     split.new_extent.stage2_owner.generation += 1;
     assert!(
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, |_| panic!(
-            "stale destination must fail before retirement"
-        ))
+        HvfVmState::commit_cow_inventory_split(
+            &mut inventory,
+            &split,
+            (None, Stage1UnpublicationReceipt::EditorRange(&stage1),),
+            |_| panic!("stale destination must fail before retirement")
+        )
         .is_err()
     );
     assert_eq!(inventory.extents[&old_key], old);
     assert_eq!(inventory.extents[&new_key], new);
     split.new_extent = new;
     assert!(
-        HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, |_| Ok(true)).unwrap()
+        HvfVmState::commit_cow_inventory_split(
+            &mut inventory,
+            &split,
+            (None, Stage1UnpublicationReceipt::EditorRange(&stage1),),
+            |_| Ok(true),
+        )
+        .unwrap()
     );
     assert_eq!(inventory.extents.len(), 1);
     assert_eq!(inventory.extents[&new_key].mapping, new.mapping);
@@ -6167,7 +6251,9 @@ fn cow_then_fork_distant_alias_keeps_inventory_for_live_owner() {
         HvfVmState::cow_inventory_split_shape(&inventory, physical_ipa, retain, |_| Ok(Some(2)))
             .expect("plan COW with distant live projection");
     assert_eq!(shape.fragments, vec![old_key]);
+    let stage1 = test_leaf_retirement_receipt(old_key.0);
     let split = CowInventorySplit {
+        stage1_authority: stage1.authority(),
         replacement_is_existing: false,
         old_key: shape.old_key,
         old: shape.old,
@@ -6190,9 +6276,12 @@ fn cow_then_fork_distant_alias_keeps_inventory_for_live_owner() {
         },
         retirement: shape.retirement,
     };
-    let retired = HvfVmState::commit_cow_inventory_split(&mut inventory, &split, None, |_| {
-        panic!("a live distant projection must prevent physical retirement")
-    })
+    let retired = HvfVmState::commit_cow_inventory_split(
+        &mut inventory,
+        &split,
+        (None, Stage1UnpublicationReceipt::EditorRange(&stage1)),
+        |_| panic!("a live distant projection must prevent physical retirement"),
+    )
     .expect("commit COW while preserving old inventory authority");
 
     assert!(!retired);
@@ -8285,14 +8374,24 @@ fn two_live_mm_empty_inventory_releases_already_terminal_table_capacity() {
     let record_snapshot = custody
         .stage2_record_snapshot(record.record_id)
         .expect("whole-MM table record exists before retirement");
-    let stage1 = frames
-        .lock()
-        .release_structural_stage2_reference(
-            (record_snapshot.ipa, record_snapshot.len as u64),
-            record,
-            Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
-        )
-        .expect("whole-MM inventory proof covers its exact table record");
+    let stage1 = {
+        let mut frames = frames.lock();
+        frames
+            .register_structural_stage2_reference(
+                (record_snapshot.ipa, record_snapshot.len as u64),
+                stage1_unpublished.mm(),
+            )
+            .and_then(|()| {
+                frames.release_structural_stage2_reference(
+                    (record_snapshot.ipa, record_snapshot.len as u64),
+                    record,
+                    stage1_unpublished.mm(),
+                    Stage1UnpublicationReceipt::Inventory(&stage1_unpublished),
+                )
+            })
+    }
+    .expect("whole-MM inventory proof covers its exact table record")
+    .expect("whole-MM inventory proof releases the last table reference");
     assert_eq!(
         custody.request_released_stage2_record_retirement(record, stage1),
         CarrierStage2RetireOutcome::DeferredActivePins

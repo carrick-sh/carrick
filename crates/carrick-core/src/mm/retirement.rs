@@ -783,6 +783,8 @@ impl LeaseGate {
 }
 /// Existing sched-core publication, owned by the kernel's placement adapter.
 pub trait AddressPublication {
+    /// Exact MM identity owned by this publication.
+    fn mm(&self) -> u64;
     fn retire_reservations(&self);
 }
 
@@ -794,7 +796,14 @@ pub trait AddressPublication {
 /// from a flag or a revision sampled after the fact.
 #[derive(::core::fmt::Debug)]
 pub struct Stage1UnpublishedMm {
-    _private: (),
+    mm: u64,
+}
+
+impl Stage1UnpublishedMm {
+    /// Exact MM whose publication was drained.
+    pub fn mm(&self) -> u64 {
+        self.mm
+    }
 }
 
 /// Drop the closed publication (draining sched-core occupants) before waiting
@@ -803,10 +812,11 @@ pub fn drain_publication<V: ResidencyVenue, G: Copy + Eq, P: AddressPublication>
     publication: P,
     residency: &ResidencyRetirement<V, G>,
 ) -> Stage1UnpublishedMm {
+    let mm = publication.mm();
     publication.retire_reservations();
     drop(publication);
     residency.wait_for_admitted_loads();
-    Stage1UnpublishedMm { _private: () }
+    Stage1UnpublishedMm { mm }
 }
 
 #[cfg(test)]
@@ -840,6 +850,10 @@ mod nonce_tests {
     struct OrderedPublication(std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>);
 
     impl AddressPublication for OrderedPublication {
+        fn mm(&self) -> u64 {
+            1
+        }
+
         fn retire_reservations(&self) {
             self.0.lock().push("editor-revision");
         }

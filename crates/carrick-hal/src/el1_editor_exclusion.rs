@@ -1,108 +1,139 @@
-//! Proof, for host code on THIS thread, that it holds an MM's guest EL1
-//! editor exclusion.
+//! Proof that the host holds an MM's guest EL1 editor exclusion.
 //!
-//! On the guest descriptor lane EL1 owns the live stage-1 descriptors: it
-//! publishes, protects and retires leaves under an MM's editor token. The
-//! host may store to those descriptors itself only while that editor is
-//! excluded (the MM's gate raised and no admitted EL1 editor left), which
-//! makes the host the MM's one editor. The exclusion is acquired in the
-//! kernel (`mm_occupancy::exclude_el1_editor`, held by the syscall and
-//! first-touch mutation guards) while the stores happen in the engine below
-//! it, so the proof travels through this crate, which both depend on.
-//!
-//! The proof is a type, not a convention:
-//! - [`HeldEl1EditorExclusion`] is registered only from a
-//!   [`carrick_sched_core::ExcludedEditor`], which only
-//!   `AddressSpaces::raise_and_wait_for_editor` (or `unpublished`) mints,
-//!   and it unregisters when dropped, on the thread that registered it.
-//! - [`El1EditorExcluded`] is the witness host-side descriptor stores
-//!   demand. It is minted only by [`with_held_exclusion`], inside a closure
-//!   on the registering thread, while a registration for the exact MM is
-//!   held; it is neither `Clone`, `Send` nor constructible elsewhere.
+//! The kernel owns the exclusion guard, but the engine operation it protects
+//! may execute on another host thread. Consequently the proof is an owned,
+//! process-visible capability rather than thread-local state. The capability
+//! stays live only while the kernel guard which registered it is alive.
 
-use std::cell::RefCell;
-use std::marker::PhantomData;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-thread_local! {
-    static HELD: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+#[derive(Debug)]
+struct ExclusionCapability {
+    mm: u64,
+    active: std::sync::atomic::AtomicBool,
 }
 
-/// One held exclusion of an MM's EL1 editor, registered on this thread for
-/// as long as it lives. Owned by the guard that raised the MM's gate and
-/// dropped before that gate is lowered.
+fn held() -> &'static Mutex<BTreeMap<u64, Vec<Weak<ExclusionCapability>>>> {
+    static HELD: OnceLock<Mutex<BTreeMap<u64, Vec<Weak<ExclusionCapability>>>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// One held exclusion of an MM's EL1 editor. Owned by the guard that raised
+/// the MM's gate (or proved the MM unpublished) and dropped before that gate
+/// is lowered.
 #[derive(Debug)]
 pub struct HeldEl1EditorExclusion {
-    mm: u64,
-    _thread_bound: PhantomData<*const ()>,
+    capability: Arc<ExclusionCapability>,
 }
 
 impl HeldEl1EditorExclusion {
-    /// Register the exclusion `excluded` proves for its MM on this thread.
+    /// Register the exclusion `excluded` proves for its exact MM.
     #[must_use]
     pub fn register(excluded: &carrick_sched_core::ExcludedEditor<'_>) -> Self {
-        let mm = excluded.key();
-        HELD.with(|held| held.borrow_mut().push(mm));
-        Self {
-            mm,
-            _thread_bound: PhantomData,
-        }
+        let capability = Arc::new(ExclusionCapability {
+            mm: excluded.key(),
+            active: std::sync::atomic::AtomicBool::new(true),
+        });
+        held()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(capability.mm)
+            .or_default()
+            .push(Arc::downgrade(&capability));
+        Self { capability }
     }
 
     /// The MM whose editor is excluded.
     #[must_use]
     pub fn mm(&self) -> u64 {
-        self.mm
+        self.capability.mm
+    }
+
+    /// Borrow-independent proof which may be handed to the host thread that
+    /// performs the edit. It remains valid only while this held exclusion is
+    /// alive.
+    #[must_use]
+    pub fn license(&self) -> El1EditorExcluded {
+        El1EditorExcluded {
+            capability: Arc::clone(&self.capability),
+        }
     }
 }
 
 impl Drop for HeldEl1EditorExclusion {
     fn drop(&mut self) {
-        HELD.with(|held| {
-            let mut held = held.borrow_mut();
-            match held.iter().rposition(|&mm| mm == self.mm) {
-                Some(at) => {
-                    held.remove(at);
-                }
-                None => carrick_fatal::carrick_fatal!(
-                    "hal::el1_editor_exclusion",
-                    "EL1 editor exclusion of MM {} released on a thread that never held it",
-                    self.mm
-                ),
-            }
+        self.capability
+            .active
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut held = held()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(capabilities) = held.get_mut(&self.capability.mm) else {
+            carrick_fatal::carrick_fatal!(
+                "hal::el1_editor_exclusion",
+                "EL1 editor exclusion of MM {} was not registered",
+                self.capability.mm
+            );
+        };
+        capabilities.retain(|candidate| {
+            candidate
+                .upgrade()
+                .is_some_and(|candidate| !Arc::ptr_eq(&candidate, &self.capability))
         });
+        if capabilities.is_empty() {
+            held.remove(&self.capability.mm);
+        }
     }
 }
 
-/// Witness that the calling thread holds MM [`Self::mm`]'s EL1 editor
-/// exclusion. Only [`with_held_exclusion`] mints one, for the duration of
-/// its closure.
-#[derive(Debug)]
+/// Owned witness that MM [`Self::mm`]'s EL1 editor is excluded. The private
+/// capability can only be minted by [`HeldEl1EditorExclusion::register`].
+#[derive(Clone, Debug)]
 pub struct El1EditorExcluded {
-    mm: u64,
-    _thread_bound: PhantomData<*const ()>,
+    capability: Arc<ExclusionCapability>,
 }
 
 impl El1EditorExcluded {
     /// The MM whose live descriptors the holder may store to.
     #[must_use]
     pub fn mm(&self) -> u64 {
-        self.mm
+        self.capability.mm
+    }
+
+    /// Whether the kernel guard which owns this capability is still live.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.capability
+            .active
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
-/// Run `f` with the witness for `mm` when this thread holds its EL1 editor
-/// exclusion, else with `None`.
+/// Run `f` with an owned proof for `mm` when its kernel exclusion is held.
+/// The lookup is process-wide because the admitted engine operation may run
+/// on a different host thread from the kernel guard that owns the exclusion.
 pub fn with_held_exclusion<R>(mm: u64, f: impl FnOnce(Option<&El1EditorExcluded>) -> R) -> R {
-    let held = mm != 0 && HELD.with(|held| held.borrow().contains(&mm));
-    if held {
-        let witness = El1EditorExcluded {
-            mm,
-            _thread_bound: PhantomData,
-        };
-        f(Some(&witness))
+    let license = if mm == 0 {
+        None
     } else {
-        f(None)
-    }
+        let mut held = held()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let capabilities = held.get_mut(&mm);
+        let capability = capabilities.and_then(|capabilities| {
+            capabilities.retain(|candidate| candidate.strong_count() != 0);
+            capabilities
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find(|capability| capability.active.load(std::sync::atomic::Ordering::Acquire))
+        });
+        if held.get(&mm).is_some_and(Vec::is_empty) {
+            held.remove(&mm);
+        }
+        capability.map(|capability| El1EditorExcluded { capability })
+    };
+    f(license.as_ref())
 }
 
 #[cfg(test)]
@@ -110,7 +141,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_registered_exclusion_on_this_thread_mints_a_witness() {
+    fn registered_exclusion_mints_an_owned_cross_thread_witness() {
         let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
         let index = spaces.publish_closed(41, 0x1000, 0).expect("publish");
         assert!(with_held_exclusion(41, |witness| witness.is_none()));
@@ -118,17 +149,22 @@ mod tests {
             let excluded = spaces.raise_and_wait_for_editor(index, || {});
             let held = HeldEl1EditorExclusion::register(&excluded);
             assert_eq!(held.mm(), 41);
+            assert_eq!(held.license().mm(), 41);
             assert_eq!(
                 with_held_exclusion(41, |witness| witness.map(El1EditorExcluded::mm)),
                 Some(41)
             );
-            assert!(
-                with_held_exclusion(42, |witness| witness.is_none()),
-                "exact MM only"
-            );
+            assert!(with_held_exclusion(42, |witness| witness.is_none()));
             std::thread::scope(|scope| {
                 scope
-                    .spawn(|| assert!(with_held_exclusion(41, |witness| witness.is_none())))
+                    .spawn(|| {
+                        assert_eq!(
+                            with_held_exclusion(41, |witness| {
+                                witness.map(El1EditorExcluded::mm)
+                            }),
+                            Some(41)
+                        );
+                    })
                     .join()
                     .unwrap();
             });

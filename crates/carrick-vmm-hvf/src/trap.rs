@@ -1579,6 +1579,21 @@ pub(crate) fn test_stage1_edit_license() -> &'static carrick_sched_core::SpaceEd
     LICENSE.with(|license| *license)
 }
 
+#[cfg(test)]
+pub(crate) fn test_stage1_edit_license_for(
+    authority: &carrick_aarch64::Stage1Authority,
+) -> &'static carrick_sched_core::SpaceEditor<'static> {
+    let mm = authority.mm().unwrap_or(1);
+    let spaces = Box::leak(Box::new(carrick_sched_core::AddressSpaces::new()));
+    let index = spaces.publish_closed(mm, 0x1000, 0).expect("test space");
+    spaces.open(index);
+    Box::leak(Box::new(
+        spaces
+            .try_begin_edit(index, mm, std::num::NonZeroU64::new(1).unwrap())
+            .expect("exact-MM test Editor license"),
+    ))
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::clone::Clone)]
 pub(crate) struct ForkAliasSnapshot {
@@ -2314,8 +2329,12 @@ pub(crate) fn prepare_test_whole_mm_retirement(
             self.changed.notify_all();
         }
     }
-    struct Publication;
+    struct Publication(u64);
     impl carrick_core::mm::retirement::AddressPublication for Publication {
+        fn mm(&self) -> u64 {
+            self.0
+        }
+
         fn retire_reservations(&self) {}
     }
 
@@ -2323,7 +2342,10 @@ pub(crate) fn prepare_test_whole_mm_retirement(
     let retirement = residency
         .begin_retirement()
         .expect("test MM residency begins retirement");
-    let proof = carrick_core::mm::retirement::drain_publication(Publication, &retirement);
+    let proof = carrick_core::mm::retirement::drain_publication(
+        Publication(task.cow_identity.expect("test task has a COW identity").mm),
+        &retirement,
+    );
 
     if task.registration.is_none() {
         let directory = std::sync::Arc::new(HvpatchCarrierTaskStateDirectory::default());
@@ -3834,7 +3856,12 @@ fn request_carrier_stage2_record_retirements(
                 let snapshot = custody.stage2_record_snapshot(identity.record_id)?;
                 let key = (snapshot.ipa, snapshot.len as u64);
                 let authority_retained = frames.authority_retained_stage2.remove(&key);
-                if frames.stage2_references.contains_key(&key) || authority_retained {
+                let structural = frames
+                    .structural_stage2_references
+                    .contains_key(&(key, stage1_unpublished.mm()));
+                if (!structural && frames.stage2_references.contains_key(&key))
+                    || authority_retained
+                {
                     // Another MM still names this physical lease, or the Kernel
                     // reported a mapping outside the backend population. Consume
                     // the handoff; later exact mapping retirement owns it.
@@ -3844,11 +3871,12 @@ fn request_carrier_stage2_record_retirements(
                         .release_structural_stage2_reference(
                             key,
                             identity,
+                            stage1_unpublished.mm(),
                             carrier_custody::Stage1UnpublicationReceipt::Inventory(
                                 stage1_unpublished,
                             ),
                         )
-                        .ok()?;
+                        .ok()??;
                     Some((identity, proof))
                 }
             })

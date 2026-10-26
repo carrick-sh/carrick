@@ -2000,9 +2000,64 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 .map_err(MappingRetirementError::Indeterminate);
         }
         if !reclaim {
-            self.apply_stage1_rules((va, len), &[(va, len, TerminalRule::pt(PtOp::Retire))])
+            let failure =
+                |what: String| MemoryError::HostMap(format!("guest stage-1 unmap: {what}"));
+            let mm = std::num::NonZeroU64::new(self.mm_generation).ok_or_else(|| {
+                MappingRetirementError::Indeterminate(failure("no MM identity".to_owned()))
+            })?;
+            let slots = carrick_el1_abi::descriptor_txn_slots_host().ok_or_else(|| {
+                MappingRetirementError::Indeterminate(failure("no descriptor slots".to_owned()))
+            })?;
+            self.load_live_stage1_manager()
                 .map_err(MappingRetirementError::Indeterminate)?;
-            return Ok(None);
+            let tables = self.page_tables.clone();
+            let op = tables
+                .with_manager(|manager| {
+                    manager.terminal_op(va, len as u64, TerminalRule::pt(PtOp::Retire))
+                })
+                .ok_or_else(|| {
+                    MappingRetirementError::Indeterminate(failure(
+                        "stage-1 image absent".to_owned(),
+                    ))
+                })?;
+            let txn = tables
+                .prepare_guest_descriptor_txn(mm, op)
+                .map_err(|error| {
+                    MappingRetirementError::Indeterminate(failure(format!("prepare: {error:?}")))
+                })?;
+            let plan = tables.prepare_guest_retirement_proof(&txn).ok_or_else(|| {
+                MappingRetirementError::Indeterminate(failure(
+                    "retirement pre-image absent".to_owned(),
+                ))
+            })?;
+            let required = std::cell::Cell::new(false);
+            let receipts = {
+                let mut services = self.descriptor_services();
+                services.required_invalidation = Some(&required);
+                crate::descriptor_drain::apply_guest_descriptor_txns_now(
+                    &mut services,
+                    slots,
+                    &[txn],
+                )
+                .map_err(|error| {
+                    MappingRetirementError::Indeterminate(failure(format!("apply: {error}")))
+                })?
+            };
+            if required.get() {
+                self.invalidate_after_edit().map_err(|error| {
+                    MappingRetirementError::Indeterminate(failure(format!(
+                        "stage-1 TLBI failed: {error}"
+                    )))
+                })?;
+            }
+            return tables
+                .complete_guest_retirement_proof(va, len, vec![plan], &receipts)
+                .ok_or_else(|| {
+                    MappingRetirementError::Indeterminate(failure(
+                        "verified retirement did not bind its old leaves".to_owned(),
+                    ))
+                })
+                .map(Some);
         }
         let failure = |what: String| MemoryError::HostMap(format!("guest stage-1 unmap: {what}"));
         let mut progress = crate::descriptor_drain::RetirementProgress::default();
@@ -2018,6 +2073,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // One required invalidation after the last piece, as in
         // `apply_stage1_rules`.
         let required = std::cell::Cell::new(false);
+        let mut retirement_plans = Vec::new();
+        let mut retirement_receipts = Vec::new();
         const TWO_MIB: u64 = 2 << 20;
         let mut retire = || -> Result<(), MappingRetirementError> {
             let mut pending = vec![(va, len as u64)];
@@ -2048,14 +2105,26 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                         return Err(progress.before_publication_error(failure(format!("prepare at 0x{start:x}: {error:?}"))));
                     }
                 };
+                let plan = tables.prepare_guest_retirement_proof(&txn).ok_or_else(|| {
+                    progress.before_publication_error(failure(format!(
+                        "retirement pre-image absent at 0x{start:x}"
+                    )))
+                })?;
                 let mut services = self.descriptor_services();
                 services.required_invalidation = Some(&required);
-                crate::descriptor_drain::apply_guest_descriptor_txns_now(
+                let mut receipts = crate::descriptor_drain::apply_guest_descriptor_txns_now(
                     &mut services,
                     slots,
                     &[txn],
                 )
                 .map_err(|error| progress.publication_error(error))?;
+                let receipt = receipts.pop().ok_or_else(|| {
+                    progress.publication_error(crate::descriptor_drain::GuestPublishError::from(
+                        TrapError::Hypervisor("guest retirement receipt absent".to_owned()),
+                    ))
+                })?;
+                retirement_plans.push(plan);
+                retirement_receipts.push(receipt);
                 progress.committed();
             }
             Ok(())
@@ -2068,7 +2137,16 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 )))
             })?;
         }
-        retired.map(|()| None)
+        retired.and_then(|()| {
+            tables
+                .complete_guest_retirement_proof(va, len, retirement_plans, &retirement_receipts)
+                .ok_or_else(|| {
+                    MappingRetirementError::Indeterminate(failure(
+                        "verified retirement did not bind its old leaves".to_owned(),
+                    ))
+                })
+                .map(Some)
+        })
     }
 
     /// Revert uncommitted page table edits from the undo journal to shadow and host memory,

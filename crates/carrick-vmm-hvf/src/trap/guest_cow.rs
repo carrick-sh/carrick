@@ -575,6 +575,7 @@ pub(crate) fn settle_one(
             backing: grant_extent.backing,
             stage2_owner: grant_extent.stage2_owner,
         },
+        state.page_tables_authority().authority_id(),
     )?;
     let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
         carrick_observability::probes::HvpatchTopologyOperation::FrameCow,
@@ -588,14 +589,14 @@ pub(crate) fn settle_one(
     let retired_old_stage2 = HvfVmState::commit_cow_inventory_split(
         &mut state.frame_inventory.ledger.lock(),
         &split,
-        Some((
+        (
             global_frame_stage2_identity_in(
                 custody,
                 split.old.stage2_base,
                 split.old.stage2_length,
             ),
             Stage1UnpublicationReceipt::EditorRange(&stage1),
-        )),
+        ),
         |stage1| {
             retire_released_cow_stage2_owner(
                 custody,

@@ -429,6 +429,7 @@ struct GrantedSlotRecord {
 /// Validated EL1 metadata-aperture retirement operation. The aperture has a
 /// permanent carrier-control stage-1 leaf, so it is outside user-MM SELECT;
 /// only the exact validated return transaction may retire its stage-2 record.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct El1MetadataRetirement {
     identity: crate::trap::CarrierStage2RecordIdentity,
 }

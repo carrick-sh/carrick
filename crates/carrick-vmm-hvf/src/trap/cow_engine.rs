@@ -4006,6 +4006,7 @@ impl HvfTaskState {
                     generation: owner_generation,
                 },
             },
+            self.page_tables_authority().authority_id(),
         ) {
             Ok(split) => split,
             Err(error) => {
@@ -4426,14 +4427,14 @@ impl HvfTaskState {
             HvfVmState::commit_cow_inventory_split(
                 &mut inventory,
                 &split,
-                Some((
+                (
                     global_frame_stage2_identity_in(
                         custody,
                         split.old.stage2_base,
                         split.old.stage2_length,
                     ),
                     Stage1UnpublicationReceipt::EditorRange(stage1),
-                )),
+                ),
                 |released| {
                     retire_released_cow_stage2_owner(
                         custody,
@@ -6489,35 +6490,11 @@ impl HvfVmState {
             }
             return Ok(None);
         };
-        let derived_stage1;
-        let stage1 = match stage1 {
-            Some(receipt) => receipt,
-            None => {
-                let end = va
-                    .checked_add(len as u64)
-                    .ok_or(TrapError::MappingTooLarge(len as u64))?;
-                let mut retired = Vec::new();
-                for row in &read_rows {
-                    let row_end = row.start.saturating_add(row.size as u64);
-                    let mut page = va.max(row.start) & !0xfff;
-                    let limit = end.min(row_end);
-                    while page < limit {
-                        retired.push((page, row.ipa + (page - row.start)));
-                        page = page.saturating_add(4096);
-                    }
-                }
-                derived_stage1 = self
-                    .page_tables_authority()
-                    .verified_replacement_unpublication(va, len, retired)
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor(
-                            "alias retirement did not verify its exact displaced stage-1 leaves"
-                                .to_owned(),
-                        )
-                    })?;
-                Stage1UnpublicationReceipt::EditorRange(&derived_stage1)
-            }
-        };
+        let stage1 = stage1.ok_or_else(|| {
+            TrapError::Hypervisor(
+                "alias retirement lacks its transaction-bound stage-1 receipt".to_owned(),
+            )
+        })?;
         let reservation = reservation.ok_or_else(|| {
             TrapError::Hypervisor(
                 "alias retirement has no prepared inventory reservation".to_owned(),
@@ -7439,12 +7416,17 @@ impl HvfTaskState {
         const TWO_MIB: u64 = 2 * 1024 * 1024;
         let custody = self.custody_arc();
         let frames = std::sync::Arc::clone(&self.frame_inventory.lock().frames);
+        let mm = self
+            .cow_identity
+            .ok_or_else(|| TrapError::Hypervisor("table retirement has no MM identity".into()))?
+            .mm;
         for stage1 in detached {
             let base = stage1.base();
             HvfVmState::retire_unpublished_stage2_lease_from_inventory(
                 &custody,
                 &frames,
                 &mut self.mappings,
+                mm,
                 Stage1UnpublicationReceipt::TableArena(stage1),
                 base,
                 TWO_MIB,

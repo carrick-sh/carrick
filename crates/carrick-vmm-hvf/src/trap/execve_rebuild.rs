@@ -260,6 +260,7 @@ impl PendingExecStage2Cleanup {
                         custody,
                         &self.frames,
                         &mut self.mappings,
+                        stage1_unpublished.mm(),
                         Stage1UnpublicationReceipt::Inventory(stage1_unpublished),
                         ipa,
                         size as u64,

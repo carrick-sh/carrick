@@ -3201,7 +3201,7 @@ fn foreign_cow_prepare_write_rejects_in_span_leaf_discontinuity() {
         let page_tables = child.state.page_tables_authority();
         page_tables
             .edit(
-                crate::trap::test_stage1_edit_license(),
+                crate::trap::test_stage1_edit_license_for(&page_tables),
                 || Err(TrapError::Hypervisor("manager must be present".to_owned())),
                 |editor| {
                     editor
@@ -3350,7 +3350,7 @@ fn foreign_cow_prepare_write_rejects_out_of_span_alias() {
         let page_tables = child.state.page_tables_authority();
         page_tables
             .edit(
-                crate::trap::test_stage1_edit_license(),
+                crate::trap::test_stage1_edit_license_for(&page_tables),
                 || Err(TrapError::Hypervisor("manager must be present".to_owned())),
                 |editor| {
                     editor
@@ -4764,7 +4764,7 @@ fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() 
     let mut block = crate::memory::LINUX_MMAP_BASE + 64 * TWO_MIB;
     pt_auth
         .edit(
-            crate::trap::test_stage1_edit_license(),
+            crate::trap::test_stage1_edit_license_for(&pt_auth),
             || Err(TrapError::Hypervisor("manager must be present".to_owned())),
             |editor| {
                 while editor.pool_stats().3 < 2 {
@@ -4943,7 +4943,7 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
         let mut block = crate::memory::LINUX_MMAP_BASE + 64 * TWO_MIB;
         pt_auth
             .edit(
-                crate::trap::test_stage1_edit_license(),
+                crate::trap::test_stage1_edit_license_for(&pt_auth),
                 || Err(TrapError::Hypervisor("manager must be present".to_owned())),
                 |editor| {
                     while editor.pool_stats().3 < 2 {
@@ -5106,7 +5106,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     let mut mapped_vas = Vec::new();
     parent_authority
         .edit(
-            crate::trap::test_stage1_edit_license(),
+            crate::trap::test_stage1_edit_license_for(&parent_authority),
             || Err(TrapError::Hypervisor("parent manager present".to_owned())),
             |editor| {
                 while editor.pool_stats().3 < 2 {
@@ -6133,7 +6133,9 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
     );
     for mapping in &prepared.mappings {
         if let Some(owner) = &mapping.structural_owner {
-            child_state.install_structural_owner(Arc::clone(owner));
+            child_state
+                .install_structural_owner(Arc::clone(owner))
+                .unwrap();
         }
     }
     let child_snapshot = TestSnapshot {
@@ -6239,7 +6241,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
     if let Some(pages) = owner_cow_pages {
         child_page_tables_authority
             .edit(
-                crate::trap::test_stage1_edit_license(),
+                crate::trap::test_stage1_edit_license_for(&child_page_tables_authority),
                 || panic!("prepared child tables"),
                 |editor| {
                     for page in 0..4 {
@@ -7549,7 +7551,7 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
     );
     for mapping in &prepared.mappings {
         if let Some(owner) = &mapping.structural_owner {
-            state.install_structural_owner(Arc::clone(owner));
+            state.install_structural_owner(Arc::clone(owner)).unwrap();
         }
     }
     let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(806).unwrap());
@@ -8664,7 +8666,9 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     );
     for mapping in &child_task_state.mappings {
         if let Some(owner) = &mapping.structural_owner {
-            stale_mm_access.install_structural_owner(Arc::clone(owner));
+            stale_mm_access
+                .install_structural_owner(Arc::clone(owner))
+                .unwrap();
         }
     }
     let stale_transport = Arc::new(CarrierForeignMmTransport::new());
@@ -9144,7 +9148,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     let tables = task.page_tables_authority();
     tables
         .edit(
-            crate::trap::test_stage1_edit_license(),
+            crate::trap::test_stage1_edit_license_for(&tables),
             || Err(TrapError::Hypervisor("missing test tables".to_owned())),
             |manager| {
                 manager
@@ -9179,7 +9183,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     assert_eq!(task.mappings.len(), before_mappings);
     tables
         .edit(
-            crate::trap::test_stage1_edit_license(),
+            crate::trap::test_stage1_edit_license_for(&tables),
             || Err(TrapError::Hypervisor("missing test tables".to_owned())),
             |manager| {
                 manager
@@ -9205,7 +9209,7 @@ fn shared_extent_repoint_requires_published_leaf_and_only_records_owner() {
     assert_eq!(task.mappings.len(), before_mappings);
     tables
         .edit(
-            crate::trap::test_stage1_edit_license(),
+            crate::trap::test_stage1_edit_license_for(&tables),
             || Err(TrapError::Hypervisor("missing test tables".to_owned())),
             |manager| {
                 manager
@@ -10976,6 +10980,7 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
             2,
         )]),
         stage2_references: std::collections::BTreeMap::from([((sentinel_ipa, sentinel_len), 4)]),
+        structural_stage2_references: std::collections::BTreeMap::new(),
         authority_retained_stage2: std::collections::BTreeSet::from([(sentinel_ipa, sentinel_len)]),
     }));
     let inventory_shared = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory {
@@ -12214,7 +12219,10 @@ fn live_resolver_records_extension_prefix_before_pool_reuse() {
         len,
     )
     .expect("extension structural owner");
-    installed.state.install_structural_owner(Arc::clone(&owner));
+    installed
+        .state
+        .install_structural_owner(Arc::clone(&owner))
+        .unwrap();
     let resolver = MmAccessLiveResolver::new(&installed.state, Arc::clone(&transport.custody));
     assert_eq!(resolver.host_ptr_for_range(base, 0x2000), Some(ptr));
     unsafe { ptr.add(0x1000).write(0xab) };
@@ -12318,16 +12326,23 @@ fn retained_reuse_fixture(
     // munmap: retire the leaves through the host editor while the host
     // still owns descriptors (output retained, VALID clear), then hand the
     // live descriptors to the requested lane.
-    tables
-        .edit(
-            crate::trap::test_stage1_edit_license(),
-            || Err(carrick_mmu_core::aarch64::PageTableError::BadAddress),
-            |editor| {
-                editor.manager.invalidate(TEST_VA, OWNER_LEN, None)?;
-                let resolver = task.page_table_resolver(editor.base(), Some(root_host as *mut u8));
-                unsafe { editor.sync_to_host(resolver) }
-            },
-        )
+    let _editor = TestEditorExclusion::unpublished(installed.snapshot.mm.get());
+    installed
+        .state
+        .with_stage1_edit_license(|license| {
+            tables
+                .edit(
+                    license,
+                    || Err(carrick_mmu_core::aarch64::PageTableError::BadAddress),
+                    |editor| {
+                        editor.manager.invalidate(TEST_VA, OWNER_LEN, None)?;
+                        let resolver =
+                            task.page_table_resolver(editor.base(), Some(root_host as *mut u8));
+                        unsafe { editor.sync_to_host(resolver) }
+                    },
+                )
+                .map_err(|error| TrapError::Hypervisor(format!("retire fixture leaves: {error:?}")))
+        })
         .expect("retire fixture leaves");
     tables.select_live_descriptor_owner(lane);
     let retained = tables
@@ -12734,6 +12749,7 @@ fn host_retained_reuse_repoints_through_the_host_editor() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _external = ExternalAliasStateRestore::capture();
     let _stub = ScopedStage2MapTestStub::enable();
+    let _editor = TestEditorExclusion::unpublished(708);
     let transport = CarrierForeignMmTransport::new();
     let mut fixture = retained_reuse_fixture(
         &transport,
@@ -12869,7 +12885,7 @@ mod guest_cow {
             .state
             .page_tables_authority()
             .edit(
-                crate::trap::test_stage1_edit_license(),
+                crate::trap::test_stage1_edit_license_for(&child.state.page_tables_authority()),
                 || panic!("fixture manager"),
                 |editor| {
                     editor.manager.provision_cow_copy_window(None)?;
@@ -12894,7 +12910,7 @@ mod guest_cow {
                 .state
                 .page_tables_authority()
                 .edit(
-                    crate::trap::test_stage1_edit_license(),
+                    crate::trap::test_stage1_edit_license_for(&child.state.page_tables_authority()),
                     || panic!("fixture manager"),
                     |editor| {
                         editor
@@ -14606,7 +14622,7 @@ fn exercise_retained_import(journal_case: u8) {
         let original = tables.with_manager(|manager| manager.translate(loader_va));
         tables
             .edit(
-                crate::trap::test_stage1_edit_license(),
+                crate::trap::test_stage1_edit_license_for(&tables),
                 || panic!("loader tables missing"),
                 |editor| {
                     editor.begin_undo().unwrap();
@@ -14661,8 +14677,13 @@ fn exercise_retained_import(journal_case: u8) {
                 .pin_count,
             0
         );
-        unsafe { tables.rollback_undo(crate::trap::test_stage1_edit_license(), &resolver) }
-            .unwrap();
+        unsafe {
+            tables.rollback_undo(
+                crate::trap::test_stage1_edit_license_for(&tables),
+                &resolver,
+            )
+        }
+        .unwrap();
         assert_eq!(
             tables.with_manager(|manager| manager.translate(loader_va)),
             original

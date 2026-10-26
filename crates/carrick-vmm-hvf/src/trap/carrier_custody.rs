@@ -446,7 +446,7 @@ impl NeverPublishedRecord {
 pub(crate) enum Stage2RetirementProof {
     Released(super::frame_inventory::Stage1Unpublished),
     NeverPublished(NeverPublishedRecord),
-    Metadata(CarrierStage2RecordIdentity),
+    Metadata(crate::metadata_grant::El1MetadataRetirement),
 }
 
 impl From<super::frame_inventory::Stage1Unpublished> for Stage2RetirementProof {
@@ -478,7 +478,7 @@ impl Stage2RetirementProof {
         match self {
             Self::Released(proof) => proof.identity() == identity,
             Self::NeverPublished(proof) => proof.identity() == identity,
-            Self::Metadata(proof_identity) => *proof_identity == identity,
+            Self::Metadata(proof) => proof.matches(identity),
         }
     }
 }
@@ -1924,7 +1924,7 @@ impl CarrierVmCustody {
         }
         self.request_stage2_record_retirement_with_proof(
             identity,
-            Stage2RetirementProof::Metadata(identity),
+            Stage2RetirementProof::Metadata(proof.clone()),
         )
     }
 
@@ -5204,7 +5204,9 @@ mod carrier_vm_custody_tests {
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             crate::hvf_aarch64_engine::HostCowStats::default(),
         );
-        mm_access.install_structural_owner(std::sync::Arc::clone(&owner));
+        mm_access
+            .install_structural_owner(std::sync::Arc::clone(&owner))
+            .unwrap();
         drop(owner);
         let projection_offset = 0x1000_u64;
         let mut region = region;
@@ -5357,7 +5359,9 @@ mod carrier_vm_custody_tests {
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
             crate::hvf_aarch64_engine::HostCowStats::default(),
         );
-        mm_access.install_structural_owner(std::sync::Arc::clone(&owner));
+        mm_access
+            .install_structural_owner(std::sync::Arc::clone(&owner))
+            .unwrap();
         drop(owner);
         let pin = custody
             .pin_stage2_record(identity)
@@ -5415,7 +5419,7 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
-    fn live_structural_owner_rebinds_exactly_to_g2_before_late_drop() {
+    fn live_structural_owner_rebinds_and_removes_predecessor_before_late_drop() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, g1) = live_custody();
         let key = (0x7d00_2000_0000, 0x4000);
@@ -5464,11 +5468,8 @@ mod carrier_vm_custody_tests {
         assert!(
             custody
                 .stage2_record_snapshot(old_identity.record_id)
-                .is_some_and(|record| {
-                    record.terminalized_by_vm_destroy
-                        && record.superseded_by_rebind
-                        && !record.mapped
-                })
+                .is_none(),
+            "an unpinned terminal predecessor must be removed during rebind"
         );
         assert!(super::alias_backing_is_live(host_addr));
 

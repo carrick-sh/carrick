@@ -232,6 +232,11 @@ impl ExcludedEditor<'_> {
 }
 
 impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'a, C> {
+    /// Exact MM identity whose Editor word admitted this mutation.
+    pub fn key(&self) -> u64 {
+        self.key
+    }
+
     /// The admitted editor retains this exact translation identity even if
     /// a host pause raises the gate while waiting for this guard to leave.
     pub fn grant(&self) -> SpaceGrant {

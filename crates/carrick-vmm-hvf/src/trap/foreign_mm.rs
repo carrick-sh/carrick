@@ -398,6 +398,7 @@ pub(crate) struct MmAccessState {
     pub(crate) structural_owners: parking_lot::RwLock<
         std::collections::BTreeMap<(u64, usize), std::sync::Arc<StructuralBackingOwner>>,
     >,
+    structural_reference_leases: parking_lot::Mutex<std::collections::BTreeSet<(u64, u64)>>,
     pub(crate) mm_root_stage2: parking_lot::Mutex<Option<MmRootStage2Authority>>,
     pub(crate) mutation_coordinator: parking_lot::Mutex<()>,
     /// First-touch producers held only through synchronous descriptor
@@ -962,6 +963,7 @@ impl MmAccessState {
             cow_armed,
             cow_deferred_publications,
             structural_owners: parking_lot::RwLock::new(std::collections::BTreeMap::new()),
+            structural_reference_leases: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             mm_root_stage2: parking_lot::Mutex::new(None),
             mutation_coordinator: parking_lot::Mutex::new(()),
             el1_grant_publications: parking_lot::Mutex::new(PendingEl1GrantPublications::default()),
@@ -1037,7 +1039,22 @@ impl MmAccessState {
         mm: carrick_hal::ForeignMmId,
         binding: CarrierForeignMmBinding,
     ) {
+        if !self.page_tables.read().bind_mm(mm.raw_for_probe()) {
+            carrick_fatal::carrick_fatal!(
+                "hvpatch::stage1_authority",
+                "stage-1 authority rebound to MM {}",
+                mm.raw_for_probe()
+            );
+        }
         *self.identity.write() = Some((mm, binding));
+        self.register_structural_stage2_references()
+            .unwrap_or_else(|error| {
+                carrick_fatal::carrick_fatal!(
+                    "hvpatch::stage2_reference",
+                    "failed to bind structural stage-2 references to MM {}: {error}",
+                    mm.raw_for_probe()
+                )
+            });
         // The initial runner may have recorded backing before the kernel
         // publishes its exact MM identity. Revisit only the same pending
         // admission once both are present.
@@ -1353,9 +1370,45 @@ impl MmAccessState {
         removed
     }
 
-    pub(crate) fn install_structural_owner(&self, owner: std::sync::Arc<StructuralBackingOwner>) {
+    fn register_structural_stage2_references(&self) -> Result<(), TrapError> {
+        let Some(mm) = self
+            .identity
+            .read()
+            .as_ref()
+            .map(|(mm, _)| mm.raw_for_probe())
+        else {
+            return Ok(());
+        };
+        let leases = self
+            .structural_owners
+            .read()
+            .keys()
+            .map(|&(ipa, len)| (ipa, len as u64))
+            .collect::<Vec<_>>();
+        let inventory = self.frame_inventory.lock();
+        let mut frames = inventory.frames.lock();
+        let mut registered = self.structural_reference_leases.lock();
+        for lease in leases {
+            if registered.insert(lease) {
+                frames
+                    .register_structural_stage2_reference(lease, mm)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!(
+                            "register structural stage-2 reference: {error:?}"
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_structural_owner(
+        &self,
+        owner: std::sync::Arc<StructuralBackingOwner>,
+    ) -> Result<(), TrapError> {
         let key = (owner.physical_ipa, owner.physical_size);
         self.structural_owners.write().insert(key, owner);
+        self.register_structural_stage2_references()
     }
 
     fn release_structural_stage2_reference(
@@ -1371,18 +1424,22 @@ impl MmAccessState {
                     "structural reference release lost its exact stage-2 record".to_owned(),
                 )
             })?;
+        let lease = (snapshot.ipa, snapshot.len as u64);
         let inventory = self.frame_inventory.lock();
-        inventory
+        let proof = inventory
             .frames
             .lock()
-            .release_structural_stage2_reference(
-                (snapshot.ipa, snapshot.len as u64),
-                identity,
-                receipt,
-            )
+            .release_structural_stage2_reference(lease, identity, self.stage1_edit_mm()?, receipt)
+            .and_then(|proof| {
+                proof.ok_or(
+                    super::frame_inventory::Stage2ReferenceReleaseError::ReceiptMismatch(lease),
+                )
+            })
             .map_err(|error| {
                 TrapError::Hypervisor(format!("release structural stage-2 reference: {error:?}"))
-            })
+            })?;
+        self.structural_reference_leases.lock().remove(&lease);
+        Ok(proof)
     }
 
     /// Host pointer of the structural owner published for exactly
@@ -1434,7 +1491,7 @@ impl MmAccessState {
         root_slot: Option<(u64, u64)>,
         owner: std::sync::Arc<StructuralBackingOwner>,
     ) -> Result<(), TrapError> {
-        self.install_structural_owner(std::sync::Arc::clone(&owner));
+        self.install_structural_owner(std::sync::Arc::clone(&owner))?;
         if let Some(root_slot) = root_slot
             && owner.physical_ipa == root_slot.0
         {
@@ -2882,6 +2939,7 @@ pub(crate) fn perform_foreign_cow_transaction(
                 generation: owner_generation,
             },
         },
+        lease.state.page_tables_authority().authority_id(),
     ) {
         Ok(split) => split,
         Err(_) => return Err(carrick_hal::ForeignMmTransportError::MutationFailed),
@@ -3458,6 +3516,7 @@ fn perform_foreign_guest_cow(
             backing,
             stage2_owner,
         },
+        lease.state.page_tables_authority().authority_id(),
     )
     .map_err(|_| Error::MutationFailed)?;
     foreign_cow_failpoint(&lease.state, 5)?;
@@ -3688,14 +3747,14 @@ fn finish_foreign_cow_publication(
         HvfVmState::commit_cow_inventory_split(
             &mut inventory,
             &split,
-            Some((
+            (
                 global_frame_stage2_identity_in(
                     &lease.custody,
                     split.old.stage2_base,
                     split.old.stage2_length,
                 ),
                 Stage1UnpublicationReceipt::EditorRange(&stage1),
-            )),
+            ),
             |stage1| {
                 retire_released_cow_stage2_owner(
                 &lease.custody,

@@ -3002,6 +3002,33 @@ pub(crate) fn finalize_carrier_exit_global_frame_owners_in_using(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn settle_rebound_predecessor(
+    custody: &CarrierVmCustody,
+    identity: CarrierStage2RecordIdentity,
+    proof: NeverPublishedRecord,
+    site: &str,
+) -> Result<(), TrapError> {
+    let snapshot = custody
+        .stage2_record_snapshot(identity.record_id)
+        .ok_or_else(|| TrapError::Hypervisor(format!("{site} predecessor disappeared")))?;
+    if snapshot.pin_count == 0 {
+        custody
+            .remove_never_published_terminal_stage2_record(identity, proof)
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!("{site} predecessor refused typed removal"))
+            })?;
+        return Ok(());
+    }
+    match custody.request_never_published_stage2_record_retirement(identity, proof) {
+        CarrierStage2RetireOutcome::DeferredActivePins
+        | CarrierStage2RetireOutcome::TerminalizedByVmDestroy => Ok(()),
+        outcome => Err(TrapError::Hypervisor(format!(
+            "{site} pinned predecessor refused typed retirement: {outcome:?}"
+        ))),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
     custody: &std::sync::Arc<CarrierVmCustody>,
     replayed: &[GlobalFrameReplayExtent],
@@ -3095,8 +3122,12 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             owners.insert(key, GlobalFrameOwnerEntry::Live(successor));
             drop(owners);
             custody.stage2_publication_authority().changed();
-            let _ = custody
-                .remove_never_published_terminal_stage2_record(owner.record_identity, predecessor);
+            settle_rebound_predecessor(
+                custody,
+                owner.record_identity,
+                predecessor,
+                "rebound global-frame",
+            )?;
             report.rebound += 1;
             continue;
         }
@@ -3223,8 +3254,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
             records.insert(key, new_identity);
             drop(records);
             custody.stage2_publication_authority().changed();
-            let _ =
-                custody.remove_never_published_terminal_stage2_record(old_identity, predecessor);
+            settle_rebound_predecessor(custody, old_identity, predecessor, "rebound carrier-MM")?;
             report.rebound += 1;
             continue;
         }
@@ -3322,8 +3352,7 @@ pub(crate) fn reconcile_global_frame_owners_after_replay_in_using(
                     "structural stage-2 owner changed during replay rebind".to_owned(),
                 ));
             }
-            let _ =
-                custody.remove_never_published_terminal_stage2_record(old_identity, predecessor);
+            settle_rebound_predecessor(custody, old_identity, predecessor, "rebound structural")?;
             report.rebound += 1;
             continue;
         }

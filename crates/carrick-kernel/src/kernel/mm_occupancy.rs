@@ -818,7 +818,7 @@ impl carrick_thread::fork_quiesce::FenceMirror for SpaceGate {
 /// an admitted one; EL1 then forwards the fault or syscall to the host.
 pub struct El1EditorExclusion {
     tables: SpaceTables,
-    index: SpaceIndex,
+    index: Option<SpaceIndex>,
     key: u64,
     /// This thread's witness registration (`carrick_hal::el1_editor_exclusion`):
     /// while it is held, engine code on this thread may store to the MM's
@@ -837,8 +837,8 @@ impl std::fmt::Debug for El1EditorExclusion {
 }
 
 /// Exclude the guest EL1 editor of `mm` for the lifetime of the returned
-/// guard. `None` when `mm` has no published address space (EL1 never edits
-/// it).
+/// guard. An unpublished MM still returns a guard: the address-space table's
+/// unpublished proof licenses bootstrap edits before its first publication.
 pub fn exclude_el1_editor(mm: MmId) -> Option<El1EditorExclusion> {
     let zone = crate::el1_zone::zone()?;
     exclude_el1_editor_in(
@@ -854,11 +854,17 @@ pub fn exclude_el1_editor(mm: MmId) -> Option<El1EditorExclusion> {
 
 fn exclude_el1_editor_in(tables: SpaceTables, mm: MmId) -> Option<El1EditorExclusion> {
     let key = mm.raw();
-    let index = tables.spaces.find(key)?;
-    let excluded = tables
-        .spaces
-        .raise_and_wait_for_editor(index, core::hint::spin_loop);
-    settle_excluded(&tables, &excluded);
+    let index = tables.spaces.find(key);
+    let excluded = match index {
+        Some(index) => {
+            let excluded = tables
+                .spaces
+                .raise_and_wait_for_editor(index, core::hint::spin_loop);
+            settle_excluded(&tables, &excluded);
+            excluded
+        }
+        None => tables.spaces.unpublished(key)?,
+    };
     let held = Some(carrick_hal::el1_editor_exclusion::HeldEl1EditorExclusion::register(&excluded));
     Some(El1EditorExclusion {
         tables,
@@ -872,7 +878,9 @@ impl Drop for El1EditorExclusion {
     fn drop(&mut self) {
         drop(self.held.take());
         if self.tables.live() {
-            self.tables.lower_after_edit(self.index);
+            if let Some(index) = self.index {
+                self.tables.lower_after_edit(index);
+            }
         }
     }
 }
@@ -1542,6 +1550,10 @@ fn publish_in_held(
 }
 
 impl carrick_core::mm::retirement::AddressPublication for AddressSpacePublication {
+    fn mm(&self) -> u64 {
+        self.mm.raw()
+    }
+
     fn retire_reservations(&self) {
         AddressSpacePublication::retire_reservations(self);
     }

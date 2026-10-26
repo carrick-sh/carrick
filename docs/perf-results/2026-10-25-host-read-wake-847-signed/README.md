@@ -430,7 +430,8 @@ requires an exact-candidate fixture bundle.
 
 ## Total Editor order and consume-once retirement ownership
 
-The implementation now follows `/tmp/847-DESIGN.md` rather than deriving
+The implementation now follows the stage-1-first design recorded on issue
+[#847](https://github.com/carrick-sh/carrick/issues/847) rather than deriving
 stage-2 retirement authority from a cached absence observation. Host stage-1
 edits require an exact edit license, mint `Stage1LeafRetired` only inside
 `edit_unpublishing`, and publish the Editor revision before lowering host
@@ -544,7 +545,7 @@ stage-2 authority instead of retiring it or aborting. The serialized HVF suite's
 `concurrent_foreign_cow_from_same_snapshot_allows_exactly_one_commit` test
 exercised this case with one remaining mapping.
 
-Records which never reached stage 1 carry a typed `Stage2RollbackReceipt` from
+Records which never reached stage 1 carry a typed `NeverPublishedRecord` from
 registration through the exact publication transaction. Rollback consumes only
 that transaction's receipts, so it cannot skip retirement or accidentally retry
 an unrelated historical owner. Host retention treats a missing host-side table

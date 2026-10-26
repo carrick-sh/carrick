@@ -97,13 +97,32 @@ mod edit_license_sealed {
 /// is held; ring edits use the admitted [`carrick_sched_core::SpaceEditor`]
 /// itself. The sealed trait prevents a caller from manufacturing a third
 /// mutation lane.
-pub trait Stage1EditLicense: edit_license_sealed::Sealed {}
+pub trait Stage1EditLicense: edit_license_sealed::Sealed {
+    fn mm(&self) -> u64;
+    fn is_active(&self) -> bool;
+}
 
-impl Stage1EditLicense for carrick_hal::el1_editor_exclusion::El1EditorExcluded {}
+impl Stage1EditLicense for carrick_hal::el1_editor_exclusion::El1EditorExcluded {
+    fn mm(&self) -> u64 {
+        self.mm()
+    }
 
-impl<C> Stage1EditLicense for carrick_sched_core::SpaceEditor<'_, C> where
-    C: Copy + Send + Sync + zerocopy::FromZeros
+    fn is_active(&self) -> bool {
+        self.is_active()
+    }
+}
+
+impl<C> Stage1EditLicense for carrick_sched_core::SpaceEditor<'_, C>
+where
+    C: Copy + Send + Sync + zerocopy::FromZeros,
 {
+    fn mm(&self) -> u64 {
+        self.key()
+    }
+
+    fn is_active(&self) -> bool {
+        true
+    }
 }
 
 /// Non-cloneable proof that one exact authority image stopped translating
@@ -125,6 +144,18 @@ struct TlbiComplete;
 struct Stage1LeafRetirementPlan {
     authority: u64,
     image_generation: std::num::NonZeroU64,
+    va: u64,
+    len: usize,
+    retired: Vec<(u64, u64)>,
+}
+
+/// Pre-publication half of a guest descriptor retirement. Its fields are
+/// private: only the authority which read the live pre-images can bind them
+/// to the verified transaction that later removes those leaves.
+#[derive(Debug)]
+pub struct PendingGuestStage1Retirement {
+    authority: u64,
+    txn_id: DescriptorTxnId,
     va: u64,
     len: usize,
     retired: Vec<(u64, u64)>,
@@ -198,6 +229,8 @@ impl Stage1LeafRetired {
 }
 
 struct Stage1AuthorityInner {
+    /// Exact Kernel MM identity once this authority is published.
+    mm: Option<u64>,
     manager: TrackedStage1Image,
     arena_source: Option<Box<dyn TableArenaSource>>,
     /// Publishes extension arenas a guest descriptor transaction grows into.
@@ -325,6 +358,9 @@ impl Stage1ImagePool {
 #[derive(Clone)]
 pub struct Stage1Authority {
     inner: Arc<Mutex<Stage1AuthorityInner>>,
+    /// Process-monotonic identity; unlike an `Arc` address, it cannot be
+    /// recycled while a consume-once retirement receipt still names it.
+    authority_id: u64,
 }
 
 impl Default for Stage1Authority {
@@ -337,7 +373,7 @@ impl std::fmt::Debug for Stage1Authority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.lock();
         f.debug_struct("Stage1Authority")
-            .field("authority_id", &self.authority_id())
+            .field("authority_id", &self.authority_id)
             .field("has_manager", &inner.manager.is_some())
             .field("has_source", &inner.arena_source.is_some())
             .field("share_state", &self.share_state())
@@ -357,33 +393,120 @@ fn stage1_primary_in_pool(base: u64) -> bool {
 }
 
 impl Stage1Authority {
-    /// Authenticate a completed replacement against the live stage-1 image
-    /// and bind the exact former translations to a retirement receipt.
-    ///
-    /// EL1 descriptor publication and host sparse publication both settle
-    /// before their displaced physical owners retire.  Their callers retain
-    /// the former `(va, ipa)` leaves from the admitted replacement plan; this
-    /// conversion succeeds only when none of those leaves remains current in
-    /// the same authority image.
-    pub fn verified_replacement_unpublication(
+    /// Bind this authority once to the exact Kernel MM whose Editor licenses
+    /// may mutate it.
+    pub fn bind_mm(&self, mm: u64) -> bool {
+        if mm == 0 {
+            return false;
+        }
+        let mut inner = self.inner.lock();
+        match inner.mm {
+            None => {
+                inner.mm = Some(mm);
+                true
+            }
+            Some(current) => current == mm,
+        }
+    }
+
+    /// Exact Kernel MM identity this authority is bound to, once published.
+    pub fn mm(&self) -> Option<u64> {
+        self.inner.lock().mm
+    }
+
+    fn assert_license(&self, license: &impl Stage1EditLicense) {
+        assert!(license.is_active(), "stage-1 Editor license expired");
+        if let Some(mm) = self.inner.lock().mm {
+            assert_eq!(
+                license.mm(),
+                mm,
+                "stage-1 Editor license belongs to another MM"
+            );
+        }
+    }
+
+    /// Capture the exact live leaves a prepared guest retirement transaction
+    /// may remove. The returned plan is bound to the transaction id and this
+    /// authority image; callers cannot supply old IPA rows themselves.
+    pub fn prepare_guest_retirement_proof(
+        &self,
+        txn: &DescriptorTxn,
+    ) -> Option<PendingGuestStage1Retirement> {
+        let span = match txn.op {
+            DescriptorOp::Retire(span) => span,
+            DescriptorOp::Terminal { span, edit }
+                if matches!(
+                    edit.rule,
+                    carrick_mmu_core::aarch64::TerminalRule::Pt {
+                        op: Some(carrick_mmu_core::aarch64::PtOp::Retire),
+                        ..
+                    }
+                ) =>
+            {
+                span
+            }
+            _ => return None,
+        };
+        let len = usize::try_from(span.len).ok()?;
+        if len == 0 {
+            return None;
+        }
+        let inner = self.inner.lock();
+        let manager = inner.manager.as_ref()?;
+        if manager.base() != txn.root.raw() {
+            return None;
+        }
+        let end = span.end()?;
+        let mut retired = Vec::new();
+        let mut page = span.va;
+        while page < end {
+            if let Some(old_ipa) = manager.translate(page) {
+                retired.push((page, old_ipa));
+            }
+            page = page.checked_add(4096)?;
+        }
+        Some(PendingGuestStage1Retirement {
+            authority: self.authority_id(),
+            txn_id: txn.id,
+            va: span.va,
+            len,
+            retired,
+        })
+    }
+
+    /// Consume verified guest retirements after their owed stage-1 TLBI and
+    /// mint the same exact old-leaf receipt as `edit_unpublishing`.
+    pub fn complete_guest_retirement_proof(
         &self,
         va: u64,
         len: usize,
-        retired: Vec<(u64, u64)>,
+        plans: Vec<PendingGuestStage1Retirement>,
+        receipts: &[VerifiedDescriptorReceipt],
     ) -> Option<Stage1LeafRetired> {
-        if len == 0 || retired.is_empty() {
+        if len == 0 || plans.len() != receipts.len() {
             return None;
         }
         let end = va.checked_add(len as u64)?;
         let inner = self.inner.lock();
         let image_generation = inner.manager.generation?;
         let manager = inner.manager.as_ref()?;
-        if retired.iter().any(|&(page, old_ipa)| {
-            page < va || page >= end || manager.translate(page) == Some(old_ipa)
-        }) {
-            return None;
+        let mut retired = Vec::new();
+        for (plan, receipt) in plans.into_iter().zip(receipts) {
+            let plan_end = plan.va.checked_add(plan.len as u64)?;
+            if plan.authority != self.authority_id()
+                || plan.txn_id != receipt.id()
+                || plan.va < va
+                || plan_end > end
+                || plan
+                    .retired
+                    .iter()
+                    .any(|&(page, old_ipa)| manager.translate(page) == Some(old_ipa))
+            {
+                return None;
+            }
+            retired.extend(plan.retired);
         }
-        Some(Stage1LeafRetired {
+        (!retired.is_empty()).then_some(Stage1LeafRetired {
             authority: self.authority_id(),
             image_generation,
             va,
@@ -489,8 +612,13 @@ impl Stage1Authority {
     }
 
     fn with_pool(manager: Option<PageTableManager>, image_pool: Arc<Stage1ImagePool>) -> Self {
+        static NEXT_AUTHORITY_ID: AtomicU64 = AtomicU64::new(1);
+        let authority_id = NEXT_AUTHORITY_ID.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(authority_id, 0, "stage-1 authority identity exhausted");
         Self {
+            authority_id,
             inner: Arc::new(Mutex::new(Stage1AuthorityInner {
+                mm: None,
                 manager: TrackedStage1Image {
                     image: manager,
                     generation: std::num::NonZeroU64::new(1),
@@ -926,9 +1054,9 @@ impl Stage1Authority {
         inner.engines = inner.engines.saturating_sub(1);
     }
 
-    /// Numerical authority identity (pointer address of the shared inner representation).
+    /// Process-monotonic identity of the shared authority representation.
     pub fn authority_id(&self) -> u64 {
-        Arc::as_ptr(&self.inner) as usize as u64
+        self.authority_id
     }
 
     /// True if `self` and `other` point to the exact same inner authority.
@@ -1120,7 +1248,8 @@ impl Stage1Authority {
     }
 
     /// Discard the open undo journal, committing all edits in the current transaction.
-    pub fn commit_undo(&self, _license: &impl Stage1EditLicense) {
+    pub fn commit_undo(&self, license: &impl Stage1EditLicense) {
+        self.assert_license(license);
         if let Some(manager) = self.inner.lock().manager.as_mut() {
             manager.commit_undo();
         }
@@ -1133,9 +1262,10 @@ impl Stage1Authority {
     /// `resolver` must return valid host pointers for all touched page table arenas.
     pub unsafe fn rollback_undo(
         &self,
-        _license: &impl Stage1EditLicense,
+        license: &impl Stage1EditLicense,
         resolver: impl HostArenaResolver,
     ) -> Result<Vec<u64>, PageTableError> {
+        self.assert_license(license);
         let mut inner = self.inner.lock();
         let inner = &mut *inner;
         let live_owner = inner.live_owner;
@@ -1153,7 +1283,7 @@ impl Stage1Authority {
     #[allow(clippy::expect_used)]
     pub fn try_edit_until<B, F, R, E>(
         &self,
-        _license: &impl Stage1EditLicense,
+        license: &impl Stage1EditLicense,
         deadline: std::time::Instant,
         on_timeout: E,
         on_absent: E,
@@ -1164,6 +1294,7 @@ impl Stage1Authority {
         B: FnOnce() -> Result<PageTableManager, E>,
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
     {
+        self.assert_license(license);
         let authority = self.authority_id();
         let mut inner = self.inner.try_lock_until(deadline).ok_or(on_timeout)?;
         if inner.manager.is_none() {
@@ -1493,7 +1624,7 @@ impl Stage1Authority {
     #[allow(clippy::expect_used)]
     pub fn edit<B, F, R, E>(
         &self,
-        _license: &impl Stage1EditLicense,
+        license: &impl Stage1EditLicense,
         builder: B,
         f: F,
     ) -> Result<R, E>
@@ -1501,6 +1632,7 @@ impl Stage1Authority {
         B: FnOnce() -> Result<PageTableManager, E>,
         F: FnOnce(&mut Stage1Editor<'_>) -> Result<R, E>,
     {
+        self.assert_license(license);
         let authority = self.authority_id();
         {
             let mut inner = self.inner.lock();
@@ -1587,10 +1719,11 @@ impl Stage1Authority {
     /// restores quiesced descriptors to live host memory, and replaces the manager. Returns the replaced manager.
     pub fn restore_image(
         &self,
-        _license: &impl Stage1EditLicense,
+        license: &impl Stage1EditLicense,
         image: &mut Option<PageTableManager>,
         site: u32,
     ) -> Result<Option<PageTableManager>, PageTableError> {
+        self.assert_license(license);
         let snapshot = image.as_mut().ok_or(PageTableError::BadAddress)?;
         let authority = self.authority_id();
         let mut inner = self.inner.lock();
@@ -1627,7 +1760,7 @@ impl Stage1Authority {
     /// across manager image restores.
     pub unsafe fn restore_image_and_host<H>(
         &self,
-        _license: &impl Stage1EditLicense,
+        license: &impl Stage1EditLicense,
         image: &mut Option<PageTableManager>,
         site: u32,
         resolve_page_table_host: H,
@@ -1635,6 +1768,7 @@ impl Stage1Authority {
     where
         H: HostArenaResolver,
     {
+        self.assert_license(license);
         let snapshot = image.as_mut().ok_or(PageTableError::BadAddress)?;
         let authority = self.authority_id();
         let mut inner = self.inner.lock();
@@ -1661,9 +1795,10 @@ impl Stage1Authority {
     /// Only this exec's vfork share is consumed; other sharers remain live.
     pub fn install_exec_successor(
         &mut self,
-        _license: &impl Stage1EditLicense,
+        license: &impl Stage1EditLicense,
         successor: Self,
     ) -> Result<bool, String> {
+        self.assert_license(license);
         if self.shares_exact_authority(&successor) {
             return Err("exec successor reused its predecessor table authority".into());
         }
@@ -1709,7 +1844,7 @@ impl Stage1Authority {
     /// Pure transition for `execve` authority replacement returning `(new_authority, was_shared)`.
     pub(crate) fn replace_for_exec_internal<B, R, E>(
         &mut self,
-        _license: &impl Stage1EditLicense,
+        license: &impl Stage1EditLicense,
         builder: B,
         mut retirer: R,
     ) -> Result<(Stage1Authority, bool), E>
@@ -1717,6 +1852,7 @@ impl Stage1Authority {
         B: FnOnce() -> Result<Option<PageTableManager>, E>,
         R: FnMut(&[carrick_mmu_core::aarch64::TableArenaDetached]) -> Result<(), E>,
     {
+        self.assert_license(license);
         let is_shared = {
             let mut inner = self.inner.lock();
             if inner.vfork_shares > 0 {
@@ -4447,7 +4583,36 @@ pub(crate) mod tests {
             .prepare_guest_descriptor_txn(nz(9), DescriptorOp::Retire(PageSpan::new(va, 4096)))
             .unwrap();
         assert_eq!(retire.id.generation, nz(2));
-        authority.abandon_guest_descriptor_txn(&retire).unwrap();
+        let plan = authority
+            .prepare_guest_retirement_proof(&retire)
+            .expect("authority captures the retirement pre-image");
+        let retire_receipt = {
+            let mut buf = resolver.buf.lock().unwrap();
+            let maintenance = CallerInvalidatesAsid;
+            let words = unsafe {
+                PrimaryTableWords::new(
+                    buf.as_mut_ptr().cast(),
+                    LINUX_PAGE_TABLES_BASE,
+                    LINUX_PAGE_TABLES_SIZE as usize,
+                    &maintenance,
+                )
+            }
+            .unwrap();
+            let mut journal = InlineJournal::new();
+            execute_descriptor_txn(
+                &words,
+                carrick_mmu_core::aarch64::SubstrateGpa(LINUX_PAGE_TABLES_BASE),
+                &retire,
+                &mut journal,
+            )
+        };
+        let verified_retire = authority
+            .settle_guest_descriptor_receipt(&retire, &retire_receipt)
+            .unwrap();
+        let retired = authority
+            .complete_guest_retirement_proof(va, 4096, vec![plan], &[verified_retire])
+            .expect("verified transaction binds the removed old leaf");
+        assert!(retired.names(ipa, 4096));
 
         // The host-owned lane never builds guest transactions.
         let host_lane = Stage1Authority::new_with_manager(Some(test_manager()));
