@@ -56,6 +56,9 @@ pub(super) struct PendingService<'a> {
     _exec_payload: Option<Box<[u8]>>,
     exec_successor: Option<Box<dyn ExecSuccessorSlot + 'a>>,
     retry_syscall_after_supply: bool,
+    /// A completed in-ring syscall result survives the carrier's readiness
+    /// wake, whose scheduler result is not a guest return value.
+    completed_carrier_result: Option<SyscallResult>,
     request: ServiceRequest,
     pub(super) wait: Option<carrick_core_abi::PortalOwnerWait>,
     pub(super) claim: carrick_core::terminal::NativeServiceClaim<&'a ThreadLifecyclePage>,
@@ -351,6 +354,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .and_then(|mm| self.service.prepare_exec_successor_slot(mm))
             })
             .transpose()?;
+        let completed_carrier_result = matches!(operation, ServiceOperation::CarrierWork { .. })
+            .then(|| SyscallResult::new(self.words.syscall_return() as i64));
         let mut reply = match operation {
             ServiceOperation::Fault(fault) if !fault.present && fault_sequence.is_some() => {
                 Some(PendingServiceReply::Fault(
@@ -424,6 +429,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 _exec_payload: exec_payload,
                 exec_successor,
                 retry_syscall_after_supply,
+                completed_carrier_result,
                 request,
                 wait: owner_wait,
                 claim,
@@ -1404,9 +1410,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     // Return the retained result explicitly: the service wake's
                     // scheduling result is only readiness and must not overwrite
                     // the completed syscall value saved in this continuation.
-                    Ok(NativeResume::Returned(SyscallResult::new(
-                        self.words.syscall_return() as i64,
-                    )))
+                    pending
+                        .completed_carrier_result
+                        .map(NativeResume::Returned)
+                        .ok_or(NativeProcessError::Quarantined)
                 }
                 (ServiceOperation::CarrierWork { .. }, ServiceResult::Refused) => {
                     Err(NativeProcessError::Quarantined)
