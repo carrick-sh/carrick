@@ -2609,7 +2609,7 @@ fn sigkill_wins_over_an_in_progress_native_exec_drain() {
 
 #[cfg(test)]
 #[test]
-fn native_parent_observes_exec_child_exit_after_successor_first_syscall() {
+fn native_parent_reaps_then_execs_a_child_after_slot_reuse() {
     let capacity = NativeServiceCapacityFixture::new(1);
     let fixture = &capacity.fixture;
     let (child_record, child_address, child_words) = capacity.select().unwrap();
@@ -2702,7 +2702,53 @@ fn native_parent_observes_exec_child_exit_after_successor_first_syscall() {
         }
         _ => panic!("parent wait4 did not return the exec child's pid"),
     }
+    let second_pid = match parent.fork(ProcessForkChildTid::NONE) {
+        LifecycleOutcome::Returned { result, .. } if result.raw() > 0 => result.raw() as u32,
+        _ => panic!("parent could not fork after reaping the first exec child"),
+    };
+    assert!(matches!(
+        parent.wait4(
+            ProcessWaitPid::from_syscall_argument(u64::MAX),
+            UserVa::new(0x1000),
+            LinuxWaitOptions::empty(),
+            UserVa::new(0),
+        ),
+        LifecycleOutcome::Transferred { .. }
+    ));
+    assert!(parent.take_handoff_receipt().is_some());
     drop(parent);
     assert_eq!(parent_service.copies, vec![LinuxWaitStatus::exited(7)]);
     assert_ne!(parent_record, child_record);
+
+    let (reused_record, reused_address, reused_words) = capacity.select().unwrap();
+    assert_eq!(
+        reused_record.id, child_record.id,
+        "the retired lifecycle slot must be reused by the second child"
+    );
+    assert_ne!(
+        reused_record.incarnation, child_record.incarnation,
+        "slot reuse must publish a fresh record incarnation"
+    );
+    assert_eq!(fixture.task.visible_pid(), Some(second_pid));
+    let mut reused_service = fixture.service();
+    let mut reused = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            reused_address,
+            &reused_words,
+            &mut reused_service,
+        )
+        .unwrap();
+    assert!(matches!(
+        reused.resume_checkpoint(),
+        Ok(NativeResume::NoPending)
+    ));
+    assert!(matches!(
+        reused.begin_exec_service(test_exec_payload(b"/bin/reused")),
+        Ok(NativeResume::Left(None))
+    ));
+    assert!(reused.take_handoff_receipt().is_some());
 }
