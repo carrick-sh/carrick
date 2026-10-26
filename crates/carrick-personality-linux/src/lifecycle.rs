@@ -298,6 +298,14 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     ) -> Result<(), i64> {
         publish()
     }
+    /// Stock one thread birth into this process's empty `page` at the clone
+    /// instant. A venue that owns its process's thread identities consumes a
+    /// TID only here, when a thread is actually being created, never ahead
+    /// of demand (fork, exec or a singleton process reserve nothing).
+    /// `false`: this venue has no in-zone identity authority for `page`.
+    fn stock_thread_birth(&mut self, _page: &ThreadLifecyclePage) -> bool {
+        false
+    }
     /// Notify an owned exit only after a claim's rollback or Born enqueue has
     /// finished. The venue releases graph ownership before publishing a wake.
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
@@ -476,6 +484,10 @@ pub trait LifecycleNative<'a>: UserCopy {
         Ok(())
     }
     fn thread_exited(&mut self, _verdict: carrick_core::terminal::RetirementVerdict) {}
+    /// See [`ProcessNative::stock_thread_birth`].
+    fn stock_thread_birth(&mut self, _page: &ThreadLifecyclePage) -> bool {
+        false
+    }
     fn route_host_thread_exit(
         &mut self,
         _verdict: carrick_core::terminal::RetirementVerdict,
@@ -959,6 +971,34 @@ impl TidOutputs {
     }
 }
 
+/// A clone whose pool claim was refused: the result the caller returns.
+fn refuse_clone_claim<'a>(
+    error: TransitionError,
+    native: &mut dyn LifecycleNative<'a>,
+) -> Option<i64> {
+    match error {
+        TransitionError::GateClosed(gate) => {
+            // A speculative claim may have been observed by an exit before
+            // the gate check backed it out. That rollback also owes a wake.
+            if native.lifecycle_admission_settled().is_err() {
+                native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+            }
+            match gate {
+                GateState::ForkClosing | GateState::AwaitingExecBinding | GateState::HostOnly => {
+                    None
+                }
+                GateState::Closed | GateState::Open => Some(-11),
+            }
+        }
+        error => {
+            if error == TransitionError::PoolEmpty {
+                native.record_decline(LifecycleDecline::ClonePoolEmpty);
+            }
+            None
+        }
+    }
+}
+
 /// `clone(flags, stack, parent_tid, tls, child_tid)` creating a thread.
 /// `Some(visible tid)`: the child is born and queued.
 fn serve_clone<'a>(
@@ -999,26 +1039,15 @@ fn serve_clone<'a>(
 
     let state = native.task_state()?;
     let affinity = native.affinity()?;
-    let claimed = match page.claim_any() {
-        Ok(claimed) => claimed,
-        Err(TransitionError::GateClosed(gate)) => {
-            // A speculative claim may have been observed by an exit before
-            // the gate check backed it out. That rollback also owes a wake.
-            if native.lifecycle_admission_settled().is_err() {
-                native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+    let mut stocked = false;
+    let claimed = loop {
+        match page.claim_any() {
+            Ok(claimed) => break claimed,
+            // An owning venue issues the identity now, at the clone instant.
+            Err(TransitionError::PoolEmpty) if !stocked && native.stock_thread_birth(page) => {
+                stocked = true;
             }
-            return match gate {
-                GateState::ForkClosing | GateState::AwaitingExecBinding | GateState::HostOnly => {
-                    None
-                }
-                GateState::Closed | GateState::Open => Some(-11),
-            };
-        }
-        Err(error) => {
-            if error == TransitionError::PoolEmpty {
-                native.record_decline(LifecycleDecline::ClonePoolEmpty);
-            }
-            return None;
+            Err(error) => return refuse_clone_claim(error, native),
         }
     };
     // This exact owned claim is the sole authority for Claimed -> Reserved.

@@ -769,9 +769,24 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     pending_child_tid: Option<UserVa>,
     signals: NativeProcessSignals<'a, carrick_personality_linux::abi::signal::LinuxSiginfo>,
     _thread_claim: NativeClaim,
+    /// In-zone thread-birth authority of a native fork child. A host-admitted
+    /// root has none: its host ledger stocks its page.
+    births: Option<NativeBirthStock<'a>>,
     channel: Option<Arc<WaitChannel>>,
     usage: TaskRusage,
     file_table: u64,
+}
+/// A native process's own thread births. Identities are issued one at a time
+/// at the clone instant, never ahead of demand: Linux consumes a TID only
+/// when a thread is created, so a fork stocks nothing and a singleton process
+/// owns no reserved gap in the visible TID space.
+pub struct NativeBirthStock<'a> {
+    /// Retained control slots; entry `i` binds slot `i + 1`.
+    controls: &'a [ThreadControlSlot],
+    /// The namespace claim behind each stocked entry index. Restocking an
+    /// index (only from `Vacant`, `Reaped` or `Revoked`) drops its previous
+    /// incarnation's claim, so claims stay bounded by the page.
+    claims: Vec<(usize, NativeClaim)>,
 }
 pub type NativeForkPreparation<'a, M, P, C> = PreparedFork<
     VisibleNamespace,
@@ -3153,6 +3168,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             pending_child_tid: None,
             signals,
             _thread_claim: thread_claim,
+            births: None,
             channel: None,
             usage: TaskRusage::default(),
             file_table,
@@ -3576,7 +3592,6 @@ struct ForkReservation<'a, M> {
     visible: VisibleIdentity,
     claim: NativeClaim,
     thread_claim: NativeClaim,
-    pool_identities: Vec<EntryIdentity>,
     parent_mm: M,
     identity: TaskIdentity,
     group: u32,
@@ -6196,7 +6211,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             visible,
             claim,
             thread_claim,
-            pool_identities,
             parent_mm,
             identity,
             group,
@@ -6283,7 +6297,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .ok_or(NativeProcessError::Exhausted)?;
             let namespace = graph.namespace.clone();
             let visible_namespace = graph.visible_namespace;
-            let (number, visible, pool) = {
+            let (number, visible) = {
                 let mut ns = namespace.lock();
                 let number = ns
                     .reserve_next(ClaimKind::Task)
@@ -6297,47 +6311,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     ns.release(number, ClaimKind::Task);
                     return Err(NativeProcessError::Exhausted);
                 };
-                let mut pool = Vec::new();
-                if pool
-                    .try_reserve(carrick_el1_abi::THREAD_POOL_STANDING_DEPTH)
-                    .is_err()
-                {
-                    ns.release(number, ClaimKind::Thread);
-                    ns.release(number, ClaimKind::Task);
-                    return Err(NativeProcessError::Exhausted);
-                }
-                for _ in 0..carrick_el1_abi::THREAD_POOL_STANDING_DEPTH {
-                    let Some(serial) = self.runtime.zone.serial_issuer().allocate() else {
-                        for &(reserved, _, _) in &pool {
-                            ns.release(reserved, ClaimKind::Thread);
-                        }
-                        ns.release(number, ClaimKind::Thread);
-                        ns.release(number, ClaimKind::Task);
-                        return Err(NativeProcessError::Exhausted);
-                    };
-                    let reserved = match ns.reserve_next(ClaimKind::Thread) {
-                        Ok(reserved) => reserved,
-                        Err(_) => {
-                            for &(reserved, _, _) in &pool {
-                                ns.release(reserved, ClaimKind::Thread);
-                            }
-                            ns.release(number, ClaimKind::Thread);
-                            ns.release(number, ClaimKind::Task);
-                            return Err(NativeProcessError::Exhausted);
-                        }
-                    };
-                    let Some(pool_visible) = ns.reserve_visible(visible_namespace) else {
-                        ns.release(reserved, ClaimKind::Thread);
-                        for &(reserved, _, _) in &pool {
-                            ns.release(reserved, ClaimKind::Thread);
-                        }
-                        ns.release(number, ClaimKind::Thread);
-                        ns.release(number, ClaimKind::Task);
-                        return Err(NativeProcessError::Exhausted);
-                    };
-                    pool.push((reserved, pool_visible, serial));
-                }
-                (number, visible, pool)
+                (number, visible)
             };
             let child_key = TaskKey {
                 id: carrick_personality_linux::identity::task_id_from_linux_pid(number.get())
@@ -6351,23 +6325,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             };
             let thread_claim = NativeClaim {
                 namespace,
-                claims: core::iter::once((number, ClaimKind::Thread))
-                    .chain(
-                        pool.iter()
-                            .map(|(number, _, _)| (*number, ClaimKind::Thread)),
-                    )
-                    .collect(),
+                claims: vec![(number, ClaimKind::Thread)],
             };
-            let pool_identities = pool
-                .into_iter()
-                .map(|(number, visible, serial)| EntryIdentity {
-                    tid: number.get() as u32,
-                    visible_tid: visible.get(),
-                    thread_serial: serial.get(),
-                    birth: carrick_core_abi::entry::BirthSerial::of_task(child_key.serial),
-                    uid_credit: 0,
-                })
-                .collect();
             let permit = graph
                 .owner
                 .reserve_birth(snapshot, snapshot, transaction)
@@ -6381,7 +6340,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 visible,
                 claim,
                 thread_claim,
-                pool_identities,
                 parent_mm,
                 identity,
                 group,
@@ -6430,7 +6388,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             visible,
             claim,
             thread_claim,
-            pool_identities,
             parent_mm,
             identity,
             group,
@@ -6471,7 +6428,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             visible,
             claim,
             thread_claim,
-            pool_identities,
             parent_mm: _,
             identity,
             group,
@@ -6588,16 +6544,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 })?;
             page.publish(born)
                 .map_err(|_| NativeProcessError::Invalid)?;
-            for identity in pool_identities {
-                let entry = (0..page.entry_count())
-                    .find_map(|index| page.stock(index, identity).ok())
-                    .ok_or(NativeProcessError::Exhausted)?;
-                let control = lifecycle
-                    .born_slot(entry)
-                    .ok_or(NativeProcessError::Invalid)?;
-                page.bind_control_address(entry, control as *const _ as u64)
-                    .map_err(|_| NativeProcessError::Invalid)?;
-            }
             Ok(control)
         })();
         let control = match metadata {
@@ -6710,6 +6656,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             pending_child_tid: child_tid.set.then_some(child_tid.address),
             signals,
             _thread_claim: thread_claim,
+            births: Some(NativeBirthStock {
+                controls: lifecycle.controls,
+                claims: Vec::new(),
+            }),
             channel: None,
             usage: TaskRusage::default(),
             file_table: child_file_table,
@@ -7047,6 +6997,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         }
         Ok(())
     }
+    fn stock_thread_birth(&mut self, page: &ThreadLifecyclePage) -> bool {
+        self.stock_native_thread_birth(page).is_some()
+    }
     fn retire_thread_verdict(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
         self.retire_thread_verdict(verdict);
     }
@@ -7334,6 +7287,61 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
             }
         }
+    }
+
+    /// Issue one thread identity into this native process's empty page at
+    /// the clone instant: the namespace TID and visible TID are reserved
+    /// here, under the graph owner, and nowhere ahead of demand.
+    #[inline(never)]
+    fn stock_native_thread_birth(&mut self, page: &ThreadLifecyclePage) -> Option<EntryRef> {
+        let mut graph = self.runtime.graph.lock();
+        let namespace = graph.namespace.clone();
+        let visible_namespace = graph.visible_namespace;
+        let task = graph.owner.task_mut(self.key).ok()?;
+        let birth = carrick_core_abi::entry::BirthSerial::of_task(task.key().serial);
+        let resources = task.native_mut().resources_mut();
+        if !core::ptr::eq(resources.page, page) || !page.gate().serves_ring() {
+            return None;
+        }
+        let stock = resources.births.as_mut()?;
+        stock.claims.try_reserve(1).ok()?;
+        let serial = self.runtime.zone.serial_issuer().allocate()?;
+        let (number, visible) = {
+            let mut ns = namespace.lock();
+            let number = ns.reserve_next(ClaimKind::Thread).ok()?;
+            let Some(visible) = ns.reserve_visible(visible_namespace) else {
+                ns.release(number, ClaimKind::Thread);
+                return None;
+            };
+            (number, visible)
+        };
+        // Dropped on refusal, this claim releases the reservation it carries.
+        let claim = NativeClaim {
+            namespace,
+            claims: vec![(number, ClaimKind::Thread)],
+        };
+        let identity = EntryIdentity {
+            tid: number.get() as u32,
+            visible_tid: visible.get(),
+            thread_serial: serial.get(),
+            birth,
+            uid_credit: 0,
+        };
+        let entry = (0..page.entry_count()).find_map(|index| {
+            let control = stock.controls.get(index.checked_add(1)?)?;
+            page.stock_bound(index, identity, control as *const _ as u64)
+                .ok()
+        })?;
+        match stock
+            .claims
+            .iter_mut()
+            .find(|(index, _)| *index == entry.index())
+        {
+            // The replaced incarnation was Vacant, Reaped or Revoked.
+            Some((_, previous)) => *previous = claim,
+            None => stock.claims.push((entry.index(), claim)),
+        }
+        Some(entry)
     }
 
     fn retire_thread_identity(&mut self, tid: u32) {
@@ -11858,6 +11866,14 @@ mod tests {
     fn interrupted_child_wait_custody_is_cleared_when_process_closes() {
         compact_root_fork_wait_contract(true, false, false, false, None, true);
     }
+    fn reserved_entries(page: &ThreadLifecyclePage) -> usize {
+        (0..page.entry_count())
+            .filter(|&index| {
+                page.state(index)
+                    .is_some_and(|(_, state)| state == carrick_el1_abi::EntryState::Reserved)
+            })
+            .count()
+    }
     fn compact_root_fork_wait_contract(
         interrupt_wait: bool,
         catch_child_exit: bool,
@@ -11980,15 +11996,9 @@ mod tests {
             assert_ne!(child, parent);
             assert_eq!(child_page.gate(), carrick_el1_abi::GateState::Open);
             assert_eq!(
-                (0..child_page.entry_count())
-                    .filter(|&index| {
-                        child_page.state(index).is_some_and(|(_, state)| {
-                            state == carrick_el1_abi::EntryState::Reserved
-                        })
-                    })
-                    .count(),
-                carrick_el1_abi::THREAD_POOL_STANDING_DEPTH,
-                "the native child must not fall through to retired host birth authority"
+                reserved_entries(&child_page),
+                0,
+                "fork consumes no thread identity ahead of the child's first clone"
             );
             assert_eq!(
                 runtime.graph.lock().owner.task(child).unwrap().parent(),
@@ -12094,6 +12104,23 @@ mod tests {
             let mut child_entry = runtime
                 .enter(source, &task, child_words, &mut service)
                 .unwrap();
+            // The child's first clone issues its in-zone birth under the
+            // native owner, never through retired host birth authority, and
+            // takes the next sequential visible TID: fork reserved no gap.
+            assert!(ProcessNative::stock_thread_birth(
+                &mut child_entry,
+                &child_page
+            ));
+            assert_eq!(reserved_entries(&child_page), 1);
+            let stocked = (0..child_page.entry_count())
+                .find_map(|index| {
+                    let (generation, state) = child_page.state(index)?;
+                    (state == carrick_el1_abi::EntryState::Reserved)
+                        .then(|| EntryRef::new(index as u32, generation))
+                })
+                .unwrap();
+            assert_eq!(child_page.identity(stocked).unwrap().visible_tid, 43);
+            assert_ne!(child_page.control_address(stocked), Some(0));
             use carrick_personality_linux::signal::{ProcessSignals, SignalInfo};
             let forged = carrick_syscall_abi::LinuxSiginfo::kill(
                 10,
