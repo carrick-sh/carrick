@@ -338,6 +338,10 @@ pub(crate) struct PreparedNativeExecSuccessor {
     root: carrick_guest_arch::RootGpa,
     entry: u64,
     stack_pointer: u64,
+    #[cfg(test)]
+    _test_backing: Option<std::sync::Arc<crate::fork_stock::NativeFrameBacking>>,
+    #[cfg(test)]
+    _test_ipa_lease: Option<GlobalFrameStage2Lease>,
 }
 
 // SAFETY: this is deliberately a movable, unpublished transaction.  Every raw
@@ -385,6 +389,46 @@ impl PreparedNativeExecSuccessor {
     ) {
         (self.physical, self.asid.publish())
     }
+
+    #[cfg(test)]
+    pub(crate) fn installed_cancel_fixture(
+        custody: &std::sync::Arc<CarrierVmCustody>,
+    ) -> Result<Self, TrapError> {
+        let lease = GlobalFrameStage2Lease::reserve(0x4000, 0x20_0000)?;
+        let ipa = lease.key().0;
+        let generation = 1;
+        let backing = std::sync::Arc::new(crate::fork_stock::NativeFrameBacking {
+            carrier: std::sync::Arc::downgrade(custody),
+            ipa,
+            generation,
+            length: 0x4000,
+        });
+        custody
+            .native_frame_backings
+            .lock()
+            .insert((ipa, generation), std::sync::Arc::downgrade(&backing));
+        let asid = custody
+            .asid_allocator()
+            .allocate_unpublished()
+            .map_err(|error| TrapError::Hypervisor(format!("test exec ASID: {error}")))?;
+        Ok(Self {
+            physical: Default::default(),
+            asid,
+            root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                0x90_0000,
+            ))
+            .ok_or_else(|| TrapError::Hypervisor("test exec root".into()))?,
+            entry: 0x40_0000,
+            stack_pointer: 0x7fff_f000,
+            _test_backing: Some(backing),
+            _test_ipa_lease: Some(lease),
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn exec_ipa_lease_count_for_tests() -> usize {
+    global_frame_ipa_allocator().lock().live.len()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -427,6 +471,10 @@ pub(crate) fn prepare_native_exec_successor(
         root,
         entry,
         stack_pointer,
+        #[cfg(test)]
+        _test_backing: None,
+        #[cfg(test)]
+        _test_ipa_lease: None,
     })
 }
 

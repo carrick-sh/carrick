@@ -1238,6 +1238,7 @@ const _: () = {
     assert!(core::mem::offset_of!(CurrentTask, metadata.lifecycle_page) == 64);
     assert!(core::mem::offset_of!(CurrentTask, metadata.control_slot) == 72);
     assert!(core::mem::offset_of!(CurrentTask, metadata.visible_pid) == 80);
+    assert!(core::mem::offset_of!(CurrentTask, metadata.ptrace_traced) == 84);
     assert!(core::mem::offset_of!(CurrentTask, root_generation) == 88);
 };
 
@@ -1311,6 +1312,18 @@ impl CurrentTask {
         (pid != 0).then_some(pid)
     }
 
+    /// Whether the exact host-loaded task has an attached ptrace tracer.
+    pub fn ptrace_traced(&self) -> bool {
+        self.metadata.ptrace_traced.load(Ordering::Acquire) != 0
+    }
+
+    /// Publish the ptrace state before making a loaded execution visible.
+    pub fn publish_ptrace_traced(&self, traced: bool) {
+        self.metadata
+            .ptrace_traced
+            .store(u32::from(traced), Ordering::Relaxed);
+    }
+
     /// The exact incarnation of the host-loaded ARM translation root.
     /// A scheduler record's incarnation and execution generation are separate.
     pub fn root_generation(&self) -> Option<carrick_guest_arch::ContextGeneration> {
@@ -1339,6 +1352,7 @@ impl CurrentTask {
         self.root_generation.store(0, Ordering::Release);
         self.publish_lifecycle(0, 0);
         self.publish_visible_pid(0);
+        self.publish_ptrace_traced(false);
     }
 
     #[inline]

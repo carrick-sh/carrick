@@ -1914,8 +1914,13 @@ fn service_native_exec_adopt(
         return Ok(refused);
     }
     let (physical, asid) = prepared.consume();
-    // SAFETY: the ring published this exact closed reservation owner before
-    // crossing; the sealed manifest binds its incarnation to this receipt.
+    // SAFETY: the ring's reservation/retirement owner chooses and publishes
+    // this exact closed successor incarnation before crossing. The host
+    // intentionally trusts that ring-owned choice, as it does for the fork
+    // completion precedent in `fork_stock`: the sealed manifest binds the
+    // chosen incarnation to both this receipt and the stopped predecessor,
+    // while the checks above authenticate the host-retained root, ASID, and
+    // MM key rather than independently inventing a second incarnation.
     let successor_handle = unsafe {
         carrick_el1_abi::El1MmHandle::from_admitted_owner(
             custody.transfer_carrier,
@@ -2466,6 +2471,149 @@ fn root_execution(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn exec_cancel_crossing_restores_all_preparation_baselines() {
+        use carrick_core_abi::service::{ServiceBirth, ServiceIdentity};
+        use carrick_sched_core::{
+            RecordId, RecordRef,
+            process::{TaskId, TaskKey, TaskSerial},
+        };
+        use core::num::{NonZeroI32, NonZeroU64};
+
+        let _serialize = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let mut region = carrick_test_support::TestEl1Region::zeroed();
+        let ptr = region.as_mut_ptr();
+        // SAFETY: exclusive aligned, zero-valid fixture ABI storage.
+        let zone = unsafe {
+            &*ptr
+                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .cast::<carrick_el1_abi::ZoneTables>()
+        };
+        let cpu = carrick_guest_arch::CpuId::new(3);
+        let slot = carrick_guest_arch::SlotId::new(3);
+        let ttbr = (4 << 48) | 0x90000;
+        let space = zone.spaces.publish_closed(5, ttbr, ttbr).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 5);
+        zone.publish_slot(slot, 5, Some(3), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 5).unwrap();
+        // SAFETY: this fixed initialized CurrentTask belongs to the fixture.
+        let task = unsafe {
+            &*ptr
+                .add(
+                    carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+                        + 3 * core::mem::size_of::<carrick_el1_abi::CurrentTask>(),
+                )
+                .cast::<carrick_el1_abi::CurrentTask>()
+        };
+        task.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+            carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            1,
+        );
+        task.mm.key.store(5, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_root_generation(carrick_guest_arch::ContextGeneration::new(
+            NonZeroU64::new(77).unwrap(),
+        ));
+
+        let custody = std::sync::Arc::new(crate::trap::CarrierVmCustody::new_live_fixture());
+        let generation = custody.live_generation();
+        let ipa_baseline = crate::trap::execve_rebuild::exec_ipa_lease_count_for_tests();
+        let frame_baseline = custody.native_frame_backings.lock().len();
+        let preparation_baseline = custody.native_exec_preparations.lock().len();
+        let prepared =
+            crate::trap::PreparedNativeExecSuccessor::installed_cancel_fixture(&custody).unwrap();
+        let prepared_asid = prepared.prepared_asid();
+        let execution = stopped_execution(
+            unsafe {
+                RetainedAbiRegion::new(ptr, carrick_el1_abi::EL1_REGION_SIZE as usize).unwrap()
+            },
+            cpu,
+            ttbr,
+        )
+        .unwrap();
+        let identity = ServiceIdentity {
+            birth: ServiceBirth {
+                process: TaskKey {
+                    id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
+                    serial: TaskSerial::from_registry_allocation(NonZeroU64::MIN),
+                },
+                thread: carrick_core_abi::EntryThreadGeneration::from_raw(101),
+                record: RecordRef {
+                    id: RecordId::from_raw(1).unwrap(),
+                    incarnation: 1,
+                },
+                // SAFETY: the fixture publishes this exact carrier/MM incarnation above.
+                mm: unsafe {
+                    carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                        custody.transfer_carrier,
+                        carrick_el1_abi::ReservationMm::new(5).unwrap(),
+                        NonZeroU64::new(77).unwrap(),
+                    )
+                },
+            },
+            execution: carrick_core_abi::SnapshotGeneration::from_raw(11),
+            sequence: NonZeroU64::MIN,
+        };
+        let receipt = custody.reserve_native_exec_receipt().unwrap();
+        custody.retain_native_exec_preparation(receipt, identity, prepared);
+        assert_eq!(
+            custody.native_exec_preparations.lock().len(),
+            preparation_baseline + 1
+        );
+        assert_eq!(
+            custody.native_frame_backings.lock().len(),
+            frame_baseline + 1
+        );
+        assert_eq!(
+            crate::trap::execve_rebuild::exec_ipa_lease_count_for_tests(),
+            ipa_baseline + 1
+        );
+
+        let address = carrick_guest_arch::KernelVa::new(
+            carrick_el1_abi::EL1_STACKS_BASE + 3 * carrick_el1_abi::EL1_STACK_SIZE,
+        );
+        let offset = (address.raw() - carrick_el1_abi::EL1_REGION_BASE) as usize;
+        // SAFETY: aligned complete stack record on the stopped fixture CPU.
+        unsafe {
+            ptr.add(offset)
+                .cast::<carrick_el1_abi::NativeExecCancellation>()
+                .write(carrick_el1_abi::NativeExecCancellation::new(receipt));
+        }
+        let bytes = unsafe {
+            RetainedAbiRegion::new(ptr, carrick_el1_abi::EL1_REGION_SIZE as usize).unwrap()
+        };
+        assert_eq!(
+            service_native_exec_cancel(
+                &custody,
+                generation,
+                bytes,
+                cpu,
+                address,
+                u64::from(cpu.raw()),
+                ttbr,
+            ),
+            [METADATA_GRANT_SUCCESS, 0, 0, 0]
+        );
+        assert_eq!(
+            custody.native_exec_preparations.lock().len(),
+            preparation_baseline
+        );
+        assert_eq!(custody.native_frame_backings.lock().len(), frame_baseline);
+        assert_eq!(
+            crate::trap::execve_rebuild::exec_ipa_lease_count_for_tests(),
+            ipa_baseline
+        );
+        let replacement = custody.asid_allocator().allocate_unpublished().unwrap();
+        assert_eq!(replacement.generation().raw(), prepared_asid.raw());
+        assert!(replacement.generation().generation() > prepared_asid.generation());
+        drop(replacement);
+        assert_eq!(execution.binding.mm.raw(), 5);
+    }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
