@@ -57,7 +57,14 @@ fn native_root_exec_replaces_pid1_shell() {
             .command(["/bin/sh", "-c", "exec /bin/echo pid1_exec_ok"])
             .run_blocking(),
     );
-    assert!(result.success(), "stderr={}", result.stderr_utf8());
+    assert!(
+        result.success(),
+        "exit {} signal {:?} stdout {:?} stderr {:?}",
+        result.exit_code,
+        result.signal,
+        result.stdout_utf8(),
+        result.stderr_utf8()
+    );
     assert_eq!(result.stdout_utf8(), "pid1_exec_ok\n");
 }
 
@@ -79,7 +86,14 @@ fn native_child_exec_after_reusing_a_retired_slot() {
             ])
             .run_blocking(),
     );
-    assert!(result.success(), "stderr={}", result.stderr_utf8());
+    assert!(
+        result.success(),
+        "exit {} signal {:?} stdout {:?} stderr {:?}",
+        result.exit_code,
+        result.signal,
+        result.stdout_utf8(),
+        result.stderr_utf8()
+    );
     assert_eq!(result.stdout_utf8(), "reused_slot_exec_ok\n");
 }
 

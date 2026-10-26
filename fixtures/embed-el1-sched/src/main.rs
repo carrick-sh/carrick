@@ -526,12 +526,16 @@ fn exec_successor_memory_child() -> i32 {
         unsafe { libc::_exit(i32::from(cow.read_volatile() != 0x22)) };
     }
     let mut status = 0;
-    if unsafe { libc::waitpid(pid, &mut status, 0) } != pid
+    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+    let parent_cow = unsafe { cow.read_volatile() };
+    if waited != pid
         || !libc::WIFEXITED(status)
         || libc::WEXITSTATUS(status) != 0
-        || unsafe { cow.read_volatile() } != 0x11
+        || parent_cow != 0x11
     {
-        println!("exec-successor-memory cow isolation failed status={status}");
+        println!(
+            "exec-successor-memory cow isolation failed pid={pid} waited={waited} status={status} parent_cow={parent_cow}"
+        );
         return 9;
     }
     unsafe {
