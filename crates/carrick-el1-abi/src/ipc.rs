@@ -633,6 +633,11 @@ pub enum IpcOpKind {
     /// original call, and a signal interrupts it with EINTR whatever the
     /// handler's `SA_RESTART` (epoll_wait(2) is never restarted).
     EpollWait = 5,
+    /// A one-description `poll(2)` wait parked on the description's native
+    /// IPC object. Like [`Self::EpollWait`], it owns no I/O progress and
+    /// retains its exact description only to keep the object incarnation
+    /// alive across the wait.
+    PollWait = 6,
 }
 
 /// Exact task key of the operation's owner (venue-defined, generation-bearing).
@@ -681,9 +686,10 @@ pub struct IpcOperation {
     pub handback: IpcHandback,
     /// The completed result for [`IpcHandback::Sigpipe`].
     pub result: i64,
-    /// An [`IpcOpKind::EpollWait`]'s absolute deadline on the guest's
-    /// virtual counter (`CNTVCT_EL0`), kept across wakes so a re-parked wait
-    /// sleeps only its remaining time. Unused by other kinds.
+    /// An [`IpcOpKind::EpollWait`] or [`IpcOpKind::PollWait`]'s absolute
+    /// deadline on the guest's virtual counter (`CNTVCT_EL0`), kept across
+    /// wakes so a re-parked wait sleeps only its remaining time. Unused by
+    /// other kinds.
     pub deadline: IpcCounterDeadline,
 }
 
