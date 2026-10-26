@@ -4955,7 +4955,9 @@ pub mod foreign_cow_test_support {
                 custody: custody.custody,
                 ..CarrierForeignMmTransport::new()
             };
-            transport.register(snapshot, &state);
+            transport
+                .register(snapshot, &state)
+                .map_err(|error| format!("bind foreign COW fixture MM identity: {error:?}"))?;
             register_shared_alias(AliasBacking {
                 start: shape.data_va,
                 ipa: data_key.0,
