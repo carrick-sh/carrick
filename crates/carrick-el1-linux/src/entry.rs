@@ -85,12 +85,14 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
     let action =
         carrick_el1_linux::dispatch::dispatch_entry(frame_ref, counters_ref, &mut owner_wait);
     let action = carrick_el1::fault::drain_before_el0_hw(frame_ref, action);
-    carrick_el1_linux::dispatch::capture_native_service_exit(
-        frame_ref,
-        action,
-        owner_wait,
-        counters_ref,
-    ) as u64
+    let action =
+        carrick_el1_linux::dispatch::capture_native_service_exit(
+            frame_ref,
+            action,
+            owner_wait,
+            counters_ref,
+        );
+    carrick_el1::substrate::sched::hw::finish_entry(frame_ref, action) as u64
 }
 
 /// Observable bare-metal panic handler.

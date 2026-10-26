@@ -121,7 +121,12 @@ fn arm_native_fork_child_reinstalls_mm_after_service_ack() {
         super::super::native_process_runtime::NativeResume::Left(None)
     ));
     assert_eq!(
-        super::super::dispatch::native_service_idle(fixture.zone, fixture.slot, &mut cpu),
+        crate::sched::finish_entry(
+            fixture.zone,
+            fixture.slot,
+            &mut cpu,
+            carrick_el1_abi::Action::Idle
+        ),
         carrick_el1_abi::Action::Idle
     );
     assert_eq!(cpu.ttbr, (0x30000, 0x30000), "park left the child roots");
@@ -348,6 +353,12 @@ fn arm_native_preemption_service_exit_reinstalls_child_root() {
         .interrupt(&mut frame, 0),
         carrick_el1_abi::Action::Idle
     );
+    crate::sched::finish_entry(
+        fixture.zone,
+        fixture.slot,
+        &mut cpu,
+        carrick_el1_abi::Action::Idle,
+    );
     assert!(fixture.zone.slot(fixture.slot).current().is_none());
     assert_eq!(
         fixture.zone.installed_space(fixture.slot),
@@ -386,6 +397,71 @@ fn arm_native_preemption_service_exit_reinstalls_child_root() {
     );
     assert_eq!(fixture.zone.installed_space(fixture.slot), child_mm);
     assert_eq!(cpu.translations.len() - installs, 1);
+
+    use crate::sched::object_wait::OperationResumePc;
+    use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
+    let child_identity = fixture.zone.record(child).identity();
+    let key = ObjectWaitKey::metadata_request(7).unwrap();
+    fixture
+        .zone
+        .bind_object_wait(key, &carrick_sched_core::ShortLockSpin)
+        .unwrap();
+    let mut transport = crate::dispatch::Zone {
+        tables: fixture.zone,
+        cpu: &mut cpu,
+        user: &crate::sched::HardwareUserWord,
+    };
+    let mut sched = super::super::dispatch::native_scheduler(
+        &mut transport,
+        &fixture.task,
+        &counters,
+        fixture.slot,
+        &mut handoff,
+    );
+    let snapshot = sched.observe_object(key).unwrap();
+    let parked = sched
+        .park_object(
+            &frame,
+            key,
+            snapshot,
+            OperationResumePc::new(0x4000).unwrap(),
+            OperationToken::metadata_request(7).unwrap(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        sched.leave_after_object_park(parked),
+        Some(carrick_core::Served::Idle)
+    );
+    crate::sched::finish_entry(
+        fixture.zone,
+        fixture.slot,
+        sched.cpu,
+        carrick_el1_abi::Action::Idle,
+    );
+    assert_eq!(
+        fixture.zone.installed_space(fixture.slot),
+        0,
+        "object park retained MM"
+    );
+    assert_eq!(sched.cpu.ttbr, (0x30000, 0x30000));
+    let (report, effects) = sched.notify_object(key).unwrap();
+    assert_eq!(report.queued, 1);
+    sched.finish_object_wake(effects);
+    let installs = sched.cpu.translations.len();
+    assert_eq!(
+        sched.idle_entry(&mut frame, 0),
+        carrick_el1_abi::Action::Served
+    );
+    assert_eq!(sched.cpu.ttbr, child_roots);
+    assert_eq!(sched.cpu.translations.len() - installs, 1);
+    assert_eq!(
+        carrick_core::wait::take_object_operation(fixture.zone, fixture.slot, child_identity)
+            .unwrap()
+            .unwrap()
+            .metadata_generation(),
+        Some(7)
+    );
 }
 
 #[test]

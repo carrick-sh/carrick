@@ -561,7 +561,12 @@ fn composed_native_supply(
             } else {
                 assert!(matches!(result, NativeResume::Left(None)));
                 assert_eq!(page.claimed_count(), 1);
-                crate::dispatch::native_service_idle(fixture.zone, fixture.slot, &mut cpu);
+                crate::sched::finish_entry(
+                    fixture.zone,
+                    fixture.slot,
+                    &mut cpu,
+                    carrick_el1_abi::Action::Idle,
+                );
                 release();
                 let mut handoff = None;
                 let mut zone = crate::dispatch::Zone {
