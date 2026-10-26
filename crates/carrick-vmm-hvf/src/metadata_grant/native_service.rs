@@ -1053,27 +1053,33 @@ fn native_output(
     root: carrick_guest_arch::RootGpa,
     va: u64,
 ) -> Option<u64> {
-    let mut table = root.address().raw();
-    for (level, index) in carrick_mmu_core::aarch64::indices(va)
-        .into_iter()
-        .enumerate()
-    {
+    native_output_from(root, va, |address| {
         let pointer = crate::fork_stock::ForkStockHostCustody::physical_ptr::<AtomicU64>(
             custody,
-            carrick_guest_arch::FrameGpa::new(table + index as u64 * 8),
+            carrick_guest_arch::FrameGpa::new(address),
         )
         .ok()?;
         // SAFETY: retained stock tables and exact owner exclusion, atomic word.
-        let word = unsafe { &*pointer }.load(Ordering::Acquire);
-        if level == 3 {
-            return (word != 0).then_some(word & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK);
-        }
-        if word & 3 != 3 {
-            return None;
-        }
-        table = word & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
-    }
-    None
+        Some(unsafe { &*pointer }.load(Ordering::Acquire))
+    })
+}
+
+fn native_output_from(
+    root: carrick_guest_arch::RootGpa,
+    va: u64,
+    mut load: impl FnMut(u64) -> Option<u64>,
+) -> Option<u64> {
+    use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerMmuRefusal};
+    Aarch64Mmu::translate_with(
+        root,
+        carrick_guest_arch::UserVa::new(va),
+        carrick_mmu_core::aarch64::LeafAccess::Read,
+        false,
+        |address| load(address).ok_or(OwnerMmuRefusal::Unreachable),
+    )
+    .ok()
+    .flatten()
+    .map(|translation| translation.output.raw() & !4095)
 }
 
 pub(crate) fn settle_native_cow(
@@ -1256,6 +1262,32 @@ mod intake_tests {
                 )
             },
         }
+    }
+
+    #[test]
+    fn native_exec_payload_authenticates_a_live_metadata_block() {
+        let root =
+            carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x1000))
+                .unwrap();
+        let address = carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + 0x1234;
+        let indices = carrick_mmu_core::aarch64::indices(address);
+        let words = std::collections::BTreeMap::from([
+            (0x1000 + indices[0] as u64 * 8, 0x2003),
+            (0x2000 + indices[1] as u64 * 8, 0x3003),
+            (
+                0x3000 + indices[2] as u64 * 8,
+                (address & !0x1f_ffff) | 0x401,
+            ),
+        ]);
+        let mut loads = 0;
+        assert_eq!(
+            native_output_from(root, address, |slot| {
+                loads += 1;
+                words.get(&slot).copied()
+            }),
+            Some(address & !4095)
+        );
+        assert_eq!(loads, 3, "a block terminates the authenticated walk");
     }
 
     #[test]
