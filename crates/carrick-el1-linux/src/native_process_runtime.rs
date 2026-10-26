@@ -4983,7 +4983,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .lock()
             .pending
             .exit(&self.key)
-            .filter(|pending| core::ptr::eq(pending.caller.control(), self.control))
+            .filter(|pending| {
+                core::ptr::eq(pending.caller.control(), self.control)
+                    || (self.source.zone.record(self.record.id).is_native_owned()
+                        && carrick_core::lifecycle::recorded_member_exit_kind(
+                            self.control,
+                            self.control.entry(),
+                        ) == carrick_core::lifecycle::MemberExitKind::Active)
+            })
             .and_then(|pending| match pending.operation {
                 PendingCloseOperation::Exit { status, entry } => Some((status, entry)),
                 PendingCloseOperation::Exec(_) => None,
@@ -5640,15 +5647,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 let (custody, membership) = custody
                     .reserve_nonfinal(page)
                     .map_err(|_| NativeProcessError::Quarantined)?;
-                let _ = page.publish(entry);
-                let host_receipt = member_host_identity(page, self.control)?;
-                page.retire_published_host_member(entry, self.control, membership)
-                    .map_err(|_| NativeProcessError::Quarantined)?;
-                page.publish_exact_host_retirement(self.control, host_receipt.retirement());
+                let verdict = if self.source.zone.record(self.record.id).is_native_owned() {
+                    custody
+                        .cancel_in_zone(page, self.control, membership)
+                        .map_err(|_| NativeProcessError::Quarantined)?
+                } else {
+                    let _ = page.publish(entry);
+                    let host_receipt = member_host_identity(page, self.control)?;
+                    page.retire_published_host_member(entry, self.control, membership)
+                        .map_err(|_| NativeProcessError::Quarantined)?;
+                    page.publish_exact_host_retirement(self.control, host_receipt.retirement());
+                    custody.into_verdict(page)
+                };
                 if let carrick_core::terminal::RetirementVerdict::RetireThread {
                     notification,
                     ..
-                } = custody.into_verdict(page)
+                } = verdict
                 {
                     member_notification = notification;
                 }
@@ -5710,6 +5724,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             for record in service_records {
                 self.runtime
                     .cancel_service(record, self.source.slot, self.service)?;
+                if record != self.record {
+                    let mut effects = WakeEffects::default();
+                    self.source.zone.prompt_native_checkpoint(
+                        record,
+                        self.source.slot,
+                        &mut effects,
+                    );
+                    self.service.wake_effects(effects);
+                }
             }
             // Closing requests host retirement; it does not retire live zone
             // records. A deferred control wake is owned by that record's vCPU

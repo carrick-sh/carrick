@@ -1692,6 +1692,19 @@ Work remains one process-member scan per retained page and at most one control
 request per member. Signed parked-thread exit and first-entry execution remain
 required director gates.
 
+Native fork children have no host task graph. Their Closing owner must prompt
+native members through the existing zone queues and selected-owner checkpoint;
+a request to the host retirement batch cannot deliver that wake. The selected
+cancelled pool member commits its exact in-zone receipt under reserved terminal
+custody, including after admission closes. It must not mint a host receipt.
+`native_fatal_worker_wakes_futex_parked_leader_before_exit_drain` executes real
+fork, pthread clone and futex dispatch, then fatal exit from the worker while
+the parent waits and the child leader joins. The pre-fix RED leaves the leader
+parked with no delivery owner. The witness requires leader retirement, wake
+and resumption of the exception owner, both records freed, and the child MM
+retired. No timeout or repeated wake supplies progress. Work is one retained
+member scan, one exact detach per parked member and bounded queue publication.
+
 ## Host fork versus terminal close (`kernel.el1.thread-lifecycle`, #441)
 
 An admitted host fork either loses to terminal close before its commit gate

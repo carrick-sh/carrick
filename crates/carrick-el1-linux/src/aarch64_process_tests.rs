@@ -7,6 +7,8 @@ mod native_child_handoff_tests;
 mod native_fault_supply_tests;
 #[cfg(test)]
 mod native_retirement_tests;
+#[cfg(test)]
+mod native_terminal_tests;
 
 use super::aarch64_process::{Aarch64NativeProcessService, ForkStockCrossing};
 #[cfg(test)]
@@ -156,6 +158,7 @@ enum CommitFault {
 }
 
 struct TestStockCrossing {
+    terminal_task: Option<&'static CurrentTask>,
     #[cfg(test)]
     ipc: Option<(
         std::sync::Arc<carrick_kernel::el1_ipc::HostIpc>,
@@ -207,6 +210,7 @@ impl TestStockCrossing {
         Self {
             #[cfg(test)]
             ipc: None,
+            terminal_task: None,
             open_table: (0..16)
                 .map(|_| carrick_el1_abi::DelegatedOpenFile::new())
                 .collect(),
@@ -273,6 +277,9 @@ impl ForkStockCrossing for TestStockCrossing {
     fn cross_child_reclaim(&self, mm: ReservationMm, cpu: u64) -> Result<(), NativeProcessError> {
         let zone = self.zone.lock().unwrap().unwrap();
         let (binding, _) = self.child.lock().unwrap().unwrap();
+        let binding = self.terminal_task.map_or(binding, |task| {
+            carrick_core::entry::binding(&task.execution, &task.mm)
+        });
         let slot = SlotId::from_index(cpu as usize).unwrap();
         assert_eq!(binding.mm.raw(), mm.raw());
         assert!(carrick_core::entry::terminal_matches(
@@ -322,6 +329,11 @@ impl ForkStockCrossing for TestStockCrossing {
             .lock()
             .unwrap()
             .ok_or(NativeProcessError::Invalid)?;
+        // The production receiver reads the stopped CPU's CurrentTask, not
+        // the original fork leader: a native pthread may own process exit.
+        let binding = self.terminal_task.map_or(binding, |task| {
+            carrick_core::entry::binding(&task.execution, &task.mm)
+        });
         let slot = SlotId::from_index(cpu as usize).unwrap();
         let source = BornInZoneSource { zone, slot };
         // SAFETY: the synchronous test crossing retains this aligned ABI record.
@@ -374,6 +386,11 @@ impl ForkStockCrossing for TestStockCrossing {
     ) -> Result<(), NativeProcessError> {
         let zone = self.zone.lock().unwrap().unwrap();
         let (binding, _) = self.child.lock().unwrap().unwrap();
+        // The production receiver reads the stopped CPU's CurrentTask, not
+        // the original fork leader: a native pthread may own process exit.
+        let binding = self.terminal_task.map_or(binding, |task| {
+            carrick_core::entry::binding(&task.execution, &task.mm)
+        });
         let slot = SlotId::from_index(cpu as usize).unwrap();
         assert!(carrick_core::entry::terminal_matches(
             binding,
