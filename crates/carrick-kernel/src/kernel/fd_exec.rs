@@ -13,7 +13,7 @@ use super::core::{FileCloseBatch, FileCloseDisposition, FileCloseEvent, Kernel, 
 use super::objects::{FileDescriptionFdLease, FileTable, FileTableExecFreeze, TaskKey};
 
 /// Exact host graph table custody. Only the lifecycle owner can capture it;
-/// callers cannot manufacture a binding from a TaskKey and an Arc<FileTable>.
+/// callers cannot manufacture a binding from a `TaskKey` and an `Arc<FileTable>`.
 pub struct HostTableCustody {
     kernel: Arc<Kernel>,
     task: TaskKey,
