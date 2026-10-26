@@ -5155,15 +5155,13 @@ fn write_el1_hook(
         emit(bytes, &mut cursor, (enc_movz_w16(1) & !31) | 2); // cause bits are not replay policy
         emit(bytes, &mut cursor, 0x889F_FC22); // stlr w2, [x1] (mark served_with_work = 1)
     }
-    // In GIC mode late host work is a scheduler event, even when the handler
-    // just served the original frame. Recast the retained frame as an IRQ and
-    // re-enter the common scheduler boundary. A native owner can then park
-    // and publish its handoff before the driver reaches any host boundary.
-    // The IRQ hook itself uses its own frame entry, closing the same race if
-    // work arrives after an IRQ handler returned `Served`.
-    if irq == El1IrqMode::Gic {
-        emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264)); // esr = 0 (IRQ)
-    }
+    // Late host work is a scheduler event in both interrupt modes, even when
+    // the handler just served the original frame. Recast the retained frame
+    // as an IRQ and re-enter the common scheduler boundary. A native owner can
+    // then park and publish its handoff before the driver reaches any host
+    // boundary. The IRQ hook itself uses its own frame entry, closing the same
+    // race if work arrives after an IRQ handler returned `Served`.
+    emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264)); // esr = 0 (IRQ)
     let late_work_branch = cursor;
     emit(bytes, &mut cursor, 0); // b scheduler IRQ entry or forward target
     let skip_label = cursor;
@@ -5210,14 +5208,10 @@ fn write_el1_hook(
         forward_branch,
         enc_bne(forward_branch as u64, forward_target as u64),
     );
-    let late_work_target = if irq == El1IrqMode::Gic {
-        scheduler_irq_entry.unwrap_or_else(|| {
-            assert_eq!(entry, HookEntry::Irq);
-            frame_entry
-        })
-    } else {
-        forward_target
-    };
+    let late_work_target = scheduler_irq_entry.unwrap_or_else(|| {
+        assert_eq!(entry, HookEntry::Irq);
+        frame_entry
+    });
     put(
         bytes,
         late_work_branch,
@@ -5347,11 +5341,15 @@ fn write_el1_hook(
 /// branches to an EL1 hook that saves the EL0 frame, marks it an interrupt
 /// (syndrome 0) and calls the EL1 image; and the current-EL IRQ slot fails
 /// loud, because EL1 never unmasks IRQs.
+fn write_scheduler_irq_hook(bytes: &mut [u8], hook_offset: usize, irq: El1IrqMode) -> usize {
+    write_el1_hook(bytes, hook_offset, 0, irq, HookEntry::Irq, None)
+}
+
 fn write_el0_irq_hook(bytes: &mut [u8], hook_offset: usize) -> usize {
     let put = |bytes: &mut [u8], off: usize, op: u32| {
         bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
     };
-    let frame_entry = write_el1_hook(bytes, hook_offset, 0, El1IrqMode::Gic, HookEntry::Irq, None);
+    let frame_entry = write_scheduler_irq_hook(bytes, hook_offset, El1IrqMode::Gic);
     let slot = AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET;
     put(bytes, slot, enc_b(slot as u64, hook_offset as u64));
     put(bytes, slot + 4, AARCH64_NOP_OPCODE);
@@ -6100,8 +6098,11 @@ fn el1_vectors_bytes_mailbox_with_layout(
 
     debug_assert!(cursor <= MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE);
     if el1_enabled {
-        let scheduler_irq_entry =
-            (irq == El1IrqMode::Gic).then(|| write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET));
+        let scheduler_irq_entry = Some(if irq == El1IrqMode::Gic {
+            write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET)
+        } else {
+            write_scheduler_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET, irq)
+        });
         write_el1_vector_hook(
             &mut bytes,
             EL1_VECTOR_HOOK_OFFSET,
@@ -8436,32 +8437,36 @@ mod syscall_mailbox_tests {
     /// and publish its handoff before any host exit.
     #[test]
     fn served_native_frame_with_late_host_work_reenters_irq_boundary() {
-        let bytes = el1_vectors_bytes_mailbox_irq(false, false, true, El1IrqMode::Gic);
-        let words: Vec<u32> = bytes
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
-            .collect();
-        let pending_load = words[EL1_VECTOR_HOOK_OFFSET / 4..(EL1_VECTOR_HOOK_OFFSET + 0x1000) / 4]
-            .iter()
-            .position(|word| *word == enc_ldar_wt_xn(2, 1))
-            .map(|index| index + EL1_VECTOR_HOOK_OFFSET / 4)
-            .expect("syscall return pending-host-work load");
-        let mut scratch = vec![0u8; LINUX_EL1_VECTORS_SIZE as usize];
-        let irq_frame_entry = write_el0_irq_hook(&mut scratch, EL0_IRQ_HOOK_OFFSET) / 4;
+        for irq in [El1IrqMode::Masked, El1IrqMode::Gic] {
+            let bytes = el1_vectors_bytes_mailbox_irq(false, false, true, irq);
+            let words: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+                .collect();
+            let pending_load = words
+                [EL1_VECTOR_HOOK_OFFSET / 4..(EL1_VECTOR_HOOK_OFFSET + 0x1000) / 4]
+                .iter()
+                .position(|word| *word == enc_ldar_wt_xn(2, 1))
+                .map(|index| index + EL1_VECTOR_HOOK_OFFSET / 4)
+                .expect("syscall return pending-host-work load");
+            let mut scratch = vec![0u8; LINUX_EL1_VECTORS_SIZE as usize];
+            let irq_frame_entry =
+                write_scheduler_irq_hook(&mut scratch, EL0_IRQ_HOOK_OFFSET, irq) / 4;
 
-        assert_eq!(
-            words[pending_load + 5],
-            enc_str_xt_xn(31, 16, 264),
-            "late work must become an IRQ frame before scheduler re-entry"
-        );
-        let branch = words[pending_load + 6];
-        assert_eq!(branch & 0xfc00_0000, 0x1400_0000, "expected branch");
-        let displacement = ((branch & 0x03ff_ffff) as i32) << 6 >> 6;
-        assert_eq!(
-            (pending_load + 6) as i32 + displacement,
-            irq_frame_entry as i32,
-            "late work bypassed the scheduler IRQ ownership boundary"
-        );
+            assert_eq!(
+                words[pending_load + 5],
+                enc_str_xt_xn(31, 16, 264),
+                "late work must become an IRQ frame before scheduler re-entry in {irq:?}"
+            );
+            let branch = words[pending_load + 6];
+            assert_eq!(branch & 0xfc00_0000, 0x1400_0000, "expected branch");
+            let displacement = ((branch & 0x03ff_ffff) as i32) << 6 >> 6;
+            assert_eq!(
+                (pending_load + 6) as i32 + displacement,
+                irq_frame_entry as i32,
+                "late work bypassed the scheduler IRQ ownership boundary in {irq:?}"
+            );
+        }
     }
 
     #[test]
