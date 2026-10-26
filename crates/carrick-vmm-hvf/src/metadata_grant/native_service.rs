@@ -29,12 +29,18 @@ pub trait NativeExecPreparation: core::fmt::Debug + Send + 'static {
 /// while guest work can name its capability.  The returned registration is
 /// the run's unique removal authority and must settle after its process tree
 /// has joined but before container resources are retired.
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct NativeExecServiceDirectory {
     services: parking_lot::Mutex<Vec<(ExecCapabilityId, Arc<dyn NativeExecHostService>)>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum NativeExecRegistrationError {
     Duplicate,
     Absent,
