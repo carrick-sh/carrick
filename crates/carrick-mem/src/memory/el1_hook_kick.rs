@@ -126,11 +126,8 @@ struct Machine {
 impl Machine {
     fn bytes(irq: El1IrqMode) -> Vec<u8> {
         let mut bytes = vec![0u8; LINUX_EL1_VECTORS_SIZE as usize];
-        let scheduler_irq_entry = Some(if irq == El1IrqMode::Gic {
-            write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET)
-        } else {
-            write_scheduler_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET, irq)
-        });
+        let scheduler_irq_entry =
+            (irq == El1IrqMode::Gic).then(|| write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET));
         write_el1_vector_hook(
             &mut bytes,
             EL1_VECTOR_HOOK_OFFSET,
@@ -703,10 +700,11 @@ fn masked_mode_vector_page_never_unmasks_irqs() {
     );
 }
 
-/// In GIC mode the lower-EL IRQ slot enters the scheduler IRQ hook; masked
-/// mode retains that hook only as the late-work software boundary and keeps
-/// its legacy vector slot. EL1 never unmasks IRQs (so the current-EL IRQ slot
-/// fails loud); with the EL1 kernel off the page has no hook at all.
+/// In GIC mode the lower-EL IRQ slot enters the scheduler IRQ hook, installed
+/// in otherwise unused vector-page space; the masked hatch has no interrupt
+/// controller, so it installs no hook and keeps its legacy slot. EL1 never
+/// unmasks IRQs (so the current-EL IRQ slot fails loud); with the EL1 kernel
+/// off the page has no hook at all.
 #[test]
 fn gic_mode_vector_page_routes_el0_interrupts_to_el1() {
     let words = |bytes: &[u8]| -> Vec<u32> {
@@ -741,9 +739,15 @@ fn gic_mode_vector_page_routes_el0_interrupts_to_el1() {
     );
     let hook = EL0_IRQ_HOOK_OFFSET / 4;
     let nop = AARCH64_NOP_OPCODE;
-    assert_ne!(
-        masked[hook], nop,
-        "masked late work needs the software scheduler IRQ boundary"
+    let hook_len = gic[hook..]
+        .iter()
+        .position(|word| *word == nop)
+        .expect("hook end");
+    assert!(
+        masked[hook..hook + hook_len]
+            .iter()
+            .all(|word| *word == nop),
+        "the masked hatch must not install the scheduler IRQ hook"
     );
     assert_eq!(
         masked[AARCH64_VECTOR_LOWER_EL_IRQ_OFFSET / 4],

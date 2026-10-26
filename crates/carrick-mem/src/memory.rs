@@ -5155,13 +5155,18 @@ fn write_el1_hook(
         emit(bytes, &mut cursor, (enc_movz_w16(1) & !31) | 2); // cause bits are not replay policy
         emit(bytes, &mut cursor, 0x889F_FC22); // stlr w2, [x1] (mark served_with_work = 1)
     }
-    // Late host work is a scheduler event in both interrupt modes, even when
-    // the handler just served the original frame. Recast the retained frame
-    // as an IRQ and re-enter the common scheduler boundary. A native owner can
+    // On a GIC carrier late host work is a scheduler event, even when the
+    // handler just served the original frame. Recast the retained frame as
+    // an IRQ and re-enter the common scheduler boundary. A native owner can
     // then park and publish its handoff before the driver reaches any host
     // boundary. The IRQ hook itself uses its own frame entry, closing the same
-    // race if work arrives after an IRQ handler returned `Served`.
-    emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264)); // esr = 0 (IRQ)
+    // race if work arrives after an IRQ handler returned `Served`. The masked
+    // hatch has no interrupt controller to acknowledge and no zone owner, so
+    // its late work forwards the frame to the host unchanged.
+    let reenters_scheduler = scheduler_irq_entry.is_some() || entry == HookEntry::Irq;
+    if reenters_scheduler {
+        emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264)); // esr = 0 (IRQ)
+    }
     let late_work_branch = cursor;
     emit(bytes, &mut cursor, 0); // b scheduler IRQ entry or forward target
     let skip_label = cursor;
@@ -5208,10 +5213,11 @@ fn write_el1_hook(
         forward_branch,
         enc_bne(forward_branch as u64, forward_target as u64),
     );
-    let late_work_target = scheduler_irq_entry.unwrap_or_else(|| {
-        assert_eq!(entry, HookEntry::Irq);
-        frame_entry
-    });
+    let late_work_target = match (scheduler_irq_entry, entry) {
+        (Some(scheduler), _) => scheduler,
+        (None, HookEntry::Irq) => frame_entry,
+        (None, _) => forward_target,
+    };
     put(
         bytes,
         late_work_branch,
@@ -6098,11 +6104,11 @@ fn el1_vectors_bytes_mailbox_with_layout(
 
     debug_assert!(cursor <= MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE);
     if el1_enabled {
-        let scheduler_irq_entry = Some(if irq == El1IrqMode::Gic {
-            write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET)
-        } else {
-            write_scheduler_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET, irq)
-        });
+        // Only a GIC carrier has a scheduler IRQ boundary to re-enter: its
+        // entry acknowledges the interrupt controller. The masked hatch has
+        // no controller and no zone, so late work keeps the forward route.
+        let scheduler_irq_entry =
+            (irq == El1IrqMode::Gic).then(|| write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET));
         write_el1_vector_hook(
             &mut bytes,
             EL1_VECTOR_HOOK_OFFSET,
@@ -8437,36 +8443,64 @@ mod syscall_mailbox_tests {
     /// and publish its handoff before any host exit.
     #[test]
     fn served_native_frame_with_late_host_work_reenters_irq_boundary() {
-        for irq in [El1IrqMode::Masked, El1IrqMode::Gic] {
-            let bytes = el1_vectors_bytes_mailbox_irq(false, false, true, irq);
-            let words: Vec<u32> = bytes
-                .chunks_exact(4)
-                .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
-                .collect();
-            let pending_load = words
-                [EL1_VECTOR_HOOK_OFFSET / 4..(EL1_VECTOR_HOOK_OFFSET + 0x1000) / 4]
-                .iter()
-                .position(|word| *word == enc_ldar_wt_xn(2, 1))
-                .map(|index| index + EL1_VECTOR_HOOK_OFFSET / 4)
-                .expect("syscall return pending-host-work load");
-            let mut scratch = vec![0u8; LINUX_EL1_VECTORS_SIZE as usize];
-            let irq_frame_entry =
-                write_scheduler_irq_hook(&mut scratch, EL0_IRQ_HOOK_OFFSET, irq) / 4;
+        let words = vector_words(El1IrqMode::Gic);
+        let pending_load = syscall_pending_load(&words);
+        let mut scratch = vec![0u8; LINUX_EL1_VECTORS_SIZE as usize];
+        let irq_frame_entry =
+            write_scheduler_irq_hook(&mut scratch, EL0_IRQ_HOOK_OFFSET, El1IrqMode::Gic) / 4;
 
-            assert_eq!(
-                words[pending_load + 5],
-                enc_str_xt_xn(31, 16, 264),
-                "late work must become an IRQ frame before scheduler re-entry in {irq:?}"
-            );
-            let branch = words[pending_load + 6];
-            assert_eq!(branch & 0xfc00_0000, 0x1400_0000, "expected branch");
-            let displacement = ((branch & 0x03ff_ffff) as i32) << 6 >> 6;
-            assert_eq!(
-                (pending_load + 6) as i32 + displacement,
-                irq_frame_entry as i32,
-                "late work bypassed the scheduler IRQ ownership boundary in {irq:?}"
-            );
-        }
+        assert_eq!(
+            words[pending_load + 5],
+            enc_str_xt_xn(31, 16, 264),
+            "late work must become an IRQ frame before scheduler re-entry"
+        );
+        assert_eq!(
+            branch_target(&words, pending_load + 6),
+            irq_frame_entry,
+            "late work bypassed the scheduler IRQ ownership boundary"
+        );
+    }
+
+    /// The `CARRICK_HVF_GIC=0` hatch has no interrupt controller: its
+    /// scheduler IRQ entry would acknowledge `ICC_IAR1_EL1` on a VM with no
+    /// GIC. Late work after a served syscall keeps the forward route, with
+    /// the syscall syndrome intact.
+    #[test]
+    fn masked_late_host_work_forwards_without_a_scheduler_irq_entry() {
+        let words = vector_words(El1IrqMode::Masked);
+        let pending_load = syscall_pending_load(&words);
+        let target = branch_target(&words, pending_load + 5);
+
+        assert_eq!(
+            words[target], 0x9100_03F0,
+            "masked late work must branch to the forward path (`mov x16, sp`)"
+        );
+        assert!(
+            !words[pending_load..pending_load + 5].contains(&enc_str_xt_xn(31, 16, 264)),
+            "masked late work must keep the syscall syndrome"
+        );
+    }
+
+    fn vector_words(irq: El1IrqMode) -> Vec<u32> {
+        el1_vectors_bytes_mailbox_irq(false, false, true, irq)
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+            .collect()
+    }
+
+    fn syscall_pending_load(words: &[u32]) -> usize {
+        words[EL1_VECTOR_HOOK_OFFSET / 4..(EL1_VECTOR_HOOK_OFFSET + 0x1000) / 4]
+            .iter()
+            .position(|word| *word == enc_ldar_wt_xn(2, 1))
+            .map(|index| index + EL1_VECTOR_HOOK_OFFSET / 4)
+            .expect("syscall return pending-host-work load")
+    }
+
+    fn branch_target(words: &[u32], at: usize) -> usize {
+        let branch = words[at];
+        assert_eq!(branch & 0xfc00_0000, 0x1400_0000, "expected branch");
+        let displacement = ((branch & 0x03ff_ffff) as i32) << 6 >> 6;
+        usize::try_from(at as i32 + displacement).expect("branch target in image")
     }
 
     #[test]
