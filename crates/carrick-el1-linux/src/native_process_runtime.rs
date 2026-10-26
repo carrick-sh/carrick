@@ -3659,6 +3659,41 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         Ok(())
     }
 
+    /// Complete the service binding for a member first admitted from an
+    /// in-zone birth. Fork publication binds the process leader eagerly, but
+    /// a later clone has no physical crossing before its first native entry.
+    #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+    pub(crate) fn bind_service_channel(&mut self) -> Result<(), NativeProcessError> {
+        let mm = self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .mm
+            .clone();
+        let handle = self.service.service_mm_handle(&mm)?;
+        let service_wait =
+            carrick_sched_core::object_wait::ObjectWaitKey::native_service(self.record)
+                .ok_or(NativeProcessError::Stale)?;
+        self.source
+            .zone
+            .bind_object_wait(service_wait, &carrick_sched_core::ShortLockSpin)
+            .map_err(|_| NativeProcessError::Quarantined)?;
+        self.control
+            .service
+            .bind(carrick_core_abi::service::ServiceBirth {
+                process: self.key,
+                thread: self.binding.thread_generation,
+                record: self.record,
+                mm: handle,
+            })
+            .map_err(|_| NativeProcessError::Quarantined)
+    }
+
     /// Test pending native work before the ISA saves FP/SIMD for delivery.
     /// A suspended mask needs its restoration even if no signal is pending.
     pub fn signal_checkpoint_needed(&self) -> bool {
