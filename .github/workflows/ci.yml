@@ -147,13 +147,13 @@ jobs:
               just doc
               # Debug PR checks/tests run last to survive bounded-cache eviction.
               just check
-              just xtask test-batch --no-run test
-              just xtask test-batch --no-run test-integration
               # Fresh Cargo outputs skip sccache entirely. Replay the critical
               # graph after clearing only this ephemeral hosted target directory.
               cargo clean
               just ci-prebuild-xtask
               export CARRICK_XTASK_BIN="$PWD/target/debug/carrick-xtask"
+              just xtask test-batch --no-run test
+              just xtask test-batch --no-run test-integration
               just clippy
               just test-xtask --no-run
               ;;
@@ -169,8 +169,6 @@ jobs:
               just doc
               # Cross/release/doc entries yield to the debug PR-critical set.
               just check
-              just xtask test-batch --no-run test
-              just xtask test-batch --no-run test-integration
               just test-loom --no-run
               just test-kernel-semantics --no-run
               cargo test --locked --no-run -p carrick-host-linux
@@ -182,9 +180,12 @@ jobs:
               cargo clean
               just ci-prebuild-xtask
               export CARRICK_XTASK_BIN="$PWD/target/debug/carrick-xtask"
+              just xtask test-batch --no-run test
+              just xtask test-batch --no-run test-integration
               just ci-build-xtask-tests
               ;;
             linux-arm64)
+              just ci-prebuild-xtask
               cargo check --locked -p carrick-kernel-example --tests
               cargo build --locked -p carrick-kernel-example --tests
               cargo test --locked --no-run -p carrick-kernel-example --tests

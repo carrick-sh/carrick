@@ -364,6 +364,20 @@ fn warm_tail_replays_consumer_xtask_builds_after_eviction_pressure() {
             .unwrap();
         let finish = commands.iter().position(|l| *l == last).unwrap();
         assert!(clean < lean && lean < finish);
+        for graph in [
+            "just xtask test-batch --no-run test",
+            "just xtask test-batch --no-run test-integration",
+        ] {
+            let position = commands
+                .iter()
+                .position(|command| *command == graph)
+                .unwrap();
+            assert!(
+                lean < position && position < finish,
+                "{family}: shard graphs must survive overflow"
+            );
+        }
+
         assert_eq!(
             commands.last().copied(),
             Some(last),
@@ -375,6 +389,18 @@ fn warm_tail_replays_consumer_xtask_builds_after_eviction_pressure() {
             "cache keys must match consumers"
         );
     }
+    let arm = script
+        .split("linux-arm64)")
+        .nth(1)
+        .unwrap()
+        .split(";;")
+        .next()
+        .unwrap();
+    assert!(
+        arm.lines()
+            .any(|line| line.trim() == "just ci-prebuild-xtask"),
+        "ARM consumers cannot use the x64 artifact"
+    );
     let justfile = std::fs::read_to_string(root.join("justfile")).unwrap();
     assert!(justfile.contains("test-batch --export target/xtask-tests.tar.gz _test-xtask-ci"));
     for recipe in [
