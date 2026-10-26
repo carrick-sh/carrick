@@ -926,7 +926,7 @@ fn arm_native_service_exit(
                         );
                     }
                     Action::Idle | Action::HostCustody => {
-                        return Some(invalid_completion(NativeInvariant::EntryBinding));
+                        invalid_completion(NativeInvariant::EntryBinding)
                     }
                 }
             }
